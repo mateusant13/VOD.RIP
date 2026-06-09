@@ -1,0 +1,10 @@
+* text=auto
+*.py text diff=python
+*.ts text diff=typescript
+*.tsx text diff=typescript
+*.css text diff=css
+*.json text
+*.md text
+*.bat text eol=crlf
+*.yaml text
+*.yml text
