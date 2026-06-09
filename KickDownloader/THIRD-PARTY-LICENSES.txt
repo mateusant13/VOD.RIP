@@ -1,0 +1,81 @@
+KickDownloader utilizes many third party libraries and resources. This document shall contain all of the relevant
+licenses and attributions required to use said libraries and resources.
+
+A library or resource shall be prefixed by '**', then the name is written followed by a '-', then the license it has
+ been obtained under is written.
+The next line shall be a statement of Copyright. If none is provided by the library or resource, then this is omitted.
+The next line shall be a link to a webpage where the library or resource can be reliably found.
+
+This document is a summary of the licenses provided by included third party components and is not a
+substitute for reading the original licenses from the original library or resource distribution webpages. Users should
+read the license for each library or resource before making decisions that may introduce the possibility of breaching a
+license.
+
+==========
+
+** yt-dlp - Unlicense
+   Copyright (c) yt-dlp contributors
+   https://github.com/yt-dlp/yt-dlp
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute this software, either in
+source code form or as a compiled software, for any purpose, commercial or non-commercial, and by any
+means.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+==========
+
+** FastAPI - MIT
+   Copyright (c) 2018 Sebastian Ramirez
+   https://github.com/tiangolo/fastapi
+
+** Uvicorn - BSD-3-Clause
+   Copyright (c) 2017-present Encode OSS Ltd.
+   https://github.com/encode/uvicorn
+
+** Pydantic - MIT
+   Copyright (c) 2017-2024 Samuel Colvin and other contributors
+   https://github.com/pydantic/pydantic
+
+** Starlette - BSD-3-Clause
+   Copyright (c) 2018 Encode OSS Ltd.
+   https://github.com/encode/starlette
+
+The MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+==========
+
+** FFmpeg - GPLv2/LGPLv2.1/GPLv3
+   Copyright (c) The FFmpeg developers
+   https://ffmpeg.org/
+
+FFmpeg is licensed under the GNU Lesser General Public License (LGPL) version 2.1 or later.
+However, FFmpeg incorporates several optional parts and optimizations under various
+other open source licenses. See the FFmpeg Legal page for details:
+https://www.ffmpeg.org/legal.html
+
+Note: FFmpeg is not bundled with this application. Users must install FFmpeg separately.
