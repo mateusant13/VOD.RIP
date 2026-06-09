@@ -6,6 +6,8 @@ node_modules/
 # Build output
 dist/
 build/
+# Generated build artifact copied from dist/ during npm run build-copy
+KickDownloader/KickDownloaderPy/static/index.html
 
 # Python
 __pycache__/

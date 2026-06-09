@@ -194,7 +194,9 @@ export default function App() {
     try {
       await apiPost(`/api/download/${id}/cancel`, {});
       refreshDownloads();
-    } catch {}
+    } catch (err: any) {
+      setError(err.message || 'Failed to cancel download');
+    }
   }, []);
 
   // ── Refresh downloads ──
