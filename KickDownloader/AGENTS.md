@@ -8,16 +8,17 @@ for the Kick & Twitch Downloader project.
 ## Architecture
 
 ### Stack
+- **Frontend:** React 19 + TypeScript + Tailwind v4 + Vite 7
 - **Backend:** FastAPI (Python) running on uvicorn
-- **Frontend:** Vanilla HTML/CSS/JS (no framework)
 - **Download Engine:** yt-dlp native Python API (no subprocess wrappers)
 - **Video Processing:** ffmpeg / ffprobe
 
 ### Port & Launch
-- Default port: **8080** (configurable via `PORT` env var)
+- Default port: **7897** (configurable via `PORT` env var)
 - Entry point: `run.py` (auto-installs deps then launches uvicorn)
 - Direct entry: `python main.py` (for development)
 - Windows convenience: `launch.bat`
+- Frontend dev server: `http://localhost:5173` (API proxied to backend)
 
 ---
 
@@ -45,18 +46,18 @@ Business logic is split into three services:
 ## Testing
 
 ### test_downloads.py
-End-to-end integrity test that:
-1. Downloads 20s clips from Twitch and Kick via the running API server
-2. Validates file size, duration (15-25s), video/audio streams via ffprobe
-3. Extracts 10 random frames and checks brightness via ffmpeg signalstats
-4. Checks audio volume via ffmpeg volumedetect (peak < -50 dB = silent)
-5. Reports PASS/FAIL per test with a summary table
+End-to-end test that downloads 20-second clips from Twitch and Kick and validates file size (< 500 MB).
+
+Supports three modes:
+- **Direct** (default): uses yt-dlp directly, no server needed
+- **`--server`**: starts download via the running API server
+- **`--info`**: fetches metadata only (no download)
 
 **Default test URLs:**
-- Twitch: https://www.twitch.tv/videos/2786101426
-- Kick: https://kick.com/titiltei/videos/c716c40f-c1ba-491b-83d8-b41b5321a0b5
+- Twitch: https://www.twitch.tv/videos/2792650770
+- Kick: https://kick.com/titiltei/videos/ddaf9751-fc2e-4f5e-9d5d-94fe637ef234
 
-**Prerequisites:** Server must be running on localhost:8080, ffmpeg+ffprobe on PATH.
+**Prerequisites:** ffmpeg on PATH for HLS stream merging.
 
 ---
 
@@ -72,30 +73,14 @@ The original TwitchDownloader used subprocess calls to yt-dlp. The migration to 
 native Python API (yt_dlp.YoutubeDL) allows real-time progress callbacks, better error
 handling, no string-parsing of CLI output, and thread-safe concurrent downloads.
 
-### Why ffmpeg signalstats for black detection?
-Using signalstats and parsing the YAVG (average luminance) value is fast and reliable
-without pulling in OpenCV or other heavy dependencies. A frame is black if YAVG < 5.0.
-
-### Why ffmpeg volumedetect for audio silence?
-The volumedetect filter provides mean_volume and max_volume values in dB, which is a
-standard and portable way to measure audio loudness. The threshold of -50 dB for silence
-was chosen empirically -- most real audio content has peaks well above this (-2 to -20 dB).
-A completely silent track hovers around -90 dB.
-
 ### Why 20-second clip for testing?
 A 20-second download is long enough to verify real content exists but short enough to
 complete quickly (2-5 seconds for most VODs). The crop is done server-side via yt-dlp's
-crop_end parameter.
+download_sections parameter.
 
-### Why random frames instead of evenly-spaced?
-10 random frame positions across the clip reduce the chance of hitting a black section
-that happens to fall at a fixed interval (e.g., a stinger transition), while still
-providing good coverage. The first 0.5s is skipped to avoid initial black frames common
-in live streams.
-
-### Twitch URL change (Jun 2026)
-The default Twitch test URL was changed from 2784018843 to 2786101426 because the
-original VOD became unavailable. The Kick test URL has been stable.
+### Why `vite-plugin-singlefile`?
+Inlines all JS and CSS into a single `dist/index.html` so the Python backend can serve
+the entire frontend as a single static file with zero additional dependencies.
 
 ---
 
@@ -103,16 +88,16 @@ original VOD became unavailable. The Kick test URL has been stable.
 
 | File | Purpose |
 |---|---|
+| src/App.tsx | React frontend UI component |
+| src/index.css | Tailwind v4 styles + custom animation system |
 | main.py | FastAPI application with all API routes |
 | run.py | Launch script (auto-installs deps, starts uvicorn) |
-| test_downloads.py | End-to-end integrity test suite |
+| test_downloads.py | End-to-end download test suite |
 | models/schemas.py | Pydantic models |
 | services/ytdlp_service.py | yt-dlp wrapper |
 | services/download_manager.py | Download queue management |
 | services/settings.py | Settings persistence |
-| static/index.html | Web UI |
-| static/js/app.js | Frontend logic |
-| static/css/app.css | Styles |
+| static/index.html | Built React UI (via npm run build-copy) |
 
 ---
 
@@ -120,6 +105,9 @@ original VOD became unavailable. The Kick test URL has been stable.
 
 | Package | Version | Purpose |
 |---|---|---|
+| react | ^19 | Frontend framework |
+| vite | ^7 | Build tool |
+| tailwindcss | ^4 | CSS framework |
 | fastapi | >=0.100.0 | Web framework |
 | uvicorn[standard] | >=0.23.0 | ASGI server |
 | yt-dlp | >=2024.1.0 | Video download engine |

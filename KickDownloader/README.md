@@ -79,7 +79,6 @@ Open `http://localhost:7897` — the React UI is served directly by the Python b
 │   ├── App.tsx                   # Main UI component
 │   ├── index.css                 # Styles
 │   ├── main.tsx                  # Entry point
-│   └── utils/cn.ts               # Tailwind utility
 ├── index.html                    # React entry HTML
 ├── package.json                  # Frontend dependencies
 ├── vite.config.ts                # Vite config with API proxy
@@ -97,9 +96,7 @@ Open `http://localhost:7897` — the React UI is served directly by the Python b
 │   │   │   ├── download_manager.py # Download queue + SSE
 │   │   │   └── settings.py       # JSON settings persistence
 │   │   └── static/
-│   │       ├── index.html        # Built React UI (via npm run build-copy)
-│   │       ├── css/app.css       # Styles
-│   │       └── js/app.js         # Legacy JS
+│   │       └── index.html        # Built React UI (via npm run build-copy)
 │   ├── launch.bat                # Windows launcher
 │   ├── AGENTS.md                 # AI agent project memory
 │   ├── LICENSE.txt

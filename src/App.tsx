@@ -399,7 +399,7 @@ export default function App() {
 
             {/* Video Info */}
             {videoInfo && (
-              <div className="flex flex-col gap-5 animate-in slide-in-from-top-2 duration-300">
+              <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-top-2 duration-300">
                 <div className="border-2 border-zinc-800 p-3 flex gap-3 bg-zinc-900 relative overflow-hidden group">
                   <div className={`absolute top-0 right-0 w-16 h-16 opacity-20 blur-2xl transition-colors duration-500 ${
                     videoInfo.platform?.toLowerCase() === 'kick' ? 'bg-[#53fc18]' : 'bg-[#9146FF]'
