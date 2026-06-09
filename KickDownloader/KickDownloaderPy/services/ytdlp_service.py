@@ -3,9 +3,15 @@
 import os
 import re
 import shutil
-import yt_dlp
+import tempfile
+import threading
+import subprocess as sp
 from pathlib import Path
 from typing import Optional, Callable
+from urllib.parse import urljoin
+
+import requests
+import yt_dlp
 
 from models.schemas import VideoInfo
 
@@ -58,12 +64,7 @@ def _get_cache_dir() -> Path:
 
 
 def _prune_cache_dir(cache_dir: Path, max_bytes: int) -> None:
-    """Remove oldest entries from *cache_dir* until its size is <= *max_bytes*.
-
-    Every file and directory directly inside *cache_dir* is a candidate.
-    Directories are sized recursively.  Removal order is by last-access time
-    (``os.path.getatime``), oldest first.
-    """
+    """Remove oldest entries from *cache_dir* until its size is <= *max_bytes*."""
     if not cache_dir.is_dir():
         return
 
@@ -81,10 +82,8 @@ def _prune_cache_dir(cache_dir: Path, max_bytes: int) -> None:
             continue
         entries.append((atime, entry, size))
 
-    # Sort ascending so oldest-access comes first.
     entries.sort(key=lambda t: t[0])
 
-    # Track size decrementally instead of re-walking the tree on each iteration.
     current_size = sum(size for _, _, size in entries)
     while entries and current_size > max_bytes:
         atime, oldest, oldest_size = entries.pop(0)
@@ -95,11 +94,10 @@ def _prune_cache_dir(cache_dir: Path, max_bytes: int) -> None:
                 oldest.unlink()
             current_size -= oldest_size
         except OSError:
-            pass  # best-effort: skip files we cannot remove
+            pass
 
 
 def _dir_size(path: Path) -> int:
-    """Return total size of all files under *path* (recursive)."""
     total = 0
     try:
         for root, _dirs, files in os.walk(path):
@@ -119,19 +117,16 @@ def _dir_size(path: Path) -> int:
 # ---------------------------------------------------------------------------
 
 def _find_ffmpeg() -> Optional[str]:
-    """Locate ffmpeg on the system — returns the BIN DIRECTORY, not the exe.
+    """Locate ffmpeg — returns the BIN DIRECTORY (not the exe).
 
-    yt-dlp's ``ffmpeg_location`` option is most reliable when given the
-    *directory* that contains *both* ``ffmpeg.exe`` and ``ffprobe.exe``,
-    rather than the executable file itself.
+    yt-dlp's ``ffmpeg_location`` and our clip pipeline both need the
+    *directory* that contains *both* ``ffmpeg.exe`` and ``ffprobe.exe``.
     """
-    # 1. Check PATH
     exe = shutil.which("ffmpeg")
     if exe:
         return str(Path(exe).parent)
 
     def _check_bin(parent: Path) -> Optional[str]:
-        """If *parent* contains ffmpeg.exe or ffmpeg, return *parent* as str."""
         if not parent.is_dir():
             return None
         for f in parent.iterdir():
@@ -139,7 +134,6 @@ def _find_ffmpeg() -> Optional[str]:
                 return str(parent)
         return None
 
-    # 2. Common install locations (Windows)
     candidates = [
         Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "ffmpeg" / "bin",
         Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "FFmpeg" / "bin",
@@ -149,22 +143,17 @@ def _find_ffmpeg() -> Optional[str]:
         Path("/usr/bin"),
         Path("/usr/local/bin"),
     ]
-
     for c in candidates:
         result = _check_bin(c)
         if result:
             return result
 
-    # 3. winget installs into a versioned subfolder under Packages
     winget_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if winget_root.is_dir():
-        # Look for any subdirectory tree that contains ffmpeg.exe
         for sub in winget_root.rglob("ffmpeg.exe"):
             return str(sub.parent)
-        # Fallback: check direct children that look like ffmpeg packages
         for pkg_dir in winget_root.iterdir():
             if pkg_dir.is_dir() and "ffmpeg" in pkg_dir.name.lower():
-                # Search within the package directory for bin/
                 for bin_dir in pkg_dir.rglob("bin"):
                     result = _check_bin(bin_dir)
                     if result:
@@ -274,14 +263,13 @@ def _build_ydl_opts(
         opts["progress_hooks"] = [progress_hook]
 
     if throttle_kib is not None and throttle_kib > 0:
-        opts["ratelimit"] = throttle_kib * 1024  # KiB/s to bytes/s
+        opts["ratelimit"] = throttle_kib * 1024
 
     if temp_folder:
         opts["paths"] = {"home": temp_folder}
 
     resolved_ffmpeg = ffmpeg_path or _find_ffmpeg()
     if resolved_ffmpeg:
-        # yt-dlp is most reliable when given a directory, not an executable.
         opts["ffmpeg_location"] = (
             resolved_ffmpeg
             if os.path.isdir(resolved_ffmpeg)
@@ -290,6 +278,208 @@ def _build_ydl_opts(
 
     return opts
 
+
+# ---------------------------------------------------------------------------
+# Segment-level HLS download (TwitchDownloader-style)
+# ---------------------------------------------------------------------------
+
+def _extract_hls_info(url: str, opts: dict) -> dict:
+    """Use yt-dlp to get HLS info without downloading."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    if "format" in opts:
+        ydl_opts["format"] = opts["format"]
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _find_hls_format(info: dict) -> dict:
+    """Pick the best HLS (m3u8) format from extracted info."""
+    formats = info.get("formats") or []
+    hls_formats = [
+        f for f in formats
+        if f.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg")
+    ]
+    if not hls_formats:
+        raise RuntimeError("No HLS format found in video info")
+    hls_formats.sort(
+        key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
+        reverse=True,
+    )
+    return hls_formats[0]
+
+
+def _parse_m3u8(media_url: str, headers: dict) -> list[dict]:
+    """Download and parse an HLS media playlist, return list of segment dicts."""
+    r = requests.get(media_url, headers=headers, timeout=30)
+    r.raise_for_status()
+    lines = r.text.splitlines()
+
+    segments = []
+    current_duration = None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            current_duration = float(line.split(":")[1].split(",")[0])
+        elif line and not line.startswith("#") and current_duration is not None:
+            segments.append({
+                "duration": current_duration,
+                "url": urljoin(media_url, line),
+            })
+            current_duration = None
+    return segments
+
+
+def _select_segments(
+    segments: list[dict],
+    start_sec: float,
+    end_sec: float,
+) -> tuple[list[dict], float]:
+    """Select HLS segments overlapping [start_sec, end_sec).
+
+    Returns (selected_segments, offset_into_first_segment).
+    """
+    selected = []
+    pos = 0.0
+    first_offset = 0.0
+    for seg in segments:
+        seg_start = pos
+        seg_end = pos + seg["duration"]
+        if seg_end > start_sec and seg_start < end_sec:
+            if not selected:
+                first_offset = max(0.0, start_sec - seg_start)
+            selected.append(seg)
+        pos = seg_end
+        if seg_start >= end_sec:
+            break
+    if not selected:
+        raise RuntimeError(f"No HLS segments found in range {start_sec}-{end_sec}")
+    return selected, first_offset
+
+
+def _download_segments(
+    segments: list[dict],
+    headers: dict,
+    temp_dir: str,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[str]:
+    """Download HLS segment files into *temp_dir*.
+
+    Supports cancellation (via *cancel_event*) and progress reporting
+    (via *progress_hook*, called with yt-dlp-style progress dicts).
+    """
+    files = []
+    total = len(segments)
+    for i, seg in enumerate(segments):
+        # Check cancellation before each segment
+        if cancel_event and cancel_event.is_set():
+            raise CancelledError("Download cancelled by user")
+
+        path = os.path.join(temp_dir, f"{i:05d}.ts")
+        r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if cancel_event and cancel_event.is_set():
+                    raise CancelledError("Download cancelled by user")
+                if chunk:
+                    f.write(chunk)
+        files.append(path)
+
+        # Report progress
+        if progress_hook:
+            pct = int((i + 1) / total * 100)
+            progress_hook({
+                "status": "downloading",
+                "total_bytes": total,
+                "downloaded_bytes": i + 1,
+                "_percent": pct,
+                "_speed_str": "",
+                "_eta_str": "",
+            })
+    return files
+
+
+def _concat_and_trim(
+    files: list[str],
+    output_path: str,
+    offset: float,
+    duration: float,
+    ffmpeg_exe: str,
+    progress_hook: Optional[Callable] = None,
+) -> None:
+    """Losslessly concatenate segment files, then trim to exact duration."""
+    tmp_dir = os.path.dirname(files[0])
+    joined = os.path.join(tmp_dir, "joined.ts")
+    concat_txt = os.path.join(tmp_dir, "concat.txt")
+
+    with open(concat_txt, "w", encoding="utf8") as f:
+        for seg_path in files:
+            # Use forward slashes on Windows (ffmpeg concat demuxer handles them)
+            posix = seg_path.replace("\\", "/")
+            f.write(f"file '{posix}'\n")
+
+    sp.run(
+        [ffmpeg_exe, "-f", "concat", "-safe", "0", "-i", concat_txt,
+         "-c", "copy", "-y", joined],
+        check=True, capture_output=True,
+    )
+
+    sp.run(
+        [ffmpeg_exe, "-ss", str(offset), "-i", joined,
+         "-t", str(duration), "-c", "copy",
+         "-avoid_negative_ts", "make_zero", "-y", output_path],
+        check=True, capture_output=True,
+    )
+
+    # Notify completion
+    if progress_hook:
+        progress_hook({"status": "finished"})
+
+
+def _download_hls_clip(
+    url: str,
+    output_path: str,
+    start_sec: float,
+    end_sec: float,
+    opts: dict,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """Download only the HLS segments covering *start_sec*–*end_sec*.
+
+    Uses the same approach as TwitchDownloader: parse the m3u8 playlist,
+    download only the needed TS fragments, then concat + trim with ffmpeg.
+    No full VOD download — only the segments in the time range.
+
+    Supports cancellation via *cancel_event* and progress via *progress_hook*.
+    """
+    duration = end_sec - start_sec
+
+    info = _extract_hls_info(url, opts)
+    fmt = _find_hls_format(info)
+    media_url = fmt["url"]
+    headers = fmt.get("http_headers") or info.get("http_headers") or {}
+
+    segments = _parse_m3u8(media_url, headers)
+    selected, first_offset = _select_segments(segments, start_sec, end_sec)
+
+    ffmpeg_dir = opts.get("ffmpeg_location")
+    ffmpeg_exe = str(Path(ffmpeg_dir) / "ffmpeg.exe") if ffmpeg_dir else "ffmpeg"
+
+    with tempfile.TemporaryDirectory(prefix="hls_clip_") as tmpdir:
+        files = _download_segments(selected, headers, tmpdir, progress_hook, cancel_event)
+        _concat_and_trim(files, output_path, first_offset, duration, ffmpeg_exe, progress_hook)
+
+
+# ---------------------------------------------------------------------------
+# Main download entry point
+# ---------------------------------------------------------------------------
 
 def download_video_sync(
     url: str,
@@ -322,44 +512,39 @@ def download_video_sync(
     platform = detect_platform(full_url)
     is_hls = platform in ("Twitch", "Kick")
 
-    # Determine crop bounds
-    need_crop = (
+    has_crop = (
         crop_start is not None
         and crop_end is not None
         and crop_end > crop_start
     )
 
-    if need_crop and is_hls:
-        # ── HLS optimisation ──────────────────────────────────────────────
-        # download_sections on HLS (Twitch/Kick) forces yt-dlp into the
-        # FFmpeg downloader path which is known to hang on large VODs.
-        # Instead we download the full stream first, then clip with FFmpeg.
-        #
-        # 1) Download whole VOD (no sections)
-        _do_full_download(full_url, output_path, opts)
+    if has_crop and is_hls:
+        # ── HLS segment-level clip (TwitchDownloader-style) ──────────────
+        # Download ONLY the TS segments covering the time range, concat + trim.
+        _download_hls_clip(full_url, output_path, crop_start, crop_end, opts)
 
-        # 2) FFmpeg-clip the requested range into a temp file, then swap.
-        _ffmpeg_clip(output_path, crop_start, crop_end, opts)
-
-    elif need_crop:
-        # Non-HLS platform — download_sections is fine
+    elif has_crop:
+        # Non-HLS platform — yt-dlp download_sections works fine
         start = _format_ts(crop_start)
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*{start}-{end}"]
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([full_url])
+
     elif crop_start is not None and crop_end is None:
         start = _format_ts(crop_start)
         opts["download_sections"] = [f"*{start}-+{DEFAULT_CLIP_SECONDS}"]
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([full_url])
+
     elif crop_end is not None and crop_start is None:
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*-{end}"]
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([full_url])
+
     else:
-        # No crop — download the entire video
+        # No crop — let yt-dlp download the full video normally
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([full_url])
 
@@ -367,49 +552,6 @@ def download_video_sync(
         raise RuntimeError(f"Download failed: output file not found at {output_path}")
 
     return output_path
-
-
-def _do_full_download(url: str, output_path: str, opts: dict) -> None:
-    """Download the full VOD without any section cropping."""
-    clean = {k: v for k, v in opts.items() if k != "download_sections"}
-    with yt_dlp.YoutubeDL(clean) as ydl:
-        ydl.download([url])
-
-
-def _ffmpeg_clip(full_path: str, start: float, end: float, opts: dict) -> None:
-    """Use ffmpeg to extract *start*-*end* from *full_path* in-place.
-
-    The clipped file replaces the original.
-    """
-    import subprocess as sp
-    import tempfile
-
-    ffmpeg_dir = opts.get("ffmpeg_location")
-    ffmpeg_exe = str(Path(ffmpeg_dir) / "ffmpeg.exe") if ffmpeg_dir else "ffmpeg"
-
-    tmp = tempfile.mktemp(suffix=".mp4", prefix="clip_")
-    duration = end - start
-
-    cmd = [
-        ffmpeg_exe,
-        "-ss", str(start),
-        "-i", full_path,
-        "-t", str(duration),
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        "-y",
-        tmp,
-    ]
-    try:
-        sp.run(cmd, check=True, capture_output=True, timeout=600)
-    except sp.CalledProcessError as exc:
-        raise RuntimeError(
-            f"FFmpeg clipping failed (start={start}, end={end}):\n"
-            f"  stderr: {exc.stderr.decode(errors='replace')[:500]}"
-        ) from exc
-
-    # Swap clipped file with original
-    os.replace(tmp, full_path)
 
 
 def _format_ts(seconds: float) -> str:
