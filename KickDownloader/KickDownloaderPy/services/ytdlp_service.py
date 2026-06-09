@@ -15,6 +15,10 @@ class CancelledError(Exception):
     pass
 
 
+# Default section duration when no crop params given (1 hour = 3600 seconds)
+DEFAULT_CLIP_SECONDS = 3600
+
+
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
     if "twitch.tv" in url_lower:
@@ -250,17 +254,20 @@ def download_video_sync(
         ffmpeg_path=settings_mgr.get().ffmpeg_path if settings_mgr is not None else None,
     )
 
-    # Download section: crop_start to crop_end, or 20-second preview from crop_start
+    # Download section: defaults to 1 hour (3600s) from start.
+    # crop_start/crop_end override this to a custom range.
     if crop_start and crop_start > 0 and crop_end and crop_end > crop_start:
         start = _format_ts(crop_start)
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*{start}-{end}"]
     elif crop_start and crop_start > 0:
         start = _format_ts(crop_start)
-        opts["download_sections"] = [f"*{start}-+20"]
+        opts["download_sections"] = [f"*{start}-+{DEFAULT_CLIP_SECONDS}"]
     elif crop_end and crop_end > 0:
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*-{end}"]
+    else:
+        opts["download_sections"] = [f"*0-+{DEFAULT_CLIP_SECONDS}"]
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([full_url])
