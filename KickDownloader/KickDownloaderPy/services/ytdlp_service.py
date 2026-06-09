@@ -115,6 +115,65 @@ def _dir_size(path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ffmpeg auto-detection (Windows, macOS, Linux)
+# ---------------------------------------------------------------------------
+
+def _find_ffmpeg() -> Optional[str]:
+    """Locate ffmpeg on the system — returns the BIN DIRECTORY, not the exe.
+
+    yt-dlp's ``ffmpeg_location`` option is most reliable when given the
+    *directory* that contains *both* ``ffmpeg.exe`` and ``ffprobe.exe``,
+    rather than the executable file itself.
+    """
+    # 1. Check PATH
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return str(Path(exe).parent)
+
+    def _check_bin(parent: Path) -> Optional[str]:
+        """If *parent* contains ffmpeg.exe or ffmpeg, return *parent* as str."""
+        if not parent.is_dir():
+            return None
+        for f in parent.iterdir():
+            if f.name.lower() in ("ffmpeg.exe", "ffmpeg"):
+                return str(parent)
+        return None
+
+    # 2. Common install locations (Windows)
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "ffmpeg" / "bin",
+        Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "FFmpeg" / "bin",
+        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "ffmpeg" / "bin",
+        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "FFmpeg" / "bin",
+        Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin",
+        Path("/usr/bin"),
+        Path("/usr/local/bin"),
+    ]
+
+    for c in candidates:
+        result = _check_bin(c)
+        if result:
+            return result
+
+    # 3. winget installs into a versioned subfolder under Packages
+    winget_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    if winget_root.is_dir():
+        # Look for any subdirectory tree that contains ffmpeg.exe
+        for sub in winget_root.rglob("ffmpeg.exe"):
+            return str(sub.parent)
+        # Fallback: check direct children that look like ffmpeg packages
+        for pkg_dir in winget_root.iterdir():
+            if pkg_dir.is_dir() and "ffmpeg" in pkg_dir.name.lower():
+                # Search within the package directory for bin/
+                for bin_dir in pkg_dir.rglob("bin"):
+                    result = _check_bin(bin_dir)
+                    if result:
+                        return result
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core service
 # ---------------------------------------------------------------------------
 
@@ -220,8 +279,14 @@ def _build_ydl_opts(
     if temp_folder:
         opts["paths"] = {"home": temp_folder}
 
-    if ffmpeg_path:
-        opts["ffmpeg_location"] = ffmpeg_path
+    resolved_ffmpeg = ffmpeg_path or _find_ffmpeg()
+    if resolved_ffmpeg:
+        # yt-dlp is most reliable when given a directory, not an executable.
+        opts["ffmpeg_location"] = (
+            resolved_ffmpeg
+            if os.path.isdir(resolved_ffmpeg)
+            else os.path.dirname(resolved_ffmpeg)
+        )
 
     return opts
 
@@ -254,28 +319,97 @@ def download_video_sync(
         ffmpeg_path=settings_mgr.get().ffmpeg_path if settings_mgr is not None else None,
     )
 
-    # Download section: defaults to 1 hour (3600s) from start.
-    # crop_start/crop_end override this to a custom range.
-    if crop_start and crop_start > 0 and crop_end and crop_end > crop_start:
+    platform = detect_platform(full_url)
+    is_hls = platform in ("Twitch", "Kick")
+
+    # Determine crop bounds
+    need_crop = (
+        crop_start is not None
+        and crop_end is not None
+        and crop_end > crop_start
+    )
+
+    if need_crop and is_hls:
+        # ── HLS optimisation ──────────────────────────────────────────────
+        # download_sections on HLS (Twitch/Kick) forces yt-dlp into the
+        # FFmpeg downloader path which is known to hang on large VODs.
+        # Instead we download the full stream first, then clip with FFmpeg.
+        #
+        # 1) Download whole VOD (no sections)
+        _do_full_download(full_url, output_path, opts)
+
+        # 2) FFmpeg-clip the requested range into a temp file, then swap.
+        _ffmpeg_clip(output_path, crop_start, crop_end, opts)
+
+    elif need_crop:
+        # Non-HLS platform — download_sections is fine
         start = _format_ts(crop_start)
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*{start}-{end}"]
-    elif crop_start and crop_start > 0:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([full_url])
+    elif crop_start is not None and crop_end is None:
         start = _format_ts(crop_start)
         opts["download_sections"] = [f"*{start}-+{DEFAULT_CLIP_SECONDS}"]
-    elif crop_end and crop_end > 0:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([full_url])
+    elif crop_end is not None and crop_start is None:
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*-{end}"]
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([full_url])
     else:
-        opts["download_sections"] = [f"*0-+{DEFAULT_CLIP_SECONDS}"]
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([full_url])
+        # No crop — download the entire video
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([full_url])
 
     if not os.path.isfile(output_path):
         raise RuntimeError(f"Download failed: output file not found at {output_path}")
 
     return output_path
+
+
+def _do_full_download(url: str, output_path: str, opts: dict) -> None:
+    """Download the full VOD without any section cropping."""
+    clean = {k: v for k, v in opts.items() if k != "download_sections"}
+    with yt_dlp.YoutubeDL(clean) as ydl:
+        ydl.download([url])
+
+
+def _ffmpeg_clip(full_path: str, start: float, end: float, opts: dict) -> None:
+    """Use ffmpeg to extract *start*-*end* from *full_path* in-place.
+
+    The clipped file replaces the original.
+    """
+    import subprocess as sp
+    import tempfile
+
+    ffmpeg_dir = opts.get("ffmpeg_location")
+    ffmpeg_exe = str(Path(ffmpeg_dir) / "ffmpeg.exe") if ffmpeg_dir else "ffmpeg"
+
+    tmp = tempfile.mktemp(suffix=".mp4", prefix="clip_")
+    duration = end - start
+
+    cmd = [
+        ffmpeg_exe,
+        "-ss", str(start),
+        "-i", full_path,
+        "-t", str(duration),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-y",
+        tmp,
+    ]
+    try:
+        sp.run(cmd, check=True, capture_output=True, timeout=600)
+    except sp.CalledProcessError as exc:
+        raise RuntimeError(
+            f"FFmpeg clipping failed (start={start}, end={end}):\n"
+            f"  stderr: {exc.stderr.decode(errors='replace')[:500]}"
+        ) from exc
+
+    # Swap clipped file with original
+    os.replace(tmp, full_path)
 
 
 def _format_ts(seconds: float) -> str:

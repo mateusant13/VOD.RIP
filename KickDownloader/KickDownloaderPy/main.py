@@ -80,16 +80,27 @@ async def update_settings(update: SettingsUpdate):
 async def channel_videos(url: str, limit: int = 20):
     url = unquote(url)
     try:
+        # Auto-prepend protocol if missing (e.g. "twitch.tv/asmongold" -> "https://twitch.tv/asmongold")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
         platform = detect_platform(url)
+
+        if platform == "Unknown":
+            raise ValueError(
+                f"Could not detect platform. Enter a full channel URL like:\n"
+                f"  • https://www.twitch.tv/channelname\n"
+                f"  • https://kick.com/channelname"
+            )
 
         # Build the channel videos URL
         if platform == "Twitch":
             m = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", url)
-            channel = m.group(1) if m else url.strip()
+            channel = m.group(1) if m else url.strip().rstrip("/").split("/")[-1]
             videos_url = f"https://www.twitch.tv/{channel}/videos"
         elif platform == "Kick":
             m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", url)
-            channel = m.group(1) if m else url.strip()
+            channel = m.group(1) if m else url.strip().rstrip("/").split("/")[-1]
             videos_url = f"https://kick.com/{channel}/videos"
         else:
             raise ValueError(f"Could not parse channel from URL: {url}")
@@ -130,8 +141,13 @@ async def channel_videos(url: str, limit: int = 20):
             })
 
         return {"videos": videos, "channel": channel, "platform": platform}
-    except Exception as e:
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        err_msg = str(e)
+        if "Invalid argument" in err_msg or "Errno 22" in err_msg:
+            err_msg = f"Could not fetch videos for this channel. The platform may block automated browsing ({platform if 'platform' in dir() else 'Unknown'})."
+        raise HTTPException(status_code=400, detail=err_msg)
 
 
 # --- Video Info ---
@@ -188,6 +204,8 @@ async def download_clip(req: DownloadRequest):
         output_file=output,
         quality=req.quality,
         oauth=req.oauth or opts.oauth,
+        crop_start=req.crop_start,
+        crop_end=req.crop_end,
     )
     return {"download_id": download_id, "status": "started"}
 

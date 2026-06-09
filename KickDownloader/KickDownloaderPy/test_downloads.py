@@ -57,40 +57,74 @@ def fmt_duration(sec: float) -> str:
 # Test modes
 # ---------------------------------------------------------------------------
 
+def _find_ffmpeg() -> str | None:
+    """Locate ffmpeg on the system — returns the BIN DIRECTORY, not the exe."""
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return str(Path(exe).parent)
+    # Check common Windows winget install location
+    local = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    if local.is_dir():
+        for sub in local.rglob("ffmpeg.exe"):
+            return str(sub.parent)
+    return None
+
+
 def test_direct(url: str, label: str) -> dict:
     """Download a 20-second clip using yt-dlp directly (no server needed)."""
     import yt_dlp
+    import subprocess as sp
 
     tmp = tempfile.mktemp(suffix=".mp4", prefix=f"test_{label}_")
     result = {"platform": label, "url": url, "status": "FAIL", "file": None, "size": 0, "error": None}
 
-    print(f"\n  [{label}] Downloading 20s clip...", end=" ", flush=True)
+    print(f"\n  [{label}] Downloading (will clip to {TEST_CLIP_DURATION}s)...", end=" ", flush=True)
 
     start = time.time()
 
+    ffmpeg_dir = _find_ffmpeg()
+
+    # Step 1: Download full VOD (no download_sections — unreliable on HLS)
     ydl_opts = {
         "outtmpl": tmp,
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "format": "best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "download_sections": [f"*0-+{TEST_CLIP_DURATION}"],
     }
+    if ffmpeg_dir:
+        ydl_opts["ffmpeg_location"] = ffmpeg_dir
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        elapsed = time.time() - start
-        size = os.path.getsize(tmp)
+        # Step 2: Clip to first TEST_CLIP_DURATION seconds with ffmpeg
+        if os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+            clipped = tempfile.mktemp(suffix=".mp4", prefix=f"clip_{label}_")
+            ffmpeg_exe = (
+                str(Path(ffmpeg_dir) / "ffmpeg.exe")
+                if ffmpeg_dir else "ffmpeg"
+            )
+            sp.run(
+                [ffmpeg_exe, "-ss", "0", "-i", tmp,
+                 "-t", str(TEST_CLIP_DURATION),
+                 "-c", "copy",
+                 "-avoid_negative_ts", "make_zero",
+                 "-y", clipped],
+                check=True, capture_output=True, timeout=120,
+            )
+            os.replace(clipped, tmp)
 
+        size = os.path.getsize(tmp)
         result["status"] = "OK"
         result["file"] = tmp
         result["size"] = size
-        result["elapsed"] = elapsed
+        result["elapsed"] = time.time() - start
 
-        print(f"OK ({fmt_bytes(size)}, {elapsed:.1f}s)")
+        print(f"OK ({fmt_bytes(size)}, {result['elapsed']:.1f}s)")
 
     except Exception as e:
         result["error"] = str(e)
