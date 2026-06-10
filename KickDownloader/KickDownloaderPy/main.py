@@ -497,6 +497,40 @@ def _looks_like_clip_entry(entry: dict) -> bool:
 
 def _filter_clip_entries(entries: List[dict]) -> List[dict]:
     return [e for e in entries if _looks_like_clip_entry(e)]
+
+
+def _resolve_channel_slug(raw: str) -> str:
+    """Parse a channel login/slug from a bare name or Kick/Twitch URL."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Could not parse a channel name from the input.")
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    platform_hint = detect_platform(raw)
+    channel: Optional[str] = None
+    if platform_hint == "Twitch":
+        m = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", raw)
+        channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
+    elif platform_hint == "Kick":
+        m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", raw)
+        channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
+    else:
+        channel = raw.strip().rstrip("/").split("/")[-1] or raw.strip()
+        if channel.startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+            channel = urlparse(channel).path.strip("/").split("/")[0] or channel
+    if not channel:
+        raise ValueError("Could not parse a channel name from the input.")
+    return channel
+
+
+def _parse_wanted_platforms(platforms: str) -> List[str]:
+    if not platforms or not platforms.strip():
+        return ["Twitch", "Kick"]
+    wanted = [p.strip() for p in platforms.split(",") if p.strip()]
+    return wanted
+
+
 def _parse_video_date(value) -> Optional[datetime]:
     """Best-effort parse of a video's `created_at` into an aware datetime.
     Returns None when the field is missing or unparseable, so the caller
@@ -533,81 +567,33 @@ async def channel_videos(
     limit: int = CHANNEL_LIMIT_MAX,
     days: int = CHANNEL_DAYS_DEFAULT,
     platforms: str = "Kick,Twitch",
-    content: str = "vods",
 ):
-    """Fetch VODs for a channel across one or more platforms.
-    `platforms` is a comma-separated list. The endpoint always returns the
-    union of results across every requested platform; the UI is expected
-    to keep the full list in memory and apply per-platform filters
-    client-side. `days` (default 14) caps results to the last N days.
-    `limit` clamps the per-platform upstream query.
-    Each video entry includes a `url` (clickable VOD link) and a
-    `created_at` (best-effort date string) for the UI to show.
-    """
-    url = unquote(url)
-    raw = url.strip()
+    """Fetch archive VODs for a channel. Use ``/api/channel/clips`` for clips."""
+    raw = unquote(url).strip()
     try:
-        # Auto-prepend protocol if missing (e.g. "twitch.tv/asmongold" -> "https://twitch.tv/asmongold")
-        if not raw.startswith(("http://", "https://")):
-            raw = "https://" + raw
-        # Parse out the channel slug and any platform hint from the URL.
-        platform_hint = detect_platform(raw)
-        channel: Optional[str] = None
-        if platform_hint == "Twitch":
-            m = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", raw)
-            channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
-        elif platform_hint == "Kick":
-            m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", raw)
-            channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
-        else:
-            # No platform hint — treat the last path segment (or whole input)
-            # as a channel name.
-            channel = raw.strip().rstrip("/").split("/")[-1] or raw.strip()
-            # Strip a protocol prefix in case the user typed "https://titiltei".
-            if channel.startswith(("http://", "https://")):
-                from urllib.parse import urlparse
-                channel = urlparse(channel).path.strip("/").split("/")[0] or channel
-        if not channel:
-            raise ValueError("Could not parse a channel name from the input.")
-        # Decide which platforms to query. The filter list is always honored
-        # (the UI sends the full set on first browse and re-sends the same
-        # set on every filter toggle — but it never resizes the result
-        # server-side, since that would defeat the "cache and filter
-        # client-side" model).
-        if not platforms or not platforms.strip():
-            wanted = ["Twitch", "Kick"]
-        else:
-            wanted = [p.strip() for p in platforms.split(",") if p.strip()]
+        channel = _resolve_channel_slug(raw)
+        wanted = _parse_wanted_platforms(platforms)
         if not wanted:
             return {
                 "videos": [],
                 "channel": channel,
                 "platforms": [],
+                "content": "vods",
+                "days": days,
                 "per_platform_errors": {},
             }
-        content_kind = (content or "vods").strip().lower()
-        clips_only = content_kind in ("clips", "clip", "only_clips")
-        # Clamp parameters so a hostile client can't ask for 1M VODs.
-        if clips_only:
-            limit = CHANNEL_CLIP_LIMIT
-            days = 0
-        else:
-            limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
-            days = max(0, min(int(days), 365))
+        limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
+        days = max(0, min(int(days), 365))
         cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
         per_platform_errors: Dict[str, str] = {}
         all_videos: List[dict] = []
         loop = asyncio.get_running_loop()
+
         async def _fetch_twitch() -> None:
             try:
-                if clips_only:
-                    vids = await loop.run_in_executor(
-                        INFO_EXECUTOR, twitch_list_channel_clips_sync, channel, CHANNEL_CLIP_LIMIT
-                    )
-                else:
-                    vids = await loop.run_in_executor(
-                        INFO_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
-                    )
+                vids = await loop.run_in_executor(
+                    INFO_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
+                )
             except Exception as e:
                 per_platform_errors["Twitch"] = _format_platform_error(e)
                 return
@@ -623,20 +609,15 @@ async def channel_videos(
                     "thumbnail_url": v.get("thumbnail_url"),
                     "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
                     "channel": channel,
-                    "content_kind": v.get("content_kind") or ("clip" if clips_only else "vod"),
+                    "content_kind": "vod",
                 })
+
         async def _fetch_kick() -> None:
             videos_url = f"https://kick.com/{channel}/videos"
             try:
-                if clips_only:
-                    vids = await loop.run_in_executor(
-                        INFO_EXECUTOR, kick_list_channel_clips_sync,
-                        f"https://kick.com/{channel}/clips", CHANNEL_CLIP_LIMIT,
-                    )
-                else:
-                    vids = await loop.run_in_executor(
-                        INFO_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
-                    )
+                vids = await loop.run_in_executor(
+                    INFO_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
+                )
             except Exception as e:
                 per_platform_errors["Kick"] = _format_platform_error(e)
                 return
@@ -650,13 +631,11 @@ async def channel_videos(
                     "created_at": v.get("created_at"),
                     "views": v.get("views"),
                     "thumbnail_url": v.get("thumbnail"),
-                    "url": v.get("url") or (
-                        f"https://kick.com/{channel}/clips/{v['id']}"
-                        if clips_only else f"https://kick.com/{channel}/videos/{v['id']}"
-                    ),
+                    "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
                     "channel": channel,
-                    "content_kind": v.get("content_kind") or ("clip" if clips_only else "vod"),
+                    "content_kind": "vod",
                 })
+
         tasks: List[asyncio.Task] = []
         if "Kick" in wanted:
             tasks.append(asyncio.create_task(_fetch_kick()))
@@ -664,41 +643,137 @@ async def channel_videos(
             tasks.append(asyncio.create_task(_fetch_twitch()))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        # Apply the date window, then sort newest-first across platforms.
-        # Entries with no parseable date are kept (so an unparseable Kick
-        # VOD isn't silently dropped) but are sorted to the end.
-        if cutoff is not None and not clips_only:
+
+        if cutoff is not None:
             filtered: List[dict] = []
             for v in all_videos:
                 dt = _parse_video_date(v.get("created_at"))
                 if dt is None or dt >= cutoff:
                     filtered.append(v)
             all_videos = filtered
-        if clips_only:
-            all_videos = _filter_clip_entries(all_videos)
-            all_videos.sort(key=lambda v: -(v.get("views") or 0))
-        else:
-            def _sort_key(v: dict) -> tuple:
-                dt = _parse_video_date(v.get("created_at"))
-                ts = -dt.timestamp() if dt else 0.0
-                return (ts, v.get("platform") or "")
-            all_videos.sort(key=_sort_key)
-        # Normalize error messages: cap at 200 chars.
+
+        def _sort_key(v: dict) -> tuple:
+            dt = _parse_video_date(v.get("created_at"))
+            ts = -dt.timestamp() if dt else 0.0
+            return (ts, v.get("platform") or "")
+
+        all_videos.sort(key=_sort_key)
         for k, v in list(per_platform_errors.items()):
             per_platform_errors[k] = _normalize_err(v)
         return {
             "videos": all_videos,
             "channel": channel,
             "platforms": wanted,
-            "content": "clips" if clips_only else "vods",
+            "content": "vods",
             "days": days,
             "per_platform_errors": per_platform_errors,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        err_msg = str(e)
-        raise HTTPException(status_code=400, detail=err_msg)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/channel/clips")
+async def channel_clips(
+    url: str,
+    platforms: str = "Kick,Twitch",
+    limit: int = CHANNEL_CLIP_LIMIT,
+):
+    """Fetch recent clips for a channel (Kick ``/clips`` API, Twitch ``clips?range=7d``).
+
+    Returns the last *limit* clips per platform (max 10), sorted by views desc.
+    Only entries <=60s with clip URLs are included.
+    """
+    raw = unquote(url).strip()
+    try:
+        channel = _resolve_channel_slug(raw)
+        wanted = _parse_wanted_platforms(platforms)
+        if not wanted:
+            return {
+                "clips": [],
+                "channel": channel,
+                "platforms": [],
+                "content": "clips",
+                "per_platform_errors": {},
+            }
+        limit = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+        per_platform_errors: Dict[str, str] = {}
+        all_clips: List[dict] = []
+        loop = asyncio.get_running_loop()
+
+        async def _fetch_twitch() -> None:
+            try:
+                vids = await loop.run_in_executor(
+                    INFO_EXECUTOR, twitch_list_channel_clips_sync, channel, limit
+                )
+            except Exception as e:
+                per_platform_errors["Twitch"] = _format_platform_error(e)
+                return
+            for v in vids:
+                all_clips.append({
+                    "id": v["id"],
+                    "platform": "Twitch",
+                    "title": v.get("title") or "Untitled",
+                    "duration": v.get("duration"),
+                    "duration_string": v.get("duration_string"),
+                    "created_at": v.get("created_at"),
+                    "views": v.get("views"),
+                    "thumbnail_url": v.get("thumbnail_url"),
+                    "url": v.get("url") or f"https://clips.twitch.tv/{v['id']}",
+                    "channel": channel,
+                    "content_kind": "clip",
+                })
+
+        async def _fetch_kick() -> None:
+            try:
+                vids = await loop.run_in_executor(
+                    INFO_EXECUTOR,
+                    kick_list_channel_clips_sync,
+                    f"https://kick.com/{channel}/clips",
+                    limit,
+                )
+            except Exception as e:
+                per_platform_errors["Kick"] = _format_platform_error(e)
+                return
+            for v in vids:
+                all_clips.append({
+                    "id": v["id"],
+                    "platform": "Kick",
+                    "title": v.get("title") or "Untitled",
+                    "duration": v.get("duration"),
+                    "duration_string": v.get("duration_string"),
+                    "created_at": v.get("created_at"),
+                    "views": v.get("views"),
+                    "thumbnail_url": v.get("thumbnail"),
+                    "url": v.get("url") or f"https://kick.com/{channel}/clips/{v['id']}",
+                    "channel": channel,
+                    "content_kind": "clip",
+                })
+
+        tasks: List[asyncio.Task] = []
+        if "Kick" in wanted:
+            tasks.append(asyncio.create_task(_fetch_kick()))
+        if "Twitch" in wanted:
+            tasks.append(asyncio.create_task(_fetch_twitch()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_clips = _filter_clip_entries(all_clips)
+        all_clips.sort(key=lambda v: -(v.get("views") or 0))
+        for k, v in list(per_platform_errors.items()):
+            per_platform_errors[k] = _normalize_err(v)
+        return {
+            "clips": all_clips,
+            "channel": channel,
+            "platforms": wanted,
+            "content": "clips",
+            "per_platform_errors": per_platform_errors,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 def _explain_oserror(e: OSError) -> str:
     """Turn a raw OSError into something a human can act on.
     The most common offender is `[Errno 22] Invalid argument` on

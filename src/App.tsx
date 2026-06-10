@@ -89,10 +89,13 @@ interface SavedChannel {
   displayName: string;
   kickSlug: string;
   twitchSlug: string;
-  videos: ChannelVideo[];
+  vodVideos: ChannelVideo[];
+  clipVideos: ChannelVideo[];
   errors: Record<string, string>;
   updatedAt: string;
   loading?: boolean;
+  /** Legacy — migrated to vodVideos / clipVideos on load */
+  videos?: ChannelVideo[];
 }
 
 type Tab = 'url' | 'channels' | 'queue' | 'settings';
@@ -990,7 +993,65 @@ function maxStreamQualityLabel(
 const CHANNEL_INITIAL_VISIBLE = 5;
 const CHANNEL_EXPAND_STEP = 10;
 const CHANNEL_FETCH_LIMIT = 100;
+/** Cheap head fetch on page load — merge only ids not already cached. */
+const CHANNEL_INCREMENTAL_LIMIT = 25;
 const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
+const PANEL_LAYOUT_STORAGE_KEY = 'vodrip_panel_layout';
+
+interface PersistedPanelLayout {
+  previewPanelWidth: number;
+  urlAside: PanelSize;
+  main: PanelSize;
+}
+
+function clampLayoutNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function clampStoredPanelSize(value: unknown, fallback: PanelSize): PanelSize {
+  if (!value || typeof value !== 'object') return fallback;
+  const o = value as { w?: unknown; h?: unknown };
+  const maxH = typeof window !== 'undefined' ? panelMaxHeight() : fallback.h;
+  return {
+    w: clampLayoutNumber(o.w, PANEL_MIN.w, PANEL_MAX_W, fallback.w),
+    h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
+  };
+}
+
+function loadPanelLayout(): PersistedPanelLayout {
+  const fallback: PersistedPanelLayout = {
+    previewPanelWidth: PREVIEW_PANEL_DEFAULT_W,
+    urlAside: URL_ASIDE_PANEL_DEFAULT,
+    main: MAIN_PANEL_DEFAULT,
+  };
+  try {
+    const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<PersistedPanelLayout>;
+    return {
+      previewPanelWidth: clampLayoutNumber(
+        parsed.previewPanelWidth,
+        PREVIEW_PANEL_MIN_W,
+        PANEL_MAX_W,
+        PREVIEW_PANEL_DEFAULT_W,
+      ),
+      urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
+      main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function persistPanelLayout(layout: PersistedPanelLayout) {
+  try {
+    localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+  } catch {
+    /* quota / private mode */
+  }
+}
 const MAX_SAVED_CHANNELS = 10;
 /** Highest quality from API list, or source when none listed (Kick). */
 function bestAvailableQuality(info: VideoInfo): string {
@@ -1058,14 +1119,29 @@ function platformCardShadow(platform: 'kick' | 'twitch' | null, compact = false)
     : 'shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF]';
 }
 
+function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
+  const { videos: legacy, ...rest } = ch;
+  let vodVideos = ch.vodVideos;
+  let clipVideos = ch.clipVideos;
+  if (vodVideos === undefined && clipVideos === undefined && Array.isArray(legacy)) {
+    vodVideos = legacy.filter((v) => !isLikelyClip(v));
+    clipVideos = legacy.filter(isLikelyClip);
+  }
+  return {
+    ...rest,
+    vodVideos: vodVideos ?? [],
+    clipVideos: clipVideos ?? [],
+    loading: false,
+  };
+}
+
 function loadSavedChannels(): SavedChannel[] {
   try {
     const raw = localStorage.getItem(CHANNELS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    // Never restore in-flight loading — a refresh mid-fetch would spin forever.
-    return parsed.map((ch) => ({ ...ch, loading: false }));
+    return parsed.map((ch) => normalizeSavedChannel(ch as SavedChannel));
   } catch {
     return [];
   }
@@ -1166,10 +1242,30 @@ function isLikelyClip(v: ChannelVideo): boolean {
   return false;
 }
 
-function filterChannelVideosByContent(videos: ChannelVideo[], mode: 'vods' | 'clips'): ChannelVideo[] {
-  return mode === 'clips'
-    ? videos.filter(isLikelyClip)
-    : videos.filter((v) => !isLikelyClip(v));
+function channelVideoKey(v: ChannelVideo): string {
+  return `${v.platform}:${v.id}`;
+}
+
+function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null }): ChannelVideo {
+  return {
+    ...v,
+    thumbnail_url: v.thumbnail_url ?? v.thumbnail ?? null,
+  };
+}
+
+/** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
+function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
+  const map = new Map<string, ChannelVideo>();
+  for (const v of incoming.map(mapApiChannelItem)) {
+    map.set(channelVideoKey(v), v);
+  }
+  for (const v of existing) {
+    const k = channelVideoKey(v);
+    if (!map.has(k)) map.set(k, v);
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
+  );
 }
 
 function buildVodUrl(v: ChannelVideo): string {
@@ -1252,18 +1348,28 @@ export default function App() {
   const explorePauseMapRef = useRef(new Map<string, () => void>());
   const exploreVolumeMenusRef = useRef(new Set<string>());
   const exploreZCounterRef = useRef(0);
-  const [previewPanelWidth, setPreviewPanelWidth] = useState(PREVIEW_PANEL_DEFAULT_W);
+  const [initialPanelLayout] = useState(loadPanelLayout);
+  const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
-  const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(URL_ASIDE_PANEL_DEFAULT);
-  const [mainPanelSize, setMainPanelSize] = useState(MAIN_PANEL_DEFAULT);
-  const previewPanelWidthRef = useRef(PREVIEW_PANEL_DEFAULT_W);
+  const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(initialPanelLayout.urlAside);
+  const [mainPanelSize, setMainPanelSize] = useState(initialPanelLayout.main);
+  const previewPanelWidthRef = useRef(initialPanelLayout.previewPanelWidth);
   const previewVideoAspectRef = useRef(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const previewChromeHRef = useRef(PREVIEW_PANEL_CHROME_H_EST);
-  const urlAsidePanelSizeRef = useRef(URL_ASIDE_PANEL_DEFAULT);
-  const mainPanelSizeRef = useRef(MAIN_PANEL_DEFAULT);
+  const urlAsidePanelSizeRef = useRef(initialPanelLayout.urlAside);
+  const mainPanelSizeRef = useRef(initialPanelLayout.main);
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
+
+  // Persist main layout panels (preview / URL aside / main card) — not channel explore popups.
+  useEffect(() => {
+    persistPanelLayout({
+      previewPanelWidth,
+      urlAside: urlAsidePanelSize,
+      main: mainPanelSize,
+    });
+  }, [previewPanelWidth, urlAsidePanelSize, mainPanelSize]);
 
   // Queue
   const [activeDownloads, setActiveDownloads] = useState<DownloadState[]>([]);
@@ -1294,21 +1400,20 @@ export default function App() {
     [savedChannels, selectedChannelId],
   );
 
-  const allChannelVideos = selectedChannel?.videos ?? [];
+  const allChannelVideos = useMemo(() => {
+    if (!selectedChannel) return [];
+    return channelContentFilter === 'clips'
+      ? (selectedChannel.clipVideos ?? [])
+      : (selectedChannel.vodVideos ?? []);
+  }, [selectedChannel, channelContentFilter]);
 
   const kickChannelVideos = useMemo(
-    () => filterChannelVideosByContent(
-      allChannelVideos.filter((v) => v.platform === 'Kick'),
-      channelContentFilter,
-    ),
-    [allChannelVideos, channelContentFilter],
+    () => allChannelVideos.filter((v) => v.platform === 'Kick'),
+    [allChannelVideos],
   );
   const twitchChannelVideos = useMemo(
-    () => filterChannelVideosByContent(
-      allChannelVideos.filter((v) => v.platform === 'Twitch'),
-      channelContentFilter,
-    ),
-    [allChannelVideos, channelContentFilter],
+    () => allChannelVideos.filter((v) => v.platform === 'Twitch'),
+    [allChannelVideos],
   );
 
   const kickBrowseLoading = selectedChannel?.loading ?? false;
@@ -2272,12 +2377,20 @@ export default function App() {
 
   // ── Channel browsing (localStorage) ──
 
-  type ChannelResponse = {
+  type ChannelVodsResponse = {
     videos: ChannelVideo[];
     channel: string;
     platforms: string[];
-    content?: 'vods' | 'clips';
+    content?: 'vods';
     days: number;
+    per_platform_errors?: Record<string, string>;
+  };
+
+  type ChannelClipsResponse = {
+    clips: ChannelVideo[];
+    channel: string;
+    platforms: string[];
+    content?: 'clips';
     per_platform_errors?: Record<string, string>;
   };
 
@@ -2293,60 +2406,118 @@ export default function App() {
     channelId: string,
     channelOverride?: SavedChannel,
     contentMode?: 'vods' | 'clips',
+    opts?: { incremental?: boolean },
   ) => {
     const ch = channelOverride ?? savedChannels.find((c) => c.id === channelId);
     if (!ch) return;
     const mode = contentMode ?? channelContentFilter;
-    updateChannel(channelId, { loading: true, videos: [] });
-    setChannelsError(null);
-    setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
-    setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+    const incremental = opts?.incremental ?? false;
 
-    const errs: Record<string, string> = {};
-    const merged: ChannelVideo[] = [];
+    if (!incremental) {
+      updateChannel(channelId, { loading: true });
+      setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+      setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+    }
+    if (!incremental) setChannelsError(null);
+
+    const errs: Record<string, string> = { ...ch.errors };
+    const incoming: ChannelVideo[] = [];
 
     try {
-      const fetchOne = async (platform: 'Kick' | 'Twitch', slug: string) => {
-        const contentQs = mode === 'clips' ? '&content=clips' : '';
-        const qs = `url=${encodeURIComponent(slug)}&limit=${CHANNEL_FETCH_LIMIT}&days=14&platforms=${encodeURIComponent(platform)}${contentQs}`;
-        try {
-          const data = await apiGet<ChannelResponse>(`/api/channel/videos?${qs}`);
-          if (data.content && data.content !== mode) {
-            errs[platform] = `Expected ${mode}, got ${data.content} — restart API (npm run dev:api)`;
-            return;
+      if (mode === 'clips') {
+        const fetchClips = async (platform: 'Kick' | 'Twitch', slug: string) => {
+          const qs = `url=${encodeURIComponent(slug)}&platforms=${encodeURIComponent(platform)}&limit=10`;
+          try {
+            const data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${qs}`);
+            if (data.content && data.content !== 'clips') {
+              errs[platform] = 'Clips API unavailable — restart API (npm run dev:api)';
+              return;
+            }
+            incoming.push(...(data.clips ?? []).map(mapApiChannelItem));
+            const pe = data.per_platform_errors?.[platform];
+            if (pe) errs[platform] = pe;
+          } catch (err: any) {
+            errs[platform] = err.message || `Failed to fetch ${platform} clips`;
           }
-          merged.push(...filterChannelVideosByContent(data.videos, mode));
-          const pe = data.per_platform_errors?.[platform];
-          if (pe) errs[platform] = pe;
-        } catch (err: any) {
-          errs[platform] = err.message || `Failed to fetch ${platform}`;
-        }
-      };
-
-      await Promise.all([
-        fetchOne('Kick', ch.kickSlug),
-        fetchOne('Twitch', ch.twitchSlug),
-      ]);
-
-      updateChannel(channelId, {
-        videos: merged,
-        errors: errs,
-        loading: false,
-        updatedAt: new Date().toISOString(),
-      });
+        };
+        await Promise.all([
+          fetchClips('Kick', ch.kickSlug),
+          fetchClips('Twitch', ch.twitchSlug),
+        ]);
+        const clipVideos = incoming
+          .filter(isLikelyClip)
+          .sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
+        updateChannel(channelId, {
+          clipVideos,
+          errors: errs,
+          loading: false,
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
+        const fetchVods = async (platform: 'Kick' | 'Twitch', slug: string) => {
+          const qs = `url=${encodeURIComponent(slug)}&limit=${limit}&days=14&platforms=${encodeURIComponent(platform)}`;
+          try {
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${qs}`);
+            incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
+            const pe = data.per_platform_errors?.[platform];
+            if (pe) errs[platform] = pe;
+          } catch (err: any) {
+            errs[platform] = err.message || `Failed to fetch ${platform} VODs`;
+          }
+        };
+        await Promise.all([
+          fetchVods('Kick', ch.kickSlug),
+          fetchVods('Twitch', ch.twitchSlug),
+        ]);
+        const vodVideos = mergeVodLists(ch.vodVideos ?? [], incoming);
+        updateChannel(channelId, {
+          vodVideos,
+          errors: errs,
+          loading: false,
+          updatedAt: new Date().toISOString(),
+        });
+      }
 
       const errKeys = Object.keys(errs).filter((k) => errs[k]);
-      if (errKeys.length) {
+      if (errKeys.length && !incremental) {
+        const hasItems = mode === 'clips'
+          ? incoming.length > 0
+          : (ch.vodVideos?.length ?? 0) > 0 || incoming.length > 0;
         setChannelsError(
-          merged.length
+          hasItems
             ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
             : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
         );
       }
     } finally {
-      updateChannel(channelId, { loading: false });
+      if (!incremental) {
+        updateChannel(channelId, { loading: false });
+      }
     }
   }, [savedChannels, updateChannel, channelContentFilter]);
+
+  const refreshChannelRef = useRef(refreshChannel);
+  refreshChannelRef.current = refreshChannel;
+
+  // On page load: cheap incremental VOD sync for every saved channel (merge new ids only).
+  const incrementalSyncDoneRef = useRef(false);
+  useEffect(() => {
+    if (incrementalSyncDoneRef.current) return;
+    incrementalSyncDoneRef.current = true;
+    const channels = loadSavedChannels();
+    channels.forEach((c) => {
+      void refreshChannelRef.current(c.id, c, 'vods', { incremental: true });
+    });
+  }, []);
+
+  // Fetch clips when user switches to Only clips and cache is empty.
+  useEffect(() => {
+    if (channelContentFilter !== 'clips' || !selectedChannelId) return;
+    const ch = savedChannels.find((c) => c.id === selectedChannelId);
+    if (!ch || (ch.clipVideos?.length ?? 0) > 0) return;
+    void refreshChannel(selectedChannelId, ch, 'clips');
+  }, [channelContentFilter, selectedChannelId, savedChannels, refreshChannel]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -2363,15 +2534,19 @@ export default function App() {
       displayName,
       kickSlug,
       twitchSlug,
-      videos: [],
+      vodVideos: [],
+      clipVideos: [],
       errors: {},
       updatedAt: '',
     };
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
     setAddChannelInput('');
-    await refreshChannel(id, entry, channelContentFilter);
-  }, [addChannelInput, savedChannels.length, refreshChannel]);
+    await refreshChannel(id, entry, 'vods');
+    if (channelContentFilter === 'clips') {
+      await refreshChannel(id, entry, 'clips');
+    }
+  }, [addChannelInput, savedChannels.length, refreshChannel, channelContentFilter]);
 
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {
