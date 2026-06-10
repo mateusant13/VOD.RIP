@@ -217,49 +217,133 @@ function formatHmsFull(sec: number): string {
 const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
+const PREVIEW_DEFAULT_VOLUME = 0.4;
 type PanelSize = { w: number; h: number };
 
 const PREVIEW_PANEL_DEFAULT: PanelSize = { w: 640, h: 400 };
 const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 384 };
 const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
-const EXPLORE_POPUP_DEFAULT: PanelSize = { w: 288, h: 320 };
 const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 const PANEL_MAX_W = 1000;
-const EXPLORE_POPUP_MAX_W = 960;
-/** Matches Tailwind `bottom-5` / `right-5` on the explore popup. */
-const EXPLORE_VIEWPORT_INSET = 20;
+/** Minimum clear space between panel chrome (incl. shadow) and viewport edges. */
+const VIEWPORT_EDGE_LOCK = 40;
+const LAYOUT_ROW_GAP_TRIPLE = 12;
+const LAYOUT_ROW_GAP_SPLIT = 24;
+const EXPLORE_PANEL_DEFAULT_W = 288;
+const EXPLORE_PANEL_MIN_W = 220;
+const EXPLORE_PANEL_MAX_W = 960;
+const EXPLORE_PANEL_CHROME_H_EST = 156;
+const EXPLORE_PANEL_PAD_V = 24;
+const EXPLORE_PANEL_PAD_H = 24;
+const EXPLORE_VIDEO_ASPECT_DEFAULT = 16 / 9;
 const CARD_BORDER_PX = 2;
 
 function panelMaxHeight() {
   return Math.round(window.innerHeight * 0.92);
 }
 
-function explorePopupMaxSize(): PanelSize {
+type LayoutPanelKey = 'preview' | 'urlAside' | 'main';
+
+interface LayoutPanelBoundsInput {
+  previewOpen: boolean;
+  urlPanelAside: boolean;
+  preview: PanelSize;
+  urlAside: PanelSize;
+  main: PanelSize;
+}
+
+function viewportContentBox(shadowPad = panelResizeHandleInset(false)): { maxW: number; maxH: number } {
+  return {
+    maxW: Math.max(PANEL_MIN.w, window.innerWidth - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
+    maxH: Math.max(PANEL_MIN.h, window.innerHeight - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
+  };
+}
+
+function layoutRowGap(previewOpen: boolean, urlPanelAside: boolean): number {
+  const count = (previewOpen ? 1 : 0) + (urlPanelAside ? 1 : 0) + 1;
+  if (count <= 1) return 0;
+  return previewOpen && urlPanelAside ? LAYOUT_ROW_GAP_TRIPLE : LAYOUT_ROW_GAP_SPLIT;
+}
+
+function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsInput): number {
+  const { maxW } = viewportContentBox();
+  const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
+  const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
+
+  let othersW = 0;
+  if (layout.previewOpen && target !== 'preview') othersW += layout.preview.w;
+  if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
+  if (target !== 'main') othersW += layout.main.w;
+
+  return Math.max(PANEL_MIN.w, Math.min(PANEL_MAX_W, maxW - othersW - gapTotal));
+}
+
+function layoutMaxPanelHeight(): number {
+  return Math.min(panelMaxHeight(), viewportContentBox().maxH);
+}
+
+function clampPanelSizeForLayout(
+  target: LayoutPanelKey,
+  size: PanelSize,
+  layout: LayoutPanelBoundsInput,
+): PanelSize {
+  const maxW = layoutMaxPanelWidth(target, layout);
+  const maxH = layoutMaxPanelHeight();
+  return {
+    w: Math.min(maxW, Math.max(PANEL_MIN.w, size.w)),
+    h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
+  };
+}
+
+function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
+  preview: PanelSize;
+  urlAside: PanelSize;
+  main: PanelSize;
+} {
+  const maxH = layoutMaxPanelHeight();
+  let preview = { ...layout.preview };
+  let urlAside = { ...layout.urlAside };
+  let main = { ...layout.main };
+  const snapshot = (): LayoutPanelBoundsInput => ({
+    ...layout,
+    preview,
+    urlAside,
+    main,
+  });
+
+  if (layout.previewOpen) {
+    preview = clampPanelSizeForLayout('preview', { ...preview, h: Math.min(preview.h, maxH) }, snapshot());
+  }
+  if (layout.urlPanelAside) {
+    urlAside = clampPanelSizeForLayout('urlAside', { ...urlAside, h: Math.min(urlAside.h, maxH) }, snapshot());
+  }
+  main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
+
+  return { preview, urlAside, main };
+}
+
+function exploreViewportBox(): { maxW: number; maxH: number } {
   const shadowPad = panelResizeHandleInset(true);
-  const maxW = window.innerWidth - EXPLORE_VIEWPORT_INSET * 2 - shadowPad;
-  const maxH = window.innerHeight - EXPLORE_VIEWPORT_INSET * 2 - shadowPad;
+  const box = viewportContentBox(shadowPad);
   return {
-    w: Math.max(160, maxW),
-    h: Math.max(140, maxH),
+    maxW: Math.max(EXPLORE_PANEL_MIN_W, box.maxW),
+    maxH: Math.max(140, box.maxH),
   };
 }
 
-function explorePopupResizeLimits(): { maxW: number; maxH: number } {
-  const vp = explorePopupMaxSize();
-  return {
-    maxW: Math.min(EXPLORE_POPUP_MAX_W, vp.w),
-    maxH: vp.h,
-  };
+function maxExplorePanelWidth(chromeH: number, aspect: number): number {
+  const { maxW, maxH } = exploreViewportBox();
+  const capW = Math.min(EXPLORE_PANEL_MAX_W, maxW);
+  const videoMaxW = capW - EXPLORE_PANEL_PAD_H;
+  const videoMaxH = Math.max(80, maxH - chromeH - EXPLORE_PANEL_PAD_V);
+  const videoMaxWFromH = videoMaxH * aspect;
+  return Math.floor(Math.min(videoMaxW, videoMaxWFromH) + EXPLORE_PANEL_PAD_H);
 }
 
-function clampExplorePopupSize(size: PanelSize): PanelSize {
-  const { maxW, maxH } = explorePopupResizeLimits();
-  const minW = Math.min(PANEL_MIN.w, maxW);
-  const minH = Math.min(PANEL_MIN.h, maxH);
-  return {
-    w: Math.min(maxW, Math.max(minW, size.w)),
-    h: Math.min(maxH, Math.max(minH, size.h)),
-  };
+function clampExplorePanelWidth(width: number, chromeH: number, aspect: number): number {
+  const minW = Math.min(EXPLORE_PANEL_MIN_W, maxExplorePanelWidth(chromeH, aspect));
+  const maxW = maxExplorePanelWidth(chromeH, aspect);
+  return Math.min(maxW, Math.max(minW, width));
 }
 
 /** Distance from panel padding edge to outer colored shadow corner (border + shadow offset). */
@@ -331,7 +415,8 @@ function startPanelResizeDrag(
 
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
-    const next = calcSize(ev.clientX, ev.clientY);
+    let next = calcSize(ev.clientX, ev.clientY);
+    if (opts?.clampSize) next = opts.clampSize(next);
     sizeRef.current = next;
     if (panelEl) {
       applyPanelSize(panelEl, next);
@@ -355,6 +440,67 @@ function startPanelResizeDrag(
       applyPanelSize(panelEl, final);
     }
     setSize({ ...final });
+  };
+
+  handle.addEventListener('pointermove', onMove);
+  handle.addEventListener('pointerup', onUp);
+  handle.addEventListener('pointercancel', onUp);
+}
+
+function startExplorePanelWidthResize(
+  e: ReactPointerEvent<HTMLDivElement>,
+  widthRef: MutableRefObject<number>,
+  setWidth: Dispatch<SetStateAction<number>>,
+  opts: {
+    panelEl: HTMLElement | null;
+    chromeH: number;
+    aspect: number;
+  },
+) {
+  e.preventDefault();
+  e.stopPropagation();
+  const handle = e.currentTarget;
+  handle.setPointerCapture(e.pointerId);
+
+  const startX = e.clientX;
+  const startW = widthRef.current;
+  const panelEl = opts.panelEl;
+  const clamp = (w: number) => clampExplorePanelWidth(w, opts.chromeH, opts.aspect);
+
+  if (panelEl) {
+    panelEl.style.willChange = 'width';
+  }
+  const prevUserSelect = document.body.style.userSelect;
+  const prevCursor = document.body.style.cursor;
+  document.body.style.userSelect = 'none';
+  document.body.style.cursor = 'se-resize';
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    const nextW = clamp(startW + ev.clientX - startX);
+    widthRef.current = nextW;
+    if (panelEl) {
+      panelEl.style.width = `${nextW}px`;
+    }
+  };
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    handle.releasePointerCapture(e.pointerId);
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onUp);
+    document.body.style.userSelect = prevUserSelect;
+    document.body.style.cursor = prevCursor;
+    if (panelEl) {
+      panelEl.style.willChange = '';
+    }
+    const finalW = clamp(widthRef.current);
+    widthRef.current = finalW;
+    if (panelEl) {
+      panelEl.style.width = `${finalW}px`;
+    }
+    setWidth(finalW);
   };
 
   handle.addEventListener('pointermove', onMove);
@@ -556,7 +702,7 @@ export default function App() {
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewMuted, setPreviewMuted] = useState(true);
-  const [previewVolume, setPreviewVolume] = useState(1);
+  const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
@@ -572,7 +718,7 @@ export default function App() {
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewControlsRef = useRef<HTMLDivElement>(null);
   const previewHlsRef = useRef<Hls | null>(null);
-  const previewVolumeRef = useRef(1);
+  const previewVolumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const previewFsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewInitialSeekDoneRef = useRef(false);
   const previewInitialPlayDoneRef = useRef(false);
@@ -593,13 +739,14 @@ export default function App() {
   const [exploreReady, setExploreReady] = useState(false);
   const [explorePlaying, setExplorePlaying] = useState(false);
   const [exploreMuted, setExploreMuted] = useState(false);
-  const [exploreVolume, setExploreVolume] = useState(1);
+  const [exploreVolume, setExploreVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [exploreVolumeMenuOpen, setExploreVolumeMenuOpen] = useState(false);
   const [exploreCurrentTime, setExploreCurrentTime] = useState(0);
   const [previewPanelSize, setPreviewPanelSize] = useState(PREVIEW_PANEL_DEFAULT);
   const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(URL_ASIDE_PANEL_DEFAULT);
   const [mainPanelSize, setMainPanelSize] = useState(MAIN_PANEL_DEFAULT);
-  const [explorePopupSize, setExplorePopupSize] = useState(EXPLORE_POPUP_DEFAULT);
+  const [explorePanelWidth, setExplorePanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
+  const [exploreVideoAspect, setExploreVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [exploreFullscreen, setExploreFullscreen] = useState(false);
   const [exploreFsControlsVisible, setExploreFsControlsVisible] = useState(true);
   const [exploreError, setExploreError] = useState<string | null>(null);
@@ -612,11 +759,14 @@ export default function App() {
   const previewPanelSizeRef = useRef(PREVIEW_PANEL_DEFAULT);
   const urlAsidePanelSizeRef = useRef(URL_ASIDE_PANEL_DEFAULT);
   const mainPanelSizeRef = useRef(MAIN_PANEL_DEFAULT);
-  const explorePopupSizeRef = useRef(EXPLORE_POPUP_DEFAULT);
+  const explorePanelWidthRef = useRef(EXPLORE_PANEL_DEFAULT_W);
+  const exploreVideoAspectRef = useRef(EXPLORE_VIDEO_ASPECT_DEFAULT);
+  const exploreChromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
+  const exploreVideoWrapRef = useRef<HTMLDivElement>(null);
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
-  const exploreVolumeRef = useRef(1);
+  const exploreVolumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
 
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -751,6 +901,8 @@ export default function App() {
     setPreviewTrimEnd(trimEndSec);
     previewInitialSeekDoneRef.current = false;
     previewInitialPlayDoneRef.current = false;
+    previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
+    setPreviewVolume(PREVIEW_DEFAULT_VOLUME);
     setPreviewOpen(true);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
@@ -795,6 +947,9 @@ export default function App() {
     const onCanPlay = () => {
       setPreviewVideoReady(true);
       setPreviewVideoLoading(false);
+      video.volume = PREVIEW_DEFAULT_VOLUME;
+      previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
+      setPreviewVolume(PREVIEW_DEFAULT_VOLUME);
       video.muted = true;
       setPreviewMuted(true);
       performInitialSeek();
@@ -1105,7 +1260,8 @@ export default function App() {
     setExploreReady(false);
     setExplorePlaying(false);
     setExploreMuted(false);
-    setExploreVolume(1);
+    setExploreVolume(PREVIEW_DEFAULT_VOLUME);
+    exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
     setExploreVolumeMenuOpen(false);
     setExploreCurrentTime(0);
     setExploreFullscreen(false);
@@ -1132,15 +1288,22 @@ export default function App() {
       platform: v.platform,
       durationSec,
     });
-    const clampedExploreSize = clampExplorePopupSize(explorePopupSizeRef.current);
-    explorePopupSizeRef.current = clampedExploreSize;
-    setExplorePopupSize(clampedExploreSize);
+    exploreVideoAspectRef.current = EXPLORE_VIDEO_ASPECT_DEFAULT;
+    setExploreVideoAspect(EXPLORE_VIDEO_ASPECT_DEFAULT);
+    const clampedExploreW = clampExplorePanelWidth(
+      explorePanelWidthRef.current,
+      exploreChromeHRef.current,
+      EXPLORE_VIDEO_ASPECT_DEFAULT,
+    );
+    explorePanelWidthRef.current = clampedExploreW;
+    setExplorePanelWidth(clampedExploreW);
     setExploreOpen(true);
     setExploreLoading(true);
     setExploreReady(false);
     setExplorePlaying(false);
     setExploreMuted(false);
-    setExploreVolume(1);
+    setExploreVolume(PREVIEW_DEFAULT_VOLUME);
+    exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
     setExploreVolumeMenuOpen(false);
     setExploreCurrentTime(0);
     setExploreError(null);
@@ -1204,31 +1367,92 @@ export default function App() {
     setExploreCurrentTime(video.currentTime);
   }, []);
 
+  const handleExploreLoadedMetadata = useCallback(() => {
+    const video = exploreVideoRef.current;
+    if (!video?.videoWidth || !video?.videoHeight) return;
+    const aspect = video.videoWidth / video.videoHeight;
+    exploreVideoAspectRef.current = aspect;
+    setExploreVideoAspect(aspect);
+    const clampedW = clampExplorePanelWidth(
+      explorePanelWidthRef.current,
+      exploreChromeHRef.current,
+      aspect,
+    );
+    explorePanelWidthRef.current = clampedW;
+    setExplorePanelWidth(clampedW);
+  }, []);
+
+  const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
+    const aside = previewOpen || channelVodPanelOpen;
+    return {
+      previewOpen,
+      urlPanelAside: aside,
+      preview: previewPanelSizeRef.current,
+      urlAside: urlAsidePanelSizeRef.current,
+      main: mainPanelSizeRef.current,
+    };
+  }, [previewOpen, channelVodPanelOpen]);
+
+  const applyLayoutPanelClamps = useCallback(() => {
+    const layout = layoutBoundsInput();
+    const clamped = clampAllLayoutPanels(layout);
+    if (layout.previewOpen) {
+      previewPanelSizeRef.current = clamped.preview;
+      setPreviewPanelSize(clamped.preview);
+      if (previewPanelRef.current) applyPanelSize(previewPanelRef.current, clamped.preview);
+    }
+    if (layout.urlPanelAside) {
+      urlAsidePanelSizeRef.current = clamped.urlAside;
+      setUrlAsidePanelSize(clamped.urlAside);
+      if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, clamped.urlAside);
+    }
+    mainPanelSizeRef.current = clamped.main;
+    setMainPanelSize(clamped.main);
+    if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clamped.main);
+  }, [layoutBoundsInput]);
+
+  useEffect(() => {
+    applyLayoutPanelClamps();
+    const onResize = () => applyLayoutPanelClamps();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
+
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    const layout = layoutBoundsInput();
     startPanelResizeDrag(e, previewPanelSizeRef, setPreviewPanelSize, {
       panelEl: previewPanelRef.current,
+      maxW: layoutMaxPanelWidth('preview', layout),
+      maxH: layoutMaxPanelHeight(),
+      clampSize: (s) => clampPanelSizeForLayout('preview', s, layoutBoundsInput()),
     });
-  }, []);
+  }, [layoutBoundsInput]);
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    const layout = layoutBoundsInput();
     startPanelResizeDrag(e, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
       panelEl: urlAsidePanelRef.current,
+      maxW: layoutMaxPanelWidth('urlAside', layout),
+      maxH: layoutMaxPanelHeight(),
+      clampSize: (s) => clampPanelSizeForLayout('urlAside', s, layoutBoundsInput()),
     });
-  }, []);
+  }, [layoutBoundsInput]);
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    const layout = layoutBoundsInput();
     startPanelResizeDrag(e, mainPanelSizeRef, setMainPanelSize, {
       panelEl: mainPanelRef.current,
+      maxW: layoutMaxPanelWidth('main', layout),
+      maxH: layoutMaxPanelHeight(),
+      clampSize: (s) => clampPanelSizeForLayout('main', s, layoutBoundsInput()),
     });
-  }, []);
+  }, [layoutBoundsInput]);
 
   const onExplorePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
-    const { maxW, maxH } = explorePopupResizeLimits();
-    startPanelResizeDrag(e, explorePopupSizeRef, setExplorePopupSize, {
-      maxW,
-      maxH,
+    startExplorePanelWidthResize(e, explorePanelWidthRef, setExplorePanelWidth, {
       panelEl: exploreContainerRef.current,
-      clampSize: clampExplorePopupSize,
+      chromeH: exploreChromeHRef.current,
+      aspect: exploreVideoAspectRef.current,
     });
   }, []);
 
@@ -1271,16 +1495,28 @@ export default function App() {
   useEffect(() => {
     if (!exploreOpen || exploreFullscreen) return;
     const fitExplorePopup = () => {
-      const clamped = clampExplorePopupSize(explorePopupSizeRef.current);
-      explorePopupSizeRef.current = clamped;
-      setExplorePopupSize(clamped);
+      const clampedW = clampExplorePanelWidth(
+        explorePanelWidthRef.current,
+        exploreChromeHRef.current,
+        exploreVideoAspectRef.current,
+      );
+      explorePanelWidthRef.current = clampedW;
+      setExplorePanelWidth(clampedW);
       if (exploreContainerRef.current) {
-        applyPanelSize(exploreContainerRef.current, clamped);
+        exploreContainerRef.current.style.width = `${clampedW}px`;
       }
     };
     window.addEventListener('resize', fitExplorePopup);
     return () => window.removeEventListener('resize', fitExplorePopup);
   }, [exploreOpen, exploreFullscreen]);
+
+  useEffect(() => {
+    if (!exploreOpen || exploreFullscreen || !exploreContainerRef.current || !exploreVideoWrapRef.current) return;
+    const chromeH = exploreContainerRef.current.offsetHeight - exploreVideoWrapRef.current.offsetHeight;
+    if (chromeH > 0) {
+      exploreChromeHRef.current = chromeH;
+    }
+  }, [exploreOpen, exploreFullscreen, explorePanelWidth, exploreVideoAspect, exploreReady]);
 
   useEffect(() => {
     if (!exploreOpen || !exploreHlsUrl) return;
@@ -1293,10 +1529,10 @@ export default function App() {
     const onCanPlay = () => {
       setExploreReady(true);
       setExploreLoading(false);
+      video.volume = PREVIEW_DEFAULT_VOLUME;
+      exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
+      setExploreVolume(PREVIEW_DEFAULT_VOLUME);
       video.muted = false;
-      video.volume = 1;
-      exploreVolumeRef.current = 1;
-      setExploreVolume(1);
       setExploreMuted(false);
       if (!exploreInitialPlayDoneRef.current && video.paused) {
         exploreInitialPlayDoneRef.current = true;
@@ -2128,22 +2364,17 @@ export default function App() {
 
   return (
     <div
-      className={`min-h-screen flex justify-center items-center selection:bg-white selection:text-black bg-[#09090b] ${
-        splitLayout
-          ? 'overflow-x-auto px-5 py-4'
-          : 'p-4'
-      }`}
+      className="h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
       style={{
         backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)',
         backgroundSize: '24px 24px',
-        scrollbarGutter: 'stable',
       }}
     >
-      <div className={`flex items-start ${
+      <div className={`flex items-start max-w-full min-w-0 ${
         triplePanelLayout
-          ? 'w-full max-w-[calc(100vw-2.5rem)] gap-3 justify-center'
+          ? 'w-full gap-3 justify-center'
           : splitLayout
-            ? 'w-max max-w-none gap-6'
+            ? 'w-full gap-6 justify-center'
             : 'w-full max-w-md justify-center gap-6'
       }`}>
       {previewOpen && (
@@ -2736,21 +2967,21 @@ export default function App() {
         <div
           ref={exploreContainerRef}
           style={exploreFullscreen ? undefined : {
-            width: explorePopupSize.w,
-            height: explorePopupSize.h,
-            maxWidth: `calc(100vw - ${EXPLORE_VIEWPORT_INSET * 2}px - ${panelResizeHandleInset(true)}px)`,
-            maxHeight: `calc(100vh - ${EXPLORE_VIEWPORT_INSET * 2}px - ${panelResizeHandleInset(true)}px)`,
+            width: explorePanelWidth,
+            maxWidth: `calc(100vw - ${VIEWPORT_EDGE_LOCK * 2}px - ${panelResizeHandleInset(true)}px)`,
           }}
-          className={`relative flex flex-col overflow-visible bg-zinc-950 border-2 border-white min-h-0 ${
+          className={`relative flex flex-col overflow-visible bg-zinc-950 border-2 border-white ${
+            exploreFullscreen ? 'min-h-0' : ''
+          } ${
             platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)
           } ${
             exploreFullscreen
               ? 'fixed inset-0 z-[200] w-screen h-screen p-0 gap-0'
-              : 'fixed bottom-5 right-5 z-[200] p-3 gap-2 max-w-[calc(100vw-2.5rem)] max-h-[calc(100vh-2.5rem)]'
+              : 'fixed bottom-5 right-5 z-[200] p-3 gap-2'
           }`}
           onMouseMove={exploreFullscreen ? bumpExploreFsControls : undefined}
         >
-          <div className={`flex flex-col min-h-0 ${exploreFullscreen ? 'h-full gap-0' : 'h-full gap-2 relative'}`}>
+          <div className={`flex flex-col ${exploreFullscreen ? 'h-full min-h-0 gap-0' : 'gap-2 relative'}`}>
           {!exploreFullscreen && (
             <div className="flex items-start justify-between gap-2 shrink-0">
               <div className="min-w-0">
@@ -2772,9 +3003,11 @@ export default function App() {
             </div>
           )}
           <div
-            className={`relative bg-black overflow-hidden ${
-              exploreFullscreen ? 'flex-1 min-h-0 border-0' : 'flex-1 min-h-0 border-2 border-zinc-700'
+            ref={exploreVideoWrapRef}
+            className={`relative bg-black overflow-hidden w-full ${
+              exploreFullscreen ? 'flex-1 min-h-0 border-0' : 'border-2 border-zinc-700 shrink-0'
             }`}
+            style={exploreFullscreen ? undefined : { aspectRatio: exploreVideoAspect }}
             onClick={(e) => {
               if ((e.target as HTMLElement).tagName === 'VIDEO') {
                 toggleExplorePlay();
@@ -2786,6 +3019,7 @@ export default function App() {
               className="w-full h-full object-contain"
               muted={exploreMuted}
               playsInline
+              onLoadedMetadata={handleExploreLoadedMetadata}
               onTimeUpdate={handleExploreTimeUpdate}
               onPlay={() => setExplorePlaying(true)}
               onPause={() => setExplorePlaying(false)}

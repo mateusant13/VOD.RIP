@@ -7,12 +7,23 @@
   --font-mono: "Space Grotesk", monospace;
 }
 
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   background-color: #09090b;
   color: #fafafa;
   font-family: var(--font-street);
   background-image: radial-gradient(#27272a 1px, transparent 1px);
   background-size: 24px 24px;
+}
+
+#root {
+  height: 100%;
+  overflow: hidden;
 }
 
 button:not(:disabled),
