@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
 import twitchIcon from '@/assets/platforms/twitch.png';
+import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -233,6 +234,7 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   return false;
 }
 type PanelSize = { w: number; h: number };
+type PanelPos = { x: number; y: number };
 
 const PREVIEW_PANEL_DEFAULT_W = 640;
 const PREVIEW_PANEL_MIN_W = 280;
@@ -246,10 +248,11 @@ const PANEL_MAX_W = 1000;
 /** Minimum clear space between panel chrome (incl. shadow) and viewport edges. */
 const VIEWPORT_EDGE_LOCK = 40;
 const EXPLORE_POPUP_Z = 9999;
+const MAX_EXPLORE_POPUPS = 5;
 const LAYOUT_ROW_GAP_TRIPLE = 12;
 const LAYOUT_ROW_GAP_SPLIT = 24;
 const EXPLORE_PANEL_DEFAULT_W = 288;
-const EXPLORE_PANEL_MIN_W = 220;
+const EXPLORE_PANEL_MIN_W = 100;
 const EXPLORE_PANEL_MAX_W = 960;
 const EXPLORE_PANEL_CHROME_H_EST = 156;
 const EXPLORE_PANEL_PAD_V = 24;
@@ -366,9 +369,8 @@ function maxExplorePanelWidth(chromeH: number, aspect: number): number {
 }
 
 function clampExplorePanelWidth(width: number, chromeH: number, aspect: number): number {
-  const minW = Math.min(EXPLORE_PANEL_MIN_W, maxExplorePanelWidth(chromeH, aspect));
   const maxW = maxExplorePanelWidth(chromeH, aspect);
-  return Math.min(maxW, Math.max(minW, width));
+  return Math.min(maxW, Math.max(EXPLORE_PANEL_MIN_W, width));
 }
 
 function maxPreviewPanelWidth(
@@ -396,13 +398,42 @@ function clampPreviewPanelWidth(
   return Math.min(maxW, Math.max(minW, width));
 }
 
-function applyExplorePopupWindowPosition(el: HTMLElement) {
+function defaultExplorePopupPosition(panelW: number, panelH: number): PanelPos {
+  const shadowPad = panelResizeHandleInset(true);
+  return {
+    x: window.innerWidth - VIEWPORT_EDGE_LOCK - panelW - shadowPad,
+    y: window.innerHeight - VIEWPORT_EDGE_LOCK - panelH - shadowPad,
+  };
+}
+
+function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
   el.style.position = 'fixed';
-  el.style.top = 'auto';
-  el.style.left = 'auto';
-  el.style.bottom = `${VIEWPORT_EDGE_LOCK}px`;
-  el.style.right = `${VIEWPORT_EDGE_LOCK}px`;
+  el.style.top = `${pos.y}px`;
+  el.style.left = `${pos.x}px`;
+  el.style.right = 'auto';
+  el.style.bottom = 'auto';
   el.style.zIndex = String(EXPLORE_POPUP_Z);
+}
+
+function layoutExplorePopupWindow(
+  el: HTMLElement,
+  width: number,
+  posRef: MutableRefObject<PanelPos | null>,
+): PanelPos {
+  applyPanelWidth(el, width);
+  if (!posRef.current) {
+    posRef.current = defaultExplorePopupPosition(el.offsetWidth, el.offsetHeight);
+  }
+  applyExplorePopupWindowPosition(el, posRef.current);
+  return posRef.current;
+}
+
+function edgeAffectsWest(edge: ResizeEdge): boolean {
+  return edge === 'w' || edge === 'nw' || edge === 'sw';
+}
+
+function edgeAffectsNorth(edge: ResizeEdge): boolean {
+  return edge === 'n' || edge === 'ne' || edge === 'nw';
 }
 
 function applyExplorePopupFullscreenPosition(el: HTMLElement) {
@@ -472,41 +503,24 @@ function PanelResizeHandles({
   const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
   const edgePad = 12;
 
-  const edgeProps = (edge: ResizeEdge, style: CSSProperties, className: string) => ({
-    role: 'separator' as const,
-    title: 'Resize',
-    'aria-orientation': (edge === 'n' || edge === 's' ? 'vertical' : 'horizontal') as 'vertical' | 'horizontal',
+  const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string, sizeClass = '') => ({
+    'data-panel-resize': true as const,
+    'aria-hidden': true as const,
     onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => onPointerDown(e, edge),
-    style: { ...style, touchAction: 'none', cursor: RESIZE_EDGE_CURSORS[edge] },
-    className: `${hit} ${className}`,
+    style: { ...style, touchAction: 'none' },
+    className: `${hit} cursor-default ${hoverCursorClass} ${sizeClass}`.trim(),
   });
-
-  const corner = (edge: ResizeEdge, style: CSSProperties) => (
-    <div
-      key={edge}
-      {...edgeProps(edge, style, 'w-4 h-4 flex items-center justify-center')}
-    >
-      <span
-        className={`block w-2 h-2 border-zinc-500 pointer-events-none ${
-          edge === 'se' ? 'border-r-2 border-b-2' :
-          edge === 'sw' ? 'border-l-2 border-b-2' :
-          edge === 'ne' ? 'border-r-2 border-t-2' :
-          'border-l-2 border-t-2'
-        }`}
-      />
-    </div>
-  );
 
   return (
     <>
-      <div {...edgeProps('n', { top: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
-      <div {...edgeProps('w', { left: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
-      {corner('nw', { top: -insetPx, left: -insetPx })}
-      {corner('ne', { top: -insetPx, right: -insetPx })}
-      {corner('sw', { bottom: -insetPx, left: -insetPx })}
-      {corner('se', { bottom: -insetPx, right: -insetPx })}
+      <div {...edgeProps('n', { top: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
+      <div {...edgeProps('s', { bottom: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
+      <div {...edgeProps('w', { left: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
+      <div {...edgeProps('nw', { top: -insetPx, left: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('ne', { top: -insetPx, right: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('sw', { bottom: -insetPx, left: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('se', { bottom: -insetPx, right: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
     </>
   );
 }
@@ -604,6 +618,8 @@ function startPanelWidthResize(
     panelEl: HTMLElement | null;
     clampWidth: (w: number) => number;
     aspect: number;
+    posRef?: MutableRefObject<PanelPos | null>;
+    setPos?: Dispatch<SetStateAction<PanelPos | null>>;
   },
 ) {
   e.preventDefault();
@@ -614,6 +630,7 @@ function startPanelWidthResize(
   const startX = e.clientX;
   const startY = e.clientY;
   const startW = widthRef.current;
+  const startPos = opts.posRef?.current ? { ...opts.posRef.current } : null;
   const panelEl = opts.panelEl;
   const clamp = opts.clampWidth;
 
@@ -625,14 +642,30 @@ function startPanelWidthResize(
   document.body.style.userSelect = 'none';
   document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
 
-  const onMove = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
-    const nextW = clamp(startW + delta);
+  const applyWidthAndPos = (nextW: number) => {
     widthRef.current = nextW;
     if (panelEl) {
       applyPanelWidth(panelEl, nextW);
     }
+    if (startPos && opts.posRef && panelEl) {
+      let x = startPos.x;
+      let y = startPos.y;
+      if (edgeAffectsWest(edge)) {
+        x = startPos.x + startW - nextW;
+      }
+      if (edgeAffectsNorth(edge)) {
+        y = startPos.y - (nextW - startW) / opts.aspect;
+      }
+      const pos = { x, y };
+      opts.posRef.current = pos;
+      applyExplorePopupWindowPosition(panelEl, pos);
+    }
+  };
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
+    applyWidthAndPos(clamp(startW + delta));
   };
 
   const onUp = (ev: PointerEvent) => {
@@ -647,11 +680,11 @@ function startPanelWidthResize(
       panelEl.style.willChange = '';
     }
     const finalW = clamp(widthRef.current);
-    widthRef.current = finalW;
-    if (panelEl) {
-      applyPanelWidth(panelEl, finalW);
-    }
+    applyWidthAndPos(finalW);
     setWidth(finalW);
+    if (opts.setPos && opts.posRef?.current) {
+      opts.setPos({ ...opts.posRef.current });
+    }
   };
 
   handle.addEventListener('pointermove', onMove);
@@ -877,51 +910,26 @@ export default function App() {
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
 
-  // Channel explore player (floating popup for browsing VODs)
-  const [exploreOpen, setExploreOpen] = useState(false);
-  const [exploreVod, setExploreVod] = useState<{
-    url: string;
-    title: string;
-    platform: string;
-    durationSec: number;
-    platformListIndex: number;
-  } | null>(null);
-  const [exploreHlsUrl, setExploreHlsUrl] = useState<string | null>(null);
-  const [exploreLoading, setExploreLoading] = useState(false);
-  const [exploreReady, setExploreReady] = useState(false);
-  const [explorePlaying, setExplorePlaying] = useState(false);
-  const [exploreMuted, setExploreMuted] = useState(false);
-  const [exploreVolume, setExploreVolume] = useState(PREVIEW_DEFAULT_VOLUME);
-  const [exploreVolumeMenuOpen, setExploreVolumeMenuOpen] = useState(false);
-  const [exploreCurrentTime, setExploreCurrentTime] = useState(0);
+  // Channel explore players (up to 5 floating popups)
+  const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
+  const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
+  const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
+  const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
+  const explorePauseMapRef = useRef(new Map<string, () => void>());
+  const exploreVolumeMenusRef = useRef(new Set<string>());
+  const exploreZCounterRef = useRef(0);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(PREVIEW_PANEL_DEFAULT_W);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(URL_ASIDE_PANEL_DEFAULT);
   const [mainPanelSize, setMainPanelSize] = useState(MAIN_PANEL_DEFAULT);
-  const [explorePanelWidth, setExplorePanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
-  const [exploreVideoAspect, setExploreVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
-  const [exploreFullscreen, setExploreFullscreen] = useState(false);
-  const [exploreFsControlsVisible, setExploreFsControlsVisible] = useState(true);
-  const [exploreError, setExploreError] = useState<string | null>(null);
-  const exploreVideoRef = useRef<HTMLVideoElement>(null);
-  const exploreContainerRef = useRef<HTMLDivElement>(null);
-  const exploreHlsRef = useRef<Hls | null>(null);
-  const exploreSessionIdRef = useRef<string | null>(null);
-  const exploreFsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const exploreInitialPlayDoneRef = useRef(false);
   const previewPanelWidthRef = useRef(PREVIEW_PANEL_DEFAULT_W);
   const previewVideoAspectRef = useRef(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const previewChromeHRef = useRef(PREVIEW_PANEL_CHROME_H_EST);
   const urlAsidePanelSizeRef = useRef(URL_ASIDE_PANEL_DEFAULT);
   const mainPanelSizeRef = useRef(MAIN_PANEL_DEFAULT);
-  const explorePanelWidthRef = useRef(EXPLORE_PANEL_DEFAULT_W);
-  const exploreVideoAspectRef = useRef(EXPLORE_VIDEO_ASPECT_DEFAULT);
-  const exploreChromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
-  const exploreVideoWrapRef = useRef<HTMLDivElement>(null);
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
-  const exploreVolumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
 
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -1387,7 +1395,7 @@ export default function App() {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
-  const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || exploreVolumeMenuOpen;
+  const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || anyExploreVolumeMenuOpen;
 
   useEffect(() => {
     if (!anyPlayerMenuOpen) return;
@@ -1396,7 +1404,7 @@ export default function App() {
       if (target.closest('[data-player-menu]')) return;
       setPreviewQualityMenuOpen(false);
       setPreviewVolumeMenuOpen(false);
-      setExploreVolumeMenuOpen(false);
+      setExploreVolumeMenuCloseTick((t) => t + 1);
     };
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
@@ -1412,172 +1420,78 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [previewOpen, previewVideoReady, focusPreviewPlayer]);
 
-  // ── Channel explore player ──
+  // ── Channel explore players ──
 
-  const destroyExplorePlayer = useCallback(() => {
-    if (exploreHlsRef.current) {
-      exploreHlsRef.current.destroy();
-      exploreHlsRef.current = null;
-    }
-    const video = exploreVideoRef.current;
-    if (video) {
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
-    }
+  const pauseAllExplorePopups = useCallback(() => {
+    explorePauseMapRef.current.forEach((pause) => pause());
   }, []);
 
-  const closeExplorePlayer = useCallback(async () => {
-    if (document.fullscreenElement === exploreContainerRef.current) {
-      try { await document.exitFullscreen(); } catch { /* ignore */ }
-    }
-    const sid = exploreSessionIdRef.current;
-    destroyExplorePlayer();
-    exploreSessionIdRef.current = null;
-    exploreInitialPlayDoneRef.current = false;
-    if (exploreFsHideTimerRef.current) {
-      window.clearTimeout(exploreFsHideTimerRef.current);
-      exploreFsHideTimerRef.current = null;
-    }
-    setExploreOpen(false);
-    setExploreVod(null);
-    setExploreHlsUrl(null);
-    setExploreLoading(false);
-    setExploreReady(false);
-    setExplorePlaying(false);
-    setExploreMuted(false);
-    setExploreVolume(PREVIEW_DEFAULT_VOLUME);
-    exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
-    setExploreVolumeMenuOpen(false);
-    setExploreCurrentTime(0);
-    setExploreFullscreen(false);
-    setExploreFsControlsVisible(true);
-    setExploreError(null);
-    if (sid) {
-      try { await apiDelete(`/api/preview/session/${sid}`); } catch { /* ignore */ }
-    }
-  }, [destroyExplorePlayer]);
+  const registerExplorePause = useCallback((id: string, pause: () => void) => {
+    explorePauseMapRef.current.set(id, pause);
+  }, []);
 
-  const openExplorePlayer = useCallback(async (v: ListedChannelVideo) => {
-    const vodUrl = buildVodUrl(v);
-    const durationSec = v.duration ? Math.max(2, Math.floor(v.duration)) : 7200;
-    const oldSid = exploreSessionIdRef.current;
-    destroyExplorePlayer();
-    if (oldSid) {
-      try { await apiDelete(`/api/preview/session/${oldSid}`); } catch { /* ignore */ }
-    }
-    exploreSessionIdRef.current = null;
-    exploreInitialPlayDoneRef.current = false;
-    setExploreVod({
-      url: vodUrl,
+  const unregisterExplorePause = useCallback((id: string) => {
+    explorePauseMapRef.current.delete(id);
+  }, []);
+
+  const handleExploreVolumeMenuOpen = useCallback((id: string, open: boolean) => {
+    if (open) exploreVolumeMenusRef.current.add(id);
+    else exploreVolumeMenusRef.current.delete(id);
+    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
+  }, []);
+
+  const assignExplorePopupZ = useCallback((id: string) => {
+    exploreZCounterRef.current += 1;
+    const rank = exploreZCounterRef.current;
+    setExploreZOrder((prev) => ({ ...prev, [id]: rank }));
+  }, []);
+
+  const bringExplorePopupToFront = useCallback((id: string) => {
+    assignExplorePopupZ(id);
+  }, [assignExplorePopupZ]);
+
+  const closeExplorePopup = useCallback((id: string) => {
+    explorePauseMapRef.current.delete(id);
+    exploreVolumeMenusRef.current.delete(id);
+    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
+    setExploreZOrder((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setExplorePopups((prev) => prev.filter((p) => p.id !== id));
+  }, []);
+
+  const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
+    pauseAllExplorePopups();
+    const vod: ExplorePopupVod = {
+      url: buildVodUrl(v),
       title: v.title || 'Untitled',
       platform: v.platform,
-      durationSec,
+      durationSec: v.duration ? Math.max(2, Math.floor(v.duration)) : 7200,
       platformListIndex: v.platformListIndex,
+    };
+    const id = crypto.randomUUID();
+    assignExplorePopupZ(id);
+    setExplorePopups((prev) => {
+      const next = [...prev, { id, vod, layoutIndex: prev.length }];
+      if (next.length > MAX_EXPLORE_POPUPS) {
+        const dropped = next.slice(0, next.length - MAX_EXPLORE_POPUPS);
+        dropped.forEach((entry) => {
+          explorePauseMapRef.current.delete(entry.id);
+          exploreVolumeMenusRef.current.delete(entry.id);
+        });
+        setExploreZOrder((zPrev) => {
+          const zNext = { ...zPrev };
+          for (const entry of dropped) delete zNext[entry.id];
+          return zNext;
+        });
+        return next.slice(-MAX_EXPLORE_POPUPS);
+      }
+      return next;
     });
-    exploreVideoAspectRef.current = EXPLORE_VIDEO_ASPECT_DEFAULT;
-    setExploreVideoAspect(EXPLORE_VIDEO_ASPECT_DEFAULT);
-    const clampedExploreW = clampExplorePanelWidth(
-      explorePanelWidthRef.current,
-      exploreChromeHRef.current,
-      EXPLORE_VIDEO_ASPECT_DEFAULT,
-    );
-    explorePanelWidthRef.current = clampedExploreW;
-    setExplorePanelWidth(clampedExploreW);
-    setExploreOpen(true);
-    setExploreLoading(true);
-    setExploreReady(false);
-    setExplorePlaying(false);
-    setExploreMuted(false);
-    setExploreVolume(PREVIEW_DEFAULT_VOLUME);
-    exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
-    setExploreVolumeMenuOpen(false);
-    setExploreCurrentTime(0);
-    setExploreError(null);
-    try {
-      const res = await apiPost<{ session_id: string; master_url: string }>('/api/preview/session', {
-        url: vodUrl,
-        crop_start: 0,
-        crop_end: durationSec,
-      });
-      exploreSessionIdRef.current = res.session_id;
-      setExploreHlsUrl(res.master_url);
-    } catch (err: any) {
-      setExploreError(err.message || 'Could not start player');
-      setExploreLoading(false);
-    }
-  }, [destroyExplorePlayer]);
-
-  const toggleExplorePlay = useCallback(() => {
-    const video = exploreVideoRef.current;
-    if (!video || !exploreReady) return;
-    if (video.paused) {
-      void video.play().catch(() => {});
-      setExplorePlaying(true);
-    } else {
-      video.pause();
-      setExplorePlaying(false);
-    }
-  }, [exploreReady]);
-
-  const setExploreVolumeLevel = useCallback((level: number) => {
-    const video = exploreVideoRef.current;
-    if (!video) return;
-    const v = Math.max(0, Math.min(1, level));
-    video.volume = v;
-    if (v > 0) {
-      exploreVolumeRef.current = v;
-    }
-    setExploreVolume(v);
-    if (v <= 0) {
-      video.muted = true;
-      setExploreMuted(true);
-    } else {
-      video.muted = false;
-      setExploreMuted(false);
-    }
-  }, []);
-
-  const seekExploreVideo = useCallback((sec: number) => {
-    const video = exploreVideoRef.current;
-    if (!video || !exploreReady || !exploreVod) return;
-    const t = Math.max(0, Math.min(sec, exploreVod.durationSec));
-    if (Math.abs(video.currentTime - t) > 0.2) {
-      video.currentTime = t;
-    }
-    setExploreCurrentTime(t);
-  }, [exploreReady, exploreVod]);
-
-  const skipExplore = useCallback((deltaSec: number) => {
-    const video = exploreVideoRef.current;
-    if (!video || !exploreReady || !exploreVod) return;
-    seekExploreVideo(video.currentTime + deltaSec);
-  }, [exploreReady, exploreVod, seekExploreVideo]);
-
-  const focusExplorePlayer = useCallback(() => {
-    exploreContainerRef.current?.focus();
-  }, []);
-
-  const handleExploreTimeUpdate = useCallback(() => {
-    const video = exploreVideoRef.current;
-    if (!video) return;
-    setExploreCurrentTime(video.currentTime);
-  }, []);
-
-  const handleExploreLoadedMetadata = useCallback(() => {
-    const video = exploreVideoRef.current;
-    if (!video?.videoWidth || !video?.videoHeight) return;
-    const aspect = video.videoWidth / video.videoHeight;
-    exploreVideoAspectRef.current = aspect;
-    setExploreVideoAspect(aspect);
-    const clampedW = clampExplorePanelWidth(
-      explorePanelWidthRef.current,
-      exploreChromeHRef.current,
-      aspect,
-    );
-    explorePanelWidthRef.current = clampedW;
-    setExplorePanelWidth(clampedW);
-  }, []);
+  }, [pauseAllExplorePopups, assignExplorePopupZ]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -1672,150 +1586,6 @@ export default function App() {
     });
   }, [layoutBoundsInput]);
 
-  const onExplorePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
-    startPanelWidthResize(e, edge, explorePanelWidthRef, setExplorePanelWidth, {
-      panelEl: exploreContainerRef.current,
-      aspect: exploreVideoAspectRef.current,
-      clampWidth: (w) => clampExplorePanelWidth(
-        w,
-        exploreChromeHRef.current,
-        exploreVideoAspectRef.current,
-      ),
-    });
-  }, []);
-
-  const toggleExploreFullscreen = useCallback(async () => {
-    const container = exploreContainerRef.current;
-    if (!container || !exploreReady) return;
-    try {
-      if (!document.fullscreenElement) {
-        await container.requestFullscreen();
-      } else {
-        await document.exitFullscreen();
-      }
-    } catch {
-      /* fullscreen denied or unsupported */
-    }
-  }, [exploreReady]);
-
-  const handleExploreKeyDown = useCallback((e: KeyboardEvent) => {
-    if (!exploreReady) return;
-    if (shouldIgnorePlayerKeyEvent(e)) return;
-
-    const { key } = e;
-    if (
-      ![' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key)
-      && key.toLowerCase() !== 'f'
-    ) {
-      return;
-    }
-
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (key === ' ') {
-      toggleExplorePlay();
-      return;
-    }
-    if (key === 'ArrowLeft') {
-      skipExplore(-PREVIEW_KEY_SKIP_SEC);
-      return;
-    }
-    if (key === 'ArrowRight') {
-      skipExplore(PREVIEW_KEY_SKIP_SEC);
-      return;
-    }
-    if (key === 'ArrowUp') {
-      setExploreVolumeLevel(exploreVolumeRef.current + 0.1);
-      return;
-    }
-    if (key === 'ArrowDown') {
-      setExploreVolumeLevel(exploreVolumeRef.current - 0.1);
-      return;
-    }
-    if (key.toLowerCase() === 'f') {
-      void toggleExploreFullscreen();
-    }
-  }, [
-    exploreReady,
-    toggleExplorePlay,
-    skipExplore,
-    setExploreVolumeLevel,
-    toggleExploreFullscreen,
-  ]);
-
-  useEffect(() => {
-    if (!exploreOpen || !exploreReady) return;
-    const t = window.setTimeout(() => focusExplorePlayer(), 0);
-    return () => window.clearTimeout(t);
-  }, [exploreOpen, exploreReady, focusExplorePlayer]);
-
-  const bumpExploreFsControls = useCallback(() => {
-    setExploreFsControlsVisible(true);
-    if (exploreFsHideTimerRef.current) {
-      window.clearTimeout(exploreFsHideTimerRef.current);
-    }
-    if (exploreFullscreen) {
-      exploreFsHideTimerRef.current = window.setTimeout(() => {
-        setExploreFsControlsVisible(false);
-      }, PREVIEW_FS_CONTROLS_HIDE_MS);
-    }
-  }, [exploreFullscreen]);
-
-  useEffect(() => {
-    const onFullscreenChange = () => {
-      const fs = document.fullscreenElement === exploreContainerRef.current;
-      setExploreFullscreen(fs);
-      setExploreFsControlsVisible(!fs);
-      const el = exploreContainerRef.current;
-      if (!el) return;
-      if (fs) {
-        applyExplorePopupFullscreenPosition(el);
-      } else {
-        applyExplorePopupWindowPosition(el);
-      }
-    };
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, []);
-
-  useLayoutEffect(() => {
-    const el = exploreContainerRef.current;
-    if (!el || !exploreOpen) return;
-    if (exploreFullscreen) {
-      applyExplorePopupFullscreenPosition(el);
-    } else {
-      applyExplorePopupWindowPosition(el);
-    }
-  }, [exploreOpen, exploreFullscreen, explorePanelWidth, exploreVideoAspect]);
-
-  useEffect(() => {
-    if (!exploreOpen || exploreFullscreen) return;
-    const fitExplorePopup = () => {
-      const clampedW = clampExplorePanelWidth(
-        explorePanelWidthRef.current,
-        exploreChromeHRef.current,
-        exploreVideoAspectRef.current,
-      );
-      explorePanelWidthRef.current = clampedW;
-      setExplorePanelWidth(clampedW);
-      if (exploreContainerRef.current) {
-        applyPanelWidth(exploreContainerRef.current, clampedW);
-        applyExplorePopupWindowPosition(exploreContainerRef.current);
-      }
-    };
-    window.addEventListener('resize', fitExplorePopup);
-    return () => window.removeEventListener('resize', fitExplorePopup);
-  }, [exploreOpen, exploreFullscreen]);
-
-  useEffect(() => {
-    if (!exploreOpen || exploreFullscreen || !exploreContainerRef.current || !exploreVideoWrapRef.current) return;
-    const chromeH = exploreContainerRef.current.offsetHeight - exploreVideoWrapRef.current.offsetHeight;
-    if (chromeH > 0) {
-      exploreChromeHRef.current = chromeH;
-    }
-  }, [exploreOpen, exploreFullscreen, explorePanelWidth, exploreVideoAspect, exploreReady]);
-
   useEffect(() => {
     if (!previewOpen || previewFullscreen || !previewPanelRef.current || !previewContainerRef.current) return;
     const chromeH = previewPanelRef.current.offsetHeight - previewContainerRef.current.offsetHeight;
@@ -1823,102 +1593,6 @@ export default function App() {
       previewChromeHRef.current = chromeH;
     }
   }, [previewOpen, previewFullscreen, previewPanelWidth, previewVideoAspect, previewVideoReady]);
-
-  useEffect(() => {
-    if (!exploreOpen || !exploreHlsUrl) return;
-    const video = exploreVideoRef.current;
-    if (!video) return;
-
-    setExploreLoading(true);
-    setExploreReady(false);
-
-    const onCanPlay = () => {
-      setExploreReady(true);
-      setExploreLoading(false);
-      video.volume = PREVIEW_DEFAULT_VOLUME;
-      exploreVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
-      setExploreVolume(PREVIEW_DEFAULT_VOLUME);
-      video.muted = false;
-      setExploreMuted(false);
-      if (!exploreInitialPlayDoneRef.current && video.paused) {
-        exploreInitialPlayDoneRef.current = true;
-        void video.play().catch(() => {
-          video.muted = true;
-          setExploreMuted(true);
-          void video.play().catch(() => {});
-        });
-      }
-    };
-
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-        backBufferLength: 30,
-        maxBufferLength: 20,
-        maxMaxBufferLength: 40,
-        startFragPrefetch: true,
-        capLevelToPlayerSize: false,
-        fragLoadingTimeOut: 20000,
-        manifestLoadingTimeOut: 10000,
-        testBandwidth: false,
-        startPosition: 0,
-      });
-      exploreHlsRef.current = hls;
-      hls.loadSource(exploreHlsUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-        const mapped: PreviewLevelOption[] = (data.levels ?? hls.levels).map((l, i) => ({
-          index: i,
-          height: l.height,
-          label: previewLevelLabel(l.height, l.bitrate),
-        }));
-        mapped.sort((a, b) => a.height - b.height);
-        const defaultIdx = mapped.length > 1
-          ? levelIndexForHeight(mapped, PREVIEW_DEFAULT_HEIGHT)
-          : lowestLevelIndex(mapped);
-        hls.loadLevel = defaultIdx;
-      });
-      video.addEventListener('canplay', onCanPlay, { once: true });
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (!data.fatal) return;
-        switch (data.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            hls.startLoad();
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            hls.recoverMediaError();
-            break;
-          default:
-            setExploreError('Playback failed — try again');
-            setExploreLoading(false);
-            hls.destroy();
-            exploreHlsRef.current = null;
-            break;
-        }
-      });
-      return () => {
-        video.removeEventListener('canplay', onCanPlay);
-        hls.destroy();
-        exploreHlsRef.current = null;
-      };
-    }
-
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = exploreHlsUrl;
-      video.addEventListener('canplay', onCanPlay, { once: true });
-      return () => {
-        video.removeEventListener('canplay', onCanPlay);
-        video.removeAttribute('src');
-        video.load();
-      };
-    }
-
-    setExploreError('HLS playback is not supported in this browser');
-    setExploreLoading(false);
-  }, [exploreOpen, exploreHlsUrl]);
-
-  useEffect(() => () => { void closeExplorePlayer(); }, [closeExplorePlayer]);
 
   // ── Fetch video info ──
 
@@ -2295,11 +1969,6 @@ export default function App() {
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
 
-  const carryExploreToUrl = useCallback(() => {
-    if (!exploreVod?.url) return;
-    selectVod(exploreVod.url);
-  }, [exploreVod, selectVod]);
-
   // ── Size estimate ──
   const clipSec = Math.max(0, trimEndSec - trimStartSec);
 
@@ -2634,40 +2303,6 @@ export default function App() {
     </div>
   );
 
-  const exploreFsCtrlBtn = 'border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]';
-
-  const exploreVolumeUi = (fs: boolean) => renderVolumeControl({
-    volume: exploreVolume,
-    muted: exploreMuted,
-    menuOpen: exploreVolumeMenuOpen,
-    setMenuOpen: setExploreVolumeMenuOpen,
-    onVolumeChange: setExploreVolumeLevel,
-    disabled: !exploreReady,
-    buttonClassName: fs ? exploreFsCtrlBtn : previewCtrlBtn(false, true),
-    popoverFs: fs,
-  });
-
-  const exploreTimelineUi = exploreVod ? (
-    <div className="flex items-center gap-1.5 w-full shrink-0">
-      <span className={`text-[9px] font-mono w-10 shrink-0 ${exploreFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
-        {formatHmsFull(exploreCurrentTime)}
-      </span>
-      <input
-        type="range"
-        min={0}
-        max={exploreVod.durationSec}
-        step={0.25}
-        value={Math.min(exploreCurrentTime, exploreVod.durationSec)}
-        disabled={!exploreReady}
-        onChange={(e) => seekExploreVideo(parseFloat(e.target.value))}
-        className="flex-1 accent-white disabled:opacity-40 h-1"
-      />
-      <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${exploreFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
-        {formatHmsFull(exploreVod.durationSec)}
-      </span>
-    </div>
-  ) : null;
-
   return (
     <div
       className="h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
@@ -2686,12 +2321,10 @@ export default function App() {
       {previewOpen && (
         <div
           ref={previewPanelRef}
-          className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
+          className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
           style={{ width: previewPanelWidth }}
         >
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-xs font-bold uppercase tracking-widest text-zinc-300">Trim preview</span>
-            <span className="text-[10px] font-mono text-zinc-500">HLS playback · trim sync</span>
+          <div className="flex items-center justify-end shrink-0">
             <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1">
               <X size={18} />
             </button>
@@ -2784,7 +2417,7 @@ export default function App() {
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
         <div
           ref={urlAsidePanelRef}
-          className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(activePlatform, true)}`}
+          className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(activePlatform, true)}`}
           style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
         >
           {showUrlInSidebar && (
@@ -2813,7 +2446,7 @@ export default function App() {
       )}
       <div
         ref={mainPanelRef}
-        className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col min-h-0 ${
+        className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col min-h-0 ${
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
         } ${platformCardShadow(activePlatform)}`}
         style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
@@ -3268,195 +2901,25 @@ export default function App() {
       <div className="fixed top-10 left-10 text-zinc-800 font-black text-9xl opacity-10 pointer-events-none select-none z-[-1] blur-sm">
         KICK
       </div>
-      {exploreOpen && exploreVod && createPortal(
-        <div
-          ref={exploreContainerRef}
-          tabIndex={0}
-          role="application"
-          aria-label="Channel explore player"
-          onKeyDown={handleExploreKeyDown}
-          onClick={focusExplorePlayer}
-          className={`outline-none focus:ring-2 focus:ring-white/25 ${
-            exploreFullscreen ? 'min-h-0 p-0 gap-0' : 'p-3 gap-2'
-          } flex flex-col overflow-visible bg-zinc-950 border-2 border-white ${platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)}`}
-          style={exploreFullscreen ? {
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            zIndex: EXPLORE_POPUP_Z,
-            width: '100vw',
-            height: '100vh',
-          } : {
-            position: 'fixed',
-            top: 'auto',
-            left: 'auto',
-            bottom: VIEWPORT_EDGE_LOCK,
-            right: VIEWPORT_EDGE_LOCK,
-            zIndex: EXPLORE_POPUP_Z,
-            width: explorePanelWidth,
-            maxWidth: `calc(100vw - ${VIEWPORT_EDGE_LOCK * 2}px - ${panelResizeHandleInset(true)}px)`,
-          }}
-          onMouseMove={exploreFullscreen ? bumpExploreFsControls : undefined}
-        >
-          <div className={`flex flex-col ${exploreFullscreen ? 'h-full min-h-0 gap-0' : 'gap-2 relative'}`}>
-          {!exploreFullscreen && (
-            <div className="flex items-start justify-between gap-2 shrink-0">
-              <div className="min-w-0 flex items-start gap-1.5">
-                <span
-                  className={`shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5 ${
-                    exploreVod.platform === 'Kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
-                  }`}
-                  title={`${exploreVod.platform} #${exploreVod.platformListIndex}`}
-                >
-                  {exploreVod.platformListIndex}
-                </span>
-                <div className="min-w-0">
-                  <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                    Channel explore
-                  </span>
-                  <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
-                    {exploreVod.title}
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => void closeExplorePlayer()}
-                className="text-zinc-500 hover:text-white p-0.5 shrink-0"
-                title="Close player"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          )}
-          <div
-            ref={exploreVideoWrapRef}
-            className={`relative bg-black overflow-hidden w-full ${
-              exploreFullscreen ? 'flex-1 min-h-0 border-0' : 'border-2 border-zinc-700 shrink-0'
-            }`}
-            style={exploreFullscreen ? undefined : { aspectRatio: exploreVideoAspect }}
-            onClick={(e) => {
-              if ((e.target as HTMLElement).tagName === 'VIDEO') {
-                toggleExplorePlay();
-              }
-            }}
-          >
-            <video
-              ref={exploreVideoRef}
-              className="w-full h-full object-contain"
-              muted={exploreMuted}
-              playsInline
-              onLoadedMetadata={handleExploreLoadedMetadata}
-              onTimeUpdate={handleExploreTimeUpdate}
-              onPlay={() => setExplorePlaying(true)}
-              onPause={() => setExplorePlaying(false)}
+      {explorePopups.length > 0 && createPortal(
+        <>
+          {explorePopups.map((entry) => (
+            <ChannelExplorePopup
+              key={entry.id}
+              id={entry.id}
+              vod={entry.vod}
+              zIndex={EXPLORE_POPUP_Z + (exploreZOrder[entry.id] ?? 0)}
+              stackIndex={entry.layoutIndex}
+              volumeMenuCloseTick={exploreVolumeMenuCloseTick}
+              onClose={() => closeExplorePopup(entry.id)}
+              onCarryToUrl={selectVod}
+              onRegisterPause={registerExplorePause}
+              onUnregisterPause={unregisterExplorePause}
+              onVolumeMenuOpen={handleExploreVolumeMenuOpen}
+              onBringToFront={() => bringExplorePopupToFront(entry.id)}
             />
-            {exploreLoading && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
-                <Loader2 size={28} className="animate-spin text-zinc-300" />
-              </div>
-            )}
-            {exploreError && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-20 p-3">
-                <p className="text-red-400 text-[10px] font-mono text-center">{exploreError}</p>
-              </div>
-            )}
-            {exploreFullscreen && (
-              <>
-                <div
-                  className={`absolute inset-x-0 bottom-0 z-10 flex flex-col gap-1.5 px-3 pb-3 pt-8 bg-gradient-to-t from-black/50 to-transparent transition-opacity duration-150 ${
-                    exploreFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                  }`}
-                  onMouseMove={bumpExploreFsControls}
-                >
-                  {exploreTimelineUi}
-                  <div className="flex items-center gap-2 pr-14">
-                    <button
-                      type="button"
-                      onClick={toggleExplorePlay}
-                      disabled={!exploreReady}
-                      className="border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]"
-                    >
-                      {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
-                    </button>
-                    {exploreVolumeUi(true)}
-                    <button
-                      type="button"
-                      onClick={carryExploreToUrl}
-                      className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                      title="Send to URL panel for rip"
-                    >
-                      <ArrowRightToLine size={14} />
-                      URL
-                    </button>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void toggleExploreFullscreen()}
-                  disabled={!exploreReady}
-                  className="absolute bottom-0 right-0 z-20 flex items-end justify-end min-w-[3.5rem] min-h-[3.5rem] p-4 pointer-events-auto border border-white/20 bg-black/25 text-zinc-100 backdrop-blur-[1px] disabled:opacity-30"
-                  title="Exit fullscreen"
-                >
-                  <Minimize2 size={18} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void closeExplorePlayer()}
-                  className="absolute top-3 right-3 z-20 text-zinc-400 hover:text-white p-2 pointer-events-auto"
-                  title="Close player"
-                >
-                  <X size={20} />
-                </button>
-              </>
-            )}
-          </div>
-          {!exploreFullscreen && (
-            <>
-              {exploreTimelineUi}
-              <p className="text-[8px] font-mono text-zinc-600 uppercase tracking-wider text-center shrink-0">
-                Fullscreen to explore
-              </p>
-              <div className="flex items-center justify-between gap-2 shrink-0">
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={toggleExplorePlay}
-                    disabled={!exploreReady}
-                    className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40"
-                  >
-                    {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
-                  </button>
-                  {exploreVolumeUi(false)}
-                  <button
-                    type="button"
-                    onClick={carryExploreToUrl}
-                    className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                    title="Send to URL panel for rip"
-                  >
-                    <ArrowRightToLine size={14} />
-                    URL
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void toggleExploreFullscreen()}
-                  disabled={!exploreReady}
-                  className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
-                  title="Fullscreen"
-                >
-                  <Maximize2 size={18} />
-                </button>
-              </div>
-            </>
-          )}
-          </div>
-          {!exploreFullscreen && (
-            <PanelResizeHandles onPointerDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
-          )}
-        </div>,
+          ))}
+        </>,
         document.getElementById('explore-portal') ?? document.body,
       )}
       <div className="fixed bottom-10 right-10 text-zinc-800 font-black text-9xl opacity-10 pointer-events-none select-none z-[-1] blur-sm">

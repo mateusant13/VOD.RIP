@@ -54,6 +54,14 @@ textarea {
   user-select: text;
 }
 
+/* Panel resize hit zones — invisible until cursor hover on the panel */
+[data-panel-resize] {
+  background: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+}
+
 select {
   -webkit-appearance: none;
   -moz-appearance: none;
