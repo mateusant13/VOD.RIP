@@ -35,6 +35,24 @@ input[type="range"] {
   cursor: pointer;
 }
 
+input[type="range"].url-trim-range {
+  height: 0.5rem;
+  margin: 0.125rem 0;
+}
+
+input[type="range"].url-trim-range::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+}
+
+input[type="range"].url-trim-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: none;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 4px;
 }
