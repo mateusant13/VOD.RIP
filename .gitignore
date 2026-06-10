@@ -69,3 +69,6 @@ debug_full_flow.py
 
 # AI agent memory (not project documentation)
 KickDownloader/AGENTS.md
+
+# Generated audit reports
+report/
