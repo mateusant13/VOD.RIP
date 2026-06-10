@@ -22,8 +22,17 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: `http://localhost:${API_PORT}`,
+        target: `http://127.0.0.1:${API_PORT}`,
         changeOrigin: true,
+        configure(proxy) {
+          proxy.on("error", (err, req) => {
+            const code = "code" in err ? (err as NodeJS.ErrnoException).code : "";
+            console.error(`[api proxy] ${code || err.message} — ${req.url}`);
+            console.error(
+              "  → FastAPI on :7897 may have crashed. Restart: npm run dev:api",
+            );
+          });
+        },
       },
     },
   },

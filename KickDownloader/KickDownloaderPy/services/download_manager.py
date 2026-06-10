@@ -1,5 +1,6 @@
 """Download manager — manages download queue, progress, and cancellation."""
 
+import logging
 import os
 import threading
 import uuid
@@ -12,6 +13,8 @@ from services.download_cleanup import delete_partial_output
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
+
+logger = logging.getLogger(__name__)
 
 # Reserve the last 10% for merge/finish so progress never sits at 100% early.
 DOWNLOAD_PROGRESS_CAP = 90
@@ -178,6 +181,11 @@ class DownloadManager:
                 if cancel_event.is_set():
                     raise ytdlp_service.CancelledError("Download cancelled by user")
                 if output_file_result and os.path.isfile(output_file_result):
+                    size = os.path.getsize(output_file_result)
+                    if size < ytdlp_service.MIN_VALID_OUTPUT_BYTES:
+                        raise RuntimeError(
+                            f"Output file too small ({size} bytes); download incomplete"
+                        )
                     with self._lock:
                         state.status = "Completed"
                         state.progress = 100
@@ -195,6 +203,15 @@ class DownloadManager:
                     state.status = "Failed"
                     state.error = str(e)
                 self._notify_sse(download_id, "error", str(e))
+                _cleanup_output()
+            except BaseException as e:
+                logger.exception(
+                    "Fatal download worker failure for %s", download_id, exc_info=e
+                )
+                with self._lock:
+                    state.status = "Failed"
+                    state.error = f"{type(e).__name__}: {e}"
+                self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             finally:
                 with self._lock:
@@ -258,6 +275,16 @@ class DownloadManager:
         active = [d for d in items if d.status not in _DONE][:50]
         history = [d for d in items if d.status in _DONE][:50]
         return {"active": active, "history": history}
+
+    def remove_history(self, download_id: str) -> bool:
+        """Drop a finished download from the in-memory history list."""
+        _DONE = frozenset({"Completed", "Failed", "Cancelled"})
+        with self._lock:
+            state = self._downloads.get(download_id)
+            if not state or state.status not in _DONE:
+                return False
+            self._downloads.pop(download_id, None)
+            return True
 
     def unregister_sse(self, download_id: str, queue):
         with self._lock:

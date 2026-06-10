@@ -7,12 +7,18 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 import subprocess as sp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
+
+# Clips shorter than this are almost certainly a broken ftyp-only placeholder.
+MIN_VALID_OUTPUT_BYTES = 50_000
+SEGMENT_DOWNLOAD_WORKERS = 8
 
 import requests
 import yt_dlp
@@ -98,9 +104,21 @@ def _resolve_ffmpeg_exe(ffmpeg_dir: Optional[str] = None) -> str:
     return "ffmpeg"
 
 
+def is_clip_url(url: str) -> bool:
+    """True for Twitch/Kick clip pages (not full VODs)."""
+    u = (url or "").lower()
+    if "clips.twitch.tv" in u:
+        return True
+    if "twitch.tv" in u and "/clip/" in u:
+        return True
+    if "kick.com" in u and "/clips/" in u:
+        return True
+    return False
+
+
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
-    if "twitch.tv" in url_lower:
+    if "clips.twitch.tv" in url_lower or "twitch.tv" in url_lower:
         return "Twitch"
     if "kick.com" in url_lower:
         return "Kick"
@@ -343,12 +361,14 @@ def _build_ydl_opts(
     if cachedir:
         opts["cachedir"] = cachedir
 
-    if quality:
+    # UI default is "source" — not a valid yt-dlp format id; omit so HLS clip
+    # extraction picks the best m3u8 variant (same as test_downloads.py).
+    if quality and quality.lower() != "source":
         m = re.search(r"(\d+)p?", quality)
         if m:
             height = m.group(1)
             opts["format"] = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
-        else:
+        elif quality not in ("best", "worst"):
             opts["format"] = quality
 
     if oauth:
@@ -426,8 +446,69 @@ def _find_hls_format(info: dict) -> dict:
     return hls_formats[0]
 
 
-def _parse_m3u8(media_url: str, headers: dict) -> list[dict]:
+def _parse_prefer_height(quality: Optional[str], default: int = 720) -> int:
+    if not quality or quality.lower() == "source":
+        return default
+    m = re.search(r"(\d+)", quality)
+    return int(m.group(1)) if m else default
+
+
+def _resolve_media_playlist(
+    media_url: str,
+    headers: dict,
+    prefer_height: int = 720,
+) -> str:
+    """Follow HLS master playlists (Kick IVS, Twitch variants) to a media playlist."""
+    r = requests.get(media_url, headers=headers, timeout=30)
+    r.raise_for_status()
+    text = r.text
+    if "#EXTINF:" in text:
+        return media_url
+
+    variants: list[tuple[int, int, str]] = []
+    lines = text.splitlines()
+    pending_bandwidth = 0
+    pending_height = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-STREAM-INF"):
+            bw_m = re.search(r"BANDWIDTH=(\d+)", stripped)
+            res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", stripped)
+            pending_bandwidth = int(bw_m.group(1)) if bw_m else 0
+            pending_height = int(res_m.group(2)) if res_m else 0
+            continue
+        if stripped and not stripped.startswith("#"):
+            variants.append((pending_height, pending_bandwidth, urljoin(media_url, stripped)))
+            pending_bandwidth = 0
+            pending_height = 0
+
+    if not variants:
+        raise RuntimeError(f"No HLS media playlist found at {media_url}")
+
+    with_height = [v for v in variants if v[0] > 0]
+    if with_height:
+        exact = [v for v in with_height if v[0] == prefer_height]
+        if exact:
+            chosen = max(exact, key=lambda item: item[1])
+        else:
+            at_or_below = [v for v in with_height if v[0] <= prefer_height]
+            if at_or_below:
+                chosen = max(at_or_below, key=lambda item: item[0])
+            else:
+                chosen = min(with_height, key=lambda item: item[0])
+    else:
+        chosen = max(variants, key=lambda item: item[1])
+
+    return _resolve_media_playlist(chosen[2], headers, prefer_height)
+
+
+def _parse_m3u8(
+    media_url: str,
+    headers: dict,
+    prefer_height: int = 720,
+) -> list[dict]:
     """Download and parse an HLS media playlist, return list of segment dicts."""
+    media_url = _resolve_media_playlist(media_url, headers, prefer_height)
     r = requests.get(media_url, headers=headers, timeout=30)
     r.raise_for_status()
     lines = r.text.splitlines()
@@ -474,6 +555,30 @@ def _select_segments(
     return selected, first_offset
 
 
+def _download_one_segment(
+    index: int,
+    seg: dict,
+    headers: dict,
+    temp_dir: str,
+    cancel_event: Optional[threading.Event],
+) -> str:
+    if cancel_event and cancel_event.is_set():
+        raise CancelledError("Download cancelled by user")
+
+    path = os.path.join(temp_dir, f"{index:05d}.ts")
+    r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(256 * 1024):
+            _check_cancelled(cancel_event)
+            if chunk:
+                f.write(chunk)
+    size = os.path.getsize(path)
+    if size < 1024:
+        raise RuntimeError(f"HLS segment {index} is too small ({size} bytes)")
+    return path
+
+
 def _download_segments(
     segments: list[dict],
     headers: dict,
@@ -481,43 +586,59 @@ def _download_segments(
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> list[str]:
-    """Download HLS segment files into *temp_dir*.
-
-    Supports cancellation (via *cancel_event*) and progress reporting
-    (via *progress_hook*, called with yt-dlp-style progress dicts).
-    """
-    files = []
+    """Download HLS segment files into *temp_dir* (parallel)."""
     total = len(segments)
-    for i, seg in enumerate(segments):
-        if cancel_event and cancel_event.is_set():
-            raise CancelledError("Download cancelled by user")
+    if total == 0:
+        raise RuntimeError("No HLS segments to download")
 
-        path = os.path.join(temp_dir, f"{i:05d}.ts")
-        r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
-        r.raise_for_status()
-        content_length = int(r.headers.get("content-length") or 0)
-        downloaded = 0
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(64 * 1024):
-                _check_cancelled(cancel_event)
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_hook and content_length > 0:
-                        seg_frac = (i + downloaded / content_length) / total
-                        progress_hook({
-                            "status": "downloading",
-                            "percent": seg_frac * 100.0,
-                        })
-        files.append(path)
+    files: list[Optional[str]] = [None] * total
+    completed = 0
+    workers = min(SEGMENT_DOWNLOAD_WORKERS, total)
 
-        if progress_hook:
-            pct = (i + 1) / total * 100.0
-            progress_hook({
-                "status": "downloading",
-                "percent": pct,
-            })
-    return files
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                _download_one_segment, i, seg, headers, temp_dir, cancel_event,
+            ): i
+            for i, seg in enumerate(segments)
+        }
+        for fut in as_completed(futures):
+            index = futures[fut]
+            files[index] = fut.result()
+            completed += 1
+            if progress_hook:
+                progress_hook({
+                    "status": "downloading",
+                    "percent": completed / total * 100.0,
+                })
+
+    return [path for path in files if path]
+
+
+def _atomic_replace(src: str, dst: str) -> None:
+    """Move *src* to *dst*, falling back to copy on cross-drive Windows paths."""
+    try:
+        os.replace(src, dst)
+    except OSError as exc:
+        winerr = getattr(exc, "winerror", None)
+        if winerr not in (17, 18) and exc.errno not in (18,):
+            raise
+        shutil.copy2(src, dst)
+        os.remove(src)
+
+
+def _verify_output_file(path: str) -> None:
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Output file missing: {path}")
+    size = os.path.getsize(path)
+    if size < MIN_VALID_OUTPUT_BYTES:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Output file too small ({size} bytes); download incomplete"
+        )
 
 
 def _concat_and_trim(
@@ -530,43 +651,45 @@ def _concat_and_trim(
     cancel_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
-    """Losslessly concatenate segment files, then trim to exact duration."""
+    """Concatenate HLS segments and trim in one lossless ffmpeg pass."""
     tmp_dir = os.path.dirname(files[0])
-    joined = os.path.join(tmp_dir, "joined.ts")
     concat_txt = os.path.join(tmp_dir, "concat.txt")
+    tmp_out = os.path.join(tmp_dir, f"clip_{uuid.uuid4().hex}.mp4")
 
     with open(concat_txt, "w", encoding="utf8") as f:
         for seg_path in files:
             posix = seg_path.replace("\\", "/")
             f.write(f"file '{posix}'\n")
 
-    _run_ffmpeg(
-        [ffmpeg_exe, "-f", "concat", "-safe", "0", "-i", concat_txt,
-         "-c", "copy", "-y", joined],
-        cancel_event=cancel_event,
-        register_abort=register_abort,
-    )
+    if progress_hook:
+        progress_hook({"status": "downloading", "percent": 92})
 
-    if offset > 0.05:
-        trim_cmd = [
-            ffmpeg_exe, "-ss", str(offset), "-i", joined,
-            "-t", str(duration),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", "-y", output_path,
-        ]
-    else:
-        trim_cmd = [
-            ffmpeg_exe, "-i", joined,
-            "-t", str(duration), "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart", "-y", output_path,
-        ]
+    cmd = [
+        ffmpeg_exe, "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", concat_txt,
+    ]
+    if offset > 0.001:
+        cmd += ["-ss", str(offset)]
+    cmd += [
+        "-t", str(duration),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-f", "mp4",
+        tmp_out,
+    ]
     _run_ffmpeg(
-        trim_cmd,
+        cmd,
         cancel_event=cancel_event,
         register_abort=register_abort,
     )
+    _verify_output_file(tmp_out)
+
+    if progress_hook:
+        progress_hook({"status": "downloading", "percent": 98})
+
+    # Atomic replace when possible; copy fallback for cross-drive temp (Windows).
+    _atomic_replace(tmp_out, output_path)
+    _verify_output_file(output_path)
 
     if progress_hook:
         progress_hook({"status": "downloading", "percent": 100})
@@ -583,11 +706,12 @@ def download_hls_media_clip(
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    prefer_height: int = 720,
 ) -> None:
     """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
     headers = headers or {}
     duration = end_sec - start_sec
-    segments = _parse_m3u8(media_url, headers)
+    segments = _parse_m3u8(media_url, headers, prefer_height)
     selected, first_offset = _select_segments(segments, start_sec, end_sec)
     selected_duration = sum(s["duration"] for s in selected)
     logger.info(
@@ -602,7 +726,10 @@ def download_hls_media_clip(
 
     resolved_ffmpeg = ffmpeg_exe or _resolve_ffmpeg_exe()
 
-    with tempfile.TemporaryDirectory(prefix="hls_clip_") as tmpdir:
+    out_parent = os.path.dirname(os.path.abspath(output_path))
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="hls_clip_", dir=out_parent or None) as tmpdir:
         files = _download_segments(
             selected, headers, tmpdir, progress_hook, cancel_event,
         )
@@ -623,6 +750,7 @@ def _download_hls_clip(
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    prefer_height: int = 720,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
     info = _extract_hls_info(url, opts)
@@ -637,6 +765,7 @@ def _download_hls_clip(
         progress_hook=progress_hook,
         cancel_event=cancel_event,
         register_abort=register_abort,
+        prefer_height=prefer_height,
     )
 
 
@@ -706,7 +835,7 @@ def download_video_sync(
     )
 
     platform = detect_platform(full_url)
-    is_hls = platform in ("Twitch", "Kick")
+    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url)
 
     if is_hls:
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)
@@ -715,6 +844,7 @@ def download_video_sync(
             progress_hook=progress_hook,
             cancel_event=cancel_event,
             register_abort=register_abort,
+            prefer_height=_parse_prefer_height(quality),
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)
@@ -728,9 +858,7 @@ def download_video_sync(
             opts["download_sections"] = [f"*{start}-{end}"]
         _ydl_download(full_url, opts, cancel_event, register_abort)
 
-    if not os.path.isfile(output_path):
-        raise RuntimeError(f"Download failed: output file not found at {output_path}")
-
+    _verify_output_file(output_path)
     return output_path
 
 

@@ -1,8 +1,12 @@
-"""Fast Kick.com access via public JSON API + curl_cffi (no browser).
+"""Fast Kick.com metadata via public JSON API + curl_cffi (no browser).
+
+Used for channel lists, VOD browse rows, and preview stream resolution.
+Actual Kick *downloads* go through headless Chromium in kick_playwright_service
+so the IVS playlist URL and session cookies match what the player uses.
 
 Endpoints used:
   GET /api/v2/channels/{slug}/videos  — channel VOD list (~1-2s)
-  GET /api/v1/video/{uuid}              — single VOD + m3u8 source (~0.5s)
+  GET /api/v1/video/{uuid}              — single VOD metadata + m3u8 (~0.5s)
   GET /api/v2/channels/{slug}           — channel metadata (~1s)
 """
 
@@ -11,7 +15,13 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from services.kick_playwright_service import KickChannel, KickVideo, _extract_slug, _extract_vod_id
+from services.kick_models import (
+    KickChannel,
+    KickVideo,
+    extract_slug,
+    extract_vod_id,
+    format_duration,
+)
 
 _IMPERSONATE = "chrome"
 _BASE = "https://kick.com"
@@ -69,11 +79,16 @@ def _normalize_created_at(value: Any) -> Optional[str]:
 
 
 def _video_from_v2_list_item(item: dict, slug: str) -> Optional[KickVideo]:
+    if item.get("is_live"):
+        return None
     video = item.get("video") if isinstance(item.get("video"), dict) else {}
     video_id = video.get("uuid") or ""
     if not video_id:
         return None
-    duration = _ms_to_seconds(item.get("duration"))
+    raw_dur = item.get("duration")
+    if raw_dur in (None, 0) and video.get("duration") is not None:
+        raw_dur = video.get("duration")
+    duration = _ms_to_seconds(raw_dur)
     return KickVideo(
         id=video_id,
         title=str(item.get("session_title") or "Untitled"),
@@ -113,6 +128,74 @@ def _video_from_v1(data: dict, slug_hint: Optional[str]) -> KickVideo:
     )
 
 
+def _clip_from_api_item(item: dict, slug: str) -> Optional[KickVideo]:
+    clip_id = str(item.get("id") or "").strip()
+    if not clip_id:
+        return None
+    views = item.get("views")
+    if views is None:
+        views = item.get("view_count")
+    dur = item.get("duration")
+    if isinstance(dur, (int, float)) and dur > 0 and dur < 1000:
+        duration = float(dur)
+    else:
+        duration = _ms_to_seconds(dur)
+    return KickVideo(
+        id=clip_id,
+        title=str(item.get("title") or "Untitled"),
+        duration=duration,
+        thumbnail=item.get("thumbnail_url") if isinstance(item.get("thumbnail_url"), str) else None,
+        views=int(views) if isinstance(views, (int, float)) else None,
+        created_at=_normalize_created_at(item.get("created_at")),
+        channel=slug,
+        url=f"https://kick.com/{slug}/clips/{clip_id}",
+    )
+
+
+def list_channel_clips_api(slug: str, limit: int = 10) -> List[KickVideo]:
+    """Last *limit* clips by date, then ranked by views (desc)."""
+    referer = f"{_BASE}/{slug}/clips"
+    data = _get_json(f"/api/v2/channels/{slug}/clips", referer)
+    raw = data.get("clips") if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        raise RuntimeError("Unexpected Kick clips API response")
+    parsed: List[KickVideo] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        clip = _clip_from_api_item(item, slug)
+        if clip and clip.id not in seen:
+            seen.add(clip.id)
+            parsed.append(clip)
+    parsed.sort(key=lambda c: c.created_at or "", reverse=True)
+    recent = parsed[: max(1, min(int(limit), 10))]
+    recent.sort(key=lambda c: c.views or 0, reverse=True)
+    return recent
+
+
+def list_channel_clips_sync(url: str, limit: int = 10) -> list[dict]:
+    slug = extract_slug(url)
+    if not slug:
+        raise ValueError(f"Not a Kick channel URL: {url}")
+    clips = list_channel_clips_api(slug, limit)
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "url": c.url,
+            "thumbnail": c.thumbnail,
+            "duration": c.duration,
+            "duration_string": format_duration(c.duration),
+            "created_at": c.created_at,
+            "views": c.views,
+            "channel": c.channel or slug,
+            "content_kind": "clip",
+        }
+        for c in clips
+    ]
+
+
 def list_channel_videos_api(slug: str, limit: int = 20) -> List[KickVideo]:
     referer = f"{_BASE}/{slug}/videos"
     data = _get_json(f"/api/v2/channels/{slug}/videos", referer)
@@ -133,10 +216,10 @@ def list_channel_videos_api(slug: str, limit: int = 20) -> List[KickVideo]:
 
 
 def get_video_info_api(url: str) -> KickVideo:
-    video_id = _extract_vod_id(url)
+    video_id = extract_vod_id(url)
     if not video_id:
         raise ValueError(f"Not a Kick VOD URL: {url}")
-    slug = _extract_slug(url)
+    slug = extract_slug(url)
     referer = url if url.startswith("http") else f"{_BASE}/{slug}/videos/{video_id}"
     data = _get_json(f"/api/v1/video/{video_id}", referer)
     if not isinstance(data, dict):
@@ -148,7 +231,7 @@ def get_video_info_api(url: str) -> KickVideo:
 
 
 def get_channel_api(url: str) -> KickChannel:
-    slug = _extract_slug(url)
+    slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
     data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}")
@@ -164,3 +247,99 @@ def get_channel_api(url: str) -> KickChannel:
         is_live=bool(ls),
         live_title=(ls.get("session_title") if ls else None),
     )
+
+
+# Sync helpers for FastAPI routes — curl_cffi only, never Playwright.
+def get_video_info_sync(url: str) -> dict:
+    v = get_video_info_api(url)
+    return {
+        "id": v.id,
+        "title": v.title,
+        "uploader": v.channel,
+        "channel": v.channel,
+        "duration": v.duration,
+        "duration_string": format_duration(v.duration),
+        "thumbnail": v.thumbnail,
+        "views": v.views,
+        "category": v.category,
+        "webpage_url": v.url,
+        "qualities": [],
+        "platform": "Kick",
+        "created_at": v.created_at,
+    }
+
+
+def list_channel_videos_sync(url: str, limit: int = 20) -> list[dict]:
+    slug = extract_slug(url)
+    if not slug:
+        raise ValueError(f"Not a Kick channel URL: {url}")
+    vids = list_channel_videos_api(slug, limit)
+    return [
+        {
+            "id": v.id,
+            "title": v.title,
+            "url": v.url,
+            "thumbnail": v.thumbnail,
+            "duration": v.duration,
+            "duration_string": format_duration(v.duration),
+            "created_at": v.created_at,
+            "views": v.views,
+            "channel": v.channel or slug,
+            "content_kind": "vod",
+        }
+        for v in vids
+    ]
+
+
+def get_channel_info_sync(url: str) -> dict:
+    ch = get_channel_api(url)
+    return {
+        "slug": ch.slug,
+        "username": ch.username,
+        "channel_id": ch.channel_id,
+        "followers": ch.followers,
+        "is_live": ch.is_live,
+        "live_title": ch.live_title,
+    }
+
+
+def download_vod_sync(
+    url: str,
+    output_path: str,
+    quality: Optional[str] = None,
+    crop_start: Optional[float] = None,
+    crop_end: Optional[float] = None,
+    progress_hook=None,
+    cancel_event=None,
+    register_abort=None,
+    **_,
+) -> str:
+    """Download a Kick VOD clip via the fast JSON API + HLS segments (no browser)."""
+    from services.ytdlp_service import (
+        _parse_prefer_height,
+        _require_crop_range,
+        _resolve_ffmpeg_exe,
+        _verify_output_file,
+        download_hls_media_clip,
+    )
+
+    info = get_video_info_api(url)
+    if not info.m3u8_url:
+        raise RuntimeError("Kick API returned no HLS source for this VOD")
+    start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+    page_url = info.url or url
+    headers = {"referer": page_url, "origin": _BASE}
+    download_hls_media_clip(
+        info.m3u8_url,
+        start_sec,
+        end_sec,
+        output_path,
+        headers=headers,
+        ffmpeg_exe=_resolve_ffmpeg_exe(),
+        progress_hook=progress_hook,
+        cancel_event=cancel_event,
+        register_abort=register_abort,
+        prefer_height=_parse_prefer_height(quality),
+    )
+    _verify_output_file(output_path)
+    return output_path

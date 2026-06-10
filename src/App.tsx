@@ -4,7 +4,7 @@ import Hls from 'hls.js';
 import {
   Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
   Users, Database, Settings2, StopCircle, Loader2,
-  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus,
+  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
@@ -59,11 +59,13 @@ interface ChannelVideo {
   platform: string;
   title: string;
   duration: number | null;
+  duration_string?: string | null;
   created_at: string | null;
   views: number | null;
   thumbnail_url: string | null;
   url: string;
   channel: string;
+  content_kind?: 'vod' | 'clip';
 }
 
 interface ListedChannelVideo extends ChannelVideo {
@@ -98,6 +100,7 @@ type Tab = 'url' | 'channels' | 'queue' | 'settings';
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const API_BASE = '';
+const API_TIMEOUT_MS = 45_000;
 
 const BACKEND_HINT =
   'Backend not running. In a terminal run: npm run dev:all  (or npm run dev:api in one terminal and npm run dev in another). API must be on http://localhost:7897.';
@@ -109,13 +112,25 @@ function apiErrorMessage(res: Response, fallback: string): string {
   return fallback;
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  let res: Response;
+async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   try {
-    res = await fetch(`${API_BASE}${path}`);
-  } catch {
+    return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(
+        'Request timed out — the API may be hung. Stop and restart: npm run dev:api (or npm run dev:all).',
+      );
+    }
     throw new Error(BACKEND_HINT);
+  } finally {
+    window.clearTimeout(timer);
   }
+}
+
+async function apiGet<T>(path: string): Promise<T> {
+  const res = await apiFetch(path);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
@@ -124,16 +139,11 @@ async function apiGet<T>(path: string): Promise<T> {
 }
 
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    throw new Error(BACKEND_HINT);
-  }
+  const res = await apiFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
@@ -142,12 +152,7 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function apiDelete(path: string): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
-  } catch {
-    throw new Error(BACKEND_HINT);
-  }
+  const res = await apiFetch(path, { method: 'DELETE' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
@@ -232,6 +237,106 @@ function formatHmsFull(sec: number): string {
   const s = sec % 60;
   const pad = (n: number) => n.toString().padStart(2, '0');
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+function EditableHmsTime({
+  valueSec,
+  minSec,
+  maxSec,
+  onChange,
+  className = '',
+}: {
+  valueSec: number;
+  minSec: number;
+  maxSec: number;
+  onChange: (sec: number) => void;
+  className?: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+
+  const clamp = useCallback(
+    (sec: number) => Math.max(minSec, Math.min(maxSec, Math.floor(sec))),
+    [minSec, maxSec],
+  );
+
+  const commit = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const parsed = parseHms((el.textContent || '').trim());
+    onChange(clamp(parsed));
+    setEditing(false);
+  }, [clamp, onChange]);
+
+  useLayoutEffect(() => {
+    if (!editing || !ref.current) return;
+    ref.current.textContent = formatHmsFull(valueSec);
+    const el = ref.current;
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    el.focus();
+  }, [editing, valueSec]);
+
+  if (!editing) {
+    return (
+      <span
+        role="button"
+        tabIndex={0}
+        title="Click to edit (HH:MM:SS)"
+        className={`cursor-text rounded px-0.5 hover:bg-zinc-800/80 focus:outline-none focus:ring-1 focus:ring-zinc-600 ${className}`}
+        onClick={() => setEditing(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setEditing(true);
+          }
+          if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            onChange(clamp(valueSec + 1));
+          }
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            onChange(clamp(valueSec - 1));
+          }
+        }}
+      >
+        {formatHmsFull(valueSec)}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      ref={ref}
+      contentEditable
+      suppressContentEditableWarning
+      className={`rounded px-0.5 bg-zinc-800 outline-none ring-1 ring-zinc-500 ${className}`}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commit();
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setEditing(false);
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          onChange(clamp(valueSec + 1));
+          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec + 1));
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          onChange(clamp(valueSec - 1));
+          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec - 1));
+        }
+      }}
+    />
+  );
 }
 
 const PREVIEW_KEY_SKIP_SEC = 5;
@@ -753,6 +858,28 @@ function detectUrlPlatform(u: string): 'kick' | 'twitch' | null {
   return null;
 }
 
+function isClipUrl(u: string): boolean {
+  const l = u.toLowerCase();
+  if (l.includes('clips.twitch.tv')) return true;
+  if (l.includes('twitch.tv') && l.includes('/clip/')) return true;
+  if (l.includes('kick.com') && l.includes('/clips/')) return true;
+  return false;
+}
+
+function channelVideoDurationSec(v: ChannelVideo): number | null {
+  if (v.duration != null && v.duration > 0) return Math.floor(v.duration);
+  if (v.duration_string) {
+    const parts = v.duration_string.split(':').map(Number);
+    if (parts.length === 3 && parts.every((n) => !Number.isNaN(n))) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    if (parts.length === 2 && parts.every((n) => !Number.isNaN(n))) {
+      return parts[0] * 60 + parts[1];
+    }
+  }
+  return null;
+}
+
 function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
   if (platform === 'kick') {
     return 'hover:bg-[#53fc18] hover:text-black hover:border-[#53fc18] hover:shadow-[4px_4px_0px_0px_#53fc18]';
@@ -787,14 +914,17 @@ function loadSavedChannels(): SavedChannel[] {
     const raw = localStorage.getItem(CHANNELS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    // Never restore in-flight loading — a refresh mid-fetch would spin forever.
+    return parsed.map((ch) => ({ ...ch, loading: false }));
   } catch {
     return [];
   }
 }
 
 function persistChannels(channels: SavedChannel[]) {
-  localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(channels));
+  const toStore = channels.map(({ loading: _loading, ...ch }) => ch);
+  localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(toStore));
 }
 
 function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
@@ -849,6 +979,8 @@ function channelVodSubline(v: ChannelVideo): string {
   const parts: string[] = [];
   const when = fmtDateAndAgo(v.created_at);
   if (when) parts.push(when);
+  const durSec = channelVideoDurationSec(v);
+  if (durSec != null) parts.push(fmtDuration(durSec));
   if (v.views != null && Number(v.views) > 0) {
     parts.push(`${fmtViews(Number(v.views))} views`);
   }
@@ -868,11 +1000,18 @@ function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }: { platform: st
 }
 
 function buildVodUrl(v: ChannelVideo): string {
+  if (v.url) return v.url;
   const isTw = v.platform === 'Twitch';
+  const isClip = v.content_kind === 'clip';
   const twitchId = isTw && v.id.startsWith('v') ? v.id.slice(1) : v.id;
-  return v.url || (isTw
-    ? `https://www.twitch.tv/videos/${twitchId}`
-    : `https://kick.com/${v.channel || ''}/videos/${v.id}`);
+  if (isTw) {
+    return isClip
+      ? `https://clips.twitch.tv/${twitchId}`
+      : `https://www.twitch.tv/videos/${twitchId}`;
+  }
+  return isClip
+    ? `https://kick.com/${v.channel || ''}/clips/${v.id}`
+    : `https://kick.com/${v.channel || ''}/videos/${v.id}`;
 }
 
 function bytes(mb: number): string {
@@ -926,6 +1065,7 @@ export default function App() {
   const previewSuppressPlayRef = useRef(false);
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
+  const previewNeedleRailRef = useRef<HTMLDivElement>(null);
 
   // Channel explore players (up to 5 floating popups)
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
@@ -970,6 +1110,7 @@ export default function App() {
   // How many cached VODs to show per platform (expand is client-side only).
   const [kickVisibleLimit, setKickVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
   const [twitchVisibleLimit, setTwitchVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
+  const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips'>('vods');
 
   const selectedChannel = useMemo(
     () => savedChannels.find((c) => c.id === selectedChannelId) ?? null,
@@ -995,7 +1136,9 @@ export default function App() {
     const items: ChannelVideo[] = [];
     if (kickEnabled) items.push(...kickChannelVideos.slice(0, kickVisibleLimit));
     if (twitchEnabled) items.push(...twitchChannelVideos.slice(0, twitchVisibleLimit));
-    const sorted = items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
+    const sorted = channelContentFilter === 'clips'
+      ? items.sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0))
+      : items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
     let kickN = 0;
     let twitchN = 0;
     return sorted.map((v): ListedChannelVideo => ({
@@ -1009,6 +1152,7 @@ export default function App() {
     twitchEnabled,
     kickVisibleLimit,
     twitchVisibleLimit,
+    channelContentFilter,
   ]);
 
   const canExpandKick = kickEnabled && kickVisibleLimit < kickChannelVideos.length;
@@ -1231,6 +1375,14 @@ export default function App() {
     setPreviewVideoLoading(false);
   }, [previewOpen, previewHlsUrl]);
 
+  useEffect(() => {
+    if (!previewOpen) return;
+    previewTrimStartRef.current = trimStartSec;
+    previewTrimEndRef.current = trimEndSec;
+    setPreviewTrimStart(trimStartSec);
+    setPreviewTrimEnd(trimEndSec);
+  }, [previewOpen, trimStartSec, trimEndSec]);
+
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video) return;
@@ -1296,6 +1448,56 @@ export default function App() {
     const t = start + (end - start) * Math.max(0, Math.min(1, fraction));
     seekPreviewVideo(t);
   }, [seekPreviewVideo]);
+
+  const applyPreviewClipRange = useCallback((start: number, end: number) => {
+    const dur = Math.max(1, vodDurationSec);
+    const s = Math.max(0, Math.min(Math.floor(start), Math.floor(end) - 1));
+    const e = Math.min(dur, Math.max(Math.floor(end), s + 1));
+    setTrimStartSec(s);
+    setTrimEndSec(e);
+    previewTrimStartRef.current = s;
+    previewTrimEndRef.current = e;
+    setPreviewTrimStart(s);
+    setPreviewTrimEnd(e);
+  }, [vodDurationSec]);
+
+  const beginPreviewNeedleDrag = useCallback((
+    e: ReactPointerEvent<HTMLElement>,
+    which: 'in' | 'out',
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rail = previewNeedleRailRef.current;
+    if (!rail || vodDurationSec <= 0) return;
+
+    const xToSec = (clientX: number) => {
+      const rect = rail.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return Math.round(frac * vodDurationSec);
+    };
+
+    let start = trimStartSec;
+    let end = trimEndSec;
+
+    const onMove = (ev: PointerEvent) => {
+      const sec = xToSec(ev.clientX);
+      if (which === 'in') {
+        start = Math.max(0, Math.min(sec, end - 1));
+      } else {
+        end = Math.min(vodDurationSec, Math.max(sec, start + 1));
+      }
+      applyPreviewClipRange(start, end);
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    onMove(e.nativeEvent);
+  }, [trimStartSec, trimEndSec, vodDurationSec, applyPreviewClipRange]);
 
   const setPreviewVolumeLevel = useCallback((level: number) => {
     const video = previewVideoRef.current;
@@ -1616,7 +1818,8 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const info = await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmed)}`);
+      const infoPath = isClipUrl(trimmed) ? '/api/info/clip' : '/api/info/video';
+      const info = await apiGet<VideoInfo>(`${infoPath}?id=${encodeURIComponent(trimmed)}`);
       setUrl(trimmed);
       setVideoInfo(info);
       setQuality(bestAvailableQuality(info));
@@ -1696,17 +1899,22 @@ export default function App() {
       setError('Choose a download folder to continue.');
       return;
     }
-    if (trimEndSec <= trimStartSec) {
+    const clipDownload = isClipUrl(url.trim());
+    if (!clipDownload && trimEndSec <= trimStartSec) {
       setError('Set a valid trim range before downloading.');
       return;
     }
     try {
-      const result = await apiPost<{ download_id: string; status: string }>('/api/download/video', {
-        url: url.trim(),
-        quality: quality || undefined,
-        crop_start: trimStartSec,
-        crop_end: trimEndSec,
-      });
+      const endpoint = clipDownload ? '/api/download/clip' : '/api/download/video';
+      const body = clipDownload
+        ? { url: url.trim(), quality: quality || undefined }
+        : {
+            url: url.trim(),
+            quality: quality || undefined,
+            crop_start: trimStartSec,
+            crop_end: trimEndSec,
+          };
+      const result = await apiPost<{ download_id: string; status: string }>(endpoint, body);
       setTab('queue');
       refreshDownloads();
     } catch (err: any) {
@@ -1733,6 +1941,16 @@ export default function App() {
       setError(err.message || 'Failed to cancel download');
     }
     refreshDownloads();
+  }, [refreshDownloads]);
+
+  const handleDeleteHistory = useCallback(async (id: string) => {
+    try {
+      await apiDelete(`/api/download/${id}`);
+      setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    } catch (err: any) {
+      setError(err.message || 'Failed to remove from history');
+      refreshDownloads();
+    }
   }, [refreshDownloads]);
 
   // Poll while any download is active (any tab)
@@ -1778,38 +1996,44 @@ export default function App() {
     const errs: Record<string, string> = {};
     const merged: ChannelVideo[] = [];
 
-    const fetchOne = async (platform: 'Kick' | 'Twitch', slug: string) => {
-      const qs = `url=${encodeURIComponent(slug)}&limit=${CHANNEL_FETCH_LIMIT}&days=14&platforms=${encodeURIComponent(platform)}`;
-      try {
-        const data = await apiGet<ChannelResponse>(`/api/channel/videos?${qs}`);
-        merged.push(...data.videos);
-        const pe = data.per_platform_errors?.[platform];
-        if (pe) errs[platform] = pe;
-      } catch (err: any) {
-        errs[platform] = err.message || `Failed to fetch ${platform}`;
+    try {
+      const fetchOne = async (platform: 'Kick' | 'Twitch', slug: string) => {
+        const contentQs = channelContentFilter === 'clips' ? '&content=clips' : '';
+        const qs = `url=${encodeURIComponent(slug)}&limit=${CHANNEL_FETCH_LIMIT}&days=14&platforms=${encodeURIComponent(platform)}${contentQs}`;
+        try {
+          const data = await apiGet<ChannelResponse>(`/api/channel/videos?${qs}`);
+          merged.push(...data.videos);
+          const pe = data.per_platform_errors?.[platform];
+          if (pe) errs[platform] = pe;
+        } catch (err: any) {
+          errs[platform] = err.message || `Failed to fetch ${platform}`;
+        }
+      };
+
+      await Promise.all([
+        fetchOne('Kick', ch.kickSlug),
+        fetchOne('Twitch', ch.twitchSlug),
+      ]);
+
+      updateChannel(channelId, {
+        videos: merged,
+        errors: errs,
+        loading: false,
+        updatedAt: new Date().toISOString(),
+      });
+
+      const errKeys = Object.keys(errs).filter((k) => errs[k]);
+      if (errKeys.length) {
+        setChannelsError(
+          merged.length
+            ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
+            : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
+        );
       }
-    };
-
-    await fetchOne('Kick', ch.kickSlug);
-    await new Promise((r) => setTimeout(r, 300));
-    await fetchOne('Twitch', ch.twitchSlug);
-
-    updateChannel(channelId, {
-      videos: merged,
-      errors: errs,
-      loading: false,
-      updatedAt: new Date().toISOString(),
-    });
-
-    const errKeys = Object.keys(errs).filter((k) => errs[k]);
-    if (errKeys.length) {
-      setChannelsError(
-        merged.length
-          ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
-          : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
-      );
+    } finally {
+      updateChannel(channelId, { loading: false });
     }
-  }, [savedChannels, updateChannel]);
+  }, [savedChannels, updateChannel, channelContentFilter]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -1947,8 +2171,12 @@ export default function App() {
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
 
+  const currentIsClip = isClipUrl(url);
+
   // ── Size estimate ──
-  const clipSec = Math.max(0, trimEndSec - trimStartSec);
+  const clipSec = currentIsClip && videoInfo?.duration
+    ? Math.max(1, Math.floor(videoInfo.duration))
+    : Math.max(0, trimEndSec - trimStartSec);
 
   const rates: Record<string, number> = {
     source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
@@ -2001,7 +2229,7 @@ export default function App() {
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder={urlFetched ? 'VOD link' : 'PASTE VOD LINK HERE...'}
+            placeholder={urlFetched ? 'VOD or clip link' : 'PASTE VOD OR CLIP LINK...'}
             onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
             className={urlInputClass}
           />
@@ -2095,14 +2323,26 @@ export default function App() {
             </div>
           </div>
 
+          {!currentIsClip && (
           <div className="flex flex-col gap-2.5 shrink-0 py-0.5">
             <div className="flex justify-between items-center">
               <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Trim</span>
               <span className="text-xs font-mono text-zinc-400">{formatHmsFull(trimEndSec - trimStartSec)}</span>
             </div>
             <div className="flex justify-between text-xs font-mono text-white px-0.5">
-              <span>{formatHmsFull(trimStartSec)}</span>
-              <span className="text-zinc-500">{formatHmsFull(trimEndSec)}</span>
+              <EditableHmsTime
+                valueSec={trimStartSec}
+                minSec={0}
+                maxSec={Math.max(0, Math.min(trimEndSec - 1, vodDurationSec - 1))}
+                onChange={setTrimStartSec}
+              />
+              <EditableHmsTime
+                valueSec={trimEndSec}
+                minSec={Math.min(vodDurationSec, trimStartSec + 1)}
+                maxSec={vodDurationSec}
+                onChange={setTrimEndSec}
+                className="text-zinc-500"
+              />
             </div>
             <input type="range" min={0} max={vodDurationSec} step={1} value={Math.min(trimStartSec, trimEndSec - 1)}
               onChange={(e) => {
@@ -2123,6 +2363,7 @@ export default function App() {
               Preview
             </button>
           </div>
+          )}
 
           <button
             onClick={handleStartDownload}
@@ -2135,7 +2376,7 @@ export default function App() {
             }`}
           >
             <Download size={16} strokeWidth={3} />
-            <span>VOD rip it!</span>
+            <span>{currentIsClip ? 'Clip rip it!' : 'VOD rip it!'}</span>
           </button>
         </div>
       )}
@@ -2200,24 +2441,87 @@ export default function App() {
     );
   };
 
+  const previewClipPct = vodDurationSec > 0
+    ? {
+        start: (trimStartSec / vodDurationSec) * 100,
+        end: (trimEndSec / vodDurationSec) * 100,
+        play: (previewCurrentTime / vodDurationSec) * 100,
+      }
+    : { start: 0, end: 100, play: 0 };
+
   const previewTimelineUi = (
-    <div className="flex items-center gap-2">
-      <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
-        {formatHmsFull(previewCurrentTime)}
-      </span>
-      <input
-        type="range"
-        min={previewTrimStart}
-        max={previewTrimEnd}
-        step={0.25}
-        value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
-        disabled={!previewVideoReady}
-        onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
-        className="flex-1 accent-white disabled:opacity-40"
-      />
-      <span className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
-        {formatHmsFull(previewTrimEnd)}
-      </span>
+    <div className="flex flex-col gap-0.5 w-full">
+      {vodDurationSec > 0 && (
+        <div className="flex items-center gap-2">
+          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider ${
+            previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
+          }`}>
+            Clip
+          </span>
+          <div
+            ref={previewNeedleRailRef}
+            className={`preview-needle-rail relative flex-1 h-3 ${
+              previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
+            }`}
+            title="Drag needles to set download range"
+          >
+            <div
+              className="preview-needle-region absolute top-1/2 -translate-y-1/2 h-1 pointer-events-none"
+              style={{
+                left: `${previewClipPct.start}%`,
+                width: `${Math.max(0, previewClipPct.end - previewClipPct.start)}%`,
+              }}
+            />
+            <div
+              className="preview-needle-playhead absolute top-0 bottom-0 w-px bg-white/50 -translate-x-1/2 pointer-events-none z-[1]"
+              style={{ left: `${previewClipPct.play}%` }}
+            />
+            <div
+              role="slider"
+              aria-label="Clip in"
+              aria-valuemin={0}
+              aria-valuemax={vodDurationSec}
+              aria-valuenow={trimStartSec}
+              className="preview-needle preview-needle-in absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
+              style={{ left: `${previewClipPct.start}%` }}
+              onPointerDown={(e) => beginPreviewNeedleDrag(e, 'in')}
+            />
+            <div
+              role="slider"
+              aria-label="Clip out"
+              aria-valuemin={0}
+              aria-valuemax={vodDurationSec}
+              aria-valuenow={trimEndSec}
+              className="preview-needle preview-needle-out absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
+              style={{ left: `${previewClipPct.end}%` }}
+              onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
+            />
+          </div>
+          <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
+            previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
+          }`}>
+            {formatHmsFull(trimEndSec - trimStartSec)}
+          </span>
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
+          {formatHmsFull(previewCurrentTime)}
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={vodDurationSec}
+          step={0.25}
+          value={Math.min(Math.max(previewCurrentTime, 0), vodDurationSec)}
+          disabled={!previewVideoReady || vodDurationSec <= 0}
+          onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
+          className="flex-1 accent-white disabled:opacity-40"
+        />
+        <span className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
+          {formatHmsFull(vodDurationSec)}
+        </span>
+      </div>
     </div>
   );
 
@@ -2254,14 +2558,25 @@ export default function App() {
             : 'border-2 border-zinc-600 bg-zinc-950'}
         />
       </div>
-      {!opts.fsCornerExit && (
-        <button type="button" onClick={() => void togglePreviewFullscreen()}
-          disabled={!previewVideoReady}
+      <div className="flex items-center gap-1.5 ml-auto">
+        <button
+          type="button"
+          onClick={() => void handleStartDownload()}
+          disabled={!previewVideoReady || !videoInfo || trimEndSec <= trimStartSec}
           className={previewCtrlBtn(previewFullscreen, true)}
-          title="Fullscreen">
-          <Maximize2 size={18} />
+          title="Download selected clip"
+        >
+          <Scissors size={18} />
         </button>
-      )}
+        {!opts.fsCornerExit && (
+          <button type="button" onClick={() => void togglePreviewFullscreen()}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen, true)}
+            title="Fullscreen">
+            <Maximize2 size={18} />
+          </button>
+        )}
+      </div>
     </div>
   );
 
@@ -2600,6 +2915,41 @@ export default function App() {
                     </div>
                   );
                 })}
+                <div className="flex items-center gap-2 font-mono text-[10px] uppercase shrink-0">
+                  <span className="text-zinc-500">Show:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (channelContentFilter !== 'vods') {
+                        setChannelContentFilter('vods');
+                        if (selectedChannelId) void refreshChannel(selectedChannelId);
+                      }
+                    }}
+                    className={`px-2 py-0.5 border font-bold ${
+                      channelContentFilter === 'vods'
+                        ? 'border-white text-white bg-zinc-900'
+                        : 'border-zinc-700 text-zinc-500 hover:text-white'
+                    }`}
+                  >
+                    VODs
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (channelContentFilter !== 'clips') {
+                        setChannelContentFilter('clips');
+                        if (selectedChannelId) void refreshChannel(selectedChannelId);
+                      }
+                    }}
+                    className={`px-2 py-0.5 border font-bold ${
+                      channelContentFilter === 'clips'
+                        ? 'border-white text-white bg-zinc-900'
+                        : 'border-zinc-700 text-zinc-500 hover:text-white'
+                    }`}
+                  >
+                    Only clips
+                  </button>
+                </div>
               </div>
             )}
 
@@ -2614,12 +2964,16 @@ export default function App() {
                     <Loader2 size={18} className="animate-spin" />
                   </div>
                 ) : visibleChannelVideos.length === 0 ? (
-                  <p className="text-center text-zinc-600 font-mono text-[10px] py-4">No VODs</p>
+                  <p className="text-center text-zinc-600 font-mono text-[10px] py-4">
+                    {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
+                  </p>
                 ) : (
                   <div className="flex flex-col gap-1">
                     {visibleChannelVideos.map((v, i) => {
                       const fullUrl = buildVodUrl(v);
                       const subline = channelVodSubline(v);
+                      const durSec = channelVideoDurationSec(v);
+                      const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
                       return (
                         <div
                           key={`${v.platform}-${v.id}-${i}`}
@@ -2647,7 +3001,7 @@ export default function App() {
                               <PlatformVodIcon platform={v.platform} />
                               <span className="truncate">
                                 {v.title || 'Untitled'}
-                                {v.duration ? <span className="text-zinc-500 ml-1">{fmtShort(v.duration)}</span> : null}
+                                {durSec != null ? <span className="text-zinc-500 ml-1">{fmtShort(durSec)}</span> : null}
                               </span>
                             </span>
                             {subline && (
@@ -2656,6 +3010,7 @@ export default function App() {
                               </span>
                             )}
                           </div>
+                          {!isClipItem && (
                           <button
                             type="button"
                             title="Preview VOD"
@@ -2668,6 +3023,7 @@ export default function App() {
                             <Eye size={10} />
                             Preview
                           </button>
+                          )}
                           <button
                             type="button"
                             title="Open in browser"
@@ -2719,7 +3075,7 @@ export default function App() {
                   <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
                     <div className="flex justify-between items-center gap-2">
                       <div className="flex items-center gap-2 min-w-0">
-                        <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: color }} />
+                        <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                         <span className="text-xs font-mono text-zinc-300 truncate">
                           {dl.title || dl.url}
                         </span>
@@ -2734,10 +3090,25 @@ export default function App() {
                     </div>
                     <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
                       <span className="truncate">{basename(dl.output_file)}</span>
-                      <button onClick={() => handleCancel(dl.download_id)}
-                        className="text-zinc-500 hover:text-red-400 flex items-center gap-1 shrink-0">
-                        <StopCircle size={12} /> Cancel
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {dl.output_file && (
+                          <button
+                            type="button"
+                            onClick={() => openFolder(dl.output_file)}
+                            className="text-zinc-400 hover:text-white flex items-center gap-1"
+                            title="Show in folder"
+                          >
+                            <FolderOpen size={12} /> Folder
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleCancel(dl.download_id)}
+                          className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
+                        >
+                          <StopCircle size={12} /> Cancel
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -2753,14 +3124,11 @@ export default function App() {
                   <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
                     NO HISTORY YET.
                   </div>
-                ) : historyDownloads.map((dl) => {
-                  const isTw = dl.platform === 'Twitch';
-                  const color = isTw ? '#9146FF' : '#53fc18';
-                  return (
+                ) : historyDownloads.map((dl) => (
                     <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
                       <div className="flex justify-between items-center gap-2">
                         <div className="flex items-center gap-2 min-w-0">
-                          <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: color }} />
+                          <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                           <span className="text-xs font-mono text-zinc-300 truncate">
                             {dl.title || dl.url}
                           </span>
@@ -2772,17 +3140,30 @@ export default function App() {
                       </div>
                       <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
                         <span className="truncate">{basename(dl.output_file)}</span>
-                        {dl.status === 'Completed' && dl.output_file && (
-                          <button type="button" onClick={() => openFolder(dl.output_file)}
-                            className="text-zinc-400 hover:text-white flex items-center gap-1 shrink-0">
-                            <FolderOpen size={12} /> Open folder
+                        <div className="flex items-center gap-2 shrink-0">
+                          {dl.output_file && (
+                            <button
+                              type="button"
+                              onClick={() => openFolder(dl.output_file)}
+                              className="text-zinc-400 hover:text-white flex items-center gap-1"
+                              title="Show in folder"
+                            >
+                              <FolderOpen size={12} /> Folder
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteHistory(dl.download_id)}
+                            className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
+                            title="Remove from history"
+                          >
+                            <Trash2 size={12} /> Delete
                           </button>
-                        )}
+                        </div>
                       </div>
                       {dl.error && <span className="text-[10px] text-red-400 font-mono">{dl.error}</span>}
                     </div>
-                  );
-                })}
+                ))}
               </div>
             </div>
           </div>

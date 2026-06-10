@@ -124,7 +124,7 @@ def test_via_server(url: str, label: str, base: str = "http://localhost:7897") -
         # Start download via API
         body = json.dumps({
             "url": url,
-            "quality": "720p",
+            "quality": "source",
             "crop_start": 0,
             "crop_end": TEST_CLIP_DURATION,
         }).encode()

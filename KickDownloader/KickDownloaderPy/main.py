@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -44,13 +45,16 @@ from services.settings import SettingsManager
 import yt_dlp
 
 logger = logging.getLogger(__name__)
-from services.ytdlp_service import detect_platform, get_video_info
-from services.twitch_gql_service import list_channel_videos_sync as twitch_list_channel_videos_sync
-from services.kick_playwright_service import (
-    download_vod_sync as kick_download_vod_sync,
+from services.ytdlp_service import detect_platform, get_video_info, is_clip_url
+from services.twitch_gql_service import (
+    get_video_info_sync as twitch_get_video_info_sync,
+    list_channel_clips_sync as twitch_list_channel_clips_sync,
+    list_channel_videos_sync as twitch_list_channel_videos_sync,
+)
+from services.kick_api_service import (
     get_video_info_sync as kick_get_video_info_sync,
+    list_channel_clips_sync as kick_list_channel_clips_sync,
     list_channel_videos_sync as kick_list_channel_videos_sync,
-    get_channel_info_sync as kick_get_channel_info_sync,
 )
 # A small helper for shaping per-platform error messages so the UI gets
 # something readable instead of a raw Playwright traceback.
@@ -116,6 +120,9 @@ app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 download_mgr.apply_settings(settings_mgr)
+# Metadata fetches use their own pool so hung yt-dlp/playwright downloads
+# cannot starve /api/info/* and /api/channel/videos.
+INFO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="info")
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"
@@ -172,6 +179,21 @@ def _download_dir(opts: AppSettings) -> Path:
     return Path.home() / "Downloads"
 
 
+def _vod_id_from_url(url: str) -> str:
+    platform = detect_platform(url)
+    if platform == "Twitch":
+        m = re.search(r"/videos/(\d+)", url)
+        return m.group(1) if m else ""
+    if platform == "Kick":
+        m = re.search(
+            r"/videos/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            url,
+            re.I,
+        )
+        return m.group(1)[:8] if m else ""
+    return ""
+
+
 def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
     if req.output_file:
         return req.output_file
@@ -179,7 +201,9 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
     title = meta.get("title") or detect_platform(req.url).lower()
     stem = _sanitize_path_component(str(title), fallback="video")
     platform = detect_platform(req.url).lower()
-    return str(base / f"{stem}_{platform}.mp4")
+    vod_id = _vod_id_from_url(req.url)
+    suffix = f"_{vod_id}" if vod_id else ""
+    return str(base / f"{stem}_{platform}{suffix}.mp4")
 
 
 def _tk_pick_folder() -> Optional[str]:
@@ -258,19 +282,31 @@ def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
 
 
 def _open_folder_sync(path: str) -> None:
+    """Reveal a file in Explorer, or open its parent folder (e.g. in-progress downloads)."""
     p = Path(path).expanduser()
-    if not p.exists():
-        raise FileNotFoundError(f"Path does not exist: {path}")
-    target = str(p.resolve())
-    if os.name == "nt":
-        if p.is_file():
-            subprocess.Popen(["explorer", "/select,", target])
+    if p.exists():
+        target = str(p.resolve())
+        if os.name == "nt":
+            if p.is_file():
+                subprocess.Popen(["explorer", "/select,", target])
+            else:
+                os.startfile(target)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target if p.is_dir() else str(p.parent)])
         else:
-            os.startfile(target)
+            subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)])
+        return
+
+    parent = p.parent.resolve()
+    if not parent.is_dir():
+        raise FileNotFoundError(f"Folder does not exist: {parent}")
+    folder = str(parent)
+    if os.name == "nt":
+        os.startfile(folder)
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", target if p.is_dir() else str(p.parent)])
+        subprocess.Popen(["open", folder])
     else:
-        subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)])
+        subprocess.Popen(["xdg-open", folder])
 
 
 @app.post("/api/pick-folder")
@@ -396,6 +432,7 @@ CHANNEL_DAYS_DEFAULT = 14
 # 14 days of any reasonable streamer (1-2 VODs/day) without hammering
 # the upstream endpoints.
 CHANNEL_LIMIT_MAX = 100
+CHANNEL_CLIP_LIMIT = 10
 def _parse_video_date(value) -> Optional[datetime]:
     """Best-effort parse of a video's `created_at` into an aware datetime.
     Returns None when the field is missing or unparseable, so the caller
@@ -432,6 +469,7 @@ async def channel_videos(
     limit: int = CHANNEL_LIMIT_MAX,
     days: int = CHANNEL_DAYS_DEFAULT,
     platforms: str = "Kick,Twitch",
+    content: str = "vods",
 ):
     """Fetch VODs for a channel across one or more platforms.
     `platforms` is a comma-separated list. The endpoint always returns the
@@ -483,22 +521,29 @@ async def channel_videos(
                 "platforms": [],
                 "per_platform_errors": {},
             }
+        content_kind = (content or "vods").strip().lower()
+        clips_only = content_kind in ("clips", "clip", "only_clips")
         # Clamp parameters so a hostile client can't ask for 1M VODs.
-        limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
-        days = max(0, min(int(days), 365))
+        if clips_only:
+            limit = CHANNEL_CLIP_LIMIT
+            days = 0
+        else:
+            limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
+            days = max(0, min(int(days), 365))
         cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
         per_platform_errors: Dict[str, str] = {}
         all_videos: List[dict] = []
         loop = asyncio.get_running_loop()
-        # Kick needs Playwright/Chromium (~15s). Start it first, then Twitch
-        # after a short stagger so the browser can launch before yt-dlp runs.
-        PLATFORM_STAGGER_SEC = 1.0
-
         async def _fetch_twitch() -> None:
             try:
-                vids = await loop.run_in_executor(
-                    None, twitch_list_channel_videos_sync, channel, limit
-                )
+                if clips_only:
+                    vids = await loop.run_in_executor(
+                        INFO_EXECUTOR, twitch_list_channel_clips_sync, channel, CHANNEL_CLIP_LIMIT
+                    )
+                else:
+                    vids = await loop.run_in_executor(
+                        INFO_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
+                    )
             except Exception as e:
                 per_platform_errors["Twitch"] = _format_platform_error(e)
                 return
@@ -508,18 +553,26 @@ async def channel_videos(
                     "platform": "Twitch",
                     "title": v.get("title") or "Untitled",
                     "duration": v.get("duration"),
+                    "duration_string": v.get("duration_string"),
                     "created_at": v.get("created_at"),
                     "views": v.get("views"),
                     "thumbnail_url": v.get("thumbnail_url"),
                     "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
                     "channel": channel,
+                    "content_kind": v.get("content_kind") or ("clip" if clips_only else "vod"),
                 })
         async def _fetch_kick() -> None:
             videos_url = f"https://kick.com/{channel}/videos"
             try:
-                vids = await loop.run_in_executor(
-                    None, kick_list_channel_videos_sync, videos_url, limit
-                )
+                if clips_only:
+                    vids = await loop.run_in_executor(
+                        INFO_EXECUTOR, kick_list_channel_clips_sync,
+                        f"https://kick.com/{channel}/clips", CHANNEL_CLIP_LIMIT,
+                    )
+                else:
+                    vids = await loop.run_in_executor(
+                        INFO_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
+                    )
             except Exception as e:
                 per_platform_errors["Kick"] = _format_platform_error(e)
                 return
@@ -529,40 +582,42 @@ async def channel_videos(
                     "platform": "Kick",
                     "title": v.get("title") or "Untitled",
                     "duration": v.get("duration"),
+                    "duration_string": v.get("duration_string"),
                     "created_at": v.get("created_at"),
                     "views": v.get("views"),
                     "thumbnail_url": v.get("thumbnail"),
-                    "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
+                    "url": v.get("url") or (
+                        f"https://kick.com/{channel}/clips/{v['id']}"
+                        if clips_only else f"https://kick.com/{channel}/videos/{v['id']}"
+                    ),
+                    "channel": channel,
+                    "content_kind": v.get("content_kind") or ("clip" if clips_only else "vod"),
                 })
-        async def _fetch_twitch_staggered() -> None:
-            if "Kick" in wanted:
-                await asyncio.sleep(PLATFORM_STAGGER_SEC)
-            await _fetch_twitch()
-
         tasks: List[asyncio.Task] = []
         if "Kick" in wanted:
             tasks.append(asyncio.create_task(_fetch_kick()))
         if "Twitch" in wanted:
-            tasks.append(asyncio.create_task(_fetch_twitch_staggered()))
+            tasks.append(asyncio.create_task(_fetch_twitch()))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         # Apply the date window, then sort newest-first across platforms.
         # Entries with no parseable date are kept (so an unparseable Kick
         # VOD isn't silently dropped) but are sorted to the end.
-        if cutoff is not None:
+        if cutoff is not None and not clips_only:
             filtered: List[dict] = []
             for v in all_videos:
                 dt = _parse_video_date(v.get("created_at"))
                 if dt is None or dt >= cutoff:
                     filtered.append(v)
             all_videos = filtered
-        def _sort_key(v: dict) -> tuple:
-            dt = _parse_video_date(v.get("created_at"))
-            ts = -dt.timestamp() if dt else 0.0
-            # Stable secondary key so missing-date entries keep their
-            # upstream order rather than shuffling on every refresh.
-            return (ts, v.get("platform") or "")
-        all_videos.sort(key=_sort_key)
+        if clips_only:
+            all_videos.sort(key=lambda v: -(v.get("views") or 0))
+        else:
+            def _sort_key(v: dict) -> tuple:
+                dt = _parse_video_date(v.get("created_at"))
+                ts = -dt.timestamp() if dt else 0.0
+                return (ts, v.get("platform") or "")
+            all_videos.sort(key=_sort_key)
         # Normalize error messages: cap at 200 chars.
         for k, v in list(per_platform_errors.items()):
             per_platform_errors[k] = _normalize_err(v)
@@ -593,13 +648,14 @@ def _explain_oserror(e: OSError) -> str:
 @app.get("/api/info/video")
 async def info_video(id: str):
     try:
-        # Kick: use the headless-browser service (Cloudflare blocks API access)
-        if "kick.com" in id.lower():
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(
-                None, kick_get_video_info_sync, id
-            )
-            return info
+        lowered = id.lower()
+        if is_clip_url(id):
+            return await info_clip(id)
+        loop = asyncio.get_running_loop()
+        if "kick.com" in lowered:
+            return await loop.run_in_executor(INFO_EXECUTOR, kick_get_video_info_sync, id)
+        if "twitch.tv" in lowered or re.search(r"^\d+$", id.strip()):
+            return await loop.run_in_executor(INFO_EXECUTOR, twitch_get_video_info_sync, id)
         info = await get_video_info(id)
         return info
     except OSError as e:
@@ -626,10 +682,11 @@ async def _fetch_queue_meta(url: str, platform: str) -> dict:
     just with less info).
     """
     try:
+        loop = asyncio.get_running_loop()
         if platform == "Kick":
-            info = await asyncio.get_event_loop().run_in_executor(
-                None, kick_get_video_info_sync, url
-            )
+            info = await loop.run_in_executor(INFO_EXECUTOR, kick_get_video_info_sync, url)
+        elif platform == "Twitch":
+            info = await loop.run_in_executor(INFO_EXECUTOR, twitch_get_video_info_sync, url)
         else:
             info = await get_video_info(url)
         if info is None:
@@ -649,6 +706,8 @@ async def _fetch_queue_meta(url: str, platform: str) -> dict:
     except Exception:
         return {}
 def _require_hls_crop(req: DownloadRequest, platform: str) -> None:
+    if is_clip_url(req.url):
+        return
     if platform not in ("Twitch", "Kick"):
         return
     if req.crop_start is None or req.crop_end is None:
@@ -668,7 +727,10 @@ async def download_video(req: DownloadRequest):
     meta = await _fetch_queue_meta(req.url, platform)
     output = _build_output_path(req, opts, meta)
     _safe_makedirs(Path(output).parent)
-    download_func = kick_download_vod_sync if platform == "Kick" else None
+    download_func = None
+    if platform == "Kick":
+        from services.kick_api_service import download_vod_sync as kick_download_vod
+        download_func = kick_download_vod
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -689,21 +751,20 @@ async def download_video(req: DownloadRequest):
 async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = detect_platform(req.url)
-    _require_hls_crop(req, platform)
     meta = await _fetch_queue_meta(req.url, platform)
     output = _build_output_path(req, opts, meta) if not req.output_file else req.output_file
     if not req.output_file and not meta.get("title"):
         output = str(_download_dir(opts) / "clip.mp4")
     _safe_makedirs(Path(output).parent)
-    download_func = kick_download_vod_sync if platform == "Kick" else None
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
-        quality=req.quality,
+        quality=req.quality or opts.quality,
         oauth=req.oauth or opts.oauth,
-        crop_start=req.crop_start,
-        crop_end=req.crop_end,
-        download_func=download_func,
+        crop_start=None,
+        crop_end=None,
+        download_func=None,
+        download_type="clip",
         settings_mgr=settings_mgr,
         title=meta.get("title"),
         channel=meta.get("channel"),
@@ -730,6 +791,16 @@ async def get_download(download_id: str):
 async def cancel_download(download_id: str):
     success = download_mgr.cancel(download_id)
     return {"cancelled": success}
+
+
+@app.delete("/api/download/{download_id}")
+async def delete_download_history(download_id: str):
+    if not download_mgr.remove_history(download_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Download not found or still active",
+        )
+    return {"removed": True}
 
 
 @app.get("/api/download/{download_id}/stream")

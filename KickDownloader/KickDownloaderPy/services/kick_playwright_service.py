@@ -1,14 +1,17 @@
-"""Kick Playwright service — uses a headless browser to fetch Kick info and download VODs.
+"""Kick Playwright service — automated headless browser for Kick downloads.
 
-Kick's API is behind Cloudflare with TLS fingerprinting / JS challenges that
-block direct HTTP clients and even Playwright's own API calls. However, the
-page itself is server-side rendered: the full VOD catalog is embedded in the
-Next.js hydration payload (`self.__next_f.push([1, ...])`). We load the page
-in a real Chromium browser (via Playwright), parse the embedded JSON, and
-extract the m3u8 playlist URL for downloading.
+No manual DevTools steps: every Kick download launches Playwright
+(`chrome-headless-shell.exe`), opens the VOD page, captures the IVS m3u8 URL
+from network responses, reads session cookies, and passes both to the HLS
+segment downloader.
 
-This replaces the dead `kickvodinfo.twitcharchives.workers.dev` API used by
-the original `lay295/KickDownloader` project.
+Kick session cookies are persisted under
+``~/.cache/KickDownloader/kick_playwright_storage.json`` so repeat downloads
+skip a cold Cloudflare handshake when possible. Set env ``KICK_BROWSER_HEADED=1``
+to watch the browser locally while debugging.
+
+Channel browse / metadata still uses the fast Kick JSON API; only downloads
+use the browser path.
 """
 
 import asyncio
@@ -21,9 +24,10 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from playwright.async_api import Browser, Page, Response, async_playwright
+if TYPE_CHECKING:
+    from playwright.async_api import Browser, Response
 # ---------------------------------------------------------------------------
 # Headless-shell pinning
 # ---------------------------------------------------------------------------
@@ -43,6 +47,30 @@ from playwright.async_api import Browser, Page, Response, async_playwright
 # Image name of Playwright's headless Chromium. Use this constant
 # everywhere a process lookup happens.
 HEADLESS_BROWSER_IMAGE = "chrome-headless-shell.exe"
+_KICK_STORAGE_LOCK = threading.Lock()
+
+
+def _kick_storage_state_path() -> Path:
+    base = Path.home() / ".cache" / "KickDownloader"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "kick_playwright_storage.json"
+
+
+def _kick_browser_headed() -> bool:
+    return os.environ.get("KICK_BROWSER_HEADED", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+async def _persist_kick_storage_state(ctx) -> None:
+    """Save cookies/localStorage so the next Kick download reuses the session."""
+    path = _kick_storage_state_path()
+    tmp = path.with_suffix(".json.tmp")
+    await ctx.storage_state(path=str(tmp))
+    with _KICK_STORAGE_LOCK:
+        os.replace(tmp, path)
+
+
 def _find_headless_shell_executable() -> Optional[str]:
     """Return the absolute path to Playwright's headless-shell binary.
     Searches `%LOCALAPPDATA%\\ms-playwright\\chromium_headless_shell-*\\\
@@ -185,11 +213,13 @@ class _BoundedBrowser:
     """
     def __init__(self) -> None:
         self._playwright = None
-        self._browser: Optional[Browser] = None
+        self._browser: Optional["Browser"] = None
         self._spawned_at: float = 0.0
         self._watchdog_task: Optional[asyncio.Task] = None
         self._closed = False
-    async def __aenter__(self) -> Browser:
+    async def __aenter__(self) -> "Browser":
+        from playwright.async_api import async_playwright
+
         self._playwright = await async_playwright().start()
         # Pin the executable path so the launched process is
         # `chrome-headless-shell.exe`, never the user's `chrome.exe`.
@@ -198,9 +228,13 @@ class _BoundedBrowser:
         # in which case we let Playwright pick — the default is still
         # the headless shell, but we lose the path for cleanup.
         executable_path = _find_headless_shell_executable()
+        headed = _kick_browser_headed()
+        launch_args = list(_LIGHTWEIGHT_CHROMIUM_ARGS)
+        if headed:
+            launch_args = [a for a in launch_args if not a.startswith("--headless")]
         launch_kwargs: Dict[str, Any] = dict(
-            headless=True,
-            args=_LIGHTWEIGHT_CHROMIUM_ARGS,
+            headless=not headed,
+            args=launch_args,
         )
         if executable_path:
             launch_kwargs["executable_path"] = executable_path
@@ -269,8 +303,6 @@ _DEFAULT_CONTEXT_OPTS: Dict[str, Any] = {
     ),
     "viewport": {"width": 800, "height": 600},
     "locale": "en-US",
-    # Don't run the service worker or store any state — this is a
-    # one-shot scrape, not a logged-in session.
     "service_workers": "block",
     # Block images / fonts / media so the page doesn't waste time or
     # bandwidth on assets we won't render. The Next.js hydration data
@@ -292,6 +324,28 @@ async def lightweight_context():
                 await ctx.close()
             except Exception:
                 pass
+
+
+@asynccontextmanager
+async def kick_session_context():
+    """Browser context for Kick downloads — loads/saves persisted session state."""
+    async with bounded_browser() as browser:
+        ctx_opts = dict(_DEFAULT_CONTEXT_OPTS)
+        state_path = _kick_storage_state_path()
+        if state_path.is_file():
+            ctx_opts["storage_state"] = str(state_path)
+        ctx = await browser.new_context(**ctx_opts)
+        try:
+            yield ctx
+        finally:
+            try:
+                await _persist_kick_storage_state(ctx)
+            except Exception:
+                pass
+            try:
+                await ctx.close()
+            except Exception:
+                pass
 # Asset types we never need. The route handler aborts these requests
 # before they hit the network, which dramatically cuts page weight
 # (Kick's HTML alone is ~30 KB; without blocking images/fonts, a
@@ -300,19 +354,25 @@ _BLOCKED_RESOURCE_TYPES = frozenset({
     "image", "imageset", "font", "media", "stylesheet",
     "ping", "beacon", "csp_report", "object", "websocket",
 })
-async def _block_heavy_assets(ctx) -> None:
+# Download page: allow media/xhr so the player can fetch playlists.
+_BLOCKED_DOWNLOAD_PAGE_TYPES = frozenset({
+    "image", "imageset", "font", "stylesheet",
+    "ping", "beacon", "csp_report", "object", "websocket",
+})
+
+
+async def _block_resource_types(ctx, blocked: frozenset[str]) -> None:
     """Install a route handler that aborts every asset we don't render.
     Kept tiny on purpose: a single closure, registered once per
     context, no extra dependencies.
     """
     async def _route(route, request):
         try:
-            if request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            if request.resource_type in blocked:
                 await route.abort()
             else:
                 await route.continue_()
         except Exception:
-            # Don't let a stray abort handler take down the whole page.
             try:
                 await route.continue_()
             except Exception:
@@ -320,8 +380,48 @@ async def _block_heavy_assets(ctx) -> None:
     try:
         await ctx.route("**/*", _route)
     except Exception:
-        # Older playwright builds may not support ctx.route for the
         pass
+
+
+async def _block_heavy_assets(ctx) -> None:
+    await _block_resource_types(ctx, _BLOCKED_RESOURCE_TYPES)
+
+
+async def _block_download_page_assets(ctx) -> None:
+    await _block_resource_types(ctx, _BLOCKED_DOWNLOAD_PAGE_TYPES)
+
+
+def _pick_best_m3u8_url(urls: List[str]) -> Optional[str]:
+    if not urls:
+        return None
+    cleaned = [u.rstrip("\\") for u in urls if u]
+    for u in cleaned:
+        if "master.m3u8" in u and "stream.kick.com" in u:
+            return u
+    for u in cleaned:
+        if "master.m3u8" in u:
+            return u
+    for u in cleaned:
+        if "stream.kick.com" in u:
+            return u
+    return cleaned[0]
+
+
+def _kick_browser_headers(vod_url: str, cookies: List[dict]) -> Dict[str, str]:
+    referer = vod_url if vod_url.startswith("http") else "https://kick.com/"
+    headers: Dict[str, str] = {
+        "referer": referer,
+        "origin": "https://kick.com",
+        "user-agent": _DEFAULT_CONTEXT_OPTS["user_agent"],
+    }
+    cookie_parts = [
+        f"{c['name']}={c['value']}"
+        for c in cookies
+        if isinstance(c, dict) and c.get("name") and c.get("value") is not None
+    ]
+    if cookie_parts:
+        headers["cookie"] = "; ".join(cookie_parts)
+    return headers
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -816,6 +916,75 @@ class KickPlaywrightService:
             )
         raise last_error  # type: ignore[misc]
 
+    async def _capture_vod_stream_browser(self, url: str) -> tuple[KickVideo, Dict[str, str]]:
+        """Load the VOD page in headless Chromium and capture playlist + session headers.
+
+        Kick IVS playlists are tied to the browser session. The public JSON API is
+        fine for channel lists, but downloads must use the URL/cookies the player
+        actually negotiates — otherwise segments can 403 or produce corrupt output.
+        """
+        video_id = _extract_vod_id(url)
+        if not video_id:
+            raise ValueError(f"Not a Kick VOD URL: {url}")
+        slug_m = re.search(r"kick\.com/([\w-]+)/videos/", url)
+        slug = slug_m.group(1) if slug_m else None
+        page_url = url if url.startswith("http") else f"https://kick.com/{slug}/videos/{video_id}"
+
+        captured_m3u8: List[str] = []
+
+        async def _on_response(response: "Response") -> None:
+            try:
+                resp_url = response.url
+                if ".m3u8" in resp_url:
+                    captured_m3u8.append(resp_url)
+            except Exception:
+                pass
+
+        has_saved_session = _kick_storage_state_path().is_file()
+        base_wait_ms = 4000 if has_saved_session else 8000
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            async with kick_session_context() as ctx:
+                await _block_download_page_assets(ctx)
+                page = await ctx.new_page()
+                page.on("response", _on_response)
+                try:
+                    await page.goto(
+                        page_url,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    # Let the embedded player request the IVS master playlist.
+                    await page.wait_for_timeout(base_wait_ms + attempt * 3000)
+                    html = await page.content()
+                    cookies = await ctx.cookies()
+                finally:
+                    await page.close()
+
+            m3u8 = _pick_best_m3u8_url(captured_m3u8)
+            payloads = _parse_next_data(html)
+            vod_objects = _find_video_objects(payloads, vod_id=video_id)
+            if vod_objects:
+                info = _build_video_from_next_data(
+                    vod_objects[0], payloads, html, slug,
+                )
+            else:
+                info = KickVideo(id=video_id, title="Untitled", channel=slug, url=page_url)
+
+            if not m3u8:
+                m3u8 = info.m3u8_url or _find_m3u8_url(html)
+            if m3u8:
+                info.m3u8_url = m3u8
+                headers = _kick_browser_headers(page_url, cookies)
+                return info, headers
+
+            last_error = ValueError(
+                f"Could not capture Kick HLS playlist in browser "
+                f"(attempt {attempt + 1}/3)"
+            )
+
+        raise last_error or RuntimeError("Kick browser playlist capture failed")
+
     # ----- Download -----
     async def download_vod(
         self,
@@ -828,21 +997,23 @@ class KickPlaywrightService:
         cancel_event: Optional[threading.Event] = None,
         register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     ) -> str:
-        """Download a Kick VOD via HLS. m3u8 URL comes from the Kick API (~0.5s)."""
-        from services.kick_api_service import get_video_info_api
-
-        info = await asyncio.to_thread(get_video_info_api, url)
+        """Download a Kick VOD via headless browser playlist capture + HLS segments."""
+        info, headers = await self._capture_vod_stream_browser(url)
         if not info.m3u8_url:
-            raise RuntimeError("Kick API returned no HLS playlist URL for this VOD")
+            raise RuntimeError("Headless browser did not capture an HLS playlist URL")
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
         from services.ytdlp_service import (
             _require_crop_range,
             _resolve_ffmpeg_exe,
+            _verify_output_file,
             download_hls_media_clip,
         )
 
+        from services.ytdlp_service import _parse_prefer_height
+
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+        prefer_height = _parse_prefer_height(quality)
         ffmpeg_exe = _resolve_ffmpeg_exe()
         await asyncio.to_thread(
             download_hls_media_clip,
@@ -850,11 +1021,12 @@ class KickPlaywrightService:
             start_sec,
             end_sec,
             str(out),
-            {},
+            headers,
             ffmpeg_exe,
             progress_hook,
             cancel_event,
             register_abort,
+            prefer_height,
         )
         if progress_hook:
             try:
@@ -862,10 +1034,7 @@ class KickPlaywrightService:
                 progress_hook({"status": "finished"})
             except Exception:
                 pass
-        if not out.is_file():
-            raise RuntimeError(
-                f"Download finished but output file is missing at {out}"
-            )
+        _verify_output_file(str(out))
         return str(out)
 
 
@@ -876,7 +1045,7 @@ class KickPlaywrightService:
 
 def _run_async(coro: Any) -> Any:
     """Run an async coroutine to completion in a fresh event loop.
-    Called from worker threads (FastAPI `run_in_executor`, download pool).
+    Called from worker threads or an isolated child process.
     Each call gets an isolated loop so Playwright objects never leak across
     invocations or onto uvicorn's main loop.
     On Windows, uvicorn --reload sets `WindowsSelectorEventLoopPolicy`
@@ -885,10 +1054,6 @@ def _run_async(coro: Any) -> Any:
     `asyncio.run()`. We therefore mint an explicit `ProactorEventLoop`
     here instead of relying on the process event-loop policy.
     """
-    try:
-        asyncio.set_event_loop(None)
-    except Exception:
-        pass
     if sys.platform == "win32":
         loop: asyncio.AbstractEventLoop = asyncio.ProactorEventLoop()
     else:
@@ -898,6 +1063,16 @@ def _run_async(coro: Any) -> Any:
         return loop.run_until_complete(coro)
     finally:
         try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
+        try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass
@@ -905,70 +1080,117 @@ def _run_async(coro: Any) -> Any:
             loop.run_until_complete(loop.shutdown_default_executor())
         except Exception:
             pass
-        loop.close()
         try:
-            asyncio.set_event_loop(None)
+            loop.close()
+        finally:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+
+
+def download_vod_subprocess(
+    url: str,
+    output_path: str,
+    quality: Optional[str] = None,
+    crop_start: Optional[float] = None,
+    crop_end: Optional[float] = None,
+    progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> str:
+    """Kick download in a child Python process so Playwright cannot kill uvicorn."""
+    import queue
+    import subprocess
+
+    from services.ytdlp_service import CancelledError
+
+    payload = {
+        "url": url,
+        "output_path": output_path,
+        "quality": quality,
+        "crop_start": crop_start,
+        "crop_end": crop_end,
+    }
+    py_dir = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "services.kick_download_worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(py_dir),
+        bufsize=1,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(payload))
+    proc.stdin.close()
+
+    def _abort() -> None:
+        try:
+            proc.terminate()
         except Exception:
             pass
 
-# Public sync wrappers used by main.py / download_manager.
-# Hot paths use the Kick JSON API (curl_cffi) — no browser, ~0.5-2s.
-def get_channel_info_sync(url: str) -> Dict[str, Any]:
-    from services.kick_api_service import get_channel_api
+    if register_abort:
+        register_abort(_abort)
 
-    ch = get_channel_api(url)
-    return {
-        "slug": ch.slug,
-        "username": ch.username,
-        "channel_id": ch.channel_id,
-        "followers": ch.followers,
-        "is_live": ch.is_live,
-        "live_title": ch.live_title,
-    }
+    line_q: queue.Queue[Optional[str]] = queue.Queue()
 
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line_q.put(raw)
+        line_q.put(None)
 
-def list_channel_videos_sync(url: str, limit: int = 20) -> List[Dict[str, Any]]:
-    from services.kick_api_service import list_channel_videos_api
+    threading.Thread(target=_reader, name="kick-dl-reader", daemon=True).start()
 
-    slug = _extract_slug(url)
-    if not slug:
-        raise ValueError(f"Not a Kick channel URL: {url}")
-    vids = list_channel_videos_api(slug, limit)
-    return [
-        {
-            "id": v.id,
-            "title": v.title,
-            "url": v.url,
-            "thumbnail": v.thumbnail,
-            "duration": v.duration,
-            "duration_string": _format_duration(v.duration),
-            "created_at": v.created_at,
-            "views": v.views,
-            "channel": v.channel or slug,
-        }
-        for v in vids
-    ]
+    result_path: Optional[str] = None
+    error_msg: Optional[str] = None
 
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _abort()
+            raise CancelledError("Download cancelled by user")
+        try:
+            line = line_q.get(timeout=0.5)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        if line is None:
+            break
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            msg = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        kind = msg.get("type")
+        if kind == "progress" and progress_hook:
+            try:
+                progress_hook(msg.get("data") or {})
+            except Exception:
+                pass
+        elif kind == "done":
+            result_path = msg.get("path")
+        elif kind == "error":
+            error_msg = msg.get("error") or "Kick download worker failed"
 
-def get_video_info_sync(url: str) -> Dict[str, Any]:
-    from services.kick_api_service import get_video_info_api
+    exit_code = proc.wait()
+    stderr_tail = ""
+    if proc.stderr is not None:
+        stderr_tail = proc.stderr.read().strip()
 
-    v = get_video_info_api(url)
-    return {
-        "id": v.id,
-        "title": v.title,
-        "uploader": v.channel,
-        "channel": v.channel,
-        "duration": v.duration,
-        "duration_string": _format_duration(v.duration),
-        "thumbnail": v.thumbnail,
-        "views": v.views,
-        "category": v.category,
-        "webpage_url": v.url,
-        "qualities": [],  # Populated after we have an m3u8
-        "platform": "Kick",
-        "created_at": v.created_at,
-    }
+    if error_msg:
+        raise RuntimeError(error_msg)
+    if exit_code != 0:
+        detail = stderr_tail or f"Kick download worker exited with code {exit_code}"
+        raise RuntimeError(detail)
+    if not result_path:
+        raise RuntimeError("Kick download worker produced no output path")
+    return result_path
 
 
 def download_vod_sync(

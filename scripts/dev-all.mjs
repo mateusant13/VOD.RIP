@@ -11,7 +11,7 @@ const apiPort = process.env.PORT || "7897";
 
 const children = [];
 
-function start(label, command, args, cwd) {
+function start(label, command, args, cwd, { restartOnCrash = false } = {}) {
   const child = spawn(command, args, {
     cwd,
     stdio: "inherit",
@@ -22,6 +22,11 @@ function start(label, command, args, cwd) {
     if (signal) return;
     if (code !== 0 && code !== null) {
       console.error(`[${label}] exited with code ${code}`);
+      if (restartOnCrash) {
+        console.error(`[${label}] restarting in 2s…`);
+        setTimeout(() => start(label, command, args, cwd, { restartOnCrash: true }), 2000);
+        return;
+      }
       shutdown(1);
     }
   });
@@ -51,7 +56,7 @@ console.log("Starting API  -> http://localhost:" + apiPort);
 console.log("Starting Vite -> http://localhost:5173");
 console.log("(Ctrl+C stops both)\n");
 
-start("api", "python", ["run.py"], pyDir);
+start("api", "python", ["run.py"], pyDir, { restartOnCrash: true });
 
 // Give uvicorn a moment to bind before Vite proxies /api.
 setTimeout(() => {
