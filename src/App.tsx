@@ -211,8 +211,9 @@ function formatHmsFull(sec: number): string {
 const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const TRIPLE_SIDE_WIDTH = 'w-[22rem]';
-const TRIPLE_SIDE_HEIGHT = 'h-[26rem]';
+const TRIPLE_SIDE_WIDTH = 'w-[26rem]';
+const TRIPLE_SIDE_HEIGHT = 'h-[28rem]';
+const TRIPLE_PREVIEW_WIDTH = '64rem';
 const EXPLORE_POPUP_DEFAULT = { w: 288, h: 320 };
 const EXPLORE_POPUP_MIN = { w: 240, h: 200 };
 const EXPLORE_POPUP_MAX_W = 960;
@@ -1568,6 +1569,7 @@ export default function App() {
     : `${COMPACT_CARD_WIDTH} ${COMPACT_CARD_HEIGHT}`;
   const showUrlInMainCard = tab === 'url' && !urlPanelAside && !urlTabBarHidden;
   const urlMainCompact = showUrlInMainCard && Boolean(videoInfo);
+  const mainCardHeaderCompact = triplePanelLayout || urlMainCompact;
   const visibleTabs: Tab[] = urlPanelAside || urlTabBarHidden
     ? ['channels', 'queue', 'settings']
     : ['url', 'channels', 'queue', 'settings'];
@@ -1865,7 +1867,7 @@ export default function App() {
           className={`shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 ${platformCardShadow(activePlatform, true)}`}
           style={{
             width: triplePanelLayout
-              ? 'min(56rem, calc(100vw - 44rem - 3rem))'
+              ? `min(${TRIPLE_PREVIEW_WIDTH}, calc(100vw - 2rem))`
               : 'min(720px, calc(100vw - 56rem - 3rem))',
           }}
         >
@@ -1981,25 +1983,32 @@ export default function App() {
           </div>
         </div>
       )}
-      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white flex flex-col ${urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'} ${splitLayout ? sidePanelSizeClass : `${COMPACT_CARD_WIDTH} ${COMPACT_CARD_HEIGHT}`} ${platformCardShadow(activePlatform)} transition-all duration-300 ${
+      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white flex flex-col overflow-hidden ${
+        triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
+      } ${splitLayout ? sidePanelSizeClass : `${COMPACT_CARD_WIDTH} ${COMPACT_CARD_HEIGHT}`} ${platformCardShadow(activePlatform)} transition-all duration-300 ${
         splitLayout ? '' : 'w-full max-w-md'
       }`}>
 
         {/* ── HEADER ── */}
-        <div className="flex justify-between items-start shrink-0">
-          <div className="flex flex-col">
-            <h1 className={`font-black uppercase tracking-tighter flex items-center gap-2 ${
-              urlMainCompact ? 'text-2xl' : 'text-4xl md:text-5xl'
+        <div className="flex justify-between items-start shrink-0 min-w-0 gap-2">
+          <div className="flex flex-col min-w-0">
+            <h1 className={`font-black uppercase tracking-tighter truncate ${
+              mainCardHeaderCompact ? 'text-2xl' : 'text-4xl md:text-5xl'
             }`}>
               VOD<span className="text-[#9146FF]">.</span>RIP
             </h1>
-            {!urlMainCompact && (
+            {!mainCardHeaderCompact && (
               <p className="text-zinc-400 text-[10px] font-mono tracking-widest uppercase mt-1">
                 <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> Downloader
               </p>
             )}
+            {triplePanelLayout && !urlMainCompact && (
+              <p className="text-zinc-500 text-[9px] font-mono tracking-widest uppercase mt-0.5 truncate">
+                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span>
+              </p>
+            )}
           </div>
-          <div className={`flex gap-1 ${urlMainCompact ? 'mt-1' : 'mt-2'}`}>
+          <div className={`flex gap-1 shrink-0 ${mainCardHeaderCompact ? 'mt-1' : 'mt-2'}`}>
             <div className="w-2 h-2 bg-[#53fc18] rounded-full animate-pulse" />
             <div className="w-2 h-2 bg-[#9146FF] rounded-full animate-pulse" style={{ animationDelay: '0.5s' }} />
           </div>
@@ -2012,7 +2021,7 @@ export default function App() {
               key={t}
               onClick={() => setTab(t)}
               className={`flex-1 text-center transition-all flex items-center justify-center gap-2 ${
-                urlMainCompact ? 'py-2' : 'py-3'
+                mainCardHeaderCompact ? 'py-2' : 'py-3'
               } ${
                 tab === t ? 'bg-white text-black' : 'bg-transparent text-zinc-500 hover:text-white'
               }`}
