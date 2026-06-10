@@ -1017,6 +1017,7 @@ def get_video_info_sync(url: str) -> Dict[str, Any]:
         "webpage_url": v.url,
         "qualities": [],  # Populated after we have an m3u8
         "platform": "Kick",
+        "created_at": v.created_at,
     }
 
 

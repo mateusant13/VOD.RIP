@@ -13,6 +13,7 @@ class VideoInfo(BaseModel):
     is_live: Optional[bool] = None
     qualities: List[str] = []
     platform: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class DownloadRequest(BaseModel):

@@ -222,6 +222,16 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                 qualities.append(label)
     qualities.sort(key=lambda q: int(re.search(r"\d+", q).group()), reverse=True)
 
+    created_at = info.get("upload_date")
+    if not created_at and info.get("timestamp"):
+        try:
+            from datetime import datetime, timezone
+            created_at = datetime.fromtimestamp(
+                float(info["timestamp"]), tz=timezone.utc
+            ).isoformat()
+        except (TypeError, ValueError, OSError):
+            created_at = None
+
     return VideoInfo(
         id=info.get("id", ""),
         title=info.get("title"),
@@ -234,6 +244,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         is_live=info.get("is_live"),
         qualities=qualities,
         platform=detect_platform(full_url),
+        created_at=created_at,
     )
 
 

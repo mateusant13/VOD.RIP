@@ -2,12 +2,15 @@
 
 import asyncio
 import json
+import logging
 import os
 import platform
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -28,6 +31,8 @@ from models.schemas import (
 from services.download_manager import DownloadManager
 from services.settings import SettingsManager
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 from services.ytdlp_service import detect_platform, get_video_info
 from services.kick_playwright_service import (
     download_vod_sync as kick_download_vod_sync,
@@ -166,39 +171,79 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
     return str(base / f"{stem}_{platform}.mp4")
 
 
-def _pick_folder_sync() -> Optional[str]:
-    """Show the native folder picker (Windows/macOS/Linux)."""
+def _tk_pick_folder() -> Optional[str]:
+    """Native folder dialog via tkinter (STA thread on Windows)."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    root.update_idletasks()
+    try:
+        path = filedialog.askdirectory(title="Choose download folder", parent=root)
+        return path or None
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
+    """Show the native folder picker. Returns (path, error_message)."""
+    err_msg: Optional[str] = None
+
+    result_q: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_q.put(("ok", _tk_pick_folder()))
+        except Exception as exc:
+            result_q.put(("err", str(exc)))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=125)
+    if not result_q.empty():
+        kind, value = result_q.get()
+        if kind == "ok" and value:
+            return value, None
+        if kind == "err":
+            err_msg = str(value)
+
     if os.name == "nt":
         ps = (
             "Add-Type -AssemblyName System.Windows.Forms; "
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
             "$d.Description = 'Choose download folder'; "
+            "$d.ShowNewFolderButton = $true; "
             "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
             "  Write-Output $d.SelectedPath "
             "}"
         )
-        try:
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Sta", "-Command", ps],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            path = (out.stdout or "").strip()
-            return path or None
-        except Exception:
-            return None
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        path = filedialog.askdirectory(title="Choose download folder")
-        root.destroy()
-        return path or None
-    except Exception:
-        return None
+        for exe in ("powershell", "pwsh"):
+            try:
+                out = subprocess.run(
+                    [exe, "-NoProfile", "-Sta", "-Command", ps],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                path = (out.stdout or "").strip()
+                if path:
+                    return path, None
+                if out.returncode != 0 and out.stderr:
+                    err_msg = out.stderr.strip()
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                err_msg = str(exc)
+                logger.warning("Folder picker %s failed: %s", exe, exc)
+
+    if err_msg:
+        return None, err_msg
+    return None, "Folder picker cancelled or unavailable."
 
 
 def _open_folder_sync(path: str) -> None:
@@ -219,12 +264,12 @@ def _open_folder_sync(path: str) -> None:
 
 @app.post("/api/pick-folder")
 async def pick_folder():
-    path = await asyncio.get_event_loop().run_in_executor(None, _pick_folder_sync)
+    path, err = await asyncio.get_event_loop().run_in_executor(None, _pick_folder_sync)
     if path:
         current = settings_mgr.get()
         current.download_folder = path
         settings_mgr.save(current)
-    return {"path": path}
+    return {"path": path, "error": err}
 
 
 @app.post("/api/open-folder")

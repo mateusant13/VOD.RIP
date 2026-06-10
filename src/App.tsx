@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import {
   Download, Scissors, Info, Play, Link2, X, FastForward, Clock,
-  Users, Database, Settings2, Tv, StopCircle, Loader2,
-  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus
+  Users, Database, Settings2, StopCircle, Loader2,
+  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus,
+  ExternalLink,
 } from 'lucide-react';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
@@ -19,6 +20,7 @@ interface VideoInfo {
   is_live: boolean | null;
   qualities: string[];
   platform: string | null;
+  created_at?: string | null;
 }
 
 interface DownloadState {
@@ -155,6 +157,26 @@ function fmtDate(value: string | null | undefined): string {
   return m ? m[1] : '';
 }
 
+function fmtRelativeAgo(value: string | null | undefined): string {
+  const ts = parseVideoTs(value);
+  if (!ts) return '';
+  const diffMs = Math.max(0, Date.now() - ts);
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+  if (days >= 1) return days === 1 ? '1 day ago' : `${days} days ago`;
+  if (hours >= 1) return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+  const mins = Math.floor(diffMs / (1000 * 60));
+  if (mins >= 1) return mins === 1 ? '1 min ago' : `${mins} mins ago`;
+  return 'just now';
+}
+
+function fmtDateAndAgo(value: string | null | undefined): string {
+  const date = fmtDate(value);
+  const ago = fmtRelativeAgo(value);
+  if (date && ago) return `${date} · ${ago}`;
+  return date || ago;
+}
+
 function parseHms(t: string): number {
   const p = t.split(':').map(Number);
   if (p.length !== 3 || p.some(isNaN)) return 0;
@@ -166,6 +188,14 @@ const CHANNEL_EXPAND_STEP = 10;
 const CHANNEL_FETCH_LIMIT = 100;
 const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
 const MAX_SAVED_CHANNELS = 10;
+
+/** Highest quality from API list, or source when none listed (Kick). */
+function bestAvailableQuality(info: VideoInfo): string {
+  if (info.qualities?.length) {
+    return info.qualities[0].toLowerCase();
+  }
+  return 'source';
+}
 
 function detectUrlPlatform(u: string): 'kick' | 'twitch' | null {
   const l = u.toLowerCase();
@@ -197,6 +227,33 @@ function loadSavedChannels(): SavedChannel[] {
 
 function persistChannels(channels: SavedChannel[]) {
   localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(channels));
+}
+
+function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '' };
+  const lower = trimmed.toLowerCase();
+  if (lower.includes('kick.com')) {
+    const m = trimmed.match(/kick\.com\/([^/?#]+)/i);
+    const slug = m?.[1] || trimmed;
+    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+  }
+  if (lower.includes('twitch.tv')) {
+    const m = trimmed.match(/twitch\.tv\/([^/?#]+)/i);
+    const slug = m?.[1] || trimmed;
+    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+  }
+  const slug = trimmed.replace(/^https?:\/\//, '').split('/').pop()?.split('?')[0] || trimmed;
+  return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+}
+
+/** Settings/section captions — not <label> so clicks never focus nearby inputs. */
+function FieldCaption({ children }: { children: ReactNode }) {
+  return (
+    <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 block">
+      {children}
+    </span>
+  );
 }
 
 function basename(path: string): string {
@@ -237,7 +294,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   // Download options
-  const [quality, setQuality] = useState('1080p');
+  const [quality, setQuality] = useState('source');
   const urlPlatform = detectUrlPlatform(url);
   const [startTime, setStartTime] = useState('00:00:00');
   const [endTime, setEndTime] = useState('04:20:00');
@@ -250,11 +307,14 @@ export default function App() {
   const [lastCompleted, setLastCompleted] = useState<DownloadState | null>(null);
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
-  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(
-    () => loadSavedChannels()[0]?.id ?? null,
-  );
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [addChannelInput, setAddChannelInput] = useState('');
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [editingChannelName, setEditingChannelName] = useState('');
+  const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' } | null>(null);
+  const [editingSlugValue, setEditingSlugValue] = useState('');
   const [channelsError, setChannelsError] = useState<string | null>(null);
+  const [pickingFolder, setPickingFolder] = useState(false);
   // Platform filter for channel browsing. Default: both enabled. Pure
   // presentation state — the backend always returns every VOD for the
   // channel across both platforms (capped to the last 14 days); this list
@@ -309,14 +369,16 @@ export default function App() {
 
   // ── Fetch video info ──
 
-  const handleGetInfo = useCallback(async () => {
-    if (!url.trim()) return;
+  const fetchVideoInfo = useCallback(async (videoUrl: string) => {
+    const trimmed = videoUrl.trim();
+    if (!trimmed) return;
     setLoading(true);
     setError(null);
     setVideoInfo(null);
     try {
-      const info = await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(url.trim())}`);
+      const info = await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmed)}`);
       setVideoInfo(info);
+      setQuality(bestAvailableQuality(info));
       if (info.duration) {
         const total = Math.floor(info.duration);
         const h = Math.floor(total / 3600);
@@ -330,19 +392,34 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [url]);
+  }, []);
+
+  const handleGetInfo = useCallback(() => fetchVideoInfo(url), [url, fetchVideoInfo]);
 
   const pickDownloadFolder = useCallback(async (): Promise<string | null> => {
-    const res = await apiPost<{ path: string | null }>('/api/pick-folder', {});
-    if (res.path) {
-      try {
-        const s = await apiGet<AppSettings>('/api/settings');
-        setSettings(s);
-      } catch {
-        setSettings((prev) => (prev ? { ...prev, download_folder: res.path! } : prev));
+    setPickingFolder(true);
+    setError(null);
+    try {
+      const res = await apiPost<{ path: string | null; error?: string | null }>('/api/pick-folder', {});
+      if (res.error && !res.path) {
+        setError(res.error);
+        return null;
       }
+      if (res.path) {
+        try {
+          const s = await apiGet<AppSettings>('/api/settings');
+          setSettings(s);
+        } catch {
+          setSettings((prev) => (prev ? { ...prev, download_folder: res.path! } : prev));
+        }
+      }
+      return res.path;
+    } catch (err: any) {
+      setError(err.message || 'Could not open folder picker');
+      return null;
+    } finally {
+      setPickingFolder(false);
     }
-    return res.path;
   }, []);
 
   const ensureDownloadFolder = useCallback(async (): Promise<boolean> => {
@@ -452,8 +529,8 @@ export default function App() {
     setSavedChannels((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }, []);
 
-  const refreshChannel = useCallback(async (channelId: string) => {
-    const ch = savedChannels.find((c) => c.id === channelId);
+  const refreshChannel = useCallback(async (channelId: string, channelOverride?: SavedChannel) => {
+    const ch = channelOverride ?? savedChannels.find((c) => c.id === channelId);
     if (!ch) return;
     updateChannel(channelId, { loading: true });
     setChannelsError(null);
@@ -500,16 +577,17 @@ export default function App() {
     const raw = addChannelInput.trim();
     if (!raw) return;
     if (savedChannels.length >= MAX_SAVED_CHANNELS) {
-      setChannelsError(`Maximum ${MAX_SAVED_CHANNELS} channels.`);
+      setChannelsError(`Max ${MAX_SAVED_CHANNELS} channels.`);
       return;
     }
-    const slug = raw.replace(/^https?:\/\//, '').split('/').pop()?.split('?')[0] || raw;
+    const { displayName, kickSlug, twitchSlug } = parseChannelInput(raw);
+    if (!kickSlug) return;
     const id = `ch_${Date.now().toString(36)}`;
     const entry: SavedChannel = {
       id,
-      displayName: slug,
-      kickSlug: slug,
-      twitchSlug: slug,
+      displayName,
+      kickSlug,
+      twitchSlug,
       videos: [],
       errors: {},
       updatedAt: '',
@@ -517,31 +595,59 @@ export default function App() {
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
     setAddChannelInput('');
-    await refreshChannel(id);
+    await refreshChannel(id, entry);
   }, [addChannelInput, savedChannels.length, refreshChannel]);
+
+  const toggleChannelSelection = useCallback((channelId: string) => {
+    setSelectedChannelId((prev) => {
+      if (prev === channelId) return null;
+      setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+      setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+      return channelId;
+    });
+    setEditingChannelId(null);
+    setEditingSlug(null);
+  }, []);
+
+  const startRenameChannel = useCallback((channelId: string) => {
+    const ch = savedChannels.find((c) => c.id === channelId);
+    if (!ch) return;
+    setEditingChannelId(channelId);
+    setEditingChannelName(ch.displayName);
+  }, [savedChannels]);
+
+  const commitRenameChannel = useCallback(() => {
+    if (!editingChannelId) return;
+    const next = editingChannelName.trim();
+    if (next) updateChannel(editingChannelId, { displayName: next });
+    setEditingChannelId(null);
+    setEditingChannelName('');
+  }, [editingChannelId, editingChannelName, updateChannel]);
+
+  const startEditPlatformSlug = useCallback((channelId: string, platform: 'Kick' | 'Twitch') => {
+    const ch = savedChannels.find((c) => c.id === channelId);
+    if (!ch) return;
+    setEditingSlug({ channelId, platform });
+    setEditingSlugValue(platform === 'Kick' ? ch.kickSlug : ch.twitchSlug);
+  }, [savedChannels]);
+
+  const commitEditPlatformSlug = useCallback(() => {
+    if (!editingSlug) return;
+    const slug = editingSlugValue.trim();
+    if (!slug) return;
+    if (editingSlug.platform === 'Kick') {
+      updateChannel(editingSlug.channelId, { kickSlug: slug });
+    } else {
+      updateChannel(editingSlug.channelId, { twitchSlug: slug });
+    }
+    setEditingSlug(null);
+    setEditingSlugValue('');
+  }, [editingSlug, editingSlugValue, updateChannel]);
 
   const handleExpandChannelList = useCallback(() => {
     if (kickEnabled) setKickVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
     if (twitchEnabled) setTwitchVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
   }, [kickEnabled, twitchEnabled]);
-
-  const renameChannelDisplay = useCallback((channelId: string) => {
-    const ch = savedChannels.find((c) => c.id === channelId);
-    if (!ch) return;
-    const next = window.prompt('Display name for this channel:', ch.displayName);
-    if (next?.trim()) updateChannel(channelId, { displayName: next.trim() });
-  }, [savedChannels, updateChannel]);
-
-  const editPlatformSlug = useCallback((channelId: string, platform: 'Kick' | 'Twitch') => {
-    const ch = savedChannels.find((c) => c.id === channelId);
-    if (!ch) return;
-    const current = platform === 'Kick' ? ch.kickSlug : ch.twitchSlug;
-    const next = window.prompt(`${platform} channel slug to fetch:`, current);
-    if (!next?.trim()) return;
-    const slug = next.trim();
-    if (platform === 'Kick') updateChannel(channelId, { kickSlug: slug });
-    else updateChannel(channelId, { twitchSlug: slug });
-  }, [savedChannels, updateChannel]);
 
   const removeChannel = useCallback((channelId: string) => {
     setSavedChannels((prev) => {
@@ -559,7 +665,6 @@ export default function App() {
     try {
       const s = await apiGet<AppSettings>('/api/settings');
       setSettings(s);
-      setQuality(s.quality || '1080p');
     } catch {}
   }, []);
 
@@ -616,20 +721,20 @@ export default function App() {
   const selectVod = useCallback((vodUrl: string) => {
     setUrl(vodUrl);
     setTab('url');
-    setVideoInfo(null);
-  }, []);
+    void fetchVideoInfo(vodUrl);
+  }, [fetchVideoInfo]);
 
   // ── Size estimate ──
   const clipSec = Math.max(0, parseHms(endTime) - parseHms(startTime));
   const rates: Record<string, number> = {
-    source: 180, '1080p60': 120, '1080p': 120, '720p60': 70,
+    source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
     '720p': 70, '480p': 35, '360p': 18,
   };
   const mbPerMin = rates[quality] || 70;
   const estSize = (clipSec / 60) * mbPerMin;
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 selection:bg-[#53fc18] selection:text-black bg-[#09090b]"
+    <div className="min-h-screen flex items-center justify-center p-4 selection:bg-white selection:text-black bg-[#09090b]"
          style={{ backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
       <div className="relative w-full max-w-md bg-zinc-950 border-4 border-white p-6 flex flex-col gap-5 shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF] transition-all duration-300">
 
@@ -746,6 +851,11 @@ export default function App() {
                     <p className="text-[10px] text-zinc-400 font-mono mt-0.5 tracking-wider">
                       Channel: {videoInfo.uploader || 'Unknown'}
                     </p>
+                    {videoInfo.created_at && (
+                      <p className="text-[10px] text-zinc-500 font-mono mt-0.5">
+                        {fmtDateAndAgo(videoInfo.created_at)}
+                      </p>
+                    )}
                     <div className="flex justify-between items-center mt-1.5 pt-1 border-t border-zinc-800/50">
                       <span className="text-[10px] text-zinc-500 font-mono flex items-center gap-1">
                         <Clock size={10} /> {videoInfo.duration_string || fmtDuration(videoInfo.duration || 0)}
@@ -762,9 +872,9 @@ export default function App() {
                 {/* Quality + Trim */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1">
-                      <Settings2 size={10} /> Quality
-                    </label>
+                    <FieldCaption>
+                      <span className="flex items-center gap-1"><Settings2 size={10} /> Quality</span>
+                    </FieldCaption>
                     <select value={quality} onChange={(e) => setQuality(e.target.value)}
                       className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs cursor-pointer">
                       {videoInfo.qualities.length > 0 ? (
@@ -781,9 +891,9 @@ export default function App() {
                     </select>
                   </div>
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1">
-                      <FastForward size={10} /> Est. Size
-                    </label>
+                    <FieldCaption>
+                      <span className="flex items-center gap-1"><FastForward size={10} /> Est. Size</span>
+                    </FieldCaption>
                     <div className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs flex items-center justify-center">
                       {bytes(estSize)}
                     </div>
@@ -792,9 +902,9 @@ export default function App() {
 
                 {/* Trim */}
                 <div className="flex flex-col gap-2">
-                  <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1">
-                    <Scissors size={10} /> Trim VOD
-                  </label>
+                  <FieldCaption>
+                    <span className="flex items-center gap-1"><Scissors size={10} /> Trim VOD</span>
+                  </FieldCaption>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="flex flex-col gap-1">
                       <div className="relative">
@@ -826,13 +936,7 @@ export default function App() {
                   <div className={`absolute inset-0 translate-x-1.5 translate-y-1.5 group-hover:translate-x-1 group-hover:translate-y-1 transition-transform ${
                     urlPlatform === 'kick' ? 'bg-[#53fc18]' : urlPlatform === 'twitch' ? 'bg-[#9146FF]' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
                   }`} />
-                  <div className={`relative bg-black border-2 border-white py-4 flex items-center justify-center gap-3 transition-colors ${
-                    urlPlatform === 'kick'
-                      ? 'group-hover:bg-[#53fc18] group-hover:text-black group-hover:border-[#53fc18]'
-                      : urlPlatform === 'twitch'
-                      ? 'group-hover:bg-[#9146FF] group-hover:text-black group-hover:border-[#9146FF]'
-                      : 'group-hover:bg-white group-hover:text-black'
-                  }`}>
+                  <div className="relative bg-black border-2 border-white py-4 flex items-center justify-center gap-3 transition-colors group-hover:bg-white group-hover:text-black group-hover:border-white">
                     <Download size={20} strokeWidth={3} className="group-hover:animate-bounce" />
                     <span className="font-black uppercase tracking-widest text-md">Rip VOD</span>
                   </div>
@@ -844,176 +948,168 @@ export default function App() {
 
         {/* ════════════════════════════ CHANNELS TAB ════════════════════════════ */}
         {tab === 'channels' && (
-          <div className="flex flex-col gap-5">
-            <div className="flex flex-col gap-2">
-              <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Add Channel (saved locally)
-              </label>
-              <div className="flex gap-2">
-                <input type="text" value={addChannelInput}
-                  onChange={(e) => setAddChannelInput(e.target.value)}
-                  placeholder="CHANNEL SLUG OR URL..."
-                  onKeyDown={(e) => e.key === 'Enter' && handleAddChannel()}
-                  className="flex-1 bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 px-3 py-2.5 focus:outline-none focus:border-white uppercase text-xs" />
-                <button onClick={handleAddChannel} disabled={channelsLoading || !addChannelInput.trim()}
-                  className="bg-white text-black font-black uppercase px-3 hover:bg-white hover:shadow-[4px_4px_0px_0px_#9146FF] transition-all text-xs border-2 border-white disabled:opacity-50 flex items-center gap-1">
-                  <Plus size={14} /> Add
-                </button>
-              </div>
+          <div className="flex flex-col gap-3">
+            <div className="flex gap-2">
+              <input type="text" value={addChannelInput}
+                onChange={(e) => setAddChannelInput(e.target.value)}
+                placeholder="CHANNEL NAME OR URL..."
+                onKeyDown={(e) => e.key === 'Enter' && handleAddChannel()}
+                className="flex-1 bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 px-3 py-2.5 focus:outline-none focus:border-white uppercase text-xs" />
+              <button type="button" onClick={handleAddChannel}
+                disabled={channelsLoading || !addChannelInput.trim()}
+                className="bg-white text-black font-black uppercase px-3 text-xs border-2 border-white disabled:opacity-50">
+                <Plus size={14} />
+              </button>
             </div>
 
-            <div className="flex flex-col gap-1.5 max-h-[120px] overflow-y-auto pr-1 custom-scrollbar">
-              {savedChannels.length === 0 ? (
-                <p className="text-[10px] text-zinc-600 font-mono py-2">No saved channels yet.</p>
-              ) : savedChannels.map((ch) => (
-                <div key={ch.id}
-                  className={`flex items-center gap-1 border-2 px-2 py-1.5 ${
-                    ch.id === selectedChannelId ? 'border-white bg-zinc-900' : 'border-zinc-800'
-                  }`}>
-                  <button type="button" onClick={() => setSelectedChannelId(ch.id)}
-                    className="flex-1 text-left text-xs font-mono text-zinc-200 truncate hover:text-white">
-                    {ch.displayName}
-                    <span className="text-zinc-600 text-[9px] ml-1">
-                      ({ch.kickSlug}/{ch.twitchSlug})
-                    </span>
-                  </button>
-                  <button type="button" title="Rename display name"
-                    onClick={() => renameChannelDisplay(ch.id)}
-                    className="text-zinc-500 hover:text-white p-0.5">
-                    <Pencil size={12} />
-                  </button>
-                  <button type="button" title="Refresh VODs"
-                    onClick={() => refreshChannel(ch.id)}
-                    disabled={ch.loading}
-                    className="text-zinc-500 hover:text-white p-0.5 disabled:opacity-40">
-                    {ch.loading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                  </button>
-                  <button type="button" title="Remove channel"
-                    onClick={() => removeChannel(ch.id)}
-                    className="text-zinc-600 hover:text-red-400 p-0.5">
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
+            {savedChannels.length > 0 && (
+              <div className="flex flex-col gap-1 max-h-[100px] overflow-y-auto pr-1 custom-scrollbar">
+                {savedChannels.map((ch) => (
+                  <div key={ch.id}
+                    className={`flex items-center gap-1 border px-2 py-1 ${
+                      ch.id === selectedChannelId ? 'border-white bg-zinc-900' : 'border-zinc-800'
+                    }`}>
+                    {editingChannelId === ch.id ? (
+                      <input type="text" value={editingChannelName}
+                        onChange={(e) => setEditingChannelName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitRenameChannel();
+                          if (e.key === 'Escape') setEditingChannelId(null);
+                        }}
+                        onBlur={commitRenameChannel}
+                        autoFocus
+                        className="flex-1 min-w-0 bg-zinc-950 text-white font-mono text-xs px-1 py-0.5 focus:outline-none" />
+                    ) : (
+                      <button type="button" onClick={() => toggleChannelSelection(ch.id)}
+                        className="flex-1 text-left text-xs font-mono text-zinc-200 truncate hover:text-white">
+                        {ch.displayName}
+                      </button>
+                    )}
+                    {editingChannelId !== ch.id && (
+                      <button type="button" title="Rename"
+                        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
+                        className="text-zinc-600 hover:text-white p-0.5">
+                        <Pencil size={11} />
+                      </button>
+                    )}
+                    <button type="button" title="Refresh"
+                      onClick={(e) => { e.stopPropagation(); refreshChannel(ch.id); }}
+                      disabled={ch.loading}
+                      className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
+                      {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                    </button>
+                    <button type="button" title="Remove"
+                      onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
+                      className="text-zinc-600 hover:text-red-400 p-0.5">
+                      <X size={11} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {selectedChannel && (
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 mr-1">
-                Filters
-              </span>
-              <div className="group relative">
-                <label
-                  className={`flex items-center gap-1.5 px-2 py-1 border-2 cursor-pointer font-mono text-[10px] uppercase font-bold tracking-wider transition-colors ${
-                    kickEnabled
-                      ? 'bg-[#53fc18]/15 border-[#53fc18] text-[#53fc18]'
-                      : 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:border-zinc-600'
-                  }`}
-                >
-                  <input type="checkbox" checked={kickEnabled}
-                    onChange={(e) => setKickEnabled(e.target.checked)}
-                    className="accent-[#53fc18] w-3 h-3" />
-                  Kick
-                  {kickBrowseLoading && <Loader2 size={10} className="animate-spin" />}
-                </label>
-                <button type="button" title="Edit Kick slug"
-                  onClick={() => selectedChannelId && editPlatformSlug(selectedChannelId, 'Kick')}
-                  className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-zinc-900 border border-[#53fc18] text-[#53fc18] p-0.5 rounded-sm">
-                  <Pencil size={10} />
-                </button>
-              </div>
-              <div className="group relative">
-                <label
-                  className={`flex items-center gap-1.5 px-2 py-1 border-2 cursor-pointer font-mono text-[10px] uppercase font-bold tracking-wider transition-colors ${
-                    twitchEnabled
-                      ? 'bg-[#9146FF]/15 border-[#9146FF] text-[#9146FF]'
-                      : 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:border-zinc-600'
-                  }`}
-                >
-                  <input type="checkbox" checked={twitchEnabled}
-                    onChange={(e) => setTwitchEnabled(e.target.checked)}
-                    className="accent-[#9146FF] w-3 h-3" />
-                  Twitch
-                  {twitchBrowseLoading && <Loader2 size={10} className="animate-spin" />}
-                </label>
-                <button type="button" title="Edit Twitch slug"
-                  onClick={() => selectedChannelId && editPlatformSlug(selectedChannelId, 'Twitch')}
-                  className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 bg-zinc-900 border border-[#9146FF] text-[#9146FF] p-0.5 rounded-sm">
-                  <Pencil size={10} />
-                </button>
-              </div>
-            </div>
-            )}
-            {channelsError && (
-              <div className="text-red-400 text-xs font-mono border-2 border-red-500/30 p-2">
-                {channelsError}
-              </div>
-            )}
-            {allChannelVideos.length > 0 && !channelsLoading && (
-              <p className="text-[9px] font-mono text-zinc-500 uppercase tracking-wider">
-                {kickEnabled && (
-                  <span className="text-[#53fc18]">
-                    Kick {Math.min(kickVisibleLimit, kickChannelVideos.length)}/{kickChannelVideos.length}
-                  </span>
-                )}
-                {kickEnabled && twitchEnabled && <span className="text-zinc-700 mx-2">•</span>}
-                {twitchEnabled && (
-                  <span className="text-[#9146FF]">
-                    Twitch {Math.min(twitchVisibleLimit, twitchChannelVideos.length)}/{twitchChannelVideos.length}
-                  </span>
-                )}
-              </p>
-            )}
-            <div className="flex flex-col gap-2 max-h-[320px] overflow-y-auto pr-1 custom-scrollbar">
-              {visibleChannelVideos.length === 0 && !channelsLoading ? (
-                <div className="text-center text-zinc-600 font-mono text-xs py-8 border-2 border-dashed border-zinc-800">
-                  {allChannelVideos.length === 0
-                    ? 'ENTER A CHANNEL URL TO BROWSE VODS.'
-                    : (kickEnabled || twitchEnabled
-                        ? 'NO VODS FOUND FOR THE SELECTED PLATFORMS.'
-                        : 'SELECT AT LEAST ONE PLATFORM FILTER.')}
-                </div>
-              ) : (
-                visibleChannelVideos.map((v, i) => {
-                  const isTw = v.platform === 'Twitch';
-                  const color = isTw ? '#9146FF' : '#53fc18';
-                  const dateStr = fmtDate(v.created_at);
-                  const fullUrl = buildVodUrl(v);
+              <div className="flex items-center gap-2 flex-wrap">
+                {(['Kick', 'Twitch'] as const).map((platform) => {
+                  const isKick = platform === 'Kick';
+                  const enabled = isKick ? kickEnabled : twitchEnabled;
+                  const slug = isKick ? selectedChannel.kickSlug : selectedChannel.twitchSlug;
+                  const color = isKick ? '#53fc18' : '#9146FF';
+                  const loading = isKick ? kickBrowseLoading : twitchBrowseLoading;
+                  const editing = editingSlug?.channelId === selectedChannelId && editingSlug.platform === platform;
                   return (
-                    <button key={`${v.platform}-${v.id}-${i}`} onClick={() => selectVod(fullUrl)}
-                      className="text-left text-xs bg-zinc-950 border border-zinc-800 p-2 hover:border-zinc-500 transition-colors flex flex-col gap-1 group/btn">
-                      <div className="flex justify-between items-center gap-2">
-                        <span className="truncate flex items-center gap-2 font-mono text-zinc-300 group-hover/btn:text-white">
-                          <Tv size={12} style={{ color }} />
-                          {v.title || 'Untitled'}
-                        </span>
-                        <span className="text-[10px] text-white font-mono font-bold shrink-0 ml-2">
-                          {v.duration ? fmtShort(v.duration) : '?'}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 text-[9px] text-zinc-500 font-mono pl-5">
-                        <span style={{ color }}>{v.platform}</span>
-                        {dateStr && (
-                          <>
-                            <span className="text-zinc-700">•</span>
-                            <span>{dateStr}</span>
-                          </>
-                        )}
-                      </div>
-                    </button>
+                    <div key={platform} className="group relative flex items-center">
+                      {editing ? (
+                        <input type="text" value={editingSlugValue}
+                          onChange={(e) => setEditingSlugValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitEditPlatformSlug();
+                            if (e.key === 'Escape') setEditingSlug(null);
+                          }}
+                          onBlur={commitEditPlatformSlug}
+                          autoFocus
+                          className="w-28 bg-zinc-950 border text-white font-mono text-[10px] px-1.5 py-0.5 focus:outline-none"
+                          style={{ borderColor: color }} />
+                      ) : (
+                        <div
+                          className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold ${
+                            enabled ? '' : 'opacity-40'
+                          }`}
+                          style={enabled ? { borderColor: color, color } : { borderColor: '#3f3f46' }}
+                        >
+                          <input type="checkbox" checked={enabled}
+                            onChange={(e) => (isKick ? setKickEnabled : setTwitchEnabled)(e.target.checked)}
+                            className="w-3 h-3 cursor-pointer" style={{ accentColor: color }} />
+                          <span>{platform}</span>
+                          <span className="text-zinc-500 normal-case font-normal">{slug}</span>
+                          {loading && <Loader2 size={9} className="animate-spin" />}
+                        </div>
+                      )}
+                      {!editing && (
+                        <button type="button" title={`Edit ${platform} name`}
+                          onClick={() => startEditPlatformSlug(selectedChannelId!, platform)}
+                          className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 p-0.5 bg-zinc-900 border rounded-sm"
+                          style={{ borderColor: color, color }}>
+                          <Pencil size={9} />
+                        </button>
+                      )}
+                    </div>
                   );
-                })
-              )}
-            </div>
-            {canExpandChannelList && (
-              <button
-                type="button"
-                onClick={handleExpandChannelList}
-                disabled={kickBrowseLoading || twitchBrowseLoading}
-                className="w-full border-2 border-zinc-700 text-zinc-300 hover:border-white hover:text-white font-mono text-[10px] uppercase font-bold tracking-wider py-2 transition-colors disabled:opacity-50"
-              >
-                Show more (+{CHANNEL_EXPAND_STEP} per platform)
-              </button>
+                })}
+              </div>
+            )}
+
+            {channelsError && (
+              <p className="text-red-400 text-[10px] font-mono">{channelsError}</p>
+            )}
+
+            {selectedChannel && (
+              <>
+                {channelsLoading ? (
+                  <div className="flex justify-center py-6 text-zinc-500">
+                    <Loader2 size={18} className="animate-spin" />
+                  </div>
+                ) : visibleChannelVideos.length === 0 ? (
+                  <p className="text-center text-zinc-600 font-mono text-[10px] py-4">No VODs</p>
+                ) : (
+                  <div className="flex flex-col gap-1 max-h-[280px] overflow-y-auto pr-1 custom-scrollbar">
+                    {visibleChannelVideos.map((v, i) => {
+                      const isTw = v.platform === 'Twitch';
+                      const color = isTw ? '#9146FF' : '#53fc18';
+                      const fullUrl = buildVodUrl(v);
+                      return (
+                        <div key={`${v.platform}-${v.id}-${i}`}
+                          className="flex items-center gap-1 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600">
+                          <button type="button" onClick={() => selectVod(fullUrl)}
+                            className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 hover:text-white">
+                            <span className="truncate block">
+                              <span style={{ color }}>{isTw ? 'TW' : 'K'}</span>
+                              {' '}{v.title || 'Untitled'}
+                              {v.duration ? <span className="text-zinc-500 ml-1">{fmtShort(v.duration)}</span> : null}
+                            </span>
+                            {v.created_at && (
+                              <span className="text-[9px] text-zinc-600 block truncate">
+                                {fmtDateAndAgo(v.created_at)}
+                              </span>
+                            )}
+                          </button>
+                          <button type="button" title="Open in browser"
+                            onClick={() => window.open(fullUrl, '_blank', 'noopener,noreferrer')}
+                            className="text-zinc-600 hover:text-white p-0.5 shrink-0">
+                            <ExternalLink size={11} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {canExpandChannelList && (
+                  <button type="button" onClick={handleExpandChannelList}
+                    className="text-[10px] font-mono text-zinc-500 hover:text-white uppercase">
+                    +{CHANNEL_EXPAND_STEP} more
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}
@@ -1140,34 +1236,30 @@ export default function App() {
         {tab === 'settings' && settings && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-1.5">
-              <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Download Folder
-              </label>
+              <FieldCaption>Download Folder</FieldCaption>
               <div className="flex gap-2">
-                <input type="text" readOnly value={settings.download_folder || '(not set)'}
-                  placeholder="Choose a folder..."
-                  className="flex-1 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate" />
-                <button type="button" onClick={pickDownloadFolder}
-                  className="bg-white text-black font-black uppercase px-3 text-[10px] border-2 border-white hover:bg-[#53fc18] hover:border-[#53fc18] shrink-0 flex items-center gap-1">
-                  <FolderOpen size={14} /> Browse
+                <input type="text" value={settings.download_folder}
+                  onChange={(e) => setSettings({ ...settings, download_folder: e.target.value })}
+                  placeholder="C:\Users\...\Downloads"
+                  className="flex-1 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white" />
+                <button type="button" onClick={pickDownloadFolder} disabled={pickingFolder}
+                  className="bg-white text-black font-black uppercase px-3 text-[10px] border-2 border-white hover:bg-[#53fc18] hover:border-[#53fc18] shrink-0 flex items-center gap-1 disabled:opacity-50">
+                  {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+                  {pickingFolder ? '...' : 'Browse'}
                 </button>
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-1.5">
-                <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                  Download Threads
-                </label>
+                <FieldCaption>Download Threads</FieldCaption>
                 <input type="number" min={1} max={16}
                   value={settings.download_threads}
                   onChange={(e) => setSettings({ ...settings, download_threads: Math.max(1, Math.min(16, parseInt(e.target.value) || 4)) })}
                   className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
               </div>
               <div className="flex flex-col gap-1.5">
-                <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                  Max Cache (MB)
-                </label>
+                <FieldCaption>Max Cache (MB)</FieldCaption>
                 <input type="number" min={50} max={2000}
                   value={settings.max_cache_mb}
                   onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
@@ -1176,9 +1268,7 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Throttle (KiB/s, -1 = unlimited)
-              </label>
+              <FieldCaption>Throttle (KiB/s, -1 = unlimited)</FieldCaption>
               <input type="number" min={-1}
                 value={settings.throttle_kib}
                 onChange={(e) => setSettings({ ...settings, throttle_kib: parseInt(e.target.value) || -1 })}
@@ -1186,9 +1276,7 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Preferred Quality
-              </label>
+              <FieldCaption>Preferred Quality</FieldCaption>
               <input type="text" value={settings.quality || '1080p'}
                 onChange={(e) => setSettings({ ...settings, quality: e.target.value })}
                 placeholder="1080p"
@@ -1196,9 +1284,7 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Twitch OAuth Token
-              </label>
+              <FieldCaption>Twitch OAuth Token</FieldCaption>
               <input type="password" value={settings.oauth}
                 onChange={(e) => setSettings({ ...settings, oauth: e.target.value })}
                 placeholder="oauth_..."
