@@ -113,7 +113,7 @@ Open `http://localhost:7897` — the React UI is served directly by the Python b
 | `/api/info` | GET | Server info and Python version |
 | `/api/info/video?id=` | GET | Get VOD metadata |
 | `/api/info/clip?id=` | GET | Get clip metadata |
-| `/api/channel/videos?url=` | GET | List channel videos |
+| `/api/channel/videos?url=&platforms=Kick,Twitch&limit=` | GET | List channel videos (filterable by platform) |
 | `/api/download/video` | POST | Start VOD download |
 | `/api/download/clip` | POST | Start clip download |
 | `/api/downloads` | GET | List active downloads |

@@ -5,12 +5,9 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Dict, Optional
-
+from typing import Callable, Dict, Optional
 from models.schemas import DownloadState
 from services import ytdlp_service
-
-
 class DownloadManager:
     def __init__(self, max_workers: int = 4):
         self._downloads: Dict[str, DownloadState] = {}
@@ -28,10 +25,17 @@ class DownloadManager:
         crop_start: Optional[float] = None,
         crop_end: Optional[float] = None,
         download_type: str = "video",
+        download_func: Optional[Callable[..., str]] = None,
+        # Pre-fetched metadata (so the queue UI can show the VOD info
+        # immediately without a second round-trip).
+        title: Optional[str] = None,
+        channel: Optional[str] = None,
+        thumbnail: Optional[str] = None,
+        duration: Optional[float] = None,
+        duration_string: Optional[str] = None,
     ) -> str:
         download_id = f"dl_{uuid.uuid4().hex[:12]}"
         platform = ytdlp_service.detect_platform(url)
-
         state = DownloadState(
             download_id=download_id,
             url=url,
@@ -40,6 +44,14 @@ class DownloadManager:
             status="Starting...",
             output_file=output_file,
             started_at=datetime.now(timezone.utc).isoformat(),
+            quality=quality,
+            crop_start=crop_start,
+            crop_end=crop_end,
+            title=title,
+            channel=channel,
+            thumbnail=thumbnail,
+            duration=duration,
+            duration_string=duration_string,
         )
 
         cancel_event = threading.Event()
@@ -54,9 +66,12 @@ class DownloadManager:
                 raise ytdlp_service.CancelledError("Download cancelled by user")
 
             if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded = d.get("downloaded_bytes", 0)
-                pct = int(downloaded / total * 100) if total > 0 else 0
+                if "percent" in d:
+                    pct = max(0, min(100, int(d["percent"])))
+                else:
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded = d.get("downloaded_bytes", 0)
+                    pct = int(downloaded / total * 100) if total > 0 else 0
                 with self._lock:
                     state.progress = pct
                     state.status = f"Downloading {pct}%"
@@ -80,20 +95,38 @@ class DownloadManager:
                     pass
 
         output_existed = os.path.isfile(output_file)
-
         def _download_worker():
             try:
                 state.status = "Downloading..."
                 self._notify_sse(download_id, "status", "Downloading...")
-                output_file_result = ytdlp_service.download_video_sync(
-                    url=url,
-                    output_path=output_file,
-                    quality=quality,
-                    oauth=oauth,
-                    crop_start=crop_start,
-                    crop_end=crop_end,
-                    progress_hook=_progress_hook,
-                )
+                # Use the platform-specific download function if provided,
+                # otherwise fall back to yt-dlp. Only forward parameters the
+                # custom function actually accepts, so platform-specific
+                # implementations don't have to mirror the full yt-dlp API.
+                if download_func is not None:
+                    import inspect
+                    sig = inspect.signature(download_func)
+                    kwargs = {
+                        "url": url,
+                        "output_path": output_file,
+                        "quality": quality,
+                        "oauth": oauth,
+                        "crop_start": crop_start,
+                        "crop_end": crop_end,
+                        "progress_hook": _progress_hook,
+                    }
+                    kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                    output_file_result = download_func(**kwargs)
+                else:
+                    output_file_result = ytdlp_service.download_video_sync(
+                        url=url,
+                        output_path=output_file,
+                        quality=quality,
+                        oauth=oauth,
+                        crop_start=crop_start,
+                        crop_end=crop_end,
+                        progress_hook=_progress_hook,
+                    )
                 if output_file_result and os.path.isfile(output_file_result):
                     with self._lock:
                         state.status = "Completed"
@@ -115,8 +148,10 @@ class DownloadManager:
             finally:
                 with self._lock:
                     self._sse_queues.pop(download_id, None)
-                    self._downloads.pop(download_id, None)
                     self._cancel_events.pop(download_id, None)
+                    # Keep completed/failed downloads for querying; only remove cancelled
+                    if state.status not in ("Completed", "Failed"):
+                        self._downloads.pop(download_id, None)
 
         self._executor.submit(_download_worker)
         return download_id
@@ -142,6 +177,18 @@ class DownloadManager:
                 key=lambda d: d.started_at,
                 reverse=True,
             )[:50]
+
+    def get_active_and_history(self) -> dict:
+        _DONE = frozenset({"Completed", "Failed", "Cancelled"})
+        with self._lock:
+            items = sorted(
+                self._downloads.values(),
+                key=lambda d: d.started_at,
+                reverse=True,
+            )
+        active = [d for d in items if d.status not in _DONE][:50]
+        history = [d for d in items if d.status in _DONE][:50]
+        return {"active": active, "history": history}
 
     def unregister_sse(self, download_id: str, queue):
         with self._lock:

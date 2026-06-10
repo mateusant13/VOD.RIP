@@ -8,6 +8,8 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const API_PORT = process.env.PORT || "7897";
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
@@ -20,7 +22,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:7897",
+        target: `http://localhost:${API_PORT}`,
         changeOrigin: true,
       },
     },

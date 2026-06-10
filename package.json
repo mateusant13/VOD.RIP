@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:api": "cd KickDownloader/KickDownloaderPy && python run.py",
+    "dev:all": "node scripts/dev-all.mjs",
     "build": "vite build",
     "build-copy": "vite build && node -e \"require('fs').copyFileSync('dist/index.html', 'KickDownloader/KickDownloaderPy/static/index.html')\"",
     "preview": "vite preview"

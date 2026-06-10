@@ -5,7 +5,12 @@ import json
 import os
 import platform
 import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +21,7 @@ from models.schemas import (
     AppSettings,
     DownloadRequest,
     DownloadState,
+    OpenFolderRequest,
     SettingsUpdate,
     VideoInfo,
 )
@@ -23,9 +29,76 @@ from services.download_manager import DownloadManager
 from services.settings import SettingsManager
 import yt_dlp
 from services.ytdlp_service import detect_platform, get_video_info
+from services.kick_playwright_service import (
+    download_vod_sync as kick_download_vod_sync,
+    get_video_info_sync as kick_get_video_info_sync,
+    list_channel_videos_sync as kick_list_channel_videos_sync,
+    get_channel_info_sync as kick_get_channel_info_sync,
+)
+# A small helper for shaping per-platform error messages so the UI gets
+# something readable instead of a raw Playwright traceback.
+def _normalize_err(msg: str, limit: int = 200) -> str:
+    if not msg:
+        return ""
+    msg = str(msg).strip()
+    return msg if len(msg) <= limit else msg[: limit - 3] + "..."
 
+
+def _format_platform_error(exc: BaseException) -> str:
+    """Human-readable per-platform error (Playwright may raise empty NotImplementedError)."""
+    msg = str(exc).strip()
+    if msg:
+        return msg
+    name = type(exc).__name__
+    if name == "NotImplementedError":
+        return (
+            "Playwright subprocess failed (Windows event loop). "
+            "Restart the backend; if using dev mode, ensure Kick runs in a worker thread."
+        )
+    return name
 app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
-
+settings_mgr = SettingsManager()
+download_mgr = DownloadManager(max_workers=4)
+# Characters that Windows rejects in file paths. Anything we use as part
+# of an output path or cache dir must be stripped of these or we get
+# `[Errno 22] Invalid argument` on filesystem syscalls.
+_WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"/\\|?*')
+# Bare reserved device names that Windows treats specially. Suffixing
+# with a dot/space or appending an extension is the only way out.
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+def _sanitize_path_component(value: str, fallback: str = "download") -> str:
+    """Strip characters Windows rejects from a single path component.
+    Returns `fallback` when the cleaned component is empty or matches a
+    reserved device name. Use this whenever user input flows into a path
+    segment that yt-dlp or ffmpeg will touch — `[Errno 22] Invalid
+    argument` is what you get otherwise on Windows.
+    """
+    if value is None:
+        return fallback
+    cleaned = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "_", str(value)).strip(" .")
+    if not cleaned or cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        return fallback
+    return cleaned
+def _safe_makedirs(path: Path) -> Path:
+    """`mkdir(parents=True, exist_ok=True)` with a friendlier fallback.
+    If the user-configured `temp_folder` or `Path.home()` produces a path
+    that the OS can't create (e.g. invalid characters, denied ACL on
+    `Users\\.cache`), we fall back to a tmpdir we know we can write to.
+    Without this, a single bad path crashes the whole download with a
+    raw `OSError` that the user has no way to act on.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "KickDownloader"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 
@@ -64,6 +137,8 @@ async def update_settings(update: SettingsUpdate):
         current.throttle_kib = update.throttle_kib
     if update.ffmpeg_path is not None:
         current.ffmpeg_path = update.ffmpeg_path
+    if update.download_folder is not None:
+        current.download_folder = update.download_folder.strip()
     if update.temp_folder is not None:
         current.temp_folder = update.temp_folder
     if update.oauth is not None:
@@ -74,89 +149,339 @@ async def update_settings(update: SettingsUpdate):
     return current
 
 
-# --- Channel Videos ---
+def _download_dir(opts: AppSettings) -> Path:
+    folder = (opts.download_folder or "").strip()
+    if folder:
+        return Path(folder)
+    return Path.home() / "Downloads"
 
+
+def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
+    if req.output_file:
+        return req.output_file
+    base = _download_dir(opts)
+    title = meta.get("title") or detect_platform(req.url).lower()
+    stem = _sanitize_path_component(str(title), fallback="video")
+    platform = detect_platform(req.url).lower()
+    return str(base / f"{stem}_{platform}.mp4")
+
+
+def _pick_folder_sync() -> Optional[str]:
+    """Show the native folder picker (Windows/macOS/Linux)."""
+    if os.name == "nt":
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$d.Description = 'Choose download folder'; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+            "  Write-Output $d.SelectedPath "
+            "}"
+        )
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Sta", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            path = (out.stdout or "").strip()
+            return path or None
+        except Exception:
+            return None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(title="Choose download folder")
+        root.destroy()
+        return path or None
+    except Exception:
+        return None
+
+
+def _open_folder_sync(path: str) -> None:
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    target = str(p.resolve())
+    if os.name == "nt":
+        if p.is_file():
+            subprocess.Popen(["explorer", "/select,", target])
+        else:
+            os.startfile(target)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target if p.is_dir() else str(p.parent)])
+    else:
+        subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)])
+
+
+@app.post("/api/pick-folder")
+async def pick_folder():
+    path = await asyncio.get_event_loop().run_in_executor(None, _pick_folder_sync)
+    if path:
+        current = settings_mgr.get()
+        current.download_folder = path
+        settings_mgr.save(current)
+    return {"path": path}
+
+
+@app.post("/api/open-folder")
+async def open_folder(req: OpenFolderRequest):
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, _open_folder_sync, req.path
+        )
+        return {"ok": True}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Channel Videos ---
+# How many days back the channel browser looks by default. The UI keeps the
+# full result in memory and lets the user filter the visible list, so the
+# window is the only knob that drives how much we fetch from upstream.
+CHANNEL_DAYS_DEFAULT = 14
+# Hard ceiling on results per platform. 100 is more than enough to cover
+# 14 days of any reasonable streamer (1-2 VODs/day) without hammering
+# the upstream endpoints.
+CHANNEL_LIMIT_MAX = 100
+def _parse_video_date(value) -> Optional[datetime]:
+    """Best-effort parse of a video's `created_at` into an aware datetime.
+    Returns None when the field is missing or unparseable, so the caller
+    can decide whether to keep the entry (we keep it; we just can't bound
+    it by date).
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Twitch `upload_date` is YYYYMMDD.
+    if re.match(r"^\d{8}$", s):
+        try:
+            return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    # ISO-ish: 2024-05-21T12:34:56Z or with offset
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
 @app.get("/api/channel/videos")
-async def channel_videos(url: str, limit: int = 20):
+async def channel_videos(
+    url: str,
+    limit: int = CHANNEL_LIMIT_MAX,
+    days: int = CHANNEL_DAYS_DEFAULT,
+    platforms: str = "Kick,Twitch",
+):
+    """Fetch VODs for a channel across one or more platforms.
+    `platforms` is a comma-separated list. The endpoint always returns the
+    union of results across every requested platform; the UI is expected
+    to keep the full list in memory and apply per-platform filters
+    client-side. `days` (default 14) caps results to the last N days.
+    `limit` clamps the per-platform upstream query.
+    Each video entry includes a `url` (clickable VOD link) and a
+    `created_at` (best-effort date string) for the UI to show.
+    """
     url = unquote(url)
+    raw = url.strip()
     try:
         # Auto-prepend protocol if missing (e.g. "twitch.tv/asmongold" -> "https://twitch.tv/asmongold")
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        platform = detect_platform(url)
-
-        if platform == "Unknown":
-            raise ValueError(
-                f"Could not detect platform. Enter a full channel URL like:\n"
-                f"  • https://www.twitch.tv/channelname\n"
-                f"  • https://kick.com/channelname"
-            )
-
-        # Build the channel videos URL
-        if platform == "Twitch":
-            m = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", url)
-            channel = m.group(1) if m else url.strip().rstrip("/").split("/")[-1]
-            videos_url = f"https://www.twitch.tv/{channel}/videos"
-        elif platform == "Kick":
-            m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", url)
-            channel = m.group(1) if m else url.strip().rstrip("/").split("/")[-1]
-            videos_url = f"https://kick.com/{channel}/videos"
+        if not raw.startswith(("http://", "https://")):
+            raw = "https://" + raw
+        # Parse out the channel slug and any platform hint from the URL.
+        platform_hint = detect_platform(raw)
+        channel: Optional[str] = None
+        if platform_hint == "Twitch":
+            m = re.search(r"twitch\.tv/([a-zA-Z0-9_]+)", raw)
+            channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
+        elif platform_hint == "Kick":
+            m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", raw)
+            channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
         else:
-            raise ValueError(f"Could not parse channel from URL: {url}")
+            # No platform hint — treat the last path segment (or whole input)
+            # as a channel name.
+            channel = raw.strip().rstrip("/").split("/")[-1] or raw.strip()
+            # Strip a protocol prefix in case the user typed "https://titiltei".
+            if channel.startswith(("http://", "https://")):
+                from urllib.parse import urlparse
+                channel = urlparse(channel).path.strip("/").split("/")[0] or channel
+        if not channel:
+            raise ValueError("Could not parse a channel name from the input.")
+        # Decide which platforms to query. The filter list is always honored
+        # (the UI sends the full set on first browse and re-sends the same
+        # set on every filter toggle — but it never resizes the result
+        # server-side, since that would defeat the "cache and filter
+        # client-side" model).
+        if not platforms or not platforms.strip():
+            wanted = ["Twitch", "Kick"]
+        else:
+            wanted = [p.strip() for p in platforms.split(",") if p.strip()]
+        if not wanted:
+            return {
+                "videos": [],
+                "channel": channel,
+                "platforms": [],
+                "per_platform_errors": {},
+            }
+        # Clamp parameters so a hostile client can't ask for 1M VODs.
+        limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
+        days = max(0, min(int(days), 365))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
+        per_platform_errors: Dict[str, str] = {}
+        all_videos: List[dict] = []
+        loop = asyncio.get_running_loop()
+        # Kick needs Playwright/Chromium (~15s). Start it first, then Twitch
+        # after a short stagger so the browser can launch before yt-dlp runs.
+        PLATFORM_STAGGER_SEC = 1.0
 
-        # Use yt-dlp to extract playlist entries (flat=True for speed)
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": True,
-            "playlistend": limit,
-            "noplaylist": False,
+        async def _fetch_twitch() -> None:
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": True,
+                "playlistend": limit,
+                "noplaylist": False,
+            }
+            videos_url = f"https://www.twitch.tv/{channel}/videos"
+            def _extract():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(videos_url, download=False)
+            try:
+                info = await loop.run_in_executor(None, _extract)
+            except Exception as e:
+                per_platform_errors["Twitch"] = _format_platform_error(e)
+                return
+            for entry in (info or {}).get("entries", []) or []:
+                if entry is None:
+                    continue
+                entry_id = entry.get("id", "")
+                # Twitch's yt-dlp entries expose the id with a leading
+                # "v" (e.g. "v1492198155"). The real URL strips it
+                # (`/videos/1492198155`), so the same id is useless for
+                # building a clickable link. Normalize it to the bare
+                # numeric form so any consumer of this endpoint (the
+                # UI, the URL tab, `yt-dlp.extract_info` on the next
+                # call) sees a URL that actually resolves.
+                numeric_id = entry_id[1:] if entry_id.startswith("v") else entry_id
+                webpage_url = (
+                    entry.get("url")
+                    or entry.get("webpage_url")
+                    or (f"https://www.twitch.tv/videos/{numeric_id}" if numeric_id else "")
+                )
+                all_videos.append({
+                    # Strip the leading "v" so the id matches the
+                    # URL's path segment. Clients that need the
+                    # full URL can use `v.url`; clients that need
+                    # just the id get a consistent numeric form.
+                    "id": numeric_id or entry_id,
+                    "platform": "Twitch",
+                    "title": entry.get("title") or entry.get("url", "Untitled"),
+                    "duration": entry.get("duration"),
+                    "created_at": entry.get("upload_date"),
+                    "views": entry.get("view_count"),
+                    "thumbnail_url": entry.get("thumbnail") or entry.get("url"),
+                    "url": webpage_url,
+                })
+        async def _fetch_kick() -> None:
+            videos_url = f"https://kick.com/{channel}/videos"
+            try:
+                vids = await loop.run_in_executor(
+                    None, kick_list_channel_videos_sync, videos_url, limit
+                )
+            except Exception as e:
+                per_platform_errors["Kick"] = _format_platform_error(e)
+                return
+            for v in vids:
+                all_videos.append({
+                    "id": v["id"],
+                    "platform": "Kick",
+                    "title": v.get("title") or "Untitled",
+                    "duration": v.get("duration"),
+                    "created_at": v.get("created_at"),
+                    "views": v.get("views"),
+                    "thumbnail_url": v.get("thumbnail"),
+                    "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
+                })
+        async def _fetch_twitch_staggered() -> None:
+            if "Kick" in wanted:
+                await asyncio.sleep(PLATFORM_STAGGER_SEC)
+            await _fetch_twitch()
+
+        tasks: List[asyncio.Task] = []
+        if "Kick" in wanted:
+            tasks.append(asyncio.create_task(_fetch_kick()))
+        if "Twitch" in wanted:
+            tasks.append(asyncio.create_task(_fetch_twitch_staggered()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Apply the date window, then sort newest-first across platforms.
+        # Entries with no parseable date are kept (so an unparseable Kick
+        # VOD isn't silently dropped) but are sorted to the end.
+        if cutoff is not None:
+            filtered: List[dict] = []
+            for v in all_videos:
+                dt = _parse_video_date(v.get("created_at"))
+                if dt is None or dt >= cutoff:
+                    filtered.append(v)
+            all_videos = filtered
+        def _sort_key(v: dict) -> tuple:
+            dt = _parse_video_date(v.get("created_at"))
+            ts = -dt.timestamp() if dt else 0.0
+            # Stable secondary key so missing-date entries keep their
+            # upstream order rather than shuffling on every refresh.
+            return (ts, v.get("platform") or "")
+        all_videos.sort(key=_sort_key)
+        # Normalize error messages: cap at 200 chars.
+        for k, v in list(per_platform_errors.items()):
+            per_platform_errors[k] = _normalize_err(v)
+        return {
+            "videos": all_videos,
+            "channel": channel,
+            "platforms": wanted,
+            "days": days,
+            "per_platform_errors": per_platform_errors,
         }
-
-        def _extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(videos_url, download=False)
-
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, _extract)
-
-        if info is None:
-            return {"videos": [], "channel": channel or url, "platform": platform}
-
-        entries = info.get("entries", [])
-        videos = []
-        for entry in entries:
-            if entry is None:
-                continue
-            videos.append({
-                "id": entry.get("id", ""),
-                "platform": platform,
-                "title": entry.get("title") or entry.get("url", "Untitled"),
-                "duration": entry.get("duration"),
-                "created_at": entry.get("upload_date"),
-                "views": entry.get("view_count"),
-                "thumbnail_url": entry.get("thumbnail") or entry.get("url"),
-            })
-
-        return {"videos": videos, "channel": channel, "platform": platform}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         err_msg = str(e)
-        if "Invalid argument" in err_msg or "Errno 22" in err_msg:
-            err_msg = f"Could not fetch videos for this channel. The platform may block automated browsing ({platform if 'platform' in dir() else 'Unknown'})."
         raise HTTPException(status_code=400, detail=err_msg)
-
-
+def _explain_oserror(e: OSError) -> str:
+    """Turn a raw OSError into something a human can act on.
+    The most common offender is `[Errno 22] Invalid argument` on
+    Windows, which usually means a path contains a character the OS
+    rejects (e.g. `<>"|?*`, or a non-drive colon). Surface the path
+    and the errno so the user can fix the offending setting.
+    """
+    msg = str(e) or e.__class__.__name__
+    if e.filename:
+        return f"{msg} (path: {e.filename!r})"
+    return msg
 # --- Video Info ---
-
 @app.get("/api/info/video")
 async def info_video(id: str):
     try:
+        # Kick: use the headless-browser service (Cloudflare blocks API access)
+        if "kick.com" in id.lower():
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(
+                None, kick_get_video_info_sync, id
+            )
+            return info
         info = await get_video_info(id)
         return info
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=_explain_oserror(e))
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -172,14 +497,43 @@ async def info_clip(id: str):
 
 # --- Downloads ---
 
+async def _fetch_queue_meta(url: str, platform: str) -> dict:
+    """Best-effort metadata fetch so the queue UI can show VOD info.
+    Returns a dict with `title`, `channel`, `thumbnail`, `duration`,
+    `duration_string`. Empty dict on failure (the queue will still work,
+    just with less info).
+    """
+    try:
+        if platform == "Kick":
+            info = await asyncio.get_event_loop().run_in_executor(
+                None, kick_get_video_info_sync, url
+            )
+        else:
+            info = await get_video_info(url)
+        if info is None:
+            return {}
+        # `info` may be a Pydantic model or a plain dict depending on the path.
+        if hasattr(info, "model_dump"):
+            info = info.model_dump()
+        elif not isinstance(info, dict):
+            return {}
+        return {
+            "title": info.get("title"),
+            "channel": info.get("channel") or info.get("uploader"),
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+            "duration_string": info.get("duration_string"),
+        }
+    except Exception:
+        return {}
 @app.post("/api/download/video")
 async def download_video(req: DownloadRequest):
     opts = settings_mgr.get()
-    output = req.output_file or str(
-        Path.home() / "Downloads" / f"{detect_platform(req.url).lower()}_video.mp4"
-    )
-    Path(output).parent.mkdir(parents=True, exist_ok=True)
-
+    platform = detect_platform(req.url)
+    meta = await _fetch_queue_meta(req.url, platform)
+    output = _build_output_path(req, opts, meta)
+    _safe_makedirs(Path(output).parent)
+    download_func = kick_download_vod_sync if platform == "Kick" else None
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -187,18 +541,24 @@ async def download_video(req: DownloadRequest):
         oauth=req.oauth or opts.oauth,
         crop_start=req.crop_start,
         crop_end=req.crop_end,
+        download_func=download_func,
+        title=meta.get("title"),
+        channel=meta.get("channel"),
+        thumbnail=meta.get("thumbnail"),
+        duration=meta.get("duration"),
+        duration_string=meta.get("duration_string"),
     )
     return {"download_id": download_id, "status": "started"}
-
-
 @app.post("/api/download/clip")
 async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
-    output = req.output_file or str(
-        Path.home() / "Downloads" / "clip.mp4"
-    )
-    Path(output).parent.mkdir(parents=True, exist_ok=True)
-
+    platform = detect_platform(req.url)
+    meta = await _fetch_queue_meta(req.url, platform)
+    output = _build_output_path(req, opts, meta) if not req.output_file else req.output_file
+    if not req.output_file and not meta.get("title"):
+        output = str(_download_dir(opts) / "clip.mp4")
+    _safe_makedirs(Path(output).parent)
+    download_func = kick_download_vod_sync if platform == "Kick" else None
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -206,13 +566,18 @@ async def download_clip(req: DownloadRequest):
         oauth=req.oauth or opts.oauth,
         crop_start=req.crop_start,
         crop_end=req.crop_end,
+        download_func=download_func,
+        title=meta.get("title"),
+        channel=meta.get("channel"),
+        thumbnail=meta.get("thumbnail"),
+        duration=meta.get("duration"),
+        duration_string=meta.get("duration_string"),
     )
     return {"download_id": download_id, "status": "started"}
 
-
 @app.get("/api/downloads")
 async def list_downloads():
-    return download_mgr.get_all()
+    return download_mgr.get_active_and_history()
 
 
 @app.get("/api/download/{download_id}")

@@ -58,9 +58,21 @@ def build_url(id_or_url: str, platform: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_cache_dir() -> Path:
-    """Return the dedicated yt-dlp cache directory for this application."""
+    """Return the dedicated yt-dlp cache directory for this application.
+    If the user's `Path.home()` produces a path that can't be created
+    (e.g. the home dir is a UNC share the OS won't create child
+    directories on, or has illegal characters in it), fall back to the
+    system temp dir. This is the most common cause of `[Errno 22]
+    Invalid argument` users see when fetching a VOD.
+    """
     base = Path.home() / ".cache" / "KickDownloader"
-    return base / "yt-dlp-cache"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "yt-dlp-cache"
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "KickDownloader" / "yt-dlp-cache"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def _prune_cache_dir(cache_dir: Path, max_bytes: int) -> None:
@@ -283,22 +295,35 @@ def _build_ydl_opts(
 # Segment-level HLS download (TwitchDownloader-style)
 # ---------------------------------------------------------------------------
 
+# Keys from _build_ydl_opts that should be forwarded to _extract_hls_info
+_HLS_FORWARD_KEYS = frozenset({
+    "format", "username", "password",
+    "cachedir", "quiet", "no_warnings",
+})
+
+
 def _extract_hls_info(url: str, opts: dict) -> dict:
-    """Use yt-dlp to get HLS info without downloading."""
+    """Use yt-dlp to get HLS info without downloading, passing auth etc."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
     }
-    if "format" in opts:
-        ydl_opts["format"] = opts["format"]
+    for key in _HLS_FORWARD_KEYS:
+        if key in opts:
+            ydl_opts[key] = opts[key]
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def _find_hls_format(info: dict) -> dict:
-    """Pick the best HLS (m3u8) format from extracted info."""
+    """Pick the best HLS (m3u8) format matching the user's quality preference.
+
+    The *info* dict is expected to come from ``_extract_hls_info`` which
+    was called with a ``format`` opt that may contain a height constraint
+    such as ``[height<=720]``.  This function honours that constraint.
+    """
     formats = info.get("formats") or []
     hls_formats = [
         f for f in formats
@@ -306,6 +331,10 @@ def _find_hls_format(info: dict) -> dict:
     ]
     if not hls_formats:
         raise RuntimeError("No HLS format found in video info")
+
+    # If the caller already passed a format string with height constraint,
+    # yt-dlp's extract_info will have already filtered the results.
+    # We just pick the tallest / highest-bitrate HLS entry from what's left.
     hls_formats.sort(
         key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
         reverse=True,
@@ -376,7 +405,6 @@ def _download_segments(
     files = []
     total = len(segments)
     for i, seg in enumerate(segments):
-        # Check cancellation before each segment
         if cancel_event and cancel_event.is_set():
             raise CancelledError("Download cancelled by user")
 
@@ -391,7 +419,6 @@ def _download_segments(
                     f.write(chunk)
         files.append(path)
 
-        # Report progress
         if progress_hook:
             pct = int((i + 1) / total * 100)
             progress_hook({
@@ -420,7 +447,6 @@ def _concat_and_trim(
 
     with open(concat_txt, "w", encoding="utf8") as f:
         for seg_path in files:
-            # Use forward slashes on Windows (ffmpeg concat demuxer handles them)
             posix = seg_path.replace("\\", "/")
             f.write(f"file '{posix}'\n")
 
@@ -437,7 +463,6 @@ def _concat_and_trim(
         check=True, capture_output=True,
     )
 
-    # Notify completion
     if progress_hook:
         progress_hook({"status": "finished"})
 
@@ -451,14 +476,7 @@ def _download_hls_clip(
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    """Download only the HLS segments covering *start_sec*–*end_sec*.
-
-    Uses the same approach as TwitchDownloader: parse the m3u8 playlist,
-    download only the needed TS fragments, then concat + trim with ffmpeg.
-    No full VOD download — only the segments in the time range.
-
-    Supports cancellation via *cancel_event* and progress via *progress_hook*.
-    """
+    """Download only the HLS segments covering *start_sec*–*end_sec*."""
     duration = end_sec - start_sec
 
     info = _extract_hls_info(url, opts)
@@ -519,12 +537,10 @@ def download_video_sync(
     )
 
     if has_crop and is_hls:
-        # ── HLS segment-level clip (TwitchDownloader-style) ──────────────
-        # Download ONLY the TS segments covering the time range, concat + trim.
-        _download_hls_clip(full_url, output_path, crop_start, crop_end, opts)
+        _download_hls_clip(full_url, output_path, crop_start, crop_end, opts,
+                          progress_hook=progress_hook)
 
     elif has_crop:
-        # Non-HLS platform — yt-dlp download_sections works fine
         start = _format_ts(crop_start)
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*{start}-{end}"]
@@ -544,7 +560,6 @@ def download_video_sync(
             ydl.download([full_url])
 
     else:
-        # No crop — let yt-dlp download the full video normally
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([full_url])
 
