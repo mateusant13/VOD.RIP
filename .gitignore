@@ -7,7 +7,7 @@ node_modules/
 dist/
 build/
 # Generated build artifact copied from dist/ during npm run build-copy
-KickDownloader/KickDownloaderPy/static/index.html
+backend/static/index.html
 
 # Python
 __pycache__/
@@ -56,19 +56,20 @@ pids/
 conversations/
 
 # Old .NET project (legacy)
+legacy/
 KickDownloader/old_kick_downloader/
 
 # Personal scripts
 scripts/download_random_clips.py
 
 # Dev / debug utilities (not production code)
-KickDownloader/KickDownloaderPy/debug_cli.py
-KickDownloader/KickDownloaderPy/scripts/test_clip_preview.py
-KickDownloader/KickDownloaderPy/test_downloads.py
+backend/debug_cli.py
+backend/scripts/test_clip_preview.py
+backend/test_downloads.py
 debug_full_flow.py
 
 # AI agent memory (not project documentation)
-KickDownloader/AGENTS.md
+backend/AGENTS.md
 
 # Generated audit reports
 report/

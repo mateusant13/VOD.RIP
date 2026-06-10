@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const pyDir = path.join(root, "KickDownloader", "KickDownloaderPy");
+const pyDir = path.join(root, "backend");
 const shell = process.platform === "win32";
 const apiPort = process.env.PORT || "7897";
 

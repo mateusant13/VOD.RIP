@@ -30,11 +30,10 @@ A lightweight web application for ripping VODs and clips from **[Kick.com](https
 
 ```bash
 # 1. Install Python dependencies
-cd KickDownloader/KickDownloaderPy
+cd backend
 pip install -r requirements.txt
 
 # 2. Install frontend dependencies (from project root)
-cd ../..
 npm install
 ```
 
@@ -44,7 +43,7 @@ Run **both** the backend and frontend simultaneously:
 
 **Terminal 1 — Python Backend:**
 ```bash
-cd KickDownloader/KickDownloaderPy
+cd backend
 python run.py
 ```
 Server starts at `http://localhost:7897`
@@ -63,7 +62,7 @@ npm run build
 
 # This copies the built frontend to the Python backend's static folder
 # Then just run the Python server:
-cd KickDownloader/KickDownloaderPy
+cd backend
 python run.py
 ```
 
@@ -84,23 +83,24 @@ Open `http://localhost:7897` — the React UI is served directly by the Python b
 ├── vite.config.ts                # Vite config with API proxy
 ├── tsconfig.json                 # TypeScript config
 │
-├── KickDownloader/
-│   ├── KickDownloaderPy/         # Python backend (FastAPI)
-│   │   ├── main.py               # FastAPI server + API routes
-│   │   ├── run.py                # Launch script (auto-installs deps)
-│   │   ├── requirements.txt      # Python dependencies
-│   │   ├── models/
-│   │   │   └── schemas.py        # Pydantic data models
-│   │   ├── services/
-│   │   │   ├── ytdlp_service.py  # yt-dlp wrapper
-│   │   │   ├── download_manager.py # Download queue + SSE
-│   │   │   └── settings.py       # JSON settings persistence
-│   │   └── static/
-│   │       └── index.html        # Built React UI (via npm run build-copy)
+├── backend/                      # Python backend (FastAPI)
+│   ├── main.py                   # FastAPI server + API routes
+│   ├── run.py                    # Launch script (auto-installs deps)
+│   ├── requirements.txt          # Python dependencies
 │   ├── launch.bat                # Windows launcher
-│   ├── AGENTS.md                 # AI agent project memory
-│   ├── LICENSE.txt
-│   └── THIRD-PARTY-LICENSES.txt
+│   ├── models/
+│   │   └── schemas.py            # Pydantic data models
+│   ├── services/
+│   │   ├── ytdlp_service.py      # yt-dlp wrapper
+│   │   ├── download_manager.py   # Download queue + SSE
+│   │   └── settings.py           # JSON settings persistence
+│   └── static/
+│       └── index.html            # Built React UI (via npm run build-copy)
+│
+├── scripts/                      # Dev automation
+│   └── dev-all.mjs               # Start API + Vite together
+├── LICENSE.txt
+├── THIRD-PARTY-LICENSES.txt
 └── .gitignore
 ```
 
@@ -129,10 +129,11 @@ Open `http://localhost:7897` — the React UI is served directly by the Python b
 
 ```bash
 # Start the server
-cd KickDownloader/KickDownloaderPy
+cd backend
 python run.py
 
 # In another terminal, run the end-to-end tests
+cd backend
 python test_downloads.py
 ```
 

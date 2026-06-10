@@ -6,10 +6,10 @@
   "scripts": {
     "dev": "node scripts/dev-all.mjs",
     "dev:vite": "vite",
-    "dev:api": "cd KickDownloader/KickDownloaderPy && python run.py",
+    "dev:api": "cd backend && python run.py",
     "dev:all": "node scripts/dev-all.mjs",
     "build": "vite build",
-    "build-copy": "vite build && node -e \"require('fs').copyFileSync('dist/index.html', 'KickDownloader/KickDownloaderPy/static/index.html')\"",
+    "build-copy": "vite build && node -e \"require('fs').copyFileSync('dist/index.html', 'backend/static/index.html')\"",
     "preview": "vite preview"
   },
   "dependencies": {
