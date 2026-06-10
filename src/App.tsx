@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MouseEvent, type MutableRefObject, type ReactNode, type SetStateAction } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -226,10 +226,40 @@ const EXPLORE_POPUP_DEFAULT: PanelSize = { w: 288, h: 320 };
 const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 const PANEL_MAX_W = 1000;
 const EXPLORE_POPUP_MAX_W = 960;
+/** Matches Tailwind `bottom-5` / `right-5` on the explore popup. */
+const EXPLORE_VIEWPORT_INSET = 20;
 const CARD_BORDER_PX = 2;
 
 function panelMaxHeight() {
   return Math.round(window.innerHeight * 0.92);
+}
+
+function explorePopupMaxSize(): PanelSize {
+  const shadowPad = panelResizeHandleInset(true);
+  const maxW = window.innerWidth - EXPLORE_VIEWPORT_INSET * 2 - shadowPad;
+  const maxH = window.innerHeight - EXPLORE_VIEWPORT_INSET * 2 - shadowPad;
+  return {
+    w: Math.max(160, maxW),
+    h: Math.max(140, maxH),
+  };
+}
+
+function explorePopupResizeLimits(): { maxW: number; maxH: number } {
+  const vp = explorePopupMaxSize();
+  return {
+    maxW: Math.min(EXPLORE_POPUP_MAX_W, vp.w),
+    maxH: vp.h,
+  };
+}
+
+function clampExplorePopupSize(size: PanelSize): PanelSize {
+  const { maxW, maxH } = explorePopupResizeLimits();
+  const minW = Math.min(PANEL_MIN.w, maxW);
+  const minH = Math.min(PANEL_MIN.h, maxH);
+  return {
+    w: Math.min(maxW, Math.max(minW, size.w)),
+    h: Math.min(maxH, Math.max(minH, size.h)),
+  };
 }
 
 /** Distance from panel padding edge to outer colored shadow corner (border + shadow offset). */
@@ -238,10 +268,10 @@ function panelResizeHandleInset(compact: boolean): number {
 }
 
 function PanelResizeHandle({
-  onMouseDown,
+  onPointerDown,
   insetPx,
 }: {
-  onMouseDown: (e: MouseEvent) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => void;
   insetPx: number;
 }) {
   return (
@@ -249,42 +279,87 @@ function PanelResizeHandle({
       role="separator"
       aria-orientation="both"
       title="Resize"
-      onMouseDown={onMouseDown}
-      style={{ bottom: -insetPx, right: -insetPx }}
-      className="absolute z-30 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto"
+      onPointerDown={onPointerDown}
+      style={{ bottom: -insetPx, right: -insetPx, touchAction: 'none' }}
+      className="absolute z-50 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto select-none"
     >
-      <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500" />
+      <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500 pointer-events-none" />
     </div>
   );
 }
 
+function applyPanelSize(el: HTMLElement, size: PanelSize) {
+  el.style.width = `${size.w}px`;
+  el.style.height = `${size.h}px`;
+}
+
 function startPanelResizeDrag(
-  e: MouseEvent,
+  e: ReactPointerEvent<HTMLDivElement>,
   sizeRef: MutableRefObject<PanelSize>,
   setSize: Dispatch<SetStateAction<PanelSize>>,
-  opts?: { maxW?: number; maxH?: number },
+  opts?: {
+    maxW?: number;
+    maxH?: number;
+    panelEl?: HTMLElement | null;
+    clampSize?: (size: PanelSize) => PanelSize;
+  },
 ) {
   e.preventDefault();
   e.stopPropagation();
+  const handle = e.currentTarget;
+  handle.setPointerCapture(e.pointerId);
+
   const startX = e.clientX;
   const startY = e.clientY;
   const { w: startW, h: startH } = sizeRef.current;
   const maxW = opts?.maxW ?? PANEL_MAX_W;
   const maxH = opts?.maxH ?? panelMaxHeight();
-  const onMove = (ev: MouseEvent) => {
-    const next = {
-      w: Math.min(maxW, Math.max(PANEL_MIN.w, startW + ev.clientX - startX)),
-      h: Math.min(maxH, Math.max(PANEL_MIN.h, startH + ev.clientY - startY)),
-    };
+  const panelEl = opts?.panelEl ?? null;
+
+  if (panelEl) {
+    panelEl.style.willChange = 'width, height';
+  }
+  const prevUserSelect = document.body.style.userSelect;
+  const prevCursor = document.body.style.cursor;
+  document.body.style.userSelect = 'none';
+  document.body.style.cursor = 'se-resize';
+
+  const calcSize = (clientX: number, clientY: number): PanelSize => ({
+    w: Math.min(maxW, Math.max(PANEL_MIN.w, startW + clientX - startX)),
+    h: Math.min(maxH, Math.max(PANEL_MIN.h, startH + clientY - startY)),
+  });
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    const next = calcSize(ev.clientX, ev.clientY);
     sizeRef.current = next;
-    setSize(next);
+    if (panelEl) {
+      applyPanelSize(panelEl, next);
+    }
   };
-  const onUp = () => {
-    window.removeEventListener('mousemove', onMove);
-    window.removeEventListener('mouseup', onUp);
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    handle.releasePointerCapture(e.pointerId);
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onUp);
+    document.body.style.userSelect = prevUserSelect;
+    document.body.style.cursor = prevCursor;
+    if (panelEl) {
+      panelEl.style.willChange = '';
+    }
+    const final = opts?.clampSize ? opts.clampSize(sizeRef.current) : sizeRef.current;
+    sizeRef.current = final;
+    if (panelEl) {
+      applyPanelSize(panelEl, final);
+    }
+    setSize({ ...final });
   };
-  window.addEventListener('mousemove', onMove);
-  window.addEventListener('mouseup', onUp);
+
+  handle.addEventListener('pointermove', onMove);
+  handle.addEventListener('pointerup', onUp);
+  handle.addEventListener('pointercancel', onUp);
 }
 
 interface PreviewLevelOption {
@@ -538,6 +613,9 @@ export default function App() {
   const urlAsidePanelSizeRef = useRef(URL_ASIDE_PANEL_DEFAULT);
   const mainPanelSizeRef = useRef(MAIN_PANEL_DEFAULT);
   const explorePopupSizeRef = useRef(EXPLORE_POPUP_DEFAULT);
+  const previewPanelRef = useRef<HTMLDivElement>(null);
+  const urlAsidePanelRef = useRef<HTMLDivElement>(null);
+  const mainPanelRef = useRef<HTMLDivElement>(null);
   const exploreVolumeRef = useRef(1);
 
   const [downloading, setDownloading] = useState<string | null>(null);
@@ -1054,6 +1132,9 @@ export default function App() {
       platform: v.platform,
       durationSec,
     });
+    const clampedExploreSize = clampExplorePopupSize(explorePopupSizeRef.current);
+    explorePopupSizeRef.current = clampedExploreSize;
+    setExplorePopupSize(clampedExploreSize);
     setExploreOpen(true);
     setExploreLoading(true);
     setExploreReady(false);
@@ -1123,22 +1204,31 @@ export default function App() {
     setExploreCurrentTime(video.currentTime);
   }, []);
 
-  const onPreviewPanelResize = useCallback((e: MouseEvent) => {
-    startPanelResizeDrag(e, previewPanelSizeRef, setPreviewPanelSize);
+  const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    startPanelResizeDrag(e, previewPanelSizeRef, setPreviewPanelSize, {
+      panelEl: previewPanelRef.current,
+    });
   }, []);
 
-  const onUrlAsidePanelResize = useCallback((e: MouseEvent) => {
-    startPanelResizeDrag(e, urlAsidePanelSizeRef, setUrlAsidePanelSize);
+  const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    startPanelResizeDrag(e, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
+      panelEl: urlAsidePanelRef.current,
+    });
   }, []);
 
-  const onMainPanelResize = useCallback((e: MouseEvent) => {
-    startPanelResizeDrag(e, mainPanelSizeRef, setMainPanelSize);
+  const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    startPanelResizeDrag(e, mainPanelSizeRef, setMainPanelSize, {
+      panelEl: mainPanelRef.current,
+    });
   }, []);
 
-  const onExplorePanelResize = useCallback((e: MouseEvent) => {
+  const onExplorePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    const { maxW, maxH } = explorePopupResizeLimits();
     startPanelResizeDrag(e, explorePopupSizeRef, setExplorePopupSize, {
-      maxW: EXPLORE_POPUP_MAX_W,
-      maxH: Math.round(window.innerHeight * 0.85),
+      maxW,
+      maxH,
+      panelEl: exploreContainerRef.current,
+      clampSize: clampExplorePopupSize,
     });
   }, []);
 
@@ -1177,6 +1267,20 @@ export default function App() {
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    if (!exploreOpen || exploreFullscreen) return;
+    const fitExplorePopup = () => {
+      const clamped = clampExplorePopupSize(explorePopupSizeRef.current);
+      explorePopupSizeRef.current = clamped;
+      setExplorePopupSize(clamped);
+      if (exploreContainerRef.current) {
+        applyPanelSize(exploreContainerRef.current, clamped);
+      }
+    };
+    window.addEventListener('resize', fitExplorePopup);
+    return () => window.removeEventListener('resize', fitExplorePopup);
+  }, [exploreOpen, exploreFullscreen]);
 
   useEffect(() => {
     if (!exploreOpen || !exploreHlsUrl) return;
@@ -1542,18 +1646,31 @@ export default function App() {
     setEditingSlugValue(platform === 'Kick' ? ch.kickSlug : ch.twitchSlug);
   }, [savedChannels]);
 
-  const commitEditPlatformSlug = useCallback(() => {
+  const commitEditPlatformSlug = useCallback(async () => {
     if (!editingSlug) return;
     const slug = editingSlugValue.trim();
     if (!slug) return;
-    if (editingSlug.platform === 'Kick') {
-      updateChannel(editingSlug.channelId, { kickSlug: slug });
-    } else {
-      updateChannel(editingSlug.channelId, { twitchSlug: slug });
-    }
+    const ch = savedChannels.find((c) => c.id === editingSlug.channelId);
+    if (!ch) return;
+
+    const prevSlug = editingSlug.platform === 'Kick' ? ch.kickSlug : ch.twitchSlug;
+    const channelId = editingSlug.channelId;
+    const updated: SavedChannel = editingSlug.platform === 'Kick'
+      ? { ...ch, kickSlug: slug }
+      : { ...ch, twitchSlug: slug };
+
     setEditingSlug(null);
     setEditingSlugValue('');
-  }, [editingSlug, editingSlugValue, updateChannel]);
+
+    if (slug === prevSlug) return;
+
+    if (editingSlug.platform === 'Kick') {
+      updateChannel(channelId, { kickSlug: slug });
+    } else {
+      updateChannel(channelId, { twitchSlug: slug });
+    }
+    await refreshChannel(channelId, updated);
+  }, [editingSlug, editingSlugValue, savedChannels, updateChannel, refreshChannel]);
 
   const handleExpandChannelList = useCallback(() => {
     if (kickEnabled) setKickVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
@@ -2031,7 +2148,8 @@ export default function App() {
       }`}>
       {previewOpen && (
         <div
-          className={`relative shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
+          ref={previewPanelRef}
+          className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
           style={{
             width: previewPanelSize.w,
             height: previewPanelSize.h,
@@ -2123,13 +2241,14 @@ export default function App() {
             )}
           </div>
           {!previewFullscreen && (
-            <PanelResizeHandle onMouseDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
+            <PanelResizeHandle onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
         <div
-          className={`relative shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(activePlatform, true)}`}
+          ref={urlAsidePanelRef}
+          className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(activePlatform, true)}`}
           style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
         >
           {showUrlInSidebar && (
@@ -2153,13 +2272,14 @@ export default function App() {
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
             {urlTabContent}
           </div>
-          <PanelResizeHandle onMouseDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
+          <PanelResizeHandle onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
         </div>
       )}
       <div
-        className={`relative shrink-0 bg-zinc-950 border-2 border-white flex flex-col overflow-hidden min-h-0 ${
+        ref={mainPanelRef}
+        className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col min-h-0 ${
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
-        } ${platformCardShadow(activePlatform)} transition-all duration-300`}
+        } ${platformCardShadow(activePlatform)}`}
         style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
       >
 
@@ -2603,7 +2723,7 @@ export default function App() {
           </div>
         )}
 
-        <PanelResizeHandle onMouseDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
+        <PanelResizeHandle onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
       </div>
       </div>
       </div>
@@ -2618,13 +2738,15 @@ export default function App() {
           style={exploreFullscreen ? undefined : {
             width: explorePopupSize.w,
             height: explorePopupSize.h,
+            maxWidth: `calc(100vw - ${EXPLORE_VIEWPORT_INSET * 2}px - ${panelResizeHandleInset(true)}px)`,
+            maxHeight: `calc(100vh - ${EXPLORE_VIEWPORT_INSET * 2}px - ${panelResizeHandleInset(true)}px)`,
           }}
-          className={`relative flex flex-col bg-zinc-950 border-2 border-white min-h-0 ${
+          className={`relative flex flex-col overflow-visible bg-zinc-950 border-2 border-white min-h-0 ${
             platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)
           } ${
             exploreFullscreen
               ? 'fixed inset-0 z-[200] w-screen h-screen p-0 gap-0'
-              : 'fixed bottom-5 right-5 z-[200] p-3 gap-2'
+              : 'fixed bottom-5 right-5 z-[200] p-3 gap-2 max-w-[calc(100vw-2.5rem)] max-h-[calc(100vh-2.5rem)]'
           }`}
           onMouseMove={exploreFullscreen ? bumpExploreFsControls : undefined}
         >
@@ -2769,7 +2891,7 @@ export default function App() {
           )}
           </div>
           {!exploreFullscreen && (
-            <PanelResizeHandle onMouseDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
+            <PanelResizeHandle onPointerDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
         </div>,
         document.body,
