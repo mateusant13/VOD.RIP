@@ -26,6 +26,7 @@ from models.schemas import (
     DownloadRequest,
     DownloadState,
     OpenFolderRequest,
+    PreviewQualityUpdateRequest,
     PreviewSessionCreateRequest,
     PreviewSessionResponse,
     SettingsUpdate,
@@ -39,6 +40,9 @@ from services.preview_service import (
     proxy_playlist,
     proxy_segment,
     resolve_upstream,
+    session_active_height,
+    session_variant_heights,
+    set_session_prefer_height,
     _is_playlist_url,
 )
 from services.download_manager import DownloadManager
@@ -429,6 +433,22 @@ async def pick_folder():
     return {"path": path, "error": err}
 
 
+def _preview_session_response(session) -> PreviewSessionResponse:
+    master = f"/api/preview/hls/{session.session_id}/master.m3u8"
+    if session.kind == "progressive":
+        playback = f"/api/preview/hls/{session.session_id}/stream.mp4"
+    else:
+        playback = master
+    return PreviewSessionResponse(
+        session_id=session.session_id,
+        master_url=master,
+        playback_url=playback,
+        kind=session.kind,
+        variant_heights=session_variant_heights(session),
+        active_height=session_active_height(session),
+    )
+
+
 @app.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
     if req.crop_end <= req.crop_start:
@@ -453,17 +473,21 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 prefer_height=req.prefer_height,
             ),
         )
-        master = f"/api/preview/hls/{session.session_id}/master.m3u8"
-        if session.kind == "progressive":
-            playback = f"/api/preview/hls/{session.session_id}/stream.mp4"
-        else:
-            playback = master
-        return PreviewSessionResponse(
-            session_id=session.session_id,
-            master_url=master,
-            playback_url=playback,
-            kind=session.kind,
+        return _preview_session_response(session)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/preview/session/{session_id}/quality")
+async def preview_set_quality(session_id: str, req: PreviewQualityUpdateRequest):
+    try:
+        session = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: set_session_prefer_height(session_id, req.prefer_height),
         )
+        return _preview_session_response(session)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

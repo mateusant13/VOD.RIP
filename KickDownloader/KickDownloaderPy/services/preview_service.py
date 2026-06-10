@@ -692,6 +692,70 @@ def get_session(session_id: str) -> Optional[PreviewSession]:
     return session
 
 
+def _heights_from_master_text(text: str) -> List[int]:
+    heights: List[int] = []
+    for line in text.splitlines():
+        if not line.startswith("#EXT-X-STREAM-INF"):
+            continue
+        res_m = _RESOLUTION_RE.search(line)
+        if res_m:
+            height = int(res_m.group(2))
+            if height > 0:
+                heights.append(height)
+    return sorted(set(heights))
+
+
+def session_variant_heights(session: PreviewSession) -> List[int]:
+    heights = sorted({h for h, _ in session.variant_entries if h > 0})
+    if heights:
+        return heights
+    if session.custom_master:
+        heights = _heights_from_master_text(session.custom_master)
+        if heights:
+            return heights
+    if session.kind == "hls":
+        try:
+            text = get_master_playlist(session.session_id)
+            heights = _heights_from_master_text(text)
+            if heights:
+                return heights
+        except Exception:
+            pass
+    if session.kind == "progressive" and session.entry_url:
+        m = re.search(r"/(\d{3,4})/", session.entry_url)
+        if m:
+            return [int(m.group(1))]
+    return []
+
+
+def session_active_height(session: PreviewSession) -> int:
+    if session.variant_entries and session.entry_url:
+        for height, url in session.variant_entries:
+            if url == session.entry_url and height > 0:
+                return height
+    m = re.search(r"/(\d{3,4})/", session.entry_url or "")
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def set_session_prefer_height(session_id: str, prefer_height: int) -> PreviewSession:
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if session.variant_entries:
+        picked = _pick_variant_by_height(session.variant_entries, prefer_height)
+        if not picked:
+            raise ValueError("No preview variant for requested height")
+        session.entry_url = picked
+        session.allowed_hosts.update(_hosts_for_url(picked))
+        session.touch()
+        return session
+    if session.kind != "progressive":
+        raise ValueError("Preview session has no quality variants")
+    raise ValueError("No preview variant for requested height")
+
+
 def resolve_upstream(session_id: str, resource_id: Optional[str], raw_url: Optional[str]) -> str:
     session = get_session(session_id)
     if not session:

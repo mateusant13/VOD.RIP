@@ -17,9 +17,15 @@ import {
   applyHlsQualityLevel,
   attachProgressivePreview,
   detachProgressivePreview,
-  previewLevelLabel,
-  resolvePreviewLevels,
+  initialPreviewPreferHeight,
+  maxQualityLabelFromList,
+  measurePlayerHeightCap,
+  mergeVariantHeights,
+  parseQualityHeights,
+  resolveHlsPreviewLevels,
   resolvePreviewPlayback,
+  resolveProgressivePreviewLevels,
+  inferLevelHeight,
   suggestClipDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
@@ -1036,25 +1042,6 @@ function sourceQualityOptionLabel(resolutionLabel: string): string {
   return `source/${resolutionLabel.toLowerCase()}`;
 }
 
-function maxStreamQualityLabel(
-  qualities: string[],
-  previewLevels: PreviewLevelOption[],
-): string {
-  if (previewLevels.length) {
-    const maxH = Math.max(...previewLevels.map((l) => l.height));
-    if (maxH > 0) {
-      const match = qualities.find((q) => {
-        const m = q.match(/(\d+)/);
-        return m && parseInt(m[1], 10) === maxH;
-      });
-      if (match) return match.toLowerCase();
-      return `${maxH}p`;
-    }
-  }
-  if (qualities.length) return qualities[0].toLowerCase();
-  return '1080p';
-}
-
 const CHANNEL_INITIAL_VISIBLE = 5;
 const CHANNEL_EXPAND_STEP = 10;
 const CHANNEL_FETCH_LIMIT = 100;
@@ -1429,6 +1416,8 @@ export default function App() {
   const [previewPlayback, setPreviewPlayback] = useState<{
     url: string;
     kind: 'hls' | 'progressive';
+    variantHeights?: number[];
+    activeHeight?: number;
   } | null>(null);
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
   const [previewVideoReady, setPreviewVideoReady] = useState(false);
@@ -1464,6 +1453,7 @@ export default function App() {
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
   const [downloadFilename, setDownloadFilename] = useState('');
   const trimDragOriginRef = useRef(0);
+  const trimNeedleDragActiveRef = useRef(false);
   const urlTrimPointerRef = useRef({ x: 0, y: 0 });
 
   // Channel explore players (up to 5 floating popups)
@@ -1666,14 +1656,18 @@ export default function App() {
       }
       destroyPreviewPlayer();
       const clipPreview = isClipUrl(url.trim());
-      const previewPreferHeight = clipPreview
-        ? PREVIEW_CLIP_DEFAULT_HEIGHT
-        : PREVIEW_MAIN_DEFAULT_HEIGHT;
+      const playerCap = measurePlayerHeightCap(
+        previewContainerRef.current ?? previewPanelRef.current,
+        previewVideoAspectRef.current,
+      );
+      const previewPreferHeight = initialPreviewPreferHeight(clipPreview, playerCap);
       const res = await apiPost<{
         session_id: string;
         master_url: string;
         playback_url?: string;
         kind?: string;
+        variant_heights?: number[];
+        active_height?: number;
       }>('/api/preview/session', {
         url: url.trim(),
         crop_start: start,
@@ -1681,7 +1675,12 @@ export default function App() {
         prefer_height: previewPreferHeight,
       });
       setPreviewSessionId(res.session_id);
-      setPreviewPlayback(resolvePreviewPlayback(url.trim(), res));
+      const playback = resolvePreviewPlayback(url.trim(), res);
+      setPreviewPlayback({
+        ...playback,
+        variantHeights: res.variant_heights,
+        activeHeight: res.active_height ?? previewPreferHeight,
+      });
     } catch (err: any) {
       setError(err.message || 'Preview failed');
       setPreviewOpen(false);
@@ -1736,15 +1735,14 @@ export default function App() {
     };
 
     if (playbackKind === 'progressive') {
-      const preferHeight = isClipUrl(url.trim())
-        ? PREVIEW_CLIP_DEFAULT_HEIGHT
-        : PREVIEW_MAIN_DEFAULT_HEIGHT;
-      setPreviewLevels([{
-        index: 0,
-        height: preferHeight,
-        label: previewLevelLabel(preferHeight, undefined, true),
-      }]);
-      setPreviewQualityLevel(0);
+      const activeH = previewPlayback.activeHeight ?? PREVIEW_CLIP_DEFAULT_HEIGHT;
+      const { mapped, defaultIndex } = resolveProgressivePreviewLevels({
+        variantHeights: previewPlayback.variantHeights,
+        qualityLabels: videoInfo?.qualities,
+        initialHeight: activeH,
+      });
+      setPreviewLevels(mapped);
+      setPreviewQualityLevel(defaultIndex);
       const onVideoError = () => {
         setError('Clip preview failed — try again');
         setPreviewVideoLoading(false);
@@ -1768,7 +1766,7 @@ export default function App() {
         maxBufferLength: 20,
         maxMaxBufferLength: 40,
         startFragPrefetch: true,
-        capLevelToPlayerSize: false,
+        capLevelToPlayerSize: true,
         fragLoadingTimeOut: 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
@@ -1778,16 +1776,31 @@ export default function App() {
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       let levelsInitialized = false;
-      const previewPreferHeight = isClipUrl(url.trim())
-        ? PREVIEW_CLIP_DEFAULT_HEIGHT
-        : PREVIEW_MAIN_DEFAULT_HEIGHT;
+      const playerCap = measurePlayerHeightCap(
+        previewContainerRef.current ?? previewPanelRef.current,
+        previewVideoAspectRef.current,
+      );
+      const previewPreferHeight = initialPreviewPreferHeight(isClipUrl(url.trim()), playerCap);
+      const fallbackHeights = mergeVariantHeights(
+        previewPlayback.variantHeights,
+        parseQualityHeights(videoInfo?.qualities ?? []),
+      );
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
-        const { mapped, defaultIndex } = resolvePreviewLevels(levels, previewPreferHeight);
+        const cappedDefault = Math.min(previewPreferHeight, playerCap);
+        const { mapped, defaultIndex } = resolveHlsPreviewLevels(levels, {
+          initialHeight: cappedDefault,
+          fallbackHeights,
+        });
+        if (!mapped.length) return;
         setPreviewLevels(mapped);
         if (!levelsInitialized || applyDefault) {
           levelsInitialized = true;
-          if (hls.levels.length > 0 && defaultIndex < hls.levels.length) {
-            hls.loadLevel = defaultIndex;
+          const hlsIndex = mapped[defaultIndex]?.index ?? defaultIndex;
+          if (hls.levels.length > 0 && hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+            const levelHeight = inferLevelHeight(hls.levels[hlsIndex]);
+            if (levelHeight > 0) {
+              hls.loadLevel = hlsIndex;
+            }
           }
           setPreviewQualityLevel(defaultIndex);
         }
@@ -1845,7 +1858,7 @@ export default function App() {
       cancelled = true;
       cleanup?.();
     };
-  }, [previewOpen, previewPlayback, url]);
+  }, [previewOpen, previewPlayback, url, videoInfo?.qualities]);
 
   useEffect(() => {
     if (!previewOpen) return;
@@ -1887,23 +1900,61 @@ export default function App() {
     }
   }, [previewVideoReady]);
 
-  const applyPreviewQuality = useCallback((levelIndex: number, forceLoad = false) => {
-    const hls = previewHlsRef.current;
+  const applyPreviewQuality = useCallback(async (levelIndex: number, forceLoad = false) => {
+    const level = previewLevels[levelIndex];
     const video = previewVideoRef.current;
     const wasPaused = video?.paused ?? true;
-    if (hls && levelIndex >= 0 && levelIndex < hls.levels.length) {
-      applyHlsQualityLevel(hls, levelIndex, forceLoad);
-      if (wasPaused && video) {
-        previewSuppressPlayRef.current = true;
-        requestAnimationFrame(() => {
-          video.pause();
-          previewSuppressPlayRef.current = false;
+
+    if (previewPlayback?.kind === 'progressive' && previewSessionId && level) {
+      try {
+        await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
+          prefer_height: level.height,
         });
+        if (video && previewPlayback.url) {
+          attachProgressivePreview(video, previewPlayback.url);
+          if (!wasPaused) void video.play().catch(() => {});
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
+        setError(msg);
+      }
+      setPreviewQualityLevel(levelIndex);
+      setPreviewQualityMenuOpen(false);
+      return;
+    }
+
+    const hls = previewHlsRef.current;
+    if (hls && level) {
+      const hlsIndex = level.index;
+      const hlsLevel = hls.levels[hlsIndex];
+      const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
+      const needsApiSwitch = !hlsHeight || hlsHeight !== level.height;
+
+      if (needsApiSwitch && previewSessionId) {
+        try {
+          await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
+            prefer_height: level.height,
+          });
+          hls.loadSource(previewPlayback?.url ?? hls.url ?? '');
+          hls.startLoad();
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Could not change preview quality';
+          setError(msg);
+        }
+      } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+        applyHlsQualityLevel(hls, hlsIndex, forceLoad);
+        if (wasPaused && video) {
+          previewSuppressPlayRef.current = true;
+          requestAnimationFrame(() => {
+            video.pause();
+            previewSuppressPlayRef.current = false;
+          });
+        }
       }
     }
     setPreviewQualityLevel(levelIndex);
     setPreviewQualityMenuOpen(false);
-  }, []);
+  }, [previewLevels, previewPlayback, previewSessionId]);
 
   const skipPreview = useCallback((deltaSec: number) => {
     const video = previewVideoRef.current;
@@ -1924,20 +1975,30 @@ export default function App() {
   const applyTrimRange = useCallback((
     rawStart: number,
     rawEnd: number,
-    opts?: { seek?: 'in' | 'out' },
+    opts?: { seek?: 'in' | 'out'; pinStart?: boolean; pinEnd?: boolean },
   ) => {
     const dur = Math.max(1, vodDurationSec);
     let start = Math.floor(rawStart);
     let end = Math.floor(rawEnd);
-    if (start >= end) {
-      if (opts?.seek === 'in') {
-        end = Math.min(dur, start + 1);
-      } else {
-        start = Math.max(0, end - 1);
+
+    if (opts?.pinEnd) {
+      end = Math.min(dur, Math.max(1, end));
+      start = Math.max(0, Math.min(start, end - 1));
+    } else if (opts?.pinStart) {
+      start = Math.max(0, Math.min(start, dur - 1));
+      end = Math.min(dur, Math.max(end, start + 1));
+    } else {
+      if (start >= end) {
+        if (opts?.seek === 'in') {
+          end = Math.min(dur, start + 1);
+        } else {
+          start = Math.max(0, end - 1);
+        }
       }
+      start = Math.max(0, Math.min(start, dur - 1));
+      end = Math.min(dur, Math.max(end, start + 1));
     }
-    start = Math.max(0, Math.min(start, dur - 1));
-    end = Math.min(dur, Math.max(end, start + 1));
+
     setTrimStartSec(start);
     setTrimEndSec(end);
     previewTrimStartRef.current = start;
@@ -1977,29 +2038,31 @@ export default function App() {
     const rail = previewNeedleRailRef.current;
     if (!rail || vodDurationSec <= 0) return;
 
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    trimNeedleDragActiveRef.current = true;
+    if (previewFsHideTimerRef.current) {
+      window.clearTimeout(previewFsHideTimerRef.current);
+    }
+    setPreviewFsControlsVisible(true);
+
+    const fixedStart = trimStartSec;
+    const fixedEnd = trimEndSec;
+    const dragOrigin = which === 'in' ? fixedStart : fixedEnd;
+    trimDragOriginRef.current = dragOrigin;
+
     const xToSec = (clientX: number) => {
       const rect = rail.getBoundingClientRect();
+      if (rect.width <= 0) return 0;
       const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
       return Math.round(frac * vodDurationSec);
     };
 
-    const dragOrigin = which === 'in' ? trimStartSec : trimEndSec;
-    trimDragOriginRef.current = dragOrigin;
-    let start = trimStartSec;
-    let end = trimEndSec;
-
     const onMove = (ev: PointerEvent) => {
       const sec = xToSec(ev.clientX);
-      if (which === 'in') {
-        start = sec;
-        if (start >= end) end = Math.min(vodDurationSec, start + 1);
-        start = Math.max(0, Math.min(start, end - 1));
-      } else {
-        end = sec;
-        if (end <= start) start = Math.max(0, end - 1);
-        end = Math.min(vodDurationSec, Math.max(end, start + 1));
-      }
-      const applied = applyTrimRange(start, end, { seek: which });
+      const applied = which === 'in'
+        ? applyTrimRange(sec, fixedEnd, { seek: 'in', pinEnd: true })
+        : applyTrimRange(fixedStart, sec, { seek: 'out', pinStart: true });
       const activeSec = which === 'in' ? applied.start : applied.end;
       updateNeedleGlance(
         which,
@@ -2011,14 +2074,18 @@ export default function App() {
       );
     };
 
-    const onUp = () => {
+    const onUp = (ev: PointerEvent) => {
+      trimNeedleDragActiveRef.current = false;
       setNeedleGlance(null);
+      try { handle.releasePointerCapture(ev.pointerId); } catch { /* ignore */ }
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
     onMove(e.nativeEvent);
   }, [trimStartSec, trimEndSec, vodDurationSec, applyTrimRange, updateNeedleGlance]);
 
@@ -2028,18 +2095,9 @@ export default function App() {
     pointer?: { x: number; y: number },
   ) => {
     const dragOrigin = trimDragOriginRef.current;
-    let start = trimStartSec;
-    let end = trimEndSec;
-    if (which === 'in') {
-      start = value;
-      if (start >= end) end = Math.min(vodDurationSec, start + 1);
-      start = Math.max(0, Math.min(start, end - 1));
-    } else {
-      end = value;
-      if (end <= start) start = Math.max(0, end - 1);
-      end = Math.min(vodDurationSec, Math.max(end, start + 1));
-    }
-    const applied = applyTrimRange(start, end, { seek: which });
+    const applied = which === 'in'
+      ? applyTrimRange(value, trimEndSec, { seek: 'in', pinEnd: true })
+      : applyTrimRange(trimStartSec, value, { seek: 'out', pinStart: true });
     if (pointer) {
       const activeSec = which === 'in' ? applied.start : applied.end;
       setNeedleGlance({
@@ -2075,9 +2133,11 @@ export default function App() {
     if (previewFsHideTimerRef.current) {
       window.clearTimeout(previewFsHideTimerRef.current);
     }
-    if (previewFullscreen) {
+    if (previewFullscreen && !trimNeedleDragActiveRef.current) {
       previewFsHideTimerRef.current = window.setTimeout(() => {
-        setPreviewFsControlsVisible(false);
+        if (!trimNeedleDragActiveRef.current) {
+          setPreviewFsControlsVisible(false);
+        }
       }, PREVIEW_FS_CONTROLS_HIDE_MS);
     }
   }, [previewFullscreen]);
@@ -2924,8 +2984,8 @@ export default function App() {
   const estSize = (clipSec / 60) * mbPerMin;
 
   const sourceQualityLabel = useMemo(
-    () => sourceQualityOptionLabel(maxStreamQualityLabel(videoInfo?.qualities ?? [], previewLevels)),
-    [videoInfo?.qualities, previewLevels],
+    () => sourceQualityOptionLabel(maxQualityLabelFromList(videoInfo?.qualities ?? [])),
+    [videoInfo?.qualities],
   );
 
   const activePlatform = detectVideoPlatform(videoInfo, url);
@@ -3086,8 +3146,11 @@ export default function App() {
             </div>
             <input type="range" min={0} max={vodDurationSec} step={1} value={Math.min(trimStartSec, trimEndSec - 1)}
               onPointerDown={(e) => {
+                trimNeedleDragActiveRef.current = true;
                 trimDragOriginRef.current = trimStartSec;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
+                if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
+                setPreviewFsControlsVisible(true);
               }}
               onPointerMove={(e) => {
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
@@ -3099,13 +3162,22 @@ export default function App() {
                   urlTrimPointerRef.current,
                 );
               }}
-              onPointerUp={() => setNeedleGlance(null)}
-              onPointerCancel={() => setNeedleGlance(null)}
+              onPointerUp={() => {
+                trimNeedleDragActiveRef.current = false;
+                setNeedleGlance(null);
+              }}
+              onPointerCancel={() => {
+                trimNeedleDragActiveRef.current = false;
+                setNeedleGlance(null);
+              }}
               className="url-trim-range w-full accent-zinc-400" />
             <input type="range" min={0} max={vodDurationSec} step={1} value={Math.max(trimEndSec, trimStartSec + 1)}
               onPointerDown={(e) => {
+                trimNeedleDragActiveRef.current = true;
                 trimDragOriginRef.current = trimEndSec;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
+                if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
+                setPreviewFsControlsVisible(true);
               }}
               onPointerMove={(e) => {
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
@@ -3117,8 +3189,14 @@ export default function App() {
                   urlTrimPointerRef.current,
                 );
               }}
-              onPointerUp={() => setNeedleGlance(null)}
-              onPointerCancel={() => setNeedleGlance(null)}
+              onPointerUp={() => {
+                trimNeedleDragActiveRef.current = false;
+                setNeedleGlance(null);
+              }}
+              onPointerCancel={() => {
+                trimNeedleDragActiveRef.current = false;
+                setNeedleGlance(null);
+              }}
               className="url-trim-range w-full accent-zinc-400" />
             <button type="button" onClick={openPreview}
               disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
@@ -3411,9 +3489,12 @@ export default function App() {
               onKeyDown={handlePreviewContainerKeyDown}
               onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
               onMouseLeave={previewFullscreen ? () => {
+                if (trimNeedleDragActiveRef.current) return;
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
                 previewFsHideTimerRef.current = window.setTimeout(() => {
-                  setPreviewFsControlsVisible(false);
+                  if (!trimNeedleDragActiveRef.current) {
+                    setPreviewFsControlsVisible(false);
+                  }
                 }, PREVIEW_FS_CONTROLS_HIDE_MS);
               } : undefined}
               onFocus={focusPreviewPlayer}

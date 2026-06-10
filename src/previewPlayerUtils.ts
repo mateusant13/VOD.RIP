@@ -46,6 +46,60 @@ export function channelSlugFromMediaUrl(u: string): string | null {
   return null;
 }
 
+const PREVIEW_HEIGHT_STEPS = [240, 360, 480, 720, 1080] as const;
+
+/** Snap CSS player height to a stream tier — avoids fetching 1080p for a tiny panel. */
+export function snapPreviewHeight(cssPx: number): number {
+  if (!Number.isFinite(cssPx) || cssPx <= 0) return PREVIEW_CLIP_DEFAULT_HEIGHT;
+  for (const step of PREVIEW_HEIGHT_STEPS) {
+    if (cssPx <= step + 48) return step;
+  }
+  return 1080;
+}
+
+/** Max stream height that matches the on-screen player box (logical CSS pixels). */
+export function measurePlayerHeightCap(element: HTMLElement | null, aspect = 16 / 9): number {
+  if (!element) return PREVIEW_MAIN_DEFAULT_HEIGHT;
+  const r = element.getBoundingClientRect();
+  let h = r.height;
+  if (h < 48 && r.width > 0) h = r.width / aspect;
+  return snapPreviewHeight(h);
+}
+
+/** First preview load: fast default (360p clips / 480p VOD), never above player cap. */
+export function initialPreviewPreferHeight(isClip: boolean, playerCap: number): number {
+  const desired = isClip ? PREVIEW_CLIP_DEFAULT_HEIGHT : PREVIEW_MAIN_DEFAULT_HEIGHT;
+  return Math.min(desired, playerCap);
+}
+
+export function parseQualityHeights(qualities: string[]): number[] {
+  const heights = qualities
+    .map((q) => {
+      const m = q.match(/(\d+)/);
+      return m ? parseInt(m[1], 10) : 0;
+    })
+    .filter((h) => h > 0);
+  return [...new Set(heights)].sort((a, b) => a - b);
+}
+
+/** Quality menu entries; highest available height is labelled source/… */
+export function mapHeightsToPreviewLevels(heights: number[]): PreviewLevelOption[] {
+  if (!heights.length) return [];
+  const maxH = Math.max(...heights);
+  return heights.map((height, index) => ({
+    index,
+    height,
+    label: previewLevelLabel(height, undefined, height === maxH),
+  }));
+}
+
+/** Highest quality label for download / URL info — never tied to preview playback. */
+export function maxQualityLabelFromList(qualities: string[]): string {
+  const heights = parseQualityHeights(qualities);
+  if (heights.length) return `${heights[heights.length - 1]}p`;
+  return '1080p';
+}
+
 export function suggestClipDownloadName(
   title: string | null | undefined,
   uploader: string | null | undefined,
@@ -104,53 +158,134 @@ export function inferLevelHeight(level: HlsLevelLike): number {
   return 0;
 }
 
-export function mapHlsLevels(
-  levels: HlsLevelLike[],
-  defaultHeight: number,
-): { mapped: PreviewLevelOption[]; defaultIndex: number } {
-  const raw = levels.map((l, i) => ({
-    index: i,
-    height: inferLevelHeight(l),
-    bitrate: l.bitrate,
-  }));
-  const maxHeight = raw.reduce((max, l) => Math.max(max, l.height), 0);
-  const mapped: PreviewLevelOption[] = raw.map((l) => ({
-    index: l.index,
-    height: l.height,
-    label: previewLevelLabel(l.height, l.bitrate, l.height === maxHeight && maxHeight > 0),
-  }));
-  mapped.sort((a, b) => a.height - b.height);
-  const defaultIndex = mapped.length ? levelIndexForHeight(mapped, defaultHeight) : 0;
-  return { mapped, defaultIndex };
+export function mergeVariantHeights(
+  ...sources: Array<number[] | undefined | null>
+): number[] {
+  const set = new Set<number>();
+  for (const src of sources) {
+    for (const h of src ?? []) {
+      if (h > 0) set.add(h);
+    }
+  }
+  return [...set].sort((a, b) => a - b);
 }
 
-/** Map HLS levels for the quality menu; synthesize one entry for single-quality streams (e.g. Kick clips). */
+function mapInferredHlsLevels(
+  raw: Array<{ index: number; height: number; bitrate?: number }>,
+  initialHeight: number,
+): { mapped: PreviewLevelOption[]; defaultIndex: number } {
+  const withHeight = raw.filter((l) => l.height > 0);
+  if (!withHeight.length) {
+    return { mapped: [], defaultIndex: 0 };
+  }
+  const maxH = Math.max(...withHeight.map((l) => l.height));
+  const mapped = withHeight
+    .map((l) => ({
+      index: l.index,
+      height: l.height,
+      label: previewLevelLabel(l.height, l.bitrate, l.height === maxH),
+    }))
+    .sort((a, b) => a.height - b.height);
+  return {
+    mapped,
+    defaultIndex: levelIndexForHeight(mapped, initialHeight),
+  };
+}
+
+/**
+ * Build the preview quality menu for HLS. Menu tiers come from the manifest and/or
+ * API variant_heights — never from the player-size cap alone (that only picks initial playback).
+ */
+export function resolveHlsPreviewLevels(
+  hlsLevels: HlsLevelLike[],
+  opts: { initialHeight: number; fallbackHeights?: number[] },
+): { mapped: PreviewLevelOption[]; defaultIndex: number } {
+  const fallback = mergeVariantHeights(opts.fallbackHeights);
+  const initialHeight = opts.initialHeight;
+
+  if (hlsLevels.length > 0) {
+    const raw = hlsLevels.map((l, i) => ({
+      index: i,
+      height: inferLevelHeight(l),
+      bitrate: l.bitrate,
+    }));
+
+    if (raw.every((l) => !l.height)) {
+      if (fallback.length === hlsLevels.length) {
+        raw.forEach((l, i) => { l.height = fallback[i]; });
+      } else if (hlsLevels.length === 1 && fallback.length > 1) {
+        const mapped = mapHeightsToPreviewLevels(fallback);
+        return {
+          mapped,
+          defaultIndex: levelIndexForHeight(mapped, initialHeight),
+        };
+      } else if (fallback.length > 0) {
+        const mapped = mapHeightsToPreviewLevels(fallback);
+        if (mapped.length === hlsLevels.length) {
+          mapped.forEach((m, i) => { m.index = i; });
+        }
+        return {
+          mapped,
+          defaultIndex: levelIndexForHeight(mapped, initialHeight),
+        };
+      }
+    }
+
+    const fromHls = mapInferredHlsLevels(raw, initialHeight);
+    if (fromHls.mapped.length) return fromHls;
+  }
+
+  if (fallback.length > 0) {
+    const mapped = mapHeightsToPreviewLevels(fallback);
+    return {
+      mapped,
+      defaultIndex: levelIndexForHeight(mapped, initialHeight),
+    };
+  }
+
+  if (hlsLevels.length > 0) {
+    const mapped = hlsLevels.map((_l, i) => ({
+      index: i,
+      height: 0,
+      label: `Level ${i + 1}`,
+    }));
+    return { mapped, defaultIndex: 0 };
+  }
+
+  return { mapped: [], defaultIndex: 0 };
+}
+
+/** @deprecated Use resolveHlsPreviewLevels */
 export function resolvePreviewLevels(
   levels: HlsLevelLike[],
   defaultHeight: number,
+  fallbackHeights?: number[],
 ): { mapped: PreviewLevelOption[]; defaultIndex: number } {
-  const result = mapHlsLevels(levels, defaultHeight);
-  if (result.mapped.length) {
-    if (result.mapped.every((l) => !l.height)) {
-      const height = defaultHeight;
-      return {
-        mapped: result.mapped.map((l) => ({
-          ...l,
-          height,
-          label: previewLevelLabel(height, undefined, true),
-        })),
-        defaultIndex: 0,
-      };
-    }
-    return result;
+  return resolveHlsPreviewLevels(levels, {
+    initialHeight: defaultHeight,
+    fallbackHeights,
+  });
+}
+
+/** Progressive / API-only quality menu (never collapse to active playback height only). */
+export function resolveProgressivePreviewLevels(
+  opts: {
+    variantHeights?: number[];
+    qualityLabels?: string[];
+    initialHeight: number;
+  },
+): { mapped: PreviewLevelOption[]; defaultIndex: number } {
+  const heights = mergeVariantHeights(
+    opts.variantHeights,
+    parseQualityHeights(opts.qualityLabels ?? []),
+  );
+  const mapped = mapHeightsToPreviewLevels(heights);
+  if (!mapped.length) {
+    return { mapped: [], defaultIndex: 0 };
   }
   return {
-    mapped: [{
-      index: 0,
-      height: defaultHeight,
-      label: previewLevelLabel(defaultHeight, undefined, true),
-    }],
-    defaultIndex: 0,
+    mapped,
+    defaultIndex: levelIndexForHeight(mapped, opts.initialHeight),
   };
 }
 
