@@ -939,22 +939,18 @@ export default function ChannelExplorePopup({
         )}
         <div
           ref={videoWrapRef}
-          className={`relative bg-black overflow-hidden w-full ${
-            fullscreen ? 'absolute inset-0 z-0 border-0 cursor-pointer' : 'border-2 border-zinc-700 shrink-0'
+          className={`relative bg-black overflow-hidden w-full cursor-pointer ${
+            fullscreen ? 'absolute inset-0 z-0 border-0' : 'border-2 border-zinc-700 shrink-0'
           }`}
           style={fullscreen ? undefined : { aspectRatio: videoAspect }}
+          onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
-            if (fullscreen) {
-              togglePlay();
-              return;
-            }
-            /* non-fs: only the video element toggles — handled via pointer-events on video */
+            if (ready) togglePlay();
           }}
         >
           <video
             ref={videoRef}
-            className={`w-full h-full object-contain ${fullscreen ? 'pointer-events-none' : ''}`}
-            onClick={fullscreen ? undefined : () => togglePlay()}
+            className="w-full h-full object-contain pointer-events-none"
             muted={muted}
             playsInline
             onLoadedMetadata={() => {

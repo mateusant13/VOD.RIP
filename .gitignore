@@ -46,3 +46,26 @@ npm-debug.log*
 pids/
 *.pid
 *.seed
+
+# Downloaded clips / media
+*.mp4
+*.mkv
+*.webm
+
+# Conversation logs (AI agent history)
+conversations/
+
+# Old .NET project (legacy)
+KickDownloader/old_kick_downloader/
+
+# Personal scripts
+scripts/download_random_clips.py
+
+# Dev / debug utilities (not production code)
+KickDownloader/KickDownloaderPy/debug_cli.py
+KickDownloader/KickDownloaderPy/scripts/test_clip_preview.py
+KickDownloader/KickDownloaderPy/test_downloads.py
+debug_full_flow.py
+
+# AI agent memory (not project documentation)
+KickDownloader/AGENTS.md

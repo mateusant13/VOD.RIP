@@ -6,6 +6,7 @@ import {
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine,
+  GripVertical,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
 import twitchIcon from '@/assets/platforms/twitch.png';
@@ -1272,6 +1273,113 @@ function persistChannels(channels: SavedChannel[]) {
   localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(toStore));
 }
 
+/** Insert-before index (0..rowCount) from pointer Y — stable while the list is not reordered mid-drag. */
+function channelInsertIndex(listEl: HTMLElement, clientY: number): number {
+  const rows = [...listEl.querySelectorAll<HTMLElement>('[data-channel-row]')];
+  if (!rows.length) return 0;
+
+  let bestIndex = rows.length;
+  let bestDist = Infinity;
+  for (let i = 0; i <= rows.length; i++) {
+    let boundaryY: number;
+    if (i === 0) {
+      boundaryY = rows[0].getBoundingClientRect().top;
+    } else if (i === rows.length) {
+      boundaryY = rows[rows.length - 1].getBoundingClientRect().bottom;
+    } else {
+      const above = rows[i - 1].getBoundingClientRect();
+      const below = rows[i].getBoundingClientRect();
+      boundaryY = (above.bottom + below.top) / 2;
+    }
+    const dist = Math.abs(clientY - boundaryY);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+function reorderChannelsById(
+  channels: SavedChannel[],
+  channelId: string,
+  insertBefore: number,
+): SavedChannel[] {
+  const from = channels.findIndex((c) => c.id === channelId);
+  if (from < 0) return channels;
+  let to = Math.max(0, Math.min(insertBefore, channels.length));
+  if (from < to) to -= 1;
+  if (from === to) return channels;
+  const next = [...channels];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
+
+function startChannelReorderDrag(
+  e: ReactPointerEvent<HTMLButtonElement>,
+  channelId: string,
+  listRef: MutableRefObject<HTMLDivElement | null>,
+  setChannels: Dispatch<SetStateAction<SavedChannel[]>>,
+  setDragId: Dispatch<SetStateAction<string | null>>,
+  setDropInsertIndex: Dispatch<SetStateAction<number | null>>,
+) {
+  e.preventDefault();
+  e.stopPropagation();
+  const handle = e.currentTarget;
+  handle.setPointerCapture(e.pointerId);
+  setDragId(channelId);
+
+  const prevUserSelect = document.body.style.userSelect;
+  document.body.style.userSelect = 'none';
+  document.body.style.cursor = 'grabbing';
+
+  let frame = 0;
+  let pendingY: number | null = null;
+  let lastInsert = -1;
+
+  const flush = () => {
+    frame = 0;
+    if (pendingY === null) return;
+    const list = listRef.current;
+    if (!list) return;
+    const insertAt = channelInsertIndex(list, pendingY);
+    if (insertAt === lastInsert) return;
+    lastInsert = insertAt;
+    setDropInsertIndex(insertAt);
+  };
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    pendingY = ev.clientY;
+    if (!frame) frame = requestAnimationFrame(flush);
+  };
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    if (frame) cancelAnimationFrame(frame);
+    const list = listRef.current;
+    const insertAt = list && pendingY !== null
+      ? channelInsertIndex(list, pendingY)
+      : lastInsert;
+    if (insertAt >= 0) {
+      setChannels((prev) => reorderChannelsById(prev, channelId, insertAt));
+    }
+    handle.releasePointerCapture(e.pointerId);
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onUp);
+    document.body.style.userSelect = prevUserSelect;
+    document.body.style.cursor = '';
+    setDragId(null);
+    setDropInsertIndex(null);
+  };
+
+  handle.addEventListener('pointermove', onMove);
+  handle.addEventListener('pointerup', onUp);
+  handle.addEventListener('pointercancel', onUp);
+}
+
 function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
   const trimmed = raw.trim();
   if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '' };
@@ -1578,6 +1686,9 @@ export default function App() {
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [channelsError, setChannelsError] = useState<string | null>(null);
+  const [channelDragId, setChannelDragId] = useState<string | null>(null);
+  const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
+  const channelListRef = useRef<HTMLDivElement>(null);
   const [pickingFolder, setPickingFolder] = useState(false);
   // Platform filter for channel browsing. Default: both enabled. Pure
   // presentation state — the backend always returns every VOD for the
@@ -1651,6 +1762,11 @@ export default function App() {
     [videoInfo],
   );
 
+  const previewDurationSec = useMemo(
+    () => Math.max(1, previewTrimEnd - previewTrimStart),
+    [previewTrimStart, previewTrimEnd],
+  );
+
   const destroyPreviewPlayer = useCallback(() => {
     if (previewHlsRef.current) {
       previewHlsRef.current.destroy();
@@ -1690,12 +1806,14 @@ export default function App() {
   const seekPreviewVideo = useCallback((sec: number, force = false) => {
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
-    const t = Math.max(0, Math.min(sec, vodDurationSec));
+    const start = previewTrimStartRef.current;
+    const end = previewTrimEndRef.current;
+    const t = Math.max(start, Math.min(sec, end));
     if (force || Math.abs(video.currentTime - t) > 0.05) {
       video.currentTime = t;
       setPreviewCurrentTime(t);
     }
-  }, [previewVideoReady, vodDurationSec]);
+  }, [previewVideoReady]);
 
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
@@ -1731,6 +1849,7 @@ export default function App() {
     setPreviewPlayback(null);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
+    setPreviewCurrentTime(start);
     setError(null);
     try {
       if (previewSessionId) {
@@ -1815,10 +1934,13 @@ export default function App() {
       if (previewInitialSeekDoneRef.current) return;
       previewInitialSeekDoneRef.current = true;
       const start = previewTrimStartRef.current;
-      if (Number.isFinite(start) && start > 0 && Math.abs(video.currentTime - start) > 0.25) {
+      const end = previewTrimEndRef.current;
+      if (Number.isFinite(start) && Math.abs(video.currentTime - start) > 0.25) {
         video.currentTime = start;
       }
-      setPreviewCurrentTime(video.currentTime);
+      const t = Math.max(start, Math.min(video.currentTime, end));
+      if (Math.abs(video.currentTime - t) > 0.05) video.currentTime = t;
+      setPreviewCurrentTime(t);
     };
 
     const onCanPlay = () => {
@@ -2008,14 +2130,20 @@ export default function App() {
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video) return;
-    const t = video.currentTime;
-    setPreviewCurrentTime(t);
+    const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
-    if (t >= end) {
+    let t = video.currentTime;
+    if (t < start - 0.05) {
+      video.currentTime = start;
+      t = start;
+    }
+    setPreviewCurrentTime(t);
+    if (t >= end - 0.05) {
       video.pause();
       if (Math.abs(video.currentTime - end) > 0.05) {
         video.currentTime = end;
       }
+      setPreviewCurrentTime(end);
       setPreviewPlaying(false);
     }
   }, []);
@@ -2026,8 +2154,9 @@ export default function App() {
     if (video.paused) {
       const start = previewTrimStartRef.current;
       const end = previewTrimEndRef.current;
-      if (video.currentTime >= end - 0.1) {
+      if (video.currentTime >= end - 0.1 || video.currentTime < start) {
         video.currentTime = start;
+        setPreviewCurrentTime(start);
       }
       void video.play();
       setPreviewPlaying(true);
@@ -3614,20 +3743,20 @@ export default function App() {
       )}
       <div className="flex items-center gap-2">
         <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
-          {formatHmsFull(previewCurrentTime)}
+          {formatHmsFull(Math.max(0, previewCurrentTime - previewTrimStart))}
         </span>
         <input
           type="range"
-          min={0}
-          max={vodDurationSec}
+          min={previewTrimStart}
+          max={previewTrimEnd}
           step={0.25}
-          value={Math.min(Math.max(previewCurrentTime, 0), vodDurationSec)}
-          disabled={!previewVideoReady || vodDurationSec <= 0}
+          value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
+          disabled={!previewVideoReady || previewDurationSec <= 0}
           onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
           className="flex-1 accent-white disabled:opacity-40"
         />
         <span className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
-          {formatHmsFull(vodDurationSec)}
+          {formatHmsFull(previewDurationSec)}
         </span>
       </div>
     </div>
@@ -3769,16 +3898,12 @@ export default function App() {
               }`}
             >
               <div
-                className={`relative bg-black overflow-hidden ${
-                  previewFullscreen ? 'absolute inset-0 z-0 cursor-pointer' : 'w-full h-full'
+                className={`relative bg-black overflow-hidden cursor-pointer ${
+                  previewFullscreen ? 'absolute inset-0 z-0' : 'w-full h-full'
                 }`}
                 style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
-                onClick={(e) => {
+                onClick={() => {
                   focusPreviewPlayer();
-                  if (!previewFullscreen) {
-                    if ((e.target as HTMLElement).tagName === 'VIDEO') togglePreviewPlay();
-                    return;
-                  }
                   togglePreviewPlay();
                 }}
               >
@@ -3961,12 +4086,45 @@ export default function App() {
             </div>
 
             {savedChannels.length > 0 && (
-              <div className="flex flex-col gap-1">
-                {savedChannels.map((ch) => (
-                  <div key={ch.id}
-                    className={`flex items-center gap-1 border px-2 py-1 ${
+              <div ref={channelListRef} className="flex flex-col gap-1">
+                {savedChannels.map((ch, index) => {
+                  const dropAbove = channelDragId != null
+                    && channelDropInsertIndex === index;
+                  const dropBelow = channelDragId != null
+                    && channelDropInsertIndex === savedChannels.length
+                    && index === savedChannels.length - 1;
+                  return (
+                  <div
+                    key={ch.id}
+                    data-channel-row
+                    data-channel-id={ch.id}
+                    className={`relative flex items-center gap-1 border px-2 py-1 ${
                       ch.id === selectedChannelId ? 'border-white bg-zinc-900' : 'border-zinc-800'
-                    }`}>
+                    } ${ch.id === channelDragId ? 'opacity-45' : ''} ${
+                      dropAbove ? 'shadow-[inset_0_2px_0_0_rgba(255,255,255,0.95)]' : ''
+                    } ${dropBelow ? 'shadow-[inset_0_-2px_0_0_rgba(255,255,255,0.95)]' : ''}`}
+                  >
+                    <button
+                      type="button"
+                      title="Drag to reorder"
+                      aria-label={`Reorder ${ch.displayName}`}
+                      disabled={editingChannelId === ch.id}
+                      onPointerDown={(e) => {
+                        if (editingChannelId === ch.id) return;
+                        setChannelDropInsertIndex(index);
+                        startChannelReorderDrag(
+                          e,
+                          ch.id,
+                          channelListRef,
+                          setSavedChannels,
+                          setChannelDragId,
+                          setChannelDropInsertIndex,
+                        );
+                      }}
+                      className="shrink-0 text-zinc-600 hover:text-zinc-300 p-0.5 cursor-grab active:cursor-grabbing touch-none disabled:opacity-30 disabled:cursor-not-allowed"
+                    >
+                      <GripVertical size={12} />
+                    </button>
                     {editingChannelId === ch.id ? (
                       <input type="text" value={editingChannelName}
                         onChange={(e) => setEditingChannelName(e.target.value)}
@@ -4002,7 +4160,8 @@ export default function App() {
                       <X size={11} />
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
