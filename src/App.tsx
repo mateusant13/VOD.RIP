@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react';
 import Hls from 'hls.js';
 import {
   Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
@@ -209,6 +209,8 @@ function formatHmsFull(sec: number): string {
 const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_FULLSCREEN_HEIGHT = 1080;
 const PREVIEW_SKIP_SEC = 10;
+const PREVIEW_KEY_SKIP_SEC = 5;
+const PREVIEW_FS_CONTROLS_HIDE_MS = 850;
 
 interface PreviewLevelOption {
   index: number;
@@ -250,6 +252,13 @@ function lowestLevelIndex(levels: PreviewLevelOption[]): number {
   if (!levels.length) return 0;
   return levels.reduce((best, l) => (l.height < best.height ? l : best)).index;
 }
+
+/**
+ * Fixed compact-card height — matches git 7bb0321 queue tab at rest
+ * (header + tabs + 2× max-h-[160px] list sections + gaps ≈ 28rem).
+ * Taller tab content scrolls inside the body.
+ */
+const COMPACT_CARD_HEIGHT = 'h-[28rem]';
 
 const CHANNEL_INITIAL_VISIBLE = 5;
 const CHANNEL_EXPAND_STEP = 10;
@@ -392,17 +401,23 @@ export default function App() {
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewMuted, setPreviewMuted] = useState(true);
+  const [previewVolume, setPreviewVolume] = useState(1);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
+  const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
+  /** URL tab hidden from bar after picking a VOD from channels; restored only on page refresh. */
+  const [urlTabBarHidden, setUrlTabBarHidden] = useState(false);
   const [previewTrimStart, setPreviewTrimStart] = useState(0);
   const [previewTrimEnd, setPreviewTrimEnd] = useState(3600);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewControlsRef = useRef<HTMLDivElement>(null);
   const previewHlsRef = useRef<Hls | null>(null);
+  const previewVolumeRef = useRef(1);
+  const previewFsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewQualityBeforeFullscreenRef = useRef<number | null>(null);
   const previewPausedBeforeFullscreenRef = useRef(false);
   const previewInitialSeekDoneRef = useRef(false);
@@ -720,6 +735,91 @@ export default function App() {
     seekPreviewVideo(t);
   }, [previewVideoReady, seekPreviewVideo]);
 
+  const seekPreviewPercent = useCallback((fraction: number) => {
+    const start = previewTrimStartRef.current;
+    const end = previewTrimEndRef.current;
+    const t = start + (end - start) * Math.max(0, Math.min(1, fraction));
+    seekPreviewVideo(t);
+  }, [seekPreviewVideo]);
+
+  const setPreviewVolumeLevel = useCallback((level: number) => {
+    const video = previewVideoRef.current;
+    if (!video) return;
+    const v = Math.max(0, Math.min(1, level));
+    video.volume = v;
+    previewVolumeRef.current = v;
+    setPreviewVolume(v);
+    if (v <= 0) {
+      video.muted = true;
+      setPreviewMuted(true);
+    } else {
+      video.muted = false;
+      setPreviewMuted(false);
+    }
+  }, []);
+
+  const bumpPreviewFsControls = useCallback(() => {
+    setPreviewFsControlsVisible(true);
+    if (previewFsHideTimerRef.current) {
+      window.clearTimeout(previewFsHideTimerRef.current);
+    }
+    if (previewFullscreen) {
+      previewFsHideTimerRef.current = window.setTimeout(() => {
+        setPreviewFsControlsVisible(false);
+      }, PREVIEW_FS_CONTROLS_HIDE_MS);
+    }
+  }, [previewFullscreen]);
+
+  const handlePreviewContainerKeyDown = useCallback((e: KeyboardEvent) => {
+    if (!previewVideoReady) return;
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+    const { key } = e;
+    const transportKeys = [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End',
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+    if (!transportKeys.includes(key)) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (key === ' ') {
+      togglePreviewPlay();
+      return;
+    }
+    if (key === 'ArrowLeft') {
+      skipPreview(-PREVIEW_KEY_SKIP_SEC);
+      return;
+    }
+    if (key === 'ArrowRight') {
+      skipPreview(PREVIEW_KEY_SKIP_SEC);
+      return;
+    }
+    if (key === 'ArrowUp') {
+      setPreviewVolumeLevel(previewVolumeRef.current + 0.1);
+      return;
+    }
+    if (key === 'ArrowDown') {
+      setPreviewVolumeLevel(previewVolumeRef.current - 0.1);
+      return;
+    }
+    if (key === 'Home' || key === '0') {
+      seekPreviewPercent(0);
+      return;
+    }
+    if (key === 'End') {
+      seekPreviewPercent(1);
+      return;
+    }
+    if (key >= '1' && key <= '9') {
+      seekPreviewPercent(parseInt(key, 10) * 0.1);
+    }
+  }, [previewVideoReady, togglePreviewPlay, skipPreview, setPreviewVolumeLevel, seekPreviewPercent]);
+
+  const focusPreviewPlayer = useCallback(() => {
+    previewContainerRef.current?.focus();
+  }, []);
+
   const togglePreviewFullscreen = useCallback(async () => {
     const container = previewContainerRef.current;
     if (!container || !previewVideoReady) return;
@@ -743,6 +843,7 @@ export default function App() {
       const video = previewVideoRef.current;
       const hls = previewHlsRef.current;
       setPreviewFullscreen(fs);
+      setPreviewFsControlsVisible(!fs);
 
       if (fs && hls?.levels.length) {
         previewPausedBeforeFullscreenRef.current = video?.paused ?? true;
@@ -790,6 +891,16 @@ export default function App() {
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
   }, [previewQualityMenuOpen]);
+
+  useEffect(() => {
+    if (!previewOpen || !previewVideoReady) return;
+    const video = previewVideoRef.current;
+    if (video) {
+      video.volume = previewVolumeRef.current;
+    }
+    const t = window.setTimeout(() => focusPreviewPlayer(), 0);
+    return () => window.clearTimeout(t);
+  }, [previewOpen, previewVideoReady, focusPreviewPlayer]);
 
   // ── Fetch video info ──
 
@@ -1146,20 +1257,9 @@ export default function App() {
   const selectVod = useCallback((vodUrl: string) => {
     setUrl(vodUrl);
     setChannelVodPanelOpen(true);
+    setUrlTabBarHidden(true);
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
-
-  useEffect(() => {
-    if (previewOpen && tab === 'channels') {
-      setTab('url');
-    }
-  }, [previewOpen, tab]);
-
-  useEffect(() => {
-    if (tab !== 'channels') {
-      setChannelVodPanelOpen(false);
-    }
-  }, [tab]);
 
   // ── Size estimate ──
   const clipSec = Math.max(0, trimEndSec - trimStartSec);
@@ -1172,12 +1272,21 @@ export default function App() {
   const estSize = (clipSec / 60) * mbPerMin;
 
   const activePlatform = detectVideoPlatform(videoInfo, url);
-  const splitChannelsLayout = channelVodPanelOpen && tab === 'channels' && !previewOpen;
-  const showUrlInSidebar = splitChannelsLayout;
-  const showUrlInMainCard = tab === 'url' || previewOpen;
-  const visibleTabs: Tab[] = previewOpen
-    ? ['url', 'queue', 'settings']
+  const channelsSplitActive = channelVodPanelOpen && !previewOpen;
+  const showUrlInSidebar = channelsSplitActive;
+  const showUrlInPreviewMiddle = previewOpen;
+  const urlPanelAside = showUrlInSidebar || showUrlInPreviewMiddle;
+  const splitLayout = urlPanelAside;
+  const showUrlInMainCard = tab === 'url' && !urlPanelAside && !urlTabBarHidden;
+  const visibleTabs: Tab[] = urlPanelAside || urlTabBarHidden
+    ? ['channels', 'queue', 'settings']
     : ['url', 'channels', 'queue', 'settings'];
+
+  useEffect(() => {
+    if ((urlPanelAside || urlTabBarHidden) && tab === 'url') {
+      setTab('channels');
+    }
+  }, [urlPanelAside, urlTabBarHidden, tab]);
 
   const urlTabContent = (
     <div className="flex flex-col gap-4">
@@ -1327,34 +1436,138 @@ export default function App() {
             </button>
           </div>
 
-          <button onClick={handleStartDownload}
+          <button
+            onClick={handleStartDownload}
             disabled={!!downloading}
-            className="w-full relative group mt-1 disabled:opacity-50">
-            <div className={`absolute inset-0 translate-x-1.5 translate-y-1.5 group-hover:translate-x-1 group-hover:translate-y-1 transition-transform ${
-              urlPlatform === 'kick' ? 'bg-[#53fc18]' : urlPlatform === 'twitch' ? 'bg-[#9146FF]' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
-            }`} />
-            <div className="relative bg-black border-2 border-white py-4 flex items-center justify-center gap-3 transition-colors group-hover:bg-white group-hover:text-black group-hover:border-white">
-              <Download size={20} strokeWidth={3} className="group-hover:animate-bounce" />
-              <span className="font-black uppercase tracking-widest text-md">Rip VOD</span>
-            </div>
+            className={`w-full mt-1 disabled:opacity-50 border-2 border-white bg-black py-4 flex items-center justify-center gap-3 font-black uppercase tracking-widest transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
+              urlPlatform === 'kick'
+                ? 'shadow-[4px_4px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
+                : urlPlatform === 'twitch'
+                  ? 'shadow-[4px_4px_0px_0px_#9146FF] hover:shadow-[2px_2px_0px_0px_#9146FF] hover:translate-x-0.5 hover:translate-y-0.5'
+                  : 'shadow-[4px_4px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
+            }`}
+          >
+            <Download size={20} strokeWidth={3} />
+            <span>Rip VOD</span>
           </button>
         </div>
       )}
     </div>
   );
 
+  const previewCtrlBtn = (fsOverlay: boolean) => fsOverlay
+    ? 'border border-white/20 bg-black/20 text-zinc-100/90 hover:bg-black/35 hover:border-white/50 p-1.5 disabled:opacity-30 backdrop-blur-[1px]'
+    : 'border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-1.5 disabled:opacity-40';
+
+  const previewControlsUi = (
+    <>
+      <div className="flex items-center gap-2">
+        <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
+          {formatHmsFull(previewCurrentTime)}
+        </span>
+        <input
+          type="range"
+          min={previewTrimStart}
+          max={previewTrimEnd}
+          step={0.25}
+          value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
+          disabled={!previewVideoReady}
+          onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
+          className="flex-1 accent-white disabled:opacity-40"
+        />
+        <span className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
+          {formatHmsFull(previewTrimEnd)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1">
+          <button type="button" onClick={() => skipPreview(-PREVIEW_SKIP_SEC)}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen)}
+            title={`Back ${PREVIEW_SKIP_SEC}s`}>
+            <SkipBack size={15} />
+          </button>
+          <button type="button" onClick={togglePreviewPlay}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen)}>
+            {previewPlaying ? <Pause size={15} /> : <Play size={15} />}
+          </button>
+          <button type="button" onClick={() => skipPreview(PREVIEW_SKIP_SEC)}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen)}
+            title={`Forward ${PREVIEW_SKIP_SEC}s`}>
+            <SkipForward size={15} />
+          </button>
+          <button type="button"
+            onClick={() => {
+              if (previewMuted || previewVolume <= 0) {
+                setPreviewVolumeLevel(previewVolumeRef.current > 0 ? previewVolumeRef.current : 1);
+              } else {
+                setPreviewVolumeLevel(0);
+              }
+            }}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen)}>
+            {previewMuted || previewVolume <= 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+          </button>
+          {previewLevels.length > 1 && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setPreviewQualityMenuOpen((o) => !o)}
+                disabled={!previewVideoReady || previewFullscreen}
+                className={previewCtrlBtn(previewFullscreen)}
+                title={previewFullscreen ? 'Quality locked in fullscreen' : 'Video quality'}
+              >
+                <Settings size={15} />
+              </button>
+              {previewQualityMenuOpen && (
+                <div className="absolute bottom-full left-0 mb-1 z-30 min-w-[7rem] border-2 border-zinc-600 bg-zinc-950 shadow-lg py-1">
+                  {previewLevels.map((l) => (
+                    <button
+                      key={l.index}
+                      type="button"
+                      onClick={() => applyPreviewQuality(l.index)}
+                      className={`block w-full text-left px-2 py-1 text-[10px] font-mono hover:bg-zinc-800 ${
+                        l.index === previewQualityLevel ? 'text-white' : 'text-zinc-400'
+                      }`}
+                    >
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <button type="button" onClick={() => void togglePreviewFullscreen()}
+          disabled={!previewVideoReady}
+          className={previewCtrlBtn(previewFullscreen)}
+          title={previewFullscreen ? 'Exit fullscreen' : 'Fullscreen (1080p)'}>
+          {previewFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+        </button>
+      </div>
+    </>
+  );
+
   return (
-    <div className={`min-h-screen flex justify-center p-4 selection:bg-white selection:text-black bg-[#09090b] ${
-      previewOpen ? 'items-start overflow-x-auto' : 'items-center'
-    }`}
-         style={{ backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
-      <div className={`flex items-start gap-6 transition-all duration-300 ${
-        previewOpen || splitChannelsLayout ? 'w-max max-w-none' : 'w-full justify-center'
+    <div
+      className={`min-h-screen flex justify-center items-center p-4 selection:bg-white selection:text-black bg-[#09090b] ${
+        splitLayout ? 'overflow-x-auto' : ''
+      }`}
+      style={{
+        backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)',
+        backgroundSize: '24px 24px',
+        scrollbarGutter: 'stable',
+      }}
+    >
+      <div className={`flex items-start gap-6 ${
+        splitLayout ? 'w-max max-w-none' : 'w-full max-w-md justify-center'
       }`}>
       {previewOpen && (
         <div
           className={`shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 ${platformCardShadow(activePlatform, true)}`}
-          style={{ width: 'min(960px, calc(100vw - 28rem - 2rem))' }}
+          style={{ width: 'min(720px, calc(100vw - 56rem - 3rem))' }}
         >
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-bold uppercase tracking-widest text-zinc-300">Trim preview</span>
@@ -1363,10 +1576,28 @@ export default function App() {
               <X size={18} />
             </button>
           </div>
-          <div className="flex gap-3 items-stretch min-h-[min(54vw,540px)]">
+          <div className="flex flex-col gap-2 w-full" data-preview-panel>
             <div
               ref={previewContainerRef}
-              className="relative flex-1 min-w-0 aspect-video bg-black border-2 border-zinc-700 overflow-hidden group"
+              tabIndex={0}
+              role="application"
+              aria-label="Trim preview player"
+              onKeyDown={handlePreviewContainerKeyDown}
+              onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
+              onMouseLeave={previewFullscreen ? () => {
+                if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
+                previewFsHideTimerRef.current = window.setTimeout(() => {
+                  setPreviewFsControlsVisible(false);
+                }, PREVIEW_FS_CONTROLS_HIDE_MS);
+              } : undefined}
+              onFocus={focusPreviewPlayer}
+              onClick={(e) => {
+                focusPreviewPlayer();
+                if ((e.target as HTMLElement).tagName === 'VIDEO') {
+                  togglePreviewPlay();
+                }
+              }}
+              className="relative w-full aspect-video bg-black border-2 border-zinc-700 overflow-hidden outline-none focus:ring-2 focus:ring-white/30"
             >
               <video
                 ref={previewVideoRef}
@@ -1382,100 +1613,33 @@ export default function App() {
                   setPreviewPlaying(true);
                 }}
                 onPause={() => setPreviewPlaying(false)}
-                onClick={togglePreviewPlay}
               />
               {previewVideoLoading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
                   <Loader2 size={40} className="animate-spin text-zinc-300" />
                 </div>
               )}
+              {previewFullscreen && (
+                <div
+                  ref={previewControlsRef}
+                  className={`absolute inset-x-0 bottom-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-3 bg-gradient-to-t from-black/35 to-transparent transition-opacity duration-150 ${
+                    previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                  }`}
+                  onClick={(e) => e.stopPropagation()}
+                  onMouseMove={bumpPreviewFsControls}
+                >
+                  {previewControlsUi}
+                </div>
+              )}
             </div>
-            <div
-              ref={previewControlsRef}
-              className="w-44 shrink-0 flex flex-col gap-2 justify-center border-l-2 border-zinc-800 pl-3"
-            >
-              <p className="text-xs font-mono text-zinc-400 text-center">
-                {formatHmsFull(previewCurrentTime)}
-              </p>
-              <div className="flex items-center gap-1">
-                <span className="text-[9px] font-mono text-zinc-600 w-10 shrink-0">{formatHmsFull(previewTrimStart)}</span>
-                <input
-                  type="range"
-                  min={previewTrimStart}
-                  max={previewTrimEnd}
-                  step={0.25}
-                  value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
-                  disabled={!previewVideoReady}
-                  onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
-                  className="flex-1 accent-white disabled:opacity-40"
-                />
-                <span className="text-[9px] font-mono text-zinc-600 w-10 shrink-0 text-right">{formatHmsFull(previewTrimEnd)}</span>
+            {!previewFullscreen && (
+              <div
+                ref={previewControlsRef}
+                className="flex flex-col gap-1.5 w-[82%] ml-auto shrink-0"
+              >
+                {previewControlsUi}
               </div>
-              <div className="flex flex-col gap-1.5 items-stretch">
-                <button type="button" onClick={() => skipPreview(-PREVIEW_SKIP_SEC)}
-                  disabled={!previewVideoReady}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
-                  title={`Back ${PREVIEW_SKIP_SEC}s`}>
-                  <SkipBack size={16} />
-                </button>
-                <button type="button" onClick={togglePreviewPlay}
-                  disabled={!previewVideoReady}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center">
-                  {previewPlaying ? <Pause size={16} /> : <Play size={16} />}
-                </button>
-                <button type="button" onClick={() => skipPreview(PREVIEW_SKIP_SEC)}
-                  disabled={!previewVideoReady}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
-                  title={`Forward ${PREVIEW_SKIP_SEC}s`}>
-                  <SkipForward size={16} />
-                </button>
-                {previewLevels.length > 1 && (
-                  <div className="relative">
-                    <button
-                      type="button"
-                      onClick={() => setPreviewQualityMenuOpen((o) => !o)}
-                      disabled={!previewVideoReady || previewFullscreen}
-                      className="w-full border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
-                      title={previewFullscreen ? 'Quality locked in fullscreen' : 'Video quality'}
-                    >
-                      <Settings size={16} />
-                    </button>
-                    {previewQualityMenuOpen && (
-                      <div className="absolute right-full top-0 mr-1 z-20 min-w-[7rem] border-2 border-zinc-600 bg-zinc-950 shadow-lg py-1">
-                        {previewLevels.map((l) => (
-                          <button
-                            key={l.index}
-                            type="button"
-                            onClick={() => applyPreviewQuality(l.index)}
-                            className={`block w-full text-left px-2 py-1 text-[10px] font-mono hover:bg-zinc-800 ${
-                              l.index === previewQualityLevel ? 'text-white' : 'text-zinc-400'
-                            }`}
-                          >
-                            {l.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-                <button type="button"
-                  onClick={() => {
-                    setPreviewMuted((m) => !m);
-                    const v = previewVideoRef.current;
-                    if (v) v.muted = !previewMuted;
-                  }}
-                  disabled={!previewVideoReady}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center">
-                  {previewMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
-                </button>
-                <button type="button" onClick={() => void togglePreviewFullscreen()}
-                  disabled={!previewVideoReady}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
-                  title={previewFullscreen ? 'Exit fullscreen' : 'Fullscreen (1080p)'}>
-                  {previewFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
-                </button>
-              </div>
-            </div>
+            )}
           </div>
           <p className="text-[10px] text-zinc-600 font-mono text-center">
             Default {PREVIEW_DEFAULT_HEIGHT}p · fullscreen {PREVIEW_FULLSCREEN_HEIGHT}p
@@ -1483,31 +1647,42 @@ export default function App() {
             preview trim {formatHmsFull(previewTrimStart)} → {formatHmsFull(previewTrimEnd)}
             <span className="text-zinc-700 mx-1">·</span>
             hit Preview again after moving trim sliders
+            <span className="text-zinc-700 mx-1">·</span>
+            click player then Space, ←/→ 5s, ↑/↓ vol, 0–9 %
           </p>
         </div>
       )}
-      {showUrlInSidebar && (
-        <div className={`shrink-0 w-[28rem] bg-zinc-950 border-2 border-white p-6 flex flex-col gap-5 ${platformCardShadow(activePlatform, true)}`}>
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400">Selected VOD</span>
-            <button
-              type="button"
-              onClick={() => { setChannelVodPanelOpen(false); setVideoInfo(null); setUrl(''); }}
-              className="text-zinc-500 hover:text-white p-1"
-              title="Clear selection"
-            >
-              <X size={14} />
-            </button>
+      {(showUrlInSidebar || showUrlInPreviewMiddle) && (
+        <div className={`shrink-0 w-[28rem] bg-zinc-950 border-2 border-white p-6 flex flex-col gap-4 ${COMPACT_CARD_HEIGHT} ${platformCardShadow(activePlatform, true)}`}>
+          {showUrlInSidebar && (
+            <div className="flex items-center justify-between shrink-0">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400">Selected VOD</span>
+              <button
+                type="button"
+                onClick={() => { setChannelVodPanelOpen(false); setVideoInfo(null); setUrl(''); }}
+                className="text-zinc-500 hover:text-white p-1"
+                title="Clear selection"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+          {showUrlInPreviewMiddle && (
+            <div className="flex items-center justify-between shrink-0">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400">VOD · Trim</span>
+            </div>
+          )}
+          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar pr-1 pb-2 overscroll-y-contain">
+            {urlTabContent}
           </div>
-          {urlTabContent}
         </div>
       )}
-      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white p-6 flex flex-col gap-5 ${platformCardShadow(activePlatform)} transition-all duration-300 ${
-        previewOpen || splitChannelsLayout ? 'w-[28rem]' : 'w-full max-w-md'
+      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white p-6 flex flex-col gap-4 ${COMPACT_CARD_HEIGHT} ${platformCardShadow(activePlatform)} transition-all duration-300 ${
+        splitLayout ? 'w-[28rem]' : 'w-full max-w-md'
       }`}>
 
         {/* ── HEADER ── */}
-        <div className="flex justify-between items-start">
+        <div className="flex justify-between items-start shrink-0">
           <div className="flex flex-col">
             <h1 className="text-4xl md:text-5xl font-black uppercase tracking-tighter flex items-center gap-2">
               VOD<span className="text-[#9146FF]">.</span>RIP
@@ -1523,7 +1698,7 @@ export default function App() {
         </div>
 
         {/* ── TABS ── */}
-        <div className="flex w-full border-2 border-zinc-800 font-mono text-[10px] uppercase font-bold tracking-widest">
+        <div className="flex w-full border-2 border-zinc-800 font-mono text-[10px] uppercase font-bold tracking-widest shrink-0">
           {visibleTabs.map((t) => (
             <button
               key={t}
@@ -1543,7 +1718,7 @@ export default function App() {
 
         {/* ── ERROR ── */}
         {error && (
-          <div className="border-2 border-red-500/50 bg-red-500/10 p-3 text-red-400 text-xs font-mono flex items-center gap-2">
+          <div className="border-2 border-red-500/50 bg-red-500/10 p-3 text-red-400 text-xs font-mono flex items-center gap-2 shrink-0">
             <AlertCircle size={14} />
             {error}
             <button onClick={() => setError(null)} className="ml-auto text-red-400/60 hover:text-red-400">
@@ -1552,11 +1727,12 @@ export default function App() {
           </div>
         )}
 
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar pr-1 pb-2 overscroll-y-contain">
         {/* ════════════════════════════ URL TAB ════════════════════════════ */}
         {showUrlInMainCard && urlTabContent}
 
         {/* ════════════════════════════ CHANNELS TAB ════════════════════════════ */}
-        {tab === 'channels' && !previewOpen && (
+        {tab === 'channels' && (
           <div className="flex flex-col gap-3">
             <div className="flex gap-2">
               <input type="text" value={addChannelInput}
@@ -1718,7 +1894,7 @@ export default function App() {
                               {v.duration ? <span className="text-zinc-500 ml-1">{fmtShort(v.duration)}</span> : null}
                             </span>
                             {v.created_at && (
-                              <span className="text-[9px] text-zinc-600 block truncate">
+                              <span className="text-[9px] text-zinc-400 block truncate">
                                 {fmtDateAndAgo(v.created_at)}
                               </span>
                             )}
@@ -1879,7 +2055,7 @@ export default function App() {
                   placeholder="C:\Users\...\Downloads"
                   className="flex-1 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white" />
                 <button type="button" onClick={pickDownloadFolder} disabled={pickingFolder}
-                  className="bg-white text-black font-black uppercase px-3 text-[10px] border-2 border-white hover:bg-[#53fc18] hover:border-[#53fc18] shrink-0 flex items-center gap-1 disabled:opacity-50">
+                  className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1 disabled:opacity-50">
                   {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
                   {pickingFolder ? '...' : 'Browse'}
                 </button>
@@ -1903,37 +2079,14 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex flex-col gap-1.5">
-              <FieldCaption>Throttle (KiB/s, -1 = unlimited)</FieldCaption>
-              <input type="number" min={-1}
-                value={settings.throttle_kib}
-                onChange={(e) => setSettings({ ...settings, throttle_kib: parseInt(e.target.value) || -1 })}
-                className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <FieldCaption>Preferred Quality</FieldCaption>
-              <input type="text" value={settings.quality || '1080p'}
-                onChange={(e) => setSettings({ ...settings, quality: e.target.value })}
-                placeholder="1080p"
-                className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <FieldCaption>Twitch OAuth Token</FieldCaption>
-              <input type="password" value={settings.oauth}
-                onChange={(e) => setSettings({ ...settings, oauth: e.target.value })}
-                placeholder="oauth_..."
-                className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-            </div>
-
             <button onClick={handleSaveSettings}
-              className="w-full bg-white text-black font-black uppercase py-3 flex items-center justify-center gap-2 hover:bg-[#53fc18] transition-all text-xs border-2 border-white hover:border-[#53fc18]">
+              className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">
               {settingsSaved ? <><CheckCircle2 size={16} /> Saved!</> : 'Save Settings'}
             </button>
           </div>
         )}
 
+      </div>
       </div>
       </div>
 
