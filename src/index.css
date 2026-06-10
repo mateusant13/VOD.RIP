@@ -26,6 +26,19 @@ body {
   overflow: hidden;
 }
 
+/* Channel explore player portal — fixed layer above the app, no layout coupling */
+#explore-portal {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: none;
+  overflow: visible;
+}
+
+#explore-portal > * {
+  pointer-events: auto;
+}
+
 button:not(:disabled),
 [role="button"]:not([aria-disabled="true"]) {
   cursor: pointer;
