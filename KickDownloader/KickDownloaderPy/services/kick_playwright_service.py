@@ -836,97 +836,26 @@ class KickPlaywrightService:
             raise RuntimeError("Kick API returned no HLS playlist URL for this VOD")
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        # Locate ffmpeg: prefer full path detection (same logic as ytdlp_service).
-        from services.ytdlp_service import _find_ffmpeg
-        ffmpeg_dir = _find_ffmpeg()
-        if ffmpeg_dir:
-            ffmpeg_exe = os.path.join(
-                ffmpeg_dir, "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-            )
-            if not os.path.isfile(ffmpeg_exe):
-                ffmpeg_exe = "ffmpeg"
-        else:
-            ffmpeg_exe = "ffmpeg"
-        # Build FFmpeg command.
-        # We use `-c copy` for speed (no re-encoding), which means we can't
-        # apply video filters. Quality is selected by the HLS playlist the
-        # browser captured; if the user asked for a specific height, we rely
-        # on the master.m3u8 already pointing at the right variant.
-        cmd = [ffmpeg_exe, "-y", "-loglevel", "error",
-               "-reconnect", "1",
-               "-reconnect_streamed", "1",
-               "-reconnect_delay_max", "5"]
-        if crop_start is not None:
-            cmd += ["-ss", f"{crop_start}"]
-        cmd += ["-i", info.m3u8_url]
-        if crop_start is not None and crop_end is not None:
-            # Use -t (duration) rather than -to (absolute timestamp) so the
-            # cut length doesn't depend on ffmpeg's input-seek interpretation.
-            cmd += ["-t", f"{max(0.0, crop_end - crop_start)}"]
-        elif crop_start is not None:
-            cmd += ["-t", "3600"]  # default 1h, same as DEFAULT_CLIP_SECONDS
-        cmd += ["-c", "copy", str(out)]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        from services.ytdlp_service import (
+            _require_crop_range,
+            _resolve_ffmpeg_exe,
+            download_hls_media_clip,
         )
-        if register_abort:
-            register_abort(lambda: proc.returncode is None and proc.kill())
 
-        from services.ytdlp_service import CancelledError
-
-        est_sec = 30.0
-        if crop_start is not None and crop_end is not None:
-            est_sec = max(5.0, float(crop_end - crop_start))
-        elif info.duration:
-            est_sec = max(5.0, float(info.duration))
-
-        async def _tick_progress() -> None:
-            if not progress_hook:
-                return
-            started = time.monotonic()
-            while proc.returncode is None:
-                if cancel_event and cancel_event.is_set():
-                    return
-                elapsed = time.monotonic() - started
-                pct = min(100, max(0, int((elapsed / est_sec) * 100)))
-                try:
-                    progress_hook({"status": "downloading", "percent": pct})
-                except Exception:
-                    return
-                await asyncio.sleep(0.25)
-
-        tick_task = asyncio.create_task(_tick_progress())
-        stderr = b""
-        try:
-            while proc.returncode is None:
-                if cancel_event and cancel_event.is_set():
-                    proc.kill()
-                    await proc.wait()
-                    raise CancelledError("Download cancelled by user")
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-            stderr = await proc.stderr.read() if proc.stderr else b""
-        finally:
-            tick_task.cancel()
-            try:
-                await tick_task
-            except asyncio.CancelledError:
-                pass
-        if cancel_event and cancel_event.is_set():
-            if out.is_file():
-                try:
-                    out.unlink()
-                except OSError:
-                    pass
-            raise CancelledError("Download cancelled by user")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"FFmpeg failed (exit {proc.returncode}): {stderr.decode(errors='ignore')[:500]}"
-            )
+        start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+        ffmpeg_exe = _resolve_ffmpeg_exe()
+        await asyncio.to_thread(
+            download_hls_media_clip,
+            info.m3u8_url,
+            start_sec,
+            end_sec,
+            str(out),
+            {},
+            ffmpeg_exe,
+            progress_hook,
+            cancel_event,
+            register_abort,
+        )
         if progress_hook:
             try:
                 progress_hook({"status": "downloading", "percent": 100})

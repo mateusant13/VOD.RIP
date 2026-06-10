@@ -1,5 +1,6 @@
 """yt-dlp service — wraps the yt-dlp Python library directly (no subprocess)."""
 
+import logging
 import os
 import re
 import shutil
@@ -8,8 +9,10 @@ import threading
 import time
 import subprocess as sp
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 from urllib.parse import urljoin
+
+logger = logging.getLogger(__name__)
 
 import requests
 import yt_dlp
@@ -51,8 +54,48 @@ def _run_ffmpeg(
             proc.wait(timeout=5)
 
 
-# Default section duration when no crop params given (1 hour = 3600 seconds)
-DEFAULT_CLIP_SECONDS = 3600
+def _normalize_crop_range(
+    crop_start: Optional[float],
+    crop_end: Optional[float],
+) -> Optional[Tuple[float, float]]:
+    """Return (start, end) when a valid trim range is present (start may be 0)."""
+    if crop_end is None:
+        return None
+    start = 0.0 if crop_start is None else float(crop_start)
+    end = float(crop_end)
+    if end <= start:
+        return None
+    return start, end
+
+
+def _require_crop_range(
+    crop_start: Optional[float],
+    crop_end: Optional[float],
+) -> Tuple[float, float]:
+    """Require an explicit trim window; never fall back to a full-VOD download."""
+    if (crop_start is None) != (crop_end is None):
+        raise ValueError(
+            "Both crop_start and crop_end are required for Twitch/Kick downloads"
+        )
+    crop = _normalize_crop_range(crop_start, crop_end)
+    if crop is None:
+        raise ValueError(
+            "crop_start and crop_end are required (crop_end must be after crop_start)"
+        )
+    return crop
+
+
+def _resolve_ffmpeg_exe(ffmpeg_dir: Optional[str] = None) -> str:
+    if ffmpeg_dir:
+        exe = Path(ffmpeg_dir) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        if exe.is_file():
+            return str(exe)
+    found = _find_ffmpeg()
+    if found:
+        exe = Path(found) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        if exe.is_file():
+            return str(exe)
+    return "ffmpeg"
 
 
 def detect_platform(url: str) -> str:
@@ -452,15 +495,24 @@ def _download_segments(
         path = os.path.join(temp_dir, f"{i:05d}.ts")
         r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
         r.raise_for_status()
+        content_length = int(r.headers.get("content-length") or 0)
+        downloaded = 0
         with open(path, "wb") as f:
             for chunk in r.iter_content(64 * 1024):
                 _check_cancelled(cancel_event)
                 if chunk:
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_hook and content_length > 0:
+                        seg_frac = (i + downloaded / content_length) / total
+                        progress_hook({
+                            "status": "downloading",
+                            "percent": seg_frac * 100.0,
+                        })
         files.append(path)
 
         if progress_hook:
-            pct = int((i + 1) / total * 100)
+            pct = (i + 1) / total * 100.0
             progress_hook({
                 "status": "downloading",
                 "percent": pct,
@@ -495,16 +547,71 @@ def _concat_and_trim(
         register_abort=register_abort,
     )
 
+    if offset > 0.05:
+        trim_cmd = [
+            ffmpeg_exe, "-ss", str(offset), "-i", joined,
+            "-t", str(duration),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", "-y", output_path,
+        ]
+    else:
+        trim_cmd = [
+            ffmpeg_exe, "-i", joined,
+            "-t", str(duration), "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart", "-y", output_path,
+        ]
     _run_ffmpeg(
-        [ffmpeg_exe, "-ss", str(offset), "-i", joined,
-         "-t", str(duration), "-c", "copy",
-         "-avoid_negative_ts", "make_zero", "-y", output_path],
+        trim_cmd,
         cancel_event=cancel_event,
         register_abort=register_abort,
     )
 
     if progress_hook:
+        progress_hook({"status": "downloading", "percent": 100})
         progress_hook({"status": "finished"})
+
+
+def download_hls_media_clip(
+    media_url: str,
+    start_sec: float,
+    end_sec: float,
+    output_path: str,
+    headers: Optional[dict] = None,
+    ffmpeg_exe: Optional[str] = None,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
+    headers = headers or {}
+    duration = end_sec - start_sec
+    segments = _parse_m3u8(media_url, headers)
+    selected, first_offset = _select_segments(segments, start_sec, end_sec)
+    selected_duration = sum(s["duration"] for s in selected)
+    logger.info(
+        "HLS clip %.2f-%.2fs: %d segments, %.1fs media (offset %.2fs)",
+        start_sec, end_sec, len(selected), selected_duration, first_offset,
+    )
+    if selected_duration > duration * 2 + 120:
+        logger.warning(
+            "HLS clip selected %.1fs of media for %.1fs trim — check segment selection",
+            selected_duration, duration,
+        )
+
+    resolved_ffmpeg = ffmpeg_exe or _resolve_ffmpeg_exe()
+
+    with tempfile.TemporaryDirectory(prefix="hls_clip_") as tmpdir:
+        files = _download_segments(
+            selected, headers, tmpdir, progress_hook, cancel_event,
+        )
+        _concat_and_trim(
+            files, output_path, first_offset, duration, resolved_ffmpeg,
+            progress_hook,
+            cancel_event=cancel_event,
+            register_abort=register_abort,
+        )
 
 
 def _download_hls_clip(
@@ -518,25 +625,19 @@ def _download_hls_clip(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
-    duration = end_sec - start_sec
-
     info = _extract_hls_info(url, opts)
     fmt = _find_hls_format(info)
     media_url = fmt["url"]
     headers = fmt.get("http_headers") or info.get("http_headers") or {}
+    ffmpeg_exe = _resolve_ffmpeg_exe(opts.get("ffmpeg_location"))
 
-    segments = _parse_m3u8(media_url, headers)
-    selected, first_offset = _select_segments(segments, start_sec, end_sec)
-
-    ffmpeg_dir = opts.get("ffmpeg_location")
-    ffmpeg_exe = str(Path(ffmpeg_dir) / "ffmpeg.exe") if ffmpeg_dir else "ffmpeg"
-
-    with tempfile.TemporaryDirectory(prefix="hls_clip_") as tmpdir:
-        files = _download_segments(selected, headers, tmpdir, progress_hook, cancel_event)
-        _concat_and_trim(
-            files, output_path, first_offset, duration, ffmpeg_exe, progress_hook,
-            cancel_event=cancel_event, register_abort=register_abort,
-        )
+    download_hls_media_clip(
+        media_url, start_sec, end_sec, output_path, headers=headers,
+        ffmpeg_exe=ffmpeg_exe,
+        progress_hook=progress_hook,
+        cancel_event=cancel_event,
+        register_abort=register_abort,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -607,37 +708,24 @@ def download_video_sync(
     platform = detect_platform(full_url)
     is_hls = platform in ("Twitch", "Kick")
 
-    has_crop = (
-        crop_start is not None
-        and crop_end is not None
-        and crop_end > crop_start
-    )
-
-    if has_crop and is_hls:
+    if is_hls:
+        start_sec, end_sec = _require_crop_range(crop_start, crop_end)
         _download_hls_clip(
-            full_url, output_path, crop_start, crop_end, opts,
+            full_url, output_path, start_sec, end_sec, opts,
             progress_hook=progress_hook,
             cancel_event=cancel_event,
             register_abort=register_abort,
         )
-
-    elif has_crop:
-        start = _format_ts(crop_start)
-        end = _format_ts(crop_end)
-        opts["download_sections"] = [f"*{start}-{end}"]
-        _ydl_download(full_url, opts, cancel_event, register_abort)
-
-    elif crop_start is not None and crop_end is None:
-        start = _format_ts(crop_start)
-        opts["download_sections"] = [f"*{start}-+{DEFAULT_CLIP_SECONDS}"]
-        _ydl_download(full_url, opts, cancel_event, register_abort)
-
-    elif crop_end is not None and crop_start is None:
-        end = _format_ts(crop_end)
-        opts["download_sections"] = [f"*-{end}"]
-        _ydl_download(full_url, opts, cancel_event, register_abort)
-
     else:
+        crop = _normalize_crop_range(crop_start, crop_end)
+        if crop_start is not None or crop_end is not None:
+            if crop is None:
+                raise ValueError(
+                    "Both crop_start and crop_end are required for trimmed downloads"
+                )
+            start = _format_ts(crop[0])
+            end = _format_ts(crop[1])
+            opts["download_sections"] = [f"*{start}-{end}"]
         _ydl_download(full_url, opts, cancel_event, register_abort)
 
     if not os.path.isfile(output_path):

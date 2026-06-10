@@ -648,10 +648,23 @@ async def _fetch_queue_meta(url: str, platform: str) -> dict:
         }
     except Exception:
         return {}
+def _require_hls_crop(req: DownloadRequest, platform: str) -> None:
+    if platform not in ("Twitch", "Kick"):
+        return
+    if req.crop_start is None or req.crop_end is None:
+        raise HTTPException(
+            status_code=400,
+            detail="crop_start and crop_end are required for Twitch/Kick downloads",
+        )
+    if req.crop_end <= req.crop_start:
+        raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
+
+
 @app.post("/api/download/video")
 async def download_video(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = detect_platform(req.url)
+    _require_hls_crop(req, platform)
     meta = await _fetch_queue_meta(req.url, platform)
     output = _build_output_path(req, opts, meta)
     _safe_makedirs(Path(output).parent)
@@ -676,6 +689,7 @@ async def download_video(req: DownloadRequest):
 async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = detect_platform(req.url)
+    _require_hls_crop(req, platform)
     meta = await _fetch_queue_meta(req.url, platform)
     output = _build_output_path(req, opts, meta) if not req.output_file else req.output_file
     if not req.output_file and not meta.get("title"):

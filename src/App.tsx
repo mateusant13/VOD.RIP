@@ -1696,14 +1696,16 @@ export default function App() {
       setError('Choose a download folder to continue.');
       return;
     }
-    const cropStart = trimStartSec > 0 ? trimStartSec : undefined;
-    const cropEnd = trimEndSec > 0 ? trimEndSec : undefined;
+    if (trimEndSec <= trimStartSec) {
+      setError('Set a valid trim range before downloading.');
+      return;
+    }
     try {
       const result = await apiPost<{ download_id: string; status: string }>('/api/download/video', {
         url: url.trim(),
         quality: quality || undefined,
-        crop_start: cropStart,
-        crop_end: cropEnd,
+        crop_start: trimStartSec,
+        crop_end: trimEndSec,
       });
       setTab('queue');
       refreshDownloads();

@@ -42,7 +42,10 @@ def _hook_progress_percent(d: dict) -> Optional[int]:
         return None
 
     raw = max(0.0, min(100.0, raw))
-    return int(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
+    pct = round(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
+    if pct == 0 and raw > 0:
+        pct = 1
+    return min(DOWNLOAD_PROGRESS_CAP, pct)
 
 
 class DownloadManager:
