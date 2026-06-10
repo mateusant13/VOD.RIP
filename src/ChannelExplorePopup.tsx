@@ -4,6 +4,13 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
+import PreviewQualityMenu from './PreviewQualityMenu';
+import {
+  PREVIEW_EXPLORE_DEFAULT_HEIGHT,
+  applyHlsQualityLevel,
+  mapHlsLevels,
+  type PreviewLevelOption,
+} from './previewPlayerUtils';
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
@@ -24,7 +31,6 @@ import {
 const API_BASE = '';
 const BACKEND_HINT =
   'Backend not running. In a terminal run: npm run dev:all  (or npm run dev:api in one terminal and npm run dev in another). API must be on http://localhost:7897.';
-const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_DEFAULT_VOLUME = 0.3;
@@ -49,12 +55,6 @@ interface ChannelExplorePopupProps {
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
   onBringToFront: () => void;
-}
-
-interface PreviewLevelOption {
-  index: number;
-  height: number;
-  label: string;
 }
 
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
@@ -110,28 +110,6 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   return false;
 }
 
-function previewLevelLabel(height: number, bitrate?: number): string {
-  if (!height) return 'Auto';
-  const kbps = bitrate ? Math.round(bitrate / 1000) : 0;
-  return kbps > 0 ? `${height}p · ${kbps}k` : `${height}p`;
-}
-
-function levelIndexForHeight(levels: PreviewLevelOption[], target: number): number {
-  if (!levels.length) return 0;
-  const matches = levels.filter((l) => l.height === target);
-  if (matches.length) return matches[0].index;
-  const below = levels.filter((l) => l.height > 0 && l.height < target);
-  if (below.length) return below[below.length - 1].index;
-  const above = levels.filter((l) => l.height > target);
-  if (above.length) return above[0].index;
-  return levels[0].index;
-}
-
-function lowestLevelIndex(levels: PreviewLevelOption[]): number {
-  if (!levels.length) return 0;
-  return levels.reduce((best, l) => (l.height < best.height ? l : best)).index;
-}
-
 function platformCardShadow(platform: 'kick' | 'twitch' | null): string {
   if (platform === 'kick') return 'shadow-[4px_4px_0px_0px_#53fc18]';
   if (platform === 'twitch') return 'shadow-[4px_4px_0px_0px_#9146FF]';
@@ -158,6 +136,9 @@ export default function ChannelExplorePopup({
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
+  const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
+  const [qualityLevel, setQualityLevel] = useState(0);
+  const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
@@ -178,6 +159,7 @@ export default function ChannelExplorePopup({
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
   const videoWrapRef = useRef<HTMLDivElement>(null);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
+  const suppressPlayRef = useRef(false);
 
   const platform = vod.platform === 'Twitch' ? 'twitch' : 'kick';
 
@@ -191,11 +173,12 @@ export default function ChannelExplorePopup({
   }, [id, onRegisterPause, onUnregisterPause]);
 
   useEffect(() => {
-    onVolumeMenuOpen(id, volumeMenuOpen);
-  }, [id, volumeMenuOpen, onVolumeMenuOpen]);
+    onVolumeMenuOpen(id, volumeMenuOpen || qualityMenuOpen);
+  }, [id, volumeMenuOpen, qualityMenuOpen, onVolumeMenuOpen]);
 
   useEffect(() => {
     setVolumeMenuOpen(false);
+    setQualityMenuOpen(false);
   }, [volumeMenuCloseTick]);
 
   useEffect(() => {
@@ -205,6 +188,9 @@ export default function ChannelExplorePopup({
     setLoading(true);
     setReady(false);
     setError(null);
+    setPreviewLevels([]);
+    setQualityLevel(0);
+    setQualityMenuOpen(false);
 
     (async () => {
       try {
@@ -212,6 +198,7 @@ export default function ChannelExplorePopup({
           url: vod.url,
           crop_start: 0,
           crop_end: vod.durationSec,
+          prefer_height: PREVIEW_EXPLORE_DEFAULT_HEIGHT,
         });
         if (cancelled) {
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
@@ -249,6 +236,24 @@ export default function ChannelExplorePopup({
       }
     };
   }, [vod.url, vod.durationSec]);
+
+  const applyQuality = useCallback((levelIndex: number) => {
+    const hls = hlsRef.current;
+    const video = videoRef.current;
+    const wasPaused = video?.paused ?? true;
+    if (hls && levelIndex >= 0 && levelIndex < hls.levels.length) {
+      applyHlsQualityLevel(hls, levelIndex);
+      if (wasPaused && video) {
+        suppressPlayRef.current = true;
+        requestAnimationFrame(() => {
+          video.pause();
+          suppressPlayRef.current = false;
+        });
+      }
+    }
+    setQualityLevel(levelIndex);
+    setQualityMenuOpen(false);
+  }, []);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -470,17 +475,23 @@ export default function ChannelExplorePopup({
       hlsRef.current = hls;
       hls.loadSource(hlsUrl);
       hls.attachMedia(video);
+      let levelsInitialized = false;
+      const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
+        const { mapped, defaultIndex } = mapHlsLevels(levels, PREVIEW_EXPLORE_DEFAULT_HEIGHT);
+        if (!mapped.length) return;
+        setPreviewLevels(mapped);
+        if (!levelsInitialized || applyDefault) {
+          levelsInitialized = true;
+          hls.loadLevel = defaultIndex;
+          setQualityLevel(defaultIndex);
+        }
+      };
+
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-        const mapped: PreviewLevelOption[] = (data.levels ?? hls.levels).map((l, i) => ({
-          index: i,
-          height: l.height,
-          label: previewLevelLabel(l.height, l.bitrate),
-        }));
-        mapped.sort((a, b) => a.height - b.height);
-        const defaultIdx = mapped.length > 1
-          ? levelIndexForHeight(mapped, PREVIEW_DEFAULT_HEIGHT)
-          : lowestLevelIndex(mapped);
-        hls.loadLevel = defaultIdx;
+        syncPreviewLevels(data.levels ?? hls.levels, true);
+      });
+      hls.on(Hls.Events.LEVELS_UPDATED, () => {
+        syncPreviewLevels(hls.levels);
       });
       video.addEventListener('canplay', onCanPlay, { once: true });
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -560,6 +571,7 @@ export default function ChannelExplorePopup({
         type="button"
         onClick={(e) => {
           e.stopPropagation();
+          setQualityMenuOpen(false);
           setVolumeMenuOpen((o) => !o);
         }}
         disabled={!ready}
@@ -588,6 +600,22 @@ export default function ChannelExplorePopup({
         </div>
       )}
     </div>
+  );
+
+  const qualityUi = (fs: boolean) => (
+    <PreviewQualityMenu
+      levels={previewLevels}
+      currentLevel={qualityLevel}
+      menuOpen={qualityMenuOpen}
+      setMenuOpen={setQualityMenuOpen}
+      onSelect={applyQuality}
+      disabled={!ready}
+      buttonClassName={fs ? fsCtrlBtn : ctrlBtn(false)}
+      onMenuOpen={() => setVolumeMenuOpen(false)}
+      popoverClassName={fs
+        ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
+        : 'border-2 border-zinc-600 bg-zinc-950'}
+    />
   );
 
   return (
@@ -693,7 +721,13 @@ export default function ChannelExplorePopup({
               const video = videoRef.current;
               if (video) setCurrentTime(video.currentTime);
             }}
-            onPlay={() => setPlaying(true)}
+            onPlay={() => {
+              if (suppressPlayRef.current) {
+                videoRef.current?.pause();
+                return;
+              }
+              setPlaying(true);
+            }}
             onPause={() => setPlaying(false)}
           />
           {loading && (
@@ -720,6 +754,7 @@ export default function ChannelExplorePopup({
                     {playing ? <Pause size={18} /> : <Play size={18} />}
                   </button>
                   {volumeUi(true)}
+                  {qualityUi(true)}
                   <button
                     type="button"
                     onClick={() => onCarryToUrl(vod.url)}
@@ -763,6 +798,7 @@ export default function ChannelExplorePopup({
                   {playing ? <Pause size={18} /> : <Play size={18} />}
                 </button>
                 {volumeUi(false)}
+                {qualityUi(false)}
                 <button
                   type="button"
                   onClick={() => onCarryToUrl(vod.url)}

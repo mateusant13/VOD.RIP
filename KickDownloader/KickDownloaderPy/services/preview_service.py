@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 from services.ytdlp_service import (
@@ -67,6 +67,8 @@ class PreviewSession:
     allowed_hosts: Set[str] = field(default_factory=set)
     resource_map: Dict[str, str] = field(default_factory=dict)
     rewritten_playlists: Dict[str, Tuple[bytes, float]] = field(default_factory=dict)
+    custom_master: Optional[str] = None
+    variant_entries: List[Tuple[int, str]] = field(default_factory=list)
     cache_bytes: int = 0
     last_access: float = field(default_factory=time.time)
     cache_dir: Path = field(default_factory=Path)
@@ -154,7 +156,61 @@ def _http_get_bytes(
     return data, ctype, out_headers, resp.status_code
 
 
-def resolve_stream_info(url: str, oauth: Optional[str] = None) -> Tuple[str, dict, str]:
+def _deduped_hls_variants(info: dict) -> List[dict]:
+    formats = info.get("formats") or []
+    hls = [
+        f for f in formats
+        if f.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg") and f.get("url")
+    ]
+    hls.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    seen_heights: set[int] = set()
+    out: List[dict] = []
+    for fmt in hls:
+        height = int(fmt.get("height") or 0)
+        if height and height in seen_heights:
+            continue
+        if height:
+            seen_heights.add(height)
+        out.append(fmt)
+    return out
+
+
+def _url_looks_like_master(url: str) -> bool:
+    lower = url.lower()
+    return "master" in lower or "multivariant" in lower
+
+
+def _pick_variant_by_height(entries: List[Tuple[int, str]], prefer_height: int) -> Optional[str]:
+    if not entries:
+        return None
+    by_height = sorted(entries, key=lambda t: t[0])
+    for height, url in by_height:
+        if height == prefer_height:
+            return url
+    at_or_below = [entry for entry in by_height if entry[0] and entry[0] <= prefer_height]
+    if at_or_below:
+        return at_or_below[-1][1]
+    return by_height[0][1]
+
+
+def _build_synthetic_master_playlist(session: PreviewSession, variants: List[dict]) -> str:
+    lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    for fmt in variants:
+        height = int(fmt.get("height") or 0)
+        if not height:
+            continue
+        width = int(fmt.get("width") or 0)
+        if not width:
+            width = int(height * 16 / 9)
+        bandwidth = int((fmt.get("tbr") or 0) * 1000) or int((fmt.get("vbr") or 0) * 1000) or 1_000_000
+        upstream = fmt.get("url") or ""
+        session.allowed_hosts.update(_hosts_for_url(upstream))
+        lines.append(f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height}")
+        lines.append(_proxy_url(session, upstream))
+    return "\n".join(lines) + "\n"
+
+
+def resolve_stream_info(url: str, oauth: Optional[str] = None) -> Tuple[str, dict, str, List[dict]]:
     platform = detect_platform(url)
     headers: dict = {}
 
@@ -168,17 +224,34 @@ def resolve_stream_info(url: str, oauth: Optional[str] = None) -> Tuple[str, dic
             "referer": "https://kick.com/",
             "origin": "https://kick.com",
         }
-        return info.m3u8_url, headers, platform
+        return info.m3u8_url, headers, platform, []
 
     full_url = build_url(url, platform)
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)
+    variants = _deduped_hls_variants(hls_info)
+    with_height = [fmt for fmt in variants if int(fmt.get("height") or 0) > 0]
+
+    if len(with_height) >= 2:
+        for fmt in variants:
+            stream_url = fmt.get("url") or ""
+            if stream_url and _url_looks_like_master(stream_url):
+                headers = fmt.get("http_headers") or hls_info.get("http_headers") or {}
+                return stream_url, headers, platform, []
+
+        first = with_height[0]
+        stream_url = first.get("url") or ""
+        if not stream_url:
+            raise RuntimeError("Twitch VOD has no HLS stream URL")
+        headers = first.get("http_headers") or hls_info.get("http_headers") or {}
+        return stream_url, headers, platform, with_height
+
     fmt = _find_hls_format(hls_info)
     stream_url = fmt.get("url") or hls_info.get("url") or ""
     if not stream_url:
         raise RuntimeError("Twitch VOD has no HLS stream URL")
     headers = fmt.get("http_headers") or hls_info.get("http_headers") or {}
-    return stream_url, headers, platform
+    return stream_url, headers, platform, []
 
 
 def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int = 480) -> Optional[str]:
@@ -222,8 +295,13 @@ def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int 
     return urljoin(master_url, variants[0][2])
 
 
-def _resolve_preview_entry(session: PreviewSession, entry_url: str) -> str:
-    """Follow master playlist to a single media playlist (~480p for prewarm)."""
+def _resolve_preview_entry(session: PreviewSession, entry_url: str, prefer_height: int = 480) -> str:
+    """Follow master playlist to a single media playlist for prewarm."""
+    if session.variant_entries:
+        picked = _pick_variant_by_height(session.variant_entries, prefer_height)
+        if picked:
+            return picked
+
     data, _, _, _ = _http_get_bytes(session, entry_url)
     if not data or not data.lstrip().startswith(b"#EXTM3U"):
         raise RuntimeError("Upstream returned an empty or invalid HLS playlist")
@@ -232,7 +310,7 @@ def _resolve_preview_entry(session: PreviewSession, entry_url: str) -> str:
     if "#EXT-X-STREAM-INF" not in text:
         return entry_url
 
-    variant_url = _pick_preview_variant(text, entry_url)
+    variant_url = _pick_preview_variant(text, entry_url, prefer_height)
     if not variant_url:
         return entry_url
 
@@ -435,10 +513,11 @@ def create_session(
     crop_start: float = 0.0,
     crop_end: float = 0.0,
     oauth: Optional[str] = None,
+    prefer_height: int = 480,
 ) -> PreviewSession:
     del crop_end
     _cleanup_stale_sessions()
-    raw_entry, headers, platform = resolve_stream_info(url, oauth=oauth)
+    raw_entry, headers, platform, variant_formats = resolve_stream_info(url, oauth=oauth)
     session_id = secrets.token_hex(8)
     cache_dir = _PREVIEW_ROOT / session_id
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -453,7 +532,18 @@ def create_session(
         allowed_hosts=_hosts_for_url(raw_entry),
         cache_dir=cache_dir,
     )
-    session.entry_url = _resolve_preview_entry(session, raw_entry)
+
+    if variant_formats:
+        session.variant_entries = [
+            (int(fmt.get("height") or 0), fmt.get("url") or "")
+            for fmt in variant_formats
+            if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+        ]
+        session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
+        for _height, upstream in session.variant_entries:
+            session.allowed_hosts.update(_hosts_for_url(upstream))
+
+    session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
 
     with _lock:
@@ -506,6 +596,8 @@ def get_master_playlist(session_id: str) -> str:
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+    if session.custom_master:
+        return session.custom_master
     body, _, _, _ = proxy_playlist(session_id, session.master_url)
     return body.decode("utf-8")
 

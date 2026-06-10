@@ -80,6 +80,7 @@ class PreviewSessionCreateRequest(BaseModel):
     url: str
     crop_start: float = 0.0
     crop_end: float = 0.0
+    prefer_height: int = 480
 
 
 class PreviewSessionResponse(BaseModel):

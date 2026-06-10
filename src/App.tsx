@@ -5,11 +5,18 @@ import {
   Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus,
-  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, Settings, ArrowRightToLine,
+  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
 import twitchIcon from '@/assets/platforms/twitch.png';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
+import PreviewQualityMenu from './PreviewQualityMenu';
+import {
+  PREVIEW_MAIN_DEFAULT_HEIGHT,
+  applyHlsQualityLevel,
+  mapHlsLevels,
+  type PreviewLevelOption,
+} from './previewPlayerUtils';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -215,7 +222,6 @@ function formatHmsFull(sec: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
-const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_DEFAULT_VOLUME = 0.3;
@@ -692,45 +698,27 @@ function startPanelWidthResize(
   handle.addEventListener('pointercancel', onUp);
 }
 
-interface PreviewLevelOption {
-  index: number;
-  height: number;
-  label: string;
+function sourceQualityOptionLabel(resolutionLabel: string): string {
+  return `source/${resolutionLabel.toLowerCase()}`;
 }
 
-function previewLevelLabel(height: number, bitrate?: number): string {
-  if (!height) return 'Auto';
-  const kbps = bitrate ? Math.round(bitrate / 1000) : 0;
-  return kbps > 0 ? `${height}p · ${kbps}k` : `${height}p`;
-}
-
-function levelIndexForHeight(levels: PreviewLevelOption[], target: number, preferHighest = false): number {
-  if (!levels.length) return 0;
-  if (preferHighest) {
-    const atOrAbove = levels.filter((l) => l.height >= target);
-    if (atOrAbove.length) {
-      return atOrAbove.reduce((best, l) => (l.height > best.height ? l : best)).index;
+function maxStreamQualityLabel(
+  qualities: string[],
+  previewLevels: PreviewLevelOption[],
+): string {
+  if (previewLevels.length) {
+    const maxH = Math.max(...previewLevels.map((l) => l.height));
+    if (maxH > 0) {
+      const match = qualities.find((q) => {
+        const m = q.match(/(\d+)/);
+        return m && parseInt(m[1], 10) === maxH;
+      });
+      if (match) return match.toLowerCase();
+      return `${maxH}p`;
     }
   }
-  const matches = levels.filter((l) => l.height === target);
-  if (matches.length) {
-    const pick = preferHighest ? matches[matches.length - 1] : matches[0];
-    return pick.index;
-  }
-  const below = levels.filter((l) => l.height > 0 && l.height < target);
-  if (below.length && !preferHighest) {
-    return below[below.length - 1].index;
-  }
-  const above = levels.filter((l) => l.height > target);
-  if (above.length) {
-    return above[0].index;
-  }
-  return levels[0].index;
-}
-
-function lowestLevelIndex(levels: PreviewLevelOption[]): number {
-  if (!levels.length) return 0;
-  return levels.reduce((best, l) => (l.height < best.height ? l : best)).index;
+  if (qualities.length) return qualities[0].toLowerCase();
+  return '1080p';
 }
 
 const CHANNEL_INITIAL_VISIBLE = 5;
@@ -1096,6 +1084,7 @@ export default function App() {
         url: url.trim(),
         crop_start: trimStartSec,
         crop_end: trimEndSec,
+        prefer_height: PREVIEW_MAIN_DEFAULT_HEIGHT,
       });
       setPreviewSessionId(res.session_id);
       setPreviewHlsUrl(res.master_url);
@@ -1160,19 +1149,23 @@ export default function App() {
       previewHlsRef.current = hls;
       hls.loadSource(previewHlsUrl);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-        const mapped: PreviewLevelOption[] = (data.levels ?? hls.levels).map((l, i) => ({
-          index: i,
-          height: l.height,
-          label: previewLevelLabel(l.height, l.bitrate),
-        }));
-        mapped.sort((a, b) => a.height - b.height);
+      let levelsInitialized = false;
+      const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
+        const { mapped, defaultIndex } = mapHlsLevels(levels, PREVIEW_MAIN_DEFAULT_HEIGHT);
+        if (!mapped.length) return;
         setPreviewLevels(mapped);
-        const defaultIdx = mapped.length > 1
-          ? levelIndexForHeight(mapped, PREVIEW_DEFAULT_HEIGHT)
-          : lowestLevelIndex(mapped);
-        hls.loadLevel = defaultIdx;
-        setPreviewQualityLevel(defaultIdx);
+        if (!levelsInitialized || applyDefault) {
+          levelsInitialized = true;
+          hls.loadLevel = defaultIndex;
+          setPreviewQualityLevel(defaultIndex);
+        }
+      };
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        syncPreviewLevels(data.levels ?? hls.levels, true);
+      });
+      hls.on(Hls.Events.LEVELS_UPDATED, () => {
+        syncPreviewLevels(hls.levels);
       });
       video.addEventListener('canplay', onCanPlay, { once: true });
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -1250,11 +1243,7 @@ export default function App() {
     const video = previewVideoRef.current;
     const wasPaused = video?.paused ?? true;
     if (hls && levelIndex >= 0 && levelIndex < hls.levels.length) {
-      if (forceLoad) {
-        hls.loadLevel = levelIndex;
-      } else {
-        hls.nextLevel = levelIndex;
-      }
+      applyHlsQualityLevel(hls, levelIndex, forceLoad);
       if (wasPaused && video) {
         previewSuppressPlayRef.current = true;
         requestAnimationFrame(() => {
@@ -1979,6 +1968,11 @@ export default function App() {
   const mbPerMin = rates[quality] || 70;
   const estSize = (clipSec / 60) * mbPerMin;
 
+  const sourceQualityLabel = useMemo(
+    () => sourceQualityOptionLabel(maxStreamQualityLabel(videoInfo?.qualities ?? [], previewLevels)),
+    [videoInfo?.qualities, previewLevels],
+  );
+
   const activePlatform = detectVideoPlatform(videoInfo, url);
   const channelsSplitActive = channelVodPanelOpen && !previewOpen;
   const showUrlInSidebar = channelsSplitActive;
@@ -2034,7 +2028,7 @@ export default function App() {
           <button
             onClick={handleGetInfo}
             disabled={!url || loading}
-            className={`w-full bg-zinc-800 text-white font-black uppercase py-3 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 border-2 border-zinc-700 ${extractBtnHoverClass}`}
+            className={`w-full bg-zinc-800 text-white font-black uppercase py-3 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 disabled:cursor-default border-2 border-zinc-700 ${extractBtnHoverClass}`}
           >
             {loading ? (
               <><Loader2 size={16} className="animate-spin" /> Loading...</>
@@ -2095,7 +2089,7 @@ export default function App() {
                   videoInfo.qualities.map((q) => <option key={q} value={q.toLowerCase()}>{q}</option>)
                 ) : (
                   <>
-                    <option value="source">Source</option>
+                    <option value="source">{sourceQualityLabel}</option>
                     <option value="1080p">1080p</option>
                     <option value="720p">720p</option>
                     <option value="480p">480p</option>
@@ -2258,39 +2252,19 @@ export default function App() {
           popoverFs: previewFullscreen,
           onMenuOpen: () => setPreviewQualityMenuOpen(false),
         })}
-        {previewLevels.length > 1 && (
-          <div className="relative" data-player-menu>
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setPreviewVolumeMenuOpen(false);
-                setPreviewQualityMenuOpen((o) => !o);
-              }}
-              disabled={!previewVideoReady}
-              className={previewCtrlBtn(previewFullscreen)}
-              title="Video quality"
-            >
-              <Settings size={15} />
-            </button>
-            {previewQualityMenuOpen && (
-              <div className="absolute bottom-full left-0 mb-1 z-30 min-w-[7rem] border-2 border-zinc-600 bg-zinc-950 shadow-lg py-1">
-                {previewLevels.map((l) => (
-                  <button
-                    key={l.index}
-                    type="button"
-                    onClick={() => applyPreviewQuality(l.index)}
-                    className={`block w-full text-left px-2 py-1 text-[10px] font-mono hover:bg-zinc-800 ${
-                      l.index === previewQualityLevel ? 'text-white' : 'text-zinc-400'
-                    }`}
-                  >
-                    {l.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        <PreviewQualityMenu
+          levels={previewLevels}
+          currentLevel={previewQualityLevel}
+          menuOpen={previewQualityMenuOpen}
+          setMenuOpen={setPreviewQualityMenuOpen}
+          onSelect={applyPreviewQuality}
+          disabled={!previewVideoReady}
+          buttonClassName={previewCtrlBtn(previewFullscreen)}
+          onMenuOpen={() => setPreviewVolumeMenuOpen(false)}
+          popoverClassName={previewFullscreen
+            ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
+            : 'border-2 border-zinc-600 bg-zinc-950'}
+        />
       </div>
       {!opts.fsCornerExit && (
         <button type="button" onClick={() => void togglePreviewFullscreen()}

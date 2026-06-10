@@ -297,6 +297,7 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 req.crop_start,
                 req.crop_end,
                 oauth=opts.oauth or None,
+                prefer_height=req.prefer_height,
             ),
         )
         master = f"/api/preview/hls/{session.session_id}/master.m3u8"
