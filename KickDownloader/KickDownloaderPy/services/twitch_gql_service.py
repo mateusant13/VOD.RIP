@@ -89,7 +89,7 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
                 "platform": "Twitch",
                 "title": node.get("title") or "Untitled",
                 "duration": node.get("lengthSeconds"),
-                "created_at": node.get("createdAt"),
+                "created_at": node.get("createdAt") or None,
                 "views": node.get("viewCount"),
                 "thumbnail_url": node.get("previewThumbnailURL"),
                 "url": f"https://www.twitch.tv/videos/{vid}",

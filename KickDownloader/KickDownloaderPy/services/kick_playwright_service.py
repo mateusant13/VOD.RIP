@@ -890,7 +890,7 @@ class KickPlaywrightService:
                 if cancel_event and cancel_event.is_set():
                     return
                 elapsed = time.monotonic() - started
-                pct = min(95, int(10 + (elapsed / est_sec) * 85))
+                pct = min(100, max(0, int((elapsed / est_sec) * 100)))
                 try:
                     progress_hook({"status": "downloading", "percent": pct})
                 except Exception:
@@ -900,11 +900,6 @@ class KickPlaywrightService:
         tick_task = asyncio.create_task(_tick_progress())
         stderr = b""
         try:
-            if progress_hook:
-                try:
-                    progress_hook({"status": "downloading", "percent": 5})
-                except Exception:
-                    pass
             while proc.returncode is None:
                 if cancel_event and cancel_event.is_set():
                     proc.kill()
@@ -922,6 +917,11 @@ class KickPlaywrightService:
             except asyncio.CancelledError:
                 pass
         if cancel_event and cancel_event.is_set():
+            if out.is_file():
+                try:
+                    out.unlink()
+                except OSError:
+                    pass
             raise CancelledError("Download cancelled by user")
         if proc.returncode != 0:
             raise RuntimeError(

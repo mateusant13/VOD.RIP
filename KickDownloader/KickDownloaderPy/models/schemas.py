@@ -53,7 +53,7 @@ class DownloadState(BaseModel):
 class AppSettings(BaseModel):
     download_folder: str = ""
     download_threads: int = 4
-    max_cache_mb: int = 200
+    max_cache_mb: int = 256
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""

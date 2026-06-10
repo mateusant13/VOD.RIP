@@ -5,29 +5,44 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from models.schemas import DownloadState
 from services import ytdlp_service
+from services.download_cleanup import delete_partial_output
+
+if TYPE_CHECKING:
+    from services.settings import SettingsManager
+
+# Reserve the last 10% for merge/finish so progress never sits at 100% early.
+DOWNLOAD_PROGRESS_CAP = 90
 
 
-def _delete_partial_output(output_file: str, output_existed: bool) -> None:
-    """Remove in-progress download artifacts (safe if file already existed)."""
-    if output_existed:
-        return
-    base, ext = os.path.splitext(output_file)
-    candidates = [
-        output_file,
-        output_file + ".part",
-        output_file + ".ytdl",
-        base + ".f" + ext.lstrip(".") + ".part",
-        base + ".temp" + ext,
-    ]
-    for candidate in candidates:
+def _hook_progress_percent(d: dict) -> Optional[int]:
+    """Normalize yt-dlp / ffmpeg / HLS hooks to 0–90% (reserve 10% for merge/done)."""
+    if d.get("status") != "downloading":
+        return None
+
+    raw: Optional[float] = None
+    if d.get("percent") is not None:
+        raw = float(d["percent"])
+    elif d.get("_percent") is not None:
+        raw = float(d["_percent"])
+    elif d.get("_percent_str"):
         try:
-            if os.path.isfile(candidate):
-                os.remove(candidate)
-        except OSError:
-            pass
+            raw = float(str(d["_percent_str"]).replace("%", "").strip())
+        except ValueError:
+            raw = None
+    if raw is None:
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        downloaded = d.get("downloaded_bytes", 0)
+        if total and total > 0:
+            raw = downloaded / float(total) * 100.0
+
+    if raw is None:
+        return None
+
+    raw = max(0.0, min(100.0, raw))
+    return int(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
 
 
 class DownloadManager:
@@ -50,6 +65,7 @@ class DownloadManager:
         crop_end: Optional[float] = None,
         download_type: str = "video",
         download_func: Optional[Callable[..., str]] = None,
+        settings_mgr: Optional["SettingsManager"] = None,
         # Pre-fetched metadata (so the queue UI can show the VOD info
         # immediately without a second round-trip).
         title: Optional[str] = None,
@@ -101,24 +117,21 @@ class DownloadManager:
                 raise ytdlp_service.CancelledError("Download cancelled by user")
 
             if d.get("status") == "downloading":
-                if "percent" in d:
-                    pct = max(0, min(100, int(d["percent"])))
-                else:
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    downloaded = d.get("downloaded_bytes", 0)
-                    pct = int(downloaded / total * 100) if total > 0 else 0
-                with self._lock:
-                    state.progress = pct
-                    state.status = f"Downloading {pct}%"
-                self._notify_sse(download_id, "progress", pct)
+                pct = _hook_progress_percent(d)
+                if pct is not None:
+                    with self._lock:
+                        state.progress = pct
+                        state.status = f"Downloading {pct}%"
+                    self._notify_sse(download_id, "progress", pct)
             elif d.get("status") == "finished":
                 with self._lock:
                     state.status = "Merging..."
-                    state.progress = 99
+                    state.progress = 95
+                self._notify_sse(download_id, "progress", 95)
                 self._notify_sse(download_id, "status", "Merging...")
 
         def _cleanup_output():
-            _delete_partial_output(output_file, output_existed)
+            delete_partial_output(output_file, output_existed)
 
         def _download_worker():
             try:
@@ -155,6 +168,7 @@ class DownloadManager:
                         crop_start=crop_start,
                         crop_end=crop_end,
                         progress_hook=_progress_hook,
+                        settings_mgr=settings_mgr,
                         cancel_event=cancel_event,
                         register_abort=_register_abort,
                     )
@@ -212,7 +226,9 @@ class DownloadManager:
             except Exception:
                 pass
         if cleanup:
-            _delete_partial_output(cleanup["output_file"], cleanup["output_existed"])
+            delete_partial_output(cleanup["output_file"], cleanup["output_existed"])
+        with self._lock:
+            self._downloads.pop(download_id, None)
         self._notify_sse(download_id, "status", "Cancelled")
         return True
 
@@ -255,9 +271,14 @@ class DownloadManager:
 
     def set_max_workers(self, max_workers: int) -> None:
         """Update the thread pool size. Existing tasks continue; new tasks use the new pool."""
+        max_workers = max(1, min(16, int(max_workers)))
         if max_workers != self._executor._max_workers:
             self._executor.shutdown(wait=False)
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    def apply_settings(self, settings_mgr: "SettingsManager") -> None:
+        """Resize the download pool from saved settings."""
+        self.set_max_workers(settings_mgr.get().download_threads)
 
     def _notify_sse(self, download_id: str, event_type: str, data):
         with self._lock:

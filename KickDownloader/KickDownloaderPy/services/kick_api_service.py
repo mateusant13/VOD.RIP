@@ -8,6 +8,7 @@ Endpoints used:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from services.kick_playwright_service import KickChannel, KickVideo, _extract_slug, _extract_vod_id
@@ -51,6 +52,22 @@ def _ms_to_seconds(value: Any) -> Optional[float]:
         return None
 
 
+def _normalize_created_at(value: Any) -> Optional[str]:
+    """Normalize Kick timestamps to ISO UTC for the frontend."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        return s.replace(" ", "T") + "Z"
+    if s.endswith("Z") or "+" in s[10:] or s.endswith("UTC"):
+        return s
+    if "T" in s:
+        return f"{s}Z"
+    return s
+
+
 def _video_from_v2_list_item(item: dict, slug: str) -> Optional[KickVideo]:
     video = item.get("video") if isinstance(item.get("video"), dict) else {}
     video_id = video.get("uuid") or ""
@@ -63,7 +80,9 @@ def _video_from_v2_list_item(item: dict, slug: str) -> Optional[KickVideo]:
         duration=duration,
         thumbnail=_thumb_url(item.get("thumbnail")),
         views=item.get("views") if isinstance(item.get("views"), (int, float)) else None,
-        created_at=item.get("created_at") or item.get("start_time"),
+        created_at=_normalize_created_at(
+            item.get("created_at") or item.get("start_time") or video.get("created_at")
+        ),
         channel=slug,
         url=f"https://kick.com/{slug}/videos/{video_id}",
         m3u8_url=item.get("source") if isinstance(item.get("source"), str) else None,
@@ -84,7 +103,9 @@ def _video_from_v1(data: dict, slug_hint: Optional[str]) -> KickVideo:
         duration=duration,
         thumbnail=_thumb_url(ls.get("thumbnail")),
         views=data.get("views") if isinstance(data.get("views"), (int, float)) else None,
-        created_at=data.get("created_at") or ls.get("created_at") or ls.get("start_time"),
+        created_at=_normalize_created_at(
+            data.get("created_at") or ls.get("created_at") or ls.get("start_time")
+        ),
         channel=slug,
         url=f"https://kick.com/{slug}/videos/{video_id}" if slug and video_id else None,
         category=category,

@@ -174,15 +174,27 @@ function fmtShort(sec: number): string {
 // string (Kick) or YYYYMMDD (Twitch) — normalize to YYYY-MM-DD and drop
 // anything we can't parse. Returns empty string when no date is present
 // so the row can hide the date cell.
+function normalizeVideoDateInput(value: string): string {
+  const raw = value.trim();
+  // Kick API: "YYYY-MM-DD HH:MM:SS"
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+    return `${raw.replace(' ', 'T')}Z`;
+  }
+  // ISO without timezone
+  if (/^\d{4}-\d{2}-\d{2}T/.test(raw) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw)) {
+    return `${raw}Z`;
+  }
+  return raw;
+}
+
 function fmtDate(value: string | null | undefined): string {
   if (!value) return '';
   const raw = String(value).trim();
   if (!raw) return '';
-  // Twitch: YYYYMMDD
+  // Twitch yt-dlp: YYYYMMDD
   if (/^\d{8}$/.test(raw)) {
     return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
   }
-  // ISO-ish: just take the first 10 chars if they look like a date.
   const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
   return m ? m[1] : '';
 }
@@ -819,11 +831,28 @@ function basename(path: string): string {
 function parseVideoTs(value: string | null | undefined): number {
   if (!value) return 0;
   const raw = String(value).trim();
+  if (!raw) return 0;
   if (/^\d{8}$/.test(raw)) {
     return new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T00:00:00Z`).getTime() || 0;
   }
-  const t = Date.parse(raw);
+  const t = Date.parse(normalizeVideoDateInput(raw));
   return Number.isNaN(t) ? 0 : t;
+}
+
+function fmtViews(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+  return String(n);
+}
+
+function channelVodSubline(v: ChannelVideo): string {
+  const parts: string[] = [];
+  const when = fmtDateAndAgo(v.created_at);
+  if (when) parts.push(when);
+  if (v.views != null && Number(v.views) > 0) {
+    parts.push(`${fmtViews(Number(v.views))} views`);
+  }
+  return parts.join(' · ');
 }
 
 function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }: { platform: string; className?: string }) {
@@ -919,13 +948,9 @@ export default function App() {
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
 
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-
   // Queue
   const [activeDownloads, setActiveDownloads] = useState<DownloadState[]>([]);
   const [historyDownloads, setHistoryDownloads] = useState<DownloadState[]>([]);
-  const [lastCompleted, setLastCompleted] = useState<DownloadState | null>(null);
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
@@ -1680,8 +1705,6 @@ export default function App() {
         crop_start: cropStart,
         crop_end: cropEnd,
       });
-      setDownloading(result.download_id);
-      setDownloadProgress(0);
       setTab('queue');
       refreshDownloads();
     } catch (err: any) {
@@ -1696,39 +1719,32 @@ export default function App() {
       const data = await apiGet<DownloadsResponse>('/api/downloads');
       setActiveDownloads(data.active || []);
       setHistoryDownloads(data.history || []);
-      const live = data.active?.find((d) => d.download_id === downloading);
-      if (live) setDownloadProgress(live.progress);
-      if (downloading) {
-        const done = data.history?.find(
-          (d) => d.download_id === downloading && d.status === 'Completed',
-        );
-        if (done) setLastCompleted(done);
-      }
     } catch {}
-  }, [downloading]);
+  }, []);
 
   // ── Cancel download ──
 
   const handleCancel = useCallback(async (id: string) => {
-    setActiveDownloads((prev) => prev.filter((d) => d.download_id !== id));
-    if (downloading === id) {
-      setDownloading(null);
-      setDownloadProgress(0);
-    }
     try {
       await apiPost(`/api/download/${id}/cancel`, {});
     } catch (err: any) {
       setError(err.message || 'Failed to cancel download');
     }
     refreshDownloads();
-  }, [downloading, refreshDownloads]);
+  }, [refreshDownloads]);
 
-  // Poll downloads while on queue tab
+  // Poll while any download is active (any tab)
+  useEffect(() => {
+    if (activeDownloads.length === 0) return;
+    refreshDownloads();
+    const id = setInterval(refreshDownloads, 1000);
+    return () => clearInterval(id);
+  }, [activeDownloads.length, refreshDownloads]);
+
+  // Refresh queue when opening the tab
   useEffect(() => {
     if (tab !== 'queue') return;
     refreshDownloads();
-    const id = setInterval(refreshDownloads, 2000);
-    return () => clearInterval(id);
   }, [tab, refreshDownloads]);
 
   // ── Channel browsing (localStorage) ──
@@ -1921,35 +1937,6 @@ export default function App() {
     }
   }, [settings]);
 
-  // ── SSE progress tracking ──
-  useEffect(() => {
-    if (!downloading) return;
-    const es = new EventSource(`/api/download/${downloading}/stream`);
-    es.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'progress') setDownloadProgress(Number(data.data) || 0);
-        if (data.type === 'complete') {
-          setDownloadProgress(100);
-          es.close();
-          setDownloading(null);
-          refreshDownloads();
-        }
-        if (data.type === 'error') {
-          es.close();
-          setDownloading(null);
-          refreshDownloads();
-        }
-      } catch {}
-    };
-    es.onerror = () => {
-      es.close();
-      setDownloading(null);
-      refreshDownloads();
-    };
-    return () => { es.close(); };
-  }, [downloading, refreshDownloads]);
-
   // ── Fill VOD from channel ──
   const selectVod = useCallback((vodUrl: string) => {
     setUrl(vodUrl);
@@ -2137,8 +2124,7 @@ export default function App() {
 
           <button
             onClick={handleStartDownload}
-            disabled={!!downloading}
-            className={`w-full mt-auto shrink-0 disabled:opacity-50 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase tracking-widest transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
+            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase tracking-widest transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
                 : urlPlatform === 'twitch'
@@ -2147,7 +2133,7 @@ export default function App() {
             }`}
           >
             <Download size={16} strokeWidth={3} />
-            <span>Rip VOD</span>
+            <span>VOD rip it!</span>
           </button>
         </div>
       )}
@@ -2631,6 +2617,7 @@ export default function App() {
                   <div className="flex flex-col gap-1">
                     {visibleChannelVideos.map((v, i) => {
                       const fullUrl = buildVodUrl(v);
+                      const subline = channelVodSubline(v);
                       return (
                         <div
                           key={`${v.platform}-${v.id}-${i}`}
@@ -2661,9 +2648,9 @@ export default function App() {
                                 {v.duration ? <span className="text-zinc-500 ml-1">{fmtShort(v.duration)}</span> : null}
                               </span>
                             </span>
-                            {v.created_at && (
+                            {subline && (
                               <span className="text-[9px] text-zinc-400 block truncate">
-                                {fmtDateAndAgo(v.created_at)}
+                                {subline}
                               </span>
                             )}
                           </div>
@@ -2718,35 +2705,8 @@ export default function App() {
               </button>
             </div>
 
-            {downloading && (
-              <div className="border-2 border-[#53fc18]/50 bg-zinc-900 p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-mono text-zinc-300 truncate pr-2">
-                    {activeDownloads.find((d) => d.download_id === downloading)?.title || 'Downloading...'}
-                  </span>
-                  <span className="text-xs font-mono text-[#53fc18] shrink-0">{downloadProgress}%</span>
-                </div>
-                <div className="w-full h-2 bg-zinc-800 border border-zinc-700">
-                  <div className="h-full bg-gradient-to-r from-[#53fc18] to-[#9146FF] transition-all duration-300"
-                    style={{ width: `${Math.max(downloadProgress, 2)}%` }} />
-                </div>
-              </div>
-            )}
-
-            {lastCompleted?.output_file && (
-              <div className="border-2 border-[#53fc18]/40 bg-zinc-900/60 p-2 flex flex-col gap-2">
-                <span className="text-xs font-mono text-[#53fc18] truncate">
-                  ✓ {lastCompleted.title || basename(lastCompleted.output_file)}
-                </span>
-                <button type="button" onClick={() => openFolder(lastCompleted.output_file)}
-                  className="text-[10px] font-mono uppercase font-bold text-white hover:text-[#53fc18] flex items-center gap-1 w-fit">
-                  <FolderOpen size={12} /> View in folder
-                </button>
-              </div>
-            )}
-
-            <div className="flex flex-col gap-2 max-h-[160px] overflow-y-auto pr-1 custom-scrollbar">
-              {activeDownloads.length === 0 && !downloading ? (
+            <div className="flex flex-col gap-2 max-h-[280px] overflow-y-auto pr-1 custom-scrollbar">
+              {activeDownloads.length === 0 ? (
                 <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
                   NO ACTIVE DOWNLOADS.
                 </div>
@@ -2762,11 +2722,13 @@ export default function App() {
                           {dl.title || dl.url}
                         </span>
                       </div>
-                      <span className="text-[10px] font-mono text-zinc-400 shrink-0">{dl.status}</span>
+                      <span className="text-[10px] font-mono shrink-0" style={{ color }}>
+                        {dl.progress > 0 ? `${dl.progress}%` : dl.status}
+                      </span>
                     </div>
-                    <div className="w-full h-1.5 bg-zinc-800">
-                      <div className="h-full bg-gradient-to-r from-[#53fc18] to-[#9146FF] transition-all"
-                        style={{ width: `${Math.max(dl.progress, 2)}%` }} />
+                    <div className="w-full h-2 bg-zinc-800 border border-zinc-700">
+                      <div className="h-full bg-gradient-to-r from-[#53fc18] to-[#9146FF] transition-all duration-300"
+                        style={{ width: `${Math.max(dl.progress, dl.status === 'Starting...' ? 2 : 0)}%` }} />
                     </div>
                     <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
                       <span className="truncate">{basename(dl.output_file)}</span>

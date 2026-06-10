@@ -73,9 +73,6 @@ def _format_platform_error(exc: BaseException) -> str:
             "Restart the backend; if using dev mode, ensure Kick runs in a worker thread."
         )
     return name
-app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
-settings_mgr = SettingsManager()
-download_mgr = DownloadManager(max_workers=4)
 # Characters that Windows rejects in file paths. Anything we use as part
 # of an output path or cache dir must be stripped of these or we get
 # `[Errno 22] Invalid argument` on filesystem syscalls.
@@ -118,6 +115,7 @@ def _safe_makedirs(path: Path) -> Path:
 app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
+download_mgr.apply_settings(settings_mgr)
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"
@@ -163,6 +161,7 @@ async def update_settings(update: SettingsUpdate):
     if update.quality is not None:
         current.quality = update.quality
     settings_mgr.save(current)
+    download_mgr.apply_settings(settings_mgr)
     return current
 
 
@@ -414,6 +413,9 @@ def _parse_video_date(value) -> Optional[datetime]:
             return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
         except ValueError:
             return None
+    # Kick API: 2024-05-21 12:34:56
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        s = s.replace(" ", "T") + "+00:00"
     # ISO-ish: 2024-05-21T12:34:56Z or with offset
     try:
         if s.endswith("Z"):
@@ -662,6 +664,7 @@ async def download_video(req: DownloadRequest):
         crop_start=req.crop_start,
         crop_end=req.crop_end,
         download_func=download_func,
+        settings_mgr=settings_mgr,
         title=meta.get("title"),
         channel=meta.get("channel"),
         thumbnail=meta.get("thumbnail"),
@@ -687,6 +690,7 @@ async def download_clip(req: DownloadRequest):
         crop_start=req.crop_start,
         crop_end=req.crop_end,
         download_func=download_func,
+        settings_mgr=settings_mgr,
         title=meta.get("title"),
         channel=meta.get("channel"),
         thumbnail=meta.get("thumbnail"),

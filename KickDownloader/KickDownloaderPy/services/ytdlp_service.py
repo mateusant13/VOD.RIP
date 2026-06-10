@@ -463,11 +463,7 @@ def _download_segments(
             pct = int((i + 1) / total * 100)
             progress_hook({
                 "status": "downloading",
-                "total_bytes": total,
-                "downloaded_bytes": i + 1,
-                "_percent": pct,
-                "_speed_str": "",
-                "_eta_str": "",
+                "percent": pct,
             })
     return files
 
