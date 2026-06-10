@@ -1128,18 +1128,75 @@ function isClipUrl(u: string): boolean {
   return false;
 }
 
-function channelVideoDurationSec(v: ChannelVideo): number | null {
-  if (v.duration != null && v.duration > 0) return Math.floor(v.duration);
-  if (v.duration_string) {
-    const parts = v.duration_string.split(':').map(Number);
-    if (parts.length === 3 && parts.every((n) => !Number.isNaN(n))) {
-      return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    }
-    if (parts.length === 2 && parts.every((n) => !Number.isNaN(n))) {
-      return parts[0] * 60 + parts[1];
-    }
+function parseHmsDurationString(s: string): number | null {
+  const parts = s.split(':').map(Number);
+  if (parts.length === 3 && parts.every((n) => !Number.isNaN(n))) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  if (parts.length === 2 && parts.every((n) => !Number.isNaN(n))) {
+    return parts[0] * 60 + parts[1];
   }
   return null;
+}
+
+function channelVideoDurationSec(v: ChannelVideo): number | null {
+  if (v.duration != null && v.duration > 0) return Math.floor(v.duration);
+  if (v.duration_string) return parseHmsDurationString(v.duration_string);
+  return null;
+}
+
+/** Full VOD length for trim sliders — never derived from the current trim end. */
+function videoInfoDurationSec(info: VideoInfo | null | undefined): number {
+  if (!info) return 3600;
+  if (info.duration != null && info.duration > 0) return Math.floor(info.duration);
+  const parsed = info.duration_string ? parseHmsDurationString(info.duration_string) : null;
+  return parsed != null && parsed > 0 ? parsed : 3600;
+}
+
+type TrimRangeOpts = {
+  seek?: 'in' | 'out';
+  move?: 'in' | 'out';
+  fixedEnd?: number;
+  fixedStart?: number;
+};
+
+function clampTrimEndpoints(
+  rawStart: number,
+  rawEnd: number,
+  dur: number,
+  currentStart: number,
+  currentEnd: number,
+  opts?: TrimRangeOpts,
+): { start: number; end: number } {
+  let start: number;
+  let end: number;
+
+  if (opts?.move === 'in') {
+    const pinnedEnd = Math.min(dur, Math.max(1, Math.floor(opts.fixedEnd ?? currentEnd)));
+    end = pinnedEnd;
+    start = Math.max(0, Math.min(Math.floor(rawStart), pinnedEnd - 1));
+  } else if (opts?.move === 'out') {
+    const pinnedStart = Math.max(0, Math.min(
+      Math.floor(opts.fixedStart ?? currentStart),
+      dur - 1,
+    ));
+    start = pinnedStart;
+    end = Math.min(dur, Math.max(Math.floor(rawEnd), pinnedStart + 1));
+  } else {
+    start = Math.floor(rawStart);
+    end = Math.floor(rawEnd);
+    if (start >= end) {
+      if (opts?.seek === 'in') {
+        end = Math.min(dur, start + 1);
+      } else {
+        start = Math.max(0, end - 1);
+      }
+    }
+    start = Math.max(0, Math.min(start, dur - 1));
+    end = Math.min(dur, Math.max(end, start + 1));
+  }
+
+  return { start, end };
 }
 
 function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
@@ -1452,8 +1509,17 @@ export default function App() {
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
   const [downloadFilename, setDownloadFilename] = useState('');
+  const trimStartSecRef = useRef(0);
+  const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
-  const trimNeedleDragActiveRef = useRef(false);
+  /** True while dragging URL trim sliders or preview in/out needles. */
+  const trimDragActiveRef = useRef(false);
+  /** Opposite trim endpoint pinned for the duration of a URL slider drag. */
+  const urlTrimDragPinRef = useRef<{
+    which: 'in' | 'out';
+    fixedStart: number;
+    fixedEnd: number;
+  } | null>(null);
   const urlTrimPointerRef = useRef({ x: 0, y: 0 });
 
   // Channel explore players (up to 5 floating popups)
@@ -1568,8 +1634,8 @@ export default function App() {
   const [settingsSaved, setSettingsSaved] = useState(false);
 
   const vodDurationSec = useMemo(
-    () => Math.max(1, Math.floor(videoInfo?.duration || trimEndSec || 1)),
-    [videoInfo?.duration, trimEndSec],
+    () => Math.max(1, videoInfoDurationSec(videoInfo)),
+    [videoInfo],
   );
 
   const destroyPreviewPlayer = useCallback(() => {
@@ -1860,14 +1926,6 @@ export default function App() {
     };
   }, [previewOpen, previewPlayback, url, videoInfo?.qualities]);
 
-  useEffect(() => {
-    if (!previewOpen) return;
-    previewTrimStartRef.current = trimStartSec;
-    previewTrimEndRef.current = trimEndSec;
-    setPreviewTrimStart(trimStartSec);
-    setPreviewTrimEnd(trimEndSec);
-  }, [previewOpen, trimStartSec, trimEndSec]);
-
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video) return;
@@ -1972,35 +2030,41 @@ export default function App() {
     seekPreviewVideo(t);
   }, [seekPreviewVideo]);
 
-  const applyTrimRange = useCallback((
+  const commitUrlTrimRange = useCallback((
     rawStart: number,
     rawEnd: number,
-    opts?: { seek?: 'in' | 'out'; pinStart?: boolean; pinEnd?: boolean },
+    opts?: TrimRangeOpts,
   ) => {
     const dur = Math.max(1, vodDurationSec);
-    let start = Math.floor(rawStart);
-    let end = Math.floor(rawEnd);
-
-    if (opts?.pinEnd) {
-      end = Math.min(dur, Math.max(1, end));
-      start = Math.max(0, Math.min(start, end - 1));
-    } else if (opts?.pinStart) {
-      start = Math.max(0, Math.min(start, dur - 1));
-      end = Math.min(dur, Math.max(end, start + 1));
-    } else {
-      if (start >= end) {
-        if (opts?.seek === 'in') {
-          end = Math.min(dur, start + 1);
-        } else {
-          start = Math.max(0, end - 1);
-        }
-      }
-      start = Math.max(0, Math.min(start, dur - 1));
-      end = Math.min(dur, Math.max(end, start + 1));
-    }
-
+    const { start, end } = clampTrimEndpoints(
+      rawStart,
+      rawEnd,
+      dur,
+      trimStartSecRef.current,
+      trimEndSecRef.current,
+      opts,
+    );
+    trimStartSecRef.current = start;
+    trimEndSecRef.current = end;
     setTrimStartSec(start);
     setTrimEndSec(end);
+    return { start, end };
+  }, [vodDurationSec]);
+
+  const commitPreviewTrimRange = useCallback((
+    rawStart: number,
+    rawEnd: number,
+    opts?: TrimRangeOpts,
+  ) => {
+    const dur = Math.max(1, vodDurationSec);
+    const { start, end } = clampTrimEndpoints(
+      rawStart,
+      rawEnd,
+      dur,
+      previewTrimStartRef.current,
+      previewTrimEndRef.current,
+      opts,
+    );
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
@@ -2039,17 +2103,21 @@ export default function App() {
     if (!rail || vodDurationSec <= 0) return;
 
     const handle = e.currentTarget;
-    handle.setPointerCapture(e.pointerId);
-    trimNeedleDragActiveRef.current = true;
+    const pointerId = e.pointerId;
+    handle.setPointerCapture(pointerId);
+    trimDragActiveRef.current = true;
     if (previewFsHideTimerRef.current) {
       window.clearTimeout(previewFsHideTimerRef.current);
     }
     setPreviewFsControlsVisible(true);
 
-    const fixedStart = trimStartSec;
-    const fixedEnd = trimEndSec;
+    const fixedStart = previewTrimStartRef.current;
+    const fixedEnd = previewTrimEndRef.current;
     const dragOrigin = which === 'in' ? fixedStart : fixedEnd;
     trimDragOriginRef.current = dragOrigin;
+
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
 
     const xToSec = (clientX: number) => {
       const rect = rail.getBoundingClientRect();
@@ -2058,11 +2126,26 @@ export default function App() {
       return Math.round(frac * vodDurationSec);
     };
 
+    let ended = false;
+    const endDrag = () => {
+      if (ended) return;
+      ended = true;
+      trimDragActiveRef.current = false;
+      setNeedleGlance(null);
+      document.body.style.userSelect = prevUserSelect;
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+      handle.removeEventListener('lostpointercapture', onLostCapture);
+      try { handle.releasePointerCapture(pointerId); } catch { /* ignore */ }
+    };
+
     const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       const sec = xToSec(ev.clientX);
       const applied = which === 'in'
-        ? applyTrimRange(sec, fixedEnd, { seek: 'in', pinEnd: true })
-        : applyTrimRange(fixedStart, sec, { seek: 'out', pinStart: true });
+        ? commitPreviewTrimRange(sec, fixedEnd, { move: 'in', fixedEnd, seek: 'in' })
+        : commitPreviewTrimRange(fixedStart, sec, { move: 'out', fixedStart, seek: 'out' });
       const activeSec = which === 'in' ? applied.start : applied.end;
       updateNeedleGlance(
         which,
@@ -2075,29 +2158,46 @@ export default function App() {
     };
 
     const onUp = (ev: PointerEvent) => {
-      trimNeedleDragActiveRef.current = false;
-      setNeedleGlance(null);
-      try { handle.releasePointerCapture(ev.pointerId); } catch { /* ignore */ }
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      if (ev.pointerId !== pointerId) return;
+      endDrag();
     };
 
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
+    const onLostCapture = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      endDrag();
+    };
+
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+    handle.addEventListener('lostpointercapture', onLostCapture);
     onMove(e.nativeEvent);
-  }, [trimStartSec, trimEndSec, vodDurationSec, applyTrimRange, updateNeedleGlance]);
+  }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance]);
+
+  const finishUrlTrimDrag = useCallback(() => {
+    urlTrimDragPinRef.current = null;
+    trimDragActiveRef.current = false;
+    setNeedleGlance(null);
+  }, []);
 
   const handleUrlTrimSlider = useCallback((
     which: 'in' | 'out',
     value: number,
     pointer?: { x: number; y: number },
   ) => {
+    const pin = urlTrimDragPinRef.current;
+    if (pin && pin.which !== which) return;
+
     const dragOrigin = trimDragOriginRef.current;
     const applied = which === 'in'
-      ? applyTrimRange(value, trimEndSec, { seek: 'in', pinEnd: true })
-      : applyTrimRange(trimStartSec, value, { seek: 'out', pinStart: true });
+      ? commitUrlTrimRange(value, pin?.fixedEnd ?? trimEndSecRef.current, {
+        move: 'in',
+        fixedEnd: pin?.fixedEnd ?? trimEndSecRef.current,
+      })
+      : commitUrlTrimRange(pin?.fixedStart ?? trimStartSecRef.current, value, {
+        move: 'out',
+        fixedStart: pin?.fixedStart ?? trimStartSecRef.current,
+      });
     if (pointer) {
       const activeSec = which === 'in' ? applied.start : applied.end;
       setNeedleGlance({
@@ -2110,7 +2210,7 @@ export default function App() {
         deltaSec: activeSec - dragOrigin,
       });
     }
-  }, [trimStartSec, trimEndSec, vodDurationSec, applyTrimRange]);
+  }, [commitUrlTrimRange]);
 
   const setPreviewVolumeLevel = useCallback((level: number) => {
     const video = previewVideoRef.current;
@@ -2133,9 +2233,9 @@ export default function App() {
     if (previewFsHideTimerRef.current) {
       window.clearTimeout(previewFsHideTimerRef.current);
     }
-    if (previewFullscreen && !trimNeedleDragActiveRef.current) {
+    if (previewFullscreen && !trimDragActiveRef.current) {
       previewFsHideTimerRef.current = window.setTimeout(() => {
-        if (!trimNeedleDragActiveRef.current) {
+        if (!trimDragActiveRef.current) {
           setPreviewFsControlsVisible(false);
         }
       }, PREVIEW_FS_CONTROLS_HIDE_MS);
@@ -2440,9 +2540,15 @@ export default function App() {
       setUrl(trimmed);
       setVideoInfo(info);
       setQuality(bestAvailableQuality(info));
-      const dur = info.duration ? Math.floor(info.duration) : 3600;
+      const end = Math.max(1, videoInfoDurationSec(info));
+      trimStartSecRef.current = 0;
+      trimEndSecRef.current = end;
+      previewTrimStartRef.current = 0;
+      previewTrimEndRef.current = end;
       setTrimStartSec(0);
-      setTrimEndSec(Math.max(1, dur));
+      setTrimEndSec(end);
+      setPreviewTrimStart(0);
+      setPreviewTrimEnd(end);
       // Keep the current preview playing until the user hits Preview on the new VOD.
       if (!previewOpen) {
         void resetPreview();
@@ -3144,10 +3250,16 @@ export default function App() {
                 className="text-zinc-500"
               />
             </div>
-            <input type="range" min={0} max={vodDurationSec} step={1} value={Math.min(trimStartSec, trimEndSec - 1)}
+            <input type="range" min={0} max={Math.max(0, trimEndSec - 1)} step={1} value={trimStartSec}
               onPointerDown={(e) => {
-                trimNeedleDragActiveRef.current = true;
-                trimDragOriginRef.current = trimStartSec;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                trimDragActiveRef.current = true;
+                urlTrimDragPinRef.current = {
+                  which: 'in',
+                  fixedStart: trimStartSecRef.current,
+                  fixedEnd: trimEndSecRef.current,
+                };
+                trimDragOriginRef.current = trimStartSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
                 setPreviewFsControlsVisible(true);
@@ -3162,19 +3274,25 @@ export default function App() {
                   urlTrimPointerRef.current,
                 );
               }}
-              onPointerUp={() => {
-                trimNeedleDragActiveRef.current = false;
-                setNeedleGlance(null);
+              onPointerUp={(e) => {
+                try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+                finishUrlTrimDrag();
               }}
-              onPointerCancel={() => {
-                trimNeedleDragActiveRef.current = false;
-                setNeedleGlance(null);
+              onPointerCancel={(e) => {
+                try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+                finishUrlTrimDrag();
               }}
               className="url-trim-range w-full accent-zinc-400" />
-            <input type="range" min={0} max={vodDurationSec} step={1} value={Math.max(trimEndSec, trimStartSec + 1)}
+            <input type="range" min={Math.min(vodDurationSec, trimStartSec + 1)} max={vodDurationSec} step={1} value={trimEndSec}
               onPointerDown={(e) => {
-                trimNeedleDragActiveRef.current = true;
-                trimDragOriginRef.current = trimEndSec;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                trimDragActiveRef.current = true;
+                urlTrimDragPinRef.current = {
+                  which: 'out',
+                  fixedStart: trimStartSecRef.current,
+                  fixedEnd: trimEndSecRef.current,
+                };
+                trimDragOriginRef.current = trimEndSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
                 setPreviewFsControlsVisible(true);
@@ -3189,13 +3307,13 @@ export default function App() {
                   urlTrimPointerRef.current,
                 );
               }}
-              onPointerUp={() => {
-                trimNeedleDragActiveRef.current = false;
-                setNeedleGlance(null);
+              onPointerUp={(e) => {
+                try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+                finishUrlTrimDrag();
               }}
-              onPointerCancel={() => {
-                trimNeedleDragActiveRef.current = false;
-                setNeedleGlance(null);
+              onPointerCancel={(e) => {
+                try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+                finishUrlTrimDrag();
               }}
               className="url-trim-range w-full accent-zinc-400" />
             <button type="button" onClick={openPreview}
@@ -3287,8 +3405,8 @@ export default function App() {
 
   const previewClipPct = vodDurationSec > 0
     ? {
-        start: (trimStartSec / vodDurationSec) * 100,
-        end: (trimEndSec / vodDurationSec) * 100,
+        start: (previewTrimStart / vodDurationSec) * 100,
+        end: (previewTrimEnd / vodDurationSec) * 100,
         play: (previewCurrentTime / vodDurationSec) * 100,
       }
     : { start: 0, end: 100, play: 0 };
@@ -3307,7 +3425,7 @@ export default function App() {
             className={`preview-needle-rail relative flex-1 h-3 ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
-            title="Drag needles to set download range"
+            title="Drag needles to set preview clip range"
           >
             <div
               className="preview-needle-region absolute top-1/2 -translate-y-1/2 h-1 pointer-events-none"
@@ -3325,7 +3443,7 @@ export default function App() {
               aria-label="Clip in"
               aria-valuemin={0}
               aria-valuemax={vodDurationSec}
-              aria-valuenow={trimStartSec}
+              aria-valuenow={previewTrimStart}
               className="preview-needle preview-needle-in absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
               style={{ left: `${previewClipPct.start}%` }}
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'in')}
@@ -3335,7 +3453,7 @@ export default function App() {
               aria-label="Clip out"
               aria-valuemin={0}
               aria-valuemax={vodDurationSec}
-              aria-valuenow={trimEndSec}
+              aria-valuenow={previewTrimEnd}
               className="preview-needle preview-needle-out absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
               style={{ left: `${previewClipPct.end}%` }}
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
@@ -3344,7 +3462,7 @@ export default function App() {
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
           }`}>
-            {formatHmsFull(trimEndSec - trimStartSec)}
+            {formatHmsFull(previewTrimEnd - previewTrimStart)}
           </span>
         </div>
       )}
@@ -3489,10 +3607,10 @@ export default function App() {
               onKeyDown={handlePreviewContainerKeyDown}
               onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
               onMouseLeave={previewFullscreen ? () => {
-                if (trimNeedleDragActiveRef.current) return;
+                if (trimDragActiveRef.current) return;
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
                 previewFsHideTimerRef.current = window.setTimeout(() => {
-                  if (!trimNeedleDragActiveRef.current) {
+                  if (!trimDragActiveRef.current) {
                     setPreviewFsControlsVisible(false);
                   }
                 }, PREVIEW_FS_CONTROLS_HIDE_MS);
