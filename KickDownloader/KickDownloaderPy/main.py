@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import unquote
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -123,6 +123,9 @@ download_mgr.apply_settings(settings_mgr)
 # Metadata fetches use their own pool so hung yt-dlp/playwright downloads
 # cannot starve /api/info/* and /api/channel/videos.
 INFO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="info")
+# Native OS actions (Explorer, folder picker) — keep off the default pool so
+# downloads/metadata work cannot queue "show in folder" behind long tasks.
+OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"
@@ -326,11 +329,17 @@ def _open_folder_sync(path: str) -> None:
         target = str(p.resolve())
         if os.name == "nt":
             if p.is_file():
-                subprocess.Popen(["explorer", "/select,", target])
+                # /select,<path> must be one argument — separate args often fail or hang.
+                subprocess.Popen(
+                    ["explorer", f"/select,{target}"],
+                    close_fds=True,
+                )
             else:
                 os.startfile(target)
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", target if p.is_dir() else str(p.parent)])
+            subprocess.Popen(
+                ["open", "-R", target] if p.is_file() else ["open", target]
+            )
         else:
             subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)])
         return
@@ -347,9 +356,25 @@ def _open_folder_sync(path: str) -> None:
         subprocess.Popen(["xdg-open", folder])
 
 
+def _validate_open_folder_path(path: str) -> str:
+    """Return normalized path if the file or its parent folder exists."""
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("path is required")
+    p = Path(raw).expanduser()
+    if p.exists():
+        return str(p.resolve())
+    parent = p.parent.resolve()
+    if parent.is_dir():
+        return str(p.resolve())
+    raise FileNotFoundError(f"Folder does not exist: {parent}")
+
+
 @app.post("/api/pick-folder")
 async def pick_folder():
-    path, err = await asyncio.get_event_loop().run_in_executor(None, _pick_folder_sync)
+    path, err = await asyncio.get_running_loop().run_in_executor(
+        OS_EXECUTOR, _pick_folder_sync
+    )
     if path:
         current = settings_mgr.get()
         current.download_folder = path
@@ -450,16 +475,17 @@ async def preview_delete_session(session_id: str):
 
 
 @app.post("/api/open-folder")
-async def open_folder(req: OpenFolderRequest):
+async def open_folder(req: OpenFolderRequest, background_tasks: BackgroundTasks):
+    """Open Explorer/Finder on a download path. Returns immediately (non-blocking)."""
     try:
-        await asyncio.get_event_loop().run_in_executor(
-            None, _open_folder_sync, req.path
-        )
-        return {"ok": True}
+        normalized = _validate_open_folder_path(req.path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    background_tasks.add_task(_open_folder_sync, normalized)
+    return {"ok": True}
 
 # --- Channel Videos ---
 # How many days back the channel browser looks by default. The UI keeps the
@@ -567,20 +593,44 @@ async def channel_videos(
     limit: int = CHANNEL_LIMIT_MAX,
     days: int = CHANNEL_DAYS_DEFAULT,
     platforms: str = "Kick,Twitch",
+    content: str = "vods",
+    kick_slug: Optional[str] = None,
+    twitch_login: Optional[str] = None,
 ):
-    """Fetch archive VODs for a channel. Use ``/api/channel/clips`` for clips."""
+    """Fetch archive VODs for a channel. Pass ``content=clips`` for clips (legacy alias)."""
     raw = unquote(url).strip()
     try:
-        channel = _resolve_channel_slug(raw)
+        default_slug = _resolve_channel_slug(raw) if raw else ""
+        kick_ch = (kick_slug or default_slug).strip().lower()
+        twitch_ch = (twitch_login or default_slug).strip().lower()
+        channel = kick_ch or twitch_ch
         wanted = _parse_wanted_platforms(platforms)
         if not wanted:
+            is_clips = (content or "").strip().lower() == "clips"
             return {
-                "videos": [],
+                "videos": [] if not is_clips else None,
+                "clips": [] if is_clips else None,
                 "channel": channel,
                 "platforms": [],
-                "content": "vods",
+                "content": "clips" if is_clips else "vods",
                 "days": days,
                 "per_platform_errors": {},
+            }
+        if (content or "").strip().lower() == "clips":
+            clip_limit = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+            all_clips, per_platform_errors = await _gather_channel_clips(
+                wanted=wanted,
+                kick_slug=kick_ch,
+                twitch_login=twitch_ch,
+                limit=clip_limit,
+            )
+            return {
+                "clips": all_clips,
+                "videos": all_clips,
+                "channel": channel,
+                "platforms": wanted,
+                "content": "clips",
+                "per_platform_errors": per_platform_errors,
             }
         limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
         days = max(0, min(int(days), 365))
@@ -674,98 +724,129 @@ async def channel_videos(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+async def _gather_channel_clips(
+    *,
+    wanted: List[str],
+    kick_slug: str,
+    twitch_login: str,
+    limit: int,
+) -> tuple[List[dict], Dict[str, str]]:
+    """Fetch clips per platform using platform-specific logins."""
+    per_platform_errors: Dict[str, str] = {}
+    all_clips: List[dict] = []
+    loop = asyncio.get_running_loop()
+    kick_slug = (kick_slug or "").strip().lower()
+    twitch_login = (twitch_login or "").strip().lower()
+
+    async def _fetch_twitch() -> None:
+        if not twitch_login:
+            per_platform_errors["Twitch"] = "Twitch login is required"
+            return
+        try:
+            vids = await loop.run_in_executor(
+                INFO_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
+            )
+        except Exception as e:
+            per_platform_errors["Twitch"] = _format_platform_error(e)
+            return
+        for v in vids:
+            all_clips.append({
+                "id": v["id"],
+                "platform": "Twitch",
+                "title": v.get("title") or "Untitled",
+                "duration": v.get("duration"),
+                "duration_string": v.get("duration_string"),
+                "created_at": v.get("created_at"),
+                "views": v.get("views"),
+                "thumbnail_url": v.get("thumbnail_url"),
+                "url": v.get("url") or f"https://clips.twitch.tv/{v['id']}",
+                "channel": twitch_login,
+                "content_kind": "clip",
+            })
+
+    async def _fetch_kick() -> None:
+        if not kick_slug:
+            per_platform_errors["Kick"] = "Kick slug is required"
+            return
+        try:
+            vids = await loop.run_in_executor(
+                INFO_EXECUTOR,
+                kick_list_channel_clips_sync,
+                f"https://kick.com/{kick_slug}/clips",
+                limit,
+            )
+        except Exception as e:
+            per_platform_errors["Kick"] = _format_platform_error(e)
+            return
+        for v in vids:
+            all_clips.append({
+                "id": v["id"],
+                "platform": "Kick",
+                "title": v.get("title") or "Untitled",
+                "duration": v.get("duration"),
+                "duration_string": v.get("duration_string"),
+                "created_at": v.get("created_at"),
+                "views": v.get("views"),
+                "thumbnail_url": v.get("thumbnail"),
+                "url": v.get("url") or f"https://kick.com/{kick_slug}/clips/{v['id']}",
+                "channel": kick_slug,
+                "content_kind": "clip",
+            })
+
+    tasks: List[asyncio.Task] = []
+    if "Kick" in wanted:
+        tasks.append(asyncio.create_task(_fetch_kick()))
+    if "Twitch" in wanted:
+        tasks.append(asyncio.create_task(_fetch_twitch()))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_clips = _filter_clip_entries(all_clips)
+    all_clips.sort(key=lambda v: -(v.get("views") or 0))
+    for k, v in list(per_platform_errors.items()):
+        per_platform_errors[k] = _normalize_err(v)
+    return all_clips, per_platform_errors
+
+
 @app.get("/api/channel/clips")
 async def channel_clips(
-    url: str,
+    url: str = "",
     platforms: str = "Kick,Twitch",
     limit: int = CHANNEL_CLIP_LIMIT,
+    kick_slug: Optional[str] = None,
+    twitch_login: Optional[str] = None,
 ):
     """Fetch recent clips for a channel (Kick ``/clips`` API, Twitch ``clips?range=7d``).
 
+    Pass ``kick_slug`` / ``twitch_login`` when Kick and Twitch logins differ.
     Returns the last *limit* clips per platform (max 10), sorted by views desc.
-    Only entries <=60s with clip URLs are included.
-    """
-    raw = unquote(url).strip()
+  """
     try:
-        channel = _resolve_channel_slug(raw)
+        default_slug = _resolve_channel_slug(unquote(url).strip()) if (url or "").strip() else ""
+        kick_ch = (kick_slug or default_slug).strip().lower()
+        twitch_ch = (twitch_login or default_slug).strip().lower()
+        if not kick_ch and not twitch_ch:
+            raise ValueError("Provide url, kick_slug, or twitch_login")
+
         wanted = _parse_wanted_platforms(platforms)
         if not wanted:
             return {
                 "clips": [],
-                "channel": channel,
+                "channel": kick_ch or twitch_ch,
                 "platforms": [],
                 "content": "clips",
                 "per_platform_errors": {},
             }
         limit = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
-        per_platform_errors: Dict[str, str] = {}
-        all_clips: List[dict] = []
-        loop = asyncio.get_running_loop()
-
-        async def _fetch_twitch() -> None:
-            try:
-                vids = await loop.run_in_executor(
-                    INFO_EXECUTOR, twitch_list_channel_clips_sync, channel, limit
-                )
-            except Exception as e:
-                per_platform_errors["Twitch"] = _format_platform_error(e)
-                return
-            for v in vids:
-                all_clips.append({
-                    "id": v["id"],
-                    "platform": "Twitch",
-                    "title": v.get("title") or "Untitled",
-                    "duration": v.get("duration"),
-                    "duration_string": v.get("duration_string"),
-                    "created_at": v.get("created_at"),
-                    "views": v.get("views"),
-                    "thumbnail_url": v.get("thumbnail_url"),
-                    "url": v.get("url") or f"https://clips.twitch.tv/{v['id']}",
-                    "channel": channel,
-                    "content_kind": "clip",
-                })
-
-        async def _fetch_kick() -> None:
-            try:
-                vids = await loop.run_in_executor(
-                    INFO_EXECUTOR,
-                    kick_list_channel_clips_sync,
-                    f"https://kick.com/{channel}/clips",
-                    limit,
-                )
-            except Exception as e:
-                per_platform_errors["Kick"] = _format_platform_error(e)
-                return
-            for v in vids:
-                all_clips.append({
-                    "id": v["id"],
-                    "platform": "Kick",
-                    "title": v.get("title") or "Untitled",
-                    "duration": v.get("duration"),
-                    "duration_string": v.get("duration_string"),
-                    "created_at": v.get("created_at"),
-                    "views": v.get("views"),
-                    "thumbnail_url": v.get("thumbnail"),
-                    "url": v.get("url") or f"https://kick.com/{channel}/clips/{v['id']}",
-                    "channel": channel,
-                    "content_kind": "clip",
-                })
-
-        tasks: List[asyncio.Task] = []
-        if "Kick" in wanted:
-            tasks.append(asyncio.create_task(_fetch_kick()))
-        if "Twitch" in wanted:
-            tasks.append(asyncio.create_task(_fetch_twitch()))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_clips = _filter_clip_entries(all_clips)
-        all_clips.sort(key=lambda v: -(v.get("views") or 0))
-        for k, v in list(per_platform_errors.items()):
-            per_platform_errors[k] = _normalize_err(v)
+        all_clips, per_platform_errors = await _gather_channel_clips(
+            wanted=wanted,
+            kick_slug=kick_ch,
+            twitch_login=twitch_ch,
+            limit=limit,
+        )
         return {
             "clips": all_clips,
-            "channel": channel,
+            "channel": kick_ch or twitch_ch,
             "platforms": wanted,
             "content": "clips",
             "per_platform_errors": per_platform_errors,
@@ -932,14 +1013,25 @@ async def cancel_download(download_id: str):
     return {"cancelled": success}
 
 
-@app.delete("/api/download/{download_id}")
-async def delete_download_history(download_id: str):
+def _remove_download_history(download_id: str) -> dict:
     if not download_mgr.remove_history(download_id):
         raise HTTPException(
             status_code=404,
             detail="Download not found or still active",
         )
     return {"removed": True}
+
+
+@app.post("/api/download/{download_id}/remove")
+async def remove_download_history(download_id: str):
+    """Remove a finished download from history (POST — same pattern as cancel)."""
+    return _remove_download_history(download_id)
+
+
+@app.delete("/api/download/{download_id}")
+async def delete_download_history(download_id: str):
+    """Remove a finished download from history."""
+    return _remove_download_history(download_id)
 
 
 @app.get("/api/download/{download_id}/stream")

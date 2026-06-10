@@ -215,7 +215,7 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
     )
     user = data.get("user")
     if not user:
-        return []
+        raise ValueError(f"Twitch channel not found: {login}")
 
     parsed: List[Dict[str, Any]] = []
     for edge in (user.get("clips") or {}).get("edges") or []:

@@ -91,6 +91,20 @@ input[type="range"].url-trim-range::-moz-range-thumb {
   border: none;
 }
 
+/* Rip button — Syne + tracking-widest makes "!" look stretched; mono + narrow scale fixes it */
+.rip-btn-bang {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0;
+  display: inline-block;
+  transform: scaleX(0.7);
+  transform-origin: left bottom;
+  margin-left: 1px;
+  line-height: 1;
+  position: relative;
+  top: -0.5px;
+}
+
 .preview-needle-rail {
   border-radius: 2px;
 }

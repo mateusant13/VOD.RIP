@@ -271,6 +271,12 @@ class ApiClient:
     def cancel_download(self, download_id: str) -> dict:
         return self.post(f"/api/download/{download_id}/cancel", {})
 
+    def remove_download(self, download_id: str) -> dict:
+        return self.post(f"/api/download/{download_id}/remove", {})
+
+    def open_folder(self, path: str) -> dict:
+        return self.post("/api/open-folder", {"path": path})
+
     def watch_sse(self, download_id: str, timeout: float = 600) -> List[dict]:
         """Consume SSE until complete/error (mirrors URL tab EventSource)."""
         state = self.get_download(download_id)

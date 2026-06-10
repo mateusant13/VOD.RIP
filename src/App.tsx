@@ -108,9 +108,19 @@ const API_TIMEOUT_MS = 45_000;
 const BACKEND_HINT =
   'Backend not running. In a terminal run: npm run dev:all  (or npm run dev:api in one terminal and npm run dev in another). API must be on http://localhost:7897.';
 
-function apiErrorMessage(res: Response, fallback: string): string {
+function apiErrorMessage(res: Response, fallback: string, path?: string): string {
   if (res.status === 500 || res.status === 502 || res.status === 503) {
     return BACKEND_HINT;
+  }
+  if (res.status === 404) {
+    const p = path ?? '';
+    const fb = String(fallback).toLowerCase();
+    if (p.includes('/api/channel/clips') || fb === 'not found') {
+      return 'Clips API not on server — restart backend (npm run dev:api)';
+    }
+  }
+  if (res.status === 405) {
+    return 'API method not supported — restart backend (npm run dev:api)';
   }
   return fallback;
 }
@@ -136,7 +146,7 @@ async function apiGet<T>(path: string): Promise<T> {
   const res = await apiFetch(path);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
+    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`, path));
   }
   return res.json();
 }
@@ -1253,6 +1263,47 @@ function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null }): Cha
   };
 }
 
+/** Twitch clip/VOD thumbs often use `{width}` / `%{width}` placeholders. */
+function resolveChannelThumbnail(
+  url: string | null | undefined,
+  width = 160,
+  height = 90,
+): string | null {
+  if (!url?.trim()) return null;
+  const w = String(width);
+  const h = String(height);
+  return url
+    .replace(/%\{width\}/g, w)
+    .replace(/%\{height\}/g, h)
+    .replace(/\{width\}/g, w)
+    .replace(/\{height\}/g, h);
+}
+
+function ChannelClipThumb({ video }: { video: ChannelVideo }) {
+  const [failed, setFailed] = useState(false);
+  const src = resolveChannelThumbnail(video.thumbnail_url);
+  if (!src || failed) {
+    return (
+      <div
+        className="shrink-0 w-16 h-9 border border-zinc-800 bg-zinc-900 flex items-center justify-center"
+        aria-hidden
+      >
+        <Play size={11} className="text-zinc-600" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      className="shrink-0 w-16 h-9 object-cover border border-zinc-800 bg-zinc-900"
+    />
+  );
+}
+
 /** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
 function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
@@ -2256,13 +2307,12 @@ export default function App() {
     return Boolean(picked);
   }, [settings?.download_folder, pickDownloadFolder]);
 
-  const openFolder = useCallback(async (filePath: string) => {
+  const openFolder = useCallback((filePath: string) => {
     if (!filePath) return;
-    try {
-      await apiPost('/api/open-folder', { path: filePath });
-    } catch (err: any) {
-      setError(err.message || 'Could not open folder');
-    }
+    void apiPost('/api/open-folder', { path: filePath }).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : 'Could not open folder';
+      setError(msg);
+    });
   }, []);
 
   // ── Start download ──
@@ -2352,11 +2402,12 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleDeleteHistory = useCallback(async (id: string) => {
+    setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
-      await apiDelete(`/api/download/${id}`);
-      setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
-    } catch (err: any) {
-      setError(err.message || 'Failed to remove from history');
+      await apiPost(`/api/download/${id}/remove`, {});
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to remove from history';
+      setError(msg);
       refreshDownloads();
     }
   }, [refreshDownloads]);
@@ -2426,14 +2477,30 @@ export default function App() {
     try {
       if (mode === 'clips') {
         const fetchClips = async (platform: 'Kick' | 'Twitch', slug: string) => {
-          const qs = `url=${encodeURIComponent(slug)}&platforms=${encodeURIComponent(platform)}&limit=10`;
+          if (!slug?.trim()) {
+            errs[platform] = `${platform} slug is not set`;
+            return;
+          }
+          const slugParam = platform === 'Kick'
+            ? `kick_slug=${encodeURIComponent(slug)}`
+            : `twitch_login=${encodeURIComponent(slug)}`;
+          const qs = `platforms=${encodeURIComponent(platform)}&limit=10&${slugParam}`;
           try {
-            const data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${qs}`);
+            let data: ChannelClipsResponse;
+            try {
+              data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${qs}`);
+            } catch (clipErr: any) {
+              const msg = clipErr?.message ?? '';
+              if (!msg.includes('Clips API not on server')) throw clipErr;
+              const fallbackQs = `url=${encodeURIComponent(slug)}&platforms=${encodeURIComponent(platform)}&limit=10&content=clips`;
+              data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${fallbackQs}`);
+            }
             if (data.content && data.content !== 'clips') {
               errs[platform] = 'Clips API unavailable — restart API (npm run dev:api)';
               return;
             }
-            incoming.push(...(data.clips ?? []).map(mapApiChannelItem));
+            const clips = data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? [];
+            incoming.push(...clips.map(mapApiChannelItem));
             const pe = data.per_platform_errors?.[platform];
             if (pe) errs[platform] = pe;
           } catch (err: any) {
@@ -2888,7 +2955,7 @@ export default function App() {
 
           <button
             onClick={promptStartDownload}
-            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase tracking-widest transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
+            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
                 : urlPlatform === 'twitch'
@@ -2897,7 +2964,10 @@ export default function App() {
             }`}
           >
             <Download size={16} strokeWidth={3} />
-            <span>{currentIsClip ? 'Clip rip it!' : 'VOD rip it!'}</span>
+            <span className="inline-flex items-baseline">
+              <span className="tracking-widest">{currentIsClip ? 'Clip rip it' : 'VOD rip it'}</span>
+              <span className="rip-btn-bang" aria-hidden="true">!</span>
+            </span>
           </button>
         </div>
       )}
@@ -3507,8 +3577,9 @@ export default function App() {
                               selectVod(fullUrl);
                             }
                           }}
-                          className="flex items-center gap-1 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
+                          className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                         >
+                          {isClipItem && <ChannelClipThumb video={v} />}
                           <span
                             className={`shrink-0 w-4 text-center text-[9px] font-mono font-bold tabular-nums ${
                               v.platform === 'Kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'

@@ -41,8 +41,18 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
         headers=_headers(referer),
         timeout=timeout,
     )
+    if resp.status_code == 404:
+        raise ValueError(f"Kick channel not found: {referer}")
     resp.raise_for_status()
     return resp.json()
+
+
+def verify_channel_exists(slug: str) -> None:
+    """Raise ValueError when the Kick channel slug does not exist."""
+    slug = (slug or "").strip()
+    if not slug:
+        raise ValueError("Kick channel slug is required")
+    _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}/clips")
 
 
 def _thumb_url(value: Any) -> Optional[str]:
@@ -160,6 +170,8 @@ def list_channel_clips_api(slug: str, limit: int = 10) -> List[KickVideo]:
 
     Uses Kick channel clips page/API: https://kick.com/{slug}/clips
     """
+    slug = (slug or "").strip().lower()
+    verify_channel_exists(slug)
     referer = f"{_BASE}/{slug}/clips"
     data = _get_json(f"/api/v2/channels/{slug}/clips", referer)
     raw = data.get("clips") if isinstance(data, dict) else []
