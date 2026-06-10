@@ -5,7 +5,7 @@ import {
   Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus,
-  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, Settings,
+  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, Settings, ArrowRightToLine,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
 import twitchIcon from '@/assets/platforms/twitch.png';
@@ -56,6 +56,11 @@ interface ChannelVideo {
   thumbnail_url: string | null;
   url: string;
   channel: string;
+}
+
+interface ListedChannelVideo extends ChannelVideo {
+  /** 1-based index within the currently visible list for this platform. */
+  platformListIndex: number;
 }
 
 interface AppSettings {
@@ -221,19 +226,32 @@ const EXPLORE_POPUP_DEFAULT: PanelSize = { w: 288, h: 320 };
 const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 const PANEL_MAX_W = 1000;
 const EXPLORE_POPUP_MAX_W = 960;
+const CARD_BORDER_PX = 2;
 
 function panelMaxHeight() {
   return Math.round(window.innerHeight * 0.92);
 }
 
-function PanelResizeHandle({ onMouseDown }: { onMouseDown: (e: MouseEvent) => void }) {
+/** Distance from panel padding edge to outer colored shadow corner (border + shadow offset). */
+function panelResizeHandleInset(compact: boolean): number {
+  return CARD_BORDER_PX + (compact ? 4 : 6);
+}
+
+function PanelResizeHandle({
+  onMouseDown,
+  insetPx,
+}: {
+  onMouseDown: (e: MouseEvent) => void;
+  insetPx: number;
+}) {
   return (
     <div
       role="separator"
       aria-orientation="both"
       title="Resize"
       onMouseDown={onMouseDown}
-      className="absolute bottom-0 right-0 z-30 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto"
+      style={{ bottom: -insetPx, right: -insetPx }}
+      className="absolute z-30 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto"
     >
       <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500" />
     </div>
@@ -573,7 +591,13 @@ export default function App() {
     const items: ChannelVideo[] = [];
     if (kickEnabled) items.push(...kickChannelVideos.slice(0, kickVisibleLimit));
     if (twitchEnabled) items.push(...twitchChannelVideos.slice(0, twitchVisibleLimit));
-    return items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
+    const sorted = items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
+    let kickN = 0;
+    let twitchN = 0;
+    return sorted.map((v): ListedChannelVideo => ({
+      ...v,
+      platformListIndex: v.platform === 'Kick' ? ++kickN : ++twitchN,
+    }));
   }, [
     kickChannelVideos,
     twitchChannelVideos,
@@ -1612,6 +1636,11 @@ export default function App() {
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
 
+  const carryExploreToUrl = useCallback(() => {
+    if (!exploreVod?.url) return;
+    selectVod(exploreVod.url);
+  }, [exploreVod, selectVod]);
+
   // ── Size estimate ──
   const clipSec = Math.max(0, trimEndSec - trimStartSec);
 
@@ -2094,7 +2123,7 @@ export default function App() {
             )}
           </div>
           {!previewFullscreen && (
-            <PanelResizeHandle onMouseDown={onPreviewPanelResize} />
+            <PanelResizeHandle onMouseDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
         </div>
       )}
@@ -2124,7 +2153,7 @@ export default function App() {
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
             {urlTabContent}
           </div>
-          <PanelResizeHandle onMouseDown={onUrlAsidePanelResize} />
+          <PanelResizeHandle onMouseDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
         </div>
       )}
       <div
@@ -2353,6 +2382,14 @@ export default function App() {
                           }}
                           className="flex items-center gap-1 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                         >
+                          <span
+                            className={`shrink-0 w-4 text-center text-[9px] font-mono font-bold tabular-nums ${
+                              v.platform === 'Kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
+                            }`}
+                            title={`${v.platform} #${v.platformListIndex}`}
+                          >
+                            {v.platformListIndex}
+                          </span>
                           <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                             <span className="truncate flex items-center gap-1">
                               <PlatformVodIcon platform={v.platform} />
@@ -2566,7 +2603,7 @@ export default function App() {
           </div>
         )}
 
-        <PanelResizeHandle onMouseDown={onMainPanelResize} />
+        <PanelResizeHandle onMouseDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
       </div>
       </div>
       </div>
@@ -2582,7 +2619,7 @@ export default function App() {
             width: explorePopupSize.w,
             height: explorePopupSize.h,
           }}
-          className={`flex flex-col bg-zinc-950 border-2 border-white min-h-0 ${
+          className={`relative flex flex-col bg-zinc-950 border-2 border-white min-h-0 ${
             platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)
           } ${
             exploreFullscreen
@@ -2660,6 +2697,15 @@ export default function App() {
                       {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
                     </button>
                     {exploreVolumeUi(true)}
+                    <button
+                      type="button"
+                      onClick={carryExploreToUrl}
+                      className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                      title="Send to URL panel for rip"
+                    >
+                      <ArrowRightToLine size={14} />
+                      URL
+                    </button>
                   </div>
                 </div>
                 <button
@@ -2699,6 +2745,15 @@ export default function App() {
                     {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
                   </button>
                   {exploreVolumeUi(false)}
+                  <button
+                    type="button"
+                    onClick={carryExploreToUrl}
+                    className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                    title="Send to URL panel for rip"
+                  >
+                    <ArrowRightToLine size={14} />
+                    URL
+                  </button>
                 </div>
                 <button
                   type="button"
@@ -2710,10 +2765,12 @@ export default function App() {
                   <Maximize2 size={18} />
                 </button>
               </div>
-              <PanelResizeHandle onMouseDown={onExplorePanelResize} />
             </>
           )}
           </div>
+          {!exploreFullscreen && (
+            <PanelResizeHandle onMouseDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
+          )}
         </div>,
         document.body,
       )}
