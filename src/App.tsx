@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
+import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -4094,8 +4094,8 @@ export default function App() {
                     && channelDropInsertIndex === savedChannels.length
                     && index === savedChannels.length - 1;
                   return (
+                  <Fragment key={ch.id}>
                   <div
-                    key={ch.id}
                     data-channel-row
                     data-channel-id={ch.id}
                     className={`relative flex items-center gap-1 border px-2 py-1 ${
@@ -4160,206 +4160,202 @@ export default function App() {
                       <X size={11} />
                     </button>
                   </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {selectedChannel && (
-              <div className="flex items-center gap-2 flex-wrap">
-                {(['Kick', 'Twitch'] as const).map((platform) => {
-                  const isKick = platform === 'Kick';
-                  const enabled = isKick ? kickEnabled : twitchEnabled;
-                  const slug = isKick ? selectedChannel.kickSlug : selectedChannel.twitchSlug;
-                  const color = isKick ? '#53fc18' : '#9146FF';
-                  const loading = isKick ? kickBrowseLoading : twitchBrowseLoading;
-                  const editing = editingSlug?.channelId === selectedChannelId && editingSlug.platform === platform;
-                  return (
-                    <div key={platform} className="group relative flex items-center">
-                      {editing ? (
-                        <input type="text" value={editingSlugValue}
-                          onChange={(e) => setEditingSlugValue(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') commitEditPlatformSlug();
-                            if (e.key === 'Escape') setEditingSlug(null);
-                          }}
-                          onBlur={commitEditPlatformSlug}
-                          autoFocus
-                          className="w-28 bg-zinc-950 border text-white font-mono text-[10px] px-1.5 py-0.5 focus:outline-none"
-                          style={{ borderColor: color }} />
+                  {selectedChannelId === ch.id && (
+                    <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {(['Kick', 'Twitch'] as const).map((platform) => {
+                          const isKick = platform === 'Kick';
+                          const enabled = isKick ? kickEnabled : twitchEnabled;
+                          const slug = isKick ? ch.kickSlug : ch.twitchSlug;
+                          const color = isKick ? '#53fc18' : '#9146FF';
+                          const loading = isKick ? kickBrowseLoading : twitchBrowseLoading;
+                          const editing = editingSlug?.channelId === ch.id && editingSlug.platform === platform;
+                          return (
+                            <div key={platform} className="group relative flex items-center">
+                              {editing ? (
+                                <input type="text" value={editingSlugValue}
+                                  onChange={(e) => setEditingSlugValue(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') commitEditPlatformSlug();
+                                    if (e.key === 'Escape') setEditingSlug(null);
+                                  }}
+                                  onBlur={commitEditPlatformSlug}
+                                  autoFocus
+                                  className="w-28 bg-zinc-950 border text-white font-mono text-[10px] px-1.5 py-0.5 focus:outline-none"
+                                  style={{ borderColor: color }} />
+                              ) : (
+                                <div
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v);
+                                    }
+                                  }}
+                                  className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold cursor-pointer select-none ${
+                                    enabled ? '' : 'opacity-40'
+                                  }`}
+                                  style={enabled ? { borderColor: color, color } : { borderColor: '#3f3f46' }}
+                                >
+                                  <input type="checkbox" checked={enabled} readOnly tabIndex={-1}
+                                    className="w-3 h-3 pointer-events-none" style={{ accentColor: color }} />
+                                  <span>{platform}</span>
+                                  <span className="text-zinc-500 normal-case font-normal">{slug}</span>
+                                  {loading && <Loader2 size={9} className="animate-spin" />}
+                                </div>
+                              )}
+                              {!editing && (
+                                <button type="button" title={`Edit ${platform} name`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    startEditPlatformSlug(ch.id, platform);
+                                  }}
+                                  className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 p-0.5 bg-zinc-900 border rounded-sm"
+                                  style={{ borderColor: color, color }}>
+                                  <Pencil size={9} />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                        <div className="flex items-center gap-2 font-mono text-[10px] uppercase shrink-0">
+                          <span className="text-zinc-500">Show:</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (channelContentFilter !== 'vods') {
+                                setChannelContentFilter('vods');
+                                setChannelsError(null);
+                              }
+                            }}
+                            className={`px-2 py-0.5 border font-bold ${
+                              channelContentFilter === 'vods'
+                                ? 'border-white text-white bg-zinc-900'
+                                : 'border-zinc-700 text-zinc-500 hover:text-white'
+                            }`}
+                          >
+                            VODs
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (channelContentFilter !== 'clips') {
+                                setChannelContentFilter('clips');
+                                setChannelsError(null);
+                              }
+                            }}
+                            className={`px-2 py-0.5 border font-bold ${
+                              channelContentFilter === 'clips'
+                                ? 'border-white text-white bg-zinc-900'
+                                : 'border-zinc-700 text-zinc-500 hover:text-white'
+                            }`}
+                          >
+                            Only clips
+                          </button>
+                        </div>
+                      </div>
+                      {channelsError && (
+                        <p className="text-red-400 text-[10px] font-mono">{channelsError}</p>
+                      )}
+                      {channelsLoading ? (
+                        <div className="flex justify-center py-4 text-zinc-500">
+                          <Loader2 size={18} className="animate-spin" />
+                        </div>
+                      ) : visibleChannelVideos.length === 0 ? (
+                        <p className="text-center text-zinc-600 font-mono text-[10px] py-3">
+                          {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
+                        </p>
                       ) : (
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v);
-                            }
-                          }}
-                          className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold cursor-pointer select-none ${
-                            enabled ? '' : 'opacity-40'
-                          }`}
-                          style={enabled ? { borderColor: color, color } : { borderColor: '#3f3f46' }}
-                        >
-                          <input type="checkbox" checked={enabled} readOnly tabIndex={-1}
-                            className="w-3 h-3 pointer-events-none" style={{ accentColor: color }} />
-                          <span>{platform}</span>
-                          <span className="text-zinc-500 normal-case font-normal">{slug}</span>
-                          {loading && <Loader2 size={9} className="animate-spin" />}
+                        <div className="flex flex-col gap-1">
+                          {visibleChannelVideos.map((v, i) => {
+                            const fullUrl = buildVodUrl(v);
+                            const subline = channelVodSubline(v);
+                            const durSec = channelVideoDurationSec(v);
+                            const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
+                            return (
+                              <div
+                                key={`${v.platform}-${v.id}-${i}`}
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => selectVod(fullUrl, {
+                                  platform: v.platform,
+                                  platformListIndex: v.platformListIndex,
+                                  isClip: isClipItem,
+                                })}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    selectVod(fullUrl, {
+                                      platform: v.platform,
+                                      platformListIndex: v.platformListIndex,
+                                      isClip: isClipItem,
+                                    });
+                                  }
+                                }}
+                                className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
+                              >
+                                {isClipItem && <ChannelClipThumb video={v} />}
+                                <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
+                                <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
+                                  <span className="truncate flex items-center gap-1">
+                                    <PlatformVodIcon platform={v.platform} />
+                                    <span className="truncate">
+                                      {v.title || 'Untitled'}
+                                      {durSec != null ? (
+                                        <span className="text-zinc-500 ml-1">
+                                          {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                  </span>
+                                  {subline && (
+                                    <span className="text-[9px] text-zinc-400 block truncate">
+                                      {subline}
+                                    </span>
+                                  )}
+                                </div>
+                                <button
+                                  type="button"
+                                  title={isClipItem ? 'Preview clip' : 'Preview VOD'}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void openExplorePlayer(v);
+                                  }}
+                                  className="shrink-0 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-400 hover:border-white hover:text-white flex items-center gap-0.5"
+                                >
+                                  <Eye size={10} />
+                                  Preview
+                                </button>
+                                <button
+                                  type="button"
+                                  title="Open in browser"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    window.open(fullUrl, '_blank', 'noopener,noreferrer');
+                                  }}
+                                  className="text-zinc-600 hover:text-white p-1 shrink-0"
+                                >
+                                  <ExternalLink size={11} />
+                                </button>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
-                      {!editing && (
-                        <button type="button" title={`Edit ${platform} name`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            startEditPlatformSlug(selectedChannelId!, platform);
-                          }}
-                          className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 p-0.5 bg-zinc-900 border rounded-sm"
-                          style={{ borderColor: color, color }}>
-                          <Pencil size={9} />
+                      {canExpandChannelList && (
+                        <button type="button" onClick={handleExpandChannelList}
+                          className="text-[10px] font-mono text-zinc-500 hover:text-white uppercase">
+                          +{CHANNEL_EXPAND_STEP} more
                         </button>
                       )}
                     </div>
+                  )}
+                  </Fragment>
                   );
                 })}
-                <div className="flex items-center gap-2 font-mono text-[10px] uppercase shrink-0">
-                  <span className="text-zinc-500">Show:</span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (channelContentFilter !== 'vods') {
-                        setChannelContentFilter('vods');
-                        setChannelsError(null);
-                      }
-                    }}
-                    className={`px-2 py-0.5 border font-bold ${
-                      channelContentFilter === 'vods'
-                        ? 'border-white text-white bg-zinc-900'
-                        : 'border-zinc-700 text-zinc-500 hover:text-white'
-                    }`}
-                  >
-                    VODs
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (channelContentFilter !== 'clips') {
-                        setChannelContentFilter('clips');
-                        setChannelsError(null);
-                      }
-                    }}
-                    className={`px-2 py-0.5 border font-bold ${
-                      channelContentFilter === 'clips'
-                        ? 'border-white text-white bg-zinc-900'
-                        : 'border-zinc-700 text-zinc-500 hover:text-white'
-                    }`}
-                  >
-                    Only clips
-                  </button>
-                </div>
               </div>
-            )}
-
-            {channelsError && (
-              <p className="text-red-400 text-[10px] font-mono">{channelsError}</p>
-            )}
-
-            {selectedChannel && (
-              <>
-                {channelsLoading ? (
-                  <div className="flex justify-center py-6 text-zinc-500">
-                    <Loader2 size={18} className="animate-spin" />
-                  </div>
-                ) : visibleChannelVideos.length === 0 ? (
-                  <p className="text-center text-zinc-600 font-mono text-[10px] py-4">
-                    {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
-                  </p>
-                ) : (
-                  <div className="flex flex-col gap-1">
-                    {visibleChannelVideos.map((v, i) => {
-                      const fullUrl = buildVodUrl(v);
-                      const subline = channelVodSubline(v);
-                      const durSec = channelVideoDurationSec(v);
-                      const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
-                      return (
-                        <div
-                          key={`${v.platform}-${v.id}-${i}`}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => selectVod(fullUrl, {
-                            platform: v.platform,
-                            platformListIndex: v.platformListIndex,
-                            isClip: isClipItem,
-                          })}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              selectVod(fullUrl, {
-                                platform: v.platform,
-                                platformListIndex: v.platformListIndex,
-                                isClip: isClipItem,
-                              });
-                            }
-                          }}
-                          className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
-                        >
-                          {isClipItem && <ChannelClipThumb video={v} />}
-                          <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
-                          <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
-                            <span className="truncate flex items-center gap-1">
-                              <PlatformVodIcon platform={v.platform} />
-                              <span className="truncate">
-                                {v.title || 'Untitled'}
-                                {durSec != null ? (
-                                  <span className="text-zinc-500 ml-1">
-                                    {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
-                                  </span>
-                                ) : null}
-                              </span>
-                            </span>
-                            {subline && (
-                              <span className="text-[9px] text-zinc-400 block truncate">
-                                {subline}
-                              </span>
-                            )}
-                          </div>
-                          <button
-                            type="button"
-                            title={isClipItem ? 'Preview clip' : 'Preview VOD'}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void openExplorePlayer(v);
-                            }}
-                            className="shrink-0 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-400 hover:border-white hover:text-white flex items-center gap-0.5"
-                          >
-                            <Eye size={10} />
-                            Preview
-                          </button>
-                          <button
-                            type="button"
-                            title="Open in browser"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              window.open(fullUrl, '_blank', 'noopener,noreferrer');
-                            }}
-                            className="text-zinc-600 hover:text-white p-1 shrink-0"
-                          >
-                            <ExternalLink size={11} />
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-                {canExpandChannelList && (
-                  <button type="button" onClick={handleExpandChannelList}
-                    className="text-[10px] font-mono text-zinc-500 hover:text-white uppercase">
-                    +{CHANNEL_EXPAND_STEP} more
-                  </button>
-                )}
-              </>
             )}
           </div>
         )}
