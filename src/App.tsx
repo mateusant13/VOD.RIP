@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -218,6 +218,20 @@ const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_DEFAULT_VOLUME = 0.3;
+
+/** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
+function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
+  if (e.ctrlKey || e.metaKey || e.altKey) return true;
+  const el = e.target as HTMLElement;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') {
+    const type = (el as HTMLInputElement).type;
+    return type !== 'range' && type !== 'checkbox' && type !== 'radio';
+  }
+  return false;
+}
 type PanelSize = { w: number; h: number };
 
 const PREVIEW_PANEL_DEFAULT_W = 640;
@@ -405,24 +419,95 @@ function panelResizeHandleInset(compact: boolean): number {
   return CARD_BORDER_PX + (compact ? 4 : 6);
 }
 
-function PanelResizeHandle({
+type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+
+const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {
+  n: 'ns-resize',
+  s: 'ns-resize',
+  e: 'ew-resize',
+  w: 'ew-resize',
+  ne: 'nesw-resize',
+  nw: 'nwse-resize',
+  se: 'nwse-resize',
+  sw: 'nesw-resize',
+};
+
+function calcPanelSizeFromEdge(
+  edge: ResizeEdge,
+  startW: number,
+  startH: number,
+  dx: number,
+  dy: number,
+): PanelSize {
+  let w = startW;
+  let h = startH;
+  if (edge === 'e' || edge === 'ne' || edge === 'se') w = startW + dx;
+  else if (edge === 'w' || edge === 'nw' || edge === 'sw') w = startW - dx;
+  if (edge === 's' || edge === 'se' || edge === 'sw') h = startH + dy;
+  else if (edge === 'n' || edge === 'ne' || edge === 'nw') h = startH - dy;
+  return { w, h };
+}
+
+function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: number): number {
+  switch (edge) {
+    case 'e': return dx;
+    case 'w': return -dx;
+    case 's': return dy * aspect;
+    case 'n': return -dy * aspect;
+    case 'se': return Math.max(dx, dy * aspect);
+    case 'sw': return Math.max(-dx, dy * aspect);
+    case 'ne': return Math.max(dx, -dy * aspect);
+    case 'nw': return Math.max(-dx, -dy * aspect);
+    default: return dx;
+  }
+}
+
+function PanelResizeHandles({
   onPointerDown,
   insetPx,
 }: {
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => void;
   insetPx: number;
 }) {
-  return (
+  const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
+  const edgePad = 12;
+
+  const edgeProps = (edge: ResizeEdge, style: CSSProperties, className: string) => ({
+    role: 'separator' as const,
+    title: 'Resize',
+    'aria-orientation': (edge === 'n' || edge === 's' ? 'vertical' : 'horizontal') as 'vertical' | 'horizontal',
+    onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => onPointerDown(e, edge),
+    style: { ...style, touchAction: 'none', cursor: RESIZE_EDGE_CURSORS[edge] },
+    className: `${hit} ${className}`,
+  });
+
+  const corner = (edge: ResizeEdge, style: CSSProperties) => (
     <div
-      role="separator"
-      aria-orientation="both"
-      title="Resize"
-      onPointerDown={onPointerDown}
-      style={{ bottom: -insetPx, right: -insetPx, touchAction: 'none' }}
-      className="absolute z-50 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto select-none"
+      key={edge}
+      {...edgeProps(edge, style, 'w-4 h-4 flex items-center justify-center')}
     >
-      <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500 pointer-events-none" />
+      <span
+        className={`block w-2 h-2 border-zinc-500 pointer-events-none ${
+          edge === 'se' ? 'border-r-2 border-b-2' :
+          edge === 'sw' ? 'border-l-2 border-b-2' :
+          edge === 'ne' ? 'border-r-2 border-t-2' :
+          'border-l-2 border-t-2'
+        }`}
+      />
     </div>
+  );
+
+  return (
+    <>
+      <div {...edgeProps('n', { top: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('s', { bottom: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      <div {...edgeProps('w', { left: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      {corner('nw', { top: -insetPx, left: -insetPx })}
+      {corner('ne', { top: -insetPx, right: -insetPx })}
+      {corner('sw', { bottom: -insetPx, left: -insetPx })}
+      {corner('se', { bottom: -insetPx, right: -insetPx })}
+    </>
   );
 }
 
@@ -433,6 +518,7 @@ function applyPanelSize(el: HTMLElement, size: PanelSize) {
 
 function startPanelResizeDrag(
   e: ReactPointerEvent<HTMLDivElement>,
+  edge: ResizeEdge,
   sizeRef: MutableRefObject<PanelSize>,
   setSize: Dispatch<SetStateAction<PanelSize>>,
   opts?: {
@@ -460,12 +546,15 @@ function startPanelResizeDrag(
   const prevUserSelect = document.body.style.userSelect;
   const prevCursor = document.body.style.cursor;
   document.body.style.userSelect = 'none';
-  document.body.style.cursor = 'se-resize';
+  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
 
-  const calcSize = (clientX: number, clientY: number): PanelSize => ({
-    w: Math.min(maxW, Math.max(PANEL_MIN.w, startW + clientX - startX)),
-    h: Math.min(maxH, Math.max(PANEL_MIN.h, startH + clientY - startY)),
-  });
+  const calcSize = (clientX: number, clientY: number): PanelSize => {
+    const raw = calcPanelSizeFromEdge(edge, startW, startH, clientX - startX, clientY - startY);
+    return {
+      w: Math.min(maxW, Math.max(PANEL_MIN.w, raw.w)),
+      h: Math.min(maxH, Math.max(PANEL_MIN.h, raw.h)),
+    };
+  };
 
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
@@ -508,11 +597,13 @@ function applyPanelWidth(el: HTMLElement, width: number) {
 
 function startPanelWidthResize(
   e: ReactPointerEvent<HTMLDivElement>,
+  edge: ResizeEdge,
   widthRef: MutableRefObject<number>,
   setWidth: Dispatch<SetStateAction<number>>,
   opts: {
     panelEl: HTMLElement | null;
     clampWidth: (w: number) => number;
+    aspect: number;
   },
 ) {
   e.preventDefault();
@@ -521,6 +612,7 @@ function startPanelWidthResize(
   handle.setPointerCapture(e.pointerId);
 
   const startX = e.clientX;
+  const startY = e.clientY;
   const startW = widthRef.current;
   const panelEl = opts.panelEl;
   const clamp = opts.clampWidth;
@@ -531,11 +623,12 @@ function startPanelWidthResize(
   const prevUserSelect = document.body.style.userSelect;
   const prevCursor = document.body.style.cursor;
   document.body.style.userSelect = 'none';
-  document.body.style.cursor = 'se-resize';
+  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
 
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
-    const nextW = clamp(startW + ev.clientX - startX);
+    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
+    const nextW = clamp(startW + delta);
     widthRef.current = nextW;
     if (panelEl) {
       applyPanelWidth(panelEl, nextW);
@@ -791,6 +884,7 @@ export default function App() {
     title: string;
     platform: string;
     durationSec: number;
+    platformListIndex: number;
   } | null>(null);
   const [exploreHlsUrl, setExploreHlsUrl] = useState<string | null>(null);
   const [exploreLoading, setExploreLoading] = useState(false);
@@ -1209,14 +1303,31 @@ export default function App() {
     }
   }, [previewFullscreen]);
 
+  const focusPreviewPlayer = useCallback(() => {
+    previewContainerRef.current?.focus();
+  }, []);
+
+  const togglePreviewFullscreen = useCallback(async () => {
+    const container = previewContainerRef.current;
+    if (!container || !previewVideoReady) return;
+    try {
+      if (!document.fullscreenElement) {
+        await container.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch {
+      /* fullscreen denied or unsupported */
+    }
+  }, [previewVideoReady]);
+
   const handlePreviewContainerKeyDown = useCallback((e: KeyboardEvent) => {
     if (!previewVideoReady) return;
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (shouldIgnorePlayerKeyEvent(e)) return;
 
     const { key } = e;
     const transportKeys = [' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End',
-      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'f', 'F'];
     if (!transportKeys.includes(key)) return;
 
     e.preventDefault();
@@ -1242,6 +1353,10 @@ export default function App() {
       setPreviewVolumeLevel(previewVolumeRef.current - 0.1);
       return;
     }
+    if (key.toLowerCase() === 'f') {
+      void togglePreviewFullscreen();
+      return;
+    }
     if (key === 'Home' || key === '0') {
       seekPreviewPercent(0);
       return;
@@ -1253,25 +1368,14 @@ export default function App() {
     if (key >= '1' && key <= '9') {
       seekPreviewPercent(parseInt(key, 10) * 0.1);
     }
-  }, [previewVideoReady, togglePreviewPlay, skipPreview, setPreviewVolumeLevel, seekPreviewPercent]);
-
-  const focusPreviewPlayer = useCallback(() => {
-    previewContainerRef.current?.focus();
-  }, []);
-
-  const togglePreviewFullscreen = useCallback(async () => {
-    const container = previewContainerRef.current;
-    if (!container || !previewVideoReady) return;
-    try {
-      if (!document.fullscreenElement) {
-        await container.requestFullscreen();
-      } else {
-        await document.exitFullscreen();
-      }
-    } catch {
-      /* fullscreen denied or unsupported */
-    }
-  }, [previewVideoReady]);
+  }, [
+    previewVideoReady,
+    togglePreviewPlay,
+    skipPreview,
+    setPreviewVolumeLevel,
+    seekPreviewPercent,
+    togglePreviewFullscreen,
+  ]);
 
   useEffect(() => {
     const onFullscreenChange = () => {
@@ -1354,7 +1458,7 @@ export default function App() {
     }
   }, [destroyExplorePlayer]);
 
-  const openExplorePlayer = useCallback(async (v: ChannelVideo) => {
+  const openExplorePlayer = useCallback(async (v: ListedChannelVideo) => {
     const vodUrl = buildVodUrl(v);
     const durationSec = v.duration ? Math.max(2, Math.floor(v.duration)) : 7200;
     const oldSid = exploreSessionIdRef.current;
@@ -1369,6 +1473,7 @@ export default function App() {
       title: v.title || 'Untitled',
       platform: v.platform,
       durationSec,
+      platformListIndex: v.platformListIndex,
     });
     exploreVideoAspectRef.current = EXPLORE_VIDEO_ASPECT_DEFAULT;
     setExploreVideoAspect(EXPLORE_VIDEO_ASPECT_DEFAULT);
@@ -1442,6 +1547,16 @@ export default function App() {
     }
     setExploreCurrentTime(t);
   }, [exploreReady, exploreVod]);
+
+  const skipExplore = useCallback((deltaSec: number) => {
+    const video = exploreVideoRef.current;
+    if (!video || !exploreReady || !exploreVod) return;
+    seekExploreVideo(video.currentTime + deltaSec);
+  }, [exploreReady, exploreVod, seekExploreVideo]);
+
+  const focusExplorePlayer = useCallback(() => {
+    exploreContainerRef.current?.focus();
+  }, []);
 
   const handleExploreTimeUpdate = useCallback(() => {
     const video = exploreVideoRef.current;
@@ -1524,9 +1639,10 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
 
-  const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
-    startPanelWidthResize(e, previewPanelWidthRef, setPreviewPanelWidth, {
+  const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
+      aspect: previewVideoAspectRef.current,
       clampWidth: (w) => clampPreviewPanelWidth(
         w,
         previewChromeHRef.current,
@@ -1536,9 +1652,9 @@ export default function App() {
     });
   }, [layoutBoundsInput]);
 
-  const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+  const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const layout = layoutBoundsInput();
-    startPanelResizeDrag(e, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
+    startPanelResizeDrag(e, edge, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
       panelEl: urlAsidePanelRef.current,
       maxW: layoutMaxPanelWidth('urlAside', layout),
       maxH: layoutMaxPanelHeight(),
@@ -1546,9 +1662,9 @@ export default function App() {
     });
   }, [layoutBoundsInput]);
 
-  const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+  const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const layout = layoutBoundsInput();
-    startPanelResizeDrag(e, mainPanelSizeRef, setMainPanelSize, {
+    startPanelResizeDrag(e, edge, mainPanelSizeRef, setMainPanelSize, {
       panelEl: mainPanelRef.current,
       maxW: layoutMaxPanelWidth('main', layout),
       maxH: layoutMaxPanelHeight(),
@@ -1556,9 +1672,10 @@ export default function App() {
     });
   }, [layoutBoundsInput]);
 
-  const onExplorePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
-    startPanelWidthResize(e, explorePanelWidthRef, setExplorePanelWidth, {
+  const onExplorePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    startPanelWidthResize(e, edge, explorePanelWidthRef, setExplorePanelWidth, {
       panelEl: exploreContainerRef.current,
+      aspect: exploreVideoAspectRef.current,
       clampWidth: (w) => clampExplorePanelWidth(
         w,
         exploreChromeHRef.current,
@@ -1580,6 +1697,58 @@ export default function App() {
       /* fullscreen denied or unsupported */
     }
   }, [exploreReady]);
+
+  const handleExploreKeyDown = useCallback((e: KeyboardEvent) => {
+    if (!exploreReady) return;
+    if (shouldIgnorePlayerKeyEvent(e)) return;
+
+    const { key } = e;
+    if (
+      ![' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key)
+      && key.toLowerCase() !== 'f'
+    ) {
+      return;
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (key === ' ') {
+      toggleExplorePlay();
+      return;
+    }
+    if (key === 'ArrowLeft') {
+      skipExplore(-PREVIEW_KEY_SKIP_SEC);
+      return;
+    }
+    if (key === 'ArrowRight') {
+      skipExplore(PREVIEW_KEY_SKIP_SEC);
+      return;
+    }
+    if (key === 'ArrowUp') {
+      setExploreVolumeLevel(exploreVolumeRef.current + 0.1);
+      return;
+    }
+    if (key === 'ArrowDown') {
+      setExploreVolumeLevel(exploreVolumeRef.current - 0.1);
+      return;
+    }
+    if (key.toLowerCase() === 'f') {
+      void toggleExploreFullscreen();
+    }
+  }, [
+    exploreReady,
+    toggleExplorePlay,
+    skipExplore,
+    setExploreVolumeLevel,
+    toggleExploreFullscreen,
+  ]);
+
+  useEffect(() => {
+    if (!exploreOpen || !exploreReady) return;
+    const t = window.setTimeout(() => focusExplorePlayer(), 0);
+    return () => window.clearTimeout(t);
+  }, [exploreOpen, exploreReady, focusExplorePlayer]);
 
   const bumpExploreFsControls = useCallback(() => {
     setExploreFsControlsVisible(true);
@@ -2608,7 +2777,7 @@ export default function App() {
             )}
           </div>
           {!previewFullscreen && (
-            <PanelResizeHandle onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
+            <PanelResizeHandles onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
         </div>
       )}
@@ -2639,7 +2808,7 @@ export default function App() {
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
             {urlTabContent}
           </div>
-          <PanelResizeHandle onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
+          <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
         </div>
       )}
       <div
@@ -3090,7 +3259,7 @@ export default function App() {
           </div>
         )}
 
-        <PanelResizeHandle onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
+        <PanelResizeHandles onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
       </div>
       </div>
       </div>
@@ -3102,6 +3271,14 @@ export default function App() {
       {exploreOpen && exploreVod && createPortal(
         <div
           ref={exploreContainerRef}
+          tabIndex={0}
+          role="application"
+          aria-label="Channel explore player"
+          onKeyDown={handleExploreKeyDown}
+          onClick={focusExplorePlayer}
+          className={`outline-none focus:ring-2 focus:ring-white/25 ${
+            exploreFullscreen ? 'min-h-0 p-0 gap-0' : 'p-3 gap-2'
+          } flex flex-col overflow-visible bg-zinc-950 border-2 border-white ${platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)}`}
           style={exploreFullscreen ? {
             position: 'fixed',
             top: 0,
@@ -3121,21 +3298,28 @@ export default function App() {
             width: explorePanelWidth,
             maxWidth: `calc(100vw - ${VIEWPORT_EDGE_LOCK * 2}px - ${panelResizeHandleInset(true)}px)`,
           }}
-          className={`flex flex-col overflow-visible bg-zinc-950 border-2 border-white ${
-            exploreFullscreen ? 'min-h-0 p-0 gap-0' : 'p-3 gap-2'
-          } ${platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)}`}
           onMouseMove={exploreFullscreen ? bumpExploreFsControls : undefined}
         >
           <div className={`flex flex-col ${exploreFullscreen ? 'h-full min-h-0 gap-0' : 'gap-2 relative'}`}>
           {!exploreFullscreen && (
             <div className="flex items-start justify-between gap-2 shrink-0">
-              <div className="min-w-0">
-                <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                  Channel explore
+              <div className="min-w-0 flex items-start gap-1.5">
+                <span
+                  className={`shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5 ${
+                    exploreVod.platform === 'Kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
+                  }`}
+                  title={`${exploreVod.platform} #${exploreVod.platformListIndex}`}
+                >
+                  {exploreVod.platformListIndex}
                 </span>
-                <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
-                  {exploreVod.title}
-                </p>
+                <div className="min-w-0">
+                  <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
+                    Channel explore
+                  </span>
+                  <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
+                    {exploreVod.title}
+                  </p>
+                </div>
               </div>
               <button
                 type="button"
@@ -3270,7 +3454,7 @@ export default function App() {
           )}
           </div>
           {!exploreFullscreen && (
-            <PanelResizeHandle onPointerDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
+            <PanelResizeHandles onPointerDown={onExplorePanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
         </div>,
         document.getElementById('explore-portal') ?? document.body,

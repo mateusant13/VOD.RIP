@@ -48,6 +48,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+input[type="text"],
+input:not([type]),
+textarea {
+  user-select: text;
+}
+
 select {
   -webkit-appearance: none;
   -moz-appearance: none;
