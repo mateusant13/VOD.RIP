@@ -5,9 +5,10 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import subprocess as sp
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -19,6 +20,35 @@ from models.schemas import VideoInfo
 class CancelledError(Exception):
     """Raised when a download is cancelled by the user."""
     pass
+
+
+def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
+    if cancel_event and cancel_event.is_set():
+        raise CancelledError("Download cancelled by user")
+
+
+def _run_ffmpeg(
+    cmd: list,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    """Run ffmpeg, polling *cancel_event* so cancel can kill the process quickly."""
+    proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+    if register_abort:
+        register_abort(lambda: proc.poll() is None and proc.kill())
+    try:
+        while proc.poll() is None:
+            _check_cancelled(cancel_event)
+            time.sleep(0.05)
+        stderr = proc.stderr.read() if proc.stderr else b""
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg failed (exit {proc.returncode}): {stderr.decode(errors='ignore')[:500]}"
+            )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 # Default section duration when no crop params given (1 hour = 3600 seconds)
@@ -423,9 +453,8 @@ def _download_segments(
         r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
         r.raise_for_status()
         with open(path, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if cancel_event and cancel_event.is_set():
-                    raise CancelledError("Download cancelled by user")
+            for chunk in r.iter_content(64 * 1024):
+                _check_cancelled(cancel_event)
                 if chunk:
                     f.write(chunk)
         files.append(path)
@@ -450,6 +479,8 @@ def _concat_and_trim(
     duration: float,
     ffmpeg_exe: str,
     progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     """Losslessly concatenate segment files, then trim to exact duration."""
     tmp_dir = os.path.dirname(files[0])
@@ -461,17 +492,19 @@ def _concat_and_trim(
             posix = seg_path.replace("\\", "/")
             f.write(f"file '{posix}'\n")
 
-    sp.run(
+    _run_ffmpeg(
         [ffmpeg_exe, "-f", "concat", "-safe", "0", "-i", concat_txt,
          "-c", "copy", "-y", joined],
-        check=True, capture_output=True,
+        cancel_event=cancel_event,
+        register_abort=register_abort,
     )
 
-    sp.run(
+    _run_ffmpeg(
         [ffmpeg_exe, "-ss", str(offset), "-i", joined,
          "-t", str(duration), "-c", "copy",
          "-avoid_negative_ts", "make_zero", "-y", output_path],
-        check=True, capture_output=True,
+        cancel_event=cancel_event,
+        register_abort=register_abort,
     )
 
     if progress_hook:
@@ -486,6 +519,7 @@ def _download_hls_clip(
     opts: dict,
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
     duration = end_sec - start_sec
@@ -503,12 +537,45 @@ def _download_hls_clip(
 
     with tempfile.TemporaryDirectory(prefix="hls_clip_") as tmpdir:
         files = _download_segments(selected, headers, tmpdir, progress_hook, cancel_event)
-        _concat_and_trim(files, output_path, first_offset, duration, ffmpeg_exe, progress_hook)
+        _concat_and_trim(
+            files, output_path, first_offset, duration, ffmpeg_exe, progress_hook,
+            cancel_event=cancel_event, register_abort=register_abort,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Main download entry point
 # ---------------------------------------------------------------------------
+
+def _wrap_progress_hook(
+    progress_hook: Optional[Callable],
+    cancel_event: Optional[threading.Event],
+) -> Optional[Callable]:
+    if not progress_hook and not cancel_event:
+        return progress_hook
+
+    def hook(d):
+        _check_cancelled(cancel_event)
+        if progress_hook:
+            progress_hook(d)
+
+    return hook
+
+
+def _ydl_download(
+    url: str,
+    opts: dict,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    ydl = yt_dlp.YoutubeDL(opts)
+    if register_abort:
+        register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
+    try:
+        ydl.download([url])
+    finally:
+        _check_cancelled(cancel_event)
+
 
 def download_video_sync(
     url: str,
@@ -519,9 +586,12 @@ def download_video_sync(
     crop_end: Optional[float] = None,
     progress_hook: Optional[Callable] = None,
     settings_mgr=None,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
+    progress_hook = _wrap_progress_hook(progress_hook, cancel_event)
 
     cache_dir = _get_cache_dir()
     max_cache_mb = 200
@@ -548,31 +618,31 @@ def download_video_sync(
     )
 
     if has_crop and is_hls:
-        _download_hls_clip(full_url, output_path, crop_start, crop_end, opts,
-                          progress_hook=progress_hook)
+        _download_hls_clip(
+            full_url, output_path, crop_start, crop_end, opts,
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            register_abort=register_abort,
+        )
 
     elif has_crop:
         start = _format_ts(crop_start)
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*{start}-{end}"]
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([full_url])
+        _ydl_download(full_url, opts, cancel_event, register_abort)
 
     elif crop_start is not None and crop_end is None:
         start = _format_ts(crop_start)
         opts["download_sections"] = [f"*{start}-+{DEFAULT_CLIP_SECONDS}"]
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([full_url])
+        _ydl_download(full_url, opts, cancel_event, register_abort)
 
     elif crop_end is not None and crop_start is None:
         end = _format_ts(crop_end)
         opts["download_sections"] = [f"*-{end}"]
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([full_url])
+        _ydl_download(full_url, opts, cancel_event, register_abort)
 
     else:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([full_url])
+        _ydl_download(full_url, opts, cancel_event, register_abort)
 
     if not os.path.isfile(output_path):
         raise RuntimeError(f"Download failed: output file not found at {output_path}")

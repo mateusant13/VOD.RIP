@@ -5,13 +5,37 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 from models.schemas import DownloadState
 from services import ytdlp_service
+
+
+def _delete_partial_output(output_file: str, output_existed: bool) -> None:
+    """Remove in-progress download artifacts (safe if file already existed)."""
+    if output_existed:
+        return
+    base, ext = os.path.splitext(output_file)
+    candidates = [
+        output_file,
+        output_file + ".part",
+        output_file + ".ytdl",
+        base + ".f" + ext.lstrip(".") + ".part",
+        base + ".temp" + ext,
+    ]
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate):
+                os.remove(candidate)
+        except OSError:
+            pass
+
+
 class DownloadManager:
     def __init__(self, max_workers: int = 4):
         self._downloads: Dict[str, DownloadState] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
+        self._abort_fns: Dict[str, List[Callable[[], None]]] = {}
+        self._cleanup_info: Dict[str, dict] = {}
         self._sse_queues: Dict[str, list] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = threading.Lock()
@@ -56,9 +80,20 @@ class DownloadManager:
 
         cancel_event = threading.Event()
 
+        output_existed = os.path.isfile(output_file)
+        abort_fns: List[Callable[[], None]] = []
+
         with self._lock:
             self._downloads[download_id] = state
             self._cancel_events[download_id] = cancel_event
+            self._abort_fns[download_id] = abort_fns
+            self._cleanup_info[download_id] = {
+                "output_file": output_file,
+                "output_existed": output_existed,
+            }
+
+        def _register_abort(fn: Callable[[], None]) -> None:
+            abort_fns.append(fn)
 
         def _progress_hook(d):
             # Check cancellation from progress hook
@@ -83,20 +118,12 @@ class DownloadManager:
                 self._notify_sse(download_id, "status", "Merging...")
 
         def _cleanup_output():
-            """Remove orphaned output and temp files on failure/cancellation."""
-            if output_existed:
-                return  # Don't touch files the user already had
-            # Remove partial output file
-            for candidate in (output_file, output_file + ".part", output_file + ".ytdl"):
-                try:
-                    if os.path.isfile(candidate):
-                        os.remove(candidate)
-                except OSError:
-                    pass
+            _delete_partial_output(output_file, output_existed)
 
-        output_existed = os.path.isfile(output_file)
         def _download_worker():
             try:
+                if cancel_event.is_set():
+                    raise ytdlp_service.CancelledError("Download cancelled by user")
                 state.status = "Downloading..."
                 self._notify_sse(download_id, "status", "Downloading...")
                 # Use the platform-specific download function if provided,
@@ -114,6 +141,8 @@ class DownloadManager:
                         "crop_start": crop_start,
                         "crop_end": crop_end,
                         "progress_hook": _progress_hook,
+                        "cancel_event": cancel_event,
+                        "register_abort": _register_abort,
                     }
                     kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
                     output_file_result = download_func(**kwargs)
@@ -126,7 +155,11 @@ class DownloadManager:
                         crop_start=crop_start,
                         crop_end=crop_end,
                         progress_hook=_progress_hook,
+                        cancel_event=cancel_event,
+                        register_abort=_register_abort,
                     )
+                if cancel_event.is_set():
+                    raise ytdlp_service.CancelledError("Download cancelled by user")
                 if output_file_result and os.path.isfile(output_file_result):
                     with self._lock:
                         state.status = "Completed"
@@ -136,8 +169,9 @@ class DownloadManager:
                     raise RuntimeError("Download finished but output file is missing")
             except ytdlp_service.CancelledError:
                 with self._lock:
-                    state.status = "Cancelled"
-                self._notify_sse(download_id, "status", "Cancelled")
+                    if state.status != "Cancelled":
+                        state.status = "Cancelled"
+                        self._notify_sse(download_id, "status", "Cancelled")
                 _cleanup_output()
             except Exception as e:
                 with self._lock:
@@ -149,6 +183,8 @@ class DownloadManager:
                 with self._lock:
                     self._sse_queues.pop(download_id, None)
                     self._cancel_events.pop(download_id, None)
+                    self._abort_fns.pop(download_id, None)
+                    self._cleanup_info.pop(download_id, None)
                     # Keep completed/failed downloads for querying; only remove cancelled
                     if state.status not in ("Completed", "Failed"):
                         self._downloads.pop(download_id, None)
@@ -157,14 +193,28 @@ class DownloadManager:
         return download_id
 
     def cancel(self, download_id: str) -> bool:
+        abort_fns: List[Callable[[], None]] = []
+        cleanup: Optional[dict] = None
         with self._lock:
             event = self._cancel_events.get(download_id)
             state = self._downloads.get(download_id)
-            if event and state and state.status not in ("Completed", "Failed", "Cancelled"):
-                event.set()
-                state.status = "Cancelling..."
-                return True
-        return False
+            if not event or not state or state.status in ("Completed", "Failed", "Cancelled"):
+                return False
+            event.set()
+            state.status = "Cancelled"
+            state.progress = 0
+            abort_fns = list(self._abort_fns.get(download_id, []))
+            cleanup = self._cleanup_info.get(download_id)
+
+        for fn in abort_fns:
+            try:
+                fn()
+            except Exception:
+                pass
+        if cleanup:
+            _delete_partial_output(cleanup["output_file"], cleanup["output_existed"])
+        self._notify_sse(download_id, "status", "Cancelled")
+        return True
 
     def get(self, download_id: str) -> Optional[DownloadState]:
         with self._lock:

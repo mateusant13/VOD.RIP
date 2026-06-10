@@ -825,6 +825,8 @@ class KickPlaywrightService:
         progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
         crop_start: Optional[float] = None,
         crop_end: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+        register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     ) -> str:
         """Download a Kick VOD via HLS. m3u8 URL comes from the Kick API (~0.5s)."""
         from services.kick_api_service import get_video_info_api
@@ -869,6 +871,11 @@ class KickPlaywrightService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        if register_abort:
+            register_abort(lambda: proc.returncode is None and proc.kill())
+
+        from services.ytdlp_service import CancelledError
+
         est_sec = 30.0
         if crop_start is not None and crop_end is not None:
             est_sec = max(5.0, float(crop_end - crop_start))
@@ -880,28 +887,42 @@ class KickPlaywrightService:
                 return
             started = time.monotonic()
             while proc.returncode is None:
+                if cancel_event and cancel_event.is_set():
+                    return
                 elapsed = time.monotonic() - started
                 pct = min(95, int(10 + (elapsed / est_sec) * 85))
                 try:
                     progress_hook({"status": "downloading", "percent": pct})
                 except Exception:
-                    pass
-                await asyncio.sleep(0.5)
+                    return
+                await asyncio.sleep(0.25)
 
         tick_task = asyncio.create_task(_tick_progress())
+        stderr = b""
         try:
             if progress_hook:
                 try:
                     progress_hook({"status": "downloading", "percent": 5})
                 except Exception:
                     pass
-            _, stderr = await proc.communicate()
+            while proc.returncode is None:
+                if cancel_event and cancel_event.is_set():
+                    proc.kill()
+                    await proc.wait()
+                    raise CancelledError("Download cancelled by user")
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+            stderr = await proc.stderr.read() if proc.stderr else b""
         finally:
             tick_task.cancel()
             try:
                 await tick_task
             except asyncio.CancelledError:
                 pass
+        if cancel_event and cancel_event.is_set():
+            raise CancelledError("Download cancelled by user")
         if proc.returncode != 0:
             raise RuntimeError(
                 f"FFmpeg failed (exit {proc.returncode}): {stderr.decode(errors='ignore')[:500]}"
@@ -1028,6 +1049,8 @@ def download_vod_sync(
     crop_start: Optional[float] = None,
     crop_end: Optional[float] = None,
     progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> str:
     svc = KickPlaywrightService()
     return _run_async(
@@ -1038,5 +1061,7 @@ def download_vod_sync(
             progress_hook=progress_hook,
             crop_start=crop_start,
             crop_end=crop_end,
+            cancel_event=cancel_event,
+            register_abort=register_abort,
         )
     )

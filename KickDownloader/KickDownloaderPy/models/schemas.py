@@ -74,3 +74,15 @@ class SettingsUpdate(BaseModel):
 
 class OpenFolderRequest(BaseModel):
     path: str
+
+
+class PreviewSessionCreateRequest(BaseModel):
+    url: str
+    crop_start: float = 0.0
+    crop_end: float = 0.0
+
+
+class PreviewSessionResponse(BaseModel):
+    session_id: str
+    master_url: str
+    playback_url: str  # alias for master_url (frontend compat)

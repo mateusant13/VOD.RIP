@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from models.schemas import (
@@ -25,8 +25,19 @@ from models.schemas import (
     DownloadRequest,
     DownloadState,
     OpenFolderRequest,
+    PreviewSessionCreateRequest,
+    PreviewSessionResponse,
     SettingsUpdate,
     VideoInfo,
+)
+from services.preview_service import (
+    create_session,
+    delete_session,
+    get_master_playlist,
+    proxy_playlist,
+    proxy_segment,
+    resolve_upstream,
+    _is_playlist_url,
 )
 from services.download_manager import DownloadManager
 from services.settings import SettingsManager
@@ -270,6 +281,97 @@ async def pick_folder():
         current.download_folder = path
         settings_mgr.save(current)
     return {"path": path, "error": err}
+
+
+@app.post("/api/preview/session")
+async def preview_create_session(req: PreviewSessionCreateRequest):
+    if req.crop_end <= req.crop_start:
+        raise HTTPException(status_code=400, detail="End must be after start")
+    opts = settings_mgr.get()
+    try:
+        session = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: create_session(
+                req.url,
+                req.crop_start,
+                req.crop_end,
+                oauth=opts.oauth or None,
+            ),
+        )
+        master = f"/api/preview/hls/{session.session_id}/master.m3u8"
+        return PreviewSessionResponse(
+            session_id=session.session_id,
+            master_url=master,
+            playback_url=master,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/preview/hls/{session_id}/master.m3u8")
+async def preview_hls_master(session_id: str):
+    try:
+        body = await asyncio.get_event_loop().run_in_executor(
+            None, get_master_playlist, session_id
+        )
+        return Response(
+            content=body,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-cache"},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/preview/hls/{session_id}/resource")
+async def preview_hls_resource(
+    session_id: str,
+    request: Request,
+    id: Optional[str] = None,
+    u: Optional[str] = None,
+):
+    range_header = request.headers.get("range")
+    try:
+        upstream = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: resolve_upstream(session_id, id, unquote(u) if u else None),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    try:
+        if _is_playlist_url(upstream):
+            data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: proxy_playlist(session_id, upstream),
+            )
+            return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
+
+        data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: proxy_segment(session_id, upstream, range_header=range_header),
+        )
+        return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/preview/session/{session_id}")
+async def preview_delete_session(session_id: str):
+    await asyncio.get_event_loop().run_in_executor(None, delete_session, session_id)
+    return {"ok": True}
 
 
 @app.post("/api/open-folder")

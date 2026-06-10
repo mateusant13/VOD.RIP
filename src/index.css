@@ -15,10 +15,24 @@ body {
   background-size: 24px 24px;
 }
 
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
 select {
   -webkit-appearance: none;
   -moz-appearance: none;
   appearance: none;
+  cursor: pointer;
+}
+
+input[type="range"] {
+  cursor: pointer;
 }
 
 .custom-scrollbar::-webkit-scrollbar {

@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
+import Hls from 'hls.js';
 import {
-  Download, Scissors, Info, Play, Link2, X, FastForward, Clock,
+  Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus,
-  ExternalLink,
+  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, SkipBack, SkipForward, Settings,
 } from 'lucide-react';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
@@ -124,6 +125,19 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+async function apiDelete(path: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  } catch {
+    throw new Error(BACKEND_HINT);
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
+  }
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function fmtDuration(sec: number): string {
@@ -183,12 +197,65 @@ function parseHms(t: string): number {
   return p[0] * 3600 + p[1] * 60 + p[2];
 }
 
+function formatHmsFull(sec: number): string {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+const PREVIEW_DEFAULT_HEIGHT = 480;
+const PREVIEW_FULLSCREEN_HEIGHT = 1080;
+const PREVIEW_SKIP_SEC = 10;
+
+interface PreviewLevelOption {
+  index: number;
+  height: number;
+  label: string;
+}
+
+function previewLevelLabel(height: number, bitrate?: number): string {
+  if (!height) return 'Auto';
+  const kbps = bitrate ? Math.round(bitrate / 1000) : 0;
+  return kbps > 0 ? `${height}p · ${kbps}k` : `${height}p`;
+}
+
+function levelIndexForHeight(levels: PreviewLevelOption[], target: number, preferHighest = false): number {
+  if (!levels.length) return 0;
+  if (preferHighest) {
+    const atOrAbove = levels.filter((l) => l.height >= target);
+    if (atOrAbove.length) {
+      return atOrAbove.reduce((best, l) => (l.height > best.height ? l : best)).index;
+    }
+  }
+  const matches = levels.filter((l) => l.height === target);
+  if (matches.length) {
+    const pick = preferHighest ? matches[matches.length - 1] : matches[0];
+    return pick.index;
+  }
+  const below = levels.filter((l) => l.height > 0 && l.height < target);
+  if (below.length && !preferHighest) {
+    return below[below.length - 1].index;
+  }
+  const above = levels.filter((l) => l.height > target);
+  if (above.length) {
+    return above[0].index;
+  }
+  return levels[0].index;
+}
+
+function lowestLevelIndex(levels: PreviewLevelOption[]): number {
+  if (!levels.length) return 0;
+  return levels.reduce((best, l) => (l.height < best.height ? l : best)).index;
+}
+
 const CHANNEL_INITIAL_VISIBLE = 5;
 const CHANNEL_EXPAND_STEP = 10;
 const CHANNEL_FETCH_LIMIT = 100;
 const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
 const MAX_SAVED_CHANNELS = 10;
-
 /** Highest quality from API list, or source when none listed (Kick). */
 function bestAvailableQuality(info: VideoInfo): string {
   if (info.qualities?.length) {
@@ -212,6 +279,25 @@ function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
     return 'hover:bg-[#9146FF] hover:text-black hover:border-[#9146FF] hover:shadow-[4px_4px_0px_0px_#9146FF]';
   }
   return 'hover:bg-white hover:text-black hover:border-white';
+}
+
+function detectVideoPlatform(info: VideoInfo | null, url: string): 'kick' | 'twitch' | null {
+  const p = info?.platform?.toLowerCase();
+  if (p === 'kick') return 'kick';
+  if (p === 'twitch') return 'twitch';
+  return detectUrlPlatform(url);
+}
+
+function platformCardShadow(platform: 'kick' | 'twitch' | null, compact = false): string {
+  if (platform === 'kick') {
+    return compact ? 'shadow-[4px_4px_0px_0px_#53fc18]' : 'shadow-[6px_6px_0px_0px_#53fc18]';
+  }
+  if (platform === 'twitch') {
+    return compact ? 'shadow-[4px_4px_0px_0px_#9146FF]' : 'shadow-[6px_6px_0px_0px_#9146FF]';
+  }
+  return compact
+    ? 'shadow-[4px_4px_0px_0px_#53fc18,6px_6px_0px_0px_#9146FF]'
+    : 'shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF]';
 }
 
 function loadSavedChannels(): SavedChannel[] {
@@ -296,8 +382,34 @@ export default function App() {
   // Download options
   const [quality, setQuality] = useState('source');
   const urlPlatform = detectUrlPlatform(url);
-  const [startTime, setStartTime] = useState('00:00:00');
-  const [endTime, setEndTime] = useState('04:20:00');
+  const [trimStartSec, setTrimStartSec] = useState(0);
+  const [trimEndSec, setTrimEndSec] = useState(3600);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewSessionId, setPreviewSessionId] = useState<string | null>(null);
+  const [previewHlsUrl, setPreviewHlsUrl] = useState<string | null>(null);
+  const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
+  const [previewVideoReady, setPreviewVideoReady] = useState(false);
+  const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
+  const [previewPlaying, setPreviewPlaying] = useState(false);
+  const [previewMuted, setPreviewMuted] = useState(true);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
+  const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
+  const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
+  const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
+  const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
+  const [previewTrimStart, setPreviewTrimStart] = useState(0);
+  const [previewTrimEnd, setPreviewTrimEnd] = useState(3600);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const previewControlsRef = useRef<HTMLDivElement>(null);
+  const previewHlsRef = useRef<Hls | null>(null);
+  const previewQualityBeforeFullscreenRef = useRef<number | null>(null);
+  const previewPausedBeforeFullscreenRef = useRef(false);
+  const previewInitialSeekDoneRef = useRef(false);
+  const previewInitialPlayDoneRef = useRef(false);
+  const previewSuppressPlayRef = useRef(false);
+  const previewTrimStartRef = useRef(0);
+  const previewTrimEndRef = useRef(3600);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
 
@@ -367,6 +479,318 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
 
+  const vodDurationSec = useMemo(
+    () => Math.max(1, Math.floor(videoInfo?.duration || trimEndSec || 1)),
+    [videoInfo?.duration, trimEndSec],
+  );
+
+  const destroyPreviewPlayer = useCallback(() => {
+    if (previewHlsRef.current) {
+      previewHlsRef.current.destroy();
+      previewHlsRef.current = null;
+    }
+    const video = previewVideoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+  }, []);
+
+  const resetPreview = useCallback(async () => {
+    const sid = previewSessionId;
+    destroyPreviewPlayer();
+    setPreviewOpen(false);
+    setPreviewSessionId(null);
+    setPreviewHlsUrl(null);
+    setPreviewVideoLoading(false);
+    setPreviewVideoReady(false);
+    setPreviewCurrentTime(0);
+    setPreviewPlaying(false);
+    setPreviewFullscreen(false);
+    setPreviewLevels([]);
+    setPreviewQualityLevel(0);
+    setPreviewQualityMenuOpen(false);
+    previewInitialSeekDoneRef.current = false;
+    previewInitialPlayDoneRef.current = false;
+    if (sid) {
+      try { await apiDelete(`/api/preview/session/${sid}`); } catch { /* ignore */ }
+    }
+  }, [previewSessionId, destroyPreviewPlayer]);
+
+  const seekPreviewVideo = useCallback((sec: number) => {
+    const video = previewVideoRef.current;
+    if (!video || !previewVideoReady) return;
+    const t = Math.max(0, Math.min(sec, vodDurationSec));
+    if (Math.abs(video.currentTime - t) > 0.3) {
+      video.currentTime = t;
+      setPreviewCurrentTime(t);
+    }
+  }, [previewVideoReady, vodDurationSec]);
+
+  const openPreview = useCallback(async () => {
+    if (!url.trim() || trimEndSec <= trimStartSec) return;
+    previewTrimStartRef.current = trimStartSec;
+    previewTrimEndRef.current = trimEndSec;
+    setPreviewTrimStart(trimStartSec);
+    setPreviewTrimEnd(trimEndSec);
+    previewInitialSeekDoneRef.current = false;
+    previewInitialPlayDoneRef.current = false;
+    setPreviewOpen(true);
+    setPreviewVideoLoading(true);
+    setPreviewVideoReady(false);
+    setError(null);
+    try {
+      if (previewSessionId) {
+        try { await apiDelete(`/api/preview/session/${previewSessionId}`); } catch { /* ignore */ }
+      }
+      destroyPreviewPlayer();
+      const res = await apiPost<{ session_id: string; master_url: string }>('/api/preview/session', {
+        url: url.trim(),
+        crop_start: trimStartSec,
+        crop_end: trimEndSec,
+      });
+      setPreviewSessionId(res.session_id);
+      setPreviewHlsUrl(res.master_url);
+    } catch (err: any) {
+      setError(err.message || 'Preview failed');
+      setPreviewOpen(false);
+      setPreviewVideoLoading(false);
+    }
+  }, [url, trimEndSec, trimStartSec, previewSessionId, destroyPreviewPlayer]);
+
+  useEffect(() => {
+    if (!previewOpen || !previewHlsUrl) return;
+    const video = previewVideoRef.current;
+    if (!video) return;
+
+    setPreviewVideoLoading(true);
+    setPreviewVideoReady(false);
+
+    const performInitialSeek = () => {
+      if (previewInitialSeekDoneRef.current) return;
+      previewInitialSeekDoneRef.current = true;
+      const start = previewTrimStartRef.current;
+      if (Number.isFinite(start) && start > 0 && Math.abs(video.currentTime - start) > 0.25) {
+        video.currentTime = start;
+      }
+      setPreviewCurrentTime(video.currentTime);
+    };
+
+    const onCanPlay = () => {
+      setPreviewVideoReady(true);
+      setPreviewVideoLoading(false);
+      performInitialSeek();
+      if (!previewInitialPlayDoneRef.current && video.paused) {
+        previewInitialPlayDoneRef.current = true;
+        void video.play().catch(() => {});
+      }
+    };
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 30,
+        maxBufferLength: 20,
+        maxMaxBufferLength: 40,
+        startFragPrefetch: true,
+        capLevelToPlayerSize: false,
+        fragLoadingTimeOut: 20000,
+        manifestLoadingTimeOut: 10000,
+        testBandwidth: false,
+        startPosition: previewTrimStartRef.current,
+      });
+      previewHlsRef.current = hls;
+      hls.loadSource(previewHlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        const mapped: PreviewLevelOption[] = (data.levels ?? hls.levels).map((l, i) => ({
+          index: i,
+          height: l.height,
+          label: previewLevelLabel(l.height, l.bitrate),
+        }));
+        mapped.sort((a, b) => a.height - b.height);
+        setPreviewLevels(mapped);
+        const defaultIdx = mapped.length > 1
+          ? levelIndexForHeight(mapped, PREVIEW_DEFAULT_HEIGHT)
+          : lowestLevelIndex(mapped);
+        hls.loadLevel = defaultIdx;
+        setPreviewQualityLevel(defaultIdx);
+      });
+      video.addEventListener('canplay', onCanPlay, { once: true });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return;
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            hls.recoverMediaError();
+            break;
+          default:
+            setError('Preview playback failed — try again');
+            setPreviewVideoLoading(false);
+            hls.destroy();
+            previewHlsRef.current = null;
+            break;
+        }
+      });
+      return () => {
+        video.removeEventListener('canplay', onCanPlay);
+        hls.destroy();
+        previewHlsRef.current = null;
+      };
+    }
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = previewHlsUrl;
+      video.addEventListener('canplay', onCanPlay, { once: true });
+      return () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeAttribute('src');
+        video.load();
+      };
+    }
+
+    setError('HLS playback is not supported in this browser');
+    setPreviewVideoLoading(false);
+  }, [previewOpen, previewHlsUrl]);
+
+  const handlePreviewTimeUpdate = useCallback(() => {
+    const video = previewVideoRef.current;
+    if (!video) return;
+    const t = video.currentTime;
+    setPreviewCurrentTime(t);
+    const end = previewTrimEndRef.current;
+    if (t >= end) {
+      video.pause();
+      if (Math.abs(video.currentTime - end) > 0.05) {
+        video.currentTime = end;
+      }
+      setPreviewPlaying(false);
+    }
+  }, []);
+
+  const togglePreviewPlay = useCallback(() => {
+    const video = previewVideoRef.current;
+    if (!video || !previewVideoReady) return;
+    if (video.paused) {
+      const start = previewTrimStartRef.current;
+      const end = previewTrimEndRef.current;
+      if (video.currentTime >= end - 0.1) {
+        video.currentTime = start;
+      }
+      void video.play();
+      setPreviewPlaying(true);
+    } else {
+      video.pause();
+      setPreviewPlaying(false);
+    }
+  }, [previewVideoReady]);
+
+  const applyPreviewQuality = useCallback((levelIndex: number, forceLoad = false) => {
+    const hls = previewHlsRef.current;
+    const video = previewVideoRef.current;
+    const wasPaused = video?.paused ?? true;
+    if (hls && levelIndex >= 0 && levelIndex < hls.levels.length) {
+      if (forceLoad) {
+        hls.loadLevel = levelIndex;
+      } else {
+        hls.nextLevel = levelIndex;
+      }
+      if (wasPaused && video) {
+        previewSuppressPlayRef.current = true;
+        requestAnimationFrame(() => {
+          video.pause();
+          previewSuppressPlayRef.current = false;
+        });
+      }
+    }
+    setPreviewQualityLevel(levelIndex);
+    setPreviewQualityMenuOpen(false);
+  }, []);
+
+  const skipPreview = useCallback((deltaSec: number) => {
+    const video = previewVideoRef.current;
+    if (!video || !previewVideoReady) return;
+    const start = previewTrimStartRef.current;
+    const end = previewTrimEndRef.current;
+    const t = Math.max(start, Math.min(end, video.currentTime + deltaSec));
+    seekPreviewVideo(t);
+  }, [previewVideoReady, seekPreviewVideo]);
+
+  const togglePreviewFullscreen = useCallback(async () => {
+    const container = previewContainerRef.current;
+    if (!container || !previewVideoReady) return;
+    const video = previewVideoRef.current;
+    try {
+      if (!document.fullscreenElement) {
+        previewPausedBeforeFullscreenRef.current = video?.paused ?? true;
+        previewQualityBeforeFullscreenRef.current = previewQualityLevel;
+        await container.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch {
+      /* fullscreen denied or unsupported */
+    }
+  }, [previewVideoReady, previewQualityLevel]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      const fs = document.fullscreenElement === previewContainerRef.current;
+      const video = previewVideoRef.current;
+      const hls = previewHlsRef.current;
+      setPreviewFullscreen(fs);
+
+      if (fs && hls?.levels.length) {
+        previewPausedBeforeFullscreenRef.current = video?.paused ?? true;
+        const mapped: PreviewLevelOption[] = hls.levels.map((l, i) => ({
+          index: i,
+          height: l.height,
+          label: previewLevelLabel(l.height, l.bitrate),
+        }));
+        const idx1080 = levelIndexForHeight(mapped, PREVIEW_FULLSCREEN_HEIGHT, true);
+        applyPreviewQuality(idx1080, true);
+        if (previewPausedBeforeFullscreenRef.current && video) {
+          previewSuppressPlayRef.current = true;
+          requestAnimationFrame(() => {
+            video.pause();
+            previewSuppressPlayRef.current = false;
+          });
+        }
+        return;
+      }
+
+      if (!fs && previewQualityBeforeFullscreenRef.current !== null) {
+        applyPreviewQuality(previewQualityBeforeFullscreenRef.current, true);
+        previewQualityBeforeFullscreenRef.current = null;
+        if (previewPausedBeforeFullscreenRef.current && video) {
+          previewSuppressPlayRef.current = true;
+          requestAnimationFrame(() => {
+            video.pause();
+            previewSuppressPlayRef.current = false;
+          });
+        }
+      }
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, [applyPreviewQuality]);
+
+  useEffect(() => {
+    if (!previewQualityMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const root = previewControlsRef.current;
+      if (root && !root.contains(e.target as Node)) {
+        setPreviewQualityMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [previewQualityMenuOpen]);
+
   // ── Fetch video info ──
 
   const fetchVideoInfo = useCallback(async (videoUrl: string) => {
@@ -379,20 +803,16 @@ export default function App() {
       const info = await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmed)}`);
       setVideoInfo(info);
       setQuality(bestAvailableQuality(info));
-      if (info.duration) {
-        const total = Math.floor(info.duration);
-        const h = Math.floor(total / 3600);
-        const m = Math.floor((total % 3600) / 60);
-        const s = total % 60;
-        const pad = (n: number) => n.toString().padStart(2, '0');
-        setEndTime(`${pad(h)}:${pad(m)}:${pad(s)}`);
-      }
+      const dur = info.duration ? Math.floor(info.duration) : 3600;
+      setTrimStartSec(0);
+      setTrimEndSec(Math.max(1, dur));
+      void resetPreview();
     } catch (err: any) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [resetPreview]);
 
   const handleGetInfo = useCallback(() => fetchVideoInfo(url), [url, fetchVideoInfo]);
 
@@ -456,8 +876,8 @@ export default function App() {
       setError('Choose a download folder to continue.');
       return;
     }
-    const cropStart = parseHms(startTime) > 0 ? parseHms(startTime) : undefined;
-    const cropEnd = parseHms(endTime) > 0 ? parseHms(endTime) : undefined;
+    const cropStart = trimStartSec > 0 ? trimStartSec : undefined;
+    const cropEnd = trimEndSec > 0 ? trimEndSec : undefined;
     try {
       const result = await apiPost<{ download_id: string; status: string }>('/api/download/video', {
         url: url.trim(),
@@ -472,18 +892,7 @@ export default function App() {
     } catch (err: any) {
       setError(err.message);
     }
-  }, [videoInfo, url, quality, startTime, endTime, ensureDownloadFolder]);
-
-  // ── Cancel download ──
-
-  const handleCancel = useCallback(async (id: string) => {
-    try {
-      await apiPost(`/api/download/${id}/cancel`, {});
-      refreshDownloads();
-    } catch (err: any) {
-      setError(err.message || 'Failed to cancel download');
-    }
-  }, []);
+  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder]);
 
   // ── Refresh downloads ──
 
@@ -502,6 +911,22 @@ export default function App() {
       }
     } catch {}
   }, [downloading]);
+
+  // ── Cancel download ──
+
+  const handleCancel = useCallback(async (id: string) => {
+    setActiveDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    if (downloading === id) {
+      setDownloading(null);
+      setDownloadProgress(0);
+    }
+    try {
+      await apiPost(`/api/download/${id}/cancel`, {});
+    } catch (err: any) {
+      setError(err.message || 'Failed to cancel download');
+    }
+    refreshDownloads();
+  }, [downloading, refreshDownloads]);
 
   // Poll downloads while on queue tab
   useEffect(() => {
@@ -720,12 +1145,25 @@ export default function App() {
   // ── Fill VOD from channel ──
   const selectVod = useCallback((vodUrl: string) => {
     setUrl(vodUrl);
-    setTab('url');
+    setChannelVodPanelOpen(true);
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
 
+  useEffect(() => {
+    if (previewOpen && tab === 'channels') {
+      setTab('url');
+    }
+  }, [previewOpen, tab]);
+
+  useEffect(() => {
+    if (tab !== 'channels') {
+      setChannelVodPanelOpen(false);
+    }
+  }, [tab]);
+
   // ── Size estimate ──
-  const clipSec = Math.max(0, parseHms(endTime) - parseHms(startTime));
+  const clipSec = Math.max(0, trimEndSec - trimStartSec);
+
   const rates: Record<string, number> = {
     source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
     '720p': 70, '480p': 35, '360p': 18,
@@ -733,10 +1171,340 @@ export default function App() {
   const mbPerMin = rates[quality] || 70;
   const estSize = (clipSec / 60) * mbPerMin;
 
+  const activePlatform = detectVideoPlatform(videoInfo, url);
+  const splitChannelsLayout = channelVodPanelOpen && tab === 'channels' && !previewOpen;
+  const showUrlInSidebar = splitChannelsLayout;
+  const showUrlInMainCard = tab === 'url' || previewOpen;
+  const visibleTabs: Tab[] = previewOpen
+    ? ['url', 'queue', 'settings']
+    : ['url', 'channels', 'queue', 'settings'];
+
+  const urlTabContent = (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
+        <div className="relative group">
+          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none transition-colors text-white/40">
+            <Link2 size={18} strokeWidth={3} />
+          </div>
+          <input
+            type="text"
+            value={url}
+            onChange={(e) => { setUrl(e.target.value); setVideoInfo(null); }}
+            placeholder="PASTE VOD LINK HERE..."
+            onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
+            className="w-full bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 pl-10 pr-10 py-3 focus:outline-none focus:border-white transition-colors uppercase text-sm"
+          />
+          {url && (
+            <button onClick={() => { setUrl(''); setVideoInfo(null); }}
+              className="absolute inset-y-0 right-0 pr-3 flex items-center text-zinc-500 hover:text-white">
+              <X size={18} strokeWidth={3} />
+            </button>
+          )}
+        </div>
+
+        {!videoInfo && (
+          <button
+            onClick={handleGetInfo}
+            disabled={!url || loading}
+            className={`w-full bg-zinc-800 text-white font-black uppercase py-4 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 border-2 border-zinc-700 ${actionBtnHover(urlPlatform)}`}
+          >
+            {loading ? (
+              <><Loader2 size={18} className="animate-spin" /> Loading...</>
+            ) : (
+              <><Info size={18} strokeWidth={3} /> Extract Info</>
+            )}
+          </button>
+        )}
+
+        {videoInfo && (
+          <button onClick={() => setVideoInfo(null)}
+            className="text-[10px] text-zinc-500 hover:text-white uppercase font-bold text-right tracking-widest">
+            [ Change URL ]
+          </button>
+        )}
+      </div>
+
+      {videoInfo && (
+        <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-top-2 duration-300">
+          <div className="border-2 border-zinc-800 p-3 flex gap-3 bg-zinc-900 relative overflow-hidden group">
+            <div className={`absolute top-0 right-0 w-16 h-16 opacity-20 blur-2xl transition-colors duration-500 ${
+              videoInfo.platform?.toLowerCase() === 'kick' ? 'bg-[#53fc18]' : 'bg-[#9146FF]'
+            }`} />
+            <div className="w-20 h-14 bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 overflow-hidden">
+              {videoInfo.thumbnail ? (
+                <img src={videoInfo.thumbnail} alt="" className="w-full h-full object-cover" />
+              ) : (
+                <Play size={16} className="text-zinc-500" />
+              )}
+            </div>
+            <div className="flex flex-col justify-center overflow-hidden w-full">
+              <h3 className="font-bold truncate uppercase text-xs">
+                {videoInfo.title || 'Untitled'}
+              </h3>
+              <p className="text-[10px] text-zinc-400 font-mono mt-0.5 tracking-wider">
+                Channel: {videoInfo.uploader || 'Unknown'}
+              </p>
+              {videoInfo.created_at && (
+                <p className="text-[10px] text-zinc-500 font-mono mt-0.5">
+                  {fmtDateAndAgo(videoInfo.created_at)}
+                </p>
+              )}
+              <div className="flex justify-between items-center mt-1.5 pt-1 border-t border-zinc-800/50">
+                <span className="text-[10px] text-zinc-500 font-mono flex items-center gap-1">
+                  <Clock size={10} /> {videoInfo.duration_string || fmtDuration(videoInfo.duration || 0)}
+                </span>
+                <span className="text-[10px] text-white font-mono flex items-center gap-1 bg-zinc-800 px-1.5 py-0.5 rounded-sm">
+                  <Database size={10} className={
+                    videoInfo.platform?.toLowerCase() === 'kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
+                  } /> {estSize >= 1024 ? `${(estSize/1024).toFixed(1)} GB` : `${estSize.toFixed(0)} MB`}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="flex flex-col gap-1.5">
+              <FieldCaption>
+                <span className="flex items-center gap-1"><Settings2 size={10} /> Quality</span>
+              </FieldCaption>
+              <select value={quality} onChange={(e) => setQuality(e.target.value)}
+                className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs cursor-pointer">
+                {videoInfo.qualities.length > 0 ? (
+                  videoInfo.qualities.map((q) => <option key={q} value={q.toLowerCase()}>{q}</option>)
+                ) : (
+                  <>
+                    <option value="source">Source (1080p60)</option>
+                    <option value="1080p">1080p</option>
+                    <option value="720p">720p</option>
+                    <option value="480p">480p</option>
+                    <option value="360p">360p</option>
+                  </>
+                )}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <FieldCaption>
+                <span className="flex items-center gap-1"><FastForward size={10} /> Est. Size</span>
+              </FieldCaption>
+              <div className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs flex items-center justify-center">
+                {bytes(estSize)}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <FieldCaption>
+              <span className="flex items-center gap-1"><Scissors size={10} /> Trim VOD</span>
+            </FieldCaption>
+            <div className="flex justify-between text-[10px] font-mono text-white">
+              <span>{formatHmsFull(trimStartSec)}</span>
+              <span className="text-zinc-400">{formatHmsFull(trimEndSec - trimStartSec)} clip</span>
+              <span>{formatHmsFull(trimEndSec)}</span>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[9px] font-mono text-zinc-600 uppercase">Start</span>
+              <input type="range" min={0} max={vodDurationSec} step={1} value={Math.min(trimStartSec, trimEndSec - 1)}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setTrimStartSec(Math.min(v, trimEndSec - 1));
+                }}
+                className="w-full accent-white" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[9px] font-mono text-zinc-600 uppercase">End</span>
+              <input type="range" min={0} max={vodDurationSec} step={1} value={Math.max(trimEndSec, trimStartSec + 1)}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setTrimEndSec(Math.max(v, trimStartSec + 1));
+                }}
+                className="w-full accent-white" />
+            </div>
+            <button type="button" onClick={openPreview}
+              disabled={previewVideoLoading || trimEndSec <= trimStartSec}
+              className="w-full border-2 border-zinc-700 text-zinc-300 hover:border-white hover:text-white font-mono text-[10px] uppercase font-bold py-2 flex items-center justify-center gap-1.5 disabled:opacity-40">
+              {previewVideoLoading ? <Loader2 size={12} className="animate-spin" /> : <Eye size={12} />}
+              Preview trim
+            </button>
+          </div>
+
+          <button onClick={handleStartDownload}
+            disabled={!!downloading}
+            className="w-full relative group mt-1 disabled:opacity-50">
+            <div className={`absolute inset-0 translate-x-1.5 translate-y-1.5 group-hover:translate-x-1 group-hover:translate-y-1 transition-transform ${
+              urlPlatform === 'kick' ? 'bg-[#53fc18]' : urlPlatform === 'twitch' ? 'bg-[#9146FF]' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
+            }`} />
+            <div className="relative bg-black border-2 border-white py-4 flex items-center justify-center gap-3 transition-colors group-hover:bg-white group-hover:text-black group-hover:border-white">
+              <Download size={20} strokeWidth={3} className="group-hover:animate-bounce" />
+              <span className="font-black uppercase tracking-widest text-md">Rip VOD</span>
+            </div>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 selection:bg-white selection:text-black bg-[#09090b]"
+    <div className={`min-h-screen flex justify-center p-4 selection:bg-white selection:text-black bg-[#09090b] ${
+      previewOpen ? 'items-start overflow-x-auto' : 'items-center'
+    }`}
          style={{ backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
-      <div className="relative w-full max-w-md bg-zinc-950 border-4 border-white p-6 flex flex-col gap-5 shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF] transition-all duration-300">
+      <div className={`flex items-start gap-6 transition-all duration-300 ${
+        previewOpen || splitChannelsLayout ? 'w-max max-w-none' : 'w-full justify-center'
+      }`}>
+      {previewOpen && (
+        <div
+          className={`shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 ${platformCardShadow(activePlatform, true)}`}
+          style={{ width: 'min(960px, calc(100vw - 28rem - 2rem))' }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-bold uppercase tracking-widest text-zinc-300">Trim preview</span>
+            <span className="text-[10px] font-mono text-zinc-500">HLS playback · trim sync</span>
+            <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1">
+              <X size={18} />
+            </button>
+          </div>
+          <div className="flex gap-3 items-stretch min-h-[min(54vw,540px)]">
+            <div
+              ref={previewContainerRef}
+              className="relative flex-1 min-w-0 aspect-video bg-black border-2 border-zinc-700 overflow-hidden group"
+            >
+              <video
+                ref={previewVideoRef}
+                className="w-full h-full object-contain"
+                muted={previewMuted}
+                playsInline
+                onTimeUpdate={handlePreviewTimeUpdate}
+                onPlay={() => {
+                  if (previewSuppressPlayRef.current) {
+                    previewVideoRef.current?.pause();
+                    return;
+                  }
+                  setPreviewPlaying(true);
+                }}
+                onPause={() => setPreviewPlaying(false)}
+                onClick={togglePreviewPlay}
+              />
+              {previewVideoLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                  <Loader2 size={40} className="animate-spin text-zinc-300" />
+                </div>
+              )}
+            </div>
+            <div
+              ref={previewControlsRef}
+              className="w-44 shrink-0 flex flex-col gap-2 justify-center border-l-2 border-zinc-800 pl-3"
+            >
+              <p className="text-xs font-mono text-zinc-400 text-center">
+                {formatHmsFull(previewCurrentTime)}
+              </p>
+              <div className="flex items-center gap-1">
+                <span className="text-[9px] font-mono text-zinc-600 w-10 shrink-0">{formatHmsFull(previewTrimStart)}</span>
+                <input
+                  type="range"
+                  min={previewTrimStart}
+                  max={previewTrimEnd}
+                  step={0.25}
+                  value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
+                  disabled={!previewVideoReady}
+                  onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
+                  className="flex-1 accent-white disabled:opacity-40"
+                />
+                <span className="text-[9px] font-mono text-zinc-600 w-10 shrink-0 text-right">{formatHmsFull(previewTrimEnd)}</span>
+              </div>
+              <div className="flex flex-col gap-1.5 items-stretch">
+                <button type="button" onClick={() => skipPreview(-PREVIEW_SKIP_SEC)}
+                  disabled={!previewVideoReady}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
+                  title={`Back ${PREVIEW_SKIP_SEC}s`}>
+                  <SkipBack size={16} />
+                </button>
+                <button type="button" onClick={togglePreviewPlay}
+                  disabled={!previewVideoReady}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center">
+                  {previewPlaying ? <Pause size={16} /> : <Play size={16} />}
+                </button>
+                <button type="button" onClick={() => skipPreview(PREVIEW_SKIP_SEC)}
+                  disabled={!previewVideoReady}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
+                  title={`Forward ${PREVIEW_SKIP_SEC}s`}>
+                  <SkipForward size={16} />
+                </button>
+                {previewLevels.length > 1 && (
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewQualityMenuOpen((o) => !o)}
+                      disabled={!previewVideoReady || previewFullscreen}
+                      className="w-full border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
+                      title={previewFullscreen ? 'Quality locked in fullscreen' : 'Video quality'}
+                    >
+                      <Settings size={16} />
+                    </button>
+                    {previewQualityMenuOpen && (
+                      <div className="absolute right-full top-0 mr-1 z-20 min-w-[7rem] border-2 border-zinc-600 bg-zinc-950 shadow-lg py-1">
+                        {previewLevels.map((l) => (
+                          <button
+                            key={l.index}
+                            type="button"
+                            onClick={() => applyPreviewQuality(l.index)}
+                            className={`block w-full text-left px-2 py-1 text-[10px] font-mono hover:bg-zinc-800 ${
+                              l.index === previewQualityLevel ? 'text-white' : 'text-zinc-400'
+                            }`}
+                          >
+                            {l.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                <button type="button"
+                  onClick={() => {
+                    setPreviewMuted((m) => !m);
+                    const v = previewVideoRef.current;
+                    if (v) v.muted = !previewMuted;
+                  }}
+                  disabled={!previewVideoReady}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center">
+                  {previewMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+                </button>
+                <button type="button" onClick={() => void togglePreviewFullscreen()}
+                  disabled={!previewVideoReady}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40 flex justify-center"
+                  title={previewFullscreen ? 'Exit fullscreen' : 'Fullscreen (1080p)'}>
+                  {previewFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                </button>
+              </div>
+            </div>
+          </div>
+          <p className="text-[10px] text-zinc-600 font-mono text-center">
+            Default {PREVIEW_DEFAULT_HEIGHT}p · fullscreen {PREVIEW_FULLSCREEN_HEIGHT}p
+            <span className="text-zinc-700 mx-1">·</span>
+            preview trim {formatHmsFull(previewTrimStart)} → {formatHmsFull(previewTrimEnd)}
+            <span className="text-zinc-700 mx-1">·</span>
+            hit Preview again after moving trim sliders
+          </p>
+        </div>
+      )}
+      {showUrlInSidebar && (
+        <div className={`shrink-0 w-[28rem] bg-zinc-950 border-2 border-white p-6 flex flex-col gap-5 ${platformCardShadow(activePlatform, true)}`}>
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-400">Selected VOD</span>
+            <button
+              type="button"
+              onClick={() => { setChannelVodPanelOpen(false); setVideoInfo(null); setUrl(''); }}
+              className="text-zinc-500 hover:text-white p-1"
+              title="Clear selection"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          {urlTabContent}
+        </div>
+      )}
+      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white p-6 flex flex-col gap-5 ${platformCardShadow(activePlatform)} transition-all duration-300 ${
+        previewOpen || splitChannelsLayout ? 'w-[28rem]' : 'w-full max-w-md'
+      }`}>
 
         {/* ── HEADER ── */}
         <div className="flex justify-between items-start">
@@ -756,7 +1524,7 @@ export default function App() {
 
         {/* ── TABS ── */}
         <div className="flex w-full border-2 border-zinc-800 font-mono text-[10px] uppercase font-bold tracking-widest">
-          {(['url', 'channels', 'queue', 'settings'] as Tab[]).map((t) => (
+          {visibleTabs.map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -785,169 +1553,10 @@ export default function App() {
         )}
 
         {/* ════════════════════════════ URL TAB ════════════════════════════ */}
-        {tab === 'url' && (
-          <div className="flex flex-col gap-4">
-            <div className="flex flex-col gap-2">
-              <div className="relative group">
-                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none transition-colors text-white/40">
-                  <Link2 size={18} strokeWidth={3} />
-                </div>
-                <input
-                  type="text"
-                  value={url}
-                  onChange={(e) => { setUrl(e.target.value); setVideoInfo(null); }}
-                  placeholder="PASTE VOD LINK HERE..."
-                  onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
-                  className="w-full bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 pl-10 pr-10 py-3 focus:outline-none focus:border-white transition-colors uppercase text-sm"
-                />
-                {url && (
-                  <button onClick={() => { setUrl(''); setVideoInfo(null); }}
-                    className="absolute inset-y-0 right-0 pr-3 flex items-center text-zinc-500 hover:text-white">
-                    <X size={18} strokeWidth={3} />
-                  </button>
-                )}
-              </div>
-
-              {!videoInfo && (
-                <button
-                  onClick={handleGetInfo}
-                  disabled={!url || loading}
-                  className={`w-full bg-zinc-800 text-white font-black uppercase py-4 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 border-2 border-zinc-700 ${actionBtnHover(urlPlatform)}`}
-                >
-                  {loading ? (
-                    <><Loader2 size={18} className="animate-spin" /> Loading...</>
-                  ) : (
-                    <><Info size={18} strokeWidth={3} /> Extract Info</>
-                  )}
-                </button>
-              )}
-
-              {videoInfo && (
-                <button onClick={() => setVideoInfo(null)}
-                  className="text-[10px] text-zinc-500 hover:text-white uppercase font-bold text-right tracking-widest">
-                  [ Change URL ]
-                </button>
-              )}
-            </div>
-
-            {/* Video Info */}
-            {videoInfo && (
-              <div className="flex flex-col gap-5 animate-in fade-in slide-in-from-top-2 duration-300">
-                <div className="border-2 border-zinc-800 p-3 flex gap-3 bg-zinc-900 relative overflow-hidden group">
-                  <div className={`absolute top-0 right-0 w-16 h-16 opacity-20 blur-2xl transition-colors duration-500 ${
-                    videoInfo.platform?.toLowerCase() === 'kick' ? 'bg-[#53fc18]' : 'bg-[#9146FF]'
-                  }`} />
-                  <div className="w-20 h-14 bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 overflow-hidden">
-                    {videoInfo.thumbnail ? (
-                      <img src={videoInfo.thumbnail} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <Play size={16} className="text-zinc-500" />
-                    )}
-                  </div>
-                  <div className="flex flex-col justify-center overflow-hidden w-full">
-                    <h3 className="font-bold truncate uppercase text-xs">
-                      {videoInfo.title || 'Untitled'}
-                    </h3>
-                    <p className="text-[10px] text-zinc-400 font-mono mt-0.5 tracking-wider">
-                      Channel: {videoInfo.uploader || 'Unknown'}
-                    </p>
-                    {videoInfo.created_at && (
-                      <p className="text-[10px] text-zinc-500 font-mono mt-0.5">
-                        {fmtDateAndAgo(videoInfo.created_at)}
-                      </p>
-                    )}
-                    <div className="flex justify-between items-center mt-1.5 pt-1 border-t border-zinc-800/50">
-                      <span className="text-[10px] text-zinc-500 font-mono flex items-center gap-1">
-                        <Clock size={10} /> {videoInfo.duration_string || fmtDuration(videoInfo.duration || 0)}
-                      </span>
-                      <span className="text-[10px] text-white font-mono flex items-center gap-1 bg-zinc-800 px-1.5 py-0.5 rounded-sm">
-                        <Database size={10} className={
-                          videoInfo.platform?.toLowerCase() === 'kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
-                        } /> {estSize >= 1024 ? `${(estSize/1024).toFixed(1)} GB` : `${estSize.toFixed(0)} MB`}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Quality + Trim */}
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="flex flex-col gap-1.5">
-                    <FieldCaption>
-                      <span className="flex items-center gap-1"><Settings2 size={10} /> Quality</span>
-                    </FieldCaption>
-                    <select value={quality} onChange={(e) => setQuality(e.target.value)}
-                      className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs cursor-pointer">
-                      {videoInfo.qualities.length > 0 ? (
-                        videoInfo.qualities.map((q) => <option key={q} value={q.toLowerCase()}>{q}</option>)
-                      ) : (
-                        <>
-                          <option value="source">Source (1080p60)</option>
-                          <option value="1080p">1080p</option>
-                          <option value="720p">720p</option>
-                          <option value="480p">480p</option>
-                          <option value="360p">360p</option>
-                        </>
-                      )}
-                    </select>
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <FieldCaption>
-                      <span className="flex items-center gap-1"><FastForward size={10} /> Est. Size</span>
-                    </FieldCaption>
-                    <div className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs flex items-center justify-center">
-                      {bytes(estSize)}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Trim */}
-                <div className="flex flex-col gap-2">
-                  <FieldCaption>
-                    <span className="flex items-center gap-1"><Scissors size={10} /> Trim VOD</span>
-                  </FieldCaption>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="flex flex-col gap-1">
-                      <div className="relative">
-                        <div className="absolute inset-y-0 left-0 pl-2 flex items-center pointer-events-none">
-                          <span className="text-[10px] text-zinc-500 font-mono">ST</span>
-                        </div>
-                        <input type="text" value={startTime}
-                          onChange={(e) => setStartTime(e.target.value)}
-                          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-700 pl-7 py-2 focus:outline-none focus:border-[#53fc18] text-xs text-center" />
-                      </div>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <div className="relative">
-                        <div className="absolute inset-y-0 left-0 pl-2 flex items-center pointer-events-none">
-                          <span className="text-[10px] text-zinc-500 font-mono">EN</span>
-                        </div>
-                        <input type="text" value={endTime}
-                          onChange={(e) => setEndTime(e.target.value)}
-                          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-700 pl-7 py-2 focus:outline-none focus:border-[#9146FF] text-xs text-center" />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Download Button */}
-                <button onClick={handleStartDownload}
-                  disabled={!!downloading}
-                  className="w-full relative group mt-1 disabled:opacity-50">
-                  <div className={`absolute inset-0 translate-x-1.5 translate-y-1.5 group-hover:translate-x-1 group-hover:translate-y-1 transition-transform ${
-                    urlPlatform === 'kick' ? 'bg-[#53fc18]' : urlPlatform === 'twitch' ? 'bg-[#9146FF]' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
-                  }`} />
-                  <div className="relative bg-black border-2 border-white py-4 flex items-center justify-center gap-3 transition-colors group-hover:bg-white group-hover:text-black group-hover:border-white">
-                    <Download size={20} strokeWidth={3} className="group-hover:animate-bounce" />
-                    <span className="font-black uppercase tracking-widest text-md">Rip VOD</span>
-                  </div>
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+        {showUrlInMainCard && urlTabContent}
 
         {/* ════════════════════════════ CHANNELS TAB ════════════════════════════ */}
-        {tab === 'channels' && (
+        {tab === 'channels' && !previewOpen && (
           <div className="flex flex-col gap-3">
             <div className="flex gap-2">
               <input type="text" value={addChannelInput}
@@ -1032,14 +1641,22 @@ export default function App() {
                           style={{ borderColor: color }} />
                       ) : (
                         <div
-                          className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold ${
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              (isKick ? setKickEnabled : setTwitchEnabled)((v) => !v);
+                            }
+                          }}
+                          className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold cursor-pointer select-none ${
                             enabled ? '' : 'opacity-40'
                           }`}
                           style={enabled ? { borderColor: color, color } : { borderColor: '#3f3f46' }}
                         >
-                          <input type="checkbox" checked={enabled}
-                            onChange={(e) => (isKick ? setKickEnabled : setTwitchEnabled)(e.target.checked)}
-                            className="w-3 h-3 cursor-pointer" style={{ accentColor: color }} />
+                          <input type="checkbox" checked={enabled} readOnly tabIndex={-1}
+                            className="w-3 h-3 pointer-events-none" style={{ accentColor: color }} />
                           <span>{platform}</span>
                           <span className="text-zinc-500 normal-case font-normal">{slug}</span>
                           {loading && <Loader2 size={9} className="animate-spin" />}
@@ -1047,7 +1664,10 @@ export default function App() {
                       )}
                       {!editing && (
                         <button type="button" title={`Edit ${platform} name`}
-                          onClick={() => startEditPlatformSlug(selectedChannelId!, platform)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startEditPlatformSlug(selectedChannelId!, platform);
+                          }}
                           className="absolute -top-1 -right-1 opacity-0 group-hover:opacity-100 p-0.5 bg-zinc-900 border rounded-sm"
                           style={{ borderColor: color, color }}>
                           <Pencil size={9} />
@@ -1078,10 +1698,20 @@ export default function App() {
                       const color = isTw ? '#9146FF' : '#53fc18';
                       const fullUrl = buildVodUrl(v);
                       return (
-                        <div key={`${v.platform}-${v.id}-${i}`}
-                          className="flex items-center gap-1 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600">
-                          <button type="button" onClick={() => selectVod(fullUrl)}
-                            className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 hover:text-white">
+                        <div
+                          key={`${v.platform}-${v.id}-${i}`}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => selectVod(fullUrl)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              selectVod(fullUrl);
+                            }
+                          }}
+                          className="flex items-center gap-1 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
+                        >
+                          <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                             <span className="truncate block">
                               <span style={{ color }}>{isTw ? 'TW' : 'K'}</span>
                               {' '}{v.title || 'Untitled'}
@@ -1092,10 +1722,16 @@ export default function App() {
                                 {fmtDateAndAgo(v.created_at)}
                               </span>
                             )}
-                          </button>
-                          <button type="button" title="Open in browser"
-                            onClick={() => window.open(fullUrl, '_blank', 'noopener,noreferrer')}
-                            className="text-zinc-600 hover:text-white p-0.5 shrink-0">
+                          </div>
+                          <button
+                            type="button"
+                            title="Open in browser"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              window.open(fullUrl, '_blank', 'noopener,noreferrer');
+                            }}
+                            className="text-zinc-600 hover:text-white p-1 shrink-0"
+                          >
                             <ExternalLink size={11} />
                           </button>
                         </div>
@@ -1298,6 +1934,7 @@ export default function App() {
           </div>
         )}
 
+      </div>
       </div>
 
       {/* Background */}
