@@ -152,8 +152,14 @@ def _clip_from_api_item(item: dict, slug: str) -> Optional[KickVideo]:
     )
 
 
+CLIP_MAX_DURATION_SEC = 60
+
+
 def list_channel_clips_api(slug: str, limit: int = 10) -> List[KickVideo]:
-    """Last *limit* clips by date, then ranked by views (desc)."""
+    """Last *limit* clips by date, then ranked by views (desc).
+
+    Uses Kick channel clips page/API: https://kick.com/{slug}/clips
+    """
     referer = f"{_BASE}/{slug}/clips"
     data = _get_json(f"/api/v2/channels/{slug}/clips", referer)
     raw = data.get("clips") if isinstance(data, dict) else []
@@ -165,9 +171,12 @@ def list_channel_clips_api(slug: str, limit: int = 10) -> List[KickVideo]:
         if not isinstance(item, dict):
             continue
         clip = _clip_from_api_item(item, slug)
-        if clip and clip.id not in seen:
-            seen.add(clip.id)
-            parsed.append(clip)
+        if not clip or clip.id in seen:
+            continue
+        if clip.duration is not None and clip.duration > CLIP_MAX_DURATION_SEC:
+            continue
+        seen.add(clip.id)
+        parsed.append(clip)
     parsed.sort(key=lambda c: c.created_at or "", reverse=True)
     recent = parsed[: max(1, min(int(limit), 10))]
     recent.sort(key=lambda c: c.views or 0, reverse=True)

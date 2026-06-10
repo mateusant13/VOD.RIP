@@ -194,6 +194,31 @@ def _vod_id_from_url(url: str) -> str:
     return ""
 
 
+def _clip_id_from_url(url: str) -> str:
+    lowered = (url or "").lower()
+    m = re.search(r"clips\.twitch\.tv/([^/?#]+)", lowered)
+    if m:
+        return m.group(1)[:24]
+    m = re.search(r"twitch\.tv/[^/]+/clip/([^/?#]+)", lowered)
+    if m:
+        return m.group(1)[:24]
+    m = re.search(r"kick\.com/[^/]+/clips/([^/?#]+)", lowered, re.I)
+    if m:
+        return m.group(1)[:24]
+    return ""
+
+
+def _clip_duration_tag(seconds: Optional[float]) -> str:
+    """Filesystem-safe clip length tag, e.g. clip_1m10s or clip_70s."""
+    if seconds is None or seconds <= 0:
+        return "clip"
+    sec = max(1, int(round(seconds)))
+    minutes, secs = divmod(sec, 60)
+    if minutes > 0:
+        return f"clip_{minutes}m{secs}s"
+    return f"clip_{secs}s"
+
+
 def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
     if req.output_file:
         return req.output_file
@@ -204,6 +229,19 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
     vod_id = _vod_id_from_url(req.url)
     suffix = f"_{vod_id}" if vod_id else ""
     return str(base / f"{stem}_{platform}{suffix}.mp4")
+
+
+def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
+    if req.output_file:
+        return req.output_file
+    base = _download_dir(opts)
+    title = meta.get("title") or "clip"
+    stem = _sanitize_path_component(str(title), fallback="clip")
+    platform = detect_platform(req.url).lower()
+    clip_tag = _clip_duration_tag(meta.get("duration"))
+    clip_id = _clip_id_from_url(req.url)
+    suffix = f"_{clip_id[:16]}" if clip_id else ""
+    return str(base / f"{stem}_{clip_tag}_{platform}{suffix}.mp4")
 
 
 def _tk_pick_folder() -> Optional[str]:
@@ -433,6 +471,32 @@ CHANNEL_DAYS_DEFAULT = 14
 # the upstream endpoints.
 CHANNEL_LIMIT_MAX = 100
 CHANNEL_CLIP_LIMIT = 10
+CHANNEL_CLIP_MAX_DURATION_SEC = 60
+
+
+def _looks_like_clip_entry(entry: dict) -> bool:
+    """Clips on Kick/Twitch are short (<=60s) and use clip URLs, not VOD pages."""
+    url = (entry.get("url") or "").lower()
+    if "/videos/" in url and "/clips/" not in url and "/clip/" not in url:
+        return False
+    if "/clips/" in url or "clips.twitch.tv" in url:
+        pass
+    elif "/clip/" in url:
+        pass
+    elif entry.get("content_kind") != "clip":
+        return False
+    duration = entry.get("duration")
+    if duration is not None:
+        try:
+            if float(duration) > CHANNEL_CLIP_MAX_DURATION_SEC:
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def _filter_clip_entries(entries: List[dict]) -> List[dict]:
+    return [e for e in entries if _looks_like_clip_entry(e)]
 def _parse_video_date(value) -> Optional[datetime]:
     """Best-effort parse of a video's `created_at` into an aware datetime.
     Returns None when the field is missing or unparseable, so the caller
@@ -611,6 +675,7 @@ async def channel_videos(
                     filtered.append(v)
             all_videos = filtered
         if clips_only:
+            all_videos = _filter_clip_entries(all_videos)
             all_videos.sort(key=lambda v: -(v.get("views") or 0))
         else:
             def _sort_key(v: dict) -> tuple:
@@ -625,6 +690,7 @@ async def channel_videos(
             "videos": all_videos,
             "channel": channel,
             "platforms": wanted,
+            "content": "clips" if clips_only else "vods",
             "days": days,
             "per_platform_errors": per_platform_errors,
         }
@@ -752,9 +818,7 @@ async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = detect_platform(req.url)
     meta = await _fetch_queue_meta(req.url, platform)
-    output = _build_output_path(req, opts, meta) if not req.output_file else req.output_file
-    if not req.output_file and not meta.get("title"):
-        output = str(_download_dir(opts) / "clip.mp4")
+    output = _build_clip_output_path(req, opts, meta)
     _safe_makedirs(Path(output).parent)
     download_id = download_mgr.start_download(
         url=req.url,

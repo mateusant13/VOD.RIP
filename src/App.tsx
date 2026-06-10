@@ -239,6 +239,155 @@ function formatHmsFull(sec: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+function formatClipDurationTag(sec: number): string {
+  sec = Math.max(1, Math.floor(sec));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m > 0) return `${m}m${s}s`;
+  return `${s}s`;
+}
+
+function formatClipDurationHuman(sec: number): string {
+  sec = Math.max(1, Math.floor(sec));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m > 0) return `${m}:${s.toString().padStart(2, '0')}`;
+  return `${s}s`;
+}
+
+type NeedleGlanceState = {
+  which: 'in' | 'out';
+  x: number;
+  y: number;
+  sec: number;
+  rangeStart: number;
+  rangeEnd: number;
+  deltaSec: number;
+};
+
+function NeedleGlancePopup({
+  glance,
+  vodDurationSec,
+}: {
+  glance: NeedleGlanceState | null;
+  vodDurationSec: number;
+}) {
+  if (!glance || vodDurationSec <= 0) return null;
+
+  const clipLen = Math.max(1, glance.rangeEnd - glance.rangeStart);
+  const zoomWindowSec = Math.max(30, vodDurationSec * 0.08);
+  const winStart = Math.max(0, glance.sec - zoomWindowSec / 2);
+  const winEnd = Math.min(vodDurationSec, winStart + zoomWindowSec);
+  const winDur = Math.max(1, winEnd - winStart);
+  const needlePct = ((glance.sec - winStart) / winDur) * 100;
+  const zoomSelStart = Math.max(0, ((glance.rangeStart - winStart) / winDur) * 100);
+  const zoomSelEnd = Math.min(100, ((glance.rangeEnd - winStart) / winDur) * 100);
+
+  const deltaLabel = glance.deltaSec === 0
+    ? null
+    : `${glance.deltaSec > 0 ? '+' : ''}${glance.deltaSec}s`;
+
+  return createPortal(
+    <div
+      className="needle-glance-popup fixed z-[500] pointer-events-none select-none"
+      style={{ left: Math.min(glance.x + 14, window.innerWidth - 200), top: Math.max(12, glance.y - 108) }}
+    >
+      <div className="border-2 border-zinc-500 bg-zinc-950/95 px-3 py-2 shadow-[4px_4px_0px_0px_rgba(113,113,122,0.5)] min-w-[168px]">
+        <div className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
+          {glance.which === 'in' ? 'In point' : 'Out point'}
+        </div>
+        <div className="text-2xl font-mono font-bold text-white tabular-nums leading-none">
+          {formatHmsFull(glance.sec)}
+        </div>
+        <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
+          <span>Selection</span>
+          <span className="text-zinc-200">{formatHmsFull(clipLen)}</span>
+        </div>
+        {deltaLabel && (
+          <div className="text-[10px] font-mono text-zinc-400 mt-0.5">
+            Moving <span className="text-white">{deltaLabel}</span>
+          </div>
+        )}
+        <div className="needle-glance-zoom-rail relative h-5 mt-2 rounded-sm bg-zinc-800 overflow-hidden">
+          <div
+            className="absolute top-1 bottom-1 bg-zinc-500/35 border-y border-zinc-400/50"
+            style={{ left: `${zoomSelStart}%`, width: `${Math.max(2, zoomSelEnd - zoomSelStart)}%` }}
+          />
+          <div
+            className="absolute top-0 bottom-0 w-0.5 bg-white -translate-x-1/2"
+            style={{ left: `${needlePct}%` }}
+          />
+        </div>
+        <div className="flex justify-between text-[8px] font-mono text-zinc-600 mt-0.5 tabular-nums">
+          <span>{formatHmsFull(winStart)}</span>
+          <span>{formatHmsFull(winEnd)}</span>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function DownloadConfirmDialog({
+  open,
+  title,
+  message,
+  detail,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  title: string;
+  message: string;
+  detail?: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  if (!open) return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/75 p-4"
+      onClick={onCancel}
+      role="presentation"
+    >
+      <div
+        className="border-2 border-white bg-zinc-950 max-w-md w-full p-4 font-mono shadow-[6px_6px_0px_0px_#ffffff20]"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="download-confirm-title"
+      >
+        <h3 id="download-confirm-title" className="text-sm font-black uppercase tracking-wider text-white">
+          {title}
+        </h3>
+        <p className="text-xs text-zinc-300 mt-2 leading-relaxed">{message}</p>
+        {detail && (
+          <p className="text-[10px] text-zinc-500 mt-2 border border-zinc-800 bg-zinc-900/80 px-2 py-1.5">
+            {detail}
+          </p>
+        )}
+        <div className="flex gap-2 mt-4 justify-end">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-3 py-1.5 border-2 border-zinc-700 text-zinc-400 text-[10px] font-bold uppercase hover:border-zinc-500 hover:text-white"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="px-3 py-1.5 border-2 border-white bg-white text-black text-[10px] font-black uppercase hover:bg-zinc-200"
+          >
+            Yes, download
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function EditableHmsTime({
   valueSec,
   minSec,
@@ -999,6 +1148,30 @@ function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }: { platform: st
   );
 }
 
+const CLIP_MAX_DURATION_SEC = 60;
+
+function isLikelyClip(v: ChannelVideo): boolean {
+  if (v.content_kind === 'clip') {
+    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
+    return true;
+  }
+  const url = (v.url || '').toLowerCase();
+  if (url.includes('/videos/') && !url.includes('/clips/') && !url.includes('/clip/')) {
+    return false;
+  }
+  if (url.includes('/clips/') || url.includes('clips.twitch.tv') || url.includes('/clip/')) {
+    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
+    return true;
+  }
+  return false;
+}
+
+function filterChannelVideosByContent(videos: ChannelVideo[], mode: 'vods' | 'clips'): ChannelVideo[] {
+  return mode === 'clips'
+    ? videos.filter(isLikelyClip)
+    : videos.filter((v) => !isLikelyClip(v));
+}
+
 function buildVodUrl(v: ChannelVideo): string {
   if (v.url) return v.url;
   const isTw = v.platform === 'Twitch';
@@ -1066,6 +1239,10 @@ export default function App() {
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
+  const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
+  const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
+  const trimDragOriginRef = useRef(0);
+  const urlTrimPointerRef = useRef({ x: 0, y: 0 });
 
   // Channel explore players (up to 5 floating popups)
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
@@ -1120,12 +1297,18 @@ export default function App() {
   const allChannelVideos = selectedChannel?.videos ?? [];
 
   const kickChannelVideos = useMemo(
-    () => allChannelVideos.filter((v) => v.platform === 'Kick'),
-    [allChannelVideos],
+    () => filterChannelVideosByContent(
+      allChannelVideos.filter((v) => v.platform === 'Kick'),
+      channelContentFilter,
+    ),
+    [allChannelVideos, channelContentFilter],
   );
   const twitchChannelVideos = useMemo(
-    () => allChannelVideos.filter((v) => v.platform === 'Twitch'),
-    [allChannelVideos],
+    () => filterChannelVideosByContent(
+      allChannelVideos.filter((v) => v.platform === 'Twitch'),
+      channelContentFilter,
+    ),
+    [allChannelVideos, channelContentFilter],
   );
 
   const kickBrowseLoading = selectedChannel?.loading ?? false;
@@ -1203,22 +1386,26 @@ export default function App() {
     }
   }, [previewSessionId, destroyPreviewPlayer]);
 
-  const seekPreviewVideo = useCallback((sec: number) => {
+  const seekPreviewVideo = useCallback((sec: number, force = false) => {
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
     const t = Math.max(0, Math.min(sec, vodDurationSec));
-    if (Math.abs(video.currentTime - t) > 0.3) {
+    if (force || Math.abs(video.currentTime - t) > 0.05) {
       video.currentTime = t;
       setPreviewCurrentTime(t);
     }
   }, [previewVideoReady, vodDurationSec]);
 
   const openPreview = useCallback(async () => {
-    if (!url.trim() || trimEndSec <= trimStartSec) return;
-    previewTrimStartRef.current = trimStartSec;
-    previewTrimEndRef.current = trimEndSec;
-    setPreviewTrimStart(trimStartSec);
-    setPreviewTrimEnd(trimEndSec);
+    if (!url.trim()) return;
+    const clip = isClipUrl(url.trim());
+    if (!clip && trimEndSec <= trimStartSec) return;
+    const start = clip ? 0 : trimStartSec;
+    const end = clip ? vodDurationSec : trimEndSec;
+    previewTrimStartRef.current = start;
+    previewTrimEndRef.current = end;
+    setPreviewTrimStart(start);
+    setPreviewTrimEnd(end);
     previewInitialSeekDoneRef.current = false;
     previewInitialPlayDoneRef.current = false;
     previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
@@ -1251,8 +1438,8 @@ export default function App() {
       destroyPreviewPlayer();
       const res = await apiPost<{ session_id: string; master_url: string }>('/api/preview/session', {
         url: url.trim(),
-        crop_start: trimStartSec,
-        crop_end: trimEndSec,
+        crop_start: start,
+        crop_end: end,
         prefer_height: PREVIEW_MAIN_DEFAULT_HEIGHT,
       });
       setPreviewSessionId(res.session_id);
@@ -1262,7 +1449,7 @@ export default function App() {
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
     }
-  }, [url, trimEndSec, trimStartSec, previewSessionId, destroyPreviewPlayer]);
+  }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer]);
 
   useEffect(() => {
     if (!previewOpen || !previewHlsUrl) return;
@@ -1449,17 +1636,52 @@ export default function App() {
     seekPreviewVideo(t);
   }, [seekPreviewVideo]);
 
-  const applyPreviewClipRange = useCallback((start: number, end: number) => {
+  const applyTrimRange = useCallback((
+    rawStart: number,
+    rawEnd: number,
+    opts?: { seek?: 'in' | 'out' },
+  ) => {
     const dur = Math.max(1, vodDurationSec);
-    const s = Math.max(0, Math.min(Math.floor(start), Math.floor(end) - 1));
-    const e = Math.min(dur, Math.max(Math.floor(end), s + 1));
-    setTrimStartSec(s);
-    setTrimEndSec(e);
-    previewTrimStartRef.current = s;
-    previewTrimEndRef.current = e;
-    setPreviewTrimStart(s);
-    setPreviewTrimEnd(e);
-  }, [vodDurationSec]);
+    let start = Math.floor(rawStart);
+    let end = Math.floor(rawEnd);
+    if (start >= end) {
+      if (opts?.seek === 'in') {
+        end = Math.min(dur, start + 1);
+      } else {
+        start = Math.max(0, end - 1);
+      }
+    }
+    start = Math.max(0, Math.min(start, dur - 1));
+    end = Math.min(dur, Math.max(end, start + 1));
+    setTrimStartSec(start);
+    setTrimEndSec(end);
+    previewTrimStartRef.current = start;
+    previewTrimEndRef.current = end;
+    setPreviewTrimStart(start);
+    setPreviewTrimEnd(end);
+    if (opts?.seek === 'in') seekPreviewVideo(start, true);
+    else if (opts?.seek === 'out') seekPreviewVideo(end, true);
+    return { start, end };
+  }, [vodDurationSec, seekPreviewVideo]);
+
+  const updateNeedleGlance = useCallback((
+    which: 'in' | 'out',
+    ev: PointerEvent,
+    rangeStart: number,
+    rangeEnd: number,
+    activeSec: number,
+    deltaSec: number,
+  ) => {
+    setNeedleGlance({
+      which,
+      x: ev.clientX,
+      y: ev.clientY,
+      sec: activeSec,
+      rangeStart,
+      rangeEnd,
+      deltaSec,
+    });
+  }, []);
 
   const beginPreviewNeedleDrag = useCallback((
     e: ReactPointerEvent<HTMLElement>,
@@ -1476,20 +1698,36 @@ export default function App() {
       return Math.round(frac * vodDurationSec);
     };
 
+    const dragOrigin = which === 'in' ? trimStartSec : trimEndSec;
+    trimDragOriginRef.current = dragOrigin;
     let start = trimStartSec;
     let end = trimEndSec;
 
     const onMove = (ev: PointerEvent) => {
       const sec = xToSec(ev.clientX);
       if (which === 'in') {
-        start = Math.max(0, Math.min(sec, end - 1));
+        start = sec;
+        if (start >= end) end = Math.min(vodDurationSec, start + 1);
+        start = Math.max(0, Math.min(start, end - 1));
       } else {
-        end = Math.min(vodDurationSec, Math.max(sec, start + 1));
+        end = sec;
+        if (end <= start) start = Math.max(0, end - 1);
+        end = Math.min(vodDurationSec, Math.max(end, start + 1));
       }
-      applyPreviewClipRange(start, end);
+      const applied = applyTrimRange(start, end, { seek: which });
+      const activeSec = which === 'in' ? applied.start : applied.end;
+      updateNeedleGlance(
+        which,
+        ev,
+        applied.start,
+        applied.end,
+        activeSec,
+        activeSec - dragOrigin,
+      );
     };
 
     const onUp = () => {
+      setNeedleGlance(null);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
@@ -1497,7 +1735,39 @@ export default function App() {
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     onMove(e.nativeEvent);
-  }, [trimStartSec, trimEndSec, vodDurationSec, applyPreviewClipRange]);
+  }, [trimStartSec, trimEndSec, vodDurationSec, applyTrimRange, updateNeedleGlance]);
+
+  const handleUrlTrimSlider = useCallback((
+    which: 'in' | 'out',
+    value: number,
+    pointer?: { x: number; y: number },
+  ) => {
+    const dragOrigin = trimDragOriginRef.current;
+    let start = trimStartSec;
+    let end = trimEndSec;
+    if (which === 'in') {
+      start = value;
+      if (start >= end) end = Math.min(vodDurationSec, start + 1);
+      start = Math.max(0, Math.min(start, end - 1));
+    } else {
+      end = value;
+      if (end <= start) start = Math.max(0, end - 1);
+      end = Math.min(vodDurationSec, Math.max(end, start + 1));
+    }
+    const applied = applyTrimRange(start, end, { seek: which });
+    if (pointer) {
+      const activeSec = which === 'in' ? applied.start : applied.end;
+      setNeedleGlance({
+        which,
+        x: pointer.x,
+        y: pointer.y,
+        sec: activeSec,
+        rangeStart: applied.start,
+        rangeEnd: applied.end,
+        deltaSec: activeSec - dragOrigin,
+      });
+    }
+  }, [trimStartSec, trimEndSec, vodDurationSec, applyTrimRange]);
 
   const setPreviewVolumeLevel = useCallback((level: number) => {
     const video = previewVideoRef.current;
@@ -1892,7 +2162,28 @@ export default function App() {
 
   // ── Start download ──
 
-  const handleStartDownload = useCallback(async () => {
+  const promptStartDownload = useCallback(() => {
+    if (!videoInfo) return;
+    const clipDownload = isClipUrl(url.trim());
+    if (!clipDownload && trimEndSec <= trimStartSec) {
+      setError('Set a valid trim range before downloading.');
+      return;
+    }
+    setDownloadConfirmOpen(true);
+  }, [videoInfo, url, trimStartSec, trimEndSec]);
+
+  // ── Refresh downloads ──
+
+  const refreshDownloads = useCallback(async () => {
+    try {
+      const data = await apiGet<DownloadsResponse>('/api/downloads');
+      setActiveDownloads(data.active || []);
+      setHistoryDownloads(data.history || []);
+    } catch {}
+  }, []);
+
+  const executeStartDownload = useCallback(async () => {
+    setDownloadConfirmOpen(false);
     if (!videoInfo) return;
     setError(null);
     if (!(await ensureDownloadFolder())) {
@@ -1914,23 +2205,35 @@ export default function App() {
             crop_start: trimStartSec,
             crop_end: trimEndSec,
           };
-      const result = await apiPost<{ download_id: string; status: string }>(endpoint, body);
+      await apiPost<{ download_id: string; status: string }>(endpoint, body);
       setTab('queue');
       refreshDownloads();
     } catch (err: any) {
       setError(err.message);
     }
-  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder]);
+  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder, refreshDownloads]);
 
-  // ── Refresh downloads ──
-
-  const refreshDownloads = useCallback(async () => {
-    try {
-      const data = await apiGet<DownloadsResponse>('/api/downloads');
-      setActiveDownloads(data.active || []);
-      setHistoryDownloads(data.history || []);
-    } catch {}
-  }, []);
+  const downloadConfirmCopy = useMemo(() => {
+    const clipDownload = isClipUrl(url.trim());
+    const title = videoInfo?.title || 'Untitled';
+    if (clipDownload) {
+      const dur = videoInfo?.duration
+        ? Math.floor(videoInfo.duration)
+        : Math.max(1, trimEndSec - trimStartSec);
+      const tag = formatClipDurationTag(dur);
+      const human = formatClipDurationHuman(dur);
+      return {
+        title: 'Download clip?',
+        message: `Download "${title}" (${human})?`,
+        detail: `File will include clip_${tag} in the name.`,
+      };
+    }
+    return {
+      title: 'Download trim?',
+      message: `Download "${title}" from ${formatHmsFull(trimStartSec)} to ${formatHmsFull(trimEndSec)}?`,
+      detail: `Trim length: ${formatHmsFull(trimEndSec - trimStartSec)}`,
+    };
+  }, [url, videoInfo, trimStartSec, trimEndSec]);
 
   // ── Cancel download ──
 
@@ -1973,6 +2276,7 @@ export default function App() {
     videos: ChannelVideo[];
     channel: string;
     platforms: string[];
+    content?: 'vods' | 'clips';
     days: number;
     per_platform_errors?: Record<string, string>;
   };
@@ -1985,10 +2289,15 @@ export default function App() {
     setSavedChannels((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }, []);
 
-  const refreshChannel = useCallback(async (channelId: string, channelOverride?: SavedChannel) => {
+  const refreshChannel = useCallback(async (
+    channelId: string,
+    channelOverride?: SavedChannel,
+    contentMode?: 'vods' | 'clips',
+  ) => {
     const ch = channelOverride ?? savedChannels.find((c) => c.id === channelId);
     if (!ch) return;
-    updateChannel(channelId, { loading: true });
+    const mode = contentMode ?? channelContentFilter;
+    updateChannel(channelId, { loading: true, videos: [] });
     setChannelsError(null);
     setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
     setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
@@ -1998,11 +2307,15 @@ export default function App() {
 
     try {
       const fetchOne = async (platform: 'Kick' | 'Twitch', slug: string) => {
-        const contentQs = channelContentFilter === 'clips' ? '&content=clips' : '';
+        const contentQs = mode === 'clips' ? '&content=clips' : '';
         const qs = `url=${encodeURIComponent(slug)}&limit=${CHANNEL_FETCH_LIMIT}&days=14&platforms=${encodeURIComponent(platform)}${contentQs}`;
         try {
           const data = await apiGet<ChannelResponse>(`/api/channel/videos?${qs}`);
-          merged.push(...data.videos);
+          if (data.content && data.content !== mode) {
+            errs[platform] = `Expected ${mode}, got ${data.content} — restart API (npm run dev:api)`;
+            return;
+          }
+          merged.push(...filterChannelVideosByContent(data.videos, mode));
           const pe = data.per_platform_errors?.[platform];
           if (pe) errs[platform] = pe;
         } catch (err: any) {
@@ -2057,7 +2370,7 @@ export default function App() {
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
     setAddChannelInput('');
-    await refreshChannel(id, entry);
+    await refreshChannel(id, entry, channelContentFilter);
   }, [addChannelInput, savedChannels.length, refreshChannel]);
 
   const toggleChannelSelection = useCallback((channelId: string) => {
@@ -2334,28 +2647,52 @@ export default function App() {
                 valueSec={trimStartSec}
                 minSec={0}
                 maxSec={Math.max(0, Math.min(trimEndSec - 1, vodDurationSec - 1))}
-                onChange={setTrimStartSec}
+                onChange={(sec) => handleUrlTrimSlider('in', sec)}
               />
               <EditableHmsTime
                 valueSec={trimEndSec}
                 minSec={Math.min(vodDurationSec, trimStartSec + 1)}
                 maxSec={vodDurationSec}
-                onChange={setTrimEndSec}
+                onChange={(sec) => handleUrlTrimSlider('out', sec)}
                 className="text-zinc-500"
               />
             </div>
             <input type="range" min={0} max={vodDurationSec} step={1} value={Math.min(trimStartSec, trimEndSec - 1)}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setTrimStartSec(Math.min(v, trimEndSec - 1));
+              onPointerDown={(e) => {
+                trimDragOriginRef.current = trimStartSec;
+                urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
               }}
-              className="url-trim-range w-full accent-white" />
+              onPointerMove={(e) => {
+                urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
+              }}
+              onInput={(e) => {
+                handleUrlTrimSlider(
+                  'in',
+                  Number((e.target as HTMLInputElement).value),
+                  urlTrimPointerRef.current,
+                );
+              }}
+              onPointerUp={() => setNeedleGlance(null)}
+              onPointerCancel={() => setNeedleGlance(null)}
+              className="url-trim-range w-full accent-zinc-400" />
             <input type="range" min={0} max={vodDurationSec} step={1} value={Math.max(trimEndSec, trimStartSec + 1)}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setTrimEndSec(Math.max(v, trimStartSec + 1));
+              onPointerDown={(e) => {
+                trimDragOriginRef.current = trimEndSec;
+                urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
               }}
-              className="url-trim-range w-full accent-white" />
+              onPointerMove={(e) => {
+                urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
+              }}
+              onInput={(e) => {
+                handleUrlTrimSlider(
+                  'out',
+                  Number((e.target as HTMLInputElement).value),
+                  urlTrimPointerRef.current,
+                );
+              }}
+              onPointerUp={() => setNeedleGlance(null)}
+              onPointerCancel={() => setNeedleGlance(null)}
+              className="url-trim-range w-full accent-zinc-400" />
             <button type="button" onClick={openPreview}
               disabled={previewVideoLoading || trimEndSec <= trimStartSec}
               className="w-full border border-zinc-700 text-zinc-400 hover:border-white hover:text-white font-mono text-[9px] uppercase font-bold py-1 flex items-center justify-center gap-1 disabled:opacity-40">
@@ -2365,8 +2702,17 @@ export default function App() {
           </div>
           )}
 
+          {currentIsClip && (
+            <button type="button" onClick={openPreview}
+              disabled={previewVideoLoading || vodDurationSec <= 0}
+              className="w-full border border-zinc-700 text-zinc-400 hover:border-white hover:text-white font-mono text-[9px] uppercase font-bold py-1 flex items-center justify-center gap-1 disabled:opacity-40 shrink-0">
+              {previewVideoLoading ? <Loader2 size={11} className="animate-spin" /> : <Eye size={11} />}
+              Preview clip
+            </button>
+          )}
+
           <button
-            onClick={handleStartDownload}
+            onClick={promptStartDownload}
             className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase tracking-widest transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
@@ -2561,10 +2907,10 @@ export default function App() {
       <div className="flex items-center gap-1.5 ml-auto">
         <button
           type="button"
-          onClick={() => void handleStartDownload()}
-          disabled={!previewVideoReady || !videoInfo || trimEndSec <= trimStartSec}
+          onClick={promptStartDownload}
+          disabled={!previewVideoReady || !videoInfo || (!currentIsClip && trimEndSec <= trimStartSec)}
           className={previewCtrlBtn(previewFullscreen, true)}
-          title="Download selected clip"
+          title={currentIsClip ? 'Download clip' : 'Download selected trim'}
         >
           <Scissors size={18} />
         </button>
@@ -2841,7 +3187,7 @@ export default function App() {
                       </button>
                     )}
                     <button type="button" title="Refresh"
-                      onClick={(e) => { e.stopPropagation(); refreshChannel(ch.id); }}
+                      onClick={(e) => { e.stopPropagation(); refreshChannel(ch.id, undefined, channelContentFilter); }}
                       disabled={ch.loading}
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
                       {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
@@ -2922,7 +3268,7 @@ export default function App() {
                     onClick={() => {
                       if (channelContentFilter !== 'vods') {
                         setChannelContentFilter('vods');
-                        if (selectedChannelId) void refreshChannel(selectedChannelId);
+                        if (selectedChannelId) void refreshChannel(selectedChannelId, undefined, 'vods');
                       }
                     }}
                     className={`px-2 py-0.5 border font-bold ${
@@ -2938,7 +3284,7 @@ export default function App() {
                     onClick={() => {
                       if (channelContentFilter !== 'clips') {
                         setChannelContentFilter('clips');
-                        if (selectedChannelId) void refreshChannel(selectedChannelId);
+                        if (selectedChannelId) void refreshChannel(selectedChannelId, undefined, 'clips');
                       }
                     }}
                     className={`px-2 py-0.5 border font-bold ${
@@ -3244,6 +3590,16 @@ export default function App() {
       <div className="fixed bottom-10 right-10 text-zinc-800 font-black text-9xl opacity-10 pointer-events-none select-none z-[-1] blur-sm">
         TWITCH
       </div>
+
+      <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
+      <DownloadConfirmDialog
+        open={downloadConfirmOpen}
+        title={downloadConfirmCopy.title}
+        message={downloadConfirmCopy.message}
+        detail={downloadConfirmCopy.detail}
+        onConfirm={() => void executeStartDownload()}
+        onCancel={() => setDownloadConfirmOpen(false)}
+      />
     </div>
   );
 }

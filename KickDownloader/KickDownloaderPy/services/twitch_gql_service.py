@@ -188,8 +188,16 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
     return out
 
 
+CLIP_MAX_DURATION_SEC = 60
+# Twitch clips page uses ?range=7d — maps to LAST_WEEK in GQL.
+TWITCH_CLIPS_RANGE_FILTER = "LAST_WEEK"
+
+
 def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """Return the *limit* most recent clips, ranked by view count (desc)."""
+    """Return the *limit* most recent clips (<=60s), ranked by view count (desc).
+
+    Equivalent to https://www.twitch.tv/{login}/clips?range=7d
+    """
     login = (login or "").strip().lower()
     if not login:
         return []
@@ -202,7 +210,7 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
         {
             "login": login,
             "limit": fetch_n,
-            "criteria": {"filter": "LAST_WEEK"},
+            "criteria": {"filter": TWITCH_CLIPS_RANGE_FILTER},
         },
     )
     user = data.get("user")
@@ -216,6 +224,12 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
         if not slug:
             continue
         duration = node.get("durationSeconds")
+        if duration is not None:
+            try:
+                if float(duration) > CLIP_MAX_DURATION_SEC:
+                    continue
+            except (TypeError, ValueError):
+                pass
         clip_url = node.get("url") or f"https://clips.twitch.tv/{slug}"
         parsed.append({
             "id": str(node.get("id") or slug),
