@@ -269,6 +269,35 @@ def _find_ffmpeg() -> Optional[str]:
 # Core service
 # ---------------------------------------------------------------------------
 
+def _qualities_from_formats(formats: list, is_clip: bool = False) -> list[str]:
+    """Build sorted quality labels (e.g. 1080p) from yt-dlp format entries."""
+    qualities: list[str] = []
+    for f in formats:
+        h = f.get("height")
+        if not h or h <= 0:
+            continue
+        fid = (f.get("format_id") or "")
+        fid_lower = fid.lower()
+        if fid_lower.startswith("portrait"):
+            continue
+        if "Audio" in fid:
+            continue
+        ext = (f.get("ext") or "").lower()
+        vcodec = f.get("vcodec") or "none"
+        if is_clip:
+            if ext not in ("mp4", "m4v", "mov", "webm"):
+                continue
+        elif vcodec == "none":
+            continue
+        fps = f.get("fps")
+        fps_suffix = "60" if fps and fps > 30 else ""
+        label = f"{int(h)}p{fps_suffix}"
+        if label not in qualities:
+            qualities.append(label)
+    qualities.sort(key=lambda q: int(re.search(r"\d+", q).group()), reverse=True)
+    return qualities
+
+
 async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     """Extract video metadata without downloading."""
     import asyncio
@@ -300,18 +329,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         raise ValueError("Could not extract video info")
 
     formats = info.get("formats", [])
-    qualities = []
-    for f in formats:
-        h = f.get("height")
-        fps = f.get("fps")
-        vcodec = f.get("vcodec", "none")
-        fid = f.get("format_id", "")
-        if h and h > 0 and vcodec != "none" and "Audio" not in fid:
-            fps_suffix = "60" if fps and fps > 30 else ""
-            label = f"{h}p{fps_suffix}"
-            if label not in qualities:
-                qualities.append(label)
-    qualities.sort(key=lambda q: int(re.search(r"\d+", q).group()), reverse=True)
+    qualities = _qualities_from_formats(formats, is_clip_url(full_url))
 
     created_at = info.get("upload_date")
     if not created_at and info.get("timestamp"):

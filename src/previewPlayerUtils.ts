@@ -72,6 +72,37 @@ export function initialPreviewPreferHeight(isClip: boolean, playerCap: number): 
   return Math.min(desired, playerCap);
 }
 
+/** Stream height to fetch: full request in fullscreen, capped to player size otherwise. */
+export function effectivePreviewHeight(
+  requestedHeight: number,
+  playerCap: number,
+  fullscreen: boolean,
+): number {
+  if (!Number.isFinite(requestedHeight) || requestedHeight <= 0) {
+    return fullscreen ? 1080 : playerCap;
+  }
+  if (fullscreen) return requestedHeight;
+  return Math.min(requestedHeight, playerCap);
+}
+
+/** Pick the highest available tier that does not exceed the target height. */
+export function snapHeightToTier(heights: number[], target: number): number {
+  const tiers = [...new Set(heights.filter((h) => h > 0))].sort((a, b) => a - b);
+  if (!tiers.length) return target;
+  const atOrBelow = tiers.filter((h) => h <= target);
+  return atOrBelow.length ? atOrBelow[atOrBelow.length - 1] : tiers[0];
+}
+
+export function playbackHeightFromRequest(
+  requestedHeight: number,
+  availableHeights: number[],
+  playerCap: number,
+  fullscreen: boolean,
+): number {
+  const effective = effectivePreviewHeight(requestedHeight, playerCap, fullscreen);
+  return snapHeightToTier(availableHeights, effective);
+}
+
 export function parseQualityHeights(qualities: string[]): number[] {
   const heights = qualities
     .map((q) => {
@@ -287,6 +318,43 @@ export function resolveProgressivePreviewLevels(
     mapped,
     defaultIndex: levelIndexForHeight(mapped, opts.initialHeight),
   };
+}
+
+export type ProgressivePreviewMeta = {
+  variantHeights?: number[];
+  qualityLabels?: string[];
+  initialHeight: number;
+};
+
+/** Merge session + optional clip-info qualities; fetch clip info only when still empty. */
+export async function resolveProgressivePreviewLevelsAsync(
+  pageUrl: string,
+  meta: ProgressivePreviewMeta,
+  fetchClipQualities?: (url: string) => Promise<string[] | undefined>,
+): Promise<{ mapped: PreviewLevelOption[]; defaultIndex: number; qualityLabels?: string[] }> {
+  let qualityLabels = meta.qualityLabels;
+  let result = resolveProgressivePreviewLevels({
+    variantHeights: meta.variantHeights,
+    qualityLabels,
+    initialHeight: meta.initialHeight,
+  });
+  if (result.mapped.length || !isClipPreviewUrl(pageUrl) || !fetchClipQualities) {
+    return result;
+  }
+  try {
+    const fetched = await fetchClipQualities(pageUrl);
+    if (fetched?.length) {
+      qualityLabels = fetched;
+      result = resolveProgressivePreviewLevels({
+        variantHeights: meta.variantHeights,
+        qualityLabels,
+        initialHeight: meta.initialHeight,
+      });
+    }
+  } catch {
+    /* keep empty */
+  }
+  return { ...result, qualityLabels };
 }
 
 export function applyHlsQualityLevel(

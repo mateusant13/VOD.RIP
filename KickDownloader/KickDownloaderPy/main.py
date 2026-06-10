@@ -41,6 +41,7 @@ from services.preview_service import (
     proxy_segment,
     resolve_upstream,
     session_active_height,
+    session_quality_labels,
     session_variant_heights,
     set_session_prefer_height,
     _is_playlist_url,
@@ -445,6 +446,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         playback_url=playback,
         kind=session.kind,
         variant_heights=session_variant_heights(session),
+        quality_labels=session_quality_labels(session),
         active_height=session_active_height(session),
     )
 

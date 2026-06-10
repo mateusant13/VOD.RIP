@@ -705,6 +705,19 @@ def _heights_from_master_text(text: str) -> List[int]:
     return sorted(set(heights))
 
 
+def session_quality_labels(session: PreviewSession) -> List[str]:
+    """Human-readable quality tiers for the preview quality menu."""
+    heights = session_variant_heights(session)
+    if not heights:
+        return []
+    labels: List[str] = []
+    for height in heights:
+        label = f"{height}p"
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 def session_variant_heights(session: PreviewSession) -> List[int]:
     heights = sorted({h for h, _ in session.variant_entries if h > 0})
     if heights:

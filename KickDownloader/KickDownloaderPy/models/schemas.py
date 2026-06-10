@@ -89,6 +89,7 @@ class PreviewSessionResponse(BaseModel):
     playback_url: str  # alias for master_url (frontend compat)
     kind: str = "hls"  # "hls" (default) or "progressive" for direct MP4 sources
     variant_heights: List[int] = []
+    quality_labels: List[str] = []
     active_height: int = 0
 
 

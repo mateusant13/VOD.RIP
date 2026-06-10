@@ -12,11 +12,15 @@ import {
   detachProgressivePreview,
   inferLevelHeight,
   initialPreviewPreferHeight,
+  levelIndexForHeight,
   measurePlayerHeightCap,
+  playbackHeightFromRequest,
   mergeVariantHeights,
   resolveHlsPreviewLevels,
+  isClipPreviewUrl,
   resolvePreviewPlayback,
   resolveProgressivePreviewLevels,
+  resolveProgressivePreviewLevelsAsync,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import {
@@ -74,6 +78,20 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+  } catch {
+    throw new Error(BACKEND_HINT);
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiGet<T>(path: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`);
   } catch {
     throw new Error(BACKEND_HINT);
   }
@@ -142,6 +160,7 @@ export default function ChannelExplorePopup({
     url: string;
     kind: 'hls' | 'progressive';
     variantHeights?: number[];
+    qualityLabels?: string[];
     activeHeight?: number;
   } | null>(null);
   const [loading, setLoading] = useState(true);
@@ -165,6 +184,13 @@ export default function ChannelExplorePopup({
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const sessionMetaRef = useRef<{
+    variantHeights: number[];
+    qualityLabels?: string[];
+    activeHeight: number;
+  } | null>(null);
+  const requestedHeightRef = useRef(0);
+  const appliedHeightRef = useRef(0);
   const fsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialPlayDoneRef = useRef(false);
   const panelWidthRef = useRef(EXPLORE_PANEL_DEFAULT_W);
@@ -205,17 +231,25 @@ export default function ChannelExplorePopup({
     setPreviewLevels([]);
     setQualityLevel(0);
     setQualityMenuOpen(false);
+    requestedHeightRef.current = 0;
+    appliedHeightRef.current = 0;
 
     (async () => {
       try {
         const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
         const preferHeight = initialPreviewPreferHeight(vod.isClip, playerCap);
+        const clipInfoPromise = vod.isClip
+          ? apiGet<{ qualities?: string[] }>(
+            `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
+          ).catch(() => null)
+          : Promise.resolve(null);
         const res = await apiPost<{
           session_id: string;
           master_url: string;
           playback_url?: string;
           kind?: string;
           variant_heights?: number[];
+          quality_labels?: string[];
           active_height?: number;
         }>('/api/preview/session', {
           url: vod.url,
@@ -223,16 +257,27 @@ export default function ChannelExplorePopup({
           crop_end: vod.durationSec,
           prefer_height: preferHeight,
         });
+        const clipInfo = await clipInfoPromise;
         if (cancelled) {
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;
         }
+        const mergedQualityLabels = clipInfo?.qualities?.length
+          ? clipInfo.qualities
+          : (res.quality_labels?.length ? res.quality_labels : undefined);
+        const activeHeight = res.active_height ?? preferHeight;
+        sessionMetaRef.current = {
+          variantHeights: res.variant_heights ?? [],
+          qualityLabels: mergedQualityLabels,
+          activeHeight,
+        };
         sessionIdRef.current = res.session_id;
         const resolved = resolvePreviewPlayback(vod.url, res);
         setPlayback({
           ...resolved,
-          variantHeights: res.variant_heights,
-          activeHeight: res.active_height ?? preferHeight,
+          variantHeights: res.variant_heights ?? [],
+          qualityLabels: mergedQualityLabels,
+          activeHeight,
         });
       } catch (err: unknown) {
         if (!cancelled) {
@@ -257,65 +302,108 @@ export default function ChannelExplorePopup({
       }
       const sid = sessionIdRef.current;
       sessionIdRef.current = null;
+      sessionMetaRef.current = null;
       if (sid) {
         void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
       }
     };
   }, [vod.url, vod.durationSec]);
 
-  const applyQuality = useCallback(async (levelIndex: number) => {
-    const level = previewLevels[levelIndex];
+  const measureExplorePlayerCap = useCallback(
+    () => measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current),
+    [],
+  );
+
+  const applyPlaybackHeight = useCallback(async (playbackHeight: number) => {
+    if (!playbackHeight || playbackHeight === appliedHeightRef.current) return;
+    appliedHeightRef.current = playbackHeight;
+
+    const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
+    const level = previewLevels[menuIndex];
+    if (!level) return;
+
     const video = videoRef.current;
     const wasPaused = video?.paused ?? true;
 
-    if (playback?.kind === 'progressive' && sessionIdRef.current && level) {
+    if (playback?.kind === 'progressive' && sessionIdRef.current) {
       try {
         await apiPost(`/api/preview/session/${sessionIdRef.current}/quality`, {
-          prefer_height: level.height,
+          prefer_height: playbackHeight,
         });
         if (video && playback.url) {
-          attachProgressivePreview(video, playback.url);
+          const bust = `t=${Date.now()}`;
+          const sep = playback.url.includes('?') ? '&' : '?';
+          attachProgressivePreview(video, `${playback.url}${sep}${bust}`);
           if (!wasPaused) void video.play().catch(() => {});
         }
       } catch (err: unknown) {
+        appliedHeightRef.current = 0;
         setError(err instanceof Error ? err.message : 'Could not change preview quality');
       }
-      setQualityLevel(levelIndex);
-      setQualityMenuOpen(false);
       return;
     }
 
     const hls = hlsRef.current;
-    if (hls && level) {
-      const hlsIndex = level.index;
-      const hlsLevel = hls.levels[hlsIndex];
-      const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
-      const needsApiSwitch = !hlsHeight || hlsHeight !== level.height;
+    if (!hls) return;
 
-      if (needsApiSwitch && sessionIdRef.current) {
-        try {
-          await apiPost(`/api/preview/session/${sessionIdRef.current}/quality`, {
-            prefer_height: level.height,
-          });
-          hls.loadSource(playback?.url ?? hls.url ?? '');
-          hls.startLoad();
-        } catch (err: unknown) {
-          setError(err instanceof Error ? err.message : 'Could not change preview quality');
-        }
-      } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-        applyHlsQualityLevel(hls, hlsIndex);
-        if (wasPaused && video) {
-          suppressPlayRef.current = true;
-          requestAnimationFrame(() => {
-            video.pause();
-            suppressPlayRef.current = false;
-          });
-        }
+    const hlsIndex = level.index;
+    const hlsLevel = hls.levels[hlsIndex];
+    const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
+    const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
+
+    if (needsApiSwitch && sessionIdRef.current) {
+      try {
+        await apiPost(`/api/preview/session/${sessionIdRef.current}/quality`, {
+          prefer_height: playbackHeight,
+        });
+        hls.loadSource(playback?.url ?? hls.url ?? '');
+        hls.startLoad();
+      } catch (err: unknown) {
+        appliedHeightRef.current = 0;
+        setError(err instanceof Error ? err.message : 'Could not change preview quality');
+      }
+    } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+      applyHlsQualityLevel(hls, hlsIndex);
+      if (wasPaused && video) {
+        suppressPlayRef.current = true;
+        requestAnimationFrame(() => {
+          video.pause();
+          suppressPlayRef.current = false;
+        });
       }
     }
+  }, [previewLevels, playback]);
+
+  const syncPlaybackToViewport = useCallback(async (fullscreenOverride?: boolean) => {
+    if (!ready || !previewLevels.length) return;
+    const requested = requestedHeightRef.current
+      || previewLevels[qualityLevel]?.height
+      || PREVIEW_CLIP_DEFAULT_HEIGHT;
+    const playbackHeight = playbackHeightFromRequest(
+      requested,
+      previewLevels.map((l) => l.height),
+      measureExplorePlayerCap(),
+      fullscreenOverride ?? fullscreen,
+    );
+    await applyPlaybackHeight(playbackHeight);
+  }, [
+    applyPlaybackHeight,
+    fullscreen,
+    measureExplorePlayerCap,
+    previewLevels,
+    qualityLevel,
+    ready,
+  ]);
+
+  const applyQuality = useCallback(async (levelIndex: number) => {
+    const level = previewLevels[levelIndex];
+    if (!level) return;
+    requestedHeightRef.current = level.height;
     setQualityLevel(levelIndex);
     setQualityMenuOpen(false);
-  }, [previewLevels, playback]);
+    appliedHeightRef.current = 0;
+    await syncPlaybackToViewport();
+  }, [previewLevels, syncPlaybackToViewport]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -453,10 +541,18 @@ export default function ChannelExplorePopup({
         const p = layoutExplorePopupWindow(el, panelWidthRef.current, posRef, stackIndex);
         setPos(p);
       }
+      appliedHeightRef.current = 0;
+      void syncPlaybackToViewport(fs);
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, [stackIndex]);
+  }, [stackIndex, syncPlaybackToViewport]);
+
+  useEffect(() => {
+    if (!ready || fullscreen) return;
+    appliedHeightRef.current = 0;
+    void syncPlaybackToViewport();
+  }, [ready, fullscreen, panelWidth, videoAspect, syncPlaybackToViewport]);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -529,18 +625,50 @@ export default function ChannelExplorePopup({
       }
     };
 
-    if (playbackKind === 'progressive') {
-      const activeH = playback.activeHeight ?? PREVIEW_CLIP_DEFAULT_HEIGHT;
-      const { mapped, defaultIndex } = resolveProgressivePreviewLevels({
-        variantHeights: playback.variantHeights,
+    if (playbackKind === 'progressive' || isClipPreviewUrl(vod.url)) {
+      const meta = sessionMetaRef.current;
+      const activeH = meta?.activeHeight
+        ?? playback.activeHeight
+        ?? PREVIEW_CLIP_DEFAULT_HEIGHT;
+      const syncProgressiveLevels = (
+        mapped: PreviewLevelOption[],
+        defaultIndex: number,
+      ) => {
+        if (cancelled) return;
+        setPreviewLevels(mapped);
+        setQualityLevel(defaultIndex);
+        const picked = mapped[defaultIndex];
+        if (picked?.height) requestedHeightRef.current = picked.height;
+      };
+      const levelOpts = {
+        variantHeights: meta?.variantHeights ?? playback.variantHeights,
+        qualityLabels: meta?.qualityLabels ?? playback.qualityLabels,
         initialHeight: activeH,
-      });
-      setPreviewLevels(mapped);
-      setQualityLevel(defaultIndex);
+      };
+      const immediate = resolveProgressivePreviewLevels(levelOpts);
+      syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
+      void resolveProgressivePreviewLevelsAsync(
+        vod.url,
+        levelOpts,
+        async (clipUrl) => {
+          const info = await apiGet<{ qualities?: string[] }>(
+            `/api/info/clip?id=${encodeURIComponent(clipUrl)}`,
+          );
+          return info.qualities;
+        },
+      ).then(({ mapped, defaultIndex, qualityLabels: resolvedLabels }) => {
+        if (resolvedLabels?.length && meta) {
+          sessionMetaRef.current = { ...meta, qualityLabels: resolvedLabels };
+        }
+        if (mapped.length !== immediate.mapped.length) {
+          syncProgressiveLevels(mapped, defaultIndex);
+        }
+      }).catch(() => { /* keep immediate levels */ });
       const onVideoError = () => {
         setError('Clip preview failed — try again');
         setLoading(false);
       };
+      appliedHeightRef.current = activeH;
       attachProgressivePreview(video, playbackUrl);
       video.addEventListener('canplay', onCanPlay, { once: true });
       video.addEventListener('error', onVideoError, { once: true });
@@ -588,9 +716,12 @@ export default function ChannelExplorePopup({
             const levelHeight = inferLevelHeight(hls.levels[hlsIndex]);
             if (levelHeight > 0) {
               hls.loadLevel = hlsIndex;
+              appliedHeightRef.current = levelHeight;
             }
           }
           setQualityLevel(defaultIndex);
+          const picked = mapped[defaultIndex];
+          if (picked?.height) requestedHeightRef.current = picked.height;
         }
       };
 

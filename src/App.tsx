@@ -18,13 +18,17 @@ import {
   attachProgressivePreview,
   detachProgressivePreview,
   initialPreviewPreferHeight,
+  levelIndexForHeight,
   maxQualityLabelFromList,
   measurePlayerHeightCap,
+  playbackHeightFromRequest,
   mergeVariantHeights,
   parseQualityHeights,
   resolveHlsPreviewLevels,
+  isClipPreviewUrl,
   resolvePreviewPlayback,
   resolveProgressivePreviewLevels,
+  resolveProgressivePreviewLevelsAsync,
   inferLevelHeight,
   suggestClipDownloadName,
   type PreviewLevelOption,
@@ -1474,6 +1478,7 @@ export default function App() {
     url: string;
     kind: 'hls' | 'progressive';
     variantHeights?: number[];
+    qualityLabels?: string[];
     activeHeight?: number;
   } | null>(null);
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
@@ -1505,6 +1510,14 @@ export default function App() {
   const previewSuppressPlayRef = useRef(false);
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
+  const previewSessionMetaRef = useRef<{
+    variantHeights: number[];
+    qualityLabels?: string[];
+    activeHeight: number;
+  } | null>(null);
+  /** Menu selection — may exceed on-screen playback height until fullscreen. */
+  const previewRequestedHeightRef = useRef(0);
+  const previewAppliedHeightRef = useRef(0);
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
@@ -1664,6 +1677,9 @@ export default function App() {
     setPreviewQualityLevel(0);
     setPreviewQualityMenuOpen(false);
     setPreviewVolumeMenuOpen(false);
+    previewSessionMetaRef.current = null;
+    previewRequestedHeightRef.current = 0;
+    previewAppliedHeightRef.current = 0;
     previewInitialSeekDoneRef.current = false;
     previewInitialPlayDoneRef.current = false;
     if (sid) {
@@ -1727,12 +1743,26 @@ export default function App() {
         previewVideoAspectRef.current,
       );
       const previewPreferHeight = initialPreviewPreferHeight(clipPreview, playerCap);
+      let qualityLabels = videoInfo?.qualities;
+      if (clipPreview && !qualityLabels?.length) {
+        try {
+          const clipInfo = await apiGet<VideoInfo>(
+            `/api/info/clip?id=${encodeURIComponent(url.trim())}`,
+          );
+          if (clipInfo.qualities?.length) {
+            qualityLabels = clipInfo.qualities;
+          }
+        } catch {
+          /* variant_heights from preview session is the primary source */
+        }
+      }
       const res = await apiPost<{
         session_id: string;
         master_url: string;
         playback_url?: string;
         kind?: string;
         variant_heights?: number[];
+        quality_labels?: string[];
         active_height?: number;
       }>('/api/preview/session', {
         url: url.trim(),
@@ -1740,19 +1770,29 @@ export default function App() {
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
+      const mergedQualityLabels = qualityLabels?.length
+        ? qualityLabels
+        : (res.quality_labels?.length ? res.quality_labels : undefined);
+      const activeHeight = res.active_height ?? previewPreferHeight;
+      previewSessionMetaRef.current = {
+        variantHeights: res.variant_heights ?? [],
+        qualityLabels: mergedQualityLabels,
+        activeHeight,
+      };
       setPreviewSessionId(res.session_id);
       const playback = resolvePreviewPlayback(url.trim(), res);
       setPreviewPlayback({
         ...playback,
-        variantHeights: res.variant_heights,
-        activeHeight: res.active_height ?? previewPreferHeight,
+        variantHeights: res.variant_heights ?? [],
+        qualityLabels: mergedQualityLabels,
+        activeHeight,
       });
     } catch (err: any) {
       setError(err.message || 'Preview failed');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
     }
-  }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer]);
+  }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo?.qualities]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -1800,19 +1840,55 @@ export default function App() {
       }
     };
 
-    if (playbackKind === 'progressive') {
-      const activeH = previewPlayback.activeHeight ?? PREVIEW_CLIP_DEFAULT_HEIGHT;
-      const { mapped, defaultIndex } = resolveProgressivePreviewLevels({
-        variantHeights: previewPlayback.variantHeights,
-        qualityLabels: videoInfo?.qualities,
+    if (playbackKind === 'progressive' || isClipPreviewUrl(url.trim())) {
+      const meta = previewSessionMetaRef.current;
+      const activeH = meta?.activeHeight
+        ?? previewPlayback.activeHeight
+        ?? PREVIEW_CLIP_DEFAULT_HEIGHT;
+      const syncProgressiveLevels = (
+        mapped: PreviewLevelOption[],
+        defaultIndex: number,
+      ) => {
+        if (cancelled) return;
+        setPreviewLevels(mapped);
+        setPreviewQualityLevel(defaultIndex);
+        const picked = mapped[defaultIndex];
+        if (picked?.height) previewRequestedHeightRef.current = picked.height;
+      };
+      const levelOpts = {
+        variantHeights: meta?.variantHeights ?? previewPlayback.variantHeights,
+        qualityLabels: meta?.qualityLabels
+          ?? previewPlayback.qualityLabels
+          ?? videoInfo?.qualities,
         initialHeight: activeH,
-      });
-      setPreviewLevels(mapped);
-      setPreviewQualityLevel(defaultIndex);
+      };
+      const immediate = resolveProgressivePreviewLevels(levelOpts);
+      syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
+      void resolveProgressivePreviewLevelsAsync(
+        url.trim(),
+        levelOpts,
+        async (clipUrl) => {
+          const clipInfo = await apiGet<VideoInfo>(
+            `/api/info/clip?id=${encodeURIComponent(clipUrl)}`,
+          );
+          return clipInfo.qualities;
+        },
+      ).then(({ mapped, defaultIndex, qualityLabels: resolvedLabels }) => {
+        if (resolvedLabels?.length && meta) {
+          previewSessionMetaRef.current = {
+            ...meta,
+            qualityLabels: resolvedLabels,
+          };
+        }
+        if (mapped.length !== immediate.mapped.length) {
+          syncProgressiveLevels(mapped, defaultIndex);
+        }
+      }).catch(() => { /* keep immediate levels */ });
       const onVideoError = () => {
         setError('Clip preview failed — try again');
         setPreviewVideoLoading(false);
       };
+      previewAppliedHeightRef.current = activeH;
       attachProgressivePreview(video, playbackUrl);
       video.addEventListener('canplay', onCanPlay, { once: true });
       video.addEventListener('error', onVideoError, { once: true });
@@ -1866,9 +1942,12 @@ export default function App() {
             const levelHeight = inferLevelHeight(hls.levels[hlsIndex]);
             if (levelHeight > 0) {
               hls.loadLevel = hlsIndex;
+              previewAppliedHeightRef.current = levelHeight;
             }
           }
           setPreviewQualityLevel(defaultIndex);
+          const picked = mapped[defaultIndex];
+          if (picked?.height) previewRequestedHeightRef.current = picked.height;
         }
       };
 
@@ -1924,7 +2003,7 @@ export default function App() {
       cancelled = true;
       cleanup?.();
     };
-  }, [previewOpen, previewPlayback, url, videoInfo?.qualities]);
+  }, [previewOpen, previewPlayback, url]);
 
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
@@ -1958,61 +2037,113 @@ export default function App() {
     }
   }, [previewVideoReady]);
 
-  const applyPreviewQuality = useCallback(async (levelIndex: number, forceLoad = false) => {
-    const level = previewLevels[levelIndex];
+  const measurePreviewPlayerCap = useCallback(
+    () => measurePlayerHeightCap(
+      previewContainerRef.current ?? previewPanelRef.current,
+      previewVideoAspectRef.current,
+    ),
+    [],
+  );
+
+  const applyPreviewPlaybackHeight = useCallback(async (
+    playbackHeight: number,
+    forceLoad = false,
+  ) => {
+    if (!playbackHeight || playbackHeight === previewAppliedHeightRef.current) return;
+    previewAppliedHeightRef.current = playbackHeight;
+
+    const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
+    const level = previewLevels[menuIndex];
+    if (!level) return;
+
     const video = previewVideoRef.current;
     const wasPaused = video?.paused ?? true;
 
-    if (previewPlayback?.kind === 'progressive' && previewSessionId && level) {
+    if (previewPlayback?.kind === 'progressive' && previewSessionId) {
       try {
         await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
-          prefer_height: level.height,
+          prefer_height: playbackHeight,
         });
         if (video && previewPlayback.url) {
-          attachProgressivePreview(video, previewPlayback.url);
+          const bust = `t=${Date.now()}`;
+          const sep = previewPlayback.url.includes('?') ? '&' : '?';
+          attachProgressivePreview(video, `${previewPlayback.url}${sep}${bust}`);
           if (!wasPaused) void video.play().catch(() => {});
         }
       } catch (err: unknown) {
+        previewAppliedHeightRef.current = 0;
         const msg = err instanceof Error ? err.message : 'Could not change preview quality';
         setError(msg);
       }
-      setPreviewQualityLevel(levelIndex);
-      setPreviewQualityMenuOpen(false);
       return;
     }
 
     const hls = previewHlsRef.current;
-    if (hls && level) {
-      const hlsIndex = level.index;
-      const hlsLevel = hls.levels[hlsIndex];
-      const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
-      const needsApiSwitch = !hlsHeight || hlsHeight !== level.height;
+    if (!hls) return;
 
-      if (needsApiSwitch && previewSessionId) {
-        try {
-          await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
-            prefer_height: level.height,
-          });
-          hls.loadSource(previewPlayback?.url ?? hls.url ?? '');
-          hls.startLoad();
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : 'Could not change preview quality';
-          setError(msg);
-        }
-      } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-        applyHlsQualityLevel(hls, hlsIndex, forceLoad);
-        if (wasPaused && video) {
-          previewSuppressPlayRef.current = true;
-          requestAnimationFrame(() => {
-            video.pause();
-            previewSuppressPlayRef.current = false;
-          });
-        }
+    const hlsIndex = level.index;
+    const hlsLevel = hls.levels[hlsIndex];
+    const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
+    const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
+
+    if (needsApiSwitch && previewSessionId) {
+      try {
+        await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
+          prefer_height: playbackHeight,
+        });
+        hls.loadSource(previewPlayback?.url ?? hls.url ?? '');
+        hls.startLoad();
+      } catch (err: unknown) {
+        previewAppliedHeightRef.current = 0;
+        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
+        setError(msg);
+      }
+    } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+      applyHlsQualityLevel(hls, hlsIndex, forceLoad);
+      if (wasPaused && video) {
+        previewSuppressPlayRef.current = true;
+        requestAnimationFrame(() => {
+          video.pause();
+          previewSuppressPlayRef.current = false;
+        });
       }
     }
+  }, [previewLevels, previewPlayback, previewSessionId]);
+
+  const syncPreviewPlaybackToViewport = useCallback(async (
+    forceLoad = false,
+    fullscreenOverride?: boolean,
+  ) => {
+    if (!previewVideoReady || !previewLevels.length) return;
+    const requested = previewRequestedHeightRef.current
+      || previewLevels[previewQualityLevel]?.height
+      || PREVIEW_MAIN_DEFAULT_HEIGHT;
+    const availableHeights = previewLevels.map((l) => l.height);
+    const playbackHeight = playbackHeightFromRequest(
+      requested,
+      availableHeights,
+      measurePreviewPlayerCap(),
+      fullscreenOverride ?? previewFullscreen,
+    );
+    await applyPreviewPlaybackHeight(playbackHeight, forceLoad);
+  }, [
+    applyPreviewPlaybackHeight,
+    measurePreviewPlayerCap,
+    previewFullscreen,
+    previewLevels,
+    previewQualityLevel,
+    previewVideoReady,
+  ]);
+
+  const applyPreviewQuality = useCallback(async (levelIndex: number) => {
+    const level = previewLevels[levelIndex];
+    if (!level) return;
+    previewRequestedHeightRef.current = level.height;
     setPreviewQualityLevel(levelIndex);
     setPreviewQualityMenuOpen(false);
-  }, [previewLevels, previewPlayback, previewSessionId]);
+    previewAppliedHeightRef.current = 0;
+    await syncPreviewPlaybackToViewport();
+  }, [previewLevels, syncPreviewPlaybackToViewport]);
 
   const skipPreview = useCallback((deltaSec: number) => {
     const video = previewVideoRef.current;
@@ -2321,10 +2452,25 @@ export default function App() {
       const fs = document.fullscreenElement === previewContainerRef.current;
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
+      previewAppliedHeightRef.current = 0;
+      void syncPreviewPlaybackToViewport(true, fs);
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, []);
+  }, [syncPreviewPlaybackToViewport]);
+
+  useEffect(() => {
+    if (!previewOpen || !previewVideoReady || previewFullscreen) return;
+    previewAppliedHeightRef.current = 0;
+    void syncPreviewPlaybackToViewport();
+  }, [
+    previewOpen,
+    previewVideoReady,
+    previewFullscreen,
+    previewPanelWidth,
+    previewVideoAspect,
+    syncPreviewPlaybackToViewport,
+  ]);
 
   const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || anyExploreVolumeMenuOpen;
 
