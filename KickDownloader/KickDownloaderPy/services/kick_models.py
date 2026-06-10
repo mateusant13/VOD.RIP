@@ -61,3 +61,26 @@ def extract_slug(url: str) -> Optional[str]:
 def extract_vod_id(url: str) -> Optional[str]:
     m = re.search(r"/videos/([\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12})", url, re.I)
     return m.group(1) if m else None
+
+
+def extract_clip_id(url: str) -> Optional[str]:
+    m = re.search(r"/clips/([^/?#]+)", url, re.I)
+    if m:
+        return m.group(1)
+    # Wrong path (/videos/clip_…) or bare id
+    m = re.search(r"/videos/(clip_[^/?#]+)", url, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"(clip_[A-Za-z0-9]+)", url or "")
+    return m.group(1) if m else None
+
+
+def canonical_kick_clip_url(url: str, *, slug: Optional[str] = None, clip_id: Optional[str] = None) -> str:
+    """Normalize any Kick clip reference to ``https://kick.com/{slug}/clips/{id}``."""
+    cid = clip_id or extract_clip_id(url)
+    if not cid:
+        raise ValueError(f"Not a Kick clip URL: {url}")
+    ch = slug or extract_slug(url)
+    if not ch:
+        raise ValueError(f"Kick channel slug missing in clip URL: {url}")
+    return f"https://kick.com/{ch}/clips/{cid}"

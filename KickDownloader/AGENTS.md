@@ -21,7 +21,7 @@ for the Kick & Twitch Downloader project.
 - Direct entry: `python main.py` (for development)
 - Windows convenience: `launch.bat`
 - Frontend dev server: `http://localhost:5173` (API proxied to backend on :7897)
-- **Dev workflow:** `npm run dev:all` starts both API + Vite. `npm run dev` alone only starts Vite — `/api` calls will fail until the Python backend is running.
+- **Dev workflow:** `npm run dev` starts both API + Vite. `npm run dev:vite` is Vite only (API must be running separately on :7897).
 - **Windows + uvicorn `--reload`:** reload mode sets `WindowsSelectorEventLoopPolicy`, which breaks Playwright subprocesses. `_run_async()` in `kick_playwright_service.py` must use an explicit `ProactorEventLoop` per call (fixed).
 
 ---

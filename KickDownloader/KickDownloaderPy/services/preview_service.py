@@ -20,6 +20,7 @@ from services.ytdlp_service import (
     _find_hls_format,
     build_url,
     detect_platform,
+    is_clip_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ _DEFAULT_UA = (
 
 _ALLOWED_HOST_SUFFIXES = (
     "kick.com",
+    "clips.kick.com",
     "twitch.tv",
     "ttvnw.net",
     "jtvnw.net",
@@ -68,6 +70,7 @@ class PreviewSession:
     resource_map: Dict[str, str] = field(default_factory=dict)
     rewritten_playlists: Dict[str, Tuple[bytes, float]] = field(default_factory=dict)
     custom_master: Optional[str] = None
+    kind: str = "hls"
     variant_entries: List[Tuple[int, str]] = field(default_factory=list)
     cache_bytes: int = 0
     last_access: float = field(default_factory=time.time)
@@ -75,6 +78,19 @@ class PreviewSession:
 
     def touch(self) -> None:
         self.last_access = time.time()
+
+    def __post_init__(self) -> None:
+        # Hot-reload can leave older in-memory instances without new fields.
+        if not hasattr(self, "rewritten_playlists") or self.rewritten_playlists is None:
+            object.__setattr__(self, "rewritten_playlists", {})
+
+
+def _playlist_cache(session: PreviewSession) -> Dict[str, Tuple[bytes, float]]:
+    cache = getattr(session, "rewritten_playlists", None)
+    if cache is None:
+        cache = {}
+        session.rewritten_playlists = cache
+    return cache
 
 
 def _hosts_for_url(url: str) -> Set[str]:
@@ -103,7 +119,7 @@ def _is_playlist_url(url: str) -> bool:
 
 
 def _guess_content_type(url: str, header_ct: str = "") -> str:
-    if header_ct and header_ct != "application/octet-stream":
+    if header_ct and header_ct not in ("application/octet-stream", "binary/octet-stream"):
         return header_ct
     path = urlparse(url).path.lower()
     if path.endswith(".m3u8"):
@@ -173,6 +189,54 @@ def _deduped_hls_variants(info: dict) -> List[dict]:
             seen_heights.add(height)
         out.append(fmt)
     return out
+def _deduped_progressive_variants(info: dict) -> List[dict]:
+    """Pick distinct heights from yt-dlp's progressive (direct MP4) formats.
+
+    Twitch clips return a flat list of MP4 URLs in ``protocol=https`` (or
+    no protocol) with heights like 360/480/720/1080 and separate ``portrait-*``
+    variants. We keep one entry per height (the highest-bitrate representative).
+    """
+    formats = info.get("formats") or []
+    progressive: list[dict] = []
+    for f in formats:
+        url = f.get("url") or ""
+        if not url:
+            continue
+        proto = (f.get("protocol") or "").lower()
+        ext = (f.get("ext") or "").lower()
+        # Accept anything that is plainly a direct file (not HLS/DASH).
+        if proto in ("m3u8", "m3u8_native", "m3u8_ffmpeg", "http_dash_segments", "dash", "http_dash"):
+            continue
+        if proto and proto not in ("https", "http"):
+            # Unknown streaming protocol — skip to stay safe.
+            if "dash" in proto or "m3u" in proto:
+                continue
+        if ext and ext not in ("mp4", "m4v", "mov", "webm"):
+            continue
+        # Twitch clips also ship vertical ``portrait-*`` renditions — prefer landscape.
+        fid = (f.get("format_id") or "").lower()
+        if fid.startswith("portrait"):
+            continue
+        progressive.append(f)
+
+    progressive.sort(
+        key=lambda f: (int(f.get("height") or 0), float(f.get("tbr") or 0) or float(f.get("vbr") or 0) or 0.0),
+        reverse=True,
+    )
+    seen_heights: set[int] = set()
+    seen_urls: set[str] = set()
+    out: List[dict] = []
+    for fmt in progressive:
+        height = int(fmt.get("height") or 0)
+        url = fmt.get("url") or ""
+        if height in seen_heights:
+            continue
+        if url in seen_urls:
+            continue
+        seen_heights.add(height)
+        seen_urls.add(url)
+        out.append(fmt)
+    return out
 
 
 def _url_looks_like_master(url: str) -> bool:
@@ -209,24 +273,60 @@ def _build_synthetic_master_playlist(session: PreviewSession, variants: List[dic
         lines.append(_proxy_url(session, upstream))
     return "\n".join(lines) + "\n"
 
+def resolve_stream_info(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 480,
+) -> Tuple[str, dict, str, List[dict], str]:
+    """Return (master_url, headers, platform, variant_formats, kind).
 
-def resolve_stream_info(url: str, oauth: Optional[str] = None) -> Tuple[str, dict, str, List[dict]]:
+    ``kind`` is ``"hls"`` for normal HLS streams (Kick clip/VOD, Twitch VOD) and
+    ``"progressive"`` for direct progressive MP4 sources (Twitch clips). For
+    progressive sources ``master_url`` is a single playable MP4 URL (already
+    routed through the preview proxy) and ``variant_formats`` is the list of
+    MP4 alternatives (used to build the synthetic master if needed).
+    """
     platform = detect_platform(url)
     headers: dict = {}
 
     if platform == "Kick":
-        from services.kick_api_service import get_video_info_api
+        from services.kick_api_service import resolve_kick_stream_api
 
-        info = get_video_info_api(url)
+        info = resolve_kick_stream_api(url)
         if not info.m3u8_url:
-            raise RuntimeError("Kick VOD has no HLS stream URL")
+            raise RuntimeError("Kick stream has no HLS URL")
+        page = info.url or url
         headers = {
-            "referer": "https://kick.com/",
+            "referer": page if page.startswith("http") else "https://kick.com/",
             "origin": "https://kick.com",
         }
-        return info.m3u8_url, headers, platform, []
+        return info.m3u8_url, headers, platform, [], "hls"
 
     full_url = build_url(url, platform)
+
+    # Twitch clips expose only progressive MP4 formats (no HLS) — collect
+    # the available heights and serve the chosen one directly.
+    if platform == "Twitch" and is_clip_url(url):
+        opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+        clip_info = _extract_hls_info(full_url, opts)
+        variants = _deduped_progressive_variants(clip_info)
+        if not variants:
+            raise RuntimeError("Twitch clip has no progressive formats")
+        chosen_url = _pick_variant_by_height(
+            [(int(v.get("height") or 0), v.get("url") or "") for v in variants],
+            prefer_height=prefer_height,
+        )
+        if not chosen_url:
+            raise RuntimeError("Twitch clip has no progressive URL")
+        # Forward http_headers from any variant; they all share the same
+        # CloudFront signature cookies.
+        first_with_headers = next((v for v in variants if v.get("http_headers")), None)
+        if first_with_headers:
+            headers = first_with_headers.get("http_headers") or {}
+        else:
+            headers = clip_info.get("http_headers") or {}
+        return chosen_url, headers, platform, variants, "progressive"
+
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)
     variants = _deduped_hls_variants(hls_info)
@@ -237,21 +337,21 @@ def resolve_stream_info(url: str, oauth: Optional[str] = None) -> Tuple[str, dic
             stream_url = fmt.get("url") or ""
             if stream_url and _url_looks_like_master(stream_url):
                 headers = fmt.get("http_headers") or hls_info.get("http_headers") or {}
-                return stream_url, headers, platform, []
+                return stream_url, headers, platform, [], "hls"
 
         first = with_height[0]
         stream_url = first.get("url") or ""
         if not stream_url:
             raise RuntimeError("Twitch VOD has no HLS stream URL")
         headers = first.get("http_headers") or hls_info.get("http_headers") or {}
-        return stream_url, headers, platform, with_height
+        return stream_url, headers, platform, with_height, "hls"
 
     fmt = _find_hls_format(hls_info)
     stream_url = fmt.get("url") or hls_info.get("url") or ""
     if not stream_url:
         raise RuntimeError("Twitch VOD has no HLS stream URL")
     headers = fmt.get("http_headers") or hls_info.get("http_headers") or {}
-    return stream_url, headers, platform, []
+    return stream_url, headers, platform, [], "hls"
 
 
 def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int = 480) -> Optional[str]:
@@ -507,7 +607,6 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
     except Exception as exc:
         logger.warning("Prewarm failed session=%s: %s", session_id[:8], exc)
 
-
 def create_session(
     url: str,
     crop_start: float = 0.0,
@@ -517,20 +616,30 @@ def create_session(
 ) -> PreviewSession:
     del crop_end
     _cleanup_stale_sessions()
-    raw_entry, headers, platform, variant_formats = resolve_stream_info(url, oauth=oauth)
+    raw_entry, headers, platform, variant_formats, kind = resolve_stream_info(
+        url, oauth=oauth, prefer_height=prefer_height,
+    )
     session_id = secrets.token_hex(8)
     cache_dir = _PREVIEW_ROOT / session_id
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # For progressive sources (Twitch clips) the "master" is a single MP4
+    # we'll route through the proxy; the master endpoint then streams the
+    # bytes with video/mp4 so the frontend can use a native <video> element.
+    proxy_master_url: Optional[str] = None
+    if kind == "progressive":
+        proxy_master_url = f"/api/preview/hls/{session_id}/master.m3u8"
+
     session = PreviewSession(
         session_id=session_id,
         vod_url=url,
-        master_url=raw_entry,
+        master_url=proxy_master_url or raw_entry,
         entry_url=raw_entry,
         platform=platform,
         http_headers=headers,
         allowed_hosts=_hosts_for_url(raw_entry),
         cache_dir=cache_dir,
+        kind=kind,
     )
 
     if variant_formats:
@@ -539,31 +648,39 @@ def create_session(
             for fmt in variant_formats
             if int(fmt.get("height") or 0) > 0 and fmt.get("url")
         ]
-        session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
-        for _height, upstream in session.variant_entries:
-            session.allowed_hosts.update(_hosts_for_url(upstream))
+        if kind == "hls" and len(session.variant_entries) >= 2:
+            session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
+            for _height, upstream in session.variant_entries:
+                session.allowed_hosts.update(_hosts_for_url(upstream))
+    if kind == "progressive":
+        # For Twitch clips the entry URL is the MP4 itself. No playlist to
+        # walk, no segment prewarm — the frontend plays the file directly.
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    else:
+        session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
 
-    session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
-    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+        with _lock:
+            _sessions[session_id] = session
+
+        # Warm master + default variant playlists so the first hls.js fetches are instant.
+        try:
+            proxy_playlist(session_id, session.master_url)
+            if session.entry_url != session.master_url:
+                proxy_playlist(session_id, session.entry_url)
+        except Exception as exc:
+            logger.warning("Playlist warm failed: %s", exc)
+
+        threading.Thread(
+            target=_prewarm_session,
+            args=(session_id, crop_start),
+            daemon=True,
+            name=f"kd-prewarm-{session_id[:8]}",
+        ).start()
+        return session
 
     with _lock:
         _sessions[session_id] = session
-
-    # Warm master + default variant playlists so the first hls.js fetches are instant.
-    try:
-        proxy_playlist(session_id, session.master_url)
-        if session.entry_url != session.master_url:
-            proxy_playlist(session_id, session.entry_url)
-    except Exception as exc:
-        logger.warning("Playlist warm failed: %s", exc)
-
-    threading.Thread(
-        target=_prewarm_session,
-        args=(session_id, crop_start),
-        daemon=True,
-        name=f"kd-prewarm-{session_id[:8]}",
-    ).start()
-
     return session
 
 
@@ -591,7 +708,6 @@ def resolve_upstream(session_id: str, resource_id: Optional[str], raw_url: Optio
         return raw_url
     raise ValueError("Missing preview resource id")
 
-
 def get_master_playlist(session_id: str) -> str:
     session = get_session(session_id)
     if not session:
@@ -602,13 +718,38 @@ def get_master_playlist(session_id: str) -> str:
     return body.decode("utf-8")
 
 
+def proxy_master(
+    session_id: str,
+    range_header: Optional[str] = None,
+) -> Tuple[bytes, str, dict, int]:
+    """Serve the master resource: HLS playlist text or a single progressive MP4.
+
+    For ``kind == "hls"`` this returns the rewritten master playlist text.
+    For ``kind == "progressive"`` it streams the underlying MP4 through the
+    preview proxy so the frontend can use a native ``<video>`` element.
+    """
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if session.kind == "progressive":
+        upstream = session.entry_url
+        data, ctype, headers, status = _http_get_bytes(session, upstream, range_header=range_header)
+        return data, ctype, headers, status
+    if session.custom_master:
+        data = session.custom_master.encode("utf-8")
+        return data, "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, 200
+    body, ctype, headers, status = proxy_playlist(session_id, session.master_url)
+    return body, ctype, headers, status
+
+
 def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict, int]:
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
 
     now = time.time()
-    cached = session.rewritten_playlists.get(upstream_url)
+    cache = _playlist_cache(session)
+    cached = cache.get(upstream_url)
     if cached and now - cached[1] < PLAYLIST_REWRITE_TTL_SEC:
         return cached[0], "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, 200
 
@@ -621,7 +762,7 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
         text = data.decode("utf-8", errors="replace")
         rewritten = _rewrite_playlist(text, session, upstream_url)
         data = rewritten.encode("utf-8")
-        session.rewritten_playlists[upstream_url] = (data, now)
+        cache[upstream_url] = (data, now)
         return data, "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, status
 
     ctype = _guess_content_type(upstream_url)

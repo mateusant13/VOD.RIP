@@ -14,7 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -35,6 +35,7 @@ from services.preview_service import (
     create_session,
     delete_session,
     get_master_playlist,
+    proxy_master,
     proxy_playlist,
     proxy_segment,
     resolve_upstream,
@@ -52,6 +53,7 @@ from services.twitch_gql_service import (
     list_channel_videos_sync as twitch_list_channel_videos_sync,
 )
 from services.kick_api_service import (
+    get_clip_info_sync as kick_get_clip_info_sync,
     get_video_info_sync as kick_get_video_info_sync,
     list_channel_clips_sync as kick_list_channel_clips_sync,
     list_channel_videos_sync as kick_list_channel_videos_sync,
@@ -137,11 +139,31 @@ if static_dir.exists():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    """Serve bundled UI when ``KICK_SERVE_UI=1``; otherwise redirect to Vite (dev)."""
     index_file = Path(__file__).parent / "static" / "index.html"
+    serve_ui = os.environ.get("KICK_SERVE_UI", "").strip() == "1"
+    ui_url = os.environ.get("KICK_UI_URL", "http://localhost:5173").strip()
+    if not serve_ui:
+        return HTMLResponse(
+            f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0;url={ui_url}">
+<title>VOD.RIP</title></head>
+<body style="font-family:system-ui;background:#09090b;color:#fafafa;padding:2rem">
+<p>Redirecting to the UI at <a href="{ui_url}" style="color:#53fc18">{ui_url}</a>…</p>
+<p style="color:#a1a1aa;font-size:0.875rem">API is on this port ({os.environ.get("PORT", "7897")}).
+Run <code>npm run dev</code> for API + UI, or set <code>KICK_SERVE_UI=1</code> after <code>npm run build-copy</code>.</p>
+</body></html>""",
+            headers={"Cache-Control": "no-store"},
+        )
     if index_file.exists():
         content = index_file.read_text(encoding="utf-8")
         return HTMLResponse(content, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
-    return HTMLResponse("<h1>Kick & Twitch Downloader</h1><p>Frontend not found. Place static/index.html in the static/ folder.</p>")
+    return HTMLResponse(
+        "<h1>Kick & Twitch Downloader</h1>"
+        "<p>Frontend not found. Run <code>npm run build-copy</code> then set <code>KICK_SERVE_UI=1</code>, "
+        f"or open <a href=\"{ui_url}\">{ui_url}</a>.</p>"
+    )
 
 
 # --- Settings ---
@@ -197,6 +219,30 @@ def _vod_id_from_url(url: str) -> str:
     return ""
 
 
+def _channel_slug_from_url(url: str) -> str:
+    lowered = (url or "").lower()
+    m = re.search(r"kick\.com/([^/?#]+)", lowered, re.I)
+    if m and m.group(1).lower() not in ("videos", "clips"):
+        return m.group(1)
+    m = re.search(r"twitch\.tv/([^/?#]+)", lowered)
+    if m and m.group(1).lower() not in ("videos", "clip", "directory", "clips"):
+        return m.group(1)
+    return ""
+
+
+def _resolve_output_file_override(
+    req: DownloadRequest, opts: AppSettings, default_path: str
+) -> str:
+    raw = (req.output_file or "").strip()
+    if not raw:
+        return default_path
+    if os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":"):
+        return raw
+    base = _download_dir(opts)
+    stem = _sanitize_path_component(Path(raw).stem, fallback="clip")
+    return str(base / f"{stem}.mp4")
+
+
 def _clip_id_from_url(url: str) -> str:
     lowered = (url or "").lower()
     m = re.search(r"clips\.twitch\.tv/([^/?#]+)", lowered)
@@ -235,16 +281,17 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
 
 
 def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
-    if req.output_file:
-        return req.output_file
     base = _download_dir(opts)
+    clipper = (
+        meta.get("channel")
+        or meta.get("uploader")
+        or _channel_slug_from_url(req.url)
+        or "channel"
+    )
     title = meta.get("title") or "clip"
-    stem = _sanitize_path_component(str(title), fallback="clip")
-    platform = detect_platform(req.url).lower()
-    clip_tag = _clip_duration_tag(meta.get("duration"))
-    clip_id = _clip_id_from_url(req.url)
-    suffix = f"_{clip_id[:16]}" if clip_id else ""
-    return str(base / f"{stem}_{clip_tag}_{platform}{suffix}.mp4")
+    default_stem = _sanitize_path_component(f"{clipper} - {title} (clip)", fallback="clip")
+    default_path = str(base / f"{default_stem}.mp4")
+    return _resolve_output_file_override(req, opts, default_path)
 
 
 def _tk_pick_folder() -> Optional[str]:
@@ -387,11 +434,19 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     if req.crop_end <= req.crop_start:
         raise HTTPException(status_code=400, detail="End must be after start")
     opts = settings_mgr.get()
+    preview_url = (req.url or "").strip()
+    try:
+        from services.kick_models import canonical_kick_clip_url, extract_clip_id
+
+        if "kick.com" in preview_url.lower() and extract_clip_id(preview_url):
+            preview_url = canonical_kick_clip_url(preview_url)
+    except ValueError:
+        pass
     try:
         session = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: create_session(
-                req.url,
+                preview_url,
                 req.crop_start,
                 req.crop_end,
                 oauth=opts.oauth or None,
@@ -399,10 +454,15 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
             ),
         )
         master = f"/api/preview/hls/{session.session_id}/master.m3u8"
+        if session.kind == "progressive":
+            playback = f"/api/preview/hls/{session.session_id}/stream.mp4"
+        else:
+            playback = master
         return PreviewSessionResponse(
             session_id=session.session_id,
             master_url=master,
-            playback_url=master,
+            playback_url=playback,
+            kind=session.kind,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -410,22 +470,37 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/preview/hls/{session_id}/master.m3u8")
-async def preview_hls_master(session_id: str):
+async def _preview_master_response(session_id: str, range_header: Optional[str]) -> Response:
     try:
-        body = await asyncio.get_event_loop().run_in_executor(
-            None, get_master_playlist, session_id
-        )
-        return Response(
-            content=body,
-            media_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache"},
+        data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
+            None, proxy_master, session_id, range_header
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    body: Any = data
+    response_headers = dict(extra_headers or {})
+    response_headers.setdefault("Cache-Control", "no-cache")
+    if ctype and ctype != "application/octet-stream":
+        response_headers.setdefault("Content-Type", ctype)
+    return Response(
+        content=body,
+        media_type=ctype or "application/octet-stream",
+        status_code=status,
+        headers=response_headers,
+    )
 
+
+@app.get("/api/preview/hls/{session_id}/master.m3u8")
+async def preview_hls_master(session_id: str, request: Request):
+    return await _preview_master_response(session_id, request.headers.get("range"))
+
+
+@app.get("/api/preview/hls/{session_id}/stream.mp4")
+async def preview_stream_mp4(session_id: str, request: Request):
+    """Progressive MP4 proxy (Twitch clips) — same bytes as master, .mp4 URL for <video>."""
+    return await _preview_master_response(session_id, request.headers.get("range"))
 
 @app.get("/api/preview/hls/{session_id}/resource")
 async def preview_hls_resource(
@@ -889,6 +964,10 @@ async def info_video(id: str):
 @app.get("/api/info/clip")
 async def info_clip(id: str):
     try:
+        loop = asyncio.get_running_loop()
+        lowered = id.lower()
+        if "kick.com" in lowered and is_clip_url(id):
+            return await loop.run_in_executor(INFO_EXECUTOR, kick_get_clip_info_sync, id)
         info = await get_video_info(id)
         return info
     except Exception as e:
@@ -905,7 +984,12 @@ async def _fetch_queue_meta(url: str, platform: str) -> dict:
     """
     try:
         loop = asyncio.get_running_loop()
-        if platform == "Kick":
+        if is_clip_url(url):
+            if platform == "Kick":
+                info = await loop.run_in_executor(INFO_EXECUTOR, kick_get_clip_info_sync, url)
+            else:
+                info = await get_video_info(url)
+        elif platform == "Kick":
             info = await loop.run_in_executor(INFO_EXECUTOR, kick_get_video_info_sync, url)
         elif platform == "Twitch":
             info = await loop.run_in_executor(INFO_EXECUTOR, twitch_get_video_info_sync, url)

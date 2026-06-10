@@ -34,9 +34,12 @@ def main():
         print("Installing dependencies...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
     
+    ui_url = os.environ.get("KICK_UI_URL", "http://localhost:5173")
     print("================================================")
     print("  Kick & Twitch Downloader v2.0 (Python)")
-    print(f"  Open http://localhost:{port} in your browser")
+    print(f"  UI (dev):     {ui_url}  — npm run dev")
+    print(f"  API:          http://localhost:{port}")
+    print("  (Set KICK_SERVE_UI=1 after npm run build-copy to serve UI on API port)")
     print("================================================")
     
     import uvicorn

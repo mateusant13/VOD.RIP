@@ -29,7 +29,7 @@ export default defineConfig({
             const code = "code" in err ? (err as NodeJS.ErrnoException).code : "";
             console.error(`[api proxy] ${code || err.message} — ${req.url}`);
             console.error(
-              "  → FastAPI on :7897 may have crashed. Restart: npm run dev:api",
+              "  → FastAPI on :7897 is not running. Start both with: npm run dev",
             );
           });
         },

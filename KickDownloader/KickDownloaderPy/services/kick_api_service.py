@@ -18,10 +18,13 @@ from typing import Any, Dict, List, Optional
 from services.kick_models import (
     KickChannel,
     KickVideo,
+    canonical_kick_clip_url,
+    extract_clip_id,
     extract_slug,
     extract_vod_id,
     format_duration,
 )
+from services.ytdlp_service import is_clip_url
 
 _IMPERSONATE = "chrome"
 _BASE = "https://kick.com"
@@ -236,6 +239,47 @@ def list_channel_videos_api(slug: str, limit: int = 20) -> List[KickVideo]:
     return out
 
 
+def resolve_kick_stream_api(url: str) -> KickVideo:
+    """Resolve Kick VOD or clip metadata (+ m3u8) from any supported URL shape."""
+    raw = (url or "").strip()
+    if is_clip_url(raw) or extract_clip_id(raw):
+        return get_clip_info_api(canonical_kick_clip_url(raw))
+    return get_video_info_api(raw)
+
+
+def get_clip_info_api(url: str) -> KickVideo:
+    clip_id = extract_clip_id(url)
+    if not clip_id:
+        raise ValueError(f"Not a Kick clip URL: {url}")
+    slug = extract_slug(url)
+    referer = url if url.startswith("http") else f"{_BASE}/{slug}/clips/{clip_id}"
+    data = _get_json(f"/api/v2/clips/{clip_id}", referer)
+    clip = data.get("clip") if isinstance(data, dict) else None
+    if not isinstance(clip, dict):
+        raise RuntimeError("Unexpected Kick clip API response")
+    channel = clip.get("channel") if isinstance(clip.get("channel"), dict) else {}
+    ch_slug = channel.get("slug") or slug
+    m3u8 = clip.get("clip_url") or clip.get("video_url")
+    if not isinstance(m3u8, str) or not m3u8.strip():
+        raise RuntimeError("Kick API returned no HLS source for this clip")
+    dur = clip.get("duration")
+    duration = float(dur) if isinstance(dur, (int, float)) and dur > 0 else None
+    views = clip.get("views")
+    if views is None:
+        views = clip.get("view_count")
+    return KickVideo(
+        id=str(clip.get("id") or clip_id),
+        title=str(clip.get("title") or "Untitled"),
+        duration=duration,
+        thumbnail=clip.get("thumbnail_url") if isinstance(clip.get("thumbnail_url"), str) else None,
+        views=int(views) if isinstance(views, (int, float)) else None,
+        created_at=clip.get("created_at") if isinstance(clip.get("created_at"), str) else None,
+        channel=ch_slug,
+        url=url if url.startswith("http") else f"{_BASE}/{ch_slug}/clips/{clip_id}",
+        m3u8_url=m3u8.strip(),
+    )
+
+
 def get_video_info_api(url: str) -> KickVideo:
     video_id = extract_vod_id(url)
     if not video_id:
@@ -271,6 +315,25 @@ def get_channel_api(url: str) -> KickChannel:
 
 
 # Sync helpers for FastAPI routes — curl_cffi only, never Playwright.
+def get_clip_info_sync(url: str) -> dict:
+    v = get_clip_info_api(url)
+    return {
+        "id": v.id,
+        "title": v.title,
+        "uploader": v.channel,
+        "channel": v.channel,
+        "duration": v.duration,
+        "duration_string": format_duration(v.duration),
+        "thumbnail": v.thumbnail,
+        "views": v.views,
+        "webpage_url": v.url,
+        "qualities": [],
+        "platform": "Kick",
+        "created_at": v.created_at,
+        "content_kind": "clip",
+    }
+
+
 def get_video_info_sync(url: str) -> dict:
     v = get_video_info_api(url)
     return {

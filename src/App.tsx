@@ -12,9 +12,15 @@ import twitchIcon from '@/assets/platforms/twitch.png';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
+  PREVIEW_CLIP_DEFAULT_HEIGHT,
   PREVIEW_MAIN_DEFAULT_HEIGHT,
   applyHlsQualityLevel,
-  mapHlsLevels,
+  attachProgressivePreview,
+  detachProgressivePreview,
+  previewLevelLabel,
+  resolvePreviewLevels,
+  resolvePreviewPlayback,
+  suggestClipDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 
@@ -73,6 +79,36 @@ interface ListedChannelVideo extends ChannelVideo {
   platformListIndex: number;
 }
 
+/** Channel list row badge shown on main preview when opened from Channels. */
+interface ChannelPreviewBadge {
+  platform: string;
+  platformListIndex: number;
+  isClip: boolean;
+}
+
+function ChannelListIndexBadge({
+  platform,
+  index,
+  size = 'sm',
+}: {
+  platform: string;
+  index: number;
+  size?: 'sm' | 'md';
+}) {
+  const isKick = platform === 'Kick';
+  const dim = size === 'md' ? 'w-5 text-[11px] leading-tight pt-0.5' : 'w-4 text-[9px]';
+  return (
+    <span
+      className={`shrink-0 text-center font-mono font-bold tabular-nums ${dim} ${
+        isKick ? 'text-[#53fc18]' : 'text-[#9146FF]'
+      }`}
+      title={`${platform} #${index}`}
+    >
+      {index}
+    </span>
+  );
+}
+
 interface AppSettings {
   download_folder: string;
   download_threads: number;
@@ -91,7 +127,10 @@ interface SavedChannel {
   twitchSlug: string;
   vodVideos: ChannelVideo[];
   clipVideos: ChannelVideo[];
-  errors: Record<string, string>;
+  vodErrors?: Record<string, string>;
+  clipErrors?: Record<string, string>;
+  /** @deprecated use vodErrors / clipErrors */
+  errors?: Record<string, string>;
   updatedAt: string;
   loading?: boolean;
   /** Legacy — migrated to vodVideos / clipVideos on load */
@@ -106,7 +145,7 @@ const API_BASE = '';
 const API_TIMEOUT_MS = 45_000;
 
 const BACKEND_HINT =
-  'Backend not running. In a terminal run: npm run dev:all  (or npm run dev:api in one terminal and npm run dev in another). API must be on http://localhost:7897.';
+  'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).';
 
 function apiErrorMessage(res: Response, fallback: string, path?: string): string {
   if (res.status === 500 || res.status === 502 || res.status === 503) {
@@ -116,11 +155,11 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
     const p = path ?? '';
     const fb = String(fallback).toLowerCase();
     if (p.includes('/api/channel/clips') || fb === 'not found') {
-      return 'Clips API not on server — restart backend (npm run dev:api)';
+      return 'Clips API not on server — restart with npm run dev';
     }
   }
   if (res.status === 405) {
-    return 'API method not supported — restart backend (npm run dev:api)';
+    return 'API method not supported — restart with npm run dev';
   }
   return fallback;
 }
@@ -133,7 +172,7 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   } catch (err: unknown) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       throw new Error(
-        'Request timed out — the API may be hung. Stop and restart: npm run dev:api (or npm run dev:all).',
+        'Request timed out — the API may be hung. Stop and restart: npm run dev',
       );
     }
     throw new Error(BACKEND_HINT);
@@ -187,6 +226,9 @@ function fmtShort(sec: number): string {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function fmtClipDuration(sec: number): string {
+  return `${Math.max(0, Math.floor(sec))}s`;
 }
 // Format a VOD's `created_at` for display. Backend returns either an ISO
 // string (Kick) or YYYYMMDD (Twitch) — normalize to YYYY-MM-DD and drop
@@ -345,14 +387,18 @@ function DownloadConfirmDialog({
   open,
   title,
   message,
-  detail,
+  filenamePlaceholder,
+  filename,
+  onFilenameChange,
   onConfirm,
   onCancel,
 }: {
   open: boolean;
   title: string;
   message: string;
-  detail?: string;
+  filenamePlaceholder?: string;
+  filename: string;
+  onFilenameChange: (value: string) => void;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -374,10 +420,19 @@ function DownloadConfirmDialog({
           {title}
         </h3>
         <p className="text-xs text-zinc-300 mt-2 leading-relaxed">{message}</p>
-        {detail && (
-          <p className="text-[10px] text-zinc-500 mt-2 border border-zinc-800 bg-zinc-900/80 px-2 py-1.5">
-            {detail}
-          </p>
+        {filenamePlaceholder && (
+          <label className="block mt-3">
+            <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">File name</span>
+            <input
+              type="text"
+              value={filename}
+              onChange={(e) => onFilenameChange(e.target.value)}
+              placeholder={filenamePlaceholder}
+              className="mt-1 w-full border-2 border-zinc-700 bg-zinc-900 text-zinc-100 text-xs px-2 py-1.5 focus:border-white focus:outline-none placeholder:text-zinc-600"
+              autoFocus
+            />
+            <span className="text-[9px] text-zinc-600 mt-1 block">Saved as .mp4 in your download folder</span>
+          </label>
         )}
         <div className="flex gap-2 mt-4 justify-end">
           <button
@@ -1137,12 +1192,19 @@ function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
     vodVideos = legacy.filter((v) => !isLikelyClip(v));
     clipVideos = legacy.filter(isLikelyClip);
   }
+  const legacyErrors = ch.errors ?? {};
   return {
     ...rest,
     vodVideos: vodVideos ?? [],
     clipVideos: clipVideos ?? [],
+    vodErrors: ch.vodErrors ?? legacyErrors,
+    clipErrors: ch.clipErrors ?? {},
     loading: false,
   };
+}
+
+function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips'): Record<string, string> {
+  return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? ch.errors ?? {});
 }
 
 function loadSavedChannels(): SavedChannel[] {
@@ -1241,6 +1303,7 @@ function isLikelyClip(v: ChannelVideo): boolean {
     if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
     return true;
   }
+  if (v.platform === 'Kick' && v.id.toLowerCase().startsWith('clip_')) return true;
   const url = (v.url || '').toLowerCase();
   if (url.includes('/videos/') && !url.includes('/clips/') && !url.includes('/clip/')) {
     return false;
@@ -1320,10 +1383,17 @@ function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): Chan
 }
 
 function buildVodUrl(v: ChannelVideo): string {
-  if (v.url) return v.url;
   const isTw = v.platform === 'Twitch';
-  const isClip = v.content_kind === 'clip';
+  const isClip = isLikelyClip(v);
   const twitchId = isTw && v.id.startsWith('v') ? v.id.slice(1) : v.id;
+  if (v.url) {
+    const u = v.url;
+    if (!isTw && isClip && u.includes('/videos/') && !u.includes('/clips/')) {
+      const slug = v.channel || u.match(/kick\.com\/([^/]+)/i)?.[1] || '';
+      return `https://kick.com/${slug}/clips/${v.id}`;
+    }
+    return u;
+  }
   if (isTw) {
     return isClip
       ? `https://clips.twitch.tv/${twitchId}`
@@ -1356,7 +1426,10 @@ export default function App() {
   const [trimEndSec, setTrimEndSec] = useState(3600);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSessionId, setPreviewSessionId] = useState<string | null>(null);
-  const [previewHlsUrl, setPreviewHlsUrl] = useState<string | null>(null);
+  const [previewPlayback, setPreviewPlayback] = useState<{
+    url: string;
+    kind: 'hls' | 'progressive';
+  } | null>(null);
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
   const [previewVideoReady, setPreviewVideoReady] = useState(false);
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
@@ -1370,6 +1443,7 @@ export default function App() {
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
   const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
+  const [previewChannelBadge, setPreviewChannelBadge] = useState<ChannelPreviewBadge | null>(null);
   /** URL tab hidden from bar after picking a VOD from channels; restored only on page refresh. */
   const [urlTabBarHidden, setUrlTabBarHidden] = useState(false);
   const [previewTrimStart, setPreviewTrimStart] = useState(0);
@@ -1388,6 +1462,7 @@ export default function App() {
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
+  const [downloadFilename, setDownloadFilename] = useState('');
   const trimDragOriginRef = useRef(0);
   const urlTrimPointerRef = useRef({ x: 0, y: 0 });
 
@@ -1514,9 +1589,7 @@ export default function App() {
     }
     const video = previewVideoRef.current;
     if (video) {
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
+      detachProgressivePreview(video);
     }
   }, []);
 
@@ -1525,7 +1598,7 @@ export default function App() {
     destroyPreviewPlayer();
     setPreviewOpen(false);
     setPreviewSessionId(null);
-    setPreviewHlsUrl(null);
+    setPreviewPlayback(null);
     setPreviewVideoLoading(false);
     setPreviewVideoReady(false);
     setPreviewCurrentTime(0);
@@ -1554,10 +1627,9 @@ export default function App() {
 
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
-    const clip = isClipUrl(url.trim());
-    if (!clip && trimEndSec <= trimStartSec) return;
-    const start = clip ? 0 : trimStartSec;
-    const end = clip ? vodDurationSec : trimEndSec;
+    if (trimEndSec <= trimStartSec) return;
+    const start = trimStartSec;
+    const end = trimEndSec;
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
@@ -1584,6 +1656,7 @@ export default function App() {
     previewPanelWidthRef.current = clampedPreviewW;
     setPreviewPanelWidth(clampedPreviewW);
     setPreviewOpen(true);
+    setPreviewPlayback(null);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
     setError(null);
@@ -1592,14 +1665,23 @@ export default function App() {
         try { await apiDelete(`/api/preview/session/${previewSessionId}`); } catch { /* ignore */ }
       }
       destroyPreviewPlayer();
-      const res = await apiPost<{ session_id: string; master_url: string }>('/api/preview/session', {
+      const clipPreview = isClipUrl(url.trim());
+      const previewPreferHeight = clipPreview
+        ? PREVIEW_CLIP_DEFAULT_HEIGHT
+        : PREVIEW_MAIN_DEFAULT_HEIGHT;
+      const res = await apiPost<{
+        session_id: string;
+        master_url: string;
+        playback_url?: string;
+        kind?: string;
+      }>('/api/preview/session', {
         url: url.trim(),
         crop_start: start,
         crop_end: end,
-        prefer_height: PREVIEW_MAIN_DEFAULT_HEIGHT,
+        prefer_height: previewPreferHeight,
       });
       setPreviewSessionId(res.session_id);
-      setPreviewHlsUrl(res.master_url);
+      setPreviewPlayback(resolvePreviewPlayback(url.trim(), res));
     } catch (err: any) {
       setError(err.message || 'Preview failed');
       setPreviewOpen(false);
@@ -1608,9 +1690,18 @@ export default function App() {
   }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer]);
 
   useEffect(() => {
-    if (!previewOpen || !previewHlsUrl) return;
-    const video = previewVideoRef.current;
-    if (!video) return;
+    if (!previewOpen || !previewPlayback?.url) return;
+    let cancelled = false;
+    let cleanup: (() => void) | undefined;
+
+    const setup = () => {
+      if (cancelled) return;
+      const video = previewVideoRef.current;
+      if (!video) {
+        requestAnimationFrame(setup);
+        return;
+      }
+      const { url: playbackUrl, kind: playbackKind } = previewPlayback;
 
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
@@ -1644,6 +1735,31 @@ export default function App() {
       }
     };
 
+    if (playbackKind === 'progressive') {
+      const preferHeight = isClipUrl(url.trim())
+        ? PREVIEW_CLIP_DEFAULT_HEIGHT
+        : PREVIEW_MAIN_DEFAULT_HEIGHT;
+      setPreviewLevels([{
+        index: 0,
+        height: preferHeight,
+        label: previewLevelLabel(preferHeight, undefined, true),
+      }]);
+      setPreviewQualityLevel(0);
+      const onVideoError = () => {
+        setError('Clip preview failed — try again');
+        setPreviewVideoLoading(false);
+      };
+      attachProgressivePreview(video, playbackUrl);
+      video.addEventListener('canplay', onCanPlay, { once: true });
+      video.addEventListener('error', onVideoError, { once: true });
+      cleanup = () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('error', onVideoError);
+        detachProgressivePreview(video);
+      };
+      return;
+    }
+
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -1659,16 +1775,20 @@ export default function App() {
         startPosition: previewTrimStartRef.current,
       });
       previewHlsRef.current = hls;
-      hls.loadSource(previewHlsUrl);
+      hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       let levelsInitialized = false;
+      const previewPreferHeight = isClipUrl(url.trim())
+        ? PREVIEW_CLIP_DEFAULT_HEIGHT
+        : PREVIEW_MAIN_DEFAULT_HEIGHT;
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
-        const { mapped, defaultIndex } = mapHlsLevels(levels, PREVIEW_MAIN_DEFAULT_HEIGHT);
-        if (!mapped.length) return;
+        const { mapped, defaultIndex } = resolvePreviewLevels(levels, previewPreferHeight);
         setPreviewLevels(mapped);
         if (!levelsInitialized || applyDefault) {
           levelsInitialized = true;
-          hls.loadLevel = defaultIndex;
+          if (hls.levels.length > 0 && defaultIndex < hls.levels.length) {
+            hls.loadLevel = defaultIndex;
+          }
           setPreviewQualityLevel(defaultIndex);
         }
       };
@@ -1697,26 +1817,35 @@ export default function App() {
             break;
         }
       });
-      return () => {
+      cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
         hls.destroy();
         previewHlsRef.current = null;
       };
+      return;
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = previewHlsUrl;
+      video.src = playbackUrl;
       video.addEventListener('canplay', onCanPlay, { once: true });
-      return () => {
+      cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
         video.removeAttribute('src');
         video.load();
       };
+      return;
     }
 
     setError('HLS playback is not supported in this browser');
     setPreviewVideoLoading(false);
-  }, [previewOpen, previewHlsUrl]);
+    };
+
+    setup();
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, [previewOpen, previewPlayback, url]);
 
   useEffect(() => {
     if (!previewOpen) return;
@@ -2107,12 +2236,14 @@ export default function App() {
 
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
     pauseAllExplorePopups();
+    const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips' || isLikelyClip(v);
     const vod: ExplorePopupVod = {
       url: buildVodUrl(v),
       title: v.title || 'Untitled',
       platform: v.platform,
       durationSec: v.duration ? Math.max(2, Math.floor(v.duration)) : 7200,
       platformListIndex: v.platformListIndex,
+      isClip: isClipItem,
     };
     const id = crypto.randomUUID();
     assignExplorePopupZ(id);
@@ -2133,7 +2264,7 @@ export default function App() {
       }
       return next;
     });
-  }, [pauseAllExplorePopups, assignExplorePopupZ]);
+  }, [pauseAllExplorePopups, assignExplorePopupZ, channelContentFilter]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -2352,8 +2483,14 @@ export default function App() {
     }
     try {
       const endpoint = clipDownload ? '/api/download/clip' : '/api/download/video';
+      const clipName = downloadFilename.trim()
+        || suggestClipDownloadName(videoInfo.title, videoInfo.uploader, url.trim());
       const body = clipDownload
-        ? { url: url.trim(), quality: quality || undefined }
+        ? {
+            url: url.trim(),
+            quality: quality || undefined,
+            output_file: clipName,
+          }
         : {
             url: url.trim(),
             quality: quality || undefined,
@@ -2366,7 +2503,7 @@ export default function App() {
     } catch (err: any) {
       setError(err.message);
     }
-  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder, refreshDownloads]);
+  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder, refreshDownloads, downloadFilename]);
 
   const downloadConfirmCopy = useMemo(() => {
     const clipDownload = isClipUrl(url.trim());
@@ -2375,20 +2512,29 @@ export default function App() {
       const dur = videoInfo?.duration
         ? Math.floor(videoInfo.duration)
         : Math.max(1, trimEndSec - trimStartSec);
-      const tag = formatClipDurationTag(dur);
       const human = formatClipDurationHuman(dur);
+      const defaultFilename = suggestClipDownloadName(
+        videoInfo?.title,
+        videoInfo?.uploader,
+        url.trim(),
+      );
       return {
         title: 'Download clip?',
-        message: `Download "${title}" (${human})?`,
-        detail: `File will include clip_${tag} in the name.`,
+        message: `Save this clip (${human}). Edit the file name below if you want.`,
+        defaultFilename,
       };
     }
     return {
       title: 'Download trim?',
       message: `Download "${title}" from ${formatHmsFull(trimStartSec)} to ${formatHmsFull(trimEndSec)}?`,
-      detail: `Trim length: ${formatHmsFull(trimEndSec - trimStartSec)}`,
+      defaultFilename: '',
     };
   }, [url, videoInfo, trimStartSec, trimEndSec]);
+
+  useEffect(() => {
+    if (!downloadConfirmOpen) return;
+    setDownloadFilename('');
+  }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename]);
 
   // ── Cancel download ──
 
@@ -2471,7 +2617,7 @@ export default function App() {
     }
     if (!incremental) setChannelsError(null);
 
-    const errs: Record<string, string> = { ...ch.errors };
+    const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
 
     try {
@@ -2496,11 +2642,12 @@ export default function App() {
               data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${fallbackQs}`);
             }
             if (data.content && data.content !== 'clips') {
-              errs[platform] = 'Clips API unavailable — restart API (npm run dev:api)';
+              errs[platform] = 'Clips API unavailable — restart with npm run dev';
               return;
             }
             const clips = data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? [];
             incoming.push(...clips.map(mapApiChannelItem));
+            delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
             if (pe) errs[platform] = pe;
           } catch (err: any) {
@@ -2516,7 +2663,7 @@ export default function App() {
           .sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
         updateChannel(channelId, {
           clipVideos,
-          errors: errs,
+          clipErrors: errs,
           loading: false,
           updatedAt: new Date().toISOString(),
         });
@@ -2527,6 +2674,7 @@ export default function App() {
           try {
             const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${qs}`);
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
+            delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
             if (pe) errs[platform] = pe;
           } catch (err: any) {
@@ -2540,7 +2688,7 @@ export default function App() {
         const vodVideos = mergeVodLists(ch.vodVideos ?? [], incoming);
         updateChannel(channelId, {
           vodVideos,
-          errors: errs,
+          vodErrors: errs,
           loading: false,
           updatedAt: new Date().toISOString(),
         });
@@ -2548,14 +2696,17 @@ export default function App() {
 
       const errKeys = Object.keys(errs).filter((k) => errs[k]);
       if (errKeys.length && !incremental) {
-        const hasItems = mode === 'clips'
-          ? incoming.length > 0
-          : (ch.vodVideos?.length ?? 0) > 0 || incoming.length > 0;
+        const cachedCount = mode === 'clips'
+          ? (ch.clipVideos?.length ?? 0)
+          : (ch.vodVideos?.length ?? 0);
+        const hasItems = incoming.length > 0 || cachedCount > 0;
         setChannelsError(
           hasItems
             ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
             : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
         );
+      } else if (!incremental && errKeys.length === 0) {
+        setChannelsError(null);
       }
     } finally {
       if (!incremental) {
@@ -2578,13 +2729,35 @@ export default function App() {
     });
   }, []);
 
-  // Fetch clips when user switches to Only clips and cache is empty.
+  // Fetch clips once when cache is empty (filter switch uses cached list).
   useEffect(() => {
     if (channelContentFilter !== 'clips' || !selectedChannelId) return;
     const ch = savedChannels.find((c) => c.id === selectedChannelId);
     if (!ch || (ch.clipVideos?.length ?? 0) > 0) return;
     void refreshChannel(selectedChannelId, ch, 'clips');
   }, [channelContentFilter, selectedChannelId, savedChannels, refreshChannel]);
+
+  // Show platform errors for the active filter only (not stale VOD errors on clips tab).
+  useEffect(() => {
+    if (!selectedChannel) {
+      setChannelsError(null);
+      return;
+    }
+    const errs = channelPlatformErrors(selectedChannel, channelContentFilter);
+    const errKeys = Object.keys(errs).filter((k) => errs[k]);
+    if (errKeys.length === 0) {
+      setChannelsError(null);
+      return;
+    }
+    const hasItems = channelContentFilter === 'clips'
+      ? (selectedChannel.clipVideos?.length ?? 0) > 0
+      : (selectedChannel.vodVideos?.length ?? 0) > 0;
+    setChannelsError(
+      hasItems
+        ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
+        : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
+    );
+  }, [selectedChannel, channelContentFilter]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -2603,7 +2776,8 @@ export default function App() {
       twitchSlug,
       vodVideos: [],
       clipVideos: [],
-      errors: {},
+      vodErrors: {},
+      clipErrors: {},
       updatedAt: '',
     };
     setSavedChannels((prev) => [...prev, entry]);
@@ -2719,12 +2893,21 @@ export default function App() {
   }, [settings]);
 
   // ── Fill VOD from channel ──
-  const selectVod = useCallback((vodUrl: string) => {
+  const selectVod = useCallback((vodUrl: string, badge?: ChannelPreviewBadge) => {
     setUrl(vodUrl);
     setChannelVodPanelOpen(true);
     setUrlTabBarHidden(true);
+    setPreviewChannelBadge(badge ?? null);
     void fetchVideoInfo(vodUrl);
   }, [fetchVideoInfo]);
+
+  const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
+    selectVod(vod.url, {
+      platform: vod.platform,
+      platformListIndex: vod.platformListIndex,
+      isClip: vod.isClip,
+    });
+  }, [selectVod]);
 
   const currentIsClip = isClipUrl(url);
 
@@ -2783,7 +2966,10 @@ export default function App() {
           <input
             type="text"
             value={url}
-            onChange={(e) => setUrl(e.target.value)}
+            onChange={(e) => {
+              setUrl(e.target.value);
+              setPreviewChannelBadge(null);
+            }}
             placeholder={urlFetched ? 'VOD or clip link' : 'PASTE VOD OR CLIP LINK...'}
             onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
             className={urlInputClass}
@@ -2878,7 +3064,6 @@ export default function App() {
             </div>
           </div>
 
-          {!currentIsClip && (
           <div className="flex flex-col gap-2.5 shrink-0 py-0.5">
             <div className="flex justify-between items-center">
               <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Trim</span>
@@ -2936,22 +3121,12 @@ export default function App() {
               onPointerCancel={() => setNeedleGlance(null)}
               className="url-trim-range w-full accent-zinc-400" />
             <button type="button" onClick={openPreview}
-              disabled={previewVideoLoading || trimEndSec <= trimStartSec}
+              disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
               className="w-full border border-zinc-700 text-zinc-400 hover:border-white hover:text-white font-mono text-[9px] uppercase font-bold py-1 flex items-center justify-center gap-1 disabled:opacity-40">
               {previewVideoLoading ? <Loader2 size={11} className="animate-spin" /> : <Eye size={11} />}
               Preview
             </button>
           </div>
-          )}
-
-          {currentIsClip && (
-            <button type="button" onClick={openPreview}
-              disabled={previewVideoLoading || vodDurationSec <= 0}
-              className="w-full border border-zinc-700 text-zinc-400 hover:border-white hover:text-white font-mono text-[9px] uppercase font-bold py-1 flex items-center justify-center gap-1 disabled:opacity-40 shrink-0">
-              {previewVideoLoading ? <Loader2 size={11} className="animate-spin" /> : <Eye size={11} />}
-              Preview clip
-            </button>
-          )}
 
           <button
             onClick={promptStartDownload}
@@ -2964,7 +3139,7 @@ export default function App() {
             }`}
           >
             <Download size={16} strokeWidth={3} />
-            <span className="inline-flex items-baseline">
+            <span className="inline-flex items-center">
               <span className="tracking-widest">{currentIsClip ? 'Clip rip it' : 'VOD rip it'}</span>
               <span className="rip-btn-bang" aria-hidden="true">!</span>
             </span>
@@ -3117,7 +3292,7 @@ export default function App() {
   );
 
   const previewTransportUi = (opts: { fsCornerExit?: boolean }) => (
-    <div className={`flex items-center gap-2 ${opts.fsCornerExit ? 'pr-14' : 'justify-between'}`}>
+    <div className="flex items-center gap-2 justify-between">
       <div className="flex items-center gap-1.5">
         <button type="button" onClick={togglePreviewPlay}
           disabled={!previewVideoReady}
@@ -3159,7 +3334,14 @@ export default function App() {
         >
           <Scissors size={18} />
         </button>
-        {!opts.fsCornerExit && (
+        {opts.fsCornerExit ? (
+          <button type="button" onClick={() => void togglePreviewFullscreen()}
+            disabled={!previewVideoReady}
+            className={previewCtrlBtn(previewFullscreen, true)}
+            title="Exit fullscreen">
+            <Minimize2 size={18} />
+          </button>
+        ) : (
           <button type="button" onClick={() => void togglePreviewFullscreen()}
             disabled={!previewVideoReady}
             className={previewCtrlBtn(previewFullscreen, true)}
@@ -3192,8 +3374,31 @@ export default function App() {
           className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
           style={{ width: previewPanelWidth }}
         >
-          <div className="flex items-center justify-end shrink-0">
-            <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1">
+          <div className="flex items-start justify-between gap-2 shrink-0">
+            {previewChannelBadge ? (
+              <div className="flex items-start gap-1.5 min-w-0">
+                <ChannelListIndexBadge
+                  platform={previewChannelBadge.platform}
+                  index={previewChannelBadge.platformListIndex}
+                  size="md"
+                />
+                <div className="min-w-0">
+                  <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
+                    {previewChannelBadge.isClip ? 'Channel clip preview' : 'Channel VOD preview'}
+                  </span>
+                  {videoInfo?.title && (
+                    <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
+                      {videoInfo.title}
+                    </p>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 pt-0.5">
+                Preview
+              </span>
+            )}
+            <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
               <X size={18} />
             </button>
           </div>
@@ -3212,59 +3417,63 @@ export default function App() {
                 }, PREVIEW_FS_CONTROLS_HIDE_MS);
               } : undefined}
               onFocus={focusPreviewPlayer}
-              onClick={(e) => {
-                focusPreviewPlayer();
-                if ((e.target as HTMLElement).tagName === 'VIDEO') {
-                  togglePreviewPlay();
-                }
-              }}
-              className="relative w-full shrink-0 bg-black border-2 border-zinc-700 overflow-hidden outline-none focus:ring-2 focus:ring-white/30"
-              style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
+              className={`preview-fs-host outline-none focus:ring-2 focus:ring-white/30 bg-black overflow-hidden ${
+                previewFullscreen
+                  ? 'border-0'
+                  : 'relative w-full shrink-0 border-2 border-zinc-700'
+              }`}
             >
-              <video
-                ref={previewVideoRef}
-                className="w-full h-full object-contain"
-                muted={previewMuted}
-                playsInline
-                onLoadedMetadata={handlePreviewLoadedMetadata}
-                onTimeUpdate={handlePreviewTimeUpdate}
-                onPlay={() => {
-                  if (previewSuppressPlayRef.current) {
-                    previewVideoRef.current?.pause();
+              <div
+                className={`relative bg-black overflow-hidden ${
+                  previewFullscreen ? 'absolute inset-0 z-0 cursor-pointer' : 'w-full h-full'
+                }`}
+                style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
+                onClick={(e) => {
+                  focusPreviewPlayer();
+                  if (!previewFullscreen) {
+                    if ((e.target as HTMLElement).tagName === 'VIDEO') togglePreviewPlay();
                     return;
                   }
-                  setPreviewPlaying(true);
+                  togglePreviewPlay();
                 }}
-                onPause={() => setPreviewPlaying(false)}
-              />
-              {previewVideoLoading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
-                  <Loader2 size={40} className="animate-spin text-zinc-300" />
-                </div>
-              )}
-              {previewFullscreen && (
-                <>
-                  <div
-                    ref={previewControlsRef}
-                    className={`absolute inset-x-0 bottom-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-3 bg-gradient-to-t from-black/35 to-transparent transition-opacity duration-150 ${
-                      previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                    }`}
-                    onClick={(e) => e.stopPropagation()}
-                    onMouseMove={bumpPreviewFsControls}
-                  >
-                    {previewTimelineUi}
-                    {previewTransportUi({ fsCornerExit: true })}
+              >
+                <video
+                  ref={previewVideoRef}
+                  className="w-full h-full object-contain pointer-events-none"
+                  muted={previewMuted}
+                  playsInline
+                  onLoadedMetadata={handlePreviewLoadedMetadata}
+                  onTimeUpdate={handlePreviewTimeUpdate}
+                  onPlay={() => {
+                    if (previewSuppressPlayRef.current) {
+                      previewVideoRef.current?.pause();
+                      return;
+                    }
+                    setPreviewPlaying(true);
+                  }}
+                  onPause={() => setPreviewPlaying(false)}
+                />
+                {previewVideoLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20 pointer-events-none">
+                    <Loader2 size={40} className="animate-spin text-zinc-300" />
                   </div>
-                  <button
-                    type="button"
-                    onClick={(e) => { e.stopPropagation(); void togglePreviewFullscreen(); }}
-                    disabled={!previewVideoReady}
-                    className={`absolute bottom-0 right-0 z-20 flex items-end justify-end min-w-[3.5rem] min-h-[3.5rem] p-4 pointer-events-auto ${previewCtrlBtn(true, true)}`}
-                    title="Exit fullscreen"
-                  >
-                    <Minimize2 size={18} />
-                  </button>
-                </>
+                )}
+              </div>
+              {previewFullscreen && (
+                <div
+                  ref={previewControlsRef}
+                  data-player-controls
+                  className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                    previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                  }`}
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onPointerUp={(e) => e.stopPropagation()}
+                  onMouseMove={bumpPreviewFsControls}
+                >
+                  {previewTimelineUi}
+                  {previewTransportUi({ fsCornerExit: true })}
+                </div>
               )}
             </div>
             {!previewFullscreen && (
@@ -3293,7 +3502,12 @@ export default function App() {
               <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">Selected VOD</span>
               <button
                 type="button"
-                onClick={() => { setChannelVodPanelOpen(false); setVideoInfo(null); setUrl(''); }}
+                onClick={() => {
+                  setChannelVodPanelOpen(false);
+                  setVideoInfo(null);
+                  setUrl('');
+                  setPreviewChannelBadge(null);
+                }}
                 className="text-zinc-500 hover:text-white p-1"
                 title="Clear selection"
               >
@@ -3513,7 +3727,7 @@ export default function App() {
                     onClick={() => {
                       if (channelContentFilter !== 'vods') {
                         setChannelContentFilter('vods');
-                        if (selectedChannelId) void refreshChannel(selectedChannelId, undefined, 'vods');
+                        setChannelsError(null);
                       }
                     }}
                     className={`px-2 py-0.5 border font-bold ${
@@ -3529,7 +3743,7 @@ export default function App() {
                     onClick={() => {
                       if (channelContentFilter !== 'clips') {
                         setChannelContentFilter('clips');
-                        if (selectedChannelId) void refreshChannel(selectedChannelId, undefined, 'clips');
+                        setChannelsError(null);
                       }
                     }}
                     className={`px-2 py-0.5 border font-bold ${
@@ -3570,30 +3784,35 @@ export default function App() {
                           key={`${v.platform}-${v.id}-${i}`}
                           role="button"
                           tabIndex={0}
-                          onClick={() => selectVod(fullUrl)}
+                          onClick={() => selectVod(fullUrl, {
+                            platform: v.platform,
+                            platformListIndex: v.platformListIndex,
+                            isClip: isClipItem,
+                          })}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
-                              selectVod(fullUrl);
+                              selectVod(fullUrl, {
+                                platform: v.platform,
+                                platformListIndex: v.platformListIndex,
+                                isClip: isClipItem,
+                              });
                             }
                           }}
                           className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                         >
                           {isClipItem && <ChannelClipThumb video={v} />}
-                          <span
-                            className={`shrink-0 w-4 text-center text-[9px] font-mono font-bold tabular-nums ${
-                              v.platform === 'Kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
-                            }`}
-                            title={`${v.platform} #${v.platformListIndex}`}
-                          >
-                            {v.platformListIndex}
-                          </span>
+                          <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
                           <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                             <span className="truncate flex items-center gap-1">
                               <PlatformVodIcon platform={v.platform} />
                               <span className="truncate">
                                 {v.title || 'Untitled'}
-                                {durSec != null ? <span className="text-zinc-500 ml-1">{fmtShort(durSec)}</span> : null}
+                                {durSec != null ? (
+                                  <span className="text-zinc-500 ml-1">
+                                    {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
+                                  </span>
+                                ) : null}
                               </span>
                             </span>
                             {subline && (
@@ -3602,10 +3821,9 @@ export default function App() {
                               </span>
                             )}
                           </div>
-                          {!isClipItem && (
                           <button
                             type="button"
-                            title="Preview VOD"
+                            title={isClipItem ? 'Preview clip' : 'Preview VOD'}
                             onClick={(e) => {
                               e.stopPropagation();
                               void openExplorePlayer(v);
@@ -3615,7 +3833,6 @@ export default function App() {
                             <Eye size={10} />
                             Preview
                           </button>
-                          )}
                           <button
                             type="button"
                             title="Open in browser"
@@ -3823,7 +4040,7 @@ export default function App() {
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
-              onCarryToUrl={selectVod}
+              onCarryToUrl={carryExploreToUrl}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
@@ -3842,7 +4059,13 @@ export default function App() {
         open={downloadConfirmOpen}
         title={downloadConfirmCopy.title}
         message={downloadConfirmCopy.message}
-        detail={downloadConfirmCopy.detail}
+        filenamePlaceholder={
+          downloadConfirmCopy.defaultFilename
+            ? downloadConfirmCopy.defaultFilename
+            : undefined
+        }
+        filename={downloadFilename}
+        onFilenameChange={setDownloadFilename}
         onConfirm={() => void executeStartDownload()}
         onCancel={() => setDownloadConfirmOpen(false)}
       />

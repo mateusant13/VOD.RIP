@@ -91,18 +91,31 @@ input[type="range"].url-trim-range::-moz-range-thumb {
   border: none;
 }
 
-/* Rip button — Syne + tracking-widest makes "!" look stretched; mono + narrow scale fixes it */
+/* Rip button — Syne tracking-widest stretches "!"; mono + flex center keeps it aligned */
 .rip-btn-bang {
   font-family: var(--font-mono);
   font-weight: 700;
   letter-spacing: 0;
-  display: inline-block;
-  transform: scaleX(0.7);
-  transform-origin: left bottom;
-  margin-left: 1px;
   line-height: 1;
-  position: relative;
-  top: -0.5px;
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
+.preview-fs-host:fullscreen {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
+
+.explore-fs-host:fullscreen {
+  width: 100%;
+  height: 100%;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  background: #000;
 }
 
 .preview-needle-rail {

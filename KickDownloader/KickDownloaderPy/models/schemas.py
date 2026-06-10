@@ -87,3 +87,4 @@ class PreviewSessionResponse(BaseModel):
     session_id: str
     master_url: str
     playback_url: str  # alias for master_url (frontend compat)
+    kind: str = "hls"  # "hls" (default) or "progressive" for direct MP4 sources

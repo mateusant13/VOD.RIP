@@ -6,9 +6,14 @@ import Hls from 'hls.js';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
+  PREVIEW_CLIP_DEFAULT_HEIGHT,
   PREVIEW_EXPLORE_DEFAULT_HEIGHT,
   applyHlsQualityLevel,
-  mapHlsLevels,
+  attachProgressivePreview,
+  detachProgressivePreview,
+  previewLevelLabel,
+  resolvePreviewLevels,
+  resolvePreviewPlayback,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import {
@@ -30,7 +35,7 @@ import {
 
 const API_BASE = '';
 const BACKEND_HINT =
-  'Backend not running. In a terminal run: npm run dev:all  (or npm run dev:api in one terminal and npm run dev in another). API must be on http://localhost:7897.';
+  'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).';
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_DEFAULT_VOLUME = 0.3;
@@ -41,6 +46,7 @@ export interface ExplorePopupVod {
   platform: string;
   durationSec: number;
   platformListIndex: number;
+  isClip: boolean;
 }
 
 interface ChannelExplorePopupProps {
@@ -50,7 +56,7 @@ interface ChannelExplorePopupProps {
   stackIndex: number;
   volumeMenuCloseTick: number;
   onClose: () => void;
-  onCarryToUrl: (url: string) => void;
+  onCarryToUrl: (vod: ExplorePopupVod) => void;
   onRegisterPause: (id: string, pause: () => void) => void;
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
@@ -129,7 +135,10 @@ export default function ChannelExplorePopup({
   onVolumeMenuOpen,
   onBringToFront,
 }: ChannelExplorePopupProps) {
-  const [hlsUrl, setHlsUrl] = useState<string | null>(null);
+  const [playback, setPlayback] = useState<{
+    url: string;
+    kind: 'hls' | 'progressive';
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -184,7 +193,7 @@ export default function ChannelExplorePopup({
   useEffect(() => {
     let cancelled = false;
     initialPlayDoneRef.current = false;
-    setHlsUrl(null);
+    setPlayback(null);
     setLoading(true);
     setReady(false);
     setError(null);
@@ -194,18 +203,26 @@ export default function ChannelExplorePopup({
 
     (async () => {
       try {
-        const res = await apiPost<{ session_id: string; master_url: string }>('/api/preview/session', {
+        const preferHeight = vod.isClip
+          ? PREVIEW_CLIP_DEFAULT_HEIGHT
+          : PREVIEW_EXPLORE_DEFAULT_HEIGHT;
+        const res = await apiPost<{
+          session_id: string;
+          master_url: string;
+          playback_url?: string;
+          kind?: string;
+        }>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
           crop_end: vod.durationSec,
-          prefer_height: PREVIEW_EXPLORE_DEFAULT_HEIGHT,
+          prefer_height: preferHeight,
         });
         if (cancelled) {
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;
         }
         sessionIdRef.current = res.session_id;
-        setHlsUrl(res.master_url);
+        setPlayback(resolvePreviewPlayback(vod.url, res));
       } catch (err: unknown) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Could not start player');
@@ -222,9 +239,7 @@ export default function ChannelExplorePopup({
       }
       const video = videoRef.current;
       if (video) {
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
+        detachProgressivePreview(video);
       }
       if (document.fullscreenElement === containerRef.current) {
         void document.exitFullscreen().catch(() => {});
@@ -433,9 +448,18 @@ export default function ChannelExplorePopup({
   }, [fullscreen, panelWidth, videoAspect, ready]);
 
   useEffect(() => {
-    if (!hlsUrl) return;
-    const video = videoRef.current;
-    if (!video) return;
+    if (!playback?.url) return;
+    let cancelled = false;
+    let cleanup: (() => void) | undefined;
+
+    const setup = () => {
+      if (cancelled) return;
+      const video = videoRef.current;
+      if (!video) {
+        requestAnimationFrame(setup);
+        return;
+      }
+      const { url: playbackUrl, kind: playbackKind } = playback;
 
     setLoading(true);
     setReady(false);
@@ -458,6 +482,31 @@ export default function ChannelExplorePopup({
       }
     };
 
+    if (playbackKind === 'progressive') {
+      const preferHeight = vod.isClip
+        ? PREVIEW_CLIP_DEFAULT_HEIGHT
+        : PREVIEW_EXPLORE_DEFAULT_HEIGHT;
+      setPreviewLevels([{
+        index: 0,
+        height: preferHeight,
+        label: previewLevelLabel(preferHeight, undefined, true),
+      }]);
+      setQualityLevel(0);
+      const onVideoError = () => {
+        setError('Clip preview failed — try again');
+        setLoading(false);
+      };
+      attachProgressivePreview(video, playbackUrl);
+      video.addEventListener('canplay', onCanPlay, { once: true });
+      video.addEventListener('error', onVideoError, { once: true });
+      cleanup = () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('error', onVideoError);
+        detachProgressivePreview(video);
+      };
+      return;
+    }
+
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -473,16 +522,20 @@ export default function ChannelExplorePopup({
         startPosition: 0,
       });
       hlsRef.current = hls;
-      hls.loadSource(hlsUrl);
+      hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       let levelsInitialized = false;
+      const preferHeight = vod.isClip
+        ? PREVIEW_CLIP_DEFAULT_HEIGHT
+        : PREVIEW_EXPLORE_DEFAULT_HEIGHT;
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
-        const { mapped, defaultIndex } = mapHlsLevels(levels, PREVIEW_EXPLORE_DEFAULT_HEIGHT);
-        if (!mapped.length) return;
+        const { mapped, defaultIndex } = resolvePreviewLevels(levels, preferHeight);
         setPreviewLevels(mapped);
         if (!levelsInitialized || applyDefault) {
           levelsInitialized = true;
-          hls.loadLevel = defaultIndex;
+          if (hls.levels.length > 0 && defaultIndex < hls.levels.length) {
+            hls.loadLevel = defaultIndex;
+          }
           setQualityLevel(defaultIndex);
         }
       };
@@ -511,26 +564,35 @@ export default function ChannelExplorePopup({
             break;
         }
       });
-      return () => {
+      cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
         hls.destroy();
         hlsRef.current = null;
       };
+      return;
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = hlsUrl;
+      video.src = playbackUrl;
       video.addEventListener('canplay', onCanPlay, { once: true });
-      return () => {
+      cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
         video.removeAttribute('src');
         video.load();
       };
+      return;
     }
 
     setError('HLS playback is not supported in this browser');
     setLoading(false);
-  }, [hlsUrl]);
+    };
+
+    setup();
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, [playback, vod.isClip]);
 
   useEffect(() => {
     if (!ready) return;
@@ -623,13 +685,15 @@ export default function ChannelExplorePopup({
       ref={containerRef}
       tabIndex={0}
       role="application"
-      aria-label="Channel explore player"
+      aria-label={vod.isClip ? 'Channel clip explore player' : 'Channel VOD explore player'}
       onKeyDown={handleKeyDown}
       onPointerDownCapture={onBringToFront}
       onClick={focusPlayer}
-      className={`group outline-none focus:ring-2 focus:ring-white/25 ${
-        fullscreen ? 'min-h-0 p-0 gap-0' : 'p-3 gap-2'
-      } flex flex-col overflow-visible bg-zinc-950 border-2 border-white ${platformCardShadow(platform)}`}
+      className={`group outline-none focus:ring-2 focus:ring-white/25 flex flex-col overflow-visible bg-zinc-950 ${
+        fullscreen
+          ? 'explore-fs-host min-h-0 p-0 gap-0 border-0 shadow-none'
+          : `p-3 gap-2 border-2 border-white ${platformCardShadow(platform)}`
+      }`}
       style={fullscreen ? {
         position: 'fixed',
         top: 0,
@@ -655,7 +719,7 @@ export default function ChannelExplorePopup({
       onMouseMove={fullscreen ? bumpFsControls : undefined}
     >
       <div
-        className={`flex flex-col ${fullscreen ? 'h-full min-h-0 gap-0' : 'gap-2 relative cursor-grab active:cursor-grabbing select-none'}`}
+        className={`flex flex-col ${fullscreen ? 'relative h-full min-h-0 w-full gap-0' : 'gap-2 relative cursor-grab active:cursor-grabbing select-none'}`}
         onPointerDown={fullscreen ? undefined : onPopupDrag}
       >
         {!fullscreen && (
@@ -671,7 +735,7 @@ export default function ChannelExplorePopup({
               </span>
               <div className="min-w-0">
                 <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                  Channel explore
+                  {vod.isClip ? 'Channel clip explore' : 'Channel VOD explore'}
                 </span>
                 <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
                   {vod.title}
@@ -691,16 +755,21 @@ export default function ChannelExplorePopup({
         <div
           ref={videoWrapRef}
           className={`relative bg-black overflow-hidden w-full ${
-            fullscreen ? 'flex-1 min-h-0 border-0' : 'border-2 border-zinc-700 shrink-0'
+            fullscreen ? 'absolute inset-0 z-0 border-0 cursor-pointer' : 'border-2 border-zinc-700 shrink-0'
           }`}
           style={fullscreen ? undefined : { aspectRatio: videoAspect }}
-          onClick={(e) => {
-            if ((e.target as HTMLElement).tagName === 'VIDEO') togglePlay();
+          onClick={() => {
+            if (fullscreen) {
+              togglePlay();
+              return;
+            }
+            /* non-fs: only the video element toggles — handled via pointer-events on video */
           }}
         >
           <video
             ref={videoRef}
-            className="w-full h-full object-contain"
+            className={`w-full h-full object-contain ${fullscreen ? 'pointer-events-none' : ''}`}
+            onClick={fullscreen ? undefined : () => togglePlay()}
             muted={muted}
             playsInline
             onLoadedMetadata={() => {
@@ -741,51 +810,55 @@ export default function ChannelExplorePopup({
             </div>
           )}
           {fullscreen && (
-            <>
-              <div
-                className={`absolute inset-x-0 bottom-0 z-10 flex flex-col gap-1.5 px-3 pb-3 pt-8 bg-gradient-to-t from-black/50 to-transparent transition-opacity duration-150 ${
-                  fsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                }`}
-                onMouseMove={bumpFsControls}
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onClose(); }}
+              className="absolute top-3 right-3 z-20 text-zinc-400 hover:text-white p-2 pointer-events-auto"
+              title="Close player"
+            >
+              <X size={20} />
+            </button>
+          )}
+        </div>
+        {fullscreen && (
+          <div
+            data-player-controls
+            className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-3 pb-3 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+              fsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+            }`}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+            onMouseMove={bumpFsControls}
+          >
+            {timelineUi}
+            <div className="flex items-center gap-2 pr-14">
+              <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
+                {playing ? <Pause size={18} /> : <Play size={18} />}
+              </button>
+              {volumeUi(true)}
+              {qualityUi(true)}
+              <button
+                type="button"
+                onClick={() => onCarryToUrl(vod)}
+                className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                title="Send to URL panel for rip"
               >
-                {timelineUi}
-                <div className="flex items-center gap-2 pr-14">
-                  <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
-                    {playing ? <Pause size={18} /> : <Play size={18} />}
-                  </button>
-                  {volumeUi(true)}
-                  {qualityUi(true)}
-                  <button
-                    type="button"
-                    onClick={() => onCarryToUrl(vod.url)}
-                    className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                    title="Send to URL panel for rip"
-                  >
-                    <ArrowRightToLine size={14} />
-                    URL
-                  </button>
-                </div>
-              </div>
+                <ArrowRightToLine size={14} />
+                URL
+              </button>
               <button
                 type="button"
                 onClick={() => void toggleFullscreen()}
                 disabled={!ready}
-                className="absolute bottom-0 right-0 z-20 flex items-end justify-end min-w-[3.5rem] min-h-[3.5rem] p-4 pointer-events-auto border border-white/20 bg-black/25 text-zinc-100 backdrop-blur-[1px] disabled:opacity-30"
+                className="ml-auto border border-white/20 bg-black/25 text-zinc-100 p-2 backdrop-blur-[1px] disabled:opacity-30"
                 title="Exit fullscreen"
               >
                 <Minimize2 size={18} />
               </button>
-              <button
-                type="button"
-                onClick={() => onClose()}
-                className="absolute top-3 right-3 z-20 text-zinc-400 hover:text-white p-2 pointer-events-auto"
-                title="Close player"
-              >
-                <X size={20} />
-              </button>
-            </>
-          )}
-        </div>
+            </div>
+          </div>
+        )}
         {!fullscreen && (
           <>
             {timelineUi}
@@ -801,7 +874,7 @@ export default function ChannelExplorePopup({
                 {qualityUi(false)}
                 <button
                   type="button"
-                  onClick={() => onCarryToUrl(vod.url)}
+                  onClick={() => onCarryToUrl(vod)}
                   className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
                   title="Send to URL panel for rip"
                 >

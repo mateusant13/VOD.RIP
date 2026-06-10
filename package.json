@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev-all.mjs",
+    "dev:vite": "vite",
     "dev:api": "cd KickDownloader/KickDownloaderPy && python run.py",
     "dev:all": "node scripts/dev-all.mjs",
     "build": "vite build",
