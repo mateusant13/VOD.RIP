@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MouseEvent, type MutableRefObject, type ReactNode, type SetStateAction } from 'react';
+import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
   Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
@@ -211,12 +212,62 @@ function formatHmsFull(sec: number): string {
 const PREVIEW_DEFAULT_HEIGHT = 480;
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const TRIPLE_SIDE_WIDTH = 'w-[26rem]';
-const TRIPLE_SIDE_HEIGHT = 'h-[28rem]';
-const TRIPLE_PREVIEW_WIDTH = '64rem';
-const EXPLORE_POPUP_DEFAULT = { w: 288, h: 320 };
-const EXPLORE_POPUP_MIN = { w: 240, h: 200 };
+type PanelSize = { w: number; h: number };
+
+const PREVIEW_PANEL_DEFAULT: PanelSize = { w: 640, h: 400 };
+const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 384 };
+const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
+const EXPLORE_POPUP_DEFAULT: PanelSize = { w: 288, h: 320 };
+const PANEL_MIN: PanelSize = { w: 200, h: 180 };
+const PANEL_MAX_W = 1000;
 const EXPLORE_POPUP_MAX_W = 960;
+
+function panelMaxHeight() {
+  return Math.round(window.innerHeight * 0.92);
+}
+
+function PanelResizeHandle({ onMouseDown }: { onMouseDown: (e: MouseEvent) => void }) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="both"
+      title="Resize"
+      onMouseDown={onMouseDown}
+      className="absolute bottom-0 right-0 z-30 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto"
+    >
+      <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500" />
+    </div>
+  );
+}
+
+function startPanelResizeDrag(
+  e: MouseEvent,
+  sizeRef: MutableRefObject<PanelSize>,
+  setSize: Dispatch<SetStateAction<PanelSize>>,
+  opts?: { maxW?: number; maxH?: number },
+) {
+  e.preventDefault();
+  e.stopPropagation();
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const { w: startW, h: startH } = sizeRef.current;
+  const maxW = opts?.maxW ?? PANEL_MAX_W;
+  const maxH = opts?.maxH ?? panelMaxHeight();
+  const onMove = (ev: MouseEvent) => {
+    const next = {
+      w: Math.min(maxW, Math.max(PANEL_MIN.w, startW + ev.clientX - startX)),
+      h: Math.min(maxH, Math.max(PANEL_MIN.h, startH + ev.clientY - startY)),
+    };
+    sizeRef.current = next;
+    setSize(next);
+  };
+  const onUp = () => {
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+}
 
 interface PreviewLevelOption {
   index: number;
@@ -258,14 +309,6 @@ function lowestLevelIndex(levels: PreviewLevelOption[]): number {
   if (!levels.length) return 0;
   return levels.reduce((best, l) => (l.height < best.height ? l : best)).index;
 }
-
-/**
- * Fixed compact-card height — matches git 7bb0321 queue tab at rest
- * (header + tabs + 2× max-h-[160px] list sections + gaps ≈ 28rem).
- * Taller tab content scrolls inside the body.
- */
-const COMPACT_CARD_WIDTH = 'w-[28rem]';
-const COMPACT_CARD_HEIGHT = 'h-[28rem]';
 
 const CHANNEL_INITIAL_VISIBLE = 5;
 const CHANNEL_EXPAND_STEP = 10;
@@ -426,6 +469,7 @@ export default function App() {
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
+  const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
   /** URL tab hidden from bar after picking a VOD from channels; restored only on page refresh. */
   const [urlTabBarHidden, setUrlTabBarHidden] = useState(false);
@@ -456,7 +500,12 @@ export default function App() {
   const [exploreReady, setExploreReady] = useState(false);
   const [explorePlaying, setExplorePlaying] = useState(false);
   const [exploreMuted, setExploreMuted] = useState(false);
+  const [exploreVolume, setExploreVolume] = useState(1);
+  const [exploreVolumeMenuOpen, setExploreVolumeMenuOpen] = useState(false);
   const [exploreCurrentTime, setExploreCurrentTime] = useState(0);
+  const [previewPanelSize, setPreviewPanelSize] = useState(PREVIEW_PANEL_DEFAULT);
+  const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(URL_ASIDE_PANEL_DEFAULT);
+  const [mainPanelSize, setMainPanelSize] = useState(MAIN_PANEL_DEFAULT);
   const [explorePopupSize, setExplorePopupSize] = useState(EXPLORE_POPUP_DEFAULT);
   const [exploreFullscreen, setExploreFullscreen] = useState(false);
   const [exploreFsControlsVisible, setExploreFsControlsVisible] = useState(true);
@@ -467,7 +516,11 @@ export default function App() {
   const exploreSessionIdRef = useRef<string | null>(null);
   const exploreFsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exploreInitialPlayDoneRef = useRef(false);
+  const previewPanelSizeRef = useRef(PREVIEW_PANEL_DEFAULT);
+  const urlAsidePanelSizeRef = useRef(URL_ASIDE_PANEL_DEFAULT);
+  const mainPanelSizeRef = useRef(MAIN_PANEL_DEFAULT);
   const explorePopupSizeRef = useRef(EXPLORE_POPUP_DEFAULT);
+  const exploreVolumeRef = useRef(1);
 
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -570,6 +623,7 @@ export default function App() {
     setPreviewLevels([]);
     setPreviewQualityLevel(0);
     setPreviewQualityMenuOpen(false);
+    setPreviewVolumeMenuOpen(false);
     previewInitialSeekDoneRef.current = false;
     previewInitialPlayDoneRef.current = false;
     if (sid) {
@@ -890,17 +944,20 @@ export default function App() {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
+  const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || exploreVolumeMenuOpen;
+
   useEffect(() => {
-    if (!previewQualityMenuOpen) return;
+    if (!anyPlayerMenuOpen) return;
     const onPointerDown = (e: MouseEvent) => {
-      const root = previewControlsRef.current;
-      if (root && !root.contains(e.target as Node)) {
-        setPreviewQualityMenuOpen(false);
-      }
+      const target = e.target as HTMLElement;
+      if (target.closest('[data-player-menu]')) return;
+      setPreviewQualityMenuOpen(false);
+      setPreviewVolumeMenuOpen(false);
+      setExploreVolumeMenuOpen(false);
     };
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
-  }, [previewQualityMenuOpen]);
+  }, [anyPlayerMenuOpen]);
 
   useEffect(() => {
     if (!previewOpen || !previewVideoReady) return;
@@ -946,6 +1003,8 @@ export default function App() {
     setExploreReady(false);
     setExplorePlaying(false);
     setExploreMuted(false);
+    setExploreVolume(1);
+    setExploreVolumeMenuOpen(false);
     setExploreCurrentTime(0);
     setExploreFullscreen(false);
     setExploreFsControlsVisible(true);
@@ -976,6 +1035,8 @@ export default function App() {
     setExploreReady(false);
     setExplorePlaying(false);
     setExploreMuted(false);
+    setExploreVolume(1);
+    setExploreVolumeMenuOpen(false);
     setExploreCurrentTime(0);
     setExploreError(null);
     try {
@@ -1004,18 +1065,23 @@ export default function App() {
     }
   }, [exploreReady]);
 
-  const toggleExploreMute = useCallback(() => {
+  const setExploreVolumeLevel = useCallback((level: number) => {
     const video = exploreVideoRef.current;
-    if (!video || !exploreReady) return;
-    if (video.muted || video.volume <= 0) {
-      video.muted = false;
-      video.volume = 1;
-      setExploreMuted(false);
-    } else {
+    if (!video) return;
+    const v = Math.max(0, Math.min(1, level));
+    video.volume = v;
+    if (v > 0) {
+      exploreVolumeRef.current = v;
+    }
+    setExploreVolume(v);
+    if (v <= 0) {
       video.muted = true;
       setExploreMuted(true);
+    } else {
+      video.muted = false;
+      setExploreMuted(false);
     }
-  }, [exploreReady]);
+  }, []);
 
   const seekExploreVideo = useCallback((sec: number) => {
     const video = exploreVideoRef.current;
@@ -1033,26 +1099,23 @@ export default function App() {
     setExploreCurrentTime(video.currentTime);
   }, []);
 
-  const startExploreResize = useCallback((e: MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const startX = e.clientX;
-    const startY = e.clientY;
-    const { w: startW, h: startH } = explorePopupSizeRef.current;
-    const maxH = Math.round(window.innerHeight * 0.85);
-    const onMove = (ev: MouseEvent) => {
-      const w = Math.min(EXPLORE_POPUP_MAX_W, Math.max(EXPLORE_POPUP_MIN.w, startW + ev.clientX - startX));
-      const h = Math.min(maxH, Math.max(EXPLORE_POPUP_MIN.h, startH + ev.clientY - startY));
-      const next = { w, h };
-      explorePopupSizeRef.current = next;
-      setExplorePopupSize(next);
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+  const onPreviewPanelResize = useCallback((e: MouseEvent) => {
+    startPanelResizeDrag(e, previewPanelSizeRef, setPreviewPanelSize);
+  }, []);
+
+  const onUrlAsidePanelResize = useCallback((e: MouseEvent) => {
+    startPanelResizeDrag(e, urlAsidePanelSizeRef, setUrlAsidePanelSize);
+  }, []);
+
+  const onMainPanelResize = useCallback((e: MouseEvent) => {
+    startPanelResizeDrag(e, mainPanelSizeRef, setMainPanelSize);
+  }, []);
+
+  const onExplorePanelResize = useCallback((e: MouseEvent) => {
+    startPanelResizeDrag(e, explorePopupSizeRef, setExplorePopupSize, {
+      maxW: EXPLORE_POPUP_MAX_W,
+      maxH: Math.round(window.innerHeight * 0.85),
+    });
   }, []);
 
   const toggleExploreFullscreen = useCallback(async () => {
@@ -1104,6 +1167,8 @@ export default function App() {
       setExploreLoading(false);
       video.muted = false;
       video.volume = 1;
+      exploreVolumeRef.current = 1;
+      setExploreVolume(1);
       setExploreMuted(false);
       if (!exploreInitialPlayDoneRef.current && video.paused) {
         exploreInitialPlayDoneRef.current = true;
@@ -1192,9 +1257,9 @@ export default function App() {
     if (!trimmed) return;
     setLoading(true);
     setError(null);
-    setVideoInfo(null);
     try {
       const info = await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmed)}`);
+      setUrl(trimmed);
       setVideoInfo(info);
       setQuality(bestAvailableQuality(info));
       const dur = info.duration ? Math.floor(info.duration) : 3600;
@@ -1564,9 +1629,6 @@ export default function App() {
   const urlPanelAside = showUrlInSidebar || showUrlInPreviewMiddle;
   const splitLayout = urlPanelAside;
   const triplePanelLayout = previewOpen && urlPanelAside;
-  const sidePanelSizeClass = triplePanelLayout
-    ? `${TRIPLE_SIDE_WIDTH} ${TRIPLE_SIDE_HEIGHT}`
-    : `${COMPACT_CARD_WIDTH} ${COMPACT_CARD_HEIGHT}`;
   const showUrlInMainCard = tab === 'url' && !urlPanelAside && !urlTabBarHidden;
   const urlMainCompact = showUrlInMainCard && Boolean(videoInfo);
   const mainCardHeaderCompact = triplePanelLayout || urlMainCompact;
@@ -1581,6 +1643,9 @@ export default function App() {
   }, [urlPanelAside, urlTabBarHidden, tab]);
 
   const urlFetched = Boolean(videoInfo);
+  const extractBtnHoverClass = urlPanelAside && !previewOpen
+    ? actionBtnHover(null)
+    : actionBtnHover(urlPlatform);
   const urlInputClass = urlFetched
     ? 'w-full bg-zinc-950 border border-zinc-800 text-zinc-400 font-mono placeholder:text-zinc-600 pl-7 pr-7 py-1 focus:outline-none focus:border-zinc-500 transition-colors text-[10px] truncate'
     : 'w-full bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 pl-10 pr-10 py-3 focus:outline-none focus:border-white transition-colors uppercase text-sm';
@@ -1595,13 +1660,13 @@ export default function App() {
           <input
             type="text"
             value={url}
-            onChange={(e) => { setUrl(e.target.value); setVideoInfo(null); }}
+            onChange={(e) => setUrl(e.target.value)}
             placeholder={urlFetched ? 'VOD link' : 'PASTE VOD LINK HERE...'}
             onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
             className={urlInputClass}
           />
           {url && (
-            <button onClick={() => { setUrl(''); setVideoInfo(null); }}
+            <button type="button" onClick={() => setUrl('')}
               className={`absolute inset-y-0 right-0 flex items-center text-zinc-500 hover:text-white ${urlFetched ? 'pr-2' : 'pr-3'}`}>
               <X size={urlFetched ? 12 : 18} strokeWidth={urlFetched ? 2 : 3} />
             </button>
@@ -1612,7 +1677,7 @@ export default function App() {
           <button
             onClick={handleGetInfo}
             disabled={!url || loading}
-            className={`w-full bg-zinc-800 text-white font-black uppercase py-3 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 border-2 border-zinc-700 ${actionBtnHover(urlPlatform)}`}
+            className={`w-full bg-zinc-800 text-white font-black uppercase py-3 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 border-2 border-zinc-700 ${extractBtnHoverClass}`}
           >
             {loading ? (
               <><Loader2 size={16} className="animate-spin" /> Loading...</>
@@ -1622,11 +1687,11 @@ export default function App() {
           </button>
         )}
 
-        {videoInfo && (
-          <button type="button" onClick={() => setVideoInfo(null)}
-            className="text-[9px] text-zinc-600 hover:text-white uppercase font-bold text-right tracking-wider">
-            [ Change URL ]
-          </button>
+        {videoInfo && loading && (
+          <div className="flex items-center justify-center gap-2 py-1 text-[10px] font-mono text-zinc-500">
+            <Loader2 size={12} className="animate-spin" />
+            Updating…
+          </div>
         )}
       </div>
 
@@ -1745,6 +1810,57 @@ export default function App() {
       : `border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white ${pad} disabled:opacity-40`;
   };
 
+  const renderVolumeControl = (opts: {
+    volume: number;
+    muted: boolean;
+    menuOpen: boolean;
+    setMenuOpen: Dispatch<SetStateAction<boolean>>;
+    onVolumeChange: (level: number) => void;
+    disabled: boolean;
+    buttonClassName: string;
+    popoverFs?: boolean;
+    onMenuOpen?: () => void;
+  }) => {
+    const displayVol = opts.muted ? 0 : opts.volume;
+    const popoverClass = opts.popoverFs
+      ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
+      : 'border-2 border-zinc-600 bg-zinc-950';
+    return (
+      <div className="relative" data-player-menu>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            opts.onMenuOpen?.();
+            opts.setMenuOpen((o) => !o);
+          }}
+          disabled={opts.disabled}
+          className={opts.buttonClassName}
+          title="Volume"
+        >
+          {opts.muted || opts.volume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+        </button>
+        {opts.menuOpen && (
+          <div
+            className={`absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${popoverClass}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={displayVol}
+              disabled={opts.disabled}
+              onChange={(e) => opts.onVolumeChange(parseFloat(e.target.value))}
+              className={`w-24 accent-white ${opts.popoverFs ? 'h-1' : 'h-1.5'}`}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const previewTimelineUi = (
     <div className="flex items-center gap-2">
       <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
@@ -1774,23 +1890,26 @@ export default function App() {
           className={previewCtrlBtn(previewFullscreen, true)}>
           {previewPlaying ? <Pause size={18} /> : <Play size={18} />}
         </button>
-        <button type="button"
-          onClick={() => {
-            if (previewMuted || previewVolume <= 0) {
-              setPreviewVolumeLevel(previewVolumeRef.current > 0 ? previewVolumeRef.current : 1);
-            } else {
-              setPreviewVolumeLevel(0);
-            }
-          }}
-          disabled={!previewVideoReady}
-          className={previewCtrlBtn(previewFullscreen, true)}>
-          {previewMuted || previewVolume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
-        </button>
+        {renderVolumeControl({
+          volume: previewVolume,
+          muted: previewMuted,
+          menuOpen: previewVolumeMenuOpen,
+          setMenuOpen: setPreviewVolumeMenuOpen,
+          onVolumeChange: setPreviewVolumeLevel,
+          disabled: !previewVideoReady,
+          buttonClassName: previewCtrlBtn(previewFullscreen, true),
+          popoverFs: previewFullscreen,
+          onMenuOpen: () => setPreviewQualityMenuOpen(false),
+        })}
         {previewLevels.length > 1 && (
-          <div className="relative">
+          <div className="relative" data-player-menu>
             <button
               type="button"
-              onClick={() => setPreviewQualityMenuOpen((o) => !o)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setPreviewVolumeMenuOpen(false);
+                setPreviewQualityMenuOpen((o) => !o);
+              }}
               disabled={!previewVideoReady}
               className={previewCtrlBtn(previewFullscreen)}
               title="Video quality"
@@ -1827,6 +1946,19 @@ export default function App() {
     </div>
   );
 
+  const exploreFsCtrlBtn = 'border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]';
+
+  const exploreVolumeUi = (fs: boolean) => renderVolumeControl({
+    volume: exploreVolume,
+    muted: exploreMuted,
+    menuOpen: exploreVolumeMenuOpen,
+    setMenuOpen: setExploreVolumeMenuOpen,
+    onVolumeChange: setExploreVolumeLevel,
+    disabled: !exploreReady,
+    buttonClassName: fs ? exploreFsCtrlBtn : previewCtrlBtn(false, true),
+    popoverFs: fs,
+  });
+
   const exploreTimelineUi = exploreVod ? (
     <div className="flex items-center gap-1.5 w-full shrink-0">
       <span className={`text-[9px] font-mono w-10 shrink-0 ${exploreFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
@@ -1850,8 +1982,10 @@ export default function App() {
 
   return (
     <div
-      className={`min-h-screen flex justify-center items-center p-4 selection:bg-white selection:text-black bg-[#09090b] ${
-        splitLayout ? 'overflow-x-auto' : ''
+      className={`min-h-screen flex justify-center items-center selection:bg-white selection:text-black bg-[#09090b] ${
+        splitLayout
+          ? 'overflow-x-auto px-5 py-4'
+          : 'p-4'
       }`}
       style={{
         backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)',
@@ -1859,16 +1993,19 @@ export default function App() {
         scrollbarGutter: 'stable',
       }}
     >
-      <div className={`flex items-start gap-6 ${
-        splitLayout ? 'w-max max-w-none' : 'w-full max-w-md justify-center'
+      <div className={`flex items-start ${
+        triplePanelLayout
+          ? 'w-full max-w-[calc(100vw-2.5rem)] gap-3 justify-center'
+          : splitLayout
+            ? 'w-max max-w-none gap-6'
+            : 'w-full max-w-md justify-center gap-6'
       }`}>
       {previewOpen && (
         <div
-          className={`shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 ${platformCardShadow(activePlatform, true)}`}
+          className={`relative shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(activePlatform, true)}`}
           style={{
-            width: triplePanelLayout
-              ? `min(${TRIPLE_PREVIEW_WIDTH}, calc(100vw - 2rem))`
-              : 'min(720px, calc(100vw - 56rem - 3rem))',
+            width: previewPanelSize.w,
+            height: previewPanelSize.h,
           }}
         >
           <div className="flex items-center justify-between gap-2">
@@ -1956,10 +2093,16 @@ export default function App() {
               </div>
             )}
           </div>
+          {!previewFullscreen && (
+            <PanelResizeHandle onMouseDown={onPreviewPanelResize} />
+          )}
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
-        <div className={`shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 ${sidePanelSizeClass} ${platformCardShadow(activePlatform, true)}`}>
+        <div
+          className={`relative shrink-0 bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(activePlatform, true)}`}
+          style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
+        >
           {showUrlInSidebar && (
             <div className="flex items-center justify-between shrink-0">
               <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">Selected VOD</span>
@@ -1981,13 +2124,15 @@ export default function App() {
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
             {urlTabContent}
           </div>
+          <PanelResizeHandle onMouseDown={onUrlAsidePanelResize} />
         </div>
       )}
-      <div className={`relative shrink-0 bg-zinc-950 border-2 border-white flex flex-col overflow-hidden ${
-        triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
-      } ${splitLayout ? sidePanelSizeClass : `${COMPACT_CARD_WIDTH} ${COMPACT_CARD_HEIGHT}`} ${platformCardShadow(activePlatform)} transition-all duration-300 ${
-        splitLayout ? '' : 'w-full max-w-md'
-      }`}>
+      <div
+        className={`relative shrink-0 bg-zinc-950 border-2 border-white flex flex-col overflow-hidden min-h-0 ${
+          triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
+        } ${platformCardShadow(activePlatform)} transition-all duration-300`}
+        style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
+      >
 
         {/* ── HEADER ── */}
         <div className="flex justify-between items-start shrink-0 min-w-0 gap-2">
@@ -2071,7 +2216,7 @@ export default function App() {
             </div>
 
             {savedChannels.length > 0 && (
-              <div className="flex flex-col gap-1 max-h-[100px] overflow-y-auto pr-1 custom-scrollbar">
+              <div className="flex flex-col gap-1">
                 {savedChannels.map((ch) => (
                   <div key={ch.id}
                     className={`flex items-center gap-1 border px-2 py-1 ${
@@ -2191,7 +2336,7 @@ export default function App() {
                 ) : visibleChannelVideos.length === 0 ? (
                   <p className="text-center text-zinc-600 font-mono text-[10px] py-4">No VODs</p>
                 ) : (
-                  <div className="flex flex-col gap-1 max-h-[280px] overflow-y-auto pr-1 custom-scrollbar">
+                  <div className="flex flex-col gap-1">
                     {visibleChannelVideos.map((v, i) => {
                       const fullUrl = buildVodUrl(v);
                       return (
@@ -2224,15 +2369,15 @@ export default function App() {
                           </div>
                           <button
                             type="button"
-                            title="Start video player"
+                            title="Preview VOD"
                             onClick={(e) => {
                               e.stopPropagation();
                               void openExplorePlayer(v);
                             }}
                             className="shrink-0 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-400 hover:border-white hover:text-white flex items-center gap-0.5"
                           >
-                            <Play size={10} fill="currentColor" />
-                            Play
+                            <Eye size={10} />
+                            Preview
                           </button>
                           <button
                             type="button"
@@ -2421,6 +2566,7 @@ export default function App() {
           </div>
         )}
 
+        <PanelResizeHandle onMouseDown={onMainPanelResize} />
       </div>
       </div>
       </div>
@@ -2429,22 +2575,23 @@ export default function App() {
       <div className="fixed top-10 left-10 text-zinc-800 font-black text-9xl opacity-10 pointer-events-none select-none z-[-1] blur-sm">
         KICK
       </div>
-      {exploreOpen && exploreVod && (
+      {exploreOpen && exploreVod && createPortal(
         <div
           ref={exploreContainerRef}
           style={exploreFullscreen ? undefined : {
             width: explorePopupSize.w,
             height: explorePopupSize.h,
           }}
-          className={`z-[100] flex flex-col bg-zinc-950 border-2 border-white min-h-0 ${
+          className={`flex flex-col bg-zinc-950 border-2 border-white min-h-0 ${
             platformCardShadow(exploreVod.platform === 'Twitch' ? 'twitch' : 'kick', true)
           } ${
             exploreFullscreen
-              ? 'fixed inset-0 w-screen h-screen p-0 gap-0'
-              : 'fixed bottom-5 right-5 p-3 gap-2 relative'
+              ? 'fixed inset-0 z-[200] w-screen h-screen p-0 gap-0'
+              : 'fixed bottom-5 right-5 z-[200] p-3 gap-2'
           }`}
           onMouseMove={exploreFullscreen ? bumpExploreFsControls : undefined}
         >
+          <div className={`flex flex-col min-h-0 ${exploreFullscreen ? 'h-full gap-0' : 'h-full gap-2 relative'}`}>
           {!exploreFullscreen && (
             <div className="flex items-start justify-between gap-2 shrink-0">
               <div className="min-w-0">
@@ -2512,14 +2659,7 @@ export default function App() {
                     >
                       {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
                     </button>
-                    <button
-                      type="button"
-                      onClick={toggleExploreMute}
-                      disabled={!exploreReady}
-                      className="border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]"
-                    >
-                      {exploreMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
-                    </button>
+                    {exploreVolumeUi(true)}
                   </div>
                 </div>
                 <button
@@ -2558,14 +2698,7 @@ export default function App() {
                   >
                     {explorePlaying ? <Pause size={18} /> : <Play size={18} />}
                   </button>
-                  <button
-                    type="button"
-                    onClick={toggleExploreMute}
-                    disabled={!exploreReady}
-                    className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40"
-                  >
-                    {exploreMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
-                  </button>
+                  {exploreVolumeUi(false)}
                 </div>
                 <button
                   type="button"
@@ -2577,18 +2710,12 @@ export default function App() {
                   <Maximize2 size={18} />
                 </button>
               </div>
-              <div
-                role="separator"
-                aria-orientation="horizontal"
-                title="Resize"
-                onMouseDown={startExploreResize}
-                className="absolute bottom-0 right-0 z-30 w-5 h-5 cursor-se-resize flex items-end justify-end p-0.5 pointer-events-auto"
-              >
-                <span className="block w-2.5 h-2.5 border-r-2 border-b-2 border-zinc-500" />
-              </div>
+              <PanelResizeHandle onMouseDown={onExplorePanelResize} />
             </>
           )}
-        </div>
+          </div>
+        </div>,
+        document.body,
       )}
       <div className="fixed bottom-10 right-10 text-zinc-800 font-black text-9xl opacity-10 pointer-events-none select-none z-[-1] blur-sm">
         TWITCH

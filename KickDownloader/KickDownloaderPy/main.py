@@ -45,6 +45,7 @@ import yt_dlp
 
 logger = logging.getLogger(__name__)
 from services.ytdlp_service import detect_platform, get_video_info
+from services.twitch_gql_service import list_channel_videos_sync as twitch_list_channel_videos_sync
 from services.kick_playwright_service import (
     download_vod_sync as kick_download_vod_sync,
     get_video_info_sync as kick_get_video_info_sync,
@@ -491,53 +492,24 @@ async def channel_videos(
         PLATFORM_STAGGER_SEC = 1.0
 
         async def _fetch_twitch() -> None:
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "extract_flat": True,
-                "playlistend": limit,
-                "noplaylist": False,
-            }
-            videos_url = f"https://www.twitch.tv/{channel}/videos"
-            def _extract():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(videos_url, download=False)
             try:
-                info = await loop.run_in_executor(None, _extract)
+                vids = await loop.run_in_executor(
+                    None, twitch_list_channel_videos_sync, channel, limit
+                )
             except Exception as e:
                 per_platform_errors["Twitch"] = _format_platform_error(e)
                 return
-            for entry in (info or {}).get("entries", []) or []:
-                if entry is None:
-                    continue
-                entry_id = entry.get("id", "")
-                # Twitch's yt-dlp entries expose the id with a leading
-                # "v" (e.g. "v1492198155"). The real URL strips it
-                # (`/videos/1492198155`), so the same id is useless for
-                # building a clickable link. Normalize it to the bare
-                # numeric form so any consumer of this endpoint (the
-                # UI, the URL tab, `yt-dlp.extract_info` on the next
-                # call) sees a URL that actually resolves.
-                numeric_id = entry_id[1:] if entry_id.startswith("v") else entry_id
-                webpage_url = (
-                    entry.get("url")
-                    or entry.get("webpage_url")
-                    or (f"https://www.twitch.tv/videos/{numeric_id}" if numeric_id else "")
-                )
+            for v in vids:
                 all_videos.append({
-                    # Strip the leading "v" so the id matches the
-                    # URL's path segment. Clients that need the
-                    # full URL can use `v.url`; clients that need
-                    # just the id get a consistent numeric form.
-                    "id": numeric_id or entry_id,
+                    "id": v["id"],
                     "platform": "Twitch",
-                    "title": entry.get("title") or entry.get("url", "Untitled"),
-                    "duration": entry.get("duration"),
-                    "created_at": entry.get("upload_date"),
-                    "views": entry.get("view_count"),
-                    "thumbnail_url": entry.get("thumbnail") or entry.get("url"),
-                    "url": webpage_url,
+                    "title": v.get("title") or "Untitled",
+                    "duration": v.get("duration"),
+                    "created_at": v.get("created_at"),
+                    "views": v.get("views"),
+                    "thumbnail_url": v.get("thumbnail_url"),
+                    "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
+                    "channel": channel,
                 })
         async def _fetch_kick() -> None:
             videos_url = f"https://kick.com/{channel}/videos"
