@@ -1,7 +1,7 @@
 @echo off
 title Kick ^& Twitch Downloader
 
-CD /D "%~dp0KickDownloaderPy"
+CD /D "%~dp0"
 
 echo =================================================
 echo   Kick ^& Twitch Downloader v2.0 (Python)
