@@ -304,15 +304,17 @@ def resolve_stream_info(
 
     full_url = build_url(url, platform)
 
-    # Twitch clips — use yt-dlp for progressive MP4 URLs with proper auth headers.
-    # GQL is also tried for fast metadata, but yt-dlp provides the http_headers
-    # (cookies, User-Agent) that Twitch's CloudFront CDN requires (GQL's sourceURLs
-    # return 401 without them).
+    # Twitch clips — prefer GQL for fast progressive MP4 resolution (~0.5-1s).
+    # GQL's sourceURLs are pre-signed CDN URLs that do not need auth cookies.
+    # yt-dlp is only used as a slow fallback when GQL fails.
     if platform == "Twitch" and is_clip_url(url):
         variants: List[dict] = []
-        headers: dict = {}
+        headers: dict = {
+            "Referer": "https://www.twitch.tv/",
+            "Origin": "https://www.twitch.tv",
+        }
 
-        # Try GQL first for fast progressive variant resolution.
+        # GQL first — fast and reliable for progressive MP4 variants.
         try:
             from services.twitch_gql_service import get_clip_progressive_variants_sync
 
@@ -320,34 +322,25 @@ def resolve_stream_info(
         except Exception as exc:
             logger.debug("Twitch clip GQL resolve failed: %s", exc)
 
-        # Always run yt-dlp to get proper http_headers — GQL sourceURLs need auth
-        # cookies/headers that only yt-dlp's extractor provides.
-        try:
-            opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
-            clip_info = _extract_hls_info(full_url, opts)
-            yt_variants = _deduped_progressive_variants(clip_info)
-
-            first_with_headers = next((v for v in yt_variants if v.get("http_headers")), None)
-            if first_with_headers:
-                headers = first_with_headers.get("http_headers") or {}
-            else:
-                headers = clip_info.get("http_headers") or {}
-
-            # If GQL returned nothing, use yt-dlp's variants.
-            if not variants:
-                variants = yt_variants
-        except Exception as exc:
-            logger.debug("Twitch clip yt-dlp fallback failed: %s", exc)
-            if not variants:
+        # yt-dlp fallback — slower but may work when GQL fails.
+        if not variants:
+            try:
+                opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+                clip_info = _extract_hls_info(full_url, opts)
+                variants = _deduped_progressive_variants(clip_info)
+                first_with_headers = next(
+                    (v for v in variants if v.get("http_headers")), None
+                )
+                if first_with_headers:
+                    headers = first_with_headers.get("http_headers") or {}
+                else:
+                    headers = clip_info.get("http_headers") or headers
+            except Exception as exc:
+                logger.debug("Twitch clip yt-dlp fallback failed: %s", exc)
                 raise RuntimeError("Twitch clip has no progressive formats")
 
         if not variants:
             raise RuntimeError("Twitch clip has no progressive formats")
-        if not headers:
-            headers = {
-                "Referer": "https://www.twitch.tv/",
-                "Origin": "https://www.twitch.tv",
-            }
         chosen_url = _pick_variant_by_height(
             [(int(v.get("height") or 0), v.get("url") or "") for v in variants],
             prefer_height=prefer_height,
