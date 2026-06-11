@@ -129,6 +129,9 @@ interface AppSettings {
   temp_folder: string;
   oauth: string;
   quality: string;
+  panel_layout?: PersistedPanelLayout | null;
+  window_geometry?: Record<string, number | boolean> | null;
+  saved_channels?: SavedChannel[] | null;
 }
 
 interface SavedChannel {
@@ -153,10 +156,17 @@ type Tab = 'url' | 'channels' | 'queue' | 'settings';
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 const API_BASE = '';
-const API_TIMEOUT_MS = 45_000;
+const API_TIMEOUT_MS = 60_000;
+const IS_DEV_UI = import.meta.env.DEV;
 
-const BACKEND_HINT =
+const BACKEND_HINT_DEV =
   'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).';
+const BACKEND_HINT_APP =
+  'API not reachable. Quit VOD.RIP from the tray and reopen the app.';
+const BACKEND_HINT = IS_DEV_UI ? BACKEND_HINT_DEV : BACKEND_HINT_APP;
+const TIMEOUT_HINT = IS_DEV_UI
+  ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
+  : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
 
 function apiErrorMessage(res: Response, fallback: string, path?: string): string {
   if (res.status === 500 || res.status === 502 || res.status === 503) {
@@ -166,29 +176,44 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
     const p = path ?? '';
     const fb = String(fallback).toLowerCase();
     if (p.includes('/api/channel/clips') || fb === 'not found') {
-      return 'Clips API not on server — restart with npm run dev';
+      return IS_DEV_UI
+        ? 'Clips API not on server — restart with npm run dev'
+        : 'Clips API unavailable — quit VOD.RIP from the tray and reopen the app';
     }
   }
   if (res.status === 405) {
-    return 'API method not supported — restart with npm run dev';
+    return IS_DEV_UI
+      ? 'API method not supported — restart with npm run dev'
+      : 'API method not supported — reopen VOD.RIP';
   }
   return fallback;
 }
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const attempt = async (): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    try {
+      return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    } finally {
+      window.clearTimeout(timer);
+    }
+  };
   try {
-    return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    return await attempt();
   } catch (err: unknown) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error(
-        'Request timed out — the API may be hung. Stop and restart: npm run dev',
-      );
+      throw new Error(TIMEOUT_HINT);
     }
-    throw new Error(BACKEND_HINT);
-  } finally {
-    window.clearTimeout(timer);
+    try {
+      await new Promise((resolve) => window.setTimeout(resolve, 400));
+      return await attempt();
+    } catch (retryErr: unknown) {
+      if (retryErr instanceof DOMException && retryErr.name === 'AbortError') {
+        throw new Error(TIMEOUT_HINT);
+      }
+      throw new Error(BACKEND_HINT);
+    }
   }
 }
 
@@ -1204,6 +1229,55 @@ function clampTrimEndpoints(
   return { start, end };
 }
 
+/** Start: button − extends clip (earlier), + trims. End: − trims, + extends. */
+function trimButtonDeltaForEndpoint(which: 'in' | 'out', buttonDelta: number): number {
+  return which === 'in' ? -buttonDelta : buttonDelta;
+}
+
+/** Move the active in/out endpoint by delta seconds (+ extends clip that way). */
+function adjustTrimEndpointByDelta(
+  start: number,
+  end: number,
+  dur: number,
+  which: 'in' | 'out',
+  delta: number,
+): { start: number; end: number } {
+  const minLen = 1;
+  if (which === 'in') {
+    const newStart = Math.max(0, Math.min(end - minLen, start - delta));
+    return { start: newStart, end };
+  }
+  const newEnd = Math.min(dur, Math.max(start + minLen, end + delta));
+  return { start, end: newEnd };
+}
+
+function ClipDurationAdjustButtons({
+  onAdjust,
+  disabled,
+  compact,
+  activeEndpoint,
+}: {
+  onAdjust: (deltaSec: number) => void;
+  disabled?: boolean;
+  compact?: boolean;
+  activeEndpoint: 'in' | 'out';
+}) {
+  const btnClass = compact
+    ? 'px-1 py-0 text-[7px] font-mono font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white disabled:opacity-30 disabled:pointer-events-none'
+    : 'px-1.5 py-0.5 text-[8px] font-mono font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white disabled:opacity-30 disabled:pointer-events-none';
+  const titles = activeEndpoint === 'in'
+    ? { m5: 'Extend clip 5s at start', m1: 'Extend clip 1s at start', p1: 'Trim 1s from start', p5: 'Trim 5s from start' }
+    : { m5: 'Trim 5s from end', m1: 'Trim 1s from end', p1: 'Extend clip 1s at end', p5: 'Extend clip 5s at end' };
+  return (
+    <div className={`flex items-center gap-0.5 shrink-0 ${compact ? '' : 'justify-end'}`}>
+      <button type="button" disabled={disabled} onClick={() => onAdjust(-5)} className={btnClass} title={titles.m5}>-5s</button>
+      <button type="button" disabled={disabled} onClick={() => onAdjust(-1)} className={btnClass} title={titles.m1}>-1s</button>
+      <button type="button" disabled={disabled} onClick={() => onAdjust(1)} className={btnClass} title={titles.p1}>+1s</button>
+      <button type="button" disabled={disabled} onClick={() => onAdjust(5)} className={btnClass} title={titles.p5}>+5s</button>
+    </div>
+  );
+}
+
 function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
   if (platform === 'kick') {
     return 'hover:bg-[#53fc18] hover:text-black hover:border-[#53fc18] hover:shadow-[4px_4px_0px_0px_#53fc18]';
@@ -1642,6 +1716,10 @@ export default function App() {
     fixedEnd: number;
   } | null>(null);
   const urlTrimPointerRef = useRef({ x: 0, y: 0 });
+  const lastUrlTrimEndpointRef = useRef<'in' | 'out'>('in');
+  const lastPreviewTrimEndpointRef = useRef<'in' | 'out'>('out');
+  const [lastUrlTrimEndpoint, setLastUrlTrimEndpoint] = useState<'in' | 'out'>('in');
+  const [lastPreviewTrimEndpoint, setLastPreviewTrimEndpoint] = useState<'in' | 'out'>('out');
 
   // Channel explore players (up to 5 floating popups)
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
@@ -1664,14 +1742,94 @@ export default function App() {
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
+  const panelLayoutPersistReadyRef = useRef(false);
+  const panelLayoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const restorePanelLayout = useCallback((pl: PersistedPanelLayout) => {
+    const clampedUrl = clampStoredPanelSize(pl.urlAside, URL_ASIDE_PANEL_DEFAULT);
+    const clampedMain = clampStoredPanelSize(pl.main, MAIN_PANEL_DEFAULT);
+    const clampedPreviewW = clampLayoutNumber(
+      pl.previewPanelWidth,
+      PREVIEW_PANEL_MIN_W,
+      PANEL_MAX_W,
+      PREVIEW_PANEL_DEFAULT_W,
+    );
+    previewPanelWidthRef.current = clampedPreviewW;
+    urlAsidePanelSizeRef.current = clampedUrl;
+    mainPanelSizeRef.current = clampedMain;
+    setPreviewPanelWidth(clampedPreviewW);
+    setUrlAsidePanelSize(clampedUrl);
+    setMainPanelSize(clampedMain);
+    persistPanelLayout({
+      previewPanelWidth: clampedPreviewW,
+      urlAside: clampedUrl,
+      main: clampedMain,
+    });
+  }, []);
+
+  const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => ({
+    previewPanelWidth: previewPanelWidthRef.current,
+    urlAside: { ...urlAsidePanelSizeRef.current },
+    main: { ...mainPanelSizeRef.current },
+  }), []);
+
+  const flushPanelLayoutToBackend = useCallback(() => {
+    if (!panelLayoutPersistReadyRef.current) return;
+    const layout = readCurrentPanelLayout();
+    persistPanelLayout(layout);
+    if (panelLayoutSaveTimerRef.current) {
+      window.clearTimeout(panelLayoutSaveTimerRef.current);
+      panelLayoutSaveTimerRef.current = null;
+    }
+    const body = JSON.stringify({ panel_layout: layout });
+    try {
+      void fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive: true,
+      });
+    } catch {
+      apiPost('/api/settings', { panel_layout: layout }).catch(() => {});
+    }
+  }, [readCurrentPanelLayout]);
+
+  useEffect(() => {
+    const win = window as Window & {
+      __vodripFlushPanelLayout?: () => void;
+      __vodripReadPanelLayout?: () => PersistedPanelLayout;
+    };
+    win.__vodripFlushPanelLayout = flushPanelLayoutToBackend;
+    win.__vodripReadPanelLayout = readCurrentPanelLayout;
+    const onPageHide = () => flushPanelLayoutToBackend();
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      delete win.__vodripFlushPanelLayout;
+      delete win.__vodripReadPanelLayout;
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [flushPanelLayoutToBackend, readCurrentPanelLayout]);
 
   // Persist main layout panels (preview / URL aside / main card) — not channel explore popups.
   useEffect(() => {
-    persistPanelLayout({
+    const layout = {
       previewPanelWidth,
       urlAside: urlAsidePanelSize,
       main: mainPanelSize,
-    });
+    };
+    persistPanelLayout(layout);
+    if (!panelLayoutPersistReadyRef.current) return;
+    if (panelLayoutSaveTimerRef.current) {
+      window.clearTimeout(panelLayoutSaveTimerRef.current);
+    }
+    panelLayoutSaveTimerRef.current = window.setTimeout(() => {
+      apiPost('/api/settings', { panel_layout: layout }).catch(() => {});
+    }, 400);
+    return () => {
+      if (panelLayoutSaveTimerRef.current) {
+        window.clearTimeout(panelLayoutSaveTimerRef.current);
+      }
+    };
   }, [previewPanelWidth, urlAsidePanelSize, mainPanelSize]);
 
   // Queue
@@ -1689,6 +1847,7 @@ export default function App() {
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
+  const channelsPersistReadyRef = useRef(false);
   const [pickingFolder, setPickingFolder] = useState(false);
   // Platform filter for channel browsing. Default: both enabled. Pure
   // presentation state — the backend always returns every VOD for the
@@ -2334,6 +2493,42 @@ export default function App() {
     return { start, end };
   }, [vodDurationSec, seekPreviewVideo]);
 
+  const markUrlTrimEndpoint = useCallback((which: 'in' | 'out') => {
+    lastUrlTrimEndpointRef.current = which;
+    setLastUrlTrimEndpoint(which);
+  }, []);
+
+  const markPreviewTrimEndpoint = useCallback((which: 'in' | 'out') => {
+    lastPreviewTrimEndpointRef.current = which;
+    setLastPreviewTrimEndpoint(which);
+  }, []);
+
+  const adjustUrlClipDuration = useCallback((buttonDelta: number) => {
+    const dur = Math.max(1, vodDurationSec);
+    const which = lastUrlTrimEndpointRef.current;
+    const adjusted = adjustTrimEndpointByDelta(
+      trimStartSecRef.current,
+      trimEndSecRef.current,
+      dur,
+      which,
+      trimButtonDeltaForEndpoint(which, buttonDelta),
+    );
+    commitUrlTrimRange(adjusted.start, adjusted.end);
+  }, [vodDurationSec, commitUrlTrimRange]);
+
+  const adjustPreviewClipDuration = useCallback((buttonDelta: number) => {
+    const dur = Math.max(1, vodDurationSec);
+    const which = lastPreviewTrimEndpointRef.current;
+    const adjusted = adjustTrimEndpointByDelta(
+      previewTrimStartRef.current,
+      previewTrimEndRef.current,
+      dur,
+      which,
+      trimButtonDeltaForEndpoint(which, buttonDelta),
+    );
+    commitPreviewTrimRange(adjusted.start, adjusted.end, { seek: which });
+  }, [vodDurationSec, commitPreviewTrimRange]);
+
   const updateNeedleGlance = useCallback((
     which: 'in' | 'out',
     ev: PointerEvent,
@@ -2357,6 +2552,7 @@ export default function App() {
     e: ReactPointerEvent<HTMLElement>,
     which: 'in' | 'out',
   ) => {
+    markPreviewTrimEndpoint(which);
     e.preventDefault();
     e.stopPropagation();
     const rail = previewNeedleRailRef.current;
@@ -2432,7 +2628,7 @@ export default function App() {
     handle.addEventListener('pointercancel', onUp);
     handle.addEventListener('lostpointercapture', onLostCapture);
     onMove(e.nativeEvent);
-  }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance]);
+  }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance, markPreviewTrimEndpoint]);
 
   const finishUrlTrimDrag = useCallback(() => {
     urlTrimDragPinRef.current = null;
@@ -2445,6 +2641,7 @@ export default function App() {
     value: number,
     pointer?: { x: number; y: number },
   ) => {
+    markUrlTrimEndpoint(which);
     const pin = urlTrimDragPinRef.current;
     if (pin && pin.which !== which) return;
 
@@ -2470,7 +2667,7 @@ export default function App() {
         deltaSec: activeSec - dragOrigin,
       });
     }
-  }, [commitUrlTrimRange]);
+  }, [commitUrlTrimRange, markUrlTrimEndpoint]);
 
   const setPreviewVolumeLevel = useCallback((level: number) => {
     const video = previewVideoRef.current;
@@ -2892,12 +3089,14 @@ export default function App() {
   const promptStartDownload = useCallback(() => {
     if (!videoInfo) return;
     const clipDownload = isClipUrl(url.trim());
-    if (!clipDownload && trimEndSec <= trimStartSec) {
+    const effectiveEnd = previewOpen ? previewTrimEndRef.current : trimEndSec;
+    const effectiveStart = previewOpen ? previewTrimStartRef.current : trimStartSec;
+    if (!clipDownload && effectiveEnd <= effectiveStart) {
       setError('Set a valid trim range before downloading.');
       return;
     }
     setDownloadConfirmOpen(true);
-  }, [videoInfo, url, trimStartSec, trimEndSec]);
+  }, [videoInfo, url, trimStartSec, trimEndSec, previewOpen]);
 
   // ── Refresh downloads ──
 
@@ -2935,8 +3134,8 @@ export default function App() {
         : {
             url: url.trim(),
             quality: quality || undefined,
-            crop_start: trimStartSec,
-            crop_end: trimEndSec,
+            crop_start: previewOpen ? previewTrimStartRef.current : trimStartSec,
+            crop_end: previewOpen ? previewTrimEndRef.current : trimEndSec,
           };
       await apiPost<{ download_id: string; status: string }>(endpoint, body);
       setTab('queue');
@@ -3034,6 +3233,9 @@ export default function App() {
 
   useEffect(() => {
     persistChannels(savedChannels);
+    if (!channelsPersistReadyRef.current) return;
+    const payload = savedChannels.map(({ loading: _loading, ...ch }) => ch);
+    apiPost('/api/settings', { saved_channels: payload }).catch(() => {});
   }, [savedChannels]);
 
   const updateChannel = useCallback((id: string, patch: Partial<SavedChannel>) => {
@@ -3076,14 +3278,26 @@ export default function App() {
             let data: ChannelClipsResponse;
             try {
               data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${qs}`);
-            } catch (clipErr: any) {
-              const msg = clipErr?.message ?? '';
-              if (!msg.includes('Clips API not on server')) throw clipErr;
-              const fallbackQs = `url=${encodeURIComponent(slug)}&platforms=${encodeURIComponent(platform)}&limit=10&content=clips`;
-              data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${fallbackQs}`);
+            } catch (clipErr: unknown) {
+              const msg = clipErr instanceof Error ? clipErr.message : '';
+              if (!msg.includes('Clips API not on server') && !msg.includes('Clips API unavailable')) {
+                throw clipErr;
+              }
+              const fallbackQs = new URLSearchParams({
+                url: slug,
+                platforms: platform,
+                limit: '10',
+                content: 'clips',
+                ...(platform === 'Kick'
+                  ? { kick_slug: slug }
+                  : { twitch_login: slug }),
+              });
+              data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${fallbackQs.toString()}`);
             }
             if (data.content && data.content !== 'clips') {
-              errs[platform] = 'Clips API unavailable — restart with npm run dev';
+              errs[platform] = IS_DEV_UI
+                ? 'Clips API unavailable — restart with npm run dev'
+                : 'Clips API unavailable — reopen VOD.RIP';
               return;
             }
             const clips = data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? [];
@@ -3091,8 +3305,8 @@ export default function App() {
             delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
             if (pe) errs[platform] = pe;
-          } catch (err: any) {
-            errs[platform] = err.message || `Failed to fetch ${platform} clips`;
+          } catch (err: unknown) {
+            errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} clips`;
           }
         };
         await Promise.all([
@@ -3181,6 +3395,10 @@ export default function App() {
   // Show platform errors for the active filter only (not stale VOD errors on clips tab).
   useEffect(() => {
     if (!selectedChannel) {
+      setChannelsError(null);
+      return;
+    }
+    if (selectedChannel.loading) {
       setChannelsError(null);
       return;
     }
@@ -3310,8 +3528,22 @@ export default function App() {
     try {
       const s = await apiGet<AppSettings>('/api/settings');
       setSettings(s);
-    } catch {}
-  }, []);
+      if (s.saved_channels && Array.isArray(s.saved_channels) && s.saved_channels.length > 0) {
+        const restored = s.saved_channels.map((ch) => normalizeSavedChannel(ch as SavedChannel));
+        setSavedChannels(restored);
+        persistChannels(restored);
+      }
+      if (s.panel_layout) {
+        const pl = s.panel_layout as PersistedPanelLayout;
+        if (pl.previewPanelWidth && pl.urlAside && pl.main) {
+          restorePanelLayout(pl);
+        }
+      }
+    } catch {} finally {
+      channelsPersistReadyRef.current = true;
+      panelLayoutPersistReadyRef.current = true;
+    }
+  }, [restorePanelLayout]);
 
   useEffect(() => {
     loadSettings();
@@ -3324,14 +3556,23 @@ export default function App() {
   const handleSaveSettings = useCallback(async () => {
     if (!settings) return;
     try {
-      await apiPost('/api/settings', settings);
+      const payload: AppSettings = {
+        ...settings,
+        panel_layout: {
+          previewPanelWidth,
+          urlAside: urlAsidePanelSize,
+          main: mainPanelSize,
+        },
+        saved_channels: savedChannels.map(({ loading: _loading, ...ch }) => ch),
+      };
+      await apiPost('/api/settings', payload);
       setSettingsSaved(true);
       setError(null);
       setTimeout(() => setSettingsSaved(false), 2000);
     } catch (err: any) {
       setError(err.message || 'Failed to save settings');
     }
-  }, [settings]);
+  }, [settings, previewPanelWidth, urlAsidePanelSize, mainPanelSize, savedChannels]);
 
   // ── Fill VOD from channel ──
   const selectVod = useCallback((vodUrl: string, badge?: ChannelPreviewBadge) => {
@@ -3506,9 +3747,14 @@ export default function App() {
           </div>
 
           <div className="flex flex-col gap-2.5 shrink-0 py-0.5">
-            <div className="flex justify-between items-center">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Trim</span>
-              <span className="text-xs font-mono text-zinc-400">{formatHmsFull(trimEndSec - trimStartSec)}</span>
+            <div className="flex justify-between items-center gap-2">
+              <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 shrink-0">Trim</span>
+              <ClipDurationAdjustButtons
+                onAdjust={adjustUrlClipDuration}
+                activeEndpoint={lastUrlTrimEndpoint}
+                disabled={vodDurationSec <= 0 || trimEndSec <= trimStartSec}
+              />
+              <span className="text-xs font-mono text-zinc-400 shrink-0">{formatHmsFull(trimEndSec - trimStartSec)}</span>
             </div>
             <div className="flex justify-between text-xs font-mono text-white px-0.5">
               <EditableHmsTime
@@ -3527,6 +3773,7 @@ export default function App() {
             </div>
             <input type="range" min={0} max={Math.max(0, trimEndSec - 1)} step={1} value={trimStartSec}
               onPointerDown={(e) => {
+                markUrlTrimEndpoint('in');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
                 urlTrimDragPinRef.current = {
@@ -3560,6 +3807,7 @@ export default function App() {
               className="url-trim-range w-full accent-zinc-400" />
             <input type="range" min={Math.min(vodDurationSec, trimStartSec + 1)} max={vodDurationSec} step={1} value={trimEndSec}
               onPointerDown={(e) => {
+                markUrlTrimEndpoint('out');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
                 urlTrimDragPinRef.current = {
@@ -3734,6 +3982,12 @@ export default function App() {
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
             />
           </div>
+          <ClipDurationAdjustButtons
+            compact
+            onAdjust={adjustPreviewClipDuration}
+            activeEndpoint={lastPreviewTrimEndpoint}
+            disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
+          />
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
           }`}>
@@ -3799,7 +4053,7 @@ export default function App() {
         <button
           type="button"
           onClick={promptStartDownload}
-          disabled={!previewVideoReady || !videoInfo || (!currentIsClip && trimEndSec <= trimStartSec)}
+          disabled={!previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
           className={previewCtrlBtn(previewFullscreen, true)}
           title={currentIsClip ? 'Download clip' : 'Download selected trim'}
         >
@@ -4480,7 +4734,7 @@ export default function App() {
 
         {/* ════════════════════════════ SETTINGS TAB ════════════════════════════ */}
         {tab === 'settings' && settings && (
-          <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-1.5">
               <FieldCaption>Download Folder</FieldCaption>
               <div className="flex gap-2">
@@ -4514,8 +4768,18 @@ export default function App() {
             </div>
 
             <button onClick={handleSaveSettings}
-              className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">
-              {settingsSaved ? <><CheckCircle2 size={16} /> Saved!</> : 'Save Settings'}
+              className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">
+              {settingsSaved ? <><CheckCircle2 size={14} /> Saved!</> : 'Save Settings'}
+            </button>
+
+            <button onClick={async () => {
+              if (!window.confirm('Exit VOD.RIP? All downloads will be cancelled and the app will close.')) return;
+              flushPanelLayoutToBackend();
+              try { await apiPost('/api/exit', {}); } catch {}
+            }}
+              className="w-full bg-red-950 text-red-400 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-300 transition-colors">
+              <StopCircle size={14} />
+              Exit VOD.RIP
             </button>
           </div>
         )}

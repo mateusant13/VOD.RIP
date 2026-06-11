@@ -51,8 +51,12 @@ from services.settings import SettingsManager
 import yt_dlp
 
 logger = logging.getLogger(__name__)
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 from services.ytdlp_service import detect_platform, get_video_info, is_clip_url
 from services.twitch_gql_service import (
+    get_clip_info_sync as twitch_get_clip_info_sync,
     get_video_info_sync as twitch_get_video_info_sync,
     list_channel_clips_sync as twitch_list_channel_clips_sync,
     list_channel_videos_sync as twitch_list_channel_videos_sync,
@@ -197,6 +201,12 @@ async def update_settings(update: SettingsUpdate):
         current.oauth = update.oauth
     if update.quality is not None:
         current.quality = update.quality
+    if update.panel_layout is not None:
+        current.panel_layout = update.panel_layout
+    if update.window_geometry is not None:
+        current.window_geometry = update.window_geometry
+    if update.saved_channels is not None:
+        current.saved_channels = update.saved_channels
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
@@ -357,6 +367,7 @@ def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                                creationflags=_NO_WINDOW,
                 )
                 path = (out.stdout or "").strip()
                 if path:
@@ -385,15 +396,17 @@ def _open_folder_sync(path: str) -> None:
                 subprocess.Popen(
                     ["explorer", f"/select,{target}"],
                     close_fds=True,
+                                creationflags=_NO_WINDOW,
                 )
             else:
                 os.startfile(target)
         elif sys.platform == "darwin":
             subprocess.Popen(
-                ["open", "-R", target] if p.is_file() else ["open", target]
+                ["open", "-R", target] if p.is_file() else ["open", target],
+                creationflags=_NO_WINDOW,
             )
         else:
-            subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)])
+            subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)], creationflags=_NO_WINDOW)
         return
 
     parent = p.parent.resolve()
@@ -403,9 +416,9 @@ def _open_folder_sync(path: str) -> None:
     if os.name == "nt":
         os.startfile(folder)
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", folder])
+        subprocess.Popen(["open", folder], creationflags=_NO_WINDOW)
     else:
-        subprocess.Popen(["xdg-open", folder])
+        subprocess.Popen(["xdg-open", folder], creationflags=_NO_WINDOW)
 
 
 def _validate_open_folder_path(path: str) -> str:
@@ -465,8 +478,8 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     except ValueError:
         pass
     try:
-        session = await asyncio.get_event_loop().run_in_executor(
-            None,
+        session = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR,
             lambda: create_session(
                 preview_url,
                 req.crop_start,
@@ -825,6 +838,9 @@ async def channel_videos(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+CLIP_FETCH_TIMEOUT_SEC = 35
+
+
 async def _gather_channel_clips(
     *,
     wanted: List[str],
@@ -844,9 +860,15 @@ async def _gather_channel_clips(
             per_platform_errors["Twitch"] = "Twitch login is required"
             return
         try:
-            vids = await loop.run_in_executor(
-                INFO_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
+            vids = await asyncio.wait_for(
+                loop.run_in_executor(
+                    INFO_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
+                ),
+                timeout=CLIP_FETCH_TIMEOUT_SEC,
             )
+        except asyncio.TimeoutError:
+            per_platform_errors["Twitch"] = "Clip fetch timed out — try again"
+            return
         except Exception as e:
             per_platform_errors["Twitch"] = _format_platform_error(e)
             return
@@ -870,12 +892,18 @@ async def _gather_channel_clips(
             per_platform_errors["Kick"] = "Kick slug is required"
             return
         try:
-            vids = await loop.run_in_executor(
-                INFO_EXECUTOR,
-                kick_list_channel_clips_sync,
-                f"https://kick.com/{kick_slug}/clips",
-                limit,
+            vids = await asyncio.wait_for(
+                loop.run_in_executor(
+                    INFO_EXECUTOR,
+                    kick_list_channel_clips_sync,
+                    f"https://kick.com/{kick_slug}/clips",
+                    limit,
+                ),
+                timeout=CLIP_FETCH_TIMEOUT_SEC,
             )
+        except asyncio.TimeoutError:
+            per_platform_errors["Kick"] = "Clip fetch timed out — try again"
+            return
         except Exception as e:
             per_platform_errors["Kick"] = _format_platform_error(e)
             return
@@ -994,6 +1022,8 @@ async def info_clip(id: str):
         lowered = id.lower()
         if "kick.com" in lowered and is_clip_url(id):
             return await loop.run_in_executor(INFO_EXECUTOR, kick_get_clip_info_sync, id)
+        if is_clip_url(id) or "clips.twitch.tv" in lowered or "/clip/" in lowered:
+            return await loop.run_in_executor(INFO_EXECUTOR, twitch_get_clip_info_sync, id)
         info = await get_video_info(id)
         return info
     except Exception as e:
@@ -1013,6 +1043,8 @@ async def _fetch_queue_meta(url: str, platform: str) -> dict:
         if is_clip_url(url):
             if platform == "Kick":
                 info = await loop.run_in_executor(INFO_EXECUTOR, kick_get_clip_info_sync, url)
+            elif platform == "Twitch":
+                info = await loop.run_in_executor(INFO_EXECUTOR, twitch_get_clip_info_sync, url)
             else:
                 info = await get_video_info(url)
         elif platform == "Kick":
@@ -1176,6 +1208,18 @@ async def download_stream(download_id: str, request: Request):
 
 
 # --- System ---
+
+
+@app.post("/api/exit")
+async def exit_app():
+    """Shut down all processes and kill the server."""
+    logger.info("Exit requested via API — shutting down")
+
+    from services.app_lifecycle import request_app_exit
+
+    request_app_exit()
+    return {"ok": True, "message": "Shutting down"}
+
 
 @app.get("/api/info")
 async def server_info():

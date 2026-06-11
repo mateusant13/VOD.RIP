@@ -168,13 +168,14 @@ def _clip_from_api_item(item: dict, slug: str) -> Optional[KickVideo]:
 CLIP_MAX_DURATION_SEC = 60
 
 
-def list_channel_clips_api(slug: str, limit: int = 10) -> List[KickVideo]:
+def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -> List[KickVideo]:
     """Last *limit* clips by date, then ranked by views (desc).
 
     Uses Kick channel clips page/API: https://kick.com/{slug}/clips
     """
     slug = (slug or "").strip().lower()
-    verify_channel_exists(slug)
+    if verify:
+        verify_channel_exists(slug)
     referer = f"{_BASE}/{slug}/clips"
     data = _get_json(f"/api/v2/channels/{slug}/clips", referer)
     raw = data.get("clips") if isinstance(data, dict) else []
@@ -202,7 +203,7 @@ def list_channel_clips_sync(url: str, limit: int = 10) -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    clips = list_channel_clips_api(slug, limit)
+    clips = list_channel_clips_api(slug, limit, verify=False)
     return [
         {
             "id": c.id,

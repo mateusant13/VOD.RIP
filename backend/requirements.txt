@@ -1,6 +1,14 @@
+# ── Runtime ──────────────────────────────────────────────────────────────
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 yt-dlp>=2024.1.0
 pydantic>=2.0
 requests>=2.31.0
 curl_cffi>=0.7.0
+
+# ── Desktop shell ──────────────────────────────────────────────────────────
+pywebview>=6.0.0
+
+# ── Tray icon (fallback when PyWebView unavailable) ────────────────────────
+pystray>=0.19.0
+Pillow>=10.0.0

@@ -304,12 +304,25 @@ def resolve_stream_info(
 
     full_url = build_url(url, platform)
 
-    # Twitch clips expose only progressive MP4 formats (no HLS) — collect
-    # the available heights and serve the chosen one directly.
+    # Twitch clips — fast GQL videoQualities (~0.5s); yt-dlp fallback if GQL fails.
     if platform == "Twitch" and is_clip_url(url):
-        opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
-        clip_info = _extract_hls_info(full_url, opts)
-        variants = _deduped_progressive_variants(clip_info)
+        variants: List[dict] = []
+        headers: dict = {}
+        try:
+            from services.twitch_gql_service import get_clip_progressive_variants_sync
+
+            variants = get_clip_progressive_variants_sync(url)
+        except Exception as exc:
+            logger.debug("Twitch clip GQL resolve failed, falling back to yt-dlp: %s", exc)
+        if not variants:
+            opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+            clip_info = _extract_hls_info(full_url, opts)
+            variants = _deduped_progressive_variants(clip_info)
+            first_with_headers = next((v for v in variants if v.get("http_headers")), None)
+            if first_with_headers:
+                headers = first_with_headers.get("http_headers") or {}
+            else:
+                headers = clip_info.get("http_headers") or {}
         if not variants:
             raise RuntimeError("Twitch clip has no progressive formats")
         chosen_url = _pick_variant_by_height(
@@ -318,13 +331,6 @@ def resolve_stream_info(
         )
         if not chosen_url:
             raise RuntimeError("Twitch clip has no progressive URL")
-        # Forward http_headers from any variant; they all share the same
-        # CloudFront signature cookies.
-        first_with_headers = next((v for v in variants if v.get("http_headers")), None)
-        if first_with_headers:
-            headers = first_with_headers.get("http_headers") or {}
-        else:
-            headers = clip_info.get("http_headers") or {}
         return chosen_url, headers, platform, variants, "progressive"
 
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)

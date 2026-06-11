@@ -103,6 +103,7 @@ def _kill_leftover_headless_shells() -> int:
     Returns the number of processes killed.
     """
     import subprocess
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if __import__('os').name == 'nt' else 0
     image = HEADLESS_BROWSER_IMAGE  # `chrome-headless-shell.exe`
     try:
         if os.name == "nt":
@@ -112,6 +113,7 @@ def _kill_leftover_headless_shells() -> int:
             out = subprocess.run(
                 ["taskkill", "/F", "/T", "/IM", image],
                 capture_output=True, text=True, timeout=10,
+                        creationflags=_NO_WINDOW,
             )
             # Parse the count of "ÊXITO" / "SUCCESS" lines.
             return sum(
@@ -122,6 +124,7 @@ def _kill_leftover_headless_shells() -> int:
             out = subprocess.run(
                 ["pkill", "-9", "-f", image],
                 capture_output=True, text=True, timeout=10,
+                        creationflags=_NO_WINDOW,
             )
             return out.returncode == 0 and 1 or 0
     except Exception:
@@ -1121,6 +1124,7 @@ def download_vod_subprocess(
         text=True,
         cwd=str(py_dir),
         bufsize=1,
+        creationflags=_NO_WINDOW,
     )
     assert proc.stdin is not None
     proc.stdin.write(json.dumps(payload))

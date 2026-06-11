@@ -1,18 +1,34 @@
 """Settings manager — persists settings to a JSON file."""
 
 import json
+import os
+import sys
 import threading
 from pathlib import Path
 
 from models.schemas import AppSettings
 
 
+def _get_appdata_dir() -> Path:
+    """Return the platform-appropriate user data directory for VOD.RIP."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "VOD.RIP"
+
+
 class SettingsManager:
     def __init__(self):
-        self._settings_dir = Path.home() / ".config" / "KickDownloader"
+        self._settings_dir = _get_appdata_dir()
         self._settings_file = self._settings_dir / "settings.json"
         self._lock = threading.Lock()
         self._settings = self._load()
+        # Auto-create file with defaults if it doesn't exist
+        if not self._settings_file.exists():
+            self.save(self._settings)
 
     def _load(self) -> AppSettings:
         try:

@@ -1,5 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional, List
+from pathlib import Path
 
 class VideoInfo(BaseModel):
     id: str
@@ -50,15 +51,22 @@ class DownloadState(BaseModel):
     estimated_size: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
+def _default_download_folder() -> str:
+    return str(Path.home() / "Downloads")
+
+
 class AppSettings(BaseModel):
-    download_folder: str = ""
-    download_threads: int = 4
-    max_cache_mb: int = 256
+    download_folder: str = Field(default_factory=_default_download_folder)
+    download_threads: int = 8
+    max_cache_mb: int = 512
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""
     oauth: str = ""
     quality: str = "1080p"
+    panel_layout: Optional[Dict[str, Any]] = None
+    window_geometry: Optional[Dict[str, Any]] = None
+    saved_channels: Optional[List[Dict[str, Any]]] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -70,6 +78,9 @@ class SettingsUpdate(BaseModel):
     temp_folder: Optional[str] = None
     oauth: Optional[str] = None
     quality: Optional[str] = None
+    panel_layout: Optional[Dict[str, Any]] = None
+    window_geometry: Optional[Dict[str, Any]] = None
+    saved_channels: Optional[List[Dict[str, Any]]] = None
 
 
 class OpenFolderRequest(BaseModel):

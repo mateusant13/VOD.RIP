@@ -36,6 +36,29 @@ query ChannelVideos($login: String!, $first: Int!, $after: Cursor) {
 }
 """
 
+CLIP_INFO_QUERY = """
+query ClipMetadata($slug: ID!) {
+  clip(slug: $slug) {
+    id
+    slug
+    title
+    durationSeconds
+    viewCount
+    createdAt
+    thumbnailURL
+    videoQualities {
+      quality
+      sourceURL
+      frameRate
+    }
+    broadcaster {
+      login
+      displayName
+    }
+  }
+}
+"""
+
 VIDEO_INFO_QUERY = """
 query VideoMetadata($id: ID!) {
   video(id: $id) {
@@ -66,6 +89,107 @@ def _format_duration(seconds: Optional[float]) -> Optional[str]:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _extract_clip_slug(url_or_slug: str) -> Optional[str]:
+    raw = (url_or_slug or "").strip()
+    if not raw:
+        return None
+    m = re.search(r"clips\.twitch\.tv/([^/?#]+)", raw, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"twitch\.tv/[^/]+/clip/([^/?#]+)", raw, re.I)
+    if m:
+        return m.group(1)
+    if "/" not in raw and "?" not in raw and "#" not in raw:
+        return raw
+    return None
+
+
+def _qualities_from_gql(video_qualities: List[dict]) -> List[str]:
+    labels: List[str] = []
+    for q in video_qualities or []:
+        try:
+            height = int(q.get("quality") or 0)
+        except (TypeError, ValueError):
+            continue
+        if height <= 0:
+            continue
+        fps = q.get("frameRate")
+        try:
+            fps_suffix = "60" if fps and float(fps) > 30 else ""
+        except (TypeError, ValueError):
+            fps_suffix = ""
+        label = f"{height}p{fps_suffix}"
+        if label not in labels:
+            labels.append(label)
+    labels.sort(key=lambda s: int(re.search(r"\d+", s).group()), reverse=True)
+    return labels
+
+
+def _clip_progressive_formats(video_qualities: List[dict]) -> List[Dict[str, Any]]:
+    """Format dicts compatible with preview_service progressive variant picking."""
+    out: List[Dict[str, Any]] = []
+    for q in video_qualities or []:
+        try:
+            height = int(q.get("quality") or 0)
+        except (TypeError, ValueError):
+            continue
+        url = (q.get("sourceURL") or "").strip()
+        if not height or not url:
+            continue
+        out.append({
+            "height": height,
+            "url": url,
+            "ext": "mp4",
+            "protocol": "https",
+            "tbr": float(height),
+        })
+    out.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    return out
+
+
+def _fetch_clip_node(url_or_slug: str) -> Dict[str, Any]:
+    slug = _extract_clip_slug(url_or_slug)
+    if not slug:
+        raise ValueError(f"Not a Twitch clip URL or slug: {url_or_slug}")
+    data = _gql_request(CLIP_INFO_QUERY, {"slug": slug})
+    node = data.get("clip")
+    if not node:
+        raise RuntimeError(f"Twitch clip not found: {slug}")
+    return node
+
+
+def get_clip_info_sync(url_or_slug: str) -> Dict[str, Any]:
+    """Return Twitch clip metadata via GQL (~0.3-1s, no yt-dlp)."""
+    node = _fetch_clip_node(url_or_slug)
+    slug = str(node.get("slug") or _extract_clip_slug(url_or_slug) or "")
+    broadcaster = node.get("broadcaster") or {}
+    login = broadcaster.get("login") or broadcaster.get("displayName")
+    duration = node.get("durationSeconds")
+    qualities = _qualities_from_gql(node.get("videoQualities") or [])
+    clip_url = f"https://clips.twitch.tv/{slug}" if slug else url_or_slug
+    return {
+        "id": str(node.get("id") or slug),
+        "title": node.get("title") or "Untitled",
+        "uploader": broadcaster.get("displayName") or login,
+        "channel": login,
+        "duration": duration,
+        "duration_string": _format_duration(duration),
+        "thumbnail": node.get("thumbnailURL"),
+        "views": node.get("viewCount"),
+        "webpage_url": clip_url,
+        "qualities": qualities,
+        "platform": "Twitch",
+        "created_at": node.get("createdAt"),
+        "content_kind": "clip",
+    }
+
+
+def get_clip_progressive_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]:
+    """Progressive MP4 variants for Twitch clip preview (~0.3-1s)."""
+    node = _fetch_clip_node(url_or_slug)
+    return _clip_progressive_formats(node.get("videoQualities") or [])
 
 
 def _extract_video_id(url_or_id: str) -> Optional[str]:

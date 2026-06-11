@@ -1,0 +1,177 @@
+# =============================================================================
+# VOD.RIP — Build & Release Pipeline
+#
+# Triggered by pushing a tag matching v* (e.g. v1.0.0, v1.1.0).
+# Builds on Windows, macOS, and Linux in parallel, then uploads all
+# platform installers as a single GitHub Release.
+# =============================================================================
+
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Lint & type-check (runs first, fails fast)
+  # -------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Python deps
+        run: pip install -r backend/requirements.txt
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Type-check frontend
+        run: npx tsc --noEmit
+
+      - name: Lint Python (syntax check)
+        run: python -m py_compile backend/**/*.py
+
+  # -------------------------------------------------------------------------
+  # Platform-specific builds (matrix)
+  # -------------------------------------------------------------------------
+  build:
+    needs: [lint]
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact-name: windows
+            installer-cmd: iscc build/installer.iss
+            output-pattern: Output\VOD.RIP-Setup.exe
+
+          - os: macos-latest
+            artifact-name: macos
+            installer-cmd: bash build/build-macos-dmg.sh
+            output-pattern: Output/VOD.RIP-*.dmg
+
+          - os: ubuntu-22.04
+            artifact-name: linux
+            installer-cmd: bash build/build-linux-appimage.sh
+            output-pattern: Output/VOD.RIP-*.AppImage
+
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Setup ────────────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          pip install pyinstaller pywebview pystray Pillow
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # ── Build frontend ────────────────────────────────────────────────
+      - name: Build frontend
+        run: npm run build-copy
+
+      # ── Generate application icons ───────────────────────────────
+      - name: Generate icons
+        run: python build/generate-icons.py
+
+      # ── Install Playwright browsers ──────────────────────────────────
+      - name: Install Playwright browsers
+        run: |
+          export PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/browsers
+          python -m playwright install chromium
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/browsers" >> $GITHUB_ENV
+
+      # ── Download ffmpeg ──────────────────────────────────────────────
+      - name: Download ffmpeg
+        run: bash build/download-ffmpeg.sh
+
+      # ── PyInstaller ──────────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: pyinstaller build/vod-rip.spec --clean
+
+      # ── Stage installer files ────────────────────────────────────────
+      # Note: Inno Setup resolves [Files] paths relative to the script
+      # directory (build/), so the staging directory must be inside build/.
+      - name: Stage installer files
+        run: |
+          STAGING_DIR="build/installer_staging"
+          mkdir -p "$STAGING_DIR/static"
+
+          # Copy PyInstaller output
+          cp -Rf dist/vod-rip/* "$STAGING_DIR/" 2>/dev/null || true
+          # macOS .app bundle (Contents/ may be empty on other platforms)
+          if [ -d "dist/VOD.RIP.app" ]; then
+            cp -Rf dist/VOD.RIP.app/Contents/MacOS/* "$STAGING_DIR/" 2>/dev/null || true
+            cp -Rf dist/VOD.RIP.app/Contents/Resources/* "$STAGING_DIR/" 2>/dev/null || true
+          fi
+
+          # Copy ffmpeg binaries
+          cp -f build/external/ffmpeg* "$STAGING_DIR/" 2>/dev/null || true
+
+          # Copy Playwright browsers
+          if [ -d "$PLAYWRIGHT_BROWSERS_PATH" ]; then
+            cp -Rf "$PLAYWRIGHT_BROWSERS_PATH"/. "$STAGING_DIR/browsers/" 2>/dev/null || true
+          fi
+
+          # Copy static UI
+          cp -f backend/static/index.html "$STAGING_DIR/static/" 2>/dev/null || true
+
+          echo "Staging directory contents:"
+          ls -la "$STAGING_DIR/"
+
+      # ── Package installer ────────────────────────────────────────────
+      - name: Package installer
+        run: ${{ matrix.installer-cmd }}
+
+      # ── Rename assets for release ────────────────────────────────────
+      - name: Rename installer for release
+        run: |
+          TAG_NAME="${{ github.ref_name }}"  # e.g. v1.0.0
+          case "${{ matrix.os }}" in
+            windows-*)
+              mv Output/VOD.RIP-Setup.exe "Output/VOD.RIP-${TAG_NAME}-Setup.exe"
+              ;;
+            macos-*)
+              mv Output/VOD.RIP-*.dmg "Output/VOD.RIP-${TAG_NAME}.dmg"
+              ;;
+            ubuntu-*)
+              mv Output/VOD.RIP-*.AppImage "Output/VOD.RIP-${TAG_NAME}-x86_64.AppImage"
+              ;;
+          esac
+
+      # ── Upload to release ────────────────────────────────────────────
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

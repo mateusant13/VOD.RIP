@@ -6,8 +6,14 @@ node_modules/
 # Build output
 dist/
 build/
+dist/vod-rip/
 # Generated build artifact copied from dist/ during npm run build-copy
 backend/static/index.html
+
+# Packaged desktop app (build locally via npm run build-dist or CI release)
+vod-rip.exe
+_internal/
+nul
 
 # Python
 __pycache__/

@@ -226,6 +226,20 @@ class DownloadManager:
         self._executor.submit(_download_worker)
         return download_id
 
+    def cancel_all(self) -> int:
+        """Cancel every active download. Returns how many were cancelled."""
+        with self._lock:
+            active_ids = [
+                download_id
+                for download_id, state in self._downloads.items()
+                if state.status not in ("Completed", "Failed", "Cancelled")
+            ]
+        cancelled = 0
+        for download_id in active_ids:
+            if self.cancel(download_id):
+                cancelled += 1
+        return cancelled
+
     def cancel(self, download_id: str) -> bool:
         abort_fns: List[Callable[[], None]] = []
         cleanup: Optional[dict] = None
