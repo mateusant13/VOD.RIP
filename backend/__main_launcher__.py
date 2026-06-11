@@ -176,9 +176,9 @@ def _check_linux_webkit() -> None:
         except (ImportError, ValueError):
             logger = logging.getLogger("VOD.RIP")
             logger.warning(
-                "WebKitGTK not found — native window will not be available on Linux. "
-                "Install: sudo apt install webkit2gtk-4.1 (Debian/Ubuntu) "
-                "or sudo dnf install webkit2gtk4.1 (Fedora)"
+                "PyGObject or WebKitGTK not found — native window unavailable on Linux. "
+                "Install: sudo apt install python3-gi gir1.2-webkit2-4.1 (Debian/Ubuntu) "
+                "or sudo dnf install python3-gobject webkit2gtk4.1 (Fedora)"
             )
     except Exception:
         pass

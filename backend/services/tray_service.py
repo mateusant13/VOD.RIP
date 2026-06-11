@@ -133,10 +133,8 @@ class TrayService:
         if os.name == "nt":
             os.startfile(folder)
         elif sys.platform == "darwin":
-            import subprocess
             subprocess.Popen(["open", folder])
         else:
-            import subprocess
             subprocess.Popen(["xdg-open", folder])
 
     def _on_open_log(self, icon=None, item=None):
@@ -144,10 +142,8 @@ class TrayService:
             if os.name == "nt":
                 os.startfile(self.log_path)
             elif sys.platform == "darwin":
-                import subprocess
                 subprocess.Popen(["open", "-R", self.log_path])
             else:
-                import subprocess
                 subprocess.Popen(["xdg-open", self.log_path])
 
     def _on_quit(self, icon=None, item=None):

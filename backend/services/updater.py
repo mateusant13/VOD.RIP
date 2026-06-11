@@ -304,7 +304,7 @@ class UpdateChecker:
                 f'src="{app_bundle}"',
                 f'dst="{parent / "VOD.RIP.app"}"',
                 'rm -rf "$dst"',
-                'cp -R "$src" "$dst"',
+                'ditto "$src" "$dst"',
                 'open "$dst"',
             ]),
             encoding="utf-8",
