@@ -1,160 +1,174 @@
-# VOD.RIP — Kick & Twitch Downloader
+<div align="center">
 
-A lightweight web application for ripping VODs and clips from **[Kick.com](https://kick.com)** and **[Twitch.tv](https://twitch.tv)**. Built with a **React + Vite** frontend and a **Python FastAPI + yt-dlp** backend.
+![VOD.RIP](screenshots/readme/hero.png)
+
+# 🎬 VOD.RIP — Kick & Twitch Downloader
+
+**Download, preview, and clip any VOD or clip from Kick & Twitch — right in your browser.**
+
+<p>
+  <a href="#features"><img src="https://img.shields.io/badge/platforms-Kick+Twitch-53fc18?style=flat-square"/></a>
+  <a href="https://github.com/mateusant13/VOD.RIP/releases"><img src="https://img.shields.io/github/v/release/mateusant13/VOD.RIP?style=flat-square&color=53fc18"/></a>
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-53fc18?style=flat-square"/></a>
+</p>
+
+</div>
 
 ---
 
-## Features
+## 👀 What is VOD.RIP?
+
+VOD.RIP is the **fastest way to save your favorite streams**. Paste a Kick or Twitch URL, preview the video right in the app, trim exactly the part you want, and download at up to 1080p60 — all without installing heavy desktop software or dealing with command-line tools.
+
+Whether you're archiving a full 6-hour stream or clipping a 10-second funny moment, VOD.RIP handles it with a beautiful, dark-themed interface.
+
+---
+
+## ✨ Features That Matter
+
+### 🎥 Preview Before You Download
+
+See exactly what you're getting before you commit. The built-in **video preview player** lets you watch any VOD or clip directly in the app — no waiting for a full download just to check the content.
+
+![Preview Player](screenshots/readme/preview.png)
+
+### ✂️ Smart Crop & Trim
+
+Don't download an entire 3-hour stream when you only need 5 minutes. Drag the trim handles to select the exact segment you want, or click the in/out points for frame-perfect precision. The **Needle Glance** popup shows you exactly where you are in the timeline.
+
+### 🔍 Channel Browser
+
+Browse and explore any streamer's recent VODs and clips without leaving the app. Save your favorite channels, toggle between Kick and Twitch feeds, and switch between VODs and clips — all organized in a clean, searchable list.
+
+![Channel Browser](screenshots/readme/channel-open.png)
+
+### 📥 Download Queue
+
+Download multiple VODs at once with **real-time progress tracking**. The queue shows active downloads, speed, estimated completion, and keeps a history of everything you've ripped. Pause, resume, or cancel downloads at any time.
+
+![Download Queue](screenshots/readme/queue.png)
+
+### 🚀 One-Click Rips
 
 | Feature | Kick | Twitch |
 |---|---|---|
-| VOD Download with start/end cropping and quality selection | ✓ | ✓ |
-| Clip Download | ✓ | ✓ |
-| Download Queue with real-time SSE progress | ✓ | ✓ |
-| Channel Browsing | ✓ | ✓ |
-| Web UI (React + Tailwind) | ✓ | ✓ |
-| OAuth Support | ✓ | ✓ |
-| Native yt-dlp (no subprocess wrappers) | ✓ | ✓ |
+| **Full VOD Downloads** with custom start/end cropping | ✅ | ✅ |
+| **Clip Downloads** — save short highlights instantly | ✅ | ✅ |
+| **Quality Selection** — 360p to 1080p60 | ✅ | ✅ |
+| **In-App Video Preview** | ✅ | ✅ |
+| **Channel Browsing** — explore recent VODs & clips | ✅ | ✅ |
+| **GPU-Accelerated Encoding** (NVIDIA, AMD, Intel) | ✅ | ✅ |
+
+### ⚡ Powered by yt-dlp
+
+VOD.RIP uses **yt-dlp** under the hood — the most powerful video extraction engine available. No subprocess wrappers, no fragile shell scripts. Direct Python API integration means faster downloads and better reliability.
+
+### 🎨 Beautiful Dark UI
+
+A pixel-perfect dark theme designed for extended use. Smooth animations, responsive layout, keyboard shortcuts for playback, and full-screen mode for the preview player. Every detail is crafted for the best experience.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### Prerequisites
-
 - **Python 3.10+**
 - **Node.js 18+**
-- **ffmpeg** (must be on PATH for video merging)
+- **ffmpeg** (for video merging — download from [ffmpeg.org](https://ffmpeg.org))
 
 ### Setup
 
 ```bash
-# 1. Install Python dependencies
+# Install Python dependencies
 cd backend
 pip install -r requirements.txt
 
-# 2. Install frontend dependencies (from project root)
+# Install frontend dependencies
+cd ..
 npm install
 ```
 
-### Running (Development)
+### Run (Development)
 
-Run **both** the backend and frontend simultaneously:
-
-**Terminal 1 — Python Backend:**
 ```bash
-cd backend
-python run.py
-```
-Server starts at `http://localhost:7897`
-
-**Terminal 2 — React Frontend (dev server with API proxy):**
-```bash
+# Start everything with one command
 npm run dev
 ```
-UI opens at `http://localhost:5173` — API calls are proxied to the backend.
 
-### Running (Production)
-
+Or run separately:
 ```bash
-# Build the React frontend (inlines into a single HTML file)
-npm run build
+# Terminal 1 — Backend API (port 7897)
+cd backend && python run.py
 
-# This copies the built frontend to the Python backend's static folder
-# Then just run the Python server:
-cd backend
-python run.py
+# Terminal 2 — Frontend UI (port 5173)
+npm run dev:vite
 ```
 
-Open `http://localhost:7897` — the React UI is served directly by the Python backend.
+Open **http://localhost:5173** — the UI proxies API calls to the backend automatically.
 
 ---
 
-## Project Structure
+## 🐳 One-Click Desktop App
 
-```
-.
-├── src/                          # React frontend (Vite + Tailwind)
-│   ├── App.tsx                   # Main UI component
-│   ├── index.css                 # Styles
-│   ├── main.tsx                  # Entry point
-├── index.html                    # React entry HTML
-├── package.json                  # Frontend dependencies
-├── vite.config.ts                # Vite config with API proxy
-├── tsconfig.json                 # TypeScript config
-│
-├── backend/                      # Python backend (FastAPI)
-│   ├── main.py                   # FastAPI server + API routes
-│   ├── run.py                    # Launch script (auto-installs deps)
-│   ├── requirements.txt          # Python dependencies
-│   ├── launch.bat                # Windows launcher
-│   ├── models/
-│   │   └── schemas.py            # Pydantic data models
-│   ├── services/
-│   │   ├── ytdlp_service.py      # yt-dlp wrapper
-│   │   ├── download_manager.py   # Download queue + SSE
-│   │   └── settings.py           # JSON settings persistence
-│   └── static/
-│       └── index.html            # Built React UI (via npm run build-copy)
-│
-├── scripts/                      # Dev automation
-│   └── dev-all.mjs               # Start API + Vite together
-├── LICENSE.txt
-├── THIRD-PARTY-LICENSES.txt
-└── .gitignore
-```
+VOD.RIP ships as a **standalone desktop application** with an embedded WebView — no browser needed. Download the latest build for your platform from the [Releases page](https://github.com/mateusant13/VOD.RIP/releases).
+
+| Platform | Download |
+|---|---|
+| **Windows** | `.exe` installer or portable `.zip` |
+| **macOS** | `.app` bundle |
+| **Linux** | Portable `.zip` |
 
 ---
 
-## API Endpoints
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/info` | GET | Server info and Python version |
-| `/api/info/video?id=` | GET | Get VOD metadata |
-| `/api/info/clip?id=` | GET | Get clip metadata |
-| `/api/channel/videos?url=&platforms=Kick,Twitch&limit=` | GET | List channel videos (filterable by platform) |
-| `/api/download/video` | POST | Start VOD download |
-| `/api/download/clip` | POST | Start clip download |
-| `/api/downloads` | GET | List active downloads |
-| `/api/download/{id}` | GET | Get download state |
-| `/api/download/{id}/cancel` | POST | Cancel a download |
-| `/api/download/{id}/stream` | GET | SSE progress stream |
-| `/api/settings` | GET/POST | App settings |
-| `/api/ytdlp/status` | GET | yt-dlp version check |
-
----
-
-## Testing
-
-```bash
-# Start the server
-cd backend
-python run.py
-
-# In another terminal, run the end-to-end tests
-cd backend
-python test_downloads.py
-```
-
-The test suite downloads 20-second clips from both Twitch and Kick, then validates:
-- File size and duration via ffprobe
-- Frame brightness (no black frames) via ffmpeg signalstats
-- Audio volume (no silence) via ffmpeg volumedetect
-
----
-
-## Tech Stack
+## 🛠 Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 19, TypeScript, Tailwind 4, Vite 7 |
-| Backend | Python, FastAPI, uvicorn |
-| Download Engine | yt-dlp (native Python API) |
-| Video Processing | ffmpeg / ffprobe |
+| **Frontend** | React 19, TypeScript, Tailwind CSS 4, Vite 7 |
+| **Backend** | Python, FastAPI, uvicorn |
+| **Download Engine** | yt-dlp (native Python API) |
+| **Video Processing** | FFmpeg / FFprobe |
+| **Packaging** | PyInstaller, Inno Setup (Windows) |
 
 ---
 
-## License
+## 📸 Screenshots
 
-[MIT](KickDownloader/LICENSE.txt)
+| | |
+|---|---|
+| ![Hero](screenshots/readme/hero.png) | ![Channels](screenshots/readme/channel-open.png) |
+| **Channel List** — Browse saved streamers | **VOD Browser** — Explore recent content |
+| ![Preview](screenshots/readme/preview.png) | ![Queue](screenshots/readme/queue.png) |
+| **Video Preview** — Watch before downloading | **Download Queue** — Real-time progress |
+
+---
+
+## 🤝 Contributing
+
+This is a personal project, but feel free to open issues or submit PRs for improvements.
+
+1. Fork the repo
+2. Create a feature branch: `git checkout -b cool-new-feature`
+3. Commit your changes: `git commit -am 'Add cool feature'`
+4. Push to the branch: `git push origin cool-new-feature`
+5. Open a Pull Request
+
+---
+
+## 📄 License
+
+[MIT](LICENSE.txt) — do what you want, just don't blame us if your hard drive fills up with streamer VODs.
+
+---
+
+<div align="center">
+  <p>
+    <strong>VOD.RIP</strong> — Because your favorite streams shouldn't disappear after 60 days.
+  </p>
+  <p>
+    <a href="https://github.com/mateusant13/VOD.RIP">GitHub</a> ·
+    <a href="https://github.com/mateusant13/VOD.RIP/releases">Releases</a> ·
+    <a href="https://kick.com">Kick</a> ·
+    <a href="https://twitch.tv">Twitch</a>
+  </p>
+</div>
