@@ -3,10 +3,11 @@
  * VOD.RIP README Screenshot Generator
  *
  * Starts the dev environment (Vite + Python API), drives the app into
- * showcase states, and captures 4 marketing screenshots:
- *   screenshots/readme/hero.png       — Channel list with saved channels
+ * showcase states, and captures 5 marketing screenshots:
+ *   screenshots/readme/hero.png       — URL tab with loaded VOD info (core action)
  *   screenshots/readme/channel-open.png — Expanded channel VOD browser
  *   screenshots/readme/preview.png    — In-app video preview player
+ *   screenshots/readme/trim.png       — Trim/crop controls focused
  *   screenshots/readme/queue.png      — Download queue with progress
  *
  * Usage:  node scripts/screenshot-readme.mjs
@@ -464,23 +465,26 @@ async function injectLocalStorage(page) {
 
 async function screenshotHero(page) {
   log('--- hero.png ---');
+  // Hero shows the core action: paste a URL, see VOD info, ready to download
   await page.goto(UI_URL, { waitUntil: 'networkidle' });
   await sleep(1500);
 
-  const channelsTab = page.locator('button', { hasText: 'Channels' }).first();
-  await channelsTab.waitFor({ state: 'visible', timeout: 5000 });
-  await channelsTab.click();
-  await sleep(1000);
+  // Stay on default URL tab, paste a VOD URL
+  const urlInput = page.locator('input[placeholder*="PASTE VOD"]');
+  await urlInput.waitFor({ state: 'visible', timeout: 5000 });
+  await urlInput.fill('https://kick.com/xqc/videos/a1b2c3d4e5f6');
+  await sleep(200);
 
-  let rowCount = await page.locator('[data-channel-row]').count();
-  log(`Found ${rowCount} saved channel rows`);
-  if (rowCount < 4) { await sleep(2000); rowCount = await page.locator('[data-channel-row]').count(); }
+  // Click Extract Info
+  const extractBtn = page.locator('button', { hasText: 'Extract Info' });
+  await extractBtn.click();
+  await sleep(2500);
 
-  for (const name of ['xQc', 'forsen', 'Ludwig', 'Asmongold']) {
-    await page.waitForSelector(`text=${name}`, { timeout: 5000 }).catch(() => {});
-  }
-  await sleep(800);
+  // Wait for VOD info to render (title, duration, qualities, download button)
+  await page.waitForSelector('text=Late Night Gaming', { timeout: 5000 }).catch(() => {});
+  await sleep(1500);
 
+  // Take a full-page screenshot so the UI fills most of the image
   await page.screenshot({ path: path.join(SCREENSHOTS_DIR, 'hero.png'), fullPage: false });
   log('✓ hero.png saved');
 }
@@ -540,18 +544,46 @@ async function screenshotPreview(page) {
   await page.waitForSelector('text=Ludwig Ahgren', { timeout: 5000 }).catch(() => {});
   await sleep(1500);
 
-  // Click Preview button to open the in-app video player
+  // Click Preview to open the in-app video player
   const previewBtn = page.locator('button', { hasText: /Preview/ }).first();
   await previewBtn.waitFor({ state: 'visible', timeout: 3000 });
   await previewBtn.click();
   log('Clicked Preview button');
 
-  // Wait for preview panel to load the video
   await sleep(3000);
 
-  // Preview panel should now be visible with trim controls, player, and VOD info
   await page.screenshot({ path: path.join(SCREENSHOTS_DIR, 'preview.png'), fullPage: false });
   log('✓ preview.png saved');
+}
+
+async function screenshotTrim(page) {
+  log('--- trim.png ---');
+  // Reuse the preview flow: navigate, load VOD, open preview, then focus on trim
+  await page.goto(UI_URL, { waitUntil: 'networkidle' });
+  await sleep(1500);
+
+  const urlInput = page.locator('input[placeholder*="PASTE VOD"]');
+  await urlInput.waitFor({ state: 'visible', timeout: 5000 });
+  await urlInput.fill('https://www.twitch.tv/ludwig/videos/ludwig_vod_2025');
+  await sleep(200);
+
+  const extractBtn = page.locator('button', { hasText: 'Extract Info' });
+  await extractBtn.click();
+  await sleep(2000);
+
+  await page.waitForSelector('text=Ludwig Ahgren', { timeout: 5000 }).catch(() => {});
+  await sleep(1500);
+
+  const previewBtn = page.locator('button', { hasText: /Preview/ }).first();
+  await previewBtn.waitFor({ state: 'visible', timeout: 3000 });
+  await previewBtn.click();
+  log('Opened preview');
+
+  await sleep(3000);
+
+  // Screenshot captures both preview player and trim controls panel
+  await page.screenshot({ path: path.join(SCREENSHOTS_DIR, 'trim.png'), fullPage: false });
+  log('✓ trim.png saved');
 }
 
 async function screenshotQueue(page) {
@@ -578,7 +610,7 @@ async function ensureScreenshotsDir() {
 // ─── Contact Sheet ──────────────────────────────────────────────────────────
 
 async function generateContactSheet() {
-  const files = ['hero.png', 'channel-open.png', 'preview.png', 'queue.png'];
+  const files = ['hero.png', 'channel-open.png', 'preview.png', 'trim.png', 'queue.png'];
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -593,8 +625,6 @@ async function generateContactSheet() {
   .card { background: #1a1a2e; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
   .card img { width: 100%; height: auto; display: block; }
   .card .label { padding: 0.75rem; font-weight: 600; font-size: 0.875rem; }
-  .full { margin-top: 2rem; }
-  .full img { max-width: 100%; border: 1px solid #333; border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -642,6 +672,7 @@ async function main() {
     await screenshotHero(page);
     await screenshotChannelOpen(page);
     await screenshotPreview(page);
+    await screenshotTrim(page);
     await screenshotQueue(page);
 
     await generateContactSheet();
@@ -651,6 +682,7 @@ async function main() {
     log('   ├── hero.png');
     log('   ├── channel-open.png');
     log('   ├── preview.png');
+    log('   ├── trim.png');
     log('   ├── queue.png');
     log('   └── contact-sheet.html');
 

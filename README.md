@@ -1,116 +1,51 @@
-<div align="center">
+# VOD.RIP
 
-![VOD.RIP](screenshots/readme/hero.png)
-
-# 🎬 VOD.RIP — Kick & Twitch Downloader
-
-**Download, preview, and clip any VOD or clip from Kick & Twitch — right in your browser.**
+Save Twitch and Kick VODs, clips, and highlights in a few clicks.
 
 <p>
-  <a href="#features"><img src="https://img.shields.io/badge/platforms-Kick+Twitch-53fc18?style=flat-square"/></a>
+  <a href="https://github.com/mateusant13/VOD.RIP/releases"><img src="https://img.shields.io/badge/download-Windows%20%E2%80%A2%20macOS%20%E2%80%A2%20Linux-53fc18?style=flat-square"/></a>
   <a href="https://github.com/mateusant13/VOD.RIP/releases"><img src="https://img.shields.io/github/v/release/mateusant13/VOD.RIP?style=flat-square&color=53fc18"/></a>
   <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-53fc18?style=flat-square"/></a>
 </p>
 
-</div>
+[Download the latest release](https://github.com/mateusant13/VOD.RIP/releases) — no setup required.
 
----
+- **Download Twitch and Kick VODs** — full streams or just the parts you want
+- **Download clips** — save short highlights instantly
+- **Preview before downloading** — watch any VOD or clip inside the app
+- **Trim only what you need** — don't download an entire stream for a 5-minute segment
+- **Queue multiple downloads** — start several downloads at once and track progress
+- **Save favorite channels** — browse recent VODs and clips without leaving the app
 
-## 👀 What is VOD.RIP?
+![Hero screenshot showing VOD info and download controls](screenshots/readme/hero.png)
 
-VOD.RIP is the **fastest way to save your favorite streams**. Paste a Kick or Twitch URL, preview the video right in the app, trim exactly the part you want, and download at up to 1080p60 — all without installing heavy desktop software or dealing with command-line tools.
+## Preview Before Downloading
 
-Whether you're archiving a full 6-hour stream or clipping a 10-second funny moment, VOD.RIP handles it with a beautiful, dark-themed interface.
+See what you're getting before you commit. Paste a Kick or Twitch URL, extract the video info, and preview the content directly in the app. No need to wait for a full download just to check what's in it.
 
----
+![Preview player and video information](screenshots/readme/preview.png)
 
-## ✨ Features That Matter
+## Download Only What You Need
 
-### 🎥 Preview Before You Download
+Pick a start and end point — download just the segment you care about. Drag the trim handles or click the in/out markers for precise control. A 3-hour stream becomes a 5-minute highlight in one step.
 
-See exactly what you're getting before you commit. The built-in **video preview player** lets you watch any VOD or clip directly in the app — no waiting for a full download just to check the content.
+![Trim controls with start and end markers](screenshots/readme/trim.png)
 
-![Preview Player](screenshots/readme/preview.png)
+## Explore Channels
 
-### ✂️ Smart Crop & Trim
+Browse any streamer's recent VODs and clips side by side. Switch between Kick and Twitch feeds, toggle between VODs and clips, and save channels for quick access later.
 
-Don't download an entire 3-hour stream when you only need 5 minutes. Drag the trim handles to select the exact segment you want, or click the in/out points for frame-perfect precision. The **Needle Glance** popup shows you exactly where you are in the timeline.
+![Channel browser with saved channels and VOD listings](screenshots/readme/channel-open.png)
 
-### 🔍 Channel Browser
+## Manage Multiple Downloads
 
-Browse and explore any streamer's recent VODs and clips without leaving the app. Save your favorite channels, toggle between Kick and Twitch feeds, and switch between VODs and clips — all organized in a clean, searchable list.
+The queue shows progress, speed, and estimated completion for each download. Start, pause, resume, or cancel at any time. Finished downloads stay in the history so you can find them again.
 
-![Channel Browser](screenshots/readme/channel-open.png)
+![Download queue with active and completed items](screenshots/readme/queue.png)
 
-### 📥 Download Queue
+## Download
 
-Download multiple VODs at once with **real-time progress tracking**. The queue shows active downloads, speed, estimated completion, and keeps a history of everything you've ripped. Pause, resume, or cancel downloads at any time.
-
-![Download Queue](screenshots/readme/queue.png)
-
-### 🚀 One-Click Rips
-
-| Feature | Kick | Twitch |
-|---|---|---|
-| **Full VOD Downloads** with custom start/end cropping | ✅ | ✅ |
-| **Clip Downloads** — save short highlights instantly | ✅ | ✅ |
-| **Quality Selection** — 360p to 1080p60 | ✅ | ✅ |
-| **In-App Video Preview** | ✅ | ✅ |
-| **Channel Browsing** — explore recent VODs & clips | ✅ | ✅ |
-| **GPU-Accelerated Encoding** (NVIDIA, AMD, Intel) | ✅ | ✅ |
-
-### ⚡ Powered by yt-dlp
-
-VOD.RIP uses **yt-dlp** under the hood — the most powerful video extraction engine available. No subprocess wrappers, no fragile shell scripts. Direct Python API integration means faster downloads and better reliability.
-
-### 🎨 Beautiful Dark UI
-
-A pixel-perfect dark theme designed for extended use. Smooth animations, responsive layout, keyboard shortcuts for playback, and full-screen mode for the preview player. Every detail is crafted for the best experience.
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- **Python 3.10+**
-- **Node.js 18+**
-- **ffmpeg** (for video merging — download from [ffmpeg.org](https://ffmpeg.org))
-
-### Setup
-
-```bash
-# Install Python dependencies
-cd backend
-pip install -r requirements.txt
-
-# Install frontend dependencies
-cd ..
-npm install
-```
-
-### Run (Development)
-
-```bash
-# Start everything with one command
-npm run dev
-```
-
-Or run separately:
-```bash
-# Terminal 1 — Backend API (port 7897)
-cd backend && python run.py
-
-# Terminal 2 — Frontend UI (port 5173)
-npm run dev:vite
-```
-
-Open **http://localhost:5173** — the UI proxies API calls to the backend automatically.
-
----
-
-## 🐳 One-Click Desktop App
-
-VOD.RIP ships as a **standalone desktop application** with an embedded WebView — no browser needed. Download the latest build for your platform from the [Releases page](https://github.com/mateusant13/VOD.RIP/releases).
+VOD.RIP runs as a standalone desktop app — no browser or command-line knowledge needed.
 
 | Platform | Download |
 |---|---|
@@ -118,57 +53,32 @@ VOD.RIP ships as a **standalone desktop application** with an embedded WebView �
 | **macOS** | `.app` bundle |
 | **Linux** | Portable `.zip` |
 
----
+Grab the latest build from the [Releases page](https://github.com/mateusant13/VOD.RIP/releases).
 
-## 🛠 Tech Stack
+## Run from Source
 
-| Layer | Technology |
-|---|---|
-| **Frontend** | React 19, TypeScript, Tailwind CSS 4, Vite 7 |
-| **Backend** | Python, FastAPI, uvicorn |
-| **Download Engine** | yt-dlp (native Python API) |
-| **Video Processing** | FFmpeg / FFprobe |
-| **Packaging** | PyInstaller, Inno Setup (Windows) |
+```bash
+npm install        # install frontend dependencies
+cd backend
+pip install -r requirements.txt   # install Python dependencies
+cd ..
+npm run dev        # start both frontend and backend
+```
 
----
+Then open `http://localhost:5173`.
 
-## 📸 Screenshots
+## For Developers
 
-| | |
-|---|---|
-| ![Hero](screenshots/readme/hero.png) | ![Channels](screenshots/readme/channel-open.png) |
-| **Channel List** — Browse saved streamers | **VOD Browser** — Explore recent content |
-| ![Preview](screenshots/readme/preview.png) | ![Queue](screenshots/readme/queue.png) |
-| **Video Preview** — Watch before downloading | **Download Queue** — Real-time progress |
+VOD.RIP is built with:
 
----
+- **Frontend:** React, TypeScript, Vite
+- **Backend:** Python, FastAPI
+- **Download engine:** yt-dlp
+- **Desktop window:** PyWebView
+- **Video processing:** FFmpeg
 
-## 🤝 Contributing
+The backend runs a FastAPI server that wraps yt-dlp's Python API. The frontend is a single-page React app that communicates with the backend over HTTP. The desktop version bundles everything into a single executable using PyInstaller.
 
-This is a personal project, but feel free to open issues or submit PRs for improvements.
+## License
 
-1. Fork the repo
-2. Create a feature branch: `git checkout -b cool-new-feature`
-3. Commit your changes: `git commit -am 'Add cool feature'`
-4. Push to the branch: `git push origin cool-new-feature`
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-[MIT](LICENSE.txt) — do what you want, just don't blame us if your hard drive fills up with streamer VODs.
-
----
-
-<div align="center">
-  <p>
-    <strong>VOD.RIP</strong> — Because your favorite streams shouldn't disappear after 60 days.
-  </p>
-  <p>
-    <a href="https://github.com/mateusant13/VOD.RIP">GitHub</a> ·
-    <a href="https://github.com/mateusant13/VOD.RIP/releases">Releases</a> ·
-    <a href="https://kick.com">Kick</a> ·
-    <a href="https://twitch.tv">Twitch</a>
-  </p>
-</div>
+[MIT](LICENSE.txt)
