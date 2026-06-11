@@ -156,8 +156,25 @@ class TrayService:
         if self.shutdown_callback:
             self.shutdown_callback()
 
+    @staticmethod
+    def _wayland_no_tray() -> bool:
+        """Detect if running under Wayland + GNOME where system tray is unreliable."""
+        if not sys.platform.startswith("linux"):
+            return False
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if "gnome" not in desktop:
+            return False
+        # Only on pure Wayland sessions; XWayland still works with tray
+        return os.environ.get("WAYLAND_DISPLAY", "") != ""
+
     def run(self):
         """Start the tray icon (blocking). Call from the main thread."""
+        # Wayland + GNOME: tray is unreliable, skip with a warning
+        if self._wayland_no_tray():
+            logger.warning("System tray unavailable under GNOME Wayland — running headless")
+            self._running.wait()
+            return
+
         try:
             import pystray
             from pystray import Menu, MenuItem

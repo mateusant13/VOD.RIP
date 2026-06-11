@@ -270,13 +270,18 @@ class UpdateChecker:
                     source = child
                     break
         script = extract_dir.parent / "vodrip-update.sh"
+        has_rsync = shutil.which("rsync") is not None
+        if has_rsync:
+            copy_cmd = 'rsync -a --delete "$src/" "$dst/"'
+        else:
+            copy_cmd = 'cp -a "$src/." "$dst/"'
         script.write_text(
             "\n".join([
                 "#!/bin/sh",
                 "sleep 2",
                 f'src="{source}"',
                 f'dst="{install_dir}"',
-                'rsync -a --delete "$src/" "$dst/" 2>/dev/null || cp -a "$src/." "$dst/"',
+                copy_cmd,
                 f'exec "$dst/VOD-RIP"',
             ]),
             encoding="utf-8",

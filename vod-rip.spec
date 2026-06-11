@@ -95,6 +95,7 @@ def _hidden_imports():
         imports += [
             "webview.platforms.gtk",
             "pystray._appindicator",
+            "pystray._gtk",
         ]
     return imports
 

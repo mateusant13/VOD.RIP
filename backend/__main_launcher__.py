@@ -158,6 +158,31 @@ def _start_background_update_check() -> None:
     except Exception as exc:
         logging.getLogger("VOD.RIP").debug("Background update check: %s", exc)
 
+def _check_linux_webkit() -> None:
+    """On Linux, check if WebKitGTK is available before PyWebView tries GTK."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import gi  # type: ignore[import-untyped]
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import WebKit2  # noqa: F401
+        logger = logging.getLogger("VOD.RIP")
+        logger.debug("WebKitGTK 4.1 detected")
+    except (ImportError, ValueError):
+        # Try 4.0 as fallback
+        try:
+            gi.require_version("WebKit2", "4.0")
+            from gi.repository import WebKit2  # noqa: F401
+        except (ImportError, ValueError):
+            logger = logging.getLogger("VOD.RIP")
+            logger.warning(
+                "WebKitGTK not found — native window will not be available on Linux. "
+                "Install: sudo apt install webkit2gtk-4.1 (Debian/Ubuntu) "
+                "or sudo dnf install webkit2gtk4.1 (Fedora)"
+            )
+    except Exception:
+        pass
+
 
 _WINDOWS_APP_ID = "mateusant13.VODRIP.1"
 
@@ -544,6 +569,9 @@ def main():
 
     _ensure_start_menu_shortcuts()
     _start_background_update_check()
+
+    # Linux: warn early if PyWebView's WebKitGTK runtime is missing
+    _check_linux_webkit()
 
     app_data = _get_appdata_dir()
     try:
