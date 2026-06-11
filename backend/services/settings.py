@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -53,7 +54,21 @@ class SettingsManager:
         with self._lock:
             self._settings = settings
             self._settings_dir.mkdir(parents=True, exist_ok=True)
-            self._settings_file.write_text(
-                settings.model_dump_json(indent=2),
-                encoding="utf-8",
-            )
+            # Atomic write: write to temp file, then replace to avoid corruption
+            tmp = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(self._settings_dir),
+                    prefix="settings_",
+                    suffix=".tmp",
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(settings.model_dump_json(indent=2))
+                os.replace(tmp_path, str(self._settings_file))
+                tmp = tmp_path
+            finally:
+                if tmp is not None and os.path.exists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass

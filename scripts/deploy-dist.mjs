@@ -16,14 +16,40 @@ const folderDist = join(distDir, 'VOD-RIP');
 const macApp = join(distDir, 'VOD.RIP.app');
 
 function copyIcon() {
-  const candidates = [
+  // Windows / Linux: copy .ico to root
+  const icoCandidates = [
     join(folderDist, 'icon.ico'),
     join(root, 'assets', 'icon.ico'),
   ];
-  for (const src of candidates) {
+  for (const src of icoCandidates) {
     if (existsSync(src)) {
       cpSync(src, join(root, 'icon.ico'));
-      return;
+      break;
+    }
+  }
+  // macOS: copy .icns into .app bundle Resources
+  if (os === 'darwin') {
+    const icnsCandidates = [
+      join(root, 'assets', 'icon.icns'),
+      join(folderDist, 'icon.icns'),
+    ];
+    const appResources = join(root, 'VOD.RIP.app', 'Contents', 'Resources');
+    for (const src of icnsCandidates) {
+      if (existsSync(src)) {
+        if (existsSync(appResources)) {
+          cpSync(src, join(appResources, 'icon.icns'));
+        }
+        break;
+      }
+    }
+    // Also copy .ico in case PyWebView on macOS needs it
+    for (const src of icoCandidates) {
+      if (existsSync(src)) {
+        if (existsSync(appResources)) {
+          cpSync(src, join(appResources, 'icon.ico'));
+        }
+        break;
+      }
     }
   }
 }

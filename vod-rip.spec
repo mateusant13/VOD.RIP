@@ -112,7 +112,9 @@ a = Analysis(
     datas=[
         (str(_STATIC_DIR / "index.html"), "static"),
         (str(_ICON_ICO), "."),
-    ],
+    ] + ([(
+        str(_ICON_ICNS), ".",
+    )] if _IS_MAC and _ICON_ICNS.is_file() else []),
     hiddenimports=_hidden_imports(),
     hookspath=[str(_hooks)] if _hooks.is_dir() else [],
     runtime_hooks=[],

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import platform as _platform
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -18,6 +21,7 @@ VENDOR_LABELS = {
     "nvidia": "NVIDIA",
     "amd": "AMD",
     "intel": "Intel",
+    "apple": "Apple (VideoToolbox)",
     "none": "None (software)",
 }
 
@@ -25,6 +29,8 @@ ENCODER_BY_VENDOR = {
     "nvidia": "h264_nvenc",
     "amd": "h264_amf",
     "intel": "h264_qsv",
+    "apple": "h264_videotoolbox",
+    "vaapi": "h264_vaapi",
     "none": "libx264",
 }
 
@@ -68,12 +74,23 @@ def _gpu_names_windows() -> List[str]:
 
 
 def _gpu_names_unix() -> List[str]:
+    names: List[str] = []
     if shutil.which("lspci"):
         out = _run_text(["lspci"])
         for line in out.splitlines():
             if re.search(r"vga|3d|display", line, re.I):
                 names.append(line.split(":", 2)[-1].strip())
     return names
+
+
+def _is_apple_silicon() -> bool:
+    """Detect Apple Silicon (M1/M2/M3/M4) without importing platform module."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        return _platform.processor() == "arm"
+    except Exception:
+        return False
 
 
 def list_gpu_names() -> List[str]:
@@ -83,7 +100,11 @@ def list_gpu_names() -> List[str]:
 
 
 def detect_gpu_vendor(names: Optional[List[str]] = None) -> str:
-    """Return ``nvidia``, ``amd``, ``intel``, or ``none``."""
+    """Return ``nvidia``, ``amd``, ``intel``, ``apple``, or ``none``."""
+    # Apple Silicon check first (doesn't appear in lspci)
+    if _is_apple_silicon():
+        return "apple"
+
     combined = " ".join(names if names is not None else list_gpu_names()).lower()
     if not combined.strip():
         return "none"
@@ -93,6 +114,9 @@ def detect_gpu_vendor(names: Optional[List[str]] = None) -> str:
         return "amd"
     if "intel" in combined or "iris" in combined or "uhd graphics" in combined:
         return "intel"
+    # Fallback: macOS Intel with no lspci available
+    if sys.platform == "darwin":
+        return "apple"
     return "none"
 
 
@@ -108,20 +132,84 @@ def ffmpeg_encoder_names(ffmpeg_bin: Optional[str] = None) -> set[str]:
     return found
 
 
+def _encoder_usable(encoder: str, ffmpeg_bin: str) -> bool:
+    """Test whether an encoder actually works via a quick trial encode."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        cmd = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+            "-c:v", encoder,
+            "-frames:v", "1",
+            "-y", tmp_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=_NO_WINDOW,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 def recommend_encoder(
     vendor: Optional[str] = None,
     ffmpeg_encoders: Optional[set[str]] = None,
+    ffmpeg_bin: Optional[str] = None,
+    validate: bool = False,
 ) -> str:
-    """Map GPU vendor to the best supported H.264 encoder."""
+    """Map GPU vendor to the best supported H.264 encoder.
+
+    On Linux, AMD and Intel map to ``h264_vaapi`` (VAAPI) instead of
+    AMF/QSV (which are Windows/Mac-oriented). On macOS, Apple Silicon
+    and Intel Macs use ``h264_videotoolbox``.
+    """
     vendor = vendor or detect_gpu_vendor()
-    encoders = ffmpeg_encoders if ffmpeg_encoders is not None else ffmpeg_encoder_names()
-    preferred = ENCODER_BY_VENDOR.get(vendor, "libx264")
+    ffmpeg = (ffmpeg_bin or "").strip() or shutil.which("ffmpeg") or "ffmpeg"
+    encoders = ffmpeg_encoders if ffmpeg_encoders is not None else ffmpeg_encoder_names(ffmpeg)
+
+    # Platform-specific encoder overrides
+    _vendor = vendor
+    if sys.platform.startswith("linux"):
+        if vendor in ("amd", "intel"):
+            _vendor = "vaapi"
+    elif sys.platform == "darwin":
+        if vendor in ("amd", "intel", "apple"):
+            _vendor = "apple"
+
+    preferred = ENCODER_BY_VENDOR.get(_vendor, "libx264")
+
     if not encoders:
         return preferred
+
+    # On Linux VAAPI path, also try QSV for Intel
+    if sys.platform.startswith("linux") and vendor == "intel" and "h264_qsv" in encoders:
+        preferred = "h264_qsv"
+
     if preferred in encoders:
-        return preferred
+        if not validate or _encoder_usable(preferred, ffmpeg):
+            return preferred
+        logger.debug("Encoder %s reported but unusable (trial encode failed)", preferred)
+
     if "libx264" in encoders:
         return "libx264"
+
+    # Fallback: try any h264 encoder that works
+    for enc in ("h264_nvenc", "h264_videotoolbox", "h264_amf", "h264_qsv", "h264_vaapi"):
+        if enc in encoders:
+            if not validate or _encoder_usable(enc, ffmpeg):
+                return enc
+
     return "libx264"
 
 
@@ -129,7 +217,7 @@ def _probe_encoder_detection(ffmpeg_bin: str) -> Dict[str, object]:
     names = list_gpu_names()
     vendor = detect_gpu_vendor(names)
     encoders = ffmpeg_encoder_names(ffmpeg_bin)
-    detected = recommend_encoder(vendor, encoders)
+    detected = recommend_encoder(vendor, encoders, ffmpeg_bin)
     return {
         "gpus": names,
         "vendor": vendor,
@@ -139,6 +227,8 @@ def _probe_encoder_detection(ffmpeg_bin: str) -> Dict[str, object]:
             "h264_nvenc": "h264_nvenc" in encoders,
             "h264_amf": "h264_amf" in encoders,
             "h264_qsv": "h264_qsv" in encoders,
+            "h264_videotoolbox": "h264_videotoolbox" in encoders,
+            "h264_vaapi": "h264_vaapi" in encoders,
             "libx264": "libx264" in encoders,
         },
     }

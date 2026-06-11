@@ -1,19 +1,22 @@
 """
 VOD.RIP — System tray icon service.
 
-Used as the *fallback* UI when PyWebView is unavailable (e.g. WebView2
-missing on Windows 10). The tray icon lets the user:
+Used on all platforms when VOD.RIP runs in browser mode (i.e. PyWebView
+failed or is unavailable). The tray icon lets the user:
 
 - Open the WebUI in their default browser
 - Open the downloads folder
 - View the application log
 - Quit the application cleanly (shutting down downloads, ffmpeg, etc.)
 
-On platforms where PyWebView works, this module is not imported at all.
+Note: On macOS, the tray icon must be started on the main thread (AppKit
+requirement). Callers should detect ``sys.platform == "darwin"`` and spawn
+the tray accordingly.
 """
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -48,6 +51,25 @@ class TrayService:
 
     @staticmethod
     def _default_downloads() -> str:
+        """Return the platform-appropriate Downloads folder."""
+        if sys.platform == "darwin":
+            return str(Path.home() / "Downloads")
+        if os.name == "nt":
+            return str(Path.home() / "Downloads")
+        # Linux: try XDG user dir, fall back to ~/Downloads
+        try:
+            xdg = subprocess.run(
+                ["xdg-user-dir", "DOWNLOAD"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if xdg.returncode == 0:
+                path = xdg.stdout.strip()
+                if path:
+                    return path
+        except Exception:
+            pass
         return str(Path.home() / "Downloads")
 
     def _get_icon_image(self):
@@ -62,11 +84,20 @@ class TrayService:
                 candidates.extend([
                     base / "icon.ico",
                     base / "icon.png",
+                    base / "icon.icns",
                     base / "_internal" / "icon.ico",
                     base / "_internal" / "icon.png",
                     base / "assets" / "icon.ico",
                     base / "assets" / "icon.png",
                 ])
+                # macOS .app bundle: check Contents/Resources
+                if sys.platform == "darwin":
+                    resources = base.parent / "Resources"
+                    candidates.extend([
+                        resources / "icon.icns",
+                        resources / "icon.png",
+                        resources / "icon.ico",
+                    ])
             else:
                 base = Path(__file__).parent.parent.parent
                 candidates.extend([

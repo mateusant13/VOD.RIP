@@ -103,9 +103,27 @@ def _setup_logging() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _enable_windows_dpi_awareness() -> None:
+    """Enable per-monitor DPI awareness on Windows (prevents blurry UI on scaled displays)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        ctypes.windll.shcore.SetProcessDpiAwarenessContext(-4)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _setup_environment():
     """Set environment variables needed by the runtime before service imports."""
     os.environ["KICK_SERVE_UI"] = "1"
+    _enable_windows_dpi_awareness()
 
 
 def _ensure_start_menu_shortcuts() -> None:
@@ -157,7 +175,11 @@ def _set_windows_app_identity() -> None:
 
 
 def _resolve_app_icon_path() -> str | None:
-    """Return the best .ico path for the window, tray, and taskbar."""
+    """Return the best icon path for the window, tray, and taskbar.
+
+    On Windows returns ``.ico``, on macOS returns ``.icns`` (or ``.ico``
+    fallback), on Linux returns ``.png`` or ``.ico``.
+    """
     candidates: list[Path] = []
     install = _get_install_dir()
     resources = _get_resources_dir()
@@ -167,7 +189,14 @@ def _resolve_app_icon_path() -> str | None:
         candidates.extend([
             base / "icon.ico",
             base / "assets" / "icon.ico",
+            base / "icon.png",
+            base / "assets" / "icon.png",
         ])
+        if sys.platform == "darwin":
+            candidates.extend([
+                base / "icon.icns",
+                base / "assets" / "icon.icns",
+            ])
 
     seen: set[str] = set()
     for path in candidates:
@@ -397,7 +426,12 @@ def _launch_pywebview(port: int) -> bool:
     tray_thread = threading.Thread(target=tray.run, daemon=True)
     tray_thread.start()
 
-    backends = ["edgechromium", "mshtml", None]
+    if sys.platform == "win32":
+        backends = ["edgechromium", "mshtml", None]
+    elif sys.platform == "darwin":
+        backends = ["cocoa", None]
+    else:
+        backends = ["gtk", None]
     for backend in backends:
         window = None
         try:
