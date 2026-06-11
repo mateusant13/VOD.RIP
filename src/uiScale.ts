@@ -5,11 +5,15 @@ const REF_H = 800;
 
 export type ViewportTier = 'narrow' | 'normal' | 'wide';
 
+/** Slight lift over the original fixed-size UI (~5% at 1280×800, up to ~10% on large displays). */
+const BASE_SCALE = 1.05;
+const MAX_SCALE = 1.1;
+
 export function computeUiScale(width: number, height: number): number {
   const areaRatio = Math.sqrt((width * height) / (REF_W * REF_H));
-  const linear = (width / REF_W + height / REF_H) / 2;
-  const blended = areaRatio * 0.55 + linear * 0.45;
-  return Math.min(1.42, Math.max(0.88, Math.round(blended * 100) / 100));
+  const extra = Math.max(0, areaRatio - 1) * 0.06;
+  const scale = BASE_SCALE + extra;
+  return Math.min(MAX_SCALE, Math.max(1, Math.round(scale * 100) / 100));
 }
 
 export function viewportTier(width: number): ViewportTier {

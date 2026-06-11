@@ -238,34 +238,29 @@ input[type="range"].url-trim-range::-moz-range-thumb {
   animation-duration: 300ms;
 }
 
-/* Responsive type — scales with --ui-scale (see uiScale.ts) */
+/* Responsive type — gentle scale only (see uiScale.ts) */
 html .text-\[8px\] {
-  font-size: max(9px, calc(8px * var(--ui-scale))) !important;
-  line-height: 1.35 !important;
+  font-size: calc(8px * var(--ui-scale)) !important;
 }
 
 html .text-\[9px\] {
-  font-size: max(10px, calc(9px * var(--ui-scale))) !important;
-  line-height: 1.4 !important;
+  font-size: calc(9px * var(--ui-scale)) !important;
 }
 
 html .text-\[10px\] {
-  font-size: max(11px, calc(10px * var(--ui-scale))) !important;
-  line-height: 1.45 !important;
+  font-size: calc(10px * var(--ui-scale)) !important;
 }
 
 html .text-\[11px\] {
-  font-size: max(12px, calc(11px * var(--ui-scale))) !important;
-  line-height: 1.45 !important;
+  font-size: calc(11px * var(--ui-scale)) !important;
 }
 
 html .text-xs {
-  font-size: max(0.75rem, calc(0.75rem * var(--ui-scale))) !important;
-  line-height: 1.4 !important;
+  font-size: calc(0.75rem * var(--ui-scale)) !important;
 }
 
 html .text-sm {
-  font-size: max(0.875rem, calc(0.875rem * var(--ui-scale))) !important;
+  font-size: calc(0.875rem * var(--ui-scale)) !important;
 }
 
 html[data-viewport="narrow"] .vod-app-shell {

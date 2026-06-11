@@ -1,8 +1,8 @@
 # PyInstaller Windows version resource — taskbar / Properties show "VOD.RIP"
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 0, 10, 0),
-        prodvers=(1, 0, 10, 0),
+        filevers=(1, 0, 11, 0),
+        prodvers=(1, 0, 11, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "mateusant13"),
                         StringStruct("FileDescription", "VOD.RIP — Kick & Twitch downloader"),
-                        StringStruct("FileVersion", "1.0.10.0"),
+                        StringStruct("FileVersion", "1.0.11.0"),
                         StringStruct("InternalName", "VOD.RIP"),
                         StringStruct("LegalCopyright", "Copyright (c) mateusant13"),
                         StringStruct("OriginalFilename", "VOD-RIP.EXE"),
                         StringStruct("ProductName", "VOD.RIP"),
-                        StringStruct("ProductVersion", "1.0.10.0"),
+                        StringStruct("ProductVersion", "1.0.11.0"),
                     ],
                 )
             ]
