@@ -4758,44 +4758,38 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex flex-col gap-2 border-2 border-zinc-800 p-3 bg-zinc-950/50">
-              <FieldCaption>Updates</FieldCaption>
-              <p className="text-[10px] text-zinc-500 font-mono">
-                Installed: v{appVersion ?? '…'}
-              </p>
-              {updateInfo ? (
-                <div className="flex flex-col gap-1.5">
-                  <p className="text-xs text-emerald-400 font-bold uppercase">
-                    v{updateInfo.version} available
-                  </p>
-                  {updateInfo.release_notes ? (
-                    <p className="text-[10px] text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto font-mono">
-                      {updateInfo.release_notes.slice(0, 500)}
-                      {updateInfo.release_notes.length > 500 ? '…' : ''}
-                    </p>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={() => void handleApplyUpdate()}
-                    disabled={updateApplying}
-                    className="w-full bg-emerald-950 text-emerald-300 font-black uppercase py-2 flex items-center justify-center gap-2 text-xs border-2 border-emerald-800 hover:border-emerald-400 disabled:opacity-50"
-                  >
-                    {updateApplying ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                    {updateApplying ? 'Installing…' : 'Install Update'}
-                  </button>
-                </div>
-              ) : updateMessage ? (
-                <p className="text-[10px] text-zinc-400 font-mono">{updateMessage}</p>
-              ) : null}
+            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
+              <span>v{appVersion ?? '…'}</span>
+              <span aria-hidden>·</span>
               <button
                 type="button"
                 onClick={() => void handleCheckUpdate()}
                 disabled={updateChecking}
-                className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
+                className="text-zinc-600 hover:text-zinc-400 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
               >
-                {updateChecking ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                {updateChecking ? 'Checking…' : 'Check for Updates'}
+                {updateChecking ? <Loader2 size={8} className="animate-spin" /> : null}
+                {updateChecking ? 'checking' : 'check for updates'}
               </button>
+              {updateInfo ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className="text-emerald-700">v{updateInfo.version}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleApplyUpdate()}
+                    disabled={updateApplying}
+                    className="text-emerald-700 hover:text-emerald-500 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
+                  >
+                    {updateApplying ? <Loader2 size={8} className="animate-spin" /> : null}
+                    {updateApplying ? 'installing' : 'install'}
+                  </button>
+                </>
+              ) : updateMessage ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className="text-zinc-600">{updateMessage}</span>
+                </>
+              ) : null}
             </div>
 
             <button onClick={handleSaveSettings}
