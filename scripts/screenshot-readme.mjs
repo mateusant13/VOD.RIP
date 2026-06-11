@@ -47,7 +47,7 @@ const MOCK_SETTINGS = {
   panel_layout: {
     previewPanelWidth: 640,
     urlAside: { w: 288, h: 384 },
-    main: { w: 448, h: 448 },
+    main: { w: 640, h: 448 },
   },
   window_geometry: null,
   saved_channels: null,
@@ -458,7 +458,7 @@ async function injectLocalStorage(page) {
     } catch { /* private browsing or quota */ }
   }, {
     channels: CHANNELS_DATA,
-    panelLayout: { previewPanelWidth: 640, urlAside: { w: 288, h: 384 }, main: { w: 448, h: 448 } },
+    panelLayout: { previewPanelWidth: 640, urlAside: { w: 288, h: 384 }, main: { w: 640, h: 448 } },
   });
 }
 
