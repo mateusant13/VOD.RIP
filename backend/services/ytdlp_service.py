@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ SEGMENT_DOWNLOAD_WORKERS = 8
 
 # FFmpeg video encoders for H.264 output (Settings → Video encoder).
 VIDEO_ENCODER_OPTIONS: dict[str, str] = {
+    "auto": "Auto (detect GPU)",
     "copy": "Source codec (fast)",
     "libx264": "H.264 — x264 (software)",
     "h264_nvenc": "H.264 — NVIDIA NVENC",
@@ -30,11 +32,38 @@ VIDEO_ENCODER_OPTIONS: dict[str, str] = {
 }
 
 
+def normalize_video_encoder_setting(value: Optional[str]) -> str:
+    """Persisted settings value — ``auto`` is allowed."""
+    key = (value or "auto").strip().lower()
+    if key == "auto":
+        return "auto"
+    return normalize_video_encoder(key)
+
+
 def normalize_video_encoder(value: Optional[str]) -> str:
     key = (value or "libx264").strip().lower()
+    if key == "auto":
+        return resolve_video_encoder("auto")
     if key not in VIDEO_ENCODER_OPTIONS:
         return "libx264"
     return key
+
+
+def resolve_video_encoder(value: Optional[str]) -> str:
+    """Turn ``auto`` into a concrete ffmpeg encoder id."""
+    key = (value or "auto").strip().lower()
+    if key != "auto":
+        return normalize_video_encoder(key)
+    try:
+        from services.gpu_detect import get_encoder_detection
+
+        detected = str(get_encoder_detection().get("detected_encoder") or "libx264")
+    except Exception:
+        detected = "libx264"
+    enc = detected.strip().lower()
+    if enc in VIDEO_ENCODER_OPTIONS and enc != "auto":
+        return enc
+    return "libx264"
 
 
 def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
@@ -88,7 +117,21 @@ def _run_ffmpeg(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     """Run ffmpeg, polling *cancel_event* / *pause_event* so stop can kill the process."""
-    proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+    if not cmd:
+        raise RuntimeError("FFmpeg command is empty")
+    ffmpeg_bin = str(cmd[0])
+    if not Path(ffmpeg_bin).is_file() and shutil.which(ffmpeg_bin) is None:
+        raise RuntimeError(
+            "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
+            "the FFmpeg folder in Settings → FFmpeg path."
+        )
+    try:
+        proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
+            "the FFmpeg folder in Settings → FFmpeg path."
+        ) from exc
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
     try:
@@ -141,17 +184,32 @@ def _require_crop_range(
     return crop
 
 
+def _ffmpeg_exe_name() -> str:
+    return "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+
+
+def _ffmpeg_bin_from_dir(directory: Path) -> Optional[str]:
+    exe = directory / _ffmpeg_exe_name()
+    return str(exe) if exe.is_file() else None
+
+
 def _resolve_ffmpeg_exe(ffmpeg_dir: Optional[str] = None) -> str:
     if ffmpeg_dir:
-        exe = Path(ffmpeg_dir) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if exe.is_file():
-            return str(exe)
+        custom = Path(ffmpeg_dir)
+        if custom.is_file():
+            return str(custom)
+        exe = _ffmpeg_bin_from_dir(custom)
+        if exe:
+            return exe
     found = _find_ffmpeg()
     if found:
-        exe = Path(found) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if exe.is_file():
-            return str(exe)
-    return "ffmpeg"
+        exe = _ffmpeg_bin_from_dir(Path(found))
+        if exe:
+            return exe
+    raise RuntimeError(
+        "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
+        "the FFmpeg folder in Settings → FFmpeg path."
+    )
 
 
 def is_clip_url(url: str) -> bool:
@@ -269,23 +327,38 @@ def _dir_size(path: Path) -> int:
 # ffmpeg auto-detection (Windows, macOS, Linux)
 # ---------------------------------------------------------------------------
 
+def _bundled_ffmpeg_dirs() -> list[Path]:
+    """PyInstaller COLLECT / one-file extract dirs that ship ffmpeg next to the app."""
+    dirs: list[Path] = []
+    if getattr(sys, "frozen", False):
+        dirs.append(Path(sys.executable).resolve().parent)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass))
+    return dirs
+
+
 def _find_ffmpeg() -> Optional[str]:
     """Locate ffmpeg — returns the BIN DIRECTORY (not the exe).
 
     yt-dlp's ``ffmpeg_location`` and our clip pipeline both need the
     *directory* that contains *both* ``ffmpeg.exe`` and ``ffprobe.exe``.
     """
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return str(Path(exe).parent)
-
     def _check_bin(parent: Path) -> Optional[str]:
         if not parent.is_dir():
             return None
-        for f in parent.iterdir():
-            if f.name.lower() in ("ffmpeg.exe", "ffmpeg"):
-                return str(parent)
+        if _ffmpeg_bin_from_dir(parent):
+            return str(parent)
         return None
+
+    for bundled in _bundled_ffmpeg_dirs():
+        result = _check_bin(bundled)
+        if result:
+            return result
+
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return str(Path(exe).parent)
 
     candidates = [
         Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "ffmpeg" / "bin",
@@ -391,20 +464,28 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         except (TypeError, ValueError, OSError):
             created_at = None
 
-    return VideoInfo(
-        id=info.get("id", ""),
-        title=info.get("title"),
-        duration=info.get("duration"),
-        duration_string=info.get("duration_string"),
-        uploader=info.get("uploader"),
-        thumbnail=info.get("thumbnail"),
-        webpage_url=info.get("webpage_url"),
-        extractor=info.get("extractor"),
-        is_live=info.get("is_live"),
-        qualities=qualities,
-        platform=detect_platform(full_url),
-        created_at=created_at,
+    from services.size_estimate import enrich_info_dict
+
+    payload = {
+        "id": info.get("id", ""),
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+        "duration_string": info.get("duration_string"),
+        "uploader": info.get("uploader"),
+        "thumbnail": info.get("thumbnail"),
+        "webpage_url": info.get("webpage_url"),
+        "extractor": info.get("extractor"),
+        "is_live": info.get("is_live"),
+        "qualities": qualities,
+        "platform": detect_platform(full_url),
+        "created_at": created_at,
+    }
+    enrich_info_dict(
+        payload,
+        formats=formats,
+        is_clip=is_clip_url(full_url),
     )
+    return VideoInfo(**payload)
 
 
 def _build_ydl_opts(
@@ -461,7 +542,7 @@ def _build_ydl_opts(
             else os.path.dirname(resolved_ffmpeg)
         )
 
-    encode_args = ffmpeg_h264_encode_args(normalize_video_encoder(video_encoder))
+    encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
     if encode_args:
         opts["postprocessors"] = [
             {"key": "FFmpegVideoConvertor", "preferedcodec": "h264"},
@@ -750,7 +831,7 @@ def _concat_and_trim(
     if offset > 0.001:
         cmd += ["-ss", str(offset)]
     cmd += ["-t", str(duration)]
-    encode_args = ffmpeg_h264_encode_args(normalize_video_encoder(video_encoder))
+    encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
     if encode_args:
         cmd += encode_args
     else:
@@ -909,7 +990,7 @@ def download_video_sync(
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
     progress_hook = _wrap_progress_hook(progress_hook, cancel_event, pause_event)
-    resolved_encoder = normalize_video_encoder(
+    resolved_encoder = resolve_video_encoder(
         video_encoder or (settings_mgr.get().video_encoder if settings_mgr else None)
     )
 

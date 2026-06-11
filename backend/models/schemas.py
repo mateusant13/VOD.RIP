@@ -15,6 +15,9 @@ class VideoInfo(BaseModel):
     qualities: List[str] = []
     platform: Optional[str] = None
     created_at: Optional[str] = None
+    size_by_quality: Optional[Dict[str, int]] = None
+    estimated_bytes: Optional[int] = None
+    bitrate_kbps: Optional[float] = None
 
 
 class DownloadRequest(BaseModel):
@@ -60,7 +63,7 @@ class AppSettings(BaseModel):
     download_folder_confirmed: bool = False
     download_threads: int = 8
     max_cache_mb: int = 512
-    video_encoder: str = "libx264"
+    video_encoder: str = "auto"
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""
@@ -69,6 +72,9 @@ class AppSettings(BaseModel):
     panel_layout: Optional[Dict[str, Any]] = None
     window_geometry: Optional[Dict[str, Any]] = None
     saved_channels: Optional[List[Dict[str, Any]]] = None
+    channel_kick_enabled: bool = True
+    channel_twitch_enabled: bool = True
+    channel_content_filter: str = "vods"
 
 
 class SettingsUpdate(BaseModel):
@@ -85,6 +91,9 @@ class SettingsUpdate(BaseModel):
     panel_layout: Optional[Dict[str, Any]] = None
     window_geometry: Optional[Dict[str, Any]] = None
     saved_channels: Optional[List[Dict[str, Any]]] = None
+    channel_kick_enabled: Optional[bool] = None
+    channel_twitch_enabled: Optional[bool] = None
+    channel_content_filter: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):

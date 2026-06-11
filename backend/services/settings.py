@@ -39,7 +39,7 @@ class SettingsManager:
                         (data.get("download_folder") or "").strip()
                     )
                 if "video_encoder" not in data:
-                    data["video_encoder"] = "copy"
+                    data["video_encoder"] = "auto"
                 return AppSettings(**data)
         except Exception:
             pass

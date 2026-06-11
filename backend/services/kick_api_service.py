@@ -316,8 +316,10 @@ def get_channel_api(url: str) -> KickChannel:
 
 # Sync helpers for FastAPI routes — curl_cffi only, never Playwright.
 def get_clip_info_sync(url: str) -> dict:
+    from services.size_estimate import enrich_info_dict
+
     v = get_clip_info_api(url)
-    return {
+    payload = {
         "id": v.id,
         "title": v.title,
         "uploader": v.channel,
@@ -332,11 +334,21 @@ def get_clip_info_sync(url: str) -> dict:
         "created_at": v.created_at,
         "content_kind": "clip",
     }
+    headers = {"referer": v.url or url, "origin": _BASE}
+    enrich_info_dict(
+        payload,
+        m3u8_url=v.m3u8_url,
+        m3u8_headers=headers,
+        is_clip=True,
+    )
+    return payload
 
 
 def get_video_info_sync(url: str) -> dict:
+    from services.size_estimate import enrich_info_dict
+
     v = get_video_info_api(url)
-    return {
+    payload = {
         "id": v.id,
         "title": v.title,
         "uploader": v.channel,
@@ -351,6 +363,14 @@ def get_video_info_sync(url: str) -> dict:
         "platform": "Kick",
         "created_at": v.created_at,
     }
+    headers = {"referer": v.url or url, "origin": _BASE}
+    enrich_info_dict(
+        payload,
+        m3u8_url=v.m3u8_url,
+        m3u8_headers=headers,
+        is_clip=False,
+    )
+    return payload
 
 
 def list_channel_videos_sync(url: str, limit: int = 20) -> list[dict]:
@@ -408,12 +428,12 @@ def download_vod_sync(
         _resolve_ffmpeg_exe,
         _verify_output_file,
         download_hls_media_clip,
-        normalize_video_encoder,
+        resolve_video_encoder,
     )
 
     if video_encoder is None and settings_mgr is not None:
         video_encoder = settings_mgr.get().video_encoder
-    resolved_encoder = normalize_video_encoder(video_encoder)
+    resolved_encoder = resolve_video_encoder(video_encoder)
 
     info = get_video_info_api(url)
     if not info.m3u8_url:

@@ -188,6 +188,10 @@ def _resolve_app_icon_path() -> str | None:
 def _start_server(port: int):
     """Import the FastAPI app and run uvicorn (blocking — runs in a thread)."""
     logger = logging.getLogger("VOD.RIP")
+    from services.server_lifecycle import register_uvicorn_server, should_stop_supervisor
+
+    if should_stop_supervisor():
+        return
     try:
         from main import app
         import uvicorn
@@ -204,6 +208,8 @@ def _start_server(port: int):
         ws_max_size=16777216,
     )
     server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None
+    register_uvicorn_server(server)
     try:
         server.run()
     except Exception:
@@ -266,14 +272,23 @@ def _kill_stale_port_process(port: int):
 
 def _server_supervisor(port: int):
     """Keep the FastAPI server alive — restart automatically after crashes."""
+    from services.server_lifecycle import should_stop_supervisor
+
     logger = logging.getLogger("VOD.RIP")
-    while True:
+    while not should_stop_supervisor():
         try:
             _start_server(port)
+            if should_stop_supervisor():
+                break
             logger.error("Uvicorn exited unexpectedly — restarting in 2s")
         except Exception:
+            if should_stop_supervisor():
+                break
             logger.exception("Server thread crashed — restarting in 2s")
+        if should_stop_supervisor():
+            break
         time.sleep(2)
+    logger.info("API server supervisor stopped")
 
 
 def _wait_for_server(port: int, timeout_sec: int = 15) -> bool:
@@ -521,13 +536,15 @@ def _launch_browser_and_tray(port: int, *, webview2_missing: bool = False):
 # ---------------------------------------------------------------------------
 
 
-def _shutdown():
-    """Cancel active downloads and kill child processes."""
+def _shutdown(port: int = 7897):
+    """Cancel active downloads, stop uvicorn, and release the API port."""
+    from services.server_lifecycle import stop_api_server
     from services.shutdown_util import shutdown_downloads_and_children
 
     logger = logging.getLogger("VOD.RIP")
     logger.info("Shutting down ...")
     shutdown_downloads_and_children()
+    stop_api_server(port)
     logger.info("Shutdown complete")
 
 
@@ -590,7 +607,7 @@ def main():
     if not _launch_pywebview(port):
         _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
 
-    _shutdown()
+    _shutdown(port)
     os._exit(0)
 
 

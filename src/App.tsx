@@ -6,7 +6,7 @@ import {
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical,
+  GripVertical, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
 import twitchIcon from '@/assets/platforms/twitch.png';
@@ -34,6 +34,8 @@ import {
   suggestClipDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
+import { panelMaxWidthCap, readUiScale } from './uiScale';
+import { useViewportTier } from './useViewportTier';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +52,9 @@ interface VideoInfo {
   qualities: string[];
   platform: string | null;
   created_at?: string | null;
+  size_by_quality?: Record<string, number>;
+  estimated_bytes?: number;
+  bitrate_kbps?: number;
 }
 
 interface DownloadState {
@@ -134,6 +139,9 @@ interface AppSettings {
   panel_layout?: PersistedPanelLayout | null;
   window_geometry?: Record<string, number | boolean> | null;
   saved_channels?: SavedChannel[] | null;
+  channel_kick_enabled?: boolean;
+  channel_twitch_enabled?: boolean;
+  channel_content_filter?: 'vods' | 'clips';
 }
 
 interface UpdateInfo {
@@ -176,6 +184,24 @@ const BACKEND_HINT = IS_DEV_UI ? BACKEND_HINT_DEV : BACKEND_HINT_APP;
 const TIMEOUT_HINT = IS_DEV_UI
   ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
   : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
+
+function formatApiDetail(detail: unknown): string {
+  if (detail == null) return '';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (item && typeof item === 'object' && 'msg' in item) {
+          return String((item as { msg?: string }).msg ?? item);
+        }
+        return String(item);
+      })
+      .filter(Boolean)
+      .join('; ');
+  }
+  if (typeof detail === 'object') return JSON.stringify(detail);
+  return String(detail);
+}
 
 function apiErrorMessage(res: Response, fallback: string, path?: string): string {
   if (res.status === 500 || res.status === 502 || res.status === 503) {
@@ -230,7 +256,8 @@ async function apiGet<T>(path: string): Promise<T> {
   const res = await apiFetch(path);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`, path));
+    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
+    throw new Error(apiErrorMessage(res, detail, path));
   }
   return res.json();
 }
@@ -243,7 +270,8 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
+    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
+    throw new Error(apiErrorMessage(res, detail));
   }
   return res.json();
 }
@@ -252,7 +280,8 @@ async function apiDelete(path: string): Promise<void> {
   const res = await apiFetch(path, { method: 'DELETE' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(apiErrorMessage(res, err.detail || `HTTP ${res.status}`));
+    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
+    throw new Error(apiErrorMessage(res, detail));
   }
 }
 
@@ -595,6 +624,35 @@ function EditableHmsTime({
 
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
+const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
+const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
+
+type GpuEncoderInfo = {
+  gpus: string[];
+  vendor: string;
+  vendor_label: string;
+  detected_encoder: string;
+  ffmpeg_encoders: Record<string, boolean>;
+};
+
+const VIDEO_ENCODER_LABELS: Record<string, string> = {
+  auto: 'Auto (detect GPU)',
+  copy: 'Source (fast)',
+  libx264: 'H.264 — x264',
+  h264_nvenc: 'H.264 — NVIDIA',
+  h264_amf: 'H.264 — AMD',
+  h264_qsv: 'H.264 — Intel',
+};
+
+function readPreviewFsUiScale(): number {
+  try {
+    const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
+    const v = raw ? parseFloat(raw) : 1;
+    return PREVIEW_FS_SCALE_STEPS.includes(v as (typeof PREVIEW_FS_SCALE_STEPS)[number]) ? v : 1;
+  } catch {
+    return 1;
+  }
+}
 const PREVIEW_DEFAULT_VOLUME = 0.3;
 
 /** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
@@ -621,7 +679,10 @@ const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
 const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 384 };
 const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
 const PANEL_MIN: PanelSize = { w: 200, h: 180 };
-const PANEL_MAX_W = 1000;
+
+function panelMaxW(): number {
+  return panelMaxWidthCap();
+}
 /** Minimum clear space between panel chrome (incl. shadow) and viewport edges. */
 const VIEWPORT_EDGE_LOCK = 40;
 const EXPLORE_POPUP_Z = 9999;
@@ -667,7 +728,7 @@ function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsIn
   if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
   if (target !== 'main') othersW += layout.main.w;
 
-  return Math.max(PANEL_MIN.w, Math.min(PANEL_MAX_W, maxW - othersW - gapTotal));
+  return Math.max(PANEL_MIN.w, Math.min(panelMaxW(), maxW - othersW - gapTotal));
 }
 
 function layoutMaxPanelHeight(): number {
@@ -727,7 +788,7 @@ function maxPreviewPanelWidth(
 ): number {
   const shadowPad = panelResizeHandleInset(true);
   const { maxH } = viewportContentBox(shadowPad);
-  const capW = Math.min(PANEL_MAX_W, layoutMaxPanelWidth('preview', layout));
+  const capW = Math.min(panelMaxW(), layoutMaxPanelWidth('preview', layout));
   const videoMaxW = capW - PREVIEW_PANEL_PAD_H;
   const videoMaxH = Math.max(100, maxH - chromeH - PREVIEW_PANEL_PAD_H);
   const videoMaxWFromH = videoMaxH * aspect;
@@ -867,7 +928,7 @@ function startPanelResizeDrag(
   const startX = e.clientX;
   const startY = e.clientY;
   const { w: startW, h: startH } = sizeRef.current;
-  const maxW = opts?.maxW ?? PANEL_MAX_W;
+  const maxW = opts?.maxW ?? panelMaxW();
   const maxH = opts?.maxH ?? panelMaxHeight();
   const panelEl = opts?.panelEl ?? null;
 
@@ -1019,7 +1080,31 @@ const CHANNEL_FETCH_LIMIT = 100;
 /** Cheap head fetch on page load — merge only ids not already cached. */
 const CHANNEL_INCREMENTAL_LIMIT = 25;
 const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
+const CHANNEL_UI_STORAGE_KEY = 'vodrip_channel_ui';
 const PANEL_LAYOUT_STORAGE_KEY = 'vodrip_panel_layout';
+
+function loadStoredChannelUi(): {
+  kick: boolean;
+  twitch: boolean;
+  content: 'vods' | 'clips';
+} {
+  try {
+    const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
+    if (!raw) return { kick: true, twitch: true, content: 'vods' };
+    const p = JSON.parse(raw) as {
+      kick?: boolean;
+      twitch?: boolean;
+      content?: string;
+    };
+    return {
+      kick: p.kick !== false,
+      twitch: p.twitch !== false,
+      content: p.content === 'clips' ? 'clips' : 'vods',
+    };
+  } catch {
+    return { kick: true, twitch: true, content: 'vods' };
+  }
+}
 
 interface PersistedPanelLayout {
   previewPanelWidth: number;
@@ -1038,17 +1123,28 @@ function clampStoredPanelSize(value: unknown, fallback: PanelSize): PanelSize {
   const o = value as { w?: unknown; h?: unknown };
   const maxH = typeof window !== 'undefined' ? panelMaxHeight() : fallback.h;
   return {
-    w: clampLayoutNumber(o.w, PANEL_MIN.w, PANEL_MAX_W, fallback.w),
+    w: clampLayoutNumber(o.w, PANEL_MIN.w, panelMaxW(), fallback.w),
     h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
   };
 }
 
-function loadPanelLayout(): PersistedPanelLayout {
-  const fallback: PersistedPanelLayout = {
-    previewPanelWidth: PREVIEW_PANEL_DEFAULT_W,
-    urlAside: URL_ASIDE_PANEL_DEFAULT,
-    main: MAIN_PANEL_DEFAULT,
+function defaultPanelLayout(): PersistedPanelLayout {
+  const scale = readUiScale();
+  return {
+    previewPanelWidth: Math.round(PREVIEW_PANEL_DEFAULT_W * scale),
+    urlAside: {
+      w: Math.round(URL_ASIDE_PANEL_DEFAULT.w * scale),
+      h: Math.round(URL_ASIDE_PANEL_DEFAULT.h * scale),
+    },
+    main: {
+      w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
+      h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
+    },
   };
+}
+
+function loadPanelLayout(): PersistedPanelLayout {
+  const fallback = defaultPanelLayout();
   try {
     const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
     if (!raw) return fallback;
@@ -1057,8 +1153,8 @@ function loadPanelLayout(): PersistedPanelLayout {
       previewPanelWidth: clampLayoutNumber(
         parsed.previewPanelWidth,
         PREVIEW_PANEL_MIN_W,
-        PANEL_MAX_W,
-        PREVIEW_PANEL_DEFAULT_W,
+        panelMaxW(),
+        fallback.previewPanelWidth,
       ),
       urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
       main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
@@ -1575,13 +1671,54 @@ function buildVodUrl(v: ChannelVideo): string {
     : `https://kick.com/${v.channel || ''}/videos/${v.id}`;
 }
 
-function bytes(mb: number): string {
-  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(0)} MB`;
+function formatBytes(nbytes: number): string {
+  if (!Number.isFinite(nbytes) || nbytes <= 0) return '—';
+  const mb = nbytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.max(1, Math.round(mb))} MB`;
+}
+
+const LEGACY_MB_PER_MIN: Record<string, number> = {
+  source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
+  '720p': 70, '480p': 35, '360p': 18,
+};
+
+function estimateDownloadBytes(
+  videoInfo: VideoInfo | null,
+  quality: string,
+  clipSec: number,
+  fullDurationSec: number,
+): number {
+  if (clipSec <= 0) return 0;
+  const fullDur = Math.max(clipSec, fullDurationSec || clipSec);
+  const sizes = videoInfo?.size_by_quality;
+  if (sizes && Object.keys(sizes).length > 0) {
+    const q = (quality || 'source').toLowerCase();
+    let fullBytes: number | undefined = sizes[quality] ?? sizes[q];
+    if (!fullBytes) {
+      const match = Object.entries(sizes).find(([k]) => {
+        const lk = k.toLowerCase();
+        return lk.startsWith(q) || q.startsWith(lk);
+      });
+      fullBytes = match?.[1];
+    }
+    if (!fullBytes) {
+      fullBytes = sizes.source ?? Math.max(...Object.values(sizes));
+    }
+    if (fullBytes && fullBytes > 0) {
+      return Math.round(fullBytes * (clipSec / fullDur));
+    }
+  }
+  if (videoInfo?.estimated_bytes && fullDur > 0) {
+    return Math.round(videoInfo.estimated_bytes * (clipSec / fullDur));
+  }
+  const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
+  return Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
 }
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const viewportTier = useViewportTier();
   const [tab, setTab] = useState<Tab>('url');
 
   // URL mode
@@ -1612,6 +1749,7 @@ export default function App() {
   const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
+  const [previewFsUiScale, setPreviewFsUiScale] = useState(readPreviewFsUiScale);
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
@@ -1697,8 +1835,8 @@ export default function App() {
     const clampedPreviewW = clampLayoutNumber(
       pl.previewPanelWidth,
       PREVIEW_PANEL_MIN_W,
-      PANEL_MAX_W,
-      PREVIEW_PANEL_DEFAULT_W,
+      panelMaxW(),
+      defaultPanelLayout().previewPanelWidth,
     );
     previewPanelWidthRef.current = clampedPreviewW;
     urlAsidePanelSizeRef.current = clampedUrl;
@@ -1794,17 +1932,18 @@ export default function App() {
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
+  const channelUiPersistReadyRef = useRef(false);
   const [pickingFolder, setPickingFolder] = useState(false);
-  // Platform filter for channel browsing. Default: both enabled. Pure
-  // presentation state — the backend always returns every VOD for the
-  // channel across both platforms (capped to the last 14 days); this list
-  // just narrows what we render.
-  const [kickEnabled, setKickEnabled] = useState(true);
-  const [twitchEnabled, setTwitchEnabled] = useState(true);
+  const initialChannelUi = useMemo(() => loadStoredChannelUi(), []);
+  // Platform filter for channel browsing — persisted in settings + localStorage.
+  const [kickEnabled, setKickEnabled] = useState(initialChannelUi.kick);
+  const [twitchEnabled, setTwitchEnabled] = useState(initialChannelUi.twitch);
   // How many cached VODs to show per platform (expand is client-side only).
   const [kickVisibleLimit, setKickVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
   const [twitchVisibleLimit, setTwitchVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
-  const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips'>('vods');
+  const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips'>(
+    initialChannelUi.content,
+  );
 
   const selectedChannel = useMemo(
     () => savedChannels.find((c) => c.id === selectedChannelId) ?? null,
@@ -1861,6 +2000,7 @@ export default function App() {
   // Settings
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [gpuEncoderInfo, setGpuEncoderInfo] = useState<GpuEncoderInfo | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -2646,6 +2786,21 @@ export default function App() {
     }
   }, [previewFullscreen]);
 
+  const adjustPreviewFsUiScale = useCallback((delta: number) => {
+    setPreviewFsUiScale((prev) => {
+      const idx = PREVIEW_FS_SCALE_STEPS.indexOf(prev as (typeof PREVIEW_FS_SCALE_STEPS)[number]);
+      const base = idx >= 0 ? idx : 0;
+      const next = PREVIEW_FS_SCALE_STEPS[Math.max(0, Math.min(PREVIEW_FS_SCALE_STEPS.length - 1, base + delta))];
+      try {
+        localStorage.setItem(PREVIEW_FS_SCALE_KEY, String(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+    bumpPreviewFsControls();
+  }, [bumpPreviewFsControls]);
+
   const focusPreviewPlayer = useCallback(() => {
     previewContainerRef.current?.focus();
   }, []);
@@ -3205,6 +3360,37 @@ export default function App() {
     apiPost('/api/settings', { saved_channels: payload }).catch(() => {});
   }, [savedChannels]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        CHANNEL_UI_STORAGE_KEY,
+        JSON.stringify({
+          kick: kickEnabled,
+          twitch: twitchEnabled,
+          content: channelContentFilter,
+        }),
+      );
+    } catch {
+      /* ignore */
+    }
+    if (!channelUiPersistReadyRef.current) return;
+    apiPost('/api/settings', {
+      channel_kick_enabled: kickEnabled,
+      channel_twitch_enabled: twitchEnabled,
+      channel_content_filter: channelContentFilter,
+    }).catch(() => {});
+    setSettings((prev) =>
+      prev
+        ? {
+            ...prev,
+            channel_kick_enabled: kickEnabled,
+            channel_twitch_enabled: twitchEnabled,
+            channel_content_filter: channelContentFilter,
+          }
+        : prev,
+    );
+  }, [kickEnabled, twitchEnabled, channelContentFilter]);
+
   const updateChannel = useCallback((id: string, patch: Partial<SavedChannel>) => {
     setSavedChannels((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }, []);
@@ -3229,6 +3415,9 @@ export default function App() {
 
     const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
+
+    const wantKick = kickEnabled;
+    const wantTwitch = twitchEnabled;
 
     try {
       if (mode === 'clips') {
@@ -3276,10 +3465,12 @@ export default function App() {
             errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} clips`;
           }
         };
-        await Promise.all([
-          fetchClips('Kick', ch.kickSlug),
-          fetchClips('Twitch', ch.twitchSlug),
-        ]);
+        const clipTasks: Promise<void>[] = [];
+        if (wantKick) clipTasks.push(fetchClips('Kick', ch.kickSlug));
+        if (wantTwitch) clipTasks.push(fetchClips('Twitch', ch.twitchSlug));
+        if (!wantKick) delete errs.Kick;
+        if (!wantTwitch) delete errs.Twitch;
+        await Promise.all(clipTasks);
         const clipVideos = incoming
           .filter(isLikelyClip)
           .sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
@@ -3292,6 +3483,10 @@ export default function App() {
       } else {
         const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
         const fetchVods = async (platform: 'Kick' | 'Twitch', slug: string) => {
+          if (!slug?.trim()) {
+            errs[platform] = `${platform} slug is not set`;
+            return;
+          }
           const qs = `url=${encodeURIComponent(slug)}&limit=${limit}&days=14&platforms=${encodeURIComponent(platform)}`;
           try {
             const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${qs}`);
@@ -3299,14 +3494,16 @@ export default function App() {
             delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
             if (pe) errs[platform] = pe;
-          } catch (err: any) {
-            errs[platform] = err.message || `Failed to fetch ${platform} VODs`;
+          } catch (err: unknown) {
+            errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} VODs`;
           }
         };
-        await Promise.all([
-          fetchVods('Kick', ch.kickSlug),
-          fetchVods('Twitch', ch.twitchSlug),
-        ]);
+        const vodTasks: Promise<void>[] = [];
+        if (wantKick) vodTasks.push(fetchVods('Kick', ch.kickSlug));
+        if (wantTwitch) vodTasks.push(fetchVods('Twitch', ch.twitchSlug));
+        if (!wantKick) delete errs.Kick;
+        if (!wantTwitch) delete errs.Twitch;
+        await Promise.all(vodTasks);
         const vodVideos = mergeVodLists(ch.vodVideos ?? [], incoming);
         updateChannel(channelId, {
           vodVideos,
@@ -3335,7 +3532,7 @@ export default function App() {
         updateChannel(channelId, { loading: false });
       }
     }
-  }, [savedChannels, updateChannel, channelContentFilter]);
+  }, [savedChannels, updateChannel, channelContentFilter, kickEnabled, twitchEnabled]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
@@ -3370,7 +3567,12 @@ export default function App() {
       return;
     }
     const errs = channelPlatformErrors(selectedChannel, channelContentFilter);
-    const errKeys = Object.keys(errs).filter((k) => errs[k]);
+    const errKeys = Object.keys(errs).filter((k) => {
+      if (!errs[k]) return false;
+      if (k === 'Kick' && !kickEnabled) return false;
+      if (k === 'Twitch' && !twitchEnabled) return false;
+      return true;
+    });
     if (errKeys.length === 0) {
       setChannelsError(null);
       return;
@@ -3383,7 +3585,7 @@ export default function App() {
         ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
         : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
     );
-  }, [selectedChannel, channelContentFilter]);
+  }, [selectedChannel, channelContentFilter, kickEnabled, twitchEnabled]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -3493,8 +3695,21 @@ export default function App() {
 
   const loadSettings = useCallback(async () => {
     try {
-      const s = await apiGet<AppSettings>('/api/settings');
+      const [s, gpu] = await Promise.all([
+        apiGet<AppSettings>('/api/settings'),
+        apiGet<GpuEncoderInfo>('/api/system/gpu-encoder').catch(() => null),
+      ]);
       setSettings(s);
+      if (gpu) setGpuEncoderInfo(gpu);
+      if (typeof s.channel_kick_enabled === 'boolean') {
+        setKickEnabled(s.channel_kick_enabled);
+      }
+      if (typeof s.channel_twitch_enabled === 'boolean') {
+        setTwitchEnabled(s.channel_twitch_enabled);
+      }
+      if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods') {
+        setChannelContentFilter(s.channel_content_filter);
+      }
       if (s.saved_channels && Array.isArray(s.saved_channels) && s.saved_channels.length > 0) {
         const restored = s.saved_channels.map((ch) => normalizeSavedChannel(ch as SavedChannel));
         setSavedChannels(restored);
@@ -3508,6 +3723,7 @@ export default function App() {
       }
     } catch {} finally {
       channelsPersistReadyRef.current = true;
+      channelUiPersistReadyRef.current = true;
       panelLayoutPersistReadyRef.current = true;
     }
   }, [restorePanelLayout]);
@@ -3578,6 +3794,9 @@ export default function App() {
           main: mainPanelSize,
         },
         saved_channels: savedChannels.map(({ loading: _loading, ...ch }) => ch),
+        channel_kick_enabled: kickEnabled,
+        channel_twitch_enabled: twitchEnabled,
+        channel_content_filter: channelContentFilter,
       };
       await apiPost('/api/settings', payload);
       setSettingsSaved(true);
@@ -3586,7 +3805,16 @@ export default function App() {
     } catch (err: any) {
       setError(err.message || 'Failed to save settings');
     }
-  }, [settings, previewPanelWidth, urlAsidePanelSize, mainPanelSize, savedChannels]);
+  }, [
+    settings,
+    previewPanelWidth,
+    urlAsidePanelSize,
+    mainPanelSize,
+    savedChannels,
+    kickEnabled,
+    twitchEnabled,
+    channelContentFilter,
+  ]);
 
   // ── Fill VOD from channel ──
   const selectVod = useCallback((vodUrl: string, badge?: ChannelPreviewBadge) => {
@@ -3619,12 +3847,12 @@ export default function App() {
     ? Math.max(1, Math.floor(videoInfo.duration))
     : Math.max(0, trimEndSec - trimStartSec);
 
-  const rates: Record<string, number> = {
-    source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
-    '720p': 70, '480p': 35, '360p': 18,
-  };
-  const mbPerMin = rates[quality] || 70;
-  const estSize = (clipSec / 60) * mbPerMin;
+  const estBytes = estimateDownloadBytes(
+    videoInfo,
+    quality,
+    clipSec,
+    videoInfo?.duration ?? clipSec,
+  );
 
   const sourceQualityLabel = useMemo(
     () => sourceQualityOptionLabel(maxQualityLabelFromList(videoInfo?.qualities ?? [])),
@@ -3735,7 +3963,7 @@ export default function App() {
                 <span className="flex items-center gap-0.5 shrink-0 text-zinc-300">
                   <Database size={9} className={
                     videoInfo.platform?.toLowerCase() === 'kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
-                  } /> {bytes(estSize)}
+                  } /> {formatBytes(estBytes)}
                 </span>
               </div>
             </div>
@@ -3762,7 +3990,7 @@ export default function App() {
             <div className="flex flex-col gap-0.5">
               <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">Est. size</span>
               <div className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono py-1 px-1.5 text-[10px] flex items-center justify-center">
-                {bytes(estSize)}
+                {formatBytes(estBytes)}
               </div>
             </div>
           </div>
@@ -4075,6 +4303,31 @@ export default function App() {
         />
       </div>
       <div className="flex items-center gap-1.5 ml-auto">
+        {opts.fsCornerExit && (
+          <div className="flex items-center gap-0.5 mr-1">
+            <button
+              type="button"
+              onClick={() => adjustPreviewFsUiScale(-1)}
+              disabled={previewFsUiScale <= PREVIEW_FS_SCALE_STEPS[0]}
+              className={previewCtrlBtn(previewFullscreen)}
+              title="Smaller controls"
+            >
+              <ZoomOut size={16} />
+            </button>
+            <span className="text-[9px] font-mono text-zinc-400 tabular-nums min-w-[2.25rem] text-center">
+              {Math.round(previewFsUiScale * 100)}%
+            </span>
+            <button
+              type="button"
+              onClick={() => adjustPreviewFsUiScale(1)}
+              disabled={previewFsUiScale >= PREVIEW_FS_SCALE_STEPS[PREVIEW_FS_SCALE_STEPS.length - 1]}
+              className={previewCtrlBtn(previewFullscreen)}
+              title="Larger controls & trim needles"
+            >
+              <ZoomIn size={16} />
+            </button>
+          </div>
+        )}
         <button
           type="button"
           onClick={promptStartDownload}
@@ -4105,18 +4358,18 @@ export default function App() {
 
   return (
     <div
-      className="h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
+      className="vod-app-shell h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
       style={{
         backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)',
-        backgroundSize: '24px 24px',
+        backgroundSize: 'calc(24px * var(--ui-scale)) calc(24px * var(--ui-scale))',
       }}
     >
-      <div className={`flex items-start max-w-full min-w-0 ${
+      <div className={`vod-layout-row flex items-start max-w-full min-w-0 ${
         triplePanelLayout
-          ? 'w-full gap-3 justify-center'
+          ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-center`
           : splitLayout
-            ? 'w-full gap-6 justify-center'
-            : 'w-full max-w-md justify-center gap-6'
+            ? `w-full ${viewportTier === 'narrow' ? 'gap-3' : 'gap-6'} justify-center`
+            : `w-full ${viewportTier === 'wide' ? 'max-w-lg' : 'max-w-md'} justify-center gap-6`
       }`}>
       {previewOpen && (
         <div
@@ -4212,6 +4465,8 @@ export default function App() {
                 <div
                   ref={previewControlsRef}
                   data-player-controls
+                  data-preview-fs-ui
+                  style={{ '--preview-fs-scale': previewFsUiScale } as CSSProperties}
                   className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
                     previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                   }`}
@@ -4813,17 +5068,30 @@ export default function App() {
               <div className="flex flex-col gap-1.5">
                 <FieldCaption>Video Encoder</FieldCaption>
                 <select
-                  value={settings.video_encoder || 'libx264'}
+                  value={settings.video_encoder || 'auto'}
                   onChange={(e) => setSettings({ ...settings, video_encoder: e.target.value })}
                   className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs"
                   title="H.264 encoders produce .mp4 files compatible with most editors"
                 >
+                  <option value="auto">
+                    Auto — {gpuEncoderInfo
+                      ? `${gpuEncoderInfo.vendor_label} → ${VIDEO_ENCODER_LABELS[gpuEncoderInfo.detected_encoder] ?? gpuEncoderInfo.detected_encoder}`
+                      : 'detect GPU'}
+                  </option>
                   <option value="copy">Source (fast)</option>
-                  <option value="libx264">H.264 — x264</option>
+                  <option value="libx264">H.264 — x264 (software)</option>
                   <option value="h264_nvenc">H.264 — NVIDIA</option>
                   <option value="h264_amf">H.264 — AMD</option>
                   <option value="h264_qsv">H.264 — Intel</option>
                 </select>
+                {gpuEncoderInfo && (
+                  <p className="text-[9px] font-mono text-zinc-600 leading-snug">
+                    GPU: {gpuEncoderInfo.gpus[0] || gpuEncoderInfo.vendor_label}
+                    {settings.video_encoder === 'auto' || !settings.video_encoder
+                      ? ` · using ${VIDEO_ENCODER_LABELS[gpuEncoderInfo.detected_encoder] ?? gpuEncoderInfo.detected_encoder}`
+                      : ''}
+                  </p>
+                )}
               </div>
             </div>
 

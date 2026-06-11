@@ -169,7 +169,9 @@ def get_clip_info_sync(url_or_slug: str) -> Dict[str, Any]:
     duration = node.get("durationSeconds")
     qualities = _qualities_from_gql(node.get("videoQualities") or [])
     clip_url = f"https://clips.twitch.tv/{slug}" if slug else url_or_slug
-    return {
+    from services.size_estimate import enrich_info_dict
+
+    payload = {
         "id": str(node.get("id") or slug),
         "title": node.get("title") or "Untitled",
         "uploader": broadcaster.get("displayName") or login,
@@ -184,6 +186,12 @@ def get_clip_info_sync(url_or_slug: str) -> Dict[str, Any]:
         "created_at": node.get("createdAt"),
         "content_kind": "clip",
     }
+    enrich_info_dict(
+        payload,
+        progressive_variants=node.get("videoQualities") or [],
+        is_clip=True,
+    )
+    return payload
 
 
 def get_clip_progressive_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]:
@@ -391,7 +399,9 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
     login = owner.get("login") or owner.get("displayName")
     duration = node.get("lengthSeconds")
 
-    return {
+    from services.size_estimate import enrich_info_dict
+
+    payload = {
         "id": str(node.get("id") or vid),
         "title": node.get("title") or "Untitled",
         "uploader": owner.get("displayName") or login,
@@ -406,3 +416,5 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
         "platform": "Twitch",
         "created_at": node.get("createdAt"),
     }
+    enrich_info_dict(payload, is_clip=False)
+    return payload

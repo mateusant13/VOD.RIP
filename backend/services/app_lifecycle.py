@@ -78,7 +78,8 @@ def on_user_close_attempt() -> bool:
     global _allow_close
     if _allow_close:
         return True
-    _flush_frontend_state()
+    # Do not call evaluate_js here — it blocks the WebView UI thread and can
+    # freeze or crash Edge Chromium when the user clicks the window X button.
     if _flush_geometry_cb:
         try:
             _flush_geometry_cb()
@@ -89,17 +90,12 @@ def on_user_close_attempt() -> bool:
             _save_geometry_cb()
         except Exception as exc:
             _logger.debug("save geometry on hide: %s", exc)
-    if _window is not None:
-        threading.Thread(target=_hide_window, daemon=True).start()
-    return False
-
-
-def _hide_window() -> None:
     try:
         if _window is not None:
             _window.hide()
     except Exception as exc:
         _logger.debug("hide window: %s", exc)
+    return False
 
 
 def show_window() -> None:
@@ -119,33 +115,44 @@ def request_app_exit() -> None:
     global _allow_close
     _allow_close = True
 
-    _flush_frontend_state()
-    if _flush_geometry_cb:
+    def _do_exit() -> None:
+        _flush_frontend_state()
+        if _flush_geometry_cb:
+            try:
+                _flush_geometry_cb()
+            except Exception as exc:
+                _logger.debug("flush geometry on exit: %s", exc)
+
+        if _tray is not None:
+            try:
+                _tray.stop()
+            except Exception as exc:
+                _logger.debug("stop tray: %s", exc)
+
+        from services.shutdown_util import shutdown_downloads_and_children
+
+        shutdown_downloads_and_children()
+
         try:
-            _flush_geometry_cb()
+            import os as _os
+
+            from services.server_lifecycle import stop_api_server
+
+            port = int(_os.environ.get("PORT", 7897))
+            stop_api_server(port)
         except Exception as exc:
-            _logger.debug("flush geometry on exit: %s", exc)
+            _logger.debug("stop api server: %s", exc)
 
-    if _tray is not None:
-        try:
-            _tray.stop()
-        except Exception as exc:
-            _logger.debug("stop tray: %s", exc)
+        if _window is not None:
+            try:
+                _window.destroy()
+            except Exception as exc:
+                _logger.debug("destroy window: %s", exc)
 
-    from services.shutdown_util import shutdown_downloads_and_children
-
-    shutdown_downloads_and_children()
-
-    if _window is not None:
-        try:
-            threading.Thread(target=_window.destroy, daemon=True).start()
-        except Exception as exc:
-            _logger.debug("destroy window: %s", exc)
-
-    def _terminate():
         os._exit(0)
 
-    threading.Timer(0.6, _terminate).start()
+    # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.
+    threading.Thread(target=_do_exit, daemon=True).start()
 
 
 def read_window_geometry() -> Optional[Dict[str, Any]]:

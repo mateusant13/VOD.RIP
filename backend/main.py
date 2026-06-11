@@ -182,6 +182,19 @@ async def get_settings():
     return settings_mgr.get()
 
 
+@app.get("/api/system/gpu-encoder")
+async def system_gpu_encoder():
+    """GPU vendor + recommended H.264 encoder (for Settings auto mode)."""
+    from services.gpu_detect import get_encoder_detection
+    from services.ytdlp_service import _resolve_ffmpeg_exe
+
+    ffmpeg_bin = _resolve_ffmpeg_exe(settings_mgr.get().ffmpeg_path or None)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        INFO_EXECUTOR, lambda: get_encoder_detection(ffmpeg_bin)
+    )
+
+
 @app.post("/api/settings", response_model=AppSettings)
 async def update_settings(update: SettingsUpdate):
     current = settings_mgr.get()
@@ -190,9 +203,9 @@ async def update_settings(update: SettingsUpdate):
     if update.max_cache_mb is not None:
         current.max_cache_mb = max(50, min(2000, update.max_cache_mb))
     if update.video_encoder is not None:
-        from services.ytdlp_service import normalize_video_encoder
+        from services.ytdlp_service import normalize_video_encoder_setting
 
-        current.video_encoder = normalize_video_encoder(update.video_encoder)
+        current.video_encoder = normalize_video_encoder_setting(update.video_encoder)
     if update.throttle_kib is not None:
         current.throttle_kib = update.throttle_kib
     if update.ffmpeg_path is not None:
@@ -215,6 +228,13 @@ async def update_settings(update: SettingsUpdate):
         current.window_geometry = update.window_geometry
     if update.saved_channels is not None:
         current.saved_channels = update.saved_channels
+    if update.channel_kick_enabled is not None:
+        current.channel_kick_enabled = bool(update.channel_kick_enabled)
+    if update.channel_twitch_enabled is not None:
+        current.channel_twitch_enabled = bool(update.channel_twitch_enabled)
+    if update.channel_content_filter is not None:
+        filt = (update.channel_content_filter or "vods").strip().lower()
+        current.channel_content_filter = "clips" if filt == "clips" else "vods"
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

@@ -18,12 +18,12 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "mateusant13"),
                         StringStruct("FileDescription", "VOD.RIP — Kick & Twitch downloader"),
-                        StringStruct("FileVersion", "1.0.8.0"),
+                        StringStruct("FileVersion", "1.0.9.0"),
                         StringStruct("InternalName", "VOD.RIP"),
                         StringStruct("LegalCopyright", "Copyright (c) mateusant13"),
                         StringStruct("OriginalFilename", "VOD-RIP.EXE"),
                         StringStruct("ProductName", "VOD.RIP"),
-                        StringStruct("ProductVersion", "1.0.8.0"),
+                        StringStruct("ProductVersion", "1.0.9.0"),
                     ],
                 )
             ]
