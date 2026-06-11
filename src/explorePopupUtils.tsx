@@ -239,8 +239,8 @@ export function startExplorePanelWidthResize(
 
 export function startFloatingPanelDrag(
   e: ReactPointerEvent<HTMLElement>,
-  posRef: MutableRefObject<PanelPos>,
-  setPos: Dispatch<SetStateAction<PanelPos>>,
+  posRef: MutableRefObject<PanelPos | null>,
+  setPos: Dispatch<SetStateAction<PanelPos | null>>,
   panelEl: HTMLElement | null,
 ) {
   if ((e.target as HTMLElement).closest('button, input, select, textarea, a, [role="slider"]')) return;
@@ -251,7 +251,7 @@ export function startFloatingPanelDrag(
 
   const startX = e.clientX;
   const startY = e.clientY;
-  const startPos = { ...posRef.current };
+  const startPos = { ...(posRef.current ?? { x: 0, y: 0 }) };
 
   if (panelEl) {
     panelEl.style.willChange = 'top, left';
@@ -284,7 +284,7 @@ export function startFloatingPanelDrag(
     if (panelEl) {
       panelEl.style.willChange = '';
     }
-    setPos({ ...posRef.current });
+    setPos(posRef.current ? { ...posRef.current } : null);
   };
 
   handle.addEventListener('pointermove', onMove);

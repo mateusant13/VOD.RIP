@@ -1,6 +1,6 @@
 import {
   useState, useEffect, useLayoutEffect, useCallback, useRef,
-  type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent,
+  type KeyboardEvent, type PointerEvent as ReactPointerEvent,
 } from 'react';
 import Hls from 'hls.js';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
@@ -191,7 +191,7 @@ export default function ChannelExplorePopup({
   } | null>(null);
   const requestedHeightRef = useRef(0);
   const appliedHeightRef = useRef(0);
-  const fsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fsHideTimerRef = useRef<number | null>(null);
   const initialPlayDoneRef = useRef(false);
   const panelWidthRef = useRef(EXPLORE_PANEL_DEFAULT_W);
   const videoAspectRef = useRef(EXPLORE_VIDEO_ASPECT_DEFAULT);
@@ -474,12 +474,7 @@ export default function ChannelExplorePopup({
       posRef.current = layoutExplorePopupWindow(el, panelWidthRef.current, posRef, stackIndex);
       setPos(posRef.current);
     }
-    startFloatingPanelDrag(
-      e,
-      posRef as MutableRefObject<PanelPos>,
-      setPos,
-      el,
-    );
+    startFloatingPanelDrag(e, posRef, setPos, el);
   }, [fullscreen, stackIndex]);
 
   const toggleFullscreen = useCallback(async () => {

@@ -11,8 +11,8 @@
     "build": "vite build",
     "build-copy": "vite build && node -e \"require('fs').copyFileSync('dist/index.html', 'backend/static/index.html')\"",
     "preview": "vite preview",
-    "generate-icon": "python scripts/generate-icon.py",
-    "build-dist": "npm run generate-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs"
+    "sync-icon": "python scripts/generate-icon.py",
+    "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",

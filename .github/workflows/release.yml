@@ -78,7 +78,7 @@ jobs:
       - name: Build frontend
         run: npm run build-copy
 
-      - name: Generate icons
+      - name: Sync app icons
         run: python scripts/generate-icon.py
 
       - name: Generate macOS icns

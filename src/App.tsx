@@ -2,10 +2,10 @@ import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, u
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
-  Download, Scissors, Info, Play, Pause, Link2, X, FastForward, Clock,
+  Download, Scissors, Info, Play, Pause, Link2, X, Clock,
   Users, Database, Settings2, StopCircle, Loader2,
   CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
-  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine,
+  ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
 import kickIcon from '@/assets/platforms/kick.ico';
@@ -330,14 +330,6 @@ function formatHmsFull(sec: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
-function formatClipDurationTag(sec: number): string {
-  sec = Math.max(1, Math.floor(sec));
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m > 0) return `${m}m${s}s`;
-  return `${s}s`;
-}
-
 function formatClipDurationHuman(sec: number): string {
   sec = Math.max(1, Math.floor(sec));
   const m = Math.floor(sec / 60);
@@ -627,13 +619,6 @@ const EXPLORE_POPUP_Z = 9999;
 const MAX_EXPLORE_POPUPS = 5;
 const LAYOUT_ROW_GAP_TRIPLE = 12;
 const LAYOUT_ROW_GAP_SPLIT = 24;
-const EXPLORE_PANEL_DEFAULT_W = 288;
-const EXPLORE_PANEL_MIN_W = 100;
-const EXPLORE_PANEL_MAX_W = 960;
-const EXPLORE_PANEL_CHROME_H_EST = 156;
-const EXPLORE_PANEL_PAD_V = 24;
-const EXPLORE_PANEL_PAD_H = 24;
-const EXPLORE_VIDEO_ASPECT_DEFAULT = 16 / 9;
 const CARD_BORDER_PX = 2;
 
 function panelMaxHeight() {
@@ -726,29 +711,6 @@ function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   return { preview, urlAside, main };
 }
 
-function exploreViewportBox(): { maxW: number; maxH: number } {
-  const shadowPad = panelResizeHandleInset(true);
-  const box = viewportContentBox(shadowPad);
-  return {
-    maxW: Math.max(EXPLORE_PANEL_MIN_W, box.maxW),
-    maxH: Math.max(140, box.maxH),
-  };
-}
-
-function maxExplorePanelWidth(chromeH: number, aspect: number): number {
-  const { maxW, maxH } = exploreViewportBox();
-  const capW = Math.min(EXPLORE_PANEL_MAX_W, maxW);
-  const videoMaxW = capW - EXPLORE_PANEL_PAD_H;
-  const videoMaxH = Math.max(80, maxH - chromeH - EXPLORE_PANEL_PAD_V);
-  const videoMaxWFromH = videoMaxH * aspect;
-  return Math.floor(Math.min(videoMaxW, videoMaxWFromH) + EXPLORE_PANEL_PAD_H);
-}
-
-function clampExplorePanelWidth(width: number, chromeH: number, aspect: number): number {
-  const maxW = maxExplorePanelWidth(chromeH, aspect);
-  return Math.min(maxW, Math.max(EXPLORE_PANEL_MIN_W, width));
-}
-
 function maxPreviewPanelWidth(
   chromeH: number,
   aspect: number,
@@ -774,14 +736,6 @@ function clampPreviewPanelWidth(
   return Math.min(maxW, Math.max(minW, width));
 }
 
-function defaultExplorePopupPosition(panelW: number, panelH: number): PanelPos {
-  const shadowPad = panelResizeHandleInset(true);
-  return {
-    x: window.innerWidth - VIEWPORT_EDGE_LOCK - panelW - shadowPad,
-    y: window.innerHeight - VIEWPORT_EDGE_LOCK - panelH - shadowPad,
-  };
-}
-
 function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
   el.style.position = 'fixed';
   el.style.top = `${pos.y}px`;
@@ -791,34 +745,12 @@ function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
   el.style.zIndex = String(EXPLORE_POPUP_Z);
 }
 
-function layoutExplorePopupWindow(
-  el: HTMLElement,
-  width: number,
-  posRef: MutableRefObject<PanelPos | null>,
-): PanelPos {
-  applyPanelWidth(el, width);
-  if (!posRef.current) {
-    posRef.current = defaultExplorePopupPosition(el.offsetWidth, el.offsetHeight);
-  }
-  applyExplorePopupWindowPosition(el, posRef.current);
-  return posRef.current;
-}
-
 function edgeAffectsWest(edge: ResizeEdge): boolean {
   return edge === 'w' || edge === 'nw' || edge === 'sw';
 }
 
 function edgeAffectsNorth(edge: ResizeEdge): boolean {
   return edge === 'n' || edge === 'ne' || edge === 'nw';
-}
-
-function applyExplorePopupFullscreenPosition(el: HTMLElement) {
-  el.style.position = 'fixed';
-  el.style.top = '0';
-  el.style.left = '0';
-  el.style.right = '0';
-  el.style.bottom = '0';
-  el.style.zIndex = String(EXPLORE_POPUP_Z);
 }
 
 /** Distance from panel padding edge to outer colored shadow corner (border + shadow offset). */
@@ -1686,7 +1618,7 @@ export default function App() {
   const previewControlsRef = useRef<HTMLDivElement>(null);
   const previewHlsRef = useRef<Hls | null>(null);
   const previewVolumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
-  const previewFsHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewFsHideTimerRef = useRef<number | null>(null);
   const previewInitialSeekDoneRef = useRef(false);
   const previewInitialPlayDoneRef = useRef(false);
   const previewSuppressPlayRef = useRef(false);
@@ -1743,7 +1675,7 @@ export default function App() {
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
   const panelLayoutPersistReadyRef = useRef(false);
-  const panelLayoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelLayoutSaveTimerRef = useRef<number | null>(null);
 
   const restorePanelLayout = useCallback((pl: PersistedPanelLayout) => {
     const clampedUrl = clampStoredPanelSize(pl.urlAside, URL_ASIDE_PANEL_DEFAULT);
