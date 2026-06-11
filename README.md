@@ -1,4 +1,4 @@
-# VOD.RIP - Kick and Twitch Downloader
+# VOD.RIP 🪦 - Kick and Twitch Downloader
 
 Save Twitch and Kick VODs, clips, and highlights in a few clicks.
 
