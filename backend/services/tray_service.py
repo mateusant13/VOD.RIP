@@ -64,13 +64,17 @@ class TrayService:
                     base / "icon.png",
                     base / "_internal" / "icon.ico",
                     base / "_internal" / "icon.png",
+                    base / "assets" / "icon.ico",
+                    base / "assets" / "icon.png",
                 ])
             else:
                 base = Path(__file__).parent.parent.parent
                 candidates.extend([
+                    base / "assets" / "icon.ico",
+                    base / "assets" / "icon.png",
+                    base / "icon.ico",
                     base / "build" / "icon.ico",
                     base / "build" / "icon.png",
-                    base / "backend" / "static" / "favicon.ico",
                 ])
 
             for path in candidates:

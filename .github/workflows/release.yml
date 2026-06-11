@@ -100,7 +100,7 @@ jobs:
 
       # ── Generate application icons ───────────────────────────────
       - name: Generate icons
-        run: python build/generate-icons.py
+        run: python scripts/generate-icon.py
 
       # ── Install Playwright browsers ──────────────────────────────────
       - name: Install Playwright browsers
@@ -115,7 +115,7 @@ jobs:
 
       # ── PyInstaller ──────────────────────────────────────────────────
       - name: Build with PyInstaller
-        run: pyinstaller build/vod-rip.spec --clean
+        run: pyinstaller vod-rip.spec --clean --noconfirm
 
       # ── Stage installer files ────────────────────────────────────────
       # Note: Inno Setup resolves [Files] paths relative to the script
@@ -126,7 +126,7 @@ jobs:
           mkdir -p "$STAGING_DIR/static"
 
           # Copy PyInstaller output
-          cp -Rf dist/vod-rip/* "$STAGING_DIR/" 2>/dev/null || true
+          cp -Rf dist/VOD-RIP/* "$STAGING_DIR/" 2>/dev/null || true
           # macOS .app bundle (Contents/ may be empty on other platforms)
           if [ -d "dist/VOD.RIP.app" ]; then
             cp -Rf dist/VOD.RIP.app/Contents/MacOS/* "$STAGING_DIR/" 2>/dev/null || true

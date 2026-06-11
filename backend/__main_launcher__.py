@@ -115,6 +115,45 @@ def _setup_environment():
     os.environ["KICK_SERVE_UI"] = "1"
 
 
+_WINDOWS_APP_ID = "mateusant13.VODRIP.1"
+
+
+def _set_windows_app_identity() -> None:
+    """Group taskbar / jump-list entries under VOD.RIP with the correct icon."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_WINDOWS_APP_ID)
+    except Exception as exc:
+        logging.getLogger("VOD.RIP").debug("AppUserModelID: %s", exc)
+
+
+def _resolve_app_icon_path() -> str | None:
+    """Return the best .ico path for the window, tray, and taskbar."""
+    candidates: list[Path] = []
+    install = _get_install_dir()
+    resources = _get_resources_dir()
+    dev_root = Path(__file__).resolve().parent.parent
+
+    for base in (install, resources, install / "_internal", dev_root):
+        candidates.extend([
+            base / "icon.ico",
+            base / "assets" / "icon.ico",
+        ])
+
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_file():
+            return str(path.resolve())
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -298,6 +337,10 @@ def _make_geometry_saver(settings_mgr: SettingsManager):
 def _launch_pywebview(port: int) -> bool:
     """Open PyWebView with system-tray minimize-on-close behavior."""
     logger = logging.getLogger("VOD.RIP")
+    _set_windows_app_identity()
+    icon_path = _resolve_app_icon_path()
+    if icon_path:
+        logger.info("Using application icon: %s", icon_path)
 
     try:
         import webview
@@ -383,6 +426,8 @@ def _launch_pywebview(port: int) -> bool:
             start_kwargs = dict(gui=backend)
             if debug_mode and "debug" in _create_window_params:
                 start_kwargs["debug"] = True
+            if icon_path:
+                start_kwargs["icon"] = icon_path
 
             webview.start(**start_kwargs)
             logger.info("PyWebView closed normally")
@@ -471,6 +516,7 @@ def main():
 
     log_path = _setup_logging()
     _setup_environment()
+    _set_windows_app_identity()
 
     app_data = _get_appdata_dir()
     try:

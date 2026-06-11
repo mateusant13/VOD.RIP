@@ -21,7 +21,7 @@ from typing import Optional
 
 import requests
 
-GITHUB_REPO = "your-username/vod-rip"  # TODO: set before first public release
+GITHUB_REPO = "mateusant13/VOD.RIP"
 CHECK_INTERVAL_SEC = 24 * 3600  # Once per day
 CACHE_FILENAME = "update_cache.json"
 

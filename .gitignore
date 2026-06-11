@@ -6,11 +6,13 @@ node_modules/
 # Build output
 dist/
 build/
-dist/vod-rip/
+dist/VOD-RIP/
 # Generated build artifact copied from dist/ during npm run build-copy
 backend/static/index.html
 
 # Packaged desktop app (build locally via npm run build-dist or CI release)
+VOD-RIP.EXE
+VOD-RIP.exe
 vod-rip.exe
 _internal/
 nul

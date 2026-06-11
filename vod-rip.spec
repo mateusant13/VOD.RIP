@@ -20,8 +20,10 @@ from pathlib import Path
 _PROJECT_ROOT = Path(os.getcwd())
 _BACKEND_DIR = _PROJECT_ROOT / "backend"
 _STATIC_DIR = _BACKEND_DIR / "static"
+_ASSETS_DIR = _PROJECT_ROOT / "assets"
 _BUILD_DIR = _PROJECT_ROOT / "build"
 _EXTERNAL_DIR = _BUILD_DIR / "external"
+_ICON_ICO = _ASSETS_DIR / "icon.ico"
 
 
 def _ffmpeg_binaries():
@@ -51,7 +53,7 @@ a = Analysis(
     binaries=_ffmpeg_binaries(),
     datas=[
         (str(_STATIC_DIR / "index.html"), "static"),
-        (str(_BUILD_DIR / "icon.ico"), "."),
+        (str(_ICON_ICO), "."),
     ],
     hiddenimports=[
         # --- uvicorn submodules ---
@@ -126,7 +128,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='vod-rip',
+    name='VOD-RIP',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -137,7 +139,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(_BUILD_DIR / "icon.ico"),
+    icon=str(_ICON_ICO),
+    version=str(_ASSETS_DIR / "version_info.py"),
 )
 
 coll = COLLECT(
@@ -148,7 +151,7 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='vod-rip',
+    name='VOD-RIP',
 )
 
 # ---------------------------------------------------------------------------
@@ -162,7 +165,7 @@ app = BUNDLE(
     bundle_identifier='com.vodrip.app',
     info_plist={
         'CFBundleDisplayName': 'VOD.RIP',
-        'CFBundleExecutable': 'vod-rip',
+        'CFBundleExecutable': 'VOD-RIP',
         'CFBundleName': 'VOD.RIP',
         'CFBundleVersion': '1.0.0',
         'CFBundleShortVersionString': '1.0.0',
