@@ -1,20 +1,19 @@
-"""Detect and silently install Microsoft Edge WebView2 on Windows."""
+"""Detect WebView2 on Windows and guide the user to install it from Microsoft.
+
+We intentionally do NOT download or execute installers from inside VOD.RIP —
+that pattern is flagged as trojan/dropper behavior by antivirus software.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import subprocess
-import tempfile
-import threading
-import time
-from pathlib import Path
+import webbrowser
 
 logger = logging.getLogger(__name__)
 
 _WEBVIEW2_CLSID = "{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}"
-_BOOTSTRAPPER_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+_WEBVIEW2_INSTALL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 
 def webview2_installed() -> bool:
@@ -38,37 +37,31 @@ def webview2_installed() -> bool:
     return False
 
 
-def ensure_webview2_silent() -> bool:
-    """Install WebView2 if missing. Shows a one-time setup window while installing."""
+def ensure_webview2() -> bool:
+    """Return True when WebView2 is available. Otherwise show a setup dialog."""
     if webview2_installed():
         return True
     if os.name != "nt":
         return False
-
-    state = {"done": False, "ok": False}
-
-    def worker() -> None:
-        try:
-            state["ok"] = _run_webview2_bootstrapper()
-        finally:
-            state["done"] = True
-
-    threading.Thread(target=worker, daemon=True, name="webview2-install").start()
-    _show_installing_window(state)
-    return state["ok"] or webview2_installed()
+    return _show_setup_dialog()
 
 
-def _show_installing_window(state: dict) -> None:
+def open_webview2_download_page() -> None:
+    webbrowser.open(_WEBVIEW2_INSTALL_URL)
+
+
+def _show_setup_dialog() -> bool:
+    """Guide the user to install WebView2 from Microsoft (no bundled/silent install)."""
     try:
         import tkinter as tk
+        from tkinter import ttk
     except ImportError:
-        while not state["done"]:
-            time.sleep(0.2)
-        return
+        logger.warning("WebView2 missing and tkinter unavailable")
+        return False
 
     root = tk.Tk()
-    root.title("VOD.RIP")
-    root.geometry("440x150")
+    root.title("VOD.RIP — WebView2 required")
+    root.geometry("480x240")
     root.resizable(False, False)
     root.configure(bg="#0A0A0A")
     try:
@@ -76,88 +69,68 @@ def _show_installing_window(state: dict) -> None:
     except Exception:
         pass
 
-    frame = tk.Frame(root, bg="#0A0A0A")
-    frame.pack(expand=True, fill="both", padx=24, pady=22)
+    result = {"ok": False}
+
+    frame = tk.Frame(root, bg="#0A0A0A", padx=24, pady=20)
+    frame.pack(expand=True, fill="both")
 
     tk.Label(
         frame,
-        text="Setting up VOD.RIP",
+        text="Desktop window needs WebView2",
         fg="#ffffff",
         bg="#0A0A0A",
         font=("Segoe UI", 12, "bold"),
         anchor="w",
     ).pack(fill="x")
 
-    status = tk.Label(
+    tk.Label(
         frame,
-        text="Installing Microsoft WebView2 Runtime…\n"
-        "One-time setup (~150 MB). Please wait.",
+        text=(
+            "VOD.RIP uses Microsoft's free WebView2 runtime for the native app window.\n\n"
+            "Click below to open Microsoft's official installer in your browser.\n"
+            "After it finishes, click “Check again” or restart VOD.RIP.\n\n"
+            "Tip: the VOD.RIP Setup.exe installer can install WebView2 for you."
+        ),
         fg="#a1a1aa",
         bg="#0A0A0A",
-        font=("Consolas", 9),
+        font=("Segoe UI", 9),
         justify="left",
         anchor="w",
+    ).pack(fill="x", pady=(10, 16))
+
+    status = tk.StringVar(value="")
+    status_label = tk.Label(
+        frame, textvariable=status, fg="#fbbf24", bg="#0A0A0A", font=("Segoe UI", 9), anchor="w",
     )
-    status.pack(fill="x", pady=(10, 0))
+    status_label.pack(fill="x", pady=(0, 10))
 
-    def pump() -> None:
-        if state["done"]:
-            if not (state["ok"] or webview2_installed()):
-                status.config(
-                    text="WebView2 install did not finish.\n"
-                    "VOD.RIP will try opening in your browser.",
-                    fg="#fbbf24",
-                )
-                root.after(1800, root.destroy)
-            else:
-                root.destroy()
-            return
-        root.update_idletasks()
-        root.after(80, pump)
+    btn_row = tk.Frame(frame, bg="#0A0A0A")
+    btn_row.pack(fill="x")
 
-    root.after(80, pump)
-    root.mainloop()
+    def on_download() -> None:
+        open_webview2_download_page()
+        status.set("Install WebView2 from the page that opened, then click “Check again”.")
 
-
-def _run_webview2_bootstrapper() -> bool:
-    dest = Path(tempfile.gettempdir()) / "VOD.RIP-WebView2-Setup.exe"
-    try:
-        import requests
-
-        logger.info("Downloading WebView2 bootstrapper …")
-        with requests.get(_BOOTSTRAPPER_URL, stream=True, timeout=180) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as handle:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        handle.write(chunk)
-    except Exception as exc:
-        logger.warning("WebView2 download failed: %s", exc)
-        return False
-
-    try:
-        logger.info("Installing WebView2 …")
-        proc = subprocess.run(
-            [str(dest), "/silent", "/install"],
-            capture_output=True,
-            timeout=300,
-            creationflags=_NO_WINDOW,
-        )
-        if proc.returncode not in (0, 3010):
-            logger.warning("WebView2 installer exit code %s", proc.returncode)
-            return False
-    except Exception as exc:
-        logger.warning("WebView2 install failed: %s", exc)
-        return False
-    finally:
-        try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    for _ in range(15):
+    def on_retry() -> None:
         if webview2_installed():
-            return True
-        time.sleep(2)
+            result["ok"] = True
+            root.destroy()
+        else:
+            status.set("WebView2 not detected yet. Finish Microsoft's installer, then retry.")
 
-    return webview2_installed()
+    def on_browser() -> None:
+        result["ok"] = False
+        root.destroy()
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    ttk.Button(btn_row, text="Open Microsoft installer", command=on_download).pack(side="left", padx=(0, 8))
+    ttk.Button(btn_row, text="Check again", command=on_retry).pack(side="left", padx=(0, 8))
+    ttk.Button(btn_row, text="Use browser mode", command=on_browser).pack(side="right")
+
+    root.mainloop()
+    return result["ok"] or webview2_installed()

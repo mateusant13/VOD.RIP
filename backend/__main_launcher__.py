@@ -547,11 +547,11 @@ def main():
     webview2_ok = True
     if os.name == "nt" and getattr(sys, "frozen", False):
         try:
-            from services.webview2_setup import ensure_webview2_silent, webview2_installed
+            from services.webview2_setup import ensure_webview2, webview2_installed
 
             if not webview2_installed():
-                logging.getLogger("VOD.RIP").info("WebView2 missing — starting silent install")
-            webview2_ok = ensure_webview2_silent()
+                logging.getLogger("VOD.RIP").info("WebView2 missing — showing setup guide")
+            webview2_ok = ensure_webview2()
         except Exception as exc:
             logging.getLogger("VOD.RIP").warning("WebView2 setup failed: %s", exc)
             webview2_ok = False

@@ -212,18 +212,11 @@ class UpdateChecker:
 
     def _launch_windows_setup(self, installer: Path) -> bool:
         logger.info("Launching installer: %s", installer)
-        subprocess.Popen(
-            [
-                str(installer),
-                "/VERYSILENT",
-                "/SUPPRESSMSGBOXES",
-                "/CLOSEAPPLICATIONS",
-                "/RESTARTAPPLICATIONS",
-                "/NORESTART",
-            ],
-            close_fds=True,
-            creationflags=_NO_WINDOW,
-        )
+        # Use the normal installer UI (not silent/hidden) — fewer antivirus false positives.
+        if os.name == "nt":
+            os.startfile(str(installer))
+        else:
+            subprocess.Popen([str(installer)], close_fds=True)
         os._exit(0)
 
     def _apply_zip_update(self, zip_path: Path) -> bool:
