@@ -24,8 +24,12 @@ def main():
         from debug_cli import main as debug_main
         raise SystemExit(debug_main())
 
-    port = os.environ.get("PORT", "7897")
-    
+    port = int(os.environ.get("PORT", "7897"))
+
+    from services.server_lifecycle import release_api_port
+
+    release_api_port(port, skip_pid=os.getpid())
+
     # Install deps if needed
     try:
         import fastapi
@@ -48,7 +52,7 @@ def main():
     # connections but never responds (Playwright + file-watch reload). Opt in
     # with KICK_RELOAD=1 when you need auto-reload.
     use_reload = os.environ.get("KICK_RELOAD", "").strip() == "1"
-    uvicorn.run("main:app", host="0.0.0.0", port=int(port), reload=use_reload)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=use_reload)
 
 if __name__ == "__main__":
     main()

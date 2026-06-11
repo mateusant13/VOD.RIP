@@ -1275,6 +1275,7 @@ async def server_info():
     return {
         "version": app_version,
         "name": "VOD.RIP",
+        "desktop": os.environ.get("KICK_SERVE_UI", "").strip() == "1",
         "engine": "yt-dlp (Python)",
         "description": "Kick & Twitch VOD and clip downloader",
         "python_version": platform.python_version(),

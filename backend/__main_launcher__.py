@@ -217,59 +217,6 @@ def _start_server(port: int):
         raise
 
 
-def _server_is_healthy(port: int) -> bool:
-    """Return True when the API on *port* responds to /api/info."""
-    import requests as http_requests
-
-    try:
-        r = http_requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def _notify_already_running():
-    """Tell the user another copy of the app is already active."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "VOD.RIP is already running.\n\nCheck the system tray hidden icons.",
-            "VOD.RIP",
-            0x40,
-        )
-    except Exception:
-        pass
-
-
-def _kill_stale_port_process(port: int):
-    """Kill a dead listener on *port* — never kills a healthy VOD.RIP instance."""
-    if _server_is_healthy(port):
-        return
-    if os.name != "nt":
-        return
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano"],
-            capture_output=True, text=True, timeout=3,
-            creationflags=_NO_WINDOW,
-        )
-        for line in result.stdout.splitlines():
-            if f":{port}" in line and "LISTENING" in line:
-                pid = line.strip().split()[-1]
-                if pid.isdigit() and int(pid) == os.getpid():
-                    continue
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", pid],
-                    capture_output=True, timeout=3,
-                    creationflags=_NO_WINDOW,
-                )
-    except Exception:
-        pass
-
-
 def _server_supervisor(port: int):
     """Keep the FastAPI server alive — restart automatically after crashes."""
     from services.server_lifecycle import should_stop_supervisor
@@ -561,18 +508,6 @@ def main():
     _setup_environment()
     _set_windows_app_identity()
 
-    webview2_ok = True
-    if os.name == "nt" and getattr(sys, "frozen", False):
-        try:
-            from services.webview2_setup import ensure_webview2, webview2_installed
-
-            if not webview2_installed():
-                logging.getLogger("VOD.RIP").info("WebView2 missing — showing setup guide")
-            webview2_ok = ensure_webview2()
-        except Exception as exc:
-            logging.getLogger("VOD.RIP").warning("WebView2 setup failed: %s", exc)
-            webview2_ok = False
-
     _ensure_start_menu_shortcuts()
     _start_background_update_check()
 
@@ -588,12 +523,9 @@ def main():
 
     logger.info("Starting FastAPI on 127.0.0.1:%d", port)
 
-    if _server_is_healthy(port):
-        logger.info("Another VOD.RIP instance is already running — exiting duplicate launch")
-        _notify_already_running()
-        sys.exit(0)
+    from services.server_lifecycle import release_api_port
 
-    _kill_stale_port_process(port)
+    release_api_port(port, skip_pid=os.getpid())
 
     server_thread = threading.Thread(target=_server_supervisor, args=(port,), daemon=True)
     server_thread.start()
@@ -604,7 +536,21 @@ def main():
 
     logger.info("Server ready — launching UI")
 
+    webview2_ok = True
     if not _launch_pywebview(port):
+        if os.name == "nt" and getattr(sys, "frozen", False):
+            try:
+                from services.webview2_setup import ensure_webview2, webview2_installed
+
+                if not webview2_installed():
+                    logger.info("PyWebView failed and WebView2 missing — showing setup guide")
+                    webview2_ok = ensure_webview2()
+                    if webview2_ok and _launch_pywebview(port):
+                        _shutdown(port)
+                        os._exit(0)
+            except Exception as exc:
+                logger.warning("WebView2 setup failed: %s", exc)
+                webview2_ok = False
         _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
 
     _shutdown(port)

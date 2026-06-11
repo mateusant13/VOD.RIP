@@ -8,12 +8,53 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import webbrowser
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _WEBVIEW2_CLSID = "{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}"
 _WEBVIEW2_INSTALL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+_INVALID_VERSIONS = frozenset(("", "0.0.0.0", "0.0.0"))
+
+# Same registry locations checked by installer/installer.iss (plus 64-bit HKLM).
+_REG_PATHS = (
+    rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
+    rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
+    rf"Software\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
+)
+
+
+def _version_ok(version: object) -> bool:
+    return bool(version) and str(version) not in _INVALID_VERSIONS
+
+
+def _reg_has_webview2(hive, subkey: str) -> bool:
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+            version, _ = winreg.QueryValueEx(key, "pv")
+            return _version_ok(version)
+    except OSError:
+        return False
+
+
+def _webview2_on_disk() -> bool:
+    for env in ("ProgramFiles(x86)", "ProgramFiles"):
+        root = os.environ.get(env)
+        if not root:
+            continue
+        app_dir = Path(root) / "Microsoft" / "EdgeWebView" / "Application"
+        if not app_dir.is_dir():
+            continue
+        for child in app_dir.iterdir():
+            if child.is_dir() and (child / "msedgewebview2.exe").is_file():
+                return True
+    return False
 
 
 def webview2_installed() -> bool:
@@ -24,17 +65,12 @@ def webview2_installed() -> bool:
     except ImportError:
         return True
 
-    subkey = rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}"
-    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        for access in (0, getattr(winreg, "KEY_WOW64_64KEY", 0)):
-            try:
-                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ | access) as key:
-                    version, _ = winreg.QueryValueEx(key, "pv")
-                    if version and str(version) not in ("0.0.0.0", "0.0.0"):
-                        return True
-            except OSError:
-                continue
-    return False
+    for subkey in _REG_PATHS:
+        hive = winreg.HKEY_CURRENT_USER if subkey.startswith("Software") else winreg.HKEY_LOCAL_MACHINE
+        if _reg_has_webview2(hive, subkey):
+            return True
+
+    return _webview2_on_disk()
 
 
 def ensure_webview2() -> bool:
@@ -43,6 +79,13 @@ def ensure_webview2() -> bool:
         return True
     if os.name != "nt":
         return False
+
+    # Registry can lag a few seconds right after the Setup installer finishes WebView2.
+    for _ in range(8):
+        time.sleep(0.5)
+        if webview2_installed():
+            return True
+
     return _show_setup_dialog()
 
 
@@ -61,7 +104,7 @@ def _show_setup_dialog() -> bool:
 
     root = tk.Tk()
     root.title("VOD.RIP — WebView2 required")
-    root.geometry("480x240")
+    root.geometry("500x250")
     root.resizable(False, False)
     root.configure(bg="#0A0A0A")
     try:
@@ -87,9 +130,10 @@ def _show_setup_dialog() -> bool:
         frame,
         text=(
             "VOD.RIP uses Microsoft's free WebView2 runtime for the native app window.\n\n"
-            "Click below to open Microsoft's official installer in your browser.\n"
-            "After it finishes, click “Check again” or restart VOD.RIP.\n\n"
-            "Tip: the VOD.RIP Setup.exe installer can install WebView2 for you."
+            "If you just ran the VOD.RIP installer, click “Check again” — registration can\n"
+            "take a few seconds after setup finishes.\n\n"
+            "Otherwise open Microsoft's installer below, complete it, then click “Check again”.\n"
+            "You can also use browser mode to run VOD.RIP without the native window."
         ),
         fg="#a1a1aa",
         bg="#0A0A0A",

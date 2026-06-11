@@ -40,10 +40,17 @@ def _pids_listening_on_port(port: int) -> list[int]:
                 creationflags=_NO_WINDOW,
             )
             for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        pids.append(int(pid))
+                if "LISTENING" not in line:
+                    continue
+                cols = line.split()
+                if len(cols) < 5:
+                    continue
+                local_addr = cols[1]
+                if not local_addr.endswith(f":{port}"):
+                    continue
+                pid = cols[-1]
+                if pid.isdigit():
+                    pids.append(int(pid))
         except Exception as exc:
             _logger.debug("netstat for port %s: %s", port, exc)
     else:
@@ -78,6 +85,27 @@ def _kill_pids(pids: list[int], *, skip_pid: Optional[int] = None) -> None:
                 os.kill(pid, 9)
         except Exception as exc:
             _logger.debug("kill pid %s: %s", pid, exc)
+
+
+def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 6.0) -> None:
+    """Kill any process listening on *port* so a new API instance can bind."""
+    listeners = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+    if not listeners:
+        return
+    _logger.info("Releasing port %s — stopping listener(s): %s", port, listeners)
+    _kill_pids(listeners, skip_pid=skip_pid)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+        if not remaining:
+            return
+        time.sleep(0.15)
+
+    remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+    if remaining:
+        _logger.warning("Port %s still busy — force kill: %s", port, remaining)
+        _kill_pids(remaining, skip_pid=skip_pid)
 
 
 def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
