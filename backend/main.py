@@ -157,7 +157,7 @@ async def index():
             f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="0;url={ui_url}">
-<title>VOD.RIP</title></head>
+<title>VOD.RIP 🪦</title></head>
 <body style="font-family:system-ui;background:#09090b;color:#fafafa;padding:2rem">
 <p>Redirecting to the UI at <a href="{ui_url}" style="color:#53fc18">{ui_url}</a>…</p>
 <p style="color:#a1a1aa;font-size:0.875rem">API is on this port ({os.environ.get("PORT", "7897")}).
@@ -1274,7 +1274,7 @@ async def server_info():
         app_version = "0.0.0"
     return {
         "version": app_version,
-        "name": "VOD.RIP",
+        "name": "VOD.RIP 🪦",
         "desktop": os.environ.get("KICK_SERVE_UI", "").strip() == "1",
         "engine": "yt-dlp (Python)",
         "description": "Kick & Twitch VOD and clip downloader",

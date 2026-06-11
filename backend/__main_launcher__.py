@@ -412,7 +412,7 @@ def _launch_pywebview(port: int) -> bool:
     _create_window_params = set(_create_window_sig.parameters.keys())
 
     kwargs = dict(
-        title="VOD.RIP",
+        title="VOD.RIP 🪦",
         url=f"http://127.0.0.1:{port}",
         width=1280,
         height=800,
