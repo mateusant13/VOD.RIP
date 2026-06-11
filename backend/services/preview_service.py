@@ -304,25 +304,43 @@ def resolve_stream_info(
 
     full_url = build_url(url, platform)
 
-    # Twitch clips — fast GQL videoQualities (~0.5s); yt-dlp fallback if GQL fails.
+    # Twitch clips — use yt-dlp for progressive MP4 URLs with proper auth headers.
+    # GQL is also tried for fast metadata, but yt-dlp provides the http_headers
+    # (cookies, User-Agent) that Twitch's CloudFront CDN requires (GQL's sourceURLs
+    # return 401 without them).
     if platform == "Twitch" and is_clip_url(url):
         variants: List[dict] = []
         headers: dict = {}
+
+        # Try GQL first for fast progressive variant resolution.
         try:
             from services.twitch_gql_service import get_clip_progressive_variants_sync
 
             variants = get_clip_progressive_variants_sync(url)
         except Exception as exc:
-            logger.debug("Twitch clip GQL resolve failed, falling back to yt-dlp: %s", exc)
-        if not variants:
+            logger.debug("Twitch clip GQL resolve failed: %s", exc)
+
+        # Always run yt-dlp to get proper http_headers — GQL sourceURLs need auth
+        # cookies/headers that only yt-dlp's extractor provides.
+        try:
             opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
             clip_info = _extract_hls_info(full_url, opts)
-            variants = _deduped_progressive_variants(clip_info)
-            first_with_headers = next((v for v in variants if v.get("http_headers")), None)
+            yt_variants = _deduped_progressive_variants(clip_info)
+
+            first_with_headers = next((v for v in yt_variants if v.get("http_headers")), None)
             if first_with_headers:
                 headers = first_with_headers.get("http_headers") or {}
             else:
                 headers = clip_info.get("http_headers") or {}
+
+            # If GQL returned nothing, use yt-dlp's variants.
+            if not variants:
+                variants = yt_variants
+        except Exception as exc:
+            logger.debug("Twitch clip yt-dlp fallback failed: %s", exc)
+            if not variants:
+                raise RuntimeError("Twitch clip has no progressive formats")
+
         if not variants:
             raise RuntimeError("Twitch clip has no progressive formats")
         if not headers:
