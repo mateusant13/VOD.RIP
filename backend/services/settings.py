@@ -34,6 +34,12 @@ class SettingsManager:
         try:
             if self._settings_file.exists():
                 data = json.loads(self._settings_file.read_text(encoding="utf-8"))
+                if "download_folder_confirmed" not in data:
+                    data["download_folder_confirmed"] = bool(
+                        (data.get("download_folder") or "").strip()
+                    )
+                if "video_encoder" not in data:
+                    data["video_encoder"] = "copy"
                 return AppSettings(**data)
         except Exception:
             pass

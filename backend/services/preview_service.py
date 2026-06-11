@@ -325,6 +325,11 @@ def resolve_stream_info(
                 headers = clip_info.get("http_headers") or {}
         if not variants:
             raise RuntimeError("Twitch clip has no progressive formats")
+        if not headers:
+            headers = {
+                "Referer": "https://www.twitch.tv/",
+                "Origin": "https://www.twitch.tv",
+            }
         chosen_url = _pick_variant_by_height(
             [(int(v.get("height") or 0), v.get("url") or "") for v in variants],
             prefer_height=prefer_height,

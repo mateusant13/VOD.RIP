@@ -20,6 +20,37 @@ logger = logging.getLogger(__name__)
 MIN_VALID_OUTPUT_BYTES = 50_000
 SEGMENT_DOWNLOAD_WORKERS = 8
 
+# FFmpeg video encoders for H.264 output (Settings → Video encoder).
+VIDEO_ENCODER_OPTIONS: dict[str, str] = {
+    "copy": "Source codec (fast)",
+    "libx264": "H.264 — x264 (software)",
+    "h264_nvenc": "H.264 — NVIDIA NVENC",
+    "h264_amf": "H.264 — AMD AMF",
+    "h264_qsv": "H.264 — Intel Quick Sync",
+}
+
+
+def normalize_video_encoder(value: Optional[str]) -> str:
+    key = (value or "libx264").strip().lower()
+    if key not in VIDEO_ENCODER_OPTIONS:
+        return "libx264"
+    return key
+
+
+def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
+    """Return ffmpeg output args for H.264 re-encode, or None for stream copy."""
+    encoder = normalize_video_encoder(encoder)
+    if encoder == "copy":
+        return None
+    audio = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", *audio]
+    if encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", "balanced", *audio]
+    if encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "23", *audio]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23", *audio]
+
 import requests
 import yt_dlp
 
@@ -31,23 +62,42 @@ class CancelledError(Exception):
     pass
 
 
-def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
+class PausedError(Exception):
+    """Raised when a download is paused by the user."""
+    pass
+
+
+def _check_pause_cancel(
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+) -> None:
     if cancel_event and cancel_event.is_set():
         raise CancelledError("Download cancelled by user")
+    if pause_event and pause_event.is_set():
+        raise PausedError("Download paused by user")
+
+
+def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
+    _check_pause_cancel(cancel_event, None)
 
 
 def _run_ffmpeg(
     cmd: list,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
-    """Run ffmpeg, polling *cancel_event* so cancel can kill the process quickly."""
+    """Run ffmpeg, polling *cancel_event* / *pause_event* so stop can kill the process."""
     proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
     try:
         while proc.poll() is None:
-            _check_cancelled(cancel_event)
+            try:
+                _check_pause_cancel(cancel_event, pause_event)
+            except PausedError:
+                proc.kill()
+                raise
             time.sleep(0.05)
         stderr = proc.stderr.read() if proc.stderr else b""
         if proc.returncode != 0:
@@ -367,6 +417,7 @@ def _build_ydl_opts(
     throttle_kib: Optional[int] = None,
     temp_folder: Optional[str] = None,
     ffmpeg_path: Optional[str] = None,
+    video_encoder: Optional[str] = None,
 ) -> dict:
     opts = {
         "outtmpl": output_path,
@@ -409,6 +460,13 @@ def _build_ydl_opts(
             if os.path.isdir(resolved_ffmpeg)
             else os.path.dirname(resolved_ffmpeg)
         )
+
+    encode_args = ffmpeg_h264_encode_args(normalize_video_encoder(video_encoder))
+    if encode_args:
+        opts["postprocessors"] = [
+            {"key": "FFmpegVideoConvertor", "preferedcodec": "h264"},
+        ]
+        opts["postprocessor_args"] = {"ffmpeg": encode_args}
 
     return opts
 
@@ -579,16 +637,16 @@ def _download_one_segment(
     headers: dict,
     temp_dir: str,
     cancel_event: Optional[threading.Event],
+    pause_event: Optional[threading.Event] = None,
 ) -> str:
-    if cancel_event and cancel_event.is_set():
-        raise CancelledError("Download cancelled by user")
+    _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
     r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
     r.raise_for_status()
     with open(path, "wb") as f:
         for chunk in r.iter_content(256 * 1024):
-            _check_cancelled(cancel_event)
+            _check_pause_cancel(cancel_event, pause_event)
             if chunk:
                 f.write(chunk)
     size = os.path.getsize(path)
@@ -603,6 +661,7 @@ def _download_segments(
     temp_dir: str,
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
 ) -> list[str]:
     """Download HLS segment files into *temp_dir* (parallel)."""
     total = len(segments)
@@ -616,7 +675,7 @@ def _download_segments(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
-                _download_one_segment, i, seg, headers, temp_dir, cancel_event,
+                _download_one_segment, i, seg, headers, temp_dir, cancel_event, pause_event,
             ): i
             for i, seg in enumerate(segments)
         }
@@ -667,9 +726,11 @@ def _concat_and_trim(
     ffmpeg_exe: str,
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    video_encoder: Optional[str] = None,
 ) -> None:
-    """Concatenate HLS segments and trim in one lossless ffmpeg pass."""
+    """Concatenate HLS segments and trim (stream copy or H.264 re-encode)."""
     tmp_dir = os.path.dirname(files[0])
     concat_txt = os.path.join(tmp_dir, "concat.txt")
     tmp_out = os.path.join(tmp_dir, f"clip_{uuid.uuid4().hex}.mp4")
@@ -688,16 +749,17 @@ def _concat_and_trim(
     ]
     if offset > 0.001:
         cmd += ["-ss", str(offset)]
-    cmd += [
-        "-t", str(duration),
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        "-f", "mp4",
-        tmp_out,
-    ]
+    cmd += ["-t", str(duration)]
+    encode_args = ffmpeg_h264_encode_args(normalize_video_encoder(video_encoder))
+    if encode_args:
+        cmd += encode_args
+    else:
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+    cmd += ["-f", "mp4", tmp_out]
     _run_ffmpeg(
         cmd,
         cancel_event=cancel_event,
+        pause_event=pause_event,
         register_abort=register_abort,
     )
     _verify_output_file(tmp_out)
@@ -723,8 +785,10 @@ def download_hls_media_clip(
     ffmpeg_exe: Optional[str] = None,
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     prefer_height: int = 720,
+    video_encoder: Optional[str] = None,
 ) -> None:
     """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
     headers = headers or {}
@@ -749,13 +813,15 @@ def download_hls_media_clip(
         os.makedirs(out_parent, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="hls_clip_", dir=out_parent or None) as tmpdir:
         files = _download_segments(
-            selected, headers, tmpdir, progress_hook, cancel_event,
+            selected, headers, tmpdir, progress_hook, cancel_event, pause_event,
         )
         _concat_and_trim(
             files, output_path, first_offset, duration, resolved_ffmpeg,
             progress_hook,
             cancel_event=cancel_event,
+            pause_event=pause_event,
             register_abort=register_abort,
+            video_encoder=video_encoder,
         )
 
 
@@ -767,8 +833,10 @@ def _download_hls_clip(
     opts: dict,
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     prefer_height: int = 720,
+    video_encoder: Optional[str] = None,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
     info = _extract_hls_info(url, opts)
@@ -782,8 +850,10 @@ def _download_hls_clip(
         ffmpeg_exe=ffmpeg_exe,
         progress_hook=progress_hook,
         cancel_event=cancel_event,
+        pause_event=pause_event,
         register_abort=register_abort,
         prefer_height=prefer_height,
+        video_encoder=video_encoder,
     )
 
 
@@ -794,12 +864,13 @@ def _download_hls_clip(
 def _wrap_progress_hook(
     progress_hook: Optional[Callable],
     cancel_event: Optional[threading.Event],
+    pause_event: Optional[threading.Event] = None,
 ) -> Optional[Callable]:
-    if not progress_hook and not cancel_event:
+    if not progress_hook and not cancel_event and not pause_event:
         return progress_hook
 
     def hook(d):
-        _check_cancelled(cancel_event)
+        _check_pause_cancel(cancel_event, pause_event)
         if progress_hook:
             progress_hook(d)
 
@@ -810,6 +881,7 @@ def _ydl_download(
     url: str,
     opts: dict,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     ydl = yt_dlp.YoutubeDL(opts)
@@ -818,7 +890,7 @@ def _ydl_download(
     try:
         ydl.download([url])
     finally:
-        _check_cancelled(cancel_event)
+        _check_pause_cancel(cancel_event, pause_event)
 
 
 def download_video_sync(
@@ -831,11 +903,15 @@ def download_video_sync(
     progress_hook: Optional[Callable] = None,
     settings_mgr=None,
     cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
-    progress_hook = _wrap_progress_hook(progress_hook, cancel_event)
+    progress_hook = _wrap_progress_hook(progress_hook, cancel_event, pause_event)
+    resolved_encoder = normalize_video_encoder(
+        video_encoder or (settings_mgr.get().video_encoder if settings_mgr else None)
+    )
 
     cache_dir = _get_cache_dir()
     max_cache_mb = 200
@@ -850,6 +926,7 @@ def download_video_sync(
         throttle_kib=settings_mgr.get().throttle_kib if settings_mgr is not None else None,
         temp_folder=settings_mgr.get().temp_folder if settings_mgr is not None else None,
         ffmpeg_path=settings_mgr.get().ffmpeg_path if settings_mgr is not None else None,
+        video_encoder=resolved_encoder,
     )
 
     platform = detect_platform(full_url)
@@ -861,8 +938,10 @@ def download_video_sync(
             full_url, output_path, start_sec, end_sec, opts,
             progress_hook=progress_hook,
             cancel_event=cancel_event,
+            pause_event=pause_event,
             register_abort=register_abort,
             prefer_height=_parse_prefer_height(quality),
+            video_encoder=resolved_encoder,
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)
@@ -874,7 +953,7 @@ def download_video_sync(
             start = _format_ts(crop[0])
             end = _format_ts(crop[1])
             opts["download_sections"] = [f"*{start}-{end}"]
-        _ydl_download(full_url, opts, cancel_event, register_abort)
+        _ydl_download(full_url, opts, cancel_event, pause_event, register_abort)
 
     _verify_output_file(output_path)
     return output_path

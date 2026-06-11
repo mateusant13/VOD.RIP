@@ -57,8 +57,10 @@ def _default_download_folder() -> str:
 
 class AppSettings(BaseModel):
     download_folder: str = Field(default_factory=_default_download_folder)
+    download_folder_confirmed: bool = False
     download_threads: int = 8
     max_cache_mb: int = 512
+    video_encoder: str = "libx264"
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""
@@ -71,8 +73,10 @@ class AppSettings(BaseModel):
 
 class SettingsUpdate(BaseModel):
     download_folder: Optional[str] = None
+    download_folder_confirmed: Optional[bool] = None
     download_threads: Optional[int] = None
     max_cache_mb: Optional[int] = None
+    video_encoder: Optional[str] = None
     throttle_kib: Optional[int] = None
     ffmpeg_path: Optional[str] = None
     temp_folder: Optional[str] = None

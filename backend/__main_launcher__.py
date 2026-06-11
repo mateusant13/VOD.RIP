@@ -474,14 +474,14 @@ def _launch_pywebview(port: int) -> bool:
     return False
 
 
-def _launch_browser_and_tray(port: int):
+def _launch_browser_and_tray(port: int, *, webview2_missing: bool = False):
     """Fallback UI: open the default browser + system tray icon."""
     import webbrowser
 
     logger = logging.getLogger("VOD.RIP")
     logger.warning("Native window unavailable — opening in default browser")
 
-    if os.name == "nt":
+    if os.name == "nt" and not webview2_missing:
         try:
             import tkinter as tk
             from tkinter import messagebox
@@ -491,9 +491,9 @@ def _launch_browser_and_tray(port: int):
             messagebox.showwarning(
                 "VOD.RIP",
                 "Could not open as a native window.\n\n"
-                "The Microsoft Edge WebView2 Runtime is required.\n"
+                "The Microsoft Edge WebView2 Runtime may be required.\n"
                 "Download it from:\n"
-                "https://developer.microsoft.com/en-us/microsoft-edge/webview2/\n\n"
+                "https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n"
                 "The app will open in your browser instead."
             )
             root.destroy()
@@ -574,8 +574,20 @@ def main():
 
     logger.info("Server ready — launching UI")
 
+    webview2_missing = False
+    if os.name == "nt":
+        try:
+            from services.webview2_setup import offer_webview2_install, webview2_installed
+
+            webview2_missing = not webview2_installed()
+            if webview2_missing:
+                offer_webview2_install()
+                webview2_missing = not webview2_installed()
+        except Exception as exc:
+            logger.debug("WebView2 check: %s", exc)
+
     if not _launch_pywebview(port):
-        _launch_browser_and_tray(port)
+        _launch_browser_and_tray(port, webview2_missing=webview2_missing)
 
     _shutdown()
     os._exit(0)

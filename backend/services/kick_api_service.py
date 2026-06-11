@@ -395,7 +395,10 @@ def download_vod_sync(
     crop_end: Optional[float] = None,
     progress_hook=None,
     cancel_event=None,
+    pause_event=None,
     register_abort=None,
+    video_encoder=None,
+    settings_mgr=None,
     **_,
 ) -> str:
     """Download a Kick VOD clip via the fast JSON API + HLS segments (no browser)."""
@@ -405,7 +408,12 @@ def download_vod_sync(
         _resolve_ffmpeg_exe,
         _verify_output_file,
         download_hls_media_clip,
+        normalize_video_encoder,
     )
+
+    if video_encoder is None and settings_mgr is not None:
+        video_encoder = settings_mgr.get().video_encoder
+    resolved_encoder = normalize_video_encoder(video_encoder)
 
     info = get_video_info_api(url)
     if not info.m3u8_url:
@@ -422,8 +430,10 @@ def download_vod_sync(
         ffmpeg_exe=_resolve_ffmpeg_exe(),
         progress_hook=progress_hook,
         cancel_event=cancel_event,
+        pause_event=pause_event,
         register_abort=register_abort,
         prefer_height=_parse_prefer_height(quality),
+        video_encoder=resolved_encoder,
     )
     _verify_output_file(output_path)
     return output_path

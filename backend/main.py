@@ -189,12 +189,20 @@ async def update_settings(update: SettingsUpdate):
         current.download_threads = max(1, min(16, update.download_threads))
     if update.max_cache_mb is not None:
         current.max_cache_mb = max(50, min(2000, update.max_cache_mb))
+    if update.video_encoder is not None:
+        from services.ytdlp_service import normalize_video_encoder
+
+        current.video_encoder = normalize_video_encoder(update.video_encoder)
     if update.throttle_kib is not None:
         current.throttle_kib = update.throttle_kib
     if update.ffmpeg_path is not None:
         current.ffmpeg_path = update.ffmpeg_path
     if update.download_folder is not None:
         current.download_folder = update.download_folder.strip()
+        if current.download_folder:
+            current.download_folder_confirmed = True
+    if update.download_folder_confirmed is not None:
+        current.download_folder_confirmed = update.download_folder_confirmed
     if update.temp_folder is not None:
         current.temp_folder = update.temp_folder
     if update.oauth is not None:
@@ -443,6 +451,7 @@ async def pick_folder():
     if path:
         current = settings_mgr.get()
         current.download_folder = path
+        current.download_folder_confirmed = True
         settings_mgr.save(current)
     return {"path": path, "error": err}
 
@@ -1153,6 +1162,22 @@ async def get_download(download_id: str):
 async def cancel_download(download_id: str):
     success = download_mgr.cancel(download_id)
     return {"cancelled": success}
+
+
+@app.post("/api/download/{download_id}/pause")
+async def pause_download(download_id: str):
+    success = download_mgr.pause(download_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Download not found or not pausable")
+    return {"paused": True}
+
+
+@app.post("/api/download/{download_id}/resume")
+async def resume_download(download_id: str):
+    success = download_mgr.resume(download_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Download not found or not paused")
+    return {"resumed": True}
 
 
 def _remove_download_history(download_id: str) -> dict:

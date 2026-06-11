@@ -243,7 +243,7 @@ export default function ChannelExplorePopup({
             `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
           ).catch(() => null)
           : Promise.resolve(null);
-        const res = await apiPost<{
+        const sessionPromise = apiPost<{
           session_id: string;
           master_url: string;
           playback_url?: string;
@@ -257,7 +257,7 @@ export default function ChannelExplorePopup({
           crop_end: vod.durationSec,
           prefer_height: preferHeight,
         });
-        const clipInfo = await clipInfoPromise;
+        const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
         if (cancelled) {
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;

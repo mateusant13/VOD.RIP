@@ -122,8 +122,10 @@ function ChannelListIndexBadge({
 
 interface AppSettings {
   download_folder: string;
+  download_folder_confirmed?: boolean;
   download_threads: number;
   max_cache_mb: number;
+  video_encoder?: string;
   throttle_kib: number;
   ffmpeg_path: string;
   temp_folder: string;
@@ -1654,6 +1656,11 @@ export default function App() {
     fixedStart: number;
     fixedEnd: number;
   } | null>(null);
+  const [urlTrimDragPin, setUrlTrimDragPin] = useState<{
+    which: 'in' | 'out';
+    fixedStart: number;
+    fixedEnd: number;
+  } | null>(null);
   const urlTrimPointerRef = useRef({ x: 0, y: 0 });
   const lastUrlTrimEndpointRef = useRef<'in' | 'out'>('in');
   const lastPreviewTrimEndpointRef = useRef<'in' | 'out'>('out');
@@ -1966,19 +1973,7 @@ export default function App() {
       );
       const previewPreferHeight = initialPreviewPreferHeight(clipPreview, playerCap);
       let qualityLabels = videoInfo?.qualities;
-      if (clipPreview && !qualityLabels?.length) {
-        try {
-          const clipInfo = await apiGet<VideoInfo>(
-            `/api/info/clip?id=${encodeURIComponent(url.trim())}`,
-          );
-          if (clipInfo.qualities?.length) {
-            qualityLabels = clipInfo.qualities;
-          }
-        } catch {
-          /* variant_heights from preview session is the primary source */
-        }
-      }
-      const res = await apiPost<{
+      const sessionPromise = apiPost<{
         session_id: string;
         master_url: string;
         playback_url?: string;
@@ -1992,6 +1987,13 @@ export default function App() {
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
+      const clipInfoPromise = clipPreview && !qualityLabels?.length
+        ? apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(url.trim())}`).catch(() => null)
+        : Promise.resolve(null);
+      const [res, clipInfo] = await Promise.all([sessionPromise, clipInfoPromise]);
+      if (clipInfo?.qualities?.length) {
+        qualityLabels = clipInfo.qualities;
+      }
       const mergedQualityLabels = qualityLabels?.length
         ? qualityLabels
         : (res.quality_labels?.length ? res.quality_labels : undefined);
@@ -2576,6 +2578,7 @@ export default function App() {
 
   const finishUrlTrimDrag = useCallback(() => {
     urlTrimDragPinRef.current = null;
+    setUrlTrimDragPin(null);
     trimDragActiveRef.current = false;
     setNeedleGlance(null);
   }, []);
@@ -3005,20 +3008,22 @@ export default function App() {
   }, []);
 
   const ensureDownloadFolder = useCallback(async (): Promise<boolean> => {
+    let confirmed = settings?.download_folder_confirmed;
     let folder = settings?.download_folder?.trim();
-    if (!folder) {
+    if (confirmed === undefined || !folder) {
       try {
         const s = await apiGet<AppSettings>('/api/settings');
         folder = s.download_folder?.trim();
+        confirmed = s.download_folder_confirmed;
         setSettings(s);
       } catch {
         /* ignore */
       }
     }
-    if (folder) return true;
+    if (confirmed && folder) return true;
     const picked = await pickDownloadFolder();
     return Boolean(picked);
-  }, [settings?.download_folder, pickDownloadFolder]);
+  }, [settings?.download_folder, settings?.download_folder_confirmed, pickDownloadFolder]);
 
   const openFolder = useCallback((filePath: string) => {
     if (!filePath) return;
@@ -3127,6 +3132,24 @@ export default function App() {
       await apiPost(`/api/download/${id}/cancel`, {});
     } catch (err: any) {
       setError(err.message || 'Failed to cancel download');
+    }
+    refreshDownloads();
+  }, [refreshDownloads]);
+
+  const handlePause = useCallback(async (id: string) => {
+    try {
+      await apiPost(`/api/download/${id}/pause`, {});
+    } catch (err: any) {
+      setError(err.message || 'Failed to pause download');
+    }
+    refreshDownloads();
+  }, [refreshDownloads]);
+
+  const handleResume = useCallback(async (id: string) => {
+    try {
+      await apiPost(`/api/download/${id}/resume`, {});
+    } catch (err: any) {
+      setError(err.message || 'Failed to resume download');
     }
     refreshDownloads();
   }, [refreshDownloads]);
@@ -3584,6 +3607,13 @@ export default function App() {
 
   const currentIsClip = isClipUrl(url);
 
+  const urlTrimStartMax = urlTrimDragPin
+    ? Math.max(0, urlTrimDragPin.fixedEnd - 1)
+    : Math.max(0, trimEndSec - 1);
+  const urlTrimEndMin = urlTrimDragPin
+    ? Math.min(vodDurationSec, urlTrimDragPin.fixedStart + 1)
+    : Math.min(vodDurationSec, trimStartSec + 1);
+
   // ── Size estimate ──
   const clipSec = currentIsClip && videoInfo?.duration
     ? Math.max(1, Math.floor(videoInfo.duration))
@@ -3751,27 +3781,29 @@ export default function App() {
               <EditableHmsTime
                 valueSec={trimStartSec}
                 minSec={0}
-                maxSec={Math.max(0, Math.min(trimEndSec - 1, vodDurationSec - 1))}
+                maxSec={Math.max(0, Math.min(urlTrimStartMax, vodDurationSec - 1))}
                 onChange={(sec) => handleUrlTrimSlider('in', sec)}
               />
               <EditableHmsTime
                 valueSec={trimEndSec}
-                minSec={Math.min(vodDurationSec, trimStartSec + 1)}
+                minSec={urlTrimEndMin}
                 maxSec={vodDurationSec}
                 onChange={(sec) => handleUrlTrimSlider('out', sec)}
                 className="text-zinc-500"
               />
             </div>
-            <input type="range" min={0} max={Math.max(0, trimEndSec - 1)} step={1} value={trimStartSec}
+            <input type="range" min={0} max={urlTrimStartMax} step={1} value={trimStartSec}
               onPointerDown={(e) => {
                 markUrlTrimEndpoint('in');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
-                urlTrimDragPinRef.current = {
-                  which: 'in',
+                const pin = {
+                  which: 'in' as const,
                   fixedStart: trimStartSecRef.current,
                   fixedEnd: trimEndSecRef.current,
                 };
+                urlTrimDragPinRef.current = pin;
+                setUrlTrimDragPin(pin);
                 trimDragOriginRef.current = trimStartSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
@@ -3796,16 +3828,18 @@ export default function App() {
                 finishUrlTrimDrag();
               }}
               className="url-trim-range w-full accent-zinc-400" />
-            <input type="range" min={Math.min(vodDurationSec, trimStartSec + 1)} max={vodDurationSec} step={1} value={trimEndSec}
+            <input type="range" min={urlTrimEndMin} max={vodDurationSec} step={1} value={trimEndSec}
               onPointerDown={(e) => {
                 markUrlTrimEndpoint('out');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
-                urlTrimDragPinRef.current = {
-                  which: 'out',
+                const pin = {
+                  which: 'out' as const,
                   fixedStart: trimStartSecRef.current,
                   fixedEnd: trimEndSecRef.current,
                 };
+                urlTrimDragPinRef.current = pin;
+                setUrlTrimDragPin(pin);
                 trimDragOriginRef.current = trimEndSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
@@ -4624,7 +4658,8 @@ export default function App() {
                 </div>
               ) : activeDownloads.map((dl) => {
                 const isTw = dl.platform === 'Twitch';
-                const color = isTw ? '#9146FF' : '#53fc18';
+                const isPaused = dl.status === 'Paused';
+                const color = isPaused ? '#fbbf24' : (isTw ? '#9146FF' : '#53fc18');
                 return (
                   <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
                     <div className="flex justify-between items-center gap-2">
@@ -4635,11 +4670,13 @@ export default function App() {
                         </span>
                       </div>
                       <span className="text-[10px] font-mono shrink-0" style={{ color }}>
-                        {dl.progress > 0 ? `${dl.progress}%` : dl.status}
+                        {isPaused ? 'Paused' : (dl.progress > 0 ? `${dl.progress}%` : dl.status)}
                       </span>
                     </div>
                     <div className="w-full h-2 bg-zinc-800 border border-zinc-700">
-                      <div className="h-full bg-gradient-to-r from-[#53fc18] to-[#9146FF] transition-all duration-300"
+                      <div className={`h-full transition-all duration-300 ${
+                        isPaused ? 'bg-yellow-500/70' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
+                      }`}
                         style={{ width: `${Math.max(dl.progress, dl.status === 'Starting...' ? 2 : 0)}%` }} />
                     </div>
                     <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
@@ -4653,6 +4690,23 @@ export default function App() {
                             title="Show in folder"
                           >
                             <FolderOpen size={12} /> Folder
+                          </button>
+                        )}
+                        {isPaused ? (
+                          <button
+                            type="button"
+                            onClick={() => handleResume(dl.download_id)}
+                            className="text-zinc-400 hover:text-white flex items-center gap-1"
+                          >
+                            <Play size={12} /> Resume
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => handlePause(dl.download_id)}
+                            className="text-zinc-400 hover:text-yellow-300 flex items-center gap-1"
+                          >
+                            <Pause size={12} /> Pause
                           </button>
                         )}
                         <button
@@ -4741,7 +4795,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <div className="flex flex-col gap-1.5">
                 <FieldCaption>Download Threads</FieldCaption>
                 <input type="number" min={1} max={16}
@@ -4755,6 +4809,21 @@ export default function App() {
                   value={settings.max_cache_mb}
                   onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
                   className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <FieldCaption>Video Encoder</FieldCaption>
+                <select
+                  value={settings.video_encoder || 'libx264'}
+                  onChange={(e) => setSettings({ ...settings, video_encoder: e.target.value })}
+                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs"
+                  title="H.264 encoders produce .mp4 files compatible with most editors"
+                >
+                  <option value="copy">Source (fast)</option>
+                  <option value="libx264">H.264 — x264</option>
+                  <option value="h264_nvenc">H.264 — NVIDIA</option>
+                  <option value="h264_amf">H.264 — AMD</option>
+                  <option value="h264_qsv">H.264 — Intel</option>
+                </select>
               </div>
             </div>
 
