@@ -1,5 +1,6 @@
 ; VOD.RIP — Windows installer (Inno Setup)
-; Build: iscc /DAppVersion=1.0.3 installer\installer.iss
+; Build: iscc /DAppVersion=1.0.6 installer\installer.iss
+; Requires MicrosoftEdgeWebview2Setup.exe beside this file (downloaded in CI).
 
 #ifndef AppVersion
   #define AppVersion "1.0.0"
@@ -8,6 +9,7 @@
 #define AppName "VOD.RIP"
 #define AppExe "VOD-RIP.EXE"
 #define AppPublisher "mateusant13"
+#define WebView2Clsid "{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}"
 
 [Setup]
 AppId={{A4B8C2E1-9F3D-4A2B-8C1E-0123456789AB}
@@ -36,13 +38,35 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "staging\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon; WorkingDir: "{app}"
 
-; Skip post-install launch — Windows Defender often quarantines the exe on first
-; extract (error 225). User launches from Start Menu after allowing the app.
-; [Run]
-; Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+[Run]
+Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Installing Microsoft WebView2 Runtime..."; Check: not IsWebView2Installed(); Flags: waituntilterminated runhidden
+
+[Code]
+function IsWebView2Installed: Boolean;
+var
+  Version: String;
+begin
+  Result := RegQueryStringValue(
+    HKLM,
+    'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
+    'pv', Version);
+  if Result and ((Version = '') or (Version = '0.0.0.0') or (Version = '0.0.0')) then
+    Result := False;
+
+  if not Result then
+  begin
+    Result := RegQueryStringValue(
+      HKCU,
+      'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
+      'pv', Version);
+    if Result and ((Version = '') or (Version = '0.0.0.0') or (Version = '0.0.0')) then
+      Result := False;
+  end;
+end;

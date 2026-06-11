@@ -543,6 +543,19 @@ def main():
     log_path = _setup_logging()
     _setup_environment()
     _set_windows_app_identity()
+
+    webview2_ok = True
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        try:
+            from services.webview2_setup import ensure_webview2_silent, webview2_installed
+
+            if not webview2_installed():
+                logging.getLogger("VOD.RIP").info("WebView2 missing — starting silent install")
+            webview2_ok = ensure_webview2_silent()
+        except Exception as exc:
+            logging.getLogger("VOD.RIP").warning("WebView2 setup failed: %s", exc)
+            webview2_ok = False
+
     _ensure_start_menu_shortcuts()
     _start_background_update_check()
 
@@ -574,20 +587,8 @@ def main():
 
     logger.info("Server ready — launching UI")
 
-    webview2_missing = False
-    if os.name == "nt":
-        try:
-            from services.webview2_setup import offer_webview2_install, webview2_installed
-
-            webview2_missing = not webview2_installed()
-            if webview2_missing:
-                offer_webview2_install()
-                webview2_missing = not webview2_installed()
-        except Exception as exc:
-            logger.debug("WebView2 check: %s", exc)
-
     if not _launch_pywebview(port):
-        _launch_browser_and_tray(port, webview2_missing=webview2_missing)
+        _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
 
     _shutdown()
     os._exit(0)

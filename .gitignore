@@ -8,6 +8,7 @@ dist/
 build/
 release/
 installer/staging/
+installer/MicrosoftEdgeWebview2Setup.exe
 # Generated build artifact copied from dist/ during npm run build-copy
 backend/static/index.html
 

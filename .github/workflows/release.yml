@@ -111,6 +111,8 @@ jobs:
           Remove-Item -Recurse -Force installer\staging -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path installer\staging | Out-Null
           Copy-Item -Path dist\VOD-RIP\* -Destination installer\staging -Recurse -Force
+          Write-Host "Downloading WebView2 bootstrapper for installer..."
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "installer\MicrosoftEdgeWebview2Setup.exe"
           choco install innosetup -y --no-progress
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$ver installer\installer.iss
 
