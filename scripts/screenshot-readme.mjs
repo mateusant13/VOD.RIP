@@ -463,9 +463,19 @@ async function injectLocalStorage(page) {
   });
 }
 
-async function screenshotHero(page) {
+async function screenshotHero(browser) {
   log('--- hero.png ---');
-  // Hero shows the core action: paste a URL, see VOD info, ready to download
+  // Use a tighter viewport so the app fills most of the image with less empty space
+  const heroContext = await browser.newContext({
+    viewport: { width: 1300, height: 780 },
+    deviceScaleFactor: 2,
+    locale: 'en-US',
+    colorScheme: 'dark',
+  });
+  const page = await heroContext.newPage();
+  await setupMockApi(page);
+  await injectLocalStorage(page);
+
   await page.goto(UI_URL, { waitUntil: 'networkidle' });
   await sleep(1500);
 
@@ -484,9 +494,10 @@ async function screenshotHero(page) {
   await page.waitForSelector('text=Late Night Gaming', { timeout: 5000 }).catch(() => {});
   await sleep(1500);
 
-  // Take a full-page screenshot so the UI fills most of the image
+  // Take a full-page screenshot — tighter viewport means less empty space
   await page.screenshot({ path: path.join(SCREENSHOTS_DIR, 'hero.png'), fullPage: false });
   log('✓ hero.png saved');
+  await heroContext.close();
 }
 
 async function screenshotChannelOpen(page) {
@@ -669,7 +680,7 @@ async function main() {
     await setupMockApi(page);
     await injectLocalStorage(page);
 
-    await screenshotHero(page);
+    await screenshotHero(browser);
     await screenshotChannelOpen(page);
     await screenshotPreview(page);
     await screenshotTrim(page);
