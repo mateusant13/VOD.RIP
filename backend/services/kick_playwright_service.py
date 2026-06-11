@@ -103,7 +103,7 @@ def _kill_leftover_headless_shells() -> int:
     Returns the number of processes killed.
     """
     import subprocess
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if __import__('os').name == 'nt' else 0
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     image = HEADLESS_BROWSER_IMAGE  # `chrome-headless-shell.exe`
     try:
         if os.name == "nt":
