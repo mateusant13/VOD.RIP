@@ -17,6 +17,9 @@ _shutdown_event = threading.Event()
 _uvicorn_server: Any = None
 _server_lock = threading.Lock()
 
+# Only terminate listeners we own — avoids antivirus flags for killing arbitrary PIDs.
+_KILLABLE_IMAGE_NAMES = frozenset({"vod-rip.exe", "python.exe", "pythonw.exe"})
+
 
 def register_uvicorn_server(server: Any) -> None:
     global _uvicorn_server
@@ -69,43 +72,130 @@ def _pids_listening_on_port(port: int) -> list[int]:
     return list(dict.fromkeys(pids))
 
 
-def _kill_pids(pids: list[int], *, skip_pid: Optional[int] = None) -> None:
-    for pid in pids:
-        if skip_pid is not None and pid == skip_pid:
-            continue
+def _process_image_name(pid: int) -> Optional[str]:
+    if os.name != "nt":
         try:
-            if os.name == "nt":
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            name = result.stdout.strip()
+            return name or None
+        except Exception:
+            return None
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=_NO_WINDOW,
+        )
+        line = result.stdout.strip()
+        if not line or line.upper().startswith("INFO:"):
+            return None
+        return line.split(",")[0].strip().strip('"') or None
+    except Exception:
+        return None
+
+
+def _is_killable_listener(pid: int) -> bool:
+    if os.name != "nt":
+        return True
+    image = _process_image_name(pid)
+    if not image:
+        return False
+    return image.lower() in _KILLABLE_IMAGE_NAMES
+
+
+def _request_graceful_shutdown(port: int) -> bool:
+    try:
+        import requests
+
+        info = requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.5)
+        if info.status_code != 200 or info.json().get("name") != "VOD.RIP":
+            return False
+        response = requests.post(f"http://127.0.0.1:{port}/api/exit", timeout=2)
+        return response.status_code == 200
+    except Exception as exc:
+        _logger.debug("graceful shutdown on port %s: %s", port, exc)
+        return False
+
+
+def _wait_for_port_free(port: int, *, skip_pid: Optional[int], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+        if not remaining:
+            return True
+        time.sleep(0.15)
+    return not [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+
+
+def _kill_pid(port: int, pid: int) -> None:
+    if os.name == "nt" and not _is_killable_listener(pid):
+        image = _process_image_name(pid)
+        _logger.warning(
+            "Port %s listener pid %s (%s) is not a VOD.RIP process — not killing (close it manually)",
+            port,
+            pid,
+            image or "unknown",
+        )
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid)],
+                capture_output=True,
+                timeout=3,
+                creationflags=_NO_WINDOW,
+            )
+            time.sleep(0.25)
+            if _process_image_name(pid):
                 subprocess.run(
                     ["taskkill", "/F", "/PID", str(pid)],
                     capture_output=True,
                     timeout=3,
                     creationflags=_NO_WINDOW,
                 )
-            else:
+        else:
+            os.kill(pid, 15)
+            time.sleep(0.25)
+            try:
+                os.kill(pid, 0)
                 os.kill(pid, 9)
-        except Exception as exc:
-            _logger.debug("kill pid %s: %s", pid, exc)
+            except OSError:
+                pass
+    except Exception as exc:
+        _logger.debug("kill pid %s: %s", pid, exc)
 
 
 def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 6.0) -> None:
-    """Kill any process listening on *port* so a new API instance can bind."""
+    """Free *port* for a new VOD.RIP / dev API instance (graceful first, then safe kill)."""
     listeners = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
     if not listeners:
         return
-    _logger.info("Releasing port %s — stopping listener(s): %s", port, listeners)
-    _kill_pids(listeners, skip_pid=skip_pid)
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
-        if not remaining:
+    _logger.info("Port %s busy — asking existing VOD.RIP API to exit", port)
+    if _request_graceful_shutdown(port):
+        if _wait_for_port_free(port, skip_pid=skip_pid, timeout=min(4.0, timeout)):
+            _logger.info("Port %s released after graceful shutdown", port)
             return
-        time.sleep(0.15)
 
     remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
-    if remaining:
-        _logger.warning("Port %s still busy — force kill: %s", port, remaining)
-        _kill_pids(remaining, skip_pid=skip_pid)
+    if not remaining:
+        return
+
+    _logger.info("Releasing port %s — stopping VOD.RIP listener(s): %s", port, remaining)
+    for pid in remaining:
+        _kill_pid(port, pid)
+
+    if not _wait_for_port_free(port, skip_pid=skip_pid, timeout=timeout):
+        still = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+        if still:
+            _logger.warning("Port %s still busy after shutdown attempt: %s", port, still)
 
 
 def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
@@ -122,14 +212,11 @@ def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
     if port is None:
         return
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        listeners = _pids_listening_on_port(port)
-        if not listeners:
-            return
-        time.sleep(0.15)
+    if _wait_for_port_free(port, skip_pid=os.getpid(), timeout=timeout):
+        return
 
-    listeners = _pids_listening_on_port(port)
+    listeners = [p for p in _pids_listening_on_port(port) if p != os.getpid()]
     if listeners:
         _logger.info("Force-releasing port %s (pids: %s)", port, listeners)
-        _kill_pids(listeners, skip_pid=os.getpid())
+        for pid in listeners:
+            _kill_pid(port, pid)

@@ -2,7 +2,6 @@
 /** Start FastAPI (7897) + Vite dev server (5173) together. */
 import { execSync, spawn } from "node:child_process";
 import http from "node:http";
-import net from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -15,17 +14,6 @@ const children = [];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function portFree(port) {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.once("listening", () => {
-      srv.close(() => resolve(true));
-    });
-    srv.listen(Number(port), "127.0.0.1");
-  });
 }
 
 function apiHealthy(port) {
@@ -42,58 +30,15 @@ function apiHealthy(port) {
   });
 }
 
-function listeningPids(port) {
-  const pids = new Set();
-  if (process.platform === "win32") {
-    const out = execSync("netstat -ano", { encoding: "utf8" });
-    for (const line of out.split(/\r?\n/)) {
-      if (!line.includes("LISTENING")) continue;
-      const cols = line.trim().split(/\s+/);
-      const local = cols[1] || "";
-      if (!local.endsWith(`:${port}`)) continue;
-      const pid = cols[cols.length - 1];
-      if (/^\d+$/.test(pid)) pids.add(Number(pid));
-    }
-    return [...pids];
-  }
+function releasePort(port) {
   try {
-    const out = execSync(`lsof -ti :${port} -sTCP:LISTEN`, { encoding: "utf8" });
-    return out
-      .split(/\s+/)
-      .filter((s) => /^\d+$/.test(s))
-      .map(Number);
+    execSync(
+      `python -c "from services.server_lifecycle import release_api_port; release_api_port(${port})"`,
+      { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(port) } },
+    );
   } catch {
-    return [];
+    console.warn(`[api] could not fully release port :${port} — close the old API manually if needed`);
   }
-}
-
-async function releasePort(port) {
-  const mine = process.pid;
-  const pids = listeningPids(port).filter((pid) => pid !== mine);
-  if (!pids.length) return;
-
-  console.log(
-    `[api] port :${port} in use (pid ${pids.join(", ")}) — stopping old listener and starting fresh`,
-  );
-
-  for (const pid of pids) {
-    try {
-      if (process.platform === "win32") {
-        execSync(`taskkill /F /T /PID ${pid}`, { stdio: "ignore" });
-      } else {
-        process.kill(pid, "SIGKILL");
-      }
-    } catch {
-      /* already gone */
-    }
-  }
-
-  for (let i = 0; i < 24; i++) {
-    await sleep(250);
-    if (await portFree(port)) return;
-  }
-
-  console.warn(`[api] port :${port} may still be busy after kill attempt`);
 }
 
 function start(label, command, args, cwd) {
@@ -118,7 +63,7 @@ function shutdown(code = 0) {
   for (const child of children) {
     try {
       if (process.platform === "win32") {
-        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { shell: true });
+        spawn("taskkill", ["/PID", String(child.pid), "/T"], { shell: true });
       } else {
         child.kill("SIGTERM");
       }
@@ -135,7 +80,7 @@ process.on("SIGTERM", () => shutdown(0));
 async function main() {
   const port = Number(apiPort);
 
-  await releasePort(port);
+  releasePort(port);
 
   console.log("Starting API  -> http://localhost:" + port + "  (/api only)");
   start("api", "python", ["run.py"], pyDir);

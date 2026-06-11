@@ -19,7 +19,7 @@ def shutdown_downloads_and_children() -> None:
     try:
         if os.name == "nt":
             subprocess.run(
-                ["taskkill", "/F", "/IM", "ffmpeg.exe", "/T"],
+                ["taskkill", "/IM", "ffmpeg.exe"],
                 capture_output=True,
                 timeout=5,
                 creationflags=_NO_WINDOW,
