@@ -1,8 +1,7 @@
 """Fast Kick.com metadata via public JSON API + curl_cffi (no browser).
 
-Used for channel lists, VOD browse rows, and preview stream resolution.
-Actual Kick *downloads* go through headless Chromium in kick_playwright_service
-so the IVS playlist URL and session cookies match what the player uses.
+Used for channel lists, VOD browse rows, preview stream resolution, and
+Kick VOD downloads (curl_cffi + HLS).
 
 Endpoints used:
   GET /api/v2/channels/{slug}/videos  — channel VOD list (~1-2s)

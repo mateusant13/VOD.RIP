@@ -85,13 +85,6 @@ jobs:
         if: runner.os == 'macOS'
         run: bash scripts/generate-icns.sh
 
-      - name: Install Playwright Chromium
-        shell: bash
-        run: |
-          export PLAYWRIGHT_BROWSERS_PATH="${{ runner.temp }}/browsers"
-          python -m playwright install chromium
-          echo "PLAYWRIGHT_BROWSERS_PATH=${{ runner.temp }}/browsers" >> "$GITHUB_ENV"
-
       - name: Download ffmpeg (optional)
         shell: bash
         run: bash scripts/download-ffmpeg.sh || true
@@ -106,6 +99,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Compress-Archive -Path dist/VOD-RIP/* -DestinationPath "release/VOD.RIP-${{ github.ref_name }}-${{ matrix.label }}.zip" -Force
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          Remove-Item -Recurse -Force installer\staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path installer\staging | Out-Null
+          Copy-Item -Path dist\VOD-RIP\* -Destination installer\staging -Recurse -Force
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$ver installer\installer.iss
 
       - name: Package macOS zip
         if: runner.os == 'macOS'
@@ -127,7 +131,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vod-rip-${{ matrix.label }}
-          path: release/*.zip
+          path: |
+            release/*.zip
+            release/*-Setup.exe
           if-no-files-found: error
 
   release:

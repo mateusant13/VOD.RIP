@@ -131,7 +131,7 @@ app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 download_mgr.apply_settings(settings_mgr)
-# Metadata fetches use their own pool so hung yt-dlp/playwright downloads
+# Metadata fetches use their own pool so hung yt-dlp downloads
 # cannot starve /api/info/* and /api/channel/videos.
 INFO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="info")
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
@@ -1223,13 +1223,61 @@ async def exit_app():
 
 @app.get("/api/info")
 async def server_info():
+    try:
+        from services._version import __version__ as app_version
+    except ImportError:
+        app_version = "0.0.0"
     return {
-        "version": "2.0.0",
-        "name": "Kick & Twitch Downloader",
+        "version": app_version,
+        "name": "VOD.RIP",
         "engine": "yt-dlp (Python)",
-        "description": "Lightweight web interface for downloading VODs and clips from Kick and Twitch",
+        "description": "Kick & Twitch VOD and clip downloader",
         "python_version": platform.python_version(),
     }
+
+
+@app.get("/api/app/version")
+async def app_version():
+    try:
+        from services._version import __version__
+    except ImportError:
+        __version__ = "0.0.0"
+    return {"version": __version__}
+
+
+@app.get("/api/update/check")
+async def update_check(force: bool = False):
+    from services.settings import _get_appdata_dir
+    from services.updater import UpdateChecker
+
+    try:
+        from services._version import __version__
+    except ImportError:
+        __version__ = "0.0.0"
+
+    checker = UpdateChecker(__version__, _get_appdata_dir())
+    release = checker.check(force=force)
+    return {"current": __version__, "update": release}
+
+
+@app.post("/api/update/apply")
+async def update_apply():
+    from services.settings import _get_appdata_dir
+    from services.updater import UpdateChecker
+
+    try:
+        from services._version import __version__
+    except ImportError:
+        __version__ = "0.0.0"
+
+    checker = UpdateChecker(__version__, _get_appdata_dir())
+    pending = checker.get_pending() or checker.check(force=True)
+    if not pending:
+        raise HTTPException(status_code=404, detail="No update available")
+
+    if not checker.download_and_install(pending):
+        raise HTTPException(status_code=500, detail="Update failed")
+    return {"ok": True, "message": "Installing update"}
 
 
 @app.get("/api/ytdlp/status")

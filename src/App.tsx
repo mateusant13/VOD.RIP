@@ -134,6 +134,13 @@ interface AppSettings {
   saved_channels?: SavedChannel[] | null;
 }
 
+interface UpdateInfo {
+  version: string;
+  release_notes?: string;
+  release_url?: string;
+  asset_name?: string;
+}
+
 interface SavedChannel {
   id: string;
   displayName: string;
@@ -1847,6 +1854,11 @@ export default function App() {
   // Settings
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateApplying, setUpdateApplying] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
 
   const vodDurationSec = useMemo(
     () => Math.max(1, videoInfoDurationSec(videoInfo)),
@@ -3485,6 +3497,53 @@ export default function App() {
     if (tab === 'settings') loadSettings();
   }, [tab, loadSettings]);
 
+  const loadUpdateStatus = useCallback(async (force = false) => {
+    try {
+      const [ver, check] = await Promise.all([
+        apiGet<{ version: string }>('/api/app/version'),
+        apiGet<{ current: string; update: UpdateInfo | null }>(
+          `/api/update/check${force ? '?force=true' : ''}`,
+        ),
+      ]);
+      setAppVersion(ver.version);
+      setUpdateInfo(check.update);
+      if (!check.update && force) {
+        setUpdateMessage(`You're on the latest version (v${ver.version}).`);
+      }
+    } catch {
+      /* packaged-only endpoints may be unavailable in dev */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === 'settings') void loadUpdateStatus();
+  }, [tab, loadUpdateStatus]);
+
+  const handleCheckUpdate = useCallback(async () => {
+    setUpdateChecking(true);
+    setUpdateMessage(null);
+    try {
+      await loadUpdateStatus(true);
+    } catch (err: any) {
+      setUpdateMessage(err.message || 'Update check failed');
+    } finally {
+      setUpdateChecking(false);
+    }
+  }, [loadUpdateStatus]);
+
+  const handleApplyUpdate = useCallback(async () => {
+    if (!updateInfo) return;
+    if (!window.confirm(`Install VOD.RIP v${updateInfo.version}? The app will restart.`)) return;
+    setUpdateApplying(true);
+    setUpdateMessage(null);
+    try {
+      await apiPost('/api/update/apply', {});
+    } catch (err: any) {
+      setUpdateMessage(err.message || 'Update failed');
+      setUpdateApplying(false);
+    }
+  }, [updateInfo]);
+
   const handleSaveSettings = useCallback(async () => {
     if (!settings) return;
     try {
@@ -4697,6 +4756,46 @@ export default function App() {
                   onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
                   className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
               </div>
+            </div>
+
+            <div className="flex flex-col gap-2 border-2 border-zinc-800 p-3 bg-zinc-950/50">
+              <FieldCaption>Updates</FieldCaption>
+              <p className="text-[10px] text-zinc-500 font-mono">
+                Installed: v{appVersion ?? '…'}
+              </p>
+              {updateInfo ? (
+                <div className="flex flex-col gap-1.5">
+                  <p className="text-xs text-emerald-400 font-bold uppercase">
+                    v{updateInfo.version} available
+                  </p>
+                  {updateInfo.release_notes ? (
+                    <p className="text-[10px] text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto font-mono">
+                      {updateInfo.release_notes.slice(0, 500)}
+                      {updateInfo.release_notes.length > 500 ? '…' : ''}
+                    </p>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => void handleApplyUpdate()}
+                    disabled={updateApplying}
+                    className="w-full bg-emerald-950 text-emerald-300 font-black uppercase py-2 flex items-center justify-center gap-2 text-xs border-2 border-emerald-800 hover:border-emerald-400 disabled:opacity-50"
+                  >
+                    {updateApplying ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                    {updateApplying ? 'Installing…' : 'Install Update'}
+                  </button>
+                </div>
+              ) : updateMessage ? (
+                <p className="text-[10px] text-zinc-400 font-mono">{updateMessage}</p>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => void handleCheckUpdate()}
+                disabled={updateChecking}
+                className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
+              >
+                {updateChecking ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                {updateChecking ? 'Checking…' : 'Check for Updates'}
+              </button>
             </div>
 
             <button onClick={handleSaveSettings}

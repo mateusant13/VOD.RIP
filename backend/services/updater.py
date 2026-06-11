@@ -1,200 +1,326 @@
 """
-VOD.RIP — Auto-update service.
+VOD.RIP — Auto-update via GitHub Releases.
 
-Checks GitHub Releases API for new versions once per day and can download
-and launch the platform-appropriate installer in silent mode.
-
-Respects GitHub's 60 req/h unauthenticated rate limit by caching the last
-check result and only re-checking every 24 hours.
+Supports:
+  Windows — silent Setup.exe (Inno) or portable zip in-place update
+  macOS   — replace VOD.RIP.app from release zip
+  Linux   — replace binary folder from release zip
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+import shutil
 import subprocess
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if __import__('os').name == 'nt' else 0
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 GITHUB_REPO = "mateusant13/VOD.RIP"
-CHECK_INTERVAL_SEC = 24 * 3600  # Once per day
+CHECK_INTERVAL_SEC = 24 * 3600
 CACHE_FILENAME = "update_cache.json"
+PENDING_FILENAME = "update_pending.json"
 
 logger = logging.getLogger(__name__)
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def _install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            exe = Path(sys.executable).resolve()
+            # .../VOD.RIP.app/Contents/MacOS/VOD-RIP
+            if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
+                return exe.parent.parent.parent
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 class UpdateChecker:
-    """Check for new VOD.RIP releases via the GitHub Releases API.
-
-    Usage:
-        checker = UpdateChecker("1.0.0", app_data_dir)
-        release = checker.check()  # Returns None if up-to-date
-        if release:
-            checker.download_and_install(release)
-    """
-
     def __init__(self, current_version: str, app_data_dir: Path):
-        self.current_version = current_version.lstrip("v")
-        self.cache_path = app_data_dir / CACHE_FILENAME
+        self.current_version = (current_version or "0").lstrip("v")
+        self.app_data_dir = Path(app_data_dir)
+        self.cache_path = self.app_data_dir / CACHE_FILENAME
+        self.pending_path = self.app_data_dir / PENDING_FILENAME
 
-    # ── Public API ──────────────────────────────────────────────────────────
-
-    def check(self) -> Optional[dict]:
-        """Return release info if a newer version is available, else None.
-
-        The returned dict has keys:
-            ``version``       — e.g. "1.1.0"
-            ``download_url``  — direct download URL for the platform asset
-            ``release_url``   — GitHub release page
-            ``release_notes`` — markdown body of the release
-        """
-        if not self._should_check():
+    def check(self, *, force: bool = False) -> Optional[dict]:
+        if not force and not self._should_check():
+            pending = self.get_pending()
+            if pending:
+                return pending
             return None
 
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=15)
             if resp.status_code != 200:
                 self._save_cache({"last_check": time.time(), "error": resp.status_code})
-                logger.warning("Update check HTTP %d for %s", resp.status_code, url)
+                logger.warning("Update check HTTP %d", resp.status_code)
                 return None
 
             data = resp.json()
-            latest_tag = data.get("tag_name", "").lstrip("v")
-
-            if not latest_tag or latest_tag == self.current_version:
+            latest_tag = (data.get("tag_name") or "").lstrip("v")
+            if not latest_tag or not self._is_newer(latest_tag, self.current_version):
+                self._clear_pending()
                 self._save_cache({"last_check": time.time(), "latest": latest_tag})
                 return None
 
-            # Find the installer asset for this platform
-            asset = self._find_platform_asset(data.get("assets", []))
+            asset = self._find_platform_asset(data.get("assets") or [])
             if not asset:
-                logger.info(
-                    "New version %s found but no matching asset for this platform",
-                    latest_tag,
-                )
+                logger.info("No release asset for this platform (latest %s)", latest_tag)
                 return None
 
             result = {
                 "version": latest_tag,
                 "download_url": asset["browser_download_url"],
-                "release_url": data["html_url"],
-                "release_notes": (data.get("body") or "")[:2000],
+                "asset_name": asset.get("name", ""),
+                "asset_kind": asset.get("_kind", "zip"),
+                "release_url": data.get("html_url", ""),
+                "release_notes": (data.get("body") or "")[:4000],
             }
-            self._save_cache({
-                "last_check": time.time(),
-                "latest": latest_tag,
-                "download_url": result["download_url"],
-            })
+            self._save_pending(result)
+            self._save_cache({"last_check": time.time(), "latest": latest_tag})
             return result
-
-        except requests.RequestException as e:
-            logger.warning("Update check failed: %s", e)
+        except requests.RequestException as exc:
+            logger.warning("Update check failed: %s", exc)
             return None
 
-    def download_and_install(self, release_info: dict) -> bool:
-        """Download the platform installer and launch it, then exit.
+    def get_pending(self) -> Optional[dict]:
+        if not self.pending_path.is_file():
+            return None
+        try:
+            data = json.loads(self.pending_path.read_text(encoding="utf-8"))
+            if data.get("version") and self._is_newer(data["version"], self.current_version):
+                return data
+        except Exception:
+            pass
+        return None
 
-        Returns ``True`` if the installer was launched (the current process
-        will exit shortly after). Returns ``False`` on failure.
-        """
-        download_url = release_info.get("download_url", "")
+    def download_and_install(self, release_info: dict) -> bool:
+        download_url = release_info.get("download_url") or ""
         if not download_url:
-            logger.error("No download URL in release info")
             return False
 
         tmp_dir = Path(tempfile.gettempdir()) / "VOD.RIP-Updates"
         tmp_dir.mkdir(parents=True, exist_ok=True)
+        asset_name = release_info.get("asset_name") or f"VOD.RIP-{release_info.get('version')}"
+        dest = tmp_dir / asset_name
 
-        ext = self._platform_installer_ext()
-        installer_path = tmp_dir / f"VOD.RIP-{release_info['version']}{ext}"
-
-        logger.info("Downloading update %s ...", release_info["version"])
+        logger.info("Downloading update %s ...", release_info.get("version"))
         try:
-            resp = requests.get(download_url, stream=True, timeout=300)
-            resp.raise_for_status()
-            with open(installer_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        except Exception as e:
-            logger.error("Update download failed: %s", e)
+            with requests.get(download_url, stream=True, timeout=600) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            handle.write(chunk)
+        except Exception as exc:
+            logger.error("Update download failed: %s", exc)
             return False
 
-        logger.info("Download complete (%d bytes)", installer_path.stat().st_size)
-        self._launch_installer(installer_path)
-        return True
+        kind = release_info.get("asset_kind") or self._guess_kind(dest.name)
+        if kind == "setup":
+            return self._launch_windows_setup(dest)
+        return self._apply_zip_update(dest)
 
-    # ── Internal ────────────────────────────────────────────────────────────
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _is_newer(self, latest: str, current: str) -> bool:
+        def parts(v: str) -> List[int]:
+            out: List[int] = []
+            for piece in v.lstrip("v").replace("-", ".").split("."):
+                try:
+                    out.append(int(piece))
+                except ValueError:
+                    break
+            return out or [0]
+
+        a, b = parts(latest), parts(current)
+        length = max(len(a), len(b))
+        a.extend([0] * (length - len(a)))
+        b.extend([0] * (length - len(b)))
+        return a > b
 
     def _should_check(self) -> bool:
         if not self.cache_path.is_file():
             return True
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            return (time.time() - data.get("last_check", 0)) > CHECK_INTERVAL_SEC
+            return (time.time() - float(data.get("last_check", 0))) > CHECK_INTERVAL_SEC
         except Exception:
             return True
 
-    def _save_cache(self, data: dict):
+    def _save_cache(self, data: dict) -> None:
         try:
+            self.app_data_dir.mkdir(parents=True, exist_ok=True)
             self.cache_path.write_text(json.dumps(data), encoding="utf-8")
         except Exception:
             pass
 
-    def _platform_installer_ext(self) -> str:
-        if sys.platform == "win32":
-            return "-Setup.exe"
-        elif sys.platform == "darwin":
-            return ".dmg"
-        else:
-            return "-x86_64.AppImage"
+    def _save_pending(self, data: dict) -> None:
+        try:
+            self.app_data_dir.mkdir(parents=True, exist_ok=True)
+            self.pending_path.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
 
-    def _platform_keyword(self) -> str:
-        """Keyword to match in the asset name for this platform."""
+    def _clear_pending(self) -> None:
+        try:
+            if self.pending_path.is_file():
+                self.pending_path.unlink()
+        except Exception:
+            pass
+
+    def _platform_keywords(self) -> Tuple[List[str], List[str]]:
         if sys.platform == "win32":
-            return "Setup.exe"
-        elif sys.platform == "darwin":
-            return ".dmg"
-        else:
-            return ".AppImage"
+            return (["Setup.exe", "Windows"], ["Windows", ".zip"])
+        if sys.platform == "darwin":
+            return ([], ["macOS", ".zip"])
+        return ([], ["Linux", ".zip"])
 
     def _find_platform_asset(self, assets: list) -> Optional[dict]:
-        keyword = self._platform_keyword()
-        for asset in assets:
-            name = asset.get("name", "")
-            if keyword in name:
-                return asset
+        preferred, fallback = self._platform_keywords()
+        for keyword in preferred:
+            for asset in assets:
+                name = asset.get("name") or ""
+                if keyword in name:
+                    copy = dict(asset)
+                    copy["_kind"] = "setup"
+                    return copy
+        for keyword in fallback:
+            for asset in assets:
+                name = asset.get("name") or ""
+                if keyword in name and name.lower().endswith(".zip"):
+                    copy = dict(asset)
+                    copy["_kind"] = "zip"
+                    return copy
         return None
 
-    def _launch_installer(self, path: Path):
-        """Launch the platform installer and exit the current process."""
-        logger.info("Launching installer: %s", path)
+    @staticmethod
+    def _guess_kind(filename: str) -> str:
+        lower = filename.lower()
+        if lower.endswith(".exe") and "setup" in lower:
+            return "setup"
+        return "zip"
 
-        if sys.platform == "win32":
-            subprocess.Popen(
-                [
-                    str(path),
-                    "/VERYSILENT",
-                    "/SUPPRESSMSGBOXES",
-                    "/CLOSEAPPLICATIONS",
-                    "/RESTARTAPPLICATIONS",
-                ],
-                close_fds=True,
-                        creationflags=_NO_WINDOW,
-            )
-        elif sys.platform == "darwin":
-            # On macOS, open the DMG — the user still has to drag to /Applications
-            subprocess.Popen(["open", str(path)], creationflags=_NO_WINDOW)
-        else:
-            # Linux: make executable and run
-            path.chmod(0o755)
-            subprocess.Popen([str(path)], creationflags=_NO_WINDOW)
-
-        logger.info("Exiting for update...")
+    def _launch_windows_setup(self, installer: Path) -> bool:
+        logger.info("Launching installer: %s", installer)
+        subprocess.Popen(
+            [
+                str(installer),
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/CLOSEAPPLICATIONS",
+                "/RESTARTAPPLICATIONS",
+                "/NORESTART",
+            ],
+            close_fds=True,
+            creationflags=_NO_WINDOW,
+        )
         os._exit(0)
+
+    def _apply_zip_update(self, zip_path: Path) -> bool:
+        install_dir = _install_dir()
+        extract_dir = zip_path.parent / "extract"
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+
+        if sys.platform == "darwin":
+            return self._apply_macos_zip(extract_dir, install_dir)
+        if sys.platform == "win32":
+            return self._apply_windows_zip(extract_dir, install_dir)
+        return self._apply_linux_zip(extract_dir, install_dir)
+
+    def _apply_windows_zip(self, extract_dir: Path, install_dir: Path) -> bool:
+        source = extract_dir
+        nested = list(extract_dir.glob("VOD-RIP.EXE")) + list(extract_dir.glob("VOD-RIP.exe"))
+        if nested:
+            source = nested[0].parent
+        exe = source / "VOD-RIP.EXE"
+        if not exe.is_file():
+            exe = source / "VOD-RIP.exe"
+        script = extract_dir.parent / "vodrip-update.ps1"
+        script.write_text(
+            "\n".join([
+                "Start-Sleep -Seconds 2",
+                f'$src = "{source}"',
+                f'$dst = "{install_dir}"',
+                "robocopy $src $dst /E /R:2 /W:2 /NFL /NDL /NJH /NJS",
+                "if ($LASTEXITCODE -ge 8) { exit 1 }",
+                f'Start-Process "{install_dir / "VOD-RIP.EXE"}"',
+            ]),
+            encoding="utf-8",
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            close_fds=True,
+            creationflags=_NO_WINDOW,
+        )
+        os._exit(0)
+
+    def _apply_linux_zip(self, extract_dir: Path, install_dir: Path) -> bool:
+        source = extract_dir
+        if not (extract_dir / "VOD-RIP").is_file() and not (extract_dir / "_internal").is_dir():
+            for child in extract_dir.iterdir():
+                if child.is_dir():
+                    source = child
+                    break
+        script = extract_dir.parent / "vodrip-update.sh"
+        script.write_text(
+            "\n".join([
+                "#!/bin/sh",
+                "sleep 2",
+                f'src="{source}"',
+                f'dst="{install_dir}"',
+                'rsync -a --delete "$src/" "$dst/" 2>/dev/null || cp -a "$src/." "$dst/"',
+                f'exec "$dst/VOD-RIP"',
+            ]),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
+        os._exit(0)
+
+    def _apply_macos_zip(self, extract_dir: Path, install_dir: Path) -> bool:
+        app_bundle = next(extract_dir.rglob("VOD.RIP.app"), None)
+        if app_bundle is None:
+            logger.error("macOS update zip missing VOD.RIP.app")
+            return False
+        parent = install_dir.parent
+        script = extract_dir.parent / "vodrip-update.sh"
+        script.write_text(
+            "\n".join([
+                "#!/bin/sh",
+                "sleep 2",
+                f'src="{app_bundle}"',
+                f'dst="{parent / "VOD.RIP.app"}"',
+                'rm -rf "$dst"',
+                'cp -R "$src" "$dst"',
+                'open "$dst"',
+            ]),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
+        os._exit(0)
+
+
+def background_check(app_data_dir: Path, current_version: str) -> None:
+    try:
+        checker = UpdateChecker(current_version, app_data_dir)
+        release = checker.check()
+        if release:
+            logger.info("Update available: v%s", release.get("version"))
+    except Exception as exc:
+        logger.debug("Background update check: %s", exc)

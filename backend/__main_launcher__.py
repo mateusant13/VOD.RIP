@@ -7,13 +7,13 @@ not imported during development — ``main.py`` is still the dev entry point.
 Responsibilities
 ----------------
 1. Set up logging to the platform-appropriate user data directory.
-2. Configure the Playwright browsers path to the bundled browsers directory.
-3. Install the global crash handler.
+2. Install the global crash handler.
+3. Ensure Windows Start Menu shortcuts (portable builds).
 4. Start FastAPI / uvicorn on 127.0.0.1.
 5. Wait for the server to be ready.
 6. Launch the PyWebView native desktop window with system-tray minimize.
 7. If PyWebView is unavailable, fall back to the default browser + tray icon.
-8. On Quit: cancel all downloads, kill ffmpeg/Playwright, exit.
+8. On Quit: cancel all downloads, kill ffmpeg, exit.
 """
 
 import logging
@@ -88,7 +88,6 @@ def _setup_logging() -> Path:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("curl_cffi").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
-    logging.getLogger("playwright").setLevel(logging.WARNING)
 
     logger = logging.getLogger("VOD.RIP")
     logger.info("=== VOD.RIP %s starting ===", __version__)
@@ -105,14 +104,41 @@ def _setup_logging() -> Path:
 
 
 def _setup_environment():
-    """Set environment variables needed by the runtime **before** any service
-    code is imported — especially Playwright's browser path."""
-    resources = _get_resources_dir()
-    browsers_path = str(resources / "browsers")
-
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", browsers_path)
-    os.environ["PLAYWRIGHT_SKIP_BROWSER_GC"] = "1"
+    """Set environment variables needed by the runtime before service imports."""
     os.environ["KICK_SERVE_UI"] = "1"
+
+
+def _ensure_start_menu_shortcuts() -> None:
+    """Create Start Menu entry on first run (portable zip users)."""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    try:
+        from services.windows_shortcuts import (
+            ensure_windows_shortcuts,
+            install_dir_from_runtime,
+            resolve_windows_exe,
+        )
+
+        install_dir = install_dir_from_runtime()
+        ensure_windows_shortcuts(resolve_windows_exe(install_dir), install_dir)
+    except Exception as exc:
+        logging.getLogger("VOD.RIP").debug("Start Menu shortcuts: %s", exc)
+
+
+def _start_background_update_check() -> None:
+    """Check GitHub Releases once per day in packaged builds."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        from services.updater import background_check
+
+        threading.Thread(
+            target=background_check,
+            args=(_get_appdata_dir(), __version__),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        logging.getLogger("VOD.RIP").debug("Background update check: %s", exc)
 
 
 _WINDOWS_APP_ID = "mateusant13.VODRIP.1"
@@ -517,6 +543,8 @@ def main():
     log_path = _setup_logging()
     _setup_environment()
     _set_windows_app_identity()
+    _ensure_start_menu_shortcuts()
+    _start_background_update_check()
 
     app_data = _get_appdata_dir()
     try:
