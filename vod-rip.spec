@@ -1,21 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-VOD.RIP — PyInstaller spec file.
+VOD.RIP — PyInstaller spec (Windows / macOS / Linux).
 
-Build command (run from PROJECT ROOT)::
+From project root::
 
-    pyinstaller vod-rip.spec --clean
-
-Paths are resolved relative to the project root (the working directory
-when ``pyinstaller`` is invoked).
+    npm run build-dist
 """
 
 import os
+import sys
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Path anchors — assumes CWD is the project root (documented usage).
-# ---------------------------------------------------------------------------
 
 _PROJECT_ROOT = Path(os.getcwd())
 _BACKEND_DIR = _PROJECT_ROOT / "backend"
@@ -24,25 +18,86 @@ _ASSETS_DIR = _PROJECT_ROOT / "assets"
 _BUILD_DIR = _PROJECT_ROOT / "build"
 _EXTERNAL_DIR = _BUILD_DIR / "external"
 _ICON_ICO = _ASSETS_DIR / "icon.ico"
+_ICON_ICNS = _ASSETS_DIR / "icon.icns"
+_IS_WIN = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
 
 
 def _ffmpeg_binaries():
-    """Return [(source, target)] tuples for ffmpeg/ffprobe if present."""
     if not _EXTERNAL_DIR.is_dir():
         return []
     result = []
     for name in ("ffmpeg", "ffprobe"):
-        for path in (_EXTERNAL_DIR / f"{name}.exe", _EXTERNAL_DIR / name):
+        for path in (
+            _EXTERNAL_DIR / f"{name}.exe",
+            _EXTERNAL_DIR / f"{name}.bin",
+            _EXTERNAL_DIR / name,
+        ):
             if path.is_file():
                 result.append((str(path), "."))
     return result
 
 
-block_cipher = None
+def _hidden_imports():
+    imports = [
+        "uvicorn",
+        "uvicorn.loops.auto",
+        "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.websockets.auto",
+        "uvicorn.logging",
+        "fastapi",
+        "pydantic",
+        "yt_dlp",
+        "yt_dlp.extractor",
+        "yt_dlp.downloader",
+        "yt_dlp.postprocessor",
+        "curl_cffi",
+        "curl_cffi.requests",
+        "main",
+        "services.kick_playwright_service",
+        "services.twitch_gql_service",
+        "services.kick_models",
+        "services.ytdlp_service",
+        "services.kick_api_service",
+        "services.kick_download_worker",
+        "services.preview_service",
+        "services.download_manager",
+        "services.download_cleanup",
+        "services.settings",
+        "services.tray_service",
+        "services.app_lifecycle",
+        "services.shutdown_util",
+        "services.updater",
+        "services.crash_handler",
+        "services._version",
+        "models.schemas",
+        "webview",
+        "PIL",
+        "PIL.Image",
+        "pystray",
+        "tkinter",
+        "tkinter.filedialog",
+    ]
+    if _IS_WIN:
+        imports += [
+            "webview.platforms.edgechromium",
+            "pystray._win32",
+        ]
+    elif _IS_MAC:
+        imports += [
+            "webview.platforms.cocoa",
+            "pystray._darwin",
+        ]
+    else:
+        imports += [
+            "webview.platforms.gtk",
+            "pystray._appindicator",
+        ]
+    return imports
 
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
+
+_hooks = _BUILD_DIR / "hooks"
+block_cipher = None
 
 a = Analysis(
     [
@@ -55,65 +110,23 @@ a = Analysis(
         (str(_STATIC_DIR / "index.html"), "static"),
         (str(_ICON_ICO), "."),
     ],
-    hiddenimports=[
-        # --- uvicorn submodules ---
-        'uvicorn',
-        'uvicorn.loops.auto',
-        'uvicorn.protocols.http.auto',
-        'uvicorn.protocols.websockets.auto',
-        'uvicorn.logging',
-        # --- FastAPI ---
-        'fastapi',
-        'pydantic',
-        # --- yt-dlp dynamic imports ---
-        'yt_dlp',
-        'yt_dlp.extractor',
-        'yt_dlp.downloader',
-        'yt_dlp.postprocessor',
-        # --- curl_cffi ---
-        'curl_cffi',
-        'curl_cffi.requests',
-        # --- Application entry + services ---
-        'main',
-        'services.kick_playwright_service',
-        'services.twitch_gql_service',
-        'services.kick_models',
-        'services.ytdlp_service',
-        'services.kick_api_service',
-        'services.kick_download_worker',
-        'services.ytdlp_service',
-        'services.preview_service',
-        'services.download_manager',
-        'services.download_cleanup',
-        'services.settings',
-        'services.tray_service',
-        'services.app_lifecycle',
-        'services.shutdown_util',
-        'services.updater',
-        'services.crash_handler',
-        'pystray',
-        'pystray._win32',
-        'PIL',
-        'PIL.Image',
-        'services._version',
-        'models.schemas',
-        # --- PyWebView platform backends ---
-        'webview',
-        'webview.platforms.edgechromium',
-        'webview.platforms.cocoa',
-        'webview.platforms.gtk',
-        # --- tkinter (native folder picker) ---
-        'tkinter',
-        'tkinter.filedialog',
-    ],
-    hookspath=[str(_BUILD_DIR / "hooks")],
+    hiddenimports=_hidden_imports(),
+    hookspath=[str(_hooks)] if _hooks.is_dir() else [],
     runtime_hooks=[],
     excludes=[
-        'tkinter.test', 'tkinter.tix',
-        'test', 'unittest',
-        'django', 'flask', 'tornado',
-        'boto3', 'botocore',
-        'matplotlib', 'scipy', 'numpy', 'pandas',
+        "tkinter.test",
+        "tkinter.tix",
+        "test",
+        "unittest",
+        "django",
+        "flask",
+        "tornado",
+        "boto3",
+        "botocore",
+        "matplotlib",
+        "scipy",
+        "numpy",
+        "pandas",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -123,12 +136,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
+_exe_kwargs = dict(
     exclude_binaries=True,
-    name='VOD-RIP',
+    name="VOD-RIP",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -139,9 +149,14 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(_ICON_ICO),
-    version=str(_ASSETS_DIR / "version_info.py"),
 )
+if _IS_WIN and _ICON_ICO.is_file():
+    _exe_kwargs["icon"] = str(_ICON_ICO)
+    _version_file = _ASSETS_DIR / "version_info.py"
+    if _version_file.is_file():
+        _exe_kwargs["version"] = str(_version_file)
+
+exe = EXE(pyz, a.scripts, [], **_exe_kwargs)
 
 coll = COLLECT(
     exe,
@@ -151,25 +166,23 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='VOD-RIP',
+    name="VOD-RIP",
 )
 
-# ---------------------------------------------------------------------------
-# macOS .app bundle
-# ---------------------------------------------------------------------------
-
-app = BUNDLE(
-    coll,
-    name='VOD.RIP.app',
-    icon=str(_BUILD_DIR / "icon.icns"),
-    bundle_identifier='com.vodrip.app',
-    info_plist={
-        'CFBundleDisplayName': 'VOD.RIP',
-        'CFBundleExecutable': 'VOD-RIP',
-        'CFBundleName': 'VOD.RIP',
-        'CFBundleVersion': '1.0.0',
-        'CFBundleShortVersionString': '1.0.0',
-        'NSHighResolutionCapable': True,
-        'NSRequiresAquaSystemAppearance': False,
-    },
-)
+if _IS_MAC:
+    _bundle_icon = str(_ICON_ICNS) if _ICON_ICNS.is_file() else None
+    app = BUNDLE(
+        coll,
+        name="VOD.RIP.app",
+        icon=_bundle_icon,
+        bundle_identifier="com.vodrip.app",
+        info_plist={
+            "CFBundleDisplayName": "VOD.RIP",
+            "CFBundleExecutable": "VOD-RIP",
+            "CFBundleName": "VOD.RIP",
+            "CFBundleVersion": "1.0.0",
+            "CFBundleShortVersionString": "1.0.0",
+            "NSHighResolutionCapable": True,
+            "NSRequiresAquaSystemAppearance": False,
+        },
+    )

@@ -1,7 +1,7 @@
 {
   "name": "vod-rip",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-all.mjs",
@@ -12,7 +12,7 @@
     "build-copy": "vite build && node -e \"require('fs').copyFileSync('dist/index.html', 'backend/static/index.html')\"",
     "preview": "vite preview",
     "generate-icon": "python scripts/generate-icon.py",
-    "build-dist": "npm run generate-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-exe.mjs"
+    "build-dist": "npm run generate-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",
