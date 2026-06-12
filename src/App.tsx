@@ -2905,7 +2905,6 @@ export default function App() {
       const fs = document.fullscreenElement === previewContainerRef.current;
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
-      previewAppliedHeightRef.current = 0;
       void syncPreviewPlaybackToViewport(true, fs);
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);

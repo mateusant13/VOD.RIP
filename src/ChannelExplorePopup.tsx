@@ -402,7 +402,6 @@ export default function ChannelExplorePopup({
     requestedHeightRef.current = level.height;
     setQualityLevel(levelIndex);
     setQualityMenuOpen(false);
-    appliedHeightRef.current = 0;
     await syncPlaybackToViewport();
   }, [previewLevels, syncPlaybackToViewport]);
 
@@ -537,7 +536,6 @@ export default function ChannelExplorePopup({
         const p = layoutExplorePopupWindow(el, panelWidthRef.current, posRef, stackIndex);
         setPos(p);
       }
-      appliedHeightRef.current = 0;
       void syncPlaybackToViewport(fs);
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
@@ -546,7 +544,6 @@ export default function ChannelExplorePopup({
 
   useEffect(() => {
     if (!ready || fullscreen) return;
-    appliedHeightRef.current = 0;
     void syncPlaybackToViewport();
   }, [ready, fullscreen, panelWidth, videoAspect, syncPlaybackToViewport]);
 

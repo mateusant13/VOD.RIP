@@ -1,0 +1,13 @@
+{
+  "saved_at": 1781225490.290377,
+  "failed_batches": [
+    {
+      "group": "Other: services [group 1]",
+      "error": "Multipart subprocess timed out for session audit_other__services__group_1__1781224431"
+    },
+    {
+      "group": "Other: src [group 1]",
+      "error": "Multipart subprocess timed out for session audit_other__src__group_1__1781225020"
+    }
+  ]
+}

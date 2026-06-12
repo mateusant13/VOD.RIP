@@ -2,8 +2,9 @@ export const PREVIEW_MAIN_DEFAULT_HEIGHT = 480;
 export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 360;
 export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
 
-/** Validate URL protocol — only https, http, and blob: are allowed. */
+/** Validate URL protocol — only https, http, blob:, and relative proxy paths are allowed. */
 export function isValidPreviewUrl(u: string): boolean {
+  if (u.startsWith('/')) return true;
   try {
     const parsed = new URL(u);
     return parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'blob:';
@@ -45,7 +46,7 @@ export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: s
   source.src = playbackUrl;
   source.type = 'video/mp4';
   video.appendChild(source);
-  if (startTime != null && Number.isFinite(startTime)) {
+  if (startTime != null && Number.isFinite(startTime) && video.readyState > HTMLMediaElement.HAVE_NOTHING) {
     video.currentTime = startTime;
   }
   video.load();
