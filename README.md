@@ -1,8 +1,6 @@
-# VOD.RIP 🪦 - Kick and Twitch Downloader
+# VOD.RIP 🪦 — Twitch & Kick Downloader
 
-Save Twitch and Kick VODs, clips, and highlights in a few clicks.
-
-Preview before downloading, trim only the part you need, and manage multiple downloads from a single app.
+A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Built for regular users — paste a link, preview the video, trim what you need, and save.
 
 <p>
   <a href="https://github.com/mateusant13/VOD.RIP/releases"><img src="https://img.shields.io/badge/download-Windows%20%E2%80%A2%20macOS%20%E2%80%A2%20Linux-53fc18?style=flat-square"/></a>
@@ -10,59 +8,54 @@ Preview before downloading, trim only the part you need, and manage multiple dow
   <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-53fc18?style=flat-square"/></a>
 </p>
 
-[Download the latest release](https://github.com/mateusant13/VOD.RIP/releases) — no setup required.
+[Download the latest release](https://github.com/mateusant13/VOD.RIP/releases) — Windows, macOS, and Linux.
 
-![Hero screenshot showing VOD info and download controls](screenshots/readme/hero.png)
+![VOD.RIP main window showing video info, quality options, trim controls, and the download queue](screenshots/readme/hero.png)
 
-## Why VOD.RIP?
+## Everything you need in one window
 
-Most download tools are built for power users. VOD.RIP focuses on making Twitch and Kick downloads simple.
+- **Download Twitch and Kick VODs** — full streams or trimmed segments
+- **Save clips and highlights** — short-form content, one click
+- **Preview before downloading** — watch the VOD or clip inside the app
+- **Trim only what you need** — skip a 3-hour stream, keep the 10-minute moment
+- **Queue multiple downloads** — run them in parallel, track progress live
+- **Save favorite channels** — recent VODs and clips, one click away
 
-1. Paste a link
-2. Preview the content
-3. Choose quality
-4. Download
-
----
-
-- **Download Twitch and Kick VODs** — full streams or just the parts you want
-- **Download clips** — save short highlights instantly
-- **Preview before downloading** — watch any VOD or clip inside the app
-- **Trim only what you need** — don't download an entire stream for a 5-minute segment
-- **Queue multiple downloads** — start several downloads at once and track progress
-- **Save favorite channels** — browse recent VODs and clips without leaving the app
+No terminal. No browser extension. No command-line setup.
 
 ---
 
-## Preview Before Downloading
+## Save your favorite channels
 
-See what you're getting before you commit. Paste a Kick or Twitch URL, extract the video info, and preview the content directly in the app. No need to wait for a full download just to check what's in it.
+Pin the creators you watch and skip the search. The channels list keeps Twitch and Kick feeds side by side so recent uploads are always one click away.
 
-![Preview player and video information](screenshots/readme/preview.png)
+![VOD.RIP channels list with saved creators](screenshots/readme/channel-close.png)
 
-## Download Only What You Need
+## Browse recent VODs and clips
 
-Pick a start and end point — download just the segment you care about. Drag the trim handles or click the in/out markers for precise control. Save a 10-minute highlight instead of a 3-hour VOD.
+Open a channel to see the latest VODs and clips in a single view. Switch between Twitch and Kick, toggle VODs and clips, and start a download straight from the list.
 
-![Trim controls with start and end markers](screenshots/readme/trim.png)
+![VOD.RIP channel view with recent VODs and clips](screenshots/readme/channel-open.png)
 
-## Explore Channels
+## Preview before you download
 
-Browse any streamer's recent VODs and clips side by side. Switch between Kick and Twitch feeds, toggle between VODs and clips, and keep your favorite channels one click away.
+From any VOD or clip row, pop the preview out into its own window. Watch the content in a smaller overlay while you keep browsing the list — no need to commit to a full download just to check what is in it.
 
-![Channel browser with saved channels and VOD listings](screenshots/readme/channel-open.png)
+![VOD.RIP pop-out preview window for a VOD or clip](screenshots/readme/pop-up-preview.png)
 
-## Manage Multiple Downloads
+## Download, trim, and save
 
-Download several VODs at the same time. The queue shows progress, speed, and estimated completion for each download. Start, pause, resume, or cancel at any time. Finished downloads stay in the history so you can find them again.
+Whether you are archiving a full stream or saving a single highlight, the whole workflow lives in one window. Paste, preview, trim, download — done.
 
-![Download queue with active and completed items](screenshots/readme/queue.png)
+![VOD.RIP complete workflow in a single window](screenshots/readme/hero.png)
+
+---
 
 ## Download
 
-VOD.RIP runs as a standalone desktop app — no browser or command-line knowledge needed.
+VOD.RIP ships as a standalone desktop app.
 
-| Platform | Download |
+| Platform | Format |
 |---|---|
 | **Windows** | `.exe` installer or portable `.zip` |
 | **macOS** | `.app` bundle |
@@ -70,7 +63,7 @@ VOD.RIP runs as a standalone desktop app — no browser or command-line knowledg
 
 Grab the latest build from the [Releases page](https://github.com/mateusant13/VOD.RIP/releases).
 
-## Run from Source
+## Run from source
 
 ```bash
 npm install
@@ -82,9 +75,7 @@ npm run dev
 
 Then open `http://localhost:5173`.
 
-## For Developers
-
-VOD.RIP is built with:
+## Built with
 
 - **Frontend:** React, TypeScript, Vite
 - **Backend:** Python, FastAPI
