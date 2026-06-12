@@ -1936,6 +1936,8 @@ export default function App() {
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
+  /** True after saved channels were hydrated once (localStorage wins over API). */
+  const channelsHydratedRef = useRef(false);
   const channelUiPersistReadyRef = useRef(false);
   const [pickingFolder, setPickingFolder] = useState(false);
   const initialChannelUi = useMemo(() => loadStoredChannelUi(), []);
@@ -3766,6 +3768,7 @@ export default function App() {
   }, [kickEnabled, twitchEnabled]);
 
   const removeChannel = useCallback((channelId: string) => {
+    clipsAutoFetchStartedRef.current.delete(channelId);
     setSavedChannels((prev) => {
       const next = prev.filter((c) => c.id !== channelId);
       if (selectedChannelId === channelId) {
@@ -3776,6 +3779,18 @@ export default function App() {
   }, [selectedChannelId]);
 
   // ── Load settings ──
+
+  const hydrateSavedChannelsOnce = useCallback((apiChannels?: SavedChannel[] | null) => {
+    if (channelsHydratedRef.current) return;
+    channelsHydratedRef.current = true;
+    const local = loadSavedChannels();
+    if (local.length === 0 && apiChannels && apiChannels.length > 0) {
+      const restored = apiChannels.map((ch) => normalizeSavedChannel(ch));
+      setSavedChannels(restored);
+      persistChannels(restored);
+    }
+    channelsPersistReadyRef.current = true;
+  }, []);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -3794,23 +3809,24 @@ export default function App() {
       if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods') {
         setChannelContentFilter(s.channel_content_filter);
       }
-      if (s.saved_channels && Array.isArray(s.saved_channels) && s.saved_channels.length > 0) {
-        const restored = s.saved_channels.map((ch) => normalizeSavedChannel(ch as SavedChannel));
-        setSavedChannels(restored);
-        persistChannels(restored);
-      }
+      hydrateSavedChannelsOnce(
+        Array.isArray(s.saved_channels)
+          ? s.saved_channels.map((ch) => normalizeSavedChannel(ch as SavedChannel))
+          : null,
+      );
       if (s.panel_layout) {
         const pl = s.panel_layout as PersistedPanelLayout;
         if (pl.previewPanelWidth && pl.urlAside && pl.main) {
           restorePanelLayout(pl);
         }
       }
-    } catch {} finally {
-      channelsPersistReadyRef.current = true;
+    } catch {
+      hydrateSavedChannelsOnce(null);
+    } finally {
       channelUiPersistReadyRef.current = true;
       panelLayoutPersistReadyRef.current = true;
     }
-  }, [restorePanelLayout]);
+  }, [restorePanelLayout, hydrateSavedChannelsOnce]);
 
   useEffect(() => {
     loadSettings();
