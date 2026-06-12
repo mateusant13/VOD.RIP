@@ -4700,7 +4700,7 @@ export default function App() {
                         className="flex-1 min-w-0 bg-zinc-950 text-white font-mono text-xs px-1 py-0.5 focus:outline-none" />
                     ) : (
                       <button type="button" onClick={() => toggleChannelSelection(ch.id)}
-                        className="flex-1 text-left text-xs font-mono text-zinc-200 truncate hover:text-white">
+                        className="flex-1 text-left text-xs font-mono text-zinc-200 truncate hover:text-white select-none">
                         {ch.displayName}
                       </button>
                     )}
