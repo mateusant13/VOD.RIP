@@ -1769,6 +1769,10 @@ export default function App() {
   const previewInitialSeekDoneRef = useRef(false);
   const previewInitialPlayDoneRef = useRef(false);
   const previewSuppressPlayRef = useRef(false);
+  /** Monotonic generation counter — increment to cancel in-flight openPreview. */
+  const previewGenRef = useRef(0);
+  /** True while a preview is active (loaded or loading) — blocks re-clicks. */
+  const previewStartedRef = useRef(false);
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
   const previewSessionMetaRef = useRef<{
@@ -2029,6 +2033,8 @@ export default function App() {
   }, []);
 
   const resetPreview = useCallback(async () => {
+    previewGenRef.current += 1; // cancel any in-flight openPreview
+    previewStartedRef.current = false;
     const sid = previewSessionId;
     destroyPreviewPlayer();
     setPreviewOpen(false);
@@ -2068,6 +2074,12 @@ export default function App() {
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
     if (trimEndSec <= trimStartSec) return;
+    // Already started — no-op on re-click (uses ref to avoid closure staleness)
+    if (previewStartedRef.current) return;
+    previewStartedRef.current = true;
+
+    // Cancel any previously in-flight openPreview
+    const gen = ++previewGenRef.current;
     const start = trimStartSec;
     const end = trimEndSec;
     previewTrimStartRef.current = start;
@@ -2131,6 +2143,7 @@ export default function App() {
         ? apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(url.trim())}`).catch(() => null)
         : Promise.resolve(null);
       const [res, clipInfo] = await Promise.all([sessionPromise, clipInfoPromise]);
+      if (gen !== previewGenRef.current) return;
       if (clipInfo?.qualities?.length) {
         qualityLabels = clipInfo.qualities;
       }
@@ -3134,7 +3147,10 @@ export default function App() {
     }
   }, [previewOpen, resetPreview]);
 
-  const handleGetInfo = useCallback(() => fetchVideoInfo(url), [url, fetchVideoInfo]);
+  const handleGetInfo = useCallback(() => {
+    previewStartedRef.current = false;
+    fetchVideoInfo(url);
+  }, [url, fetchVideoInfo]);
 
   const pickDownloadFolder = useCallback(async (): Promise<string | null> => {
     setPickingFolder(true);
@@ -3822,8 +3838,9 @@ export default function App() {
     setChannelVodPanelOpen(true);
     setUrlTabBarHidden(true);
     setPreviewChannelBadge(badge ?? null);
+    void resetPreview();
     void fetchVideoInfo(vodUrl);
-  }, [fetchVideoInfo]);
+  }, [fetchVideoInfo, resetPreview]);
 
   const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
     selectVod(vod.url, {
