@@ -193,14 +193,72 @@ export function maxQualityLabelFromList(qualities: string[]): string {
   return '1080p';
 }
 
+function _fmtTrimSec(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m > 0) return `${m.toString().padStart(2, '0')}m${r.toString().padStart(2, '0')}s`;
+  return `${r.toString().padStart(2, '0')}s`;
+}
+
+function _trimRangeTag(cropStart: number | null | undefined, cropEnd: number | null | undefined): string {
+  if (cropStart == null && cropEnd == null) return '';
+  const start = _fmtTrimSec(cropStart ?? 0);
+  const end = _fmtTrimSec(cropEnd ?? (cropStart ?? 0) + 1);
+  return `${start}-${end}`;
+}
+
+function _durationTag(seconds: number | null | undefined): string {
+  if (!seconds || seconds <= 0) return 'clip';
+  const sec = Math.max(1, Math.round(seconds));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m > 0) return `clip_${m}m${s}s`;
+  return `clip_${s}s`;
+}
+
 export function suggestClipDownloadName(
   title: string | null | undefined,
   uploader: string | null | undefined,
   mediaUrl: string,
+  options?: {
+    duration?: number | null;
+    cropStart?: number | null;
+    cropEnd?: number | null;
+    platform?: 'Kick' | 'Twitch' | string | null;
+  },
 ): string {
   const clipper = uploader?.trim() || channelSlugFromMediaUrl(mediaUrl) || 'channel';
   const clipTitle = title?.trim() || 'Untitled';
-  return `${clipper} - ${clipTitle} (clip)`;
+  const dur = _durationTag(options?.duration);
+  const platform = options?.platform ? options.platform.toLowerCase() : '';
+  const parts: string[] = [clipper, clipTitle, dur];
+  if (platform) parts.push(platform);
+  const trim = _trimRangeTag(options?.cropStart ?? null, options?.cropEnd ?? null);
+  if (trim) parts.push(`[${trim}]`);
+  return parts.join(' - ');
+}
+
+export function suggestVideoDownloadName(
+  title: string | null | undefined,
+  platform: 'Kick' | 'Twitch' | string | null | undefined,
+  vodId: string | null | undefined,
+  options?: {
+    duration?: number | null;
+    cropStart?: number | null;
+    cropEnd?: number | null;
+  },
+): string {
+  const cleanTitle = title?.trim() || platform?.toLowerCase() || 'video';
+  const dur = options?.duration ? _durationTag(options.duration) : '';
+  const platformPart = platform ? platform.toLowerCase() : '';
+  const parts: string[] = [cleanTitle];
+  if (dur) parts.push(dur);
+  if (platformPart) parts.push(platformPart);
+  if (vodId) parts.push(vodId);
+  const stem = parts.join(' - ');
+  const trim = _trimRangeTag(options?.cropStart ?? null, options?.cropEnd ?? null);
+  return trim ? `${stem} [${trim}]` : stem;
 }
 
 export interface PreviewLevelOption {

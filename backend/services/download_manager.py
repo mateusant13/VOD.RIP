@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from models.schemas import DownloadState
 from services import ytdlp_service
-from services.download_cleanup import delete_partial_output
+from services.download_cleanup import delete_partial_output, remove_temp_dirs
 from services.settings import _get_appdata_dir
 
 if TYPE_CHECKING:
@@ -403,6 +403,13 @@ class DownloadManager:
                     self._worker_params.pop(download_id, None)
                     if state.status not in _DONE_STATUSES:
                         self._downloads.pop(download_id, None)
+                # Best-effort: wipe any leftover HLS temp folders so cancel
+                # at 99% doesn't leave a heap of empty `hls_clip_XXXX` dirs.
+                try:
+                    if final_state.status != "Completed":
+                        remove_temp_dirs(params.get("output_file", ""))
+                except Exception:
+                    pass
                 # Persist outside the lock — disk write should never hold the
                 # download state lock.
                 if final_state.status in _DONE_STATUSES:

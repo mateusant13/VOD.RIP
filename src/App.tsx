@@ -33,6 +33,7 @@ import {
   resolveProgressivePreviewLevelsAsync,
   inferLevelHeight,
   suggestClipDownloadName,
+  suggestVideoDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { ActiveDownloadsList } from './components/ActiveDownloadsList';
@@ -3353,8 +3354,29 @@ export default function App() {
     }
     try {
       const endpoint = clipDownload ? '/api/download/clip' : '/api/download/video';
-      const clipName = downloadFilename.trim()
-        || suggestClipDownloadName(videoInfo.title, videoInfo.uploader, url.trim());
+      const platform = (videoInfo as any)?.platform || undefined;
+      const clipDuration = clipDownload
+        ? (videoInfo?.duration ?? Math.max(1, cropEnd - cropStart))
+        : (videoInfo?.duration ?? null);
+      const defaultName = clipDownload
+        ? suggestClipDownloadName(
+            videoInfo.title,
+            videoInfo.uploader,
+            url.trim(),
+            {
+              duration: clipDuration,
+              cropStart,
+              cropEnd,
+              platform,
+            },
+          )
+        : suggestVideoDownloadName(
+            videoInfo.title,
+            platform,
+            null,
+            { duration: clipDuration, cropStart, cropEnd },
+          );
+      const clipName = downloadFilename.trim() || defaultName;
       const trimBody = { crop_start: cropStart, crop_end: cropEnd };
       const body = clipDownload
         ? {
@@ -3382,12 +3404,14 @@ export default function App() {
     const trimStart = previewOpen ? previewTrimStart : trimStartSec;
     const trimEnd = previewOpen ? previewTrimEnd : trimEndSec;
     const trimDur = Math.max(1, trimEnd - trimStart);
+    const platform = (videoInfo as any)?.platform || undefined;
     if (clipDownload) {
       const human = formatClipDurationHuman(trimDur);
       const defaultFilename = suggestClipDownloadName(
         videoInfo?.title,
         videoInfo?.uploader,
         url.trim(),
+        { duration: videoInfo?.duration, cropStart: trimStart, cropEnd: trimEnd, platform },
       );
       const rangeNote = trimDur < (videoInfo?.duration ?? trimDur)
         ? ` (${formatHmsFull(trimStart)} → ${formatHmsFull(trimEnd)})`

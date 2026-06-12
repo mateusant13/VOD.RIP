@@ -310,16 +310,44 @@ def _clip_duration_tag(seconds: Optional[float]) -> str:
     return f"clip_{secs}s"
 
 
+def _trim_range_tag(crop_start: Optional[float], crop_end: Optional[float]) -> str:
+    """Filesystem-safe trim tag like ``00m12s-02m30s`` (start-end)."""
+    def _fmt(sec: float) -> str:
+        sec = max(0, int(round(sec)))
+        m, s = divmod(sec, 60)
+        if m > 0:
+            return f"{m:02d}m{s:02d}s"
+        return f"{s:02d}s"
+
+    if crop_start is None and crop_end is None:
+        return ""
+    start = _fmt(crop_start or 0.0)
+    end = _fmt(crop_end if crop_end is not None else (crop_start or 0.0) + 1)
+    return f"{start}-{end}"
+
+
 def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
     if req.output_file:
         return req.output_file
     base = _download_dir(opts)
     title = meta.get("title") or detect_platform(req.url).lower()
-    stem = _sanitize_path_component(str(title), fallback="video")
     platform = detect_platform(req.url).lower()
     vod_id = _vod_id_from_url(req.url)
-    suffix = f"_{vod_id}" if vod_id else ""
-    return str(base / f"{stem}_{platform}{suffix}.mp4")
+    duration = meta.get("duration")
+    parts: list[str] = [_sanitize_path_component(str(title), fallback="video")]
+    dur_tag = _clip_duration_tag(duration) if duration else ""
+    if dur_tag:
+        parts.append(dur_tag)
+    parts.append(platform)
+    if vod_id:
+        parts.append(vod_id)
+    stem = " - ".join([parts[0]] + parts[1:])
+    if req.crop_start is not None and req.crop_end is not None:
+        tag = _trim_range_tag(req.crop_start, req.crop_end)
+        if tag:
+            stem = f"{stem} [{tag}]"
+    stem = _sanitize_path_component(stem, fallback="video")
+    return str(base / f"{stem}.mp4")
 
 
 def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> str:
@@ -331,8 +359,19 @@ def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict)
         or "channel"
     )
     title = meta.get("title") or "clip"
-    default_stem = _sanitize_path_component(f"{clipper} - {title} (clip)", fallback="clip")
-    default_path = str(base / f"{default_stem}.mp4")
+    duration = meta.get("duration")
+    parts: list[str] = [
+        _sanitize_path_component(clipper, fallback="channel"),
+        _sanitize_path_component(title, fallback="clip"),
+        _clip_duration_tag(duration) if duration else "clip",
+    ]
+    if req.crop_start is not None and req.crop_end is not None:
+        tag = _trim_range_tag(req.crop_start, req.crop_end)
+        if tag:
+            parts.append(f"[{tag}]")
+    stem = " - ".join(parts)
+    stem = _sanitize_path_component(stem, fallback="clip")
+    default_path = str(base / f"{stem}.mp4")
     return _resolve_output_file_override(req, opts, default_path)
 
 
@@ -427,17 +466,33 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
         SW_RESTORE = 9
+        SW_SHOW = 5
         GW_OWNER = 4
+        GA_ROOT = 2
 
         folder_norm = os.path.normcase(os.path.abspath(folder_path))
-        target_titles: set[str] = {
-            (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
-        }
+        folder_base = (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
+
+        # Build a set of "this might be a match" patterns. Modern Windows
+        # titles look like ``foo - File Explorer`` or just ``foo``; we
+        # used to only match the literal base name, which silently missed
+        # everything that had the explorer suffix appended.
+        needles: set[str] = {folder_base}
         if item_name:
-            target_titles.add(os.path.normcase(item_name).lower())
+            needles.add(os.path.normcase(item_name).lower())
+
+        def _title_matches(tv: str) -> bool:
+            tv = tv.lower()
+            for n in needles:
+                if not n:
+                    continue
+                if tv == n or tv.startswith(n) or n in tv:
+                    return True
+            return False
 
         captured: list[int] = []
 
@@ -458,19 +513,41 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
             n = user32.GetWindowTextW(hwnd, title, 512)
             if n <= 0:
                 return True
-            tv = title.value.lower()
-            for t in target_titles:
-                if tv == t or tv.endswith(t):
-                    captured.append(hwnd)
-                    return False
+            if _title_matches(title.value):
+                captured.append(hwnd)
+                return False
             return True
 
         user32.EnumWindows(WNDENUMPROC(_cb), 0)
         hwnd = captured[0] if captured else 0
         if not hwnd:
             return False
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetForegroundWindow(hwnd)
+        # Climb to the root window (CabinetWClass is a child of the
+        # frame on some builds), otherwise SetForegroundWindow fails.
+        root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+        # Force-foreground dance: SetForegroundWindow is gated by
+        # Windows' "the calling thread cannot steal focus" rule. We
+        # briefly attach our thread input to the foreground thread so
+        # the call is allowed.
+        try:
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, 0)
+            my_thread = kernel32.GetCurrentThreadId()
+            attached = False
+            if fg_thread and fg_thread != my_thread:
+                user32.AttachThreadInput(fg_thread, my_thread, True)
+                attached = True
+            try:
+                user32.ShowWindow(root, SW_RESTORE)
+                user32.ShowWindow(root, SW_SHOW)
+                user32.BringWindowToTop(root)
+                user32.SetForegroundWindow(root)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(fg_thread, my_thread, False)
+        except Exception:
+            user32.ShowWindow(root, SW_RESTORE)
+            user32.SetForegroundWindow(root)
         return True
     except Exception:
         logger.debug("Could not focus Explorer window", exc_info=True)
@@ -509,16 +586,26 @@ def _reveal_path_windows(target: str) -> None:
         return
     # If the folder is already open in an Explorer window, just bring it
     # forward — don't spawn a duplicate. Otherwise let explorer.exe do
-    # its thing and then locate the new window.
-    if not _focus_explorer_window(folder, item):
-        if item:
-            subprocess.Popen(
-                ["explorer.exe", f"/select,{abspath}"],
-                creationflags=_NO_WINDOW,
-            )
-        else:
-            subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
-        _focus_explorer_window(folder, item)
+    # its thing and then locate the new window. The poll loop handles
+    # the small race where the new window isn't fully realized yet
+    # (otherwise the second _focus_explorer_window would miss it).
+    if _focus_explorer_window(folder, item):
+        return
+    if item:
+        subprocess.Popen(
+            ["explorer.exe", f"/select,{abspath}"],
+            creationflags=_NO_WINDOW,
+        )
+    else:
+        subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
+    # Give explorer.exe a moment to actually create the window before
+    # we try to find and focus it. Without this the EnumWindows pass
+    # runs before the window exists and the request silently lands in
+    # the background.
+    for _ in range(20):
+        if _focus_explorer_window(folder, item):
+            return
+        time.sleep(0.1)
 
 
 def _open_folder_sync(path: str) -> None:

@@ -964,6 +964,7 @@ def _concat_and_trim(
     else:
         cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
     cmd += ["-f", "mp4", tmp_out]
+    _check_pause_cancel(cancel_event, pause_event)
     _run_ffmpeg(
         cmd,
         cancel_event=cancel_event,
@@ -974,6 +975,7 @@ def _concat_and_trim(
         progress_from=92.0,
         progress_to=98.0,
     )
+    _check_pause_cancel(cancel_event, pause_event)
     _verify_output_file(tmp_out)
 
     if progress_hook:
@@ -1023,7 +1025,12 @@ def download_hls_media_clip(
     out_parent = os.path.dirname(os.path.abspath(output_path))
     if out_parent:
         os.makedirs(out_parent, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="hls_clip_", dir=out_parent or None) as tmpdir:
+    # We don't use ``tempfile.TemporaryDirectory`` here because we need the
+    # path to remain reachable after a cancel so the cleanup pass in the
+    # download manager can wipe any leftover ``hls_clip_*`` folders the
+    # user has not asked to keep.
+    tmpdir = tempfile.mkdtemp(prefix="hls_clip_", dir=out_parent or None)
+    try:
         files = _download_segments(
             selected, headers, tmpdir, progress_hook, cancel_event, pause_event,
         )
@@ -1035,6 +1042,8 @@ def download_hls_media_clip(
             register_abort=register_abort,
             video_encoder=video_encoder,
         )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _download_hls_clip(
