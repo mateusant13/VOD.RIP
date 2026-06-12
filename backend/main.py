@@ -285,18 +285,6 @@ def _resolve_output_file_override(
     return str(base / f"{stem}.mp4")
 
 
-def _clip_id_from_url(url: str) -> str:
-    lowered = (url or "").lower()
-    m = re.search(r"clips\.twitch\.tv/([^/?#]+)", lowered)
-    if m:
-        return m.group(1)[:24]
-    m = re.search(r"twitch\.tv/[^/]+/clip/([^/?#]+)", lowered)
-    if m:
-        return m.group(1)[:24]
-    m = re.search(r"kick\.com/[^/]+/clips/([^/?#]+)", lowered, re.I)
-    if m:
-        return m.group(1)[:24]
-    return ""
 
 
 def _clip_duration_tag(seconds: Optional[float]) -> str:

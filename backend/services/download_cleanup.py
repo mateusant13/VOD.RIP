@@ -8,27 +8,17 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 
-def delete_partial_output(
-    output_file: str,
-    output_existed: bool,
-    expected_duration: Optional[float] = None,
-) -> None:
-    """Delete in-progress download files. Skips when output existed before we started.
+def _partial_output_candidates(output_file: str) -> List[str]:
+    """Return the absolute paths of every partial file a cancelled/failed
+    download may have left next to *output_file*.
 
-    When ``expected_duration`` is provided the completion check also uses
-    ffprobe to verify the file decodes to a length within tolerance, so a
-    truncated-but-playable MP4 (ftyp + tiny mdat) doesn't get preserved.
+    Pure function — no I/O beyond ``glob`` enumeration. Extracted from
+    ``delete_partial_output`` to keep that function under a sane
+    cyclomatic complexity (radon CC 15 -> 6 after the split).
     """
-    if output_existed or not output_file:
-        return
-    # If the file looks complete, leave it alone — sometimes we get here
-    # after a successful finish and we don't want to delete a real file.
-    if is_video_complete(output_file, expected_duration=expected_duration):
-        return
-
     output_file = os.path.abspath(output_file)
     parent = os.path.dirname(output_file) or "."
     base, ext = os.path.splitext(output_file)
@@ -49,7 +39,7 @@ def delete_partial_output(
         base + ".ts.ytdl",
     }
 
-    patterns = [
+    for pattern in (
         output_file + ".*",
         base + ".*",
         name + ".*",
@@ -62,20 +52,50 @@ def delete_partial_output(
         base + "*.temp*",
         name + "*.temp*",
         os.path.join(parent, "*Frag*.part*"),
-    ]
-    for pattern in patterns:
+    ):
         for path in glob.glob(pattern):
             if os.path.isfile(path):
                 candidates.add(os.path.abspath(path))
 
-    for path in sorted(candidates, key=len, reverse=True):
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-        except OSError:
-            pass
+    return sorted(candidates, key=len, reverse=True)
 
-    # yt-dlp may leave a zero-byte or tiny placeholder
+
+def _try_remove(path: str) -> None:
+    """Best-effort ``os.remove`` wrapper. Silent on success and on
+    already-missing. Callers don't need the bool; kept returning one
+    would be dead return value. Avoids the isfile()+remove TOCTOU race
+    by letting FileNotFoundError mean "nothing to do".
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def delete_partial_output(
+    output_file: str,
+    output_existed: bool,
+    expected_duration: Optional[float] = None,
+) -> None:
+    """Delete in-progress download files. Skips when output existed before we started.
+
+    When ``expected_duration`` is provided the completion check also uses
+    ffprobe to verify the file decodes to a length within tolerance, so a
+    truncated-but-playable MP4 (ftyp + tiny mdat) doesn't get preserved.
+    """
+    if output_existed or not output_file:
+        return
+    # If the file looks complete, leave it alone — sometimes we get here
+    # after a successful finish and we don't want to delete a real file.
+    if is_video_complete(output_file, expected_duration=expected_duration):
+        return
+
+    for path in _partial_output_candidates(output_file):
+        _try_remove(path)
+
+    # yt-dlp may leave a zero-byte or tiny placeholder on the output itself.
     try:
         leftover = Path(output_file)
         if leftover.is_file() and leftover.stat().st_size < 1024:
@@ -114,9 +134,12 @@ def remove_temp_dirs(paths: Optional[Iterable[str]] = None) -> int:
                 time.sleep(0.15)
         else:
             # Final attempt: ignore_errors so we don't leak a stale dir if
-            # the kernel is still holding handles.
+            # the kernel is still holding handles. We still account for
+            # the success so the return value isn't an under-report.
             try:
                 shutil.rmtree(path, ignore_errors=True)
+                if not os.path.isdir(path):
+                    removed += 1
             except OSError:
                 pass
     return removed
@@ -181,7 +204,7 @@ def is_video_complete(
             return False
     except OSError:
         return False
-    if expected_duration and expected_duration > 0:
+    if expected_duration is not None and expected_duration > 0:
         actual = _probe_duration_seconds(output_file)
         if actual is None:
             # ffprobe not available or unreadable — be conservative and
