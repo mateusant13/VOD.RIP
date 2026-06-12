@@ -34,7 +34,9 @@ import {
   suggestClipDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
+import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
+import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
 import { useViewportTier } from './useViewportTier';
 
@@ -1703,7 +1705,7 @@ export default function App() {
   } | null>(null);
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
   const [previewVideoReady, setPreviewVideoReady] = useState(false);
-  const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
+  const [previewTimeUi, setPreviewTimeUi] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewMuted, setPreviewMuted] = useState(false);
   const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
@@ -1721,6 +1723,10 @@ export default function App() {
   const [previewTrimStart, setPreviewTrimStart] = useState(0);
   const [previewTrimEnd, setPreviewTrimEnd] = useState(3600);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const previewPlayheadRef = useRef<HTMLDivElement>(null);
+  const previewCurrentTimeRef = useRef(0);
+  const previewTimeUiRef = useRef(0);
+  const vodDurationSecRef = useRef(0);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewControlsRef = useRef<HTMLDivElement>(null);
   const previewHlsRef = useRef<Hls | null>(null);
@@ -1971,10 +1977,27 @@ export default function App() {
   const [updateApplying, setUpdateApplying] = useState(false);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
 
+  const syncPreviewTimeUi = useCallback((t: number, force = false) => {
+    previewCurrentTimeRef.current = t;
+    const dur = vodDurationSecRef.current;
+    if (previewPlayheadRef.current && dur > 0) {
+      previewPlayheadRef.current.style.left = `${(t / dur) * 100}%`;
+    }
+    const quant = Math.round(t * 4) / 4;
+    if (force || quant !== previewTimeUiRef.current) {
+      previewTimeUiRef.current = quant;
+      setPreviewTimeUi(quant);
+    }
+  }, []);
+
   const vodDurationSec = useMemo(
     () => Math.max(1, videoInfoDurationSec(videoInfo)),
     [videoInfo],
   );
+
+  useEffect(() => {
+    vodDurationSecRef.current = vodDurationSec;
+  }, [vodDurationSec]);
 
   const previewDurationSec = useMemo(
     () => Math.max(1, previewTrimEnd - previewTrimStart),
@@ -2002,7 +2025,9 @@ export default function App() {
     setPreviewPlayback(null);
     setPreviewVideoLoading(false);
     setPreviewVideoReady(false);
-    setPreviewCurrentTime(0);
+    previewCurrentTimeRef.current = 0;
+    previewTimeUiRef.current = 0;
+    setPreviewTimeUi(0);
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
     setPreviewLevels([]);
@@ -2027,9 +2052,9 @@ export default function App() {
     const t = Math.max(start, Math.min(sec, end));
     if (force || Math.abs(video.currentTime - t) > 0.05) {
       video.currentTime = t;
-      setPreviewCurrentTime(t);
+      syncPreviewTimeUi(t, true);
     }
-  }, [previewVideoReady]);
+  }, [previewVideoReady, syncPreviewTimeUi]);
 
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
@@ -2071,7 +2096,7 @@ export default function App() {
     setPreviewPlayback(null);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
-    setPreviewCurrentTime(start);
+    syncPreviewTimeUi(start, true);
     setError(null);
     try {
       if (previewSessionId) {
@@ -2158,7 +2183,7 @@ export default function App() {
       }
       const t = Math.max(start, Math.min(video.currentTime, end));
       if (Math.abs(video.currentTime - t) > 0.05) video.currentTime = t;
-      setPreviewCurrentTime(t);
+      syncPreviewTimeUi(t, true);
     };
 
     const onCanPlay = () => {
@@ -2355,16 +2380,16 @@ export default function App() {
       video.currentTime = start;
       t = start;
     }
-    setPreviewCurrentTime(t);
+    syncPreviewTimeUi(t);
     if (t >= end - 0.05) {
       video.pause();
       if (Math.abs(video.currentTime - end) > 0.05) {
         video.currentTime = end;
       }
-      setPreviewCurrentTime(end);
+      syncPreviewTimeUi(end, true);
       setPreviewPlaying(false);
     }
-  }, []);
+  }, [syncPreviewTimeUi]);
 
   const togglePreviewPlay = useCallback(() => {
     const video = previewVideoRef.current;
@@ -2374,7 +2399,7 @@ export default function App() {
       const end = previewTrimEndRef.current;
       if (video.currentTime >= end - 0.1 || video.currentTime < start) {
         video.currentTime = start;
-        setPreviewCurrentTime(start);
+        syncPreviewTimeUi(start, true);
       }
       void video.play();
       setPreviewPlaying(true);
@@ -3199,6 +3224,23 @@ export default function App() {
     } catch {}
   }, []);
 
+  const activeDownloadIds = useMemo(
+    () => activeDownloads.map((d) => d.download_id),
+    [activeDownloads],
+  );
+
+  const handleDownloadSseEvent = useCallback((id: string, event: { type: string; data: unknown }) => {
+    setActiveDownloads((prev) =>
+      prev.map((dl) => (dl.download_id === id ? applyDownloadSseEvent(dl, event) : dl)),
+    );
+  }, []);
+
+  const handleDownloadTerminal = useCallback(() => {
+    void refreshDownloads();
+  }, [refreshDownloads]);
+
+  useDownloadStreams(activeDownloadIds, handleDownloadSseEvent, handleDownloadTerminal);
+
   const executeStartDownload = useCallback(async () => {
     setDownloadConfirmOpen(false);
     if (!videoInfo) return;
@@ -3307,13 +3349,9 @@ export default function App() {
     }
   }, [refreshDownloads]);
 
-  // Poll while any download is active (any tab)
   useEffect(() => {
-    if (activeDownloads.length === 0) return;
-    refreshDownloads();
-    const id = setInterval(refreshDownloads, 1000);
-    return () => clearInterval(id);
-  }, [activeDownloads.length, refreshDownloads]);
+    void refreshDownloads();
+  }, [refreshDownloads]);
 
   // Refresh queue when opening the tab
   useEffect(() => {
@@ -4171,7 +4209,7 @@ export default function App() {
     ? {
         start: (previewTrimStart / vodDurationSec) * 100,
         end: (previewTrimEnd / vodDurationSec) * 100,
-        play: (previewCurrentTime / vodDurationSec) * 100,
+        play: (previewTimeUi / vodDurationSec) * 100,
       }
     : { start: 0, end: 100, play: 0 };
 
@@ -4199,6 +4237,7 @@ export default function App() {
               }}
             />
             <div
+              ref={previewPlayheadRef}
               className="preview-needle-playhead absolute top-0 bottom-0 w-px bg-white/50 -translate-x-1/2 pointer-events-none z-[1]"
               style={{ left: `${previewClipPct.play}%` }}
             />
@@ -4238,14 +4277,14 @@ export default function App() {
       )}
       <div className="flex items-center gap-2">
         <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
-          {formatHmsFull(Math.max(0, previewCurrentTime - previewTrimStart))}
+          {formatHmsFull(Math.max(0, previewTimeUi - previewTrimStart))}
         </span>
         <input
           type="range"
           min={previewTrimStart}
           max={previewTrimEnd}
           step={0.25}
-          value={Math.min(Math.max(previewCurrentTime, previewTrimStart), previewTrimEnd)}
+          value={Math.min(Math.max(previewTimeUi, previewTrimStart), previewTrimEnd)}
           disabled={!previewVideoReady || previewDurationSec <= 0}
           onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
           className="flex-1 accent-white disabled:opacity-40"
@@ -4902,75 +4941,17 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-2 max-h-[280px] overflow-y-auto pr-1 custom-scrollbar">
-              {activeDownloads.length === 0 ? (
-                <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-                  NO ACTIVE DOWNLOADS.
-                </div>
-              ) : activeDownloads.map((dl) => {
-                const isTw = dl.platform === 'Twitch';
-                const isPaused = dl.status === 'Paused';
-                const color = isPaused ? '#fbbf24' : (isTw ? '#9146FF' : '#53fc18');
-                return (
-                  <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
-                    <div className="flex justify-between items-center gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
-                        <span className="text-xs font-mono text-zinc-300 truncate">
-                          {dl.title || dl.url}
-                        </span>
-                      </div>
-                      <span className="text-[10px] font-mono shrink-0" style={{ color }}>
-                        {isPaused ? 'Paused' : (dl.progress > 0 ? `${dl.progress}%` : dl.status)}
-                      </span>
-                    </div>
-                    <div className="w-full h-2 bg-zinc-800 border border-zinc-700">
-                      <div className={`h-full transition-all duration-300 ${
-                        isPaused ? 'bg-yellow-500/70' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
-                      }`}
-                        style={{ width: `${Math.max(dl.progress, dl.status === 'Starting...' ? 2 : 0)}%` }} />
-                    </div>
-                    <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
-                      <span className="truncate">{basename(dl.output_file)}</span>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {dl.output_file && (
-                          <button
-                            type="button"
-                            onClick={() => openFolder(dl.output_file)}
-                            className="text-zinc-400 hover:text-white flex items-center gap-1"
-                            title="Show in folder"
-                          >
-                            <FolderOpen size={12} /> Folder
-                          </button>
-                        )}
-                        {isPaused ? (
-                          <button
-                            type="button"
-                            onClick={() => handleResume(dl.download_id)}
-                            className="text-zinc-400 hover:text-white flex items-center gap-1"
-                          >
-                            <Play size={12} /> Resume
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => handlePause(dl.download_id)}
-                            className="text-zinc-400 hover:text-yellow-300 flex items-center gap-1"
-                          >
-                            <Pause size={12} /> Pause
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => handleCancel(dl.download_id)}
-                          className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
-                        >
-                          <StopCircle size={12} /> Cancel
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+              <ActiveDownloadsList
+                downloads={activeDownloads}
+                onPause={handlePause}
+                onResume={handleResume}
+                onCancel={handleCancel}
+                onOpenFolder={openFolder}
+                basename={basename}
+                platformIcon={(platform, className) => (
+                  <PlatformVodIcon platform={platform} className={className} />
+                )}
+              />
             </div>
 
             <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">

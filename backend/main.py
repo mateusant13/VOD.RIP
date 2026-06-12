@@ -46,6 +46,7 @@ from services.preview_service import (
     set_session_prefer_height,
     _is_playlist_url,
 )
+from services.channel_cache import get_cached, make_channel_cache_key, set_cached
 from services.download_manager import DownloadManager
 from services.settings import SettingsManager
 import yt_dlp
@@ -134,6 +135,7 @@ download_mgr.apply_settings(settings_mgr)
 # Metadata fetches use their own pool so hung yt-dlp downloads
 # cannot starve /api/info/* and /api/channel/videos.
 INFO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="info")
+CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="channel")
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")
@@ -747,9 +749,25 @@ async def channel_videos(
         twitch_ch = (twitch_login or default_slug).strip().lower()
         channel = kick_ch or twitch_ch
         wanted = _parse_wanted_platforms(platforms)
+        content_norm = (content or "").strip().lower()
+        limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT if content_norm == "clips" else CHANNEL_LIMIT_MAX))
+        days_norm = max(0, min(int(days), 365))
+        cache_key = make_channel_cache_key(
+            "videos",
+            content_norm,
+            kick_ch,
+            twitch_ch,
+            platforms,
+            limit_norm,
+            days_norm,
+            ",".join(sorted(wanted)),
+        )
+        cached = get_cached(cache_key)
+        if cached is not None:
+            return cached
         if not wanted:
-            is_clips = (content or "").strip().lower() == "clips"
-            return {
+            is_clips = content_norm == "clips"
+            payload = {
                 "videos": [] if not is_clips else None,
                 "clips": [] if is_clips else None,
                 "channel": channel,
@@ -758,15 +776,16 @@ async def channel_videos(
                 "days": days,
                 "per_platform_errors": {},
             }
-        if (content or "").strip().lower() == "clips":
-            clip_limit = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+            set_cached(cache_key, payload)
+            return payload
+        if content_norm == "clips":
             all_clips, per_platform_errors = await _gather_channel_clips(
                 wanted=wanted,
                 kick_slug=kick_ch,
                 twitch_login=twitch_ch,
-                limit=clip_limit,
+                limit=limit_norm,
             )
-            return {
+            payload = {
                 "clips": all_clips,
                 "videos": all_clips,
                 "channel": channel,
@@ -774,8 +793,10 @@ async def channel_videos(
                 "content": "clips",
                 "per_platform_errors": per_platform_errors,
             }
-        limit = max(1, min(int(limit), CHANNEL_LIMIT_MAX))
-        days = max(0, min(int(days), 365))
+            set_cached(cache_key, payload)
+            return payload
+        limit = limit_norm
+        days = days_norm
         cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
         per_platform_errors: Dict[str, str] = {}
         all_videos: List[dict] = []
@@ -784,7 +805,7 @@ async def channel_videos(
         async def _fetch_twitch() -> None:
             try:
                 vids = await loop.run_in_executor(
-                    INFO_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
+                    CHANNEL_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
                 )
             except Exception as e:
                 per_platform_errors["Twitch"] = _format_platform_error(e)
@@ -808,7 +829,7 @@ async def channel_videos(
             videos_url = f"https://kick.com/{channel}/videos"
             try:
                 vids = await loop.run_in_executor(
-                    INFO_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
+                    CHANNEL_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
                 )
             except Exception as e:
                 per_platform_errors["Kick"] = _format_platform_error(e)
@@ -852,7 +873,7 @@ async def channel_videos(
         all_videos.sort(key=_sort_key)
         for k, v in list(per_platform_errors.items()):
             per_platform_errors[k] = _normalize_err(v)
-        return {
+        payload = {
             "videos": all_videos,
             "channel": channel,
             "platforms": wanted,
@@ -860,6 +881,8 @@ async def channel_videos(
             "days": days,
             "per_platform_errors": per_platform_errors,
         }
+        set_cached(cache_key, payload)
+        return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -890,7 +913,7 @@ async def _gather_channel_clips(
         try:
             vids = await asyncio.wait_for(
                 loop.run_in_executor(
-                    INFO_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
+                    CHANNEL_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
                 ),
                 timeout=CLIP_FETCH_TIMEOUT_SEC,
             )
@@ -922,7 +945,7 @@ async def _gather_channel_clips(
         try:
             vids = await asyncio.wait_for(
                 loop.run_in_executor(
-                    INFO_EXECUTOR,
+                    CHANNEL_EXECUTOR,
                     kick_list_channel_clips_sync,
                     f"https://kick.com/{kick_slug}/clips",
                     limit,
@@ -986,28 +1009,43 @@ async def channel_clips(
             raise ValueError("Provide url, kick_slug, or twitch_login")
 
         wanted = _parse_wanted_platforms(platforms)
+        limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+        cache_key = make_channel_cache_key(
+            "clips",
+            kick_ch,
+            twitch_ch,
+            platforms,
+            limit_norm,
+            ",".join(sorted(wanted)),
+        )
+        cached = get_cached(cache_key)
+        if cached is not None:
+            return cached
         if not wanted:
-            return {
+            payload = {
                 "clips": [],
                 "channel": kick_ch or twitch_ch,
                 "platforms": [],
                 "content": "clips",
                 "per_platform_errors": {},
             }
-        limit = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+            set_cached(cache_key, payload)
+            return payload
         all_clips, per_platform_errors = await _gather_channel_clips(
             wanted=wanted,
             kick_slug=kick_ch,
             twitch_login=twitch_ch,
-            limit=limit,
+            limit=limit_norm,
         )
-        return {
+        payload = {
             "clips": all_clips,
             "channel": kick_ch or twitch_ch,
             "platforms": wanted,
             "content": "clips",
             "per_platform_errors": per_platform_errors,
         }
+        set_cached(cache_key, payload)
+        return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
