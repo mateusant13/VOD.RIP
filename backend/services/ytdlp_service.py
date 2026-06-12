@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import subprocess as sp
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -110,11 +111,23 @@ def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
     _check_pause_cancel(cancel_event, None)
 
 
+def _ffmpeg_cmd_with_progress(cmd: list) -> list:
+    """Insert ffmpeg machine-readable progress flags before the output file."""
+    if "-f" in cmd:
+        idx = cmd.index("-f")
+        return cmd[:idx] + ["-nostats", "-progress", "pipe:2"] + cmd[idx:]
+    return cmd[:-1] + ["-nostats", "-progress", "pipe:2", cmd[-1]]
+
+
 def _run_ffmpeg(
     cmd: list,
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    progress_hook: Optional[Callable] = None,
+    encode_duration: Optional[float] = None,
+    progress_from: float = 92.0,
+    progress_to: float = 98.0,
 ) -> None:
     """Run ffmpeg, polling *cancel_event* / *pause_event* so stop can kill the process."""
     if not cmd:
@@ -125,8 +138,16 @@ def _run_ffmpeg(
             "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
             "the FFmpeg folder in Settings → FFmpeg path."
         )
+
+    track_encode = (
+        progress_hook is not None
+        and encode_duration is not None
+        and encode_duration > 0
+    )
+    run_cmd = _ffmpeg_cmd_with_progress(cmd) if track_encode else cmd
+
     try:
-        proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+        proc = sp.Popen(run_cmd, stdout=sp.PIPE, stderr=sp.PIPE)
     except FileNotFoundError as exc:
         raise RuntimeError(
             "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
@@ -135,16 +156,39 @@ def _run_ffmpeg(
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
 
-    # Drain stderr on a background thread to prevent pipe-buffer deadlock.
-    stderr_chunks: list[bytes] = []
+    stderr_chunks: deque[bytes] = deque(maxlen=32)
     _stop_stderr = threading.Event()
+    last_reported_pct = progress_from
+
+    def _emit_encode_progress(out_time_ms: int) -> None:
+        nonlocal last_reported_pct
+        if not track_encode or not progress_hook:
+            return
+        encoded_sec = max(0.0, out_time_ms / 1_000_000.0)
+        ratio = min(1.0, encoded_sec / encode_duration)
+        pct = progress_from + ratio * (progress_to - progress_from)
+        if pct >= last_reported_pct + 0.4 or pct >= progress_to - 0.1:
+            last_reported_pct = pct
+            progress_hook({"status": "postprocessing", "percent": pct})
 
     def _drain_stderr():
         assert proc.stderr is not None
+        line_buf = ""
         for chunk in iter(lambda: proc.stderr.read(4096), b""):
             if _stop_stderr.is_set():
                 break
             stderr_chunks.append(chunk)
+            if not track_encode:
+                continue
+            line_buf += chunk.decode(errors="ignore")
+            while "\n" in line_buf:
+                line, line_buf = line_buf.split("\n", 1)
+                line = line.strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        _emit_encode_progress(int(line.split("=", 1)[1]))
+                    except ValueError:
+                        pass
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
@@ -557,6 +601,17 @@ def _build_ydl_opts(
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
 
+        def _postprocessor_hook(d: dict) -> None:
+            status = d.get("status")
+            if status == "started":
+                progress_hook({"status": "postprocessing", "percent": 92})
+            elif status == "processing":
+                progress_hook({"status": "postprocessing", "percent": 95})
+            elif status == "finished":
+                progress_hook({"status": "postprocessing", "percent": 98})
+
+        opts["postprocessor_hooks"] = [_postprocessor_hook]
+
     if throttle_kib is not None and throttle_kib > 0:
         opts["ratelimit"] = throttle_kib * 1024
 
@@ -904,6 +959,10 @@ def _concat_and_trim(
         cancel_event=cancel_event,
         pause_event=pause_event,
         register_abort=register_abort,
+        progress_hook=progress_hook,
+        encode_duration=duration,
+        progress_from=92.0,
+        progress_to=98.0,
     )
     _verify_output_file(tmp_out)
 

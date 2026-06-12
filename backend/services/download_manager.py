@@ -370,6 +370,7 @@ class DownloadManager:
             self._abort_fns.pop(download_id, None)
             self._cleanup_info.pop(download_id, None)
             self._worker_params.pop(download_id, None)
+            self._sse_queues.pop(download_id, None)
         self._notify_sse(download_id, "status", "Cancelled")
         return True
 

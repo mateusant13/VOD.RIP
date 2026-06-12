@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -435,7 +436,14 @@ def _reveal_path_windows(target: str) -> None:
 
 def _open_folder_sync(path: str) -> None:
     """Reveal a file in Explorer, or open its parent folder (e.g. in-progress downloads)."""
-    p = Path(path).expanduser()
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("path is required")
+    p = Path(raw).expanduser()
+    for _ in range(12):
+        if p.exists():
+            break
+        time.sleep(0.25)
     if p.exists():
         target = str(p.resolve())
         if os.name == "nt":
@@ -671,14 +679,10 @@ async def preview_delete_session(session_id: str):
 @app.post("/api/open-folder")
 async def open_folder(req: OpenFolderRequest, background_tasks: BackgroundTasks):
     """Open Explorer/Finder on a download path. Returns immediately (non-blocking)."""
-    try:
-        normalized = _validate_open_folder_path(req.path)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    background_tasks.add_task(_open_folder_sync, normalized)
+    raw = (req.path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="path is required")
+    background_tasks.add_task(_open_folder_sync, raw)
     return {"ok": True}
 
 # --- Channel Videos ---
