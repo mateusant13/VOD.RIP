@@ -749,6 +749,24 @@ def _select_segments(
     return selected, first_offset
 
 
+_SEGMENT_CONNECT_TIMEOUT = 15
+_SEGMENT_READ_TIMEOUT = 60
+_SEGMENT_STALL_SECONDS = 90
+
+
+def _iter_response_chunks(response, chunk_size: int, stall_seconds: float):
+    """Yield response chunks; abort when no bytes arrive for *stall_seconds*."""
+    deadline = time.monotonic() + stall_seconds
+    for chunk in response.iter_content(chunk_size):
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"HLS segment download stalled (>{stall_seconds:.0f}s without data)"
+            )
+        if chunk:
+            deadline = time.monotonic() + stall_seconds
+        yield chunk
+
+
 def _download_one_segment(
     index: int,
     seg: dict,
@@ -760,10 +778,15 @@ def _download_one_segment(
     _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
-    r = requests.get(seg["url"], headers=headers, stream=True, timeout=60)
+    r = requests.get(
+        seg["url"],
+        headers=headers,
+        stream=True,
+        timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
+    )
     r.raise_for_status()
     with open(path, "wb") as f:
-        for chunk in r.iter_content(256 * 1024):
+        for chunk in _iter_response_chunks(r, 256 * 1024, _SEGMENT_STALL_SECONDS):
             _check_pause_cancel(cancel_event, pause_event)
             if chunk:
                 f.write(chunk)

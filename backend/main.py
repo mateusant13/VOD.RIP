@@ -575,13 +575,12 @@ async def preview_hls_resource(
     session_id: str,
     request: Request,
     id: Optional[str] = None,
-    u: Optional[str] = None,
 ):
     range_header = request.headers.get("range")
     try:
         upstream = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: resolve_upstream(session_id, id, unquote(u) if u else None),
+            lambda: resolve_upstream(session_id, id),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

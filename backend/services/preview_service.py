@@ -790,21 +790,17 @@ def set_session_prefer_height(session_id: str, prefer_height: int) -> PreviewSes
     raise ValueError("No preview variant for requested height")
 
 
-def resolve_upstream(session_id: str, resource_id: Optional[str], raw_url: Optional[str]) -> str:
+def resolve_upstream(session_id: str, resource_id: Optional[str]) -> str:
+    """Resolve a preview resource URL — only IDs registered in session.resource_map."""
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
-    if resource_id:
-        upstream = session.resource_map.get(resource_id)
-        if not upstream:
-            raise ValueError("Unknown preview resource")
-        return upstream
-    if raw_url and raw_url.startswith("http"):
-        host = urlparse(raw_url).hostname or ""
-        if not _host_allowed(host, session):
-            raise PermissionError(f"URL host not allowed for preview: {host}")
-        return raw_url
-    raise ValueError("Missing preview resource id")
+    if not resource_id:
+        raise ValueError("Missing preview resource id")
+    upstream = session.resource_map.get(resource_id)
+    if not upstream:
+        raise ValueError("Unknown preview resource")
+    return upstream
 
 def get_master_playlist(session_id: str) -> str:
     session = get_session(session_id)

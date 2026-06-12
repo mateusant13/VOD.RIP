@@ -34,6 +34,7 @@ import {
   suggestClipDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
+import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
 import { useViewportTier } from './useViewportTier';
 
@@ -689,8 +690,6 @@ const EXPLORE_POPUP_Z = 9999;
 const MAX_EXPLORE_POPUPS = 5;
 const LAYOUT_ROW_GAP_TRIPLE = 12;
 const LAYOUT_ROW_GAP_SPLIT = 24;
-const CARD_BORDER_PX = 2;
-
 function panelMaxHeight() {
   return Math.round(window.innerHeight * 0.92);
 }
@@ -823,13 +822,6 @@ function edgeAffectsNorth(edge: ResizeEdge): boolean {
   return edge === 'n' || edge === 'ne' || edge === 'nw';
 }
 
-/** Distance from panel padding edge to outer colored shadow corner (border + shadow offset). */
-function panelResizeHandleInset(compact: boolean): number {
-  return CARD_BORDER_PX + (compact ? 4 : 6);
-}
-
-type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
-
 const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {
   n: 'ns-resize',
   s: 'ns-resize',
@@ -869,38 +861,6 @@ function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: nu
     case 'nw': return Math.max(-dx, -dy * aspect);
     default: return dx;
   }
-}
-
-function PanelResizeHandles({
-  onPointerDown,
-  insetPx,
-}: {
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => void;
-  insetPx: number;
-}) {
-  const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
-  const edgePad = 12;
-
-  const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string, sizeClass = '') => ({
-    'data-panel-resize': true as const,
-    'aria-hidden': true as const,
-    onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => onPointerDown(e, edge),
-    style: { ...style, touchAction: 'none' },
-    className: `${hit} cursor-default ${hoverCursorClass} ${sizeClass}`.trim(),
-  });
-
-  return (
-    <>
-      <div {...edgeProps('n', { top: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('w', { left: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('nw', { top: -insetPx, left: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
-      <div {...edgeProps('ne', { top: -insetPx, right: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('sw', { bottom: -insetPx, left: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('se', { bottom: -insetPx, right: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
-    </>
-  );
 }
 
 function applyPanelSize(el: HTMLElement, size: PanelSize) {
