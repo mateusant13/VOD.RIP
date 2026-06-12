@@ -4366,14 +4366,7 @@ export default function App() {
         >
           <Scissors size={18} />
         </button>
-        {opts.fsCornerExit ? (
-          <button type="button" onClick={() => void togglePreviewFullscreen()}
-            disabled={!previewVideoReady}
-            className={previewCtrlBtn(previewFullscreen, true)}
-            title="Exit fullscreen">
-            <Minimize2 size={18} />
-          </button>
-        ) : (
+        {opts.fsCornerExit ? null : (
           <button type="button" onClick={() => void togglePreviewFullscreen()}
             disabled={!previewVideoReady}
             className={previewCtrlBtn(previewFullscreen, true)}
@@ -4454,7 +4447,7 @@ export default function App() {
               onFocus={focusPreviewPlayer}
               className={`preview-fs-host outline-none focus:ring-2 focus:ring-white/30 bg-black overflow-hidden ${
                 previewFullscreen
-                  ? 'border-0'
+                  ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
             >
@@ -4507,6 +4500,23 @@ export default function App() {
                   {previewTimelineUi}
                   {previewTransportUi({ fsCornerExit: true })}
                 </div>
+              )}
+              {previewFullscreen && (
+              <div
+                className="absolute bottom-0 right-0 z-20 cursor-pointer"
+                title="Exit fullscreen"
+              >
+                <div className="relative w-10 h-10">
+                  <button
+                    type="button"
+                    disabled={!previewVideoReady}
+                    className="absolute bottom-0 right-0 p-1.5 text-zinc-100/80 hover:text-white hover:bg-black/20 disabled:opacity-30"
+                    onClick={() => void togglePreviewFullscreen()}
+                  >
+                    <Minimize2 size={18} />
+                  </button>
+                </div>
+              </div>
               )}
             </div>
             {!previewFullscreen && (
