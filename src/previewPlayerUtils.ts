@@ -35,10 +35,46 @@ export function resolvePreviewPlayback(
   return { url, kind: progressive ? 'progressive' : 'hls' };
 }
 
+/** Append prefer_height (and cache-bust) so the proxy switches tier on the same request. */
+export function previewUrlWithPreferHeight(baseUrl: string, height: number): string {
+  try {
+    const u = new URL(baseUrl, window.location.origin);
+    u.searchParams.set('prefer_height', String(height));
+    u.searchParams.set('t', String(Date.now()));
+    return `${u.pathname}${u.search}`;
+  } catch {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    return `${baseUrl}${sep}prefer_height=${height}&t=${Date.now()}`;
+  }
+}
+
+/** Strip cache-bust only — keep prefer_height so tier changes still reload. */
+export function progressivePlaybackUrlKey(playbackUrl: string): string {
+  try {
+    const u = new URL(playbackUrl, 'http://vod-rip.local');
+    u.searchParams.delete('t');
+    return `${u.pathname}${u.search}`;
+  } catch {
+    return playbackUrl.replace(/([?&])t=\d+(&?)/, (_m, lead, tail) => (tail ? lead : ''));
+  }
+}
+
 /** Load proxied MP4 into a <video> — use <source type="video/mp4"> so .m3u8 paths still play. */
 export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: string, startTime?: number): void {
   if (!isValidPreviewUrl(playbackUrl)) {
     throw new Error(`Blocked playback URL with disallowed protocol: ${playbackUrl.slice(0, 80)}`);
+  }
+  const existingSource = video.querySelector('source');
+  const existingUrl = existingSource?.getAttribute('src') ?? video.currentSrc;
+  if (
+    existingUrl
+    && progressivePlaybackUrlKey(existingUrl) === progressivePlaybackUrlKey(playbackUrl)
+    && video.readyState >= HTMLMediaElement.HAVE_METADATA
+  ) {
+    if (startTime != null && Number.isFinite(startTime) && Math.abs(video.currentTime - startTime) > 0.25) {
+      video.currentTime = startTime;
+    }
+    return;
   }
   video.innerHTML = '';
   video.removeAttribute('src');
@@ -383,12 +419,27 @@ export async function resolveProgressivePreviewLevelsAsync(
   return { ...result, qualityLabels };
 }
 
+export interface HlsLevelController {
+  levels: unknown[];
+  currentLevel: number;
+  nextLevel: number;
+  loadLevel: number;
+  autoLevelCapping?: number;
+  config?: { capLevelToPlayerSize?: boolean };
+}
+
+/** Switch HLS quality — immediate uses currentLevel (same fragment), else next segment. */
 export function applyHlsQualityLevel(
-  hls: { levels: unknown[]; loadLevel: number; nextLevel: number },
+  hls: HlsLevelController,
   levelIndex: number,
-  forceLoad = false,
+  immediate = false,
 ): void {
   if (levelIndex < 0 || levelIndex >= hls.levels.length) return;
-  if (forceLoad) hls.loadLevel = levelIndex;
-  else hls.nextLevel = levelIndex;
+  if (immediate) {
+    if (hls.config) hls.config.capLevelToPlayerSize = false;
+    if (typeof hls.autoLevelCapping === 'number') hls.autoLevelCapping = -1;
+    hls.currentLevel = levelIndex;
+    return;
+  }
+  hls.nextLevel = levelIndex;
 }

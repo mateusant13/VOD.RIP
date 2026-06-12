@@ -17,6 +17,7 @@ import {
   PREVIEW_MAIN_DEFAULT_HEIGHT,
   applyHlsQualityLevel,
   attachProgressivePreview,
+  previewUrlWithPreferHeight,
   detachProgressivePreview,
   initialPreviewPreferHeight,
   levelIndexForHeight,
@@ -679,7 +680,7 @@ const PREVIEW_PANEL_MIN_W = 280;
 const PREVIEW_PANEL_CHROME_H_EST = 120;
 const PREVIEW_PANEL_PAD_H = 32;
 const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
-const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 384 };
+const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
 const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
 const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 
@@ -1739,6 +1740,8 @@ export default function App() {
   const previewGenRef = useRef(0);
   /** True while a preview is active (loaded or loading) — blocks re-clicks. */
   const previewStartedRef = useRef(false);
+  /** URL currently loaded in the preview player (may differ from `url` while browsing channel VODs). */
+  const previewLoadedUrlRef = useRef<string | null>(null);
   const previewTrimStartRef = useRef(0);
   const previewTrimEndRef = useRef(3600);
   const previewSessionMetaRef = useRef<{
@@ -2018,6 +2021,7 @@ export default function App() {
   const resetPreview = useCallback(async () => {
     previewGenRef.current += 1; // cancel any in-flight openPreview
     previewStartedRef.current = false;
+    previewLoadedUrlRef.current = null;
     const sid = previewSessionId;
     destroyPreviewPlayer();
     setPreviewOpen(false);
@@ -2059,8 +2063,9 @@ export default function App() {
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
     if (trimEndSec <= trimStartSec) return;
-    // Already started — no-op on re-click (uses ref to avoid closure staleness)
-    if (previewStartedRef.current) return;
+    const trimmedUrl = url.trim();
+    // Already showing this URL — no-op on re-click (uses refs to avoid closure staleness)
+    if (previewStartedRef.current && previewLoadedUrlRef.current === trimmedUrl) return;
     previewStartedRef.current = true;
 
     // Cancel any previously in-flight openPreview
@@ -2149,7 +2154,10 @@ export default function App() {
         qualityLabels: mergedQualityLabels,
         activeHeight,
       });
+      previewLoadedUrlRef.current = trimmedUrl;
     } catch (err: any) {
+      previewStartedRef.current = false;
+      previewLoadedUrlRef.current = null;
       setError(err.message || 'Preview failed');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
@@ -2419,10 +2427,12 @@ export default function App() {
 
   const applyPreviewPlaybackHeight = useCallback(async (
     playbackHeight: number,
-    forceLoad = false,
+    opts?: boolean | { userInitiated?: boolean },
   ) => {
     if (!playbackHeight || playbackHeight === previewAppliedHeightRef.current) return;
     previewAppliedHeightRef.current = playbackHeight;
+
+    const userInitiated = typeof opts === 'boolean' ? opts : (opts?.userInitiated ?? false);
 
     const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
     const level = previewLevels[menuIndex];
@@ -2430,17 +2440,28 @@ export default function App() {
 
     const video = previewVideoRef.current;
     const wasPaused = video?.paused ?? true;
+    const savedTime = video?.currentTime ?? previewTrimStartRef.current;
+
+    const syncSessionQuality = () => apiPost(
+      `/api/preview/session/${previewSessionId}/quality`,
+      { prefer_height: playbackHeight },
+    );
 
     if (previewPlayback?.kind === 'progressive' && previewSessionId) {
+      if (!video || !previewPlayback.url) return;
       try {
-        await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
-          prefer_height: playbackHeight,
-        });
-        if (video && previewPlayback.url) {
-          const bust = `t=${Date.now()}`;
-          const sep = previewPlayback.url.includes('?') ? '&' : '?';
-          attachProgressivePreview(video, `${previewPlayback.url}${sep}${bust}`);
-          if (!wasPaused) void video.play().catch(() => {});
+        const targetUrl = userInitiated
+          ? previewUrlWithPreferHeight(previewPlayback.url, playbackHeight)
+          : `${previewPlayback.url}${previewPlayback.url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+        attachProgressivePreview(video, targetUrl, savedTime);
+        if (!wasPaused) void video.play().catch(() => {});
+        if (userInitiated) {
+          void syncSessionQuality().catch((err: unknown) => {
+            previewAppliedHeightRef.current = 0;
+            setError(err instanceof Error ? err.message : 'Could not change preview quality');
+          });
+        } else {
+          await syncSessionQuality();
         }
       } catch (err: unknown) {
         previewAppliedHeightRef.current = 0;
@@ -2457,22 +2478,35 @@ export default function App() {
     const hlsLevel = hls.levels[hlsIndex];
     const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
     const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
+    const playbackUrl = previewPlayback?.url ?? '';
 
-    if (needsApiSwitch && previewSessionId) {
+    if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
+      applyHlsQualityLevel(hls, hlsIndex, true);
+      return;
+    }
+
+    if (needsApiSwitch && previewSessionId && playbackUrl) {
       try {
-        await apiPost(`/api/preview/session/${previewSessionId}/quality`, {
-          prefer_height: playbackHeight,
-        });
-        hls.loadSource(previewPlayback?.url ?? hls.url ?? '');
-        hls.startLoad();
+        if (userInitiated) {
+          hls.loadSource(previewUrlWithPreferHeight(playbackUrl, playbackHeight));
+          hls.startLoad(savedTime);
+          void syncSessionQuality().catch((err: unknown) => {
+            previewAppliedHeightRef.current = 0;
+            setError(err instanceof Error ? err.message : 'Could not change preview quality');
+          });
+        } else {
+          await syncSessionQuality();
+          hls.loadSource(playbackUrl);
+          hls.startLoad();
+        }
       } catch (err: unknown) {
         previewAppliedHeightRef.current = 0;
         const msg = err instanceof Error ? err.message : 'Could not change preview quality';
         setError(msg);
       }
     } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-      applyHlsQualityLevel(hls, hlsIndex, forceLoad);
-      if (wasPaused && video) {
+      applyHlsQualityLevel(hls, hlsIndex, userInitiated);
+      if (!userInitiated && wasPaused && video) {
         previewSuppressPlayRef.current = true;
         requestAnimationFrame(() => {
           video.pause();
@@ -2487,6 +2521,8 @@ export default function App() {
     fullscreenOverride?: boolean,
   ) => {
     if (!previewVideoReady || !previewLevels.length) return;
+    // Progressive clips are a single MP4 — viewport sync only reloads and causes black flashes.
+    if (previewPlayback?.kind === 'progressive') return;
     const requested = previewRequestedHeightRef.current
       || previewLevels[previewQualityLevel]?.height
       || PREVIEW_MAIN_DEFAULT_HEIGHT;
@@ -2505,6 +2541,7 @@ export default function App() {
     previewLevels,
     previewQualityLevel,
     previewVideoReady,
+    previewPlayback?.kind,
   ]);
 
   const applyPreviewQuality = useCallback(async (levelIndex: number) => {
@@ -2513,9 +2550,8 @@ export default function App() {
     previewRequestedHeightRef.current = level.height;
     setPreviewQualityLevel(levelIndex);
     setPreviewQualityMenuOpen(false);
-    previewAppliedHeightRef.current = 0;
-    await syncPreviewPlaybackToViewport();
-  }, [previewLevels, syncPreviewPlaybackToViewport]);
+    await applyPreviewPlaybackHeight(level.height, { userInitiated: true });
+  }, [previewLevels, applyPreviewPlaybackHeight]);
 
   const skipPreview = useCallback((deltaSec: number) => {
     const video = previewVideoRef.current;
@@ -2890,7 +2926,9 @@ export default function App() {
       const fs = document.fullscreenElement === previewContainerRef.current;
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
-      void syncPreviewPlaybackToViewport(true, fs);
+      requestAnimationFrame(() => {
+        void syncPreviewPlaybackToViewport(false, fs);
+      });
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
@@ -2898,7 +2936,7 @@ export default function App() {
 
   useEffect(() => {
     if (!previewOpen || !previewVideoReady || previewFullscreen) return;
-    previewAppliedHeightRef.current = 0;
+    if (previewPlayback?.kind === 'progressive') return;
     void syncPreviewPlaybackToViewport();
   }, [
     previewOpen,
@@ -2906,6 +2944,7 @@ export default function App() {
     previewFullscreen,
     previewPanelWidth,
     previewVideoAspect,
+    previewPlayback?.kind,
     syncPreviewPlaybackToViewport,
   ]);
 
@@ -3033,9 +3072,11 @@ export default function App() {
       aspect,
       { ...layout, previewOpen: true },
     );
-    previewPanelWidthRef.current = clampedW;
-    setPreviewPanelWidth(clampedW);
-    if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, clampedW);
+    if (document.fullscreenElement !== previewContainerRef.current) {
+      previewPanelWidthRef.current = clampedW;
+      setPreviewPanelWidth(clampedW);
+      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, clampedW);
+    }
   }, [layoutBoundsInput]);
 
   const applyLayoutPanelClamps = useCallback(() => {
@@ -3126,14 +3167,14 @@ export default function App() {
       const end = Math.max(1, videoInfoDurationSec(info));
       trimStartSecRef.current = 0;
       trimEndSecRef.current = end;
-      previewTrimStartRef.current = 0;
-      previewTrimEndRef.current = end;
       setTrimStartSec(0);
       setTrimEndSec(end);
-      setPreviewTrimStart(0);
-      setPreviewTrimEnd(end);
       // Keep the current preview playing until the user hits Preview on the new VOD.
       if (!previewOpen) {
+        previewTrimStartRef.current = 0;
+        previewTrimEndRef.current = end;
+        setPreviewTrimStart(0);
+        setPreviewTrimEnd(end);
         void resetPreview();
       }
     } catch (err: any) {
@@ -3847,9 +3888,8 @@ export default function App() {
     setChannelVodPanelOpen(true);
     setUrlTabBarHidden(true);
     setPreviewChannelBadge(badge ?? null);
-    void resetPreview();
     void fetchVideoInfo(vodUrl);
-  }, [fetchVideoInfo, resetPreview]);
+  }, [fetchVideoInfo]);
 
   const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
     selectVod(vod.url, {
@@ -4450,7 +4490,7 @@ export default function App() {
                 }, PREVIEW_FS_CONTROLS_HIDE_MS);
               } : undefined}
               onFocus={focusPreviewPlayer}
-              className={`preview-fs-host outline-none focus:ring-2 focus:ring-white/30 bg-black overflow-hidden ${
+              className={`preview-fs-host outline-none focus:ring-2 focus:ring-white/30 bg-black overflow-hidden flex flex-col ${
                 previewFullscreen
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
@@ -4458,7 +4498,7 @@ export default function App() {
             >
               <div
                 className={`relative bg-black overflow-hidden cursor-pointer ${
-                  previewFullscreen ? 'absolute inset-0 z-0' : 'w-full h-full'
+                  previewFullscreen ? 'absolute inset-0 z-0' : 'w-full shrink-0'
                 }`}
                 style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
                 onClick={() => {
@@ -4488,24 +4528,26 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {previewFullscreen && (
-                <div
-                  ref={previewControlsRef}
-                  data-player-controls
-                  data-preview-fs-ui
-                  style={{ '--preview-fs-scale': previewFsUiScale } as CSSProperties}
-                  className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
-                    previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                  }`}
-                  onClick={(e) => e.stopPropagation()}
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onPointerUp={(e) => e.stopPropagation()}
-                  onMouseMove={bumpPreviewFsControls}
-                >
-                  {previewTimelineUi}
-                  {previewTransportUi({ fsCornerExit: true })}
-                </div>
-              )}
+              <div
+                ref={previewControlsRef}
+                data-player-controls
+                data-preview-fs-ui={previewFullscreen ? '' : undefined}
+                style={previewFullscreen ? ({ '--preview-fs-scale': previewFsUiScale } as CSSProperties) : undefined}
+                className={
+                  previewFullscreen
+                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                      previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                    }`
+                    : 'flex flex-col gap-1.5 w-full shrink-0'
+                }
+                onClick={previewFullscreen ? (e) => e.stopPropagation() : undefined}
+                onPointerDown={previewFullscreen ? (e) => e.stopPropagation() : undefined}
+                onPointerUp={previewFullscreen ? (e) => e.stopPropagation() : undefined}
+                onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
+              >
+                {previewTimelineUi}
+                {previewTransportUi({ fsCornerExit: previewFullscreen })}
+              </div>
               {previewFullscreen && (
                 <div
                   className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"
@@ -4514,15 +4556,6 @@ export default function App() {
                 />
               )}
             </div>
-            {!previewFullscreen && (
-              <div
-                ref={previewControlsRef}
-                className="flex flex-col gap-1.5 w-full shrink-0"
-              >
-                {previewTimelineUi}
-                {previewTransportUi({ fsCornerExit: false })}
-              </div>
-            )}
           </div>
           {!previewFullscreen && (
             <PanelResizeHandles onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />

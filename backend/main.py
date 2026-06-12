@@ -529,8 +529,8 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
 @app.post("/api/preview/session/{session_id}/quality")
 async def preview_set_quality(session_id: str, req: PreviewQualityUpdateRequest):
     try:
-        session = await asyncio.get_event_loop().run_in_executor(
-            None,
+        session = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR,
             lambda: set_session_prefer_height(session_id, req.prefer_height),
         )
         return _preview_session_response(session)
@@ -540,10 +540,28 @@ async def preview_set_quality(session_id: str, req: PreviewQualityUpdateRequest)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _preview_master_response(session_id: str, range_header: Optional[str]) -> Response:
+async def _preview_apply_prefer_height(session_id: str, prefer_height: Optional[int]) -> None:
+    if not prefer_height or prefer_height <= 0:
+        return
     try:
-        data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
-            None, proxy_master, session_id, range_header
+        await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR,
+            lambda: set_session_prefer_height(session_id, prefer_height),
+        )
+    except ValueError:
+        pass
+
+
+async def _preview_master_response(
+    session_id: str,
+    range_header: Optional[str],
+    prefer_height: Optional[int] = None,
+) -> Response:
+    if prefer_height:
+        await _preview_apply_prefer_height(session_id, prefer_height)
+    try:
+        data, ctype, extra_headers, status = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR, proxy_master, session_id, range_header
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -562,15 +580,34 @@ async def _preview_master_response(session_id: str, range_header: Optional[str])
     )
 
 
+def _parse_prefer_height_query(request: Request) -> Optional[int]:
+    raw = request.query_params.get("prefer_height")
+    if not raw:
+        return None
+    try:
+        height = int(raw)
+    except ValueError:
+        return None
+    return height if height > 0 else None
+
+
 @app.get("/api/preview/hls/{session_id}/master.m3u8")
 async def preview_hls_master(session_id: str, request: Request):
-    return await _preview_master_response(session_id, request.headers.get("range"))
+    return await _preview_master_response(
+        session_id,
+        request.headers.get("range"),
+        _parse_prefer_height_query(request),
+    )
 
 
 @app.get("/api/preview/hls/{session_id}/stream.mp4")
 async def preview_stream_mp4(session_id: str, request: Request):
     """Progressive MP4 proxy (Twitch clips) — same bytes as master, .mp4 URL for <video>."""
-    return await _preview_master_response(session_id, request.headers.get("range"))
+    return await _preview_master_response(
+        session_id,
+        request.headers.get("range"),
+        _parse_prefer_height_query(request),
+    )
 
 @app.get("/api/preview/hls/{session_id}/resource")
 async def preview_hls_resource(

@@ -21,6 +21,7 @@ import {
   resolvePreviewPlayback,
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
+  previewUrlWithPreferHeight,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
@@ -315,9 +316,14 @@ export default function ChannelExplorePopup({
     [],
   );
 
-  const applyPlaybackHeight = useCallback(async (playbackHeight: number) => {
+  const applyPlaybackHeight = useCallback(async (
+    playbackHeight: number,
+    opts?: boolean | { userInitiated?: boolean },
+  ) => {
     if (!playbackHeight || playbackHeight === appliedHeightRef.current) return;
     appliedHeightRef.current = playbackHeight;
+
+    const userInitiated = typeof opts === 'boolean' ? opts : (opts?.userInitiated ?? false);
 
     const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
     const level = previewLevels[menuIndex];
@@ -325,17 +331,29 @@ export default function ChannelExplorePopup({
 
     const video = videoRef.current;
     const wasPaused = video?.paused ?? true;
+    const savedTime = video?.currentTime ?? 0;
+    const sessionId = sessionIdRef.current;
 
-    if (playback?.kind === 'progressive' && sessionIdRef.current) {
+    const syncSessionQuality = () => apiPost(
+      `/api/preview/session/${sessionId}/quality`,
+      { prefer_height: playbackHeight },
+    );
+
+    if (playback?.kind === 'progressive' && sessionId) {
+      if (!video || !playback.url) return;
       try {
-        await apiPost(`/api/preview/session/${sessionIdRef.current}/quality`, {
-          prefer_height: playbackHeight,
-        });
-        if (video && playback.url) {
-          const bust = `t=${Date.now()}`;
-          const sep = playback.url.includes('?') ? '&' : '?';
-          attachProgressivePreview(video, `${playback.url}${sep}${bust}`);
-          if (!wasPaused) void video.play().catch(() => {});
+        const targetUrl = userInitiated
+          ? previewUrlWithPreferHeight(playback.url, playbackHeight)
+          : `${playback.url}${playback.url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+        attachProgressivePreview(video, targetUrl, savedTime);
+        if (!wasPaused) void video.play().catch(() => {});
+        if (userInitiated) {
+          void syncSessionQuality().catch((err: unknown) => {
+            appliedHeightRef.current = 0;
+            setError(err instanceof Error ? err.message : 'Could not change preview quality');
+          });
+        } else {
+          await syncSessionQuality();
         }
       } catch (err: unknown) {
         appliedHeightRef.current = 0;
@@ -351,21 +369,34 @@ export default function ChannelExplorePopup({
     const hlsLevel = hls.levels[hlsIndex];
     const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
     const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
+    const playbackUrl = playback?.url ?? '';
 
-    if (needsApiSwitch && sessionIdRef.current) {
+    if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
+      applyHlsQualityLevel(hls, hlsIndex, true);
+      return;
+    }
+
+    if (needsApiSwitch && sessionId && playbackUrl) {
       try {
-        await apiPost(`/api/preview/session/${sessionIdRef.current}/quality`, {
-          prefer_height: playbackHeight,
-        });
-        hls.loadSource(playback?.url ?? hls.url ?? '');
-        hls.startLoad();
+        if (userInitiated) {
+          hls.loadSource(previewUrlWithPreferHeight(playbackUrl, playbackHeight));
+          hls.startLoad(savedTime);
+          void syncSessionQuality().catch((err: unknown) => {
+            appliedHeightRef.current = 0;
+            setError(err instanceof Error ? err.message : 'Could not change preview quality');
+          });
+        } else {
+          await syncSessionQuality();
+          hls.loadSource(playbackUrl);
+          hls.startLoad();
+        }
       } catch (err: unknown) {
         appliedHeightRef.current = 0;
         setError(err instanceof Error ? err.message : 'Could not change preview quality');
       }
     } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-      applyHlsQualityLevel(hls, hlsIndex);
-      if (wasPaused && video) {
+      applyHlsQualityLevel(hls, hlsIndex, userInitiated);
+      if (!userInitiated && wasPaused && video) {
         suppressPlayRef.current = true;
         requestAnimationFrame(() => {
           video.pause();
@@ -402,8 +433,8 @@ export default function ChannelExplorePopup({
     requestedHeightRef.current = level.height;
     setQualityLevel(levelIndex);
     setQualityMenuOpen(false);
-    await syncPlaybackToViewport();
-  }, [previewLevels, syncPlaybackToViewport]);
+    await applyPlaybackHeight(level.height, { userInitiated: true });
+  }, [previewLevels, applyPlaybackHeight]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
