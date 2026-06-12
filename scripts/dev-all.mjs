@@ -7,7 +7,6 @@ import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pyDir = path.join(root, "backend");
-const shell = process.platform === "win32";
 const apiPort = process.env.PORT || "7897";
 
 const children = [];
@@ -36,8 +35,8 @@ function releasePort(port) {
       `python -c "from services.server_lifecycle import release_api_port; release_api_port(${port})"`,
       { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(port) } },
     );
-  } catch {
-    console.warn(`[api] could not fully release port :${port} — close the old API manually if needed`);
+  } catch (err) {
+    console.warn(`[api] port :${port} release failed:`, err?.message || err);
   }
 }
 
@@ -45,7 +44,7 @@ function start(label, command, args, cwd) {
   const child = spawn(command, args, {
     cwd,
     stdio: "inherit",
-    shell,
+    shell: false,
     env: { ...process.env, PORT: apiPort },
   });
   child.on("exit", (code, signal) => {
@@ -63,7 +62,10 @@ function shutdown(code = 0) {
   for (const child of children) {
     try {
       if (process.platform === "win32") {
-        spawn("taskkill", ["/PID", String(child.pid), "/T"], { shell: true });
+        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
       } else {
         child.kill("SIGTERM");
       }
@@ -98,7 +100,7 @@ async function main() {
   console.log("Open UI at    -> http://localhost:5173");
   console.log("(Ctrl+C stops both)\n");
 
-  start("web", shell ? "npx.cmd" : "npx", ["vite"], root);
+  start("web", process.platform === "win32" ? "npx.cmd" : "npx", ["vite"], root);
 }
 
 main().catch((err) => {

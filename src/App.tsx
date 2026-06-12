@@ -1336,6 +1336,29 @@ function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips'): Record
   return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? ch.errors ?? {});
 }
 
+function formatChannelErrorMessage(
+  ch: SavedChannel,
+  mode: 'vods' | 'clips',
+  kickEnabled: boolean,
+  twitchEnabled: boolean,
+): string | null {
+  if (ch.loading) return null;
+  const errs = channelPlatformErrors(ch, mode);
+  const errKeys = Object.keys(errs).filter((k) => {
+    if (!errs[k]) return false;
+    if (k === 'Kick' && !kickEnabled) return false;
+    if (k === 'Twitch' && !twitchEnabled) return false;
+    return true;
+  });
+  if (errKeys.length === 0) return null;
+  const hasItems = mode === 'clips'
+    ? (ch.clipVideos?.length ?? 0) > 0
+    : (ch.vodVideos?.length ?? 0) > 0;
+  return hasItems
+    ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
+    : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ');
+}
+
 function loadSavedChannels(): SavedChannel[] {
   try {
     const raw = localStorage.getItem(CHANNELS_STORAGE_KEY);
@@ -1906,7 +1929,7 @@ export default function App() {
   const [editingChannelName, setEditingChannelName] = useState('');
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
-  const [channelsError, setChannelsError] = useState<string | null>(null);
+  const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
@@ -3475,8 +3498,6 @@ export default function App() {
       setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
       setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
     }
-    if (!incremental) setChannelsError(null);
-
     const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
 
@@ -3577,20 +3598,6 @@ export default function App() {
         });
       }
 
-      const errKeys = Object.keys(errs).filter((k) => errs[k]);
-      if (errKeys.length && !incremental) {
-        const cachedCount = mode === 'clips'
-          ? (ch.clipVideos?.length ?? 0)
-          : (ch.vodVideos?.length ?? 0);
-        const hasItems = incoming.length > 0 || cachedCount > 0;
-        setChannelsError(
-          hasItems
-            ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
-            : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
-        );
-      } else if (!incremental && errKeys.length === 0) {
-        setChannelsError(null);
-      }
     } finally {
       if (!incremental) {
         updateChannel(channelId, { loading: false });
@@ -3620,44 +3627,14 @@ export default function App() {
     void refreshChannel(selectedChannelId, ch, 'clips');
   }, [channelContentFilter, selectedChannelId, savedChannels, refreshChannel]);
 
-  // Show platform errors for the active filter only (not stale VOD errors on clips tab).
-  useEffect(() => {
-    if (!selectedChannel) {
-      setChannelsError(null);
-      return;
-    }
-    if (selectedChannel.loading) {
-      setChannelsError(null);
-      return;
-    }
-    const errs = channelPlatformErrors(selectedChannel, channelContentFilter);
-    const errKeys = Object.keys(errs).filter((k) => {
-      if (!errs[k]) return false;
-      if (k === 'Kick' && !kickEnabled) return false;
-      if (k === 'Twitch' && !twitchEnabled) return false;
-      return true;
-    });
-    if (errKeys.length === 0) {
-      setChannelsError(null);
-      return;
-    }
-    const hasItems = channelContentFilter === 'clips'
-      ? (selectedChannel.clipVideos?.length ?? 0) > 0
-      : (selectedChannel.vodVideos?.length ?? 0) > 0;
-    setChannelsError(
-      hasItems
-        ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
-        : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | '),
-    );
-  }, [selectedChannel, channelContentFilter, kickEnabled, twitchEnabled]);
-
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
     if (!raw) return;
     if (savedChannels.length >= MAX_SAVED_CHANNELS) {
-      setChannelsError(`Max ${MAX_SAVED_CHANNELS} channels.`);
+      setAddChannelNotice(`Max ${MAX_SAVED_CHANNELS} channels.`);
       return;
     }
+    setAddChannelNotice(null);
     const { displayName, kickSlug, twitchSlug } = parseChannelInput(raw);
     if (!kickSlug) return;
     const id = `ch_${Date.now().toString(36)}`;
@@ -4675,6 +4652,9 @@ export default function App() {
                 <Plus size={14} />
               </button>
             </div>
+            {addChannelNotice && (
+              <p className="text-amber-400 text-[10px] font-mono">{addChannelNotice}</p>
+            )}
 
             {savedChannels.length > 0 && (
               <div ref={channelListRef} className="flex flex-col gap-1">
@@ -4818,7 +4798,6 @@ export default function App() {
                             onClick={() => {
                               if (channelContentFilter !== 'vods') {
                                 setChannelContentFilter('vods');
-                                setChannelsError(null);
                               }
                             }}
                             className={`px-2 py-0.5 border font-bold ${
@@ -4834,7 +4813,6 @@ export default function App() {
                             onClick={() => {
                               if (channelContentFilter !== 'clips') {
                                 setChannelContentFilter('clips');
-                                setChannelsError(null);
                               }
                             }}
                             className={`px-2 py-0.5 border font-bold ${
@@ -4847,9 +4825,17 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      {channelsError && (
-                        <p className="text-red-400 text-[10px] font-mono">{channelsError}</p>
-                      )}
+                      {(() => {
+                        const msg = formatChannelErrorMessage(
+                          ch,
+                          channelContentFilter,
+                          kickEnabled,
+                          twitchEnabled,
+                        );
+                        return msg ? (
+                          <p className="text-red-400 text-[10px] font-mono">{msg}</p>
+                        ) : null;
+                      })()}
                       {channelsLoading ? (
                         <div className="flex justify-center py-4 text-zinc-500">
                           <Loader2 size={18} className="animate-spin" />

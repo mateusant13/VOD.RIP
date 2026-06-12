@@ -17,10 +17,6 @@ _shutdown_event = threading.Event()
 _uvicorn_server: Any = None
 _server_lock = threading.Lock()
 
-# Only terminate listeners we own — avoids antivirus flags for killing arbitrary PIDs.
-_KILLABLE_IMAGE_NAMES = frozenset({"vod-rip.exe", "python.exe", "pythonw.exe"})
-
-
 def register_uvicorn_server(server: Any) -> None:
     global _uvicorn_server
     with _server_lock:
@@ -101,15 +97,6 @@ def _process_image_name(pid: int) -> Optional[str]:
         return None
 
 
-def _is_killable_listener(pid: int) -> bool:
-    if os.name != "nt":
-        return True
-    image = _process_image_name(pid)
-    if not image:
-        return False
-    return image.lower() in _KILLABLE_IMAGE_NAMES
-
-
 def _request_graceful_shutdown(port: int) -> bool:
     try:
         import requests
@@ -135,31 +122,18 @@ def _wait_for_port_free(port: int, *, skip_pid: Optional[int], timeout: float) -
 
 
 def _kill_pid(port: int, pid: int) -> None:
-    if os.name == "nt" and not _is_killable_listener(pid):
-        image = _process_image_name(pid)
-        _logger.warning(
-            "Port %s listener pid %s (%s) is not a VOD.RIP process — not killing (close it manually)",
-            port,
-            pid,
-            image or "unknown",
-        )
+    if pid == os.getpid():
         return
+    image = _process_image_name(pid) or "unknown"
     try:
         if os.name == "nt":
+            _logger.info("Stopping port %s listener pid %s (%s)", port, pid, image)
             subprocess.run(
-                ["taskkill", "/PID", str(pid)],
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
-                timeout=3,
+                timeout=5,
                 creationflags=_NO_WINDOW,
             )
-            time.sleep(0.25)
-            if _process_image_name(pid):
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(pid)],
-                    capture_output=True,
-                    timeout=3,
-                    creationflags=_NO_WINDOW,
-                )
         else:
             os.kill(pid, 15)
             time.sleep(0.25)
@@ -188,7 +162,7 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
     if not remaining:
         return
 
-    _logger.info("Releasing port %s — stopping VOD.RIP listener(s): %s", port, remaining)
+    _logger.info("Releasing port %s — stopping listener(s): %s", port, remaining)
     for pid in remaining:
         _kill_pid(port, pid)
 
