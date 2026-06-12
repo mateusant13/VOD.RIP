@@ -19,6 +19,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from zipfile import ZipFile, ZipInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -226,8 +227,8 @@ class UpdateChecker:
             shutil.rmtree(extract_dir, ignore_errors=True)
         extract_dir.mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(extract_dir)
+        with ZipFile(zip_path, "r") as archive:
+            _safe_extractall(archive, extract_dir)
 
         if sys.platform == "darwin":
             return self._apply_macos_zip(extract_dir, install_dir)
@@ -312,6 +313,23 @@ class UpdateChecker:
         script.chmod(0o755)
         subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
         os._exit(0)
+
+
+def _safe_extractall(archive: ZipFile, target: Path) -> None:
+    """Extract zip members while validating paths to prevent Zip Slip."""
+    for member in archive.infolist():
+        # Resolve the member path and ensure it stays inside target.
+        member_path = target.resolve() / member.filename
+        resolved = member_path.resolve()
+        if not str(resolved).startswith(str(target.resolve())):
+            raise SecurityError(
+                f"Zip member '{member.filename}' would extract outside target"
+            )
+    archive.extractall(target)
+
+
+class SecurityError(Exception):
+    pass
 
 
 def background_check(app_data_dir: Path, current_version: str) -> None:

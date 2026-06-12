@@ -2,11 +2,25 @@ export const PREVIEW_MAIN_DEFAULT_HEIGHT = 480;
 export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 360;
 export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
 
+/** Validate URL protocol — only https, http, and blob: are allowed. */
+export function isValidPreviewUrl(u: string): boolean {
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'blob:';
+  } catch { return false; }
+}
+
+/** Extract hostname from a URL, falling back to the raw string on parse failure. */
+export function hostnameFromUrl(u: string): string {
+  try { return new URL(u).hostname; } catch { return u; }
+}
+
 export function isClipPreviewUrl(u: string): boolean {
-  const l = u.toLowerCase();
-  if (l.includes('clips.twitch.tv')) return true;
-  if (l.includes('twitch.tv') && l.includes('/clip/')) return true;
-  if (l.includes('kick.com') && l.includes('/clips/')) return true;
+  const host = hostnameFromUrl(u);
+  const lower = u.toLowerCase();
+  if (host === 'clips.twitch.tv') return true;
+  if ((host === 'www.twitch.tv' || host === 'twitch.tv' || host.endsWith('.twitch.tv')) && lower.includes('/clip/')) return true;
+  if ((host === 'kick.com' || host === 'www.kick.com') && lower.includes('/clips/')) return true;
   return false;
 }
 
@@ -22,6 +36,9 @@ export function resolvePreviewPlayback(
 
 /** Load proxied MP4 into a <video> — use <source type="video/mp4"> so .m3u8 paths still play. */
 export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: string, startTime?: number): void {
+  if (!isValidPreviewUrl(playbackUrl)) {
+    throw new Error(`Blocked playback URL with disallowed protocol: ${playbackUrl.slice(0, 80)}`);
+  }
   video.innerHTML = '';
   video.removeAttribute('src');
   const source = document.createElement('source');
@@ -42,10 +59,15 @@ export function detachProgressivePreview(video: HTMLVideoElement): void {
 }
 
 export function channelSlugFromMediaUrl(u: string): string | null {
-  const kick = u.match(/kick\.com\/([^/?#]+)/i);
-  if (kick && !['videos', 'clips'].includes(kick[1].toLowerCase())) return kick[1];
-  const tw = u.match(/twitch\.tv\/([^/?#]+)/i);
-  if (tw && !['videos', 'clip', 'directory', 'clips'].includes(tw[1].toLowerCase())) return tw[1];
+  const host = hostnameFromUrl(u);
+  if (host === 'kick.com' || host === 'www.kick.com') {
+    const kick = u.match(/kick\.com\/([^/?#]+)/i);
+    if (kick && !['videos', 'clips'].includes(kick[1].toLowerCase())) return kick[1];
+  }
+  if (host === 'www.twitch.tv' || host === 'twitch.tv' || host.endsWith('.twitch.tv')) {
+    const tw = u.match(/twitch\.tv\/([^/?#]+)/i);
+    if (tw && !['videos', 'clip', 'directory', 'clips'].includes(tw[1].toLowerCase())) return tw[1];
+  }
   return null;
 }
 

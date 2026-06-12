@@ -22,6 +22,7 @@ import {
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
   type PreviewLevelOption,
+  isValidPreviewUrl,
 } from './previewPlayerUtils';
 import {
   EXPLORE_PANEL_DEFAULT_W,
@@ -753,6 +754,11 @@ export default function ChannelExplorePopup({
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      if (!isValidPreviewUrl(playbackUrl)) {
+        setError('Invalid playback URL');
+        setLoading(false);
+        return;
+      }
       video.src = playbackUrl;
       video.addEventListener('canplay', onCanPlay, { once: true });
       cleanup = () => {

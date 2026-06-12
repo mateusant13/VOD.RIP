@@ -134,6 +134,21 @@ def _run_ffmpeg(
         ) from exc
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
+
+    # Drain stderr on a background thread to prevent pipe-buffer deadlock.
+    stderr_chunks: list[bytes] = []
+    _stop_stderr = threading.Event()
+
+    def _drain_stderr():
+        assert proc.stderr is not None
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            if _stop_stderr.is_set():
+                break
+            stderr_chunks.append(chunk)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
     try:
         while proc.poll() is None:
             try:
@@ -142,12 +157,15 @@ def _run_ffmpeg(
                 proc.kill()
                 raise
             time.sleep(0.05)
-        stderr = proc.stderr.read() if proc.stderr else b""
+        _stop_stderr.set()
+        stderr_thread.join(timeout=2)
+        stderr = b"".join(stderr_chunks)[-2000:]
         if proc.returncode != 0:
             raise RuntimeError(
                 f"FFmpeg failed (exit {proc.returncode}): {stderr.decode(errors='ignore')[:500]}"
             )
     finally:
+        _stop_stderr.set()
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
@@ -212,23 +230,34 @@ def _resolve_ffmpeg_exe(ffmpeg_dir: Optional[str] = None) -> str:
     )
 
 
+def _hostname_from_url(url_str: str) -> str:
+    """Extract hostname from a URL string."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url_str)
+        return parsed.hostname or ""
+    except Exception:
+        return ""
+
+
 def is_clip_url(url: str) -> bool:
     """True for Twitch/Kick clip pages (not full VODs)."""
-    u = (url or "").lower()
-    if "clips.twitch.tv" in u:
+    host = _hostname_from_url(url)
+    path = (url or "").lower()
+    if host == "clips.twitch.tv":
         return True
-    if "twitch.tv" in u and "/clip/" in u:
+    if host in ("twitch.tv", "www.twitch.tv") and "/clip/" in path:
         return True
-    if "kick.com" in u and "/clips/" in u:
+    if host in ("kick.com", "www.kick.com") and "/clips/" in path:
         return True
     return False
 
 
 def detect_platform(url: str) -> str:
-    url_lower = url.lower()
-    if "clips.twitch.tv" in url_lower or "twitch.tv" in url_lower:
+    host = _hostname_from_url(url)
+    if host in ("clips.twitch.tv", "twitch.tv", "www.twitch.tv") or host.endswith(".twitch.tv"):
         return "Twitch"
-    if "kick.com" in url_lower:
+    if host in ("kick.com", "www.kick.com") or host.endswith(".kick.com"):
         return "Kick"
     if re.match(r"^\d+$", url.strip()):
         return "Twitch"
@@ -614,11 +643,16 @@ def _resolve_media_playlist(
     media_url: str,
     headers: dict,
     prefer_height: int = 720,
+    _depth: int = 0,
 ) -> str:
     """Follow HLS master playlists (Kick IVS, Twitch variants) to a media playlist."""
+    if _depth > 10:
+        raise RuntimeError(f"HLS playlist resolution exceeded max depth (10) at {media_url}")
     r = requests.get(media_url, headers=headers, timeout=30)
     r.raise_for_status()
     text = r.text
+    if len(text) > 5 * 1024 * 1024:
+        raise RuntimeError(f"HLS playlist too large ({len(text)} bytes) at {media_url}")
     if "#EXTINF:" in text:
         return media_url
 
@@ -656,7 +690,7 @@ def _resolve_media_playlist(
     else:
         chosen = max(variants, key=lambda item: item[1])
 
-    return _resolve_media_playlist(chosen[2], headers, prefer_height)
+    return _resolve_media_playlist(chosen[2], headers, prefer_height, _depth=_depth + 1)
 
 
 def _parse_m3u8(
@@ -669,6 +703,9 @@ def _parse_m3u8(
     r = requests.get(media_url, headers=headers, timeout=30)
     r.raise_for_status()
     lines = r.text.splitlines()
+    MAX_PLAYLIST_LINES = 100_000
+    if len(lines) > MAX_PLAYLIST_LINES:
+        raise RuntimeError(f"HLS media playlist too large ({len(lines)} lines) at {media_url}")
 
     segments = []
     current_duration = None
@@ -986,6 +1023,7 @@ def download_video_sync(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    video_encoder: Optional[str] = None,
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
