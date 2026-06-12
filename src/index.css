@@ -173,8 +173,15 @@ input[type="range"].url-trim-range::-moz-range-thumb {
 }
 
 .needle-glance-popup {
-  transform: scale(1.05);
   transform-origin: top left;
+}
+
+.needle-glance-popup--drag {
+  transition: none;
+}
+
+.needle-glance-popup--idle {
+  transition: opacity 0.12s ease;
 }
 
 .needle-glance-zoom-rail {

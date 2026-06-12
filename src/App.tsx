@@ -388,6 +388,7 @@ type NeedleGlanceState = {
   rangeStart: number;
   rangeEnd: number;
   deltaSec: number;
+  dragging: boolean;
 };
 
 function NeedleGlancePopup({
@@ -400,52 +401,57 @@ function NeedleGlancePopup({
   if (!glance || vodDurationSec <= 0) return null;
 
   const clipLen = Math.max(1, glance.rangeEnd - glance.rangeStart);
-  const zoomWindowSec = Math.max(30, vodDurationSec * 0.08);
-  const winStart = Math.max(0, glance.sec - zoomWindowSec / 2);
-  const winEnd = Math.min(vodDurationSec, winStart + zoomWindowSec);
-  const winDur = Math.max(1, winEnd - winStart);
-  const needlePct = ((glance.sec - winStart) / winDur) * 100;
-  const zoomSelStart = Math.max(0, ((glance.rangeStart - winStart) / winDur) * 100);
-  const zoomSelEnd = Math.min(100, ((glance.rangeEnd - winStart) / winDur) * 100);
+  const winDur = Math.max(1, vodDurationSec);
+  const needlePct = (glance.sec / winDur) * 100;
+  const selStartPct = (glance.rangeStart / winDur) * 100;
+  const selEndPct = (glance.rangeEnd / winDur) * 100;
 
   const deltaLabel = glance.deltaSec === 0
     ? null
-    : `${glance.deltaSec > 0 ? '+' : ''}${glance.deltaSec}s`;
+    : `${glance.deltaSec > 0 ? '+' : '−'}${Math.abs(glance.deltaSec)}s`;
+
+  const popupLeft = Math.min(glance.x + 14, window.innerWidth - 200);
+  const popupTop = Math.max(12, glance.y - 96);
 
   return createPortal(
     <div
-      className="needle-glance-popup fixed z-[500] pointer-events-none select-none"
-      style={{ left: Math.min(glance.x + 14, window.innerWidth - 200), top: Math.max(12, glance.y - 108) }}
+      className={`needle-glance-popup fixed z-[500] pointer-events-none select-none ${
+        glance.dragging ? 'needle-glance-popup--drag' : 'needle-glance-popup--idle'
+      }`}
+      style={{ left: popupLeft, top: popupTop }}
     >
       <div className="border-2 border-zinc-500 bg-zinc-950/95 px-3 py-2 shadow-[4px_4px_0px_0px_rgba(113,113,122,0.5)] min-w-[168px]">
         <div className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
-          {glance.which === 'in' ? 'In point' : 'Out point'}
+          {glance.which === 'in' ? 'Trim start' : 'Trim end'}
         </div>
         <div className="text-2xl font-mono font-bold text-white tabular-nums leading-none">
           {formatHmsFull(glance.sec)}
         </div>
         <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
-          <span>Selection</span>
+          <span>Clip length</span>
           <span className="text-zinc-200">{formatHmsFull(clipLen)}</span>
         </div>
         {deltaLabel && (
           <div className="text-[10px] font-mono text-zinc-400 mt-0.5">
-            Moving <span className="text-white">{deltaLabel}</span>
+            <span className="text-white">{deltaLabel}</span>
+            {' '}from drag start
           </div>
         )}
         <div className="needle-glance-zoom-rail relative h-5 mt-2 rounded-sm bg-zinc-800 overflow-hidden">
           <div
             className="absolute top-1 bottom-1 bg-zinc-500/35 border-y border-zinc-400/50"
-            style={{ left: `${zoomSelStart}%`, width: `${Math.max(2, zoomSelEnd - zoomSelStart)}%` }}
+            style={{ left: `${selStartPct}%`, width: `${Math.max(2, selEndPct - selStartPct)}%` }}
           />
           <div
-            className="absolute top-0 bottom-0 w-0.5 bg-white -translate-x-1/2"
+            className={`absolute top-0 bottom-0 w-0.5 -translate-x-1/2 ${
+              glance.which === 'in' ? 'bg-white' : 'bg-zinc-400'
+            }`}
             style={{ left: `${needlePct}%` }}
           />
         </div>
         <div className="flex justify-between text-[8px] font-mono text-zinc-600 mt-0.5 tabular-nums">
-          <span>{formatHmsFull(winStart)}</span>
-          <span>{formatHmsFull(winEnd)}</span>
+          <span>0:00</span>
+          <span>{formatHmsFull(vodDurationSec)}</span>
         </div>
       </div>
     </div>,
@@ -1473,9 +1479,14 @@ function parseChannelInput(raw: string): { displayName: string; kickSlug: string
 }
 
 /** Settings/section captions — not <label> so clicks never focus nearby inputs. */
-function FieldCaption({ children }: { children: ReactNode }) {
+function FieldCaption({ children, noWrap }: { children: ReactNode; noWrap?: boolean }) {
   return (
-    <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 block">
+    <span
+      className={`text-[9px] font-bold uppercase tracking-widest text-zinc-500 block min-w-0 ${
+        noWrap ? 'whitespace-nowrap overflow-hidden text-ellipsis' : ''
+      }`}
+      style={noWrap ? { fontSize: 'clamp(7px, 2.4vw, 9px)' } : undefined}
+    >
       {children}
     </span>
   );
@@ -1763,11 +1774,6 @@ export default function App() {
   const trimDragActiveRef = useRef(false);
   /** Opposite trim endpoint pinned for the duration of a URL slider drag. */
   const urlTrimDragPinRef = useRef<{
-    which: 'in' | 'out';
-    fixedStart: number;
-    fixedEnd: number;
-  } | null>(null);
-  const [urlTrimDragPin, setUrlTrimDragPin] = useState<{
     which: 'in' | 'out';
     fixedStart: number;
     fixedEnd: number;
@@ -2166,6 +2172,7 @@ export default function App() {
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
+    const previewPageUrl = previewLoadedUrlRef.current ?? url.trim();
     let cancelled = false;
     let cleanup: (() => void) | undefined;
 
@@ -2213,7 +2220,7 @@ export default function App() {
       }
     };
 
-    if (playbackKind === 'progressive' || isClipPreviewUrl(url.trim())) {
+    if (playbackKind === 'progressive' || isClipPreviewUrl(previewPageUrl)) {
       const meta = previewSessionMetaRef.current;
       const activeH = meta?.activeHeight
         ?? previewPlayback.activeHeight
@@ -2238,7 +2245,7 @@ export default function App() {
       const immediate = resolveProgressivePreviewLevels(levelOpts);
       syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
       void resolveProgressivePreviewLevelsAsync(
-        url.trim(),
+        previewPageUrl,
         levelOpts,
         async (clipUrl) => {
           const clipInfo = await apiGet<VideoInfo>(
@@ -2295,7 +2302,7 @@ export default function App() {
         previewContainerRef.current ?? previewPanelRef.current,
         previewVideoAspectRef.current,
       );
-      const previewPreferHeight = initialPreviewPreferHeight(isClipUrl(url.trim()), playerCap);
+      const previewPreferHeight = initialPreviewPreferHeight(isClipUrl(previewPageUrl), playerCap);
       const fallbackHeights = mergeVariantHeights(
         previewPlayback.variantHeights,
         parseQualityHeights(videoInfo?.qualities ?? []),
@@ -2376,7 +2383,7 @@ export default function App() {
       cancelled = true;
       cleanup?.();
     };
-  }, [previewOpen, previewPlayback, url]);
+  }, [previewOpen, previewPlayback]);
 
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
@@ -2587,12 +2594,8 @@ export default function App() {
     trimEndSecRef.current = end;
     setTrimStartSec(start);
     setTrimEndSec(end);
-    // Keep pin in sync with current values so min/max don't jump when pin is cleared
-    if (urlTrimDragPinRef.current) {
-      const updated = { ...urlTrimDragPinRef.current, fixedStart: start, fixedEnd: end };
-      urlTrimDragPinRef.current = updated;
-      setUrlTrimDragPin(updated);
-    }
+    // Pin endpoints are frozen at pointerdown — updating them during drag shifts the
+    // other slider's min/max and makes its thumb appear to move the wrong way.
     return { start, end };
   }, [vodDurationSec]);
 
@@ -2671,6 +2674,7 @@ export default function App() {
       rangeStart,
       rangeEnd,
       deltaSec,
+      dragging: true,
     });
   }, []);
 
@@ -2757,14 +2761,7 @@ export default function App() {
   }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance, markPreviewTrimEndpoint]);
 
   const finishUrlTrimDrag = useCallback(() => {
-    // Keep pin with current values so min/max stay stable between drags
-    const current = {
-      which: lastUrlTrimEndpointRef.current,
-      fixedStart: trimStartSecRef.current,
-      fixedEnd: trimEndSecRef.current,
-    };
-    urlTrimDragPinRef.current = current;
-    setUrlTrimDragPin(current);
+    urlTrimDragPinRef.current = null;
     trimDragActiveRef.current = false;
     setNeedleGlance(null);
   }, []);
@@ -2798,6 +2795,7 @@ export default function App() {
         rangeStart: applied.start,
         rangeEnd: applied.end,
         deltaSec: activeSec - dragOrigin,
+        dragging: true,
       });
     }
   }, [commitUrlTrimRange, markUrlTrimEndpoint]);
@@ -3901,12 +3899,8 @@ export default function App() {
 
   const currentIsClip = isClipUrl(url);
 
-  const urlTrimStartMax = urlTrimDragPin
-    ? Math.max(0, urlTrimDragPin.fixedEnd - 1)
-    : Math.max(0, trimEndSec - 1);
-  const urlTrimEndMin = urlTrimDragPin
-    ? Math.min(vodDurationSec, urlTrimDragPin.fixedStart + 1)
-    : Math.min(vodDurationSec, trimStartSec + 1);
+  const urlTrimStartMax = Math.max(0, trimEndSec - 1);
+  const urlTrimEndMin = Math.min(vodDurationSec, trimStartSec + 1);
 
   // ── Size estimate ──
   const clipSec = currentIsClip && videoInfo?.duration
@@ -4086,18 +4080,16 @@ export default function App() {
                 className="text-zinc-500"
               />
             </div>
-            <input type="range" min={0} max={urlTrimStartMax} step={1} value={trimStartSec}
+            <input type="range" min={0} max={vodDurationSec} step={1} value={trimStartSec}
               onPointerDown={(e) => {
                 markUrlTrimEndpoint('in');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
-                const pin = {
-                  which: 'in' as const,
+                urlTrimDragPinRef.current = {
+                  which: 'in',
                   fixedStart: trimStartSecRef.current,
                   fixedEnd: trimEndSecRef.current,
                 };
-                urlTrimDragPinRef.current = pin;
-                setUrlTrimDragPin(pin);
                 trimDragOriginRef.current = trimStartSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
@@ -4122,18 +4114,16 @@ export default function App() {
                 finishUrlTrimDrag();
               }}
               className="url-trim-range w-full accent-zinc-400" />
-            <input type="range" min={urlTrimEndMin} max={vodDurationSec} step={1} value={trimEndSec}
+            <input type="range" min={0} max={vodDurationSec} step={1} value={trimEndSec}
               onPointerDown={(e) => {
                 markUrlTrimEndpoint('out');
                 e.currentTarget.setPointerCapture(e.pointerId);
                 trimDragActiveRef.current = true;
-                const pin = {
-                  which: 'out' as const,
+                urlTrimDragPinRef.current = {
+                  which: 'out',
                   fixedStart: trimStartSecRef.current,
                   fixedEnd: trimEndSecRef.current,
                 };
-                urlTrimDragPinRef.current = pin;
-                setUrlTrimDragPin(pin);
                 trimDragOriginRef.current = trimEndSecRef.current;
                 urlTrimPointerRef.current = { x: e.clientX, y: e.clientY };
                 if (previewFsHideTimerRef.current) window.clearTimeout(previewFsHideTimerRef.current);
@@ -4678,7 +4668,7 @@ export default function App() {
                 onChange={(e) => setAddChannelInput(e.target.value)}
                 placeholder="CHANNEL NAME OR URL..."
                 onKeyDown={(e) => e.key === 'Enter' && handleAddChannel()}
-                className="flex-1 bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 px-3 py-2.5 focus:outline-none focus:border-white uppercase text-xs" />
+                className="flex-1 bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 px-2 py-1.5 focus:outline-none focus:border-white uppercase text-[10px] min-h-0" />
               <button type="button" onClick={handleAddChannel}
                 disabled={channelsLoading || !addChannelInput.trim()}
                 className="bg-white text-black font-black uppercase px-3 text-xs border-2 border-white disabled:opacity-50">
@@ -5061,7 +5051,7 @@ export default function App() {
 
             <div className="grid grid-cols-3 gap-3">
               <div className="flex flex-col gap-1.5">
-                <FieldCaption>Download Threads</FieldCaption>
+                <FieldCaption noWrap>Download Threads</FieldCaption>
                 <input type="number" min={1} max={16}
                   value={settings.download_threads}
                   onChange={(e) => setSettings({ ...settings, download_threads: Math.max(1, Math.min(16, parseInt(e.target.value) || 4)) })}

@@ -52,6 +52,18 @@ def _run_text(cmd: List[str], timeout: float = 8.0) -> str:
         return ""
 
 
+def _gpu_names_nvidia_smi() -> List[str]:
+    names: List[str] = []
+    if not shutil.which("nvidia-smi"):
+        return names
+    out = _run_text(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+    for line in out.splitlines():
+        line = line.strip()
+        if line and line.lower() != "name":
+            names.append(line)
+    return names
+
+
 def _gpu_names_windows() -> List[str]:
     names: List[str] = []
     ps = (
@@ -95,7 +107,11 @@ def _is_apple_silicon() -> bool:
 
 def list_gpu_names() -> List[str]:
     if os.name == "nt":
-        return _gpu_names_windows()
+        names = _gpu_names_windows()
+        for name in _gpu_names_nvidia_smi():
+            if name not in names:
+                names.append(name)
+        return names
     return _gpu_names_unix()
 
 
@@ -213,11 +229,32 @@ def recommend_encoder(
     return "libx264"
 
 
+def _infer_vendor_from_working_encoders(ffmpeg_bin: str, encoders: set[str]) -> Optional[str]:
+    """When WMI/lspci fail, pick vendor from the first HW encoder that actually encodes."""
+    for vendor, encoder in (
+        ("nvidia", "h264_nvenc"),
+        ("amd", "h264_amf"),
+        ("intel", "h264_qsv"),
+    ):
+        if encoder in encoders and _encoder_usable(encoder, ffmpeg_bin):
+            return vendor
+    if sys.platform == "darwin" and "h264_videotoolbox" in encoders:
+        if _encoder_usable("h264_videotoolbox", ffmpeg_bin):
+            return "apple"
+    return None
+
+
 def _probe_encoder_detection(ffmpeg_bin: str) -> Dict[str, object]:
     names = list_gpu_names()
     vendor = detect_gpu_vendor(names)
     encoders = ffmpeg_encoder_names(ffmpeg_bin)
-    detected = recommend_encoder(vendor, encoders, ffmpeg_bin)
+    if vendor == "none":
+        inferred = _infer_vendor_from_working_encoders(ffmpeg_bin, encoders)
+        if inferred:
+            vendor = inferred
+            if not names:
+                names = [VENDOR_LABELS.get(inferred, inferred)]
+    detected = recommend_encoder(vendor, encoders, ffmpeg_bin, validate=True)
     return {
         "gpus": names,
         "vendor": vendor,
@@ -239,7 +276,11 @@ def _cached_encoder_detection(ffmpeg_bin: str) -> Dict[str, object]:
     return _probe_encoder_detection(ffmpeg_bin)
 
 
-def get_encoder_detection(ffmpeg_bin: Optional[str] = None) -> Dict[str, object]:
+def clear_encoder_detection_cache() -> None:
+    _cached_encoder_detection.cache_clear()
+
+
+def get_encoder_detection(ffmpeg_bin: Optional[str] = None, *, fresh: bool = False) -> Dict[str, object]:
     """GPU + encoder probe for settings UI and auto mode."""
     if ffmpeg_bin is None:
         try:
@@ -248,4 +289,6 @@ def get_encoder_detection(ffmpeg_bin: Optional[str] = None) -> Dict[str, object]
             ffmpeg_bin = _resolve_ffmpeg_exe()
         except Exception:
             ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+    if fresh:
+        clear_encoder_detection_cache()
     return _cached_encoder_detection(ffmpeg_bin)

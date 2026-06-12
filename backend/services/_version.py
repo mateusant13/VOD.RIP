@@ -1,4 +1,4 @@
 """VOD.RIP version — single source of truth."""
 
-__version__ = "1.0.19"
+__version__ = "1.0.20"
 VERSION = __version__

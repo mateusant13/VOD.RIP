@@ -193,7 +193,7 @@ async def system_gpu_encoder():
     ffmpeg_bin = _resolve_ffmpeg_exe(settings_mgr.get().ffmpeg_path or None)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        INFO_EXECUTOR, lambda: get_encoder_detection(ffmpeg_bin)
+        INFO_EXECUTOR, lambda: get_encoder_detection(ffmpeg_bin, fresh=True)
     )
 
 
