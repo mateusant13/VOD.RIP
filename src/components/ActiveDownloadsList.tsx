@@ -45,16 +45,18 @@ function ActiveDownloadsListInner({
         const isPaused = dl.status === 'Paused';
         const color = isPaused ? '#fbbf24' : (isTw ? '#9146FF' : '#53fc18');
         // The backend status string is rich ("Encoding 87% • 1.4x • ETA 23s",
-        // "Finalising…", "Remuxing 92% • ETA 2s"). The first space-separated
-        // token is the phase label, which maps 1:1 to a stable phase_id
-        // (encoding / remuxing / finalising / merging). The id is what the
-        // UI logic branches on, so changing the display text never breaks
-        // the animation/colour contract.
+        // "Finalising 99% • 47.2 MB/s • ETA 0:32", "Remuxing 92% • ETA 2s",
+        // "Muxing 95% • 1.8x"). The first space-separated token is the
+        // phase label, which maps 1:1 to a stable phase_id (encoding /
+        // remuxing / finalising / merging). The id is what the UI logic
+        // branches on, so changing the display text never breaks the
+        // animation/colour contract.
         const dlStatus = dl.status ?? '';
         const firstToken = (dlStatus.split(/\s+/, 1)[0] || '').toLowerCase();
         const phaseId =
           firstToken.startsWith('finalis') ? 'finalising'
           : firstToken.startsWith('remux') ? 'remuxing'
+          : firstToken.startsWith('mux') ? 'muxing'
           : firstToken.startsWith('merg') ? 'merging'
           : firstToken.startsWith('encod') ? 'encoding'
           : '';

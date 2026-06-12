@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -339,6 +340,116 @@ class DownloadManager:
                 )
                 info.setdefault("temp_dirs", []).append(path)
 
+        # PP-state progress poller
+        # ------------------------
+        # yt-dlp's stock postprocessor hides the ffmpeg merge in a
+        # synchronous Popen.run and only fires started/finished hooks.
+        # The custom ``_InstrumentedFFmpegPP`` overrides that to emit
+        # -progress pipe:2 lines into a state dict, but the manager's
+        # own progress_hook is never told about those events. We bridge
+        # the gap with a background poller that watches the state dict
+        # every 250 ms and synthesises a real progress_hook call.
+        pp_holder: dict = {}
+        pp_stop = threading.Event()
+        last_emit_pct = -1.0
+        last_emit_wall = 0.0
+        poller_thread: Optional[threading.Thread] = None
+
+        def _pp_progress_poller():
+            """Translate ``pp_state`` updates into progress_hook events.
+
+            The poller never invents progress on its own — it only
+            re-emits whatever the instrumented PP wrote into
+            ``last_percent``. A separate heartbeat fires every 3 s
+            (with the existing "Working…" pattern) only if the PP
+            hasn't written anything in that window. This keeps the
+            user informed without lying about percent.
+            """
+            nonlocal last_emit_pct, last_emit_wall
+            # Wait for the PP to be constructed (state is empty until
+            # then) and to make first progress.
+            while not pp_stop.is_set():
+                state = pp_holder.get("state")
+                if state is None:
+                    pp_stop.wait(0.25)
+                    continue
+                with state["lock"]:
+                    pct = state.get("last_percent") or 0.0
+                    speed = state.get("last_speed") or ""
+                    eta = state.get("last_eta_seconds")
+                if pct > 0.0:
+                    # PP has reported something. Map the 0..1 from
+                    # out_time_ms / duration_us onto the 92..99 percent
+                    # range our manager already uses for postprocess.
+                    # The monotonic clamp in _progress_hook keeps the
+                    # bar from running backwards.
+                    ui_pct = 92.0 + min(7.0, pct * 7.0)
+                    # Emit at most every 0.5 s of real progress, or if
+                    # the integer percent advanced.
+                    now = time.monotonic()
+                    if (
+                        int(ui_pct) != int(last_emit_pct)
+                        or (now - last_emit_wall) > 0.5
+                    ):
+                        last_emit_pct = ui_pct
+                        last_emit_wall = now
+                        d = {
+                            "status": "postprocessing",
+                            "percent": ui_pct,
+                            "phase": "Muxing",
+                            "phase_id": "encoding",
+                            "speed": speed or None,
+                            "eta_seconds": eta,
+                        }
+                        try:
+                            _progress_hook(d)
+                        except Exception:
+                            # _progress_hook raises on cancel/pause;
+                            # propagate so the poller exits too.
+                            pp_stop.set()
+                            return
+                else:
+                    # PP hasn't written anything yet. Heartbeat every
+                    # 3 s so the user sees the bar is still alive
+                    # during the (often 10+ s) "starting ffmpeg"
+                    # window for large VODs.
+                    now = time.monotonic()
+                    if (now - last_emit_wall) > 3.0:
+                        last_emit_wall = now
+                        d = {
+                            "status": "postprocessing",
+                            "percent": 92.0,
+                            "phase": "Muxing",
+                            "phase_id": "encoding",
+                            "heartbeat": True,
+                        }
+                        try:
+                            _progress_hook(d)
+                        except Exception:
+                            pp_stop.set()
+                            return
+                pp_stop.wait(0.25)
+
+        def _start_poller() -> None:
+            nonlocal poller_thread
+            if poller_thread is not None and poller_thread.is_alive():
+                return
+            poller_thread = threading.Thread(
+                target=_pp_progress_poller, daemon=True,
+                name=f"pp-poller-{download_id[:8]}",
+            )
+            poller_thread.start()
+
+        def _stop_poller() -> None:
+            pp_stop.set()
+            if poller_thread is not None:
+                poller_thread.join(timeout=2)
+
+        def _register_pp_state(state: dict) -> None:
+            """Called by ytdlp_service after it builds the state dict."""
+            pp_holder["state"] = state
+            _start_poller()
+
         def _download_worker():
             try:
                 if cancel_event.is_set():
@@ -383,6 +494,7 @@ class DownloadManager:
                         pause_event=pause_event,
                         register_abort=_register_abort,
                         register_temp_dir=_register_temp_dir,
+                        register_pp_state=_register_pp_state,
                     )
 
                 if cancel_event.is_set():
@@ -472,6 +584,13 @@ class DownloadManager:
                         remove_temp_dirs(temp_dirs)
                 except Exception:
                     pass
+                # Stop the postprocess progress poller (if it was
+                # started). The thread is daemon=True so it would exit
+                # on its own when the worker thread ends, but stopping
+                # it explicitly prevents a brief "Completed, 100%
+                # [no, Muxing 98%]" flicker if the poller ticks one
+                # more time after we've set Completed.
+                _stop_poller()
                 # Persist outside the lock — disk write should never hold the
                 # download state lock.
                 if final_state.status in _DONE_STATUSES:

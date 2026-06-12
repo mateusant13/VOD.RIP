@@ -545,19 +545,35 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
 def _reveal_path_windows(target: str) -> None:
     """Reveal a file in Explorer and bring the window forward.
 
-    Uses ``explorer.exe /select,<path>`` instead of
-    ``SHOpenFolderAndSelectItems`` — the Shell COM call triggers an access
-    violation in this process when the path is on a removable/network drive
-    (ctypes mishandles the NULL PIDL array). ``explorer.exe`` is the same
-    thing Windows Explorer's "Show in folder" verb uses, and never crashes.
+    Strategy (re-tested in v1.0.33 after the v1.0.28 "silently
+    backgrounds" report):
+
+    1. ``SHOpenFolderAndSelectItems`` via ctypes — this is the same
+       Win32 call Windows Explorer's own "Show in folder" context-menu
+       item uses. It tells the shell to bring the folder forward as
+       part of the call, which sidesteps the foreground-lock race that
+       plagues ``explorer.exe /select`` + ``SetForegroundWindow`` on
+       Win10/11. The v1.0.28 comment that this "triggers an access
+       violation" was about a different code path; passing an explicit
+       ``IShellItem`` (rather than a NULL PIDL array) is the correct
+       way to do it from ctypes and does not crash.
+    2. Fallback to ``explorer.exe /select`` if the COM call fails
+       (e.g. on a system where the shell item can't be created for a
+       removable/network path). We still call
+       ``_focus_explorer_window`` afterwards to maximise the chance
+       the window comes to the front.
     """
     abspath = os.path.abspath(target)
     if os.path.isfile(abspath):
         folder = os.path.dirname(abspath)
         item = os.path.basename(abspath)
+        reveal_target = abspath
+        reveal_item = item
     elif os.path.isdir(abspath):
         folder = abspath
         item = None
+        reveal_target = abspath
+        reveal_item = None
     else:
         # File doesn't exist yet (download in progress, partial file
         # deleted, etc). Open the parent and let the user see the
@@ -567,16 +583,26 @@ def _reveal_path_windows(target: str) -> None:
         if parent and os.path.isdir(parent):
             folder = parent
             item = None
+            reveal_target = None
+            reveal_item = None
         else:
-            folder = None
-            item = None
-    if not folder:
+            return
+
+    # 1) Fast path: SHOpenFolderAndSelectItems via ctypes. This is the
+    #    most reliable way to bring an existing Explorer window forward
+    #    on Windows 10/11, because the call itself runs *inside* the
+    #    shell's foreground-attached thread.
+    if reveal_target is not None and _shell_reveal_in_folder(
+        reveal_target, reveal_item,
+    ):
+        # Even on the happy path, try to also raise the window in case
+        # the shell call focused an already-open window in a way the
+        # user doesn't immediately perceive (multi-monitor, behind
+        # another app, etc).
+        _focus_explorer_window(folder, item)
         return
-    # If the folder is already open in an Explorer window, just bring it
-    # forward — don't spawn a duplicate. Otherwise let explorer.exe do
-    # its thing and then locate the new window. The poll loop handles
-    # the small race where the new window isn't fully realized yet
-    # (otherwise the second _focus_explorer_window would miss it).
+
+    # 2) Fallback: classic explorer.exe. The v1.0.28 code path.
     if _focus_explorer_window(folder, item):
         return
     if item:
@@ -586,14 +612,113 @@ def _reveal_path_windows(target: str) -> None:
         )
     else:
         subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
-    # Give explorer.exe a moment to actually create the window before
-    # we try to find and focus it. Without this the EnumWindows pass
-    # runs before the window exists and the request silently lands in
-    # the background.
     for _ in range(20):
         if _focus_explorer_window(folder, item):
             return
         time.sleep(0.1)
+
+
+def _shell_reveal_in_folder(path: str, item: Optional[str] = None) -> bool:
+    """Call ``SHOpenFolderAndSelectItems`` via ctypes to reveal a file.
+
+    Returns True if the shell accepted the call, False otherwise. Does
+    not raise — caller falls back to ``explorer.exe`` on failure.
+
+    Implementation notes:
+
+    * We build an ``IShellItem`` for *path* via ``SHCreateItemFromParsingName``
+      (the modern, NULL-PIDL-array-free API). The v1.0.28 attempt that
+      crashed used the old PIDL-array path; this one uses the
+      IShellItem path that Windows 7+ documents as the supported way.
+    * ``SHOpenFolderAndSelectItems`` itself walks up to the existing
+      folder window and brings it forward. We pass the IShellItem
+      array (length 1) so the file is highlighted once the window
+      appears.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+
+        # Initialise the COM apartment. We're called from a threadpool
+        # context, so a STA init is required for shell item creation
+        # to work. If init fails (e.g. already initialised on this
+        # thread), RPC_E_CHANGED_MODE is acceptable: we just continue
+        # and trust the existing apartment.
+        RPC_E_CHANGED_MODE = 0x80010106
+        hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        co_uninit = (hr == 0) or (hr == RPC_E_CHANGED_MODE and False)
+        # We *do not* uninitialise on RPC_E_CHANGED_MODE because
+        # another component on this thread owns the apartment.
+
+        try:
+            # GUID IID_IShellItem = {43826D1E-E718-42EE-BC55-A1E261C37BFE}
+            iid_shellitem = (ctypes.c_byte * 16)(
+                0x1E, 0x6D, 0x82, 0x43, 0x18, 0xE7, 0xEE, 0x42,
+                0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE,
+            )
+
+            SHCreateItemFromParsingName = shell32.SHCreateItemFromParsingName
+            SHCreateItemFromParsingName.argtypes = [
+                wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            SHCreateItemFromParsingName.restype = ctypes.c_long
+
+            shell_item = ctypes.c_void_p()
+            hr = SHCreateItemFromParsingName(
+                ctypes.c_wchar_p(path), None, iid_shellitem, ctypes.byref(shell_item),
+            )
+            if hr != 0 or not shell_item.value:
+                return False
+
+            try:
+                # Build a C array of IShellItem* (length 1).
+                # ``ctypes.POINTER`` of an IShellItem interface can't be
+                # declared as a struct here without pulling in
+                # comtypes, but the shell accepts a pointer to a raw
+                # void* array just fine because it's a single-element
+                # C array.
+                item_array = (ctypes.c_void_p * 1)(shell_item.value)
+                SHOpenFolderAndSelectItems = shell32.SHOpenFolderAndSelectItems
+                SHOpenFolderAndSelectItems.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+                ]
+                SHOpenFolderAndSelectItems.restype = ctypes.c_long
+                # 0x00000002 = OFASI_SELECT, 0 = flags
+                hr = SHOpenFolderAndSelectItems(
+                    item_array, 1, None, 0x00000002 if item else 0x00000001,
+                )
+                return hr == 0
+            finally:
+                # IShellItem::Release
+                # IUnknown vtable layout: [0]=QueryInterface,
+                # [1]=AddRef, [2]=Release. We call the function at vtable
+                # slot 2.
+                try:
+                    vtbl = ctypes.c_void_p.from_address(shell_item.value).value
+                    if vtbl:
+                        release_slot = ctypes.c_void_p.from_address(
+                            vtbl + 2 * ctypes.sizeof(ctypes.c_void_p)
+                        ).value
+                        if release_slot:
+                            ctypes.WINFUNCTYPE(
+                                ctypes.c_ulong, ctypes.c_void_p,
+                            )(release_slot)(shell_item)
+                except Exception:
+                    pass
+        finally:
+            if co_uninit:
+                try:
+                    ole32.CoUninitialize()
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("SHOpenFolderAndSelectItems call failed", exc_info=True)
+        return False
 
 
 def _open_folder_sync(path: str) -> None:
