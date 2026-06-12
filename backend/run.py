@@ -34,8 +34,8 @@ def main():
 
     # Install deps if needed
     try:
-        import fastapi
-        import yt_dlp
+        import fastapi  # noqa: F401
+        import yt_dlp  # noqa: F401
     except ImportError:
         print("Installing dependencies...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])

@@ -17,10 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time
-import zipfile
 from pathlib import Path
-from zipfile import ZipFile, ZipInfo
-from typing import Any, Dict, List, Optional, Tuple
+from zipfile import ZipFile
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -283,7 +282,7 @@ class UpdateChecker:
                 f'src="{source}"',
                 f'dst="{install_dir}"',
                 copy_cmd,
-                f'exec "$dst/VOD-RIP"',
+                'exec "$dst/VOD-RIP"',
             ]),
             encoding="utf-8",
         )

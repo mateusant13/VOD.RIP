@@ -19,24 +19,21 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from models.schemas import (
     AppSettings,
     DownloadRequest,
-    DownloadState,
     OpenFolderRequest,
     PreviewQualityUpdateRequest,
     PreviewSessionCreateRequest,
     PreviewSessionResponse,
     SettingsUpdate,
-    VideoInfo,
 )
 from services.preview_service import (
     create_session,
     delete_session,
-    get_master_playlist,
     proxy_master,
     proxy_playlist,
     proxy_segment,
@@ -50,7 +47,6 @@ from services.preview_service import (
 from services.channel_cache import get_cached, make_channel_cache_key, set_cached
 from services.download_manager import DownloadManager
 from services.settings import SettingsManager
-import yt_dlp
 
 logger = logging.getLogger(__name__)
 
@@ -1427,7 +1423,7 @@ async def download_stream(download_id: str, request: Request):
                 if event.get("type") in ("complete", "error"):
                     break
             except asyncio.TimeoutError:
-                yield f": keepalive\n\n"
+                yield f": keepalive\n\n"  # noqa: F541
 
     async def stream_wrapper():
         try:
@@ -1532,8 +1528,8 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 7897))
-    print(f"================================================")
-    print(f"  Kick & Twitch Downloader v2.0 (Python)")
+    print("================================================")
+    print("  Kick & Twitch Downloader v2.0 (Python)")
     print(f"  Open http://localhost:{port} in your browser")
-    print(f"================================================")
+    print("================================================")
     uvicorn.run(app, host="0.0.0.0", port=port)

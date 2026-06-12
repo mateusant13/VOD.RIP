@@ -7,7 +7,6 @@ enables faulthandler so native/C-extension crashes produce a traceback.
 """
 
 import faulthandler
-import os
 import platform
 import sys
 import traceback

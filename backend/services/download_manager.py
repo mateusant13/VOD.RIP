@@ -16,7 +16,6 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from models.schemas import DownloadState

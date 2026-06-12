@@ -1,4 +1,5 @@
 # PyInstaller Windows version resource — taskbar / Properties show "VOD.RIP"
+# ruff: noqa: F821  (VSVersionInfo/FixedFileInfo/etc. come from PyInstaller runtime, not real names)
 VSVersionInfo(
     ffi=FixedFileInfo(
         filevers=(1, 0, 18, 0),
