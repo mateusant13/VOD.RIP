@@ -1000,43 +1000,50 @@ export default function ChannelExplorePopup({
           )}
         </div>
         {fullscreen && (
-          <div
-            data-player-controls
-            className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-3 pb-3 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
-              fsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-            }`}
-            onClick={(e) => e.stopPropagation()}
-            onPointerDown={(e) => e.stopPropagation()}
-            onPointerUp={(e) => e.stopPropagation()}
-            onMouseMove={bumpFsControls}
-          >
-            {timelineUi}
-            <div className="flex items-center gap-2 pr-14">
-              <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
-                {playing ? <Pause size={18} /> : <Play size={18} />}
-              </button>
-              {volumeUi(true)}
-              {qualityUi(true)}
-              <button
-                type="button"
-                onClick={() => onCarryToUrl(vod)}
-                className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                title="Send to URL panel for rip"
-              >
-                <ArrowRightToLine size={14} />
-                URL
-              </button>
-              <button
-                type="button"
-                onClick={() => void toggleFullscreen()}
-                disabled={!ready}
-                className="ml-auto border border-white/20 bg-black/25 text-zinc-100 p-2 backdrop-blur-[1px] disabled:opacity-30"
-                title="Exit fullscreen"
-              >
-                <Minimize2 size={18} />
-              </button>
+          <>
+            <div
+              data-player-controls
+              className={`absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-3 pb-3 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                fsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+              }`}
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerUp={(e) => e.stopPropagation()}
+              onMouseMove={bumpFsControls}
+            >
+              {timelineUi}
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
+                  {playing ? <Pause size={18} /> : <Play size={18} />}
+                </button>
+                {volumeUi(true)}
+                {qualityUi(true)}
+                <button
+                  type="button"
+                  onClick={() => onCarryToUrl(vod)}
+                  className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                  title="Send to URL panel for rip"
+                >
+                  <ArrowRightToLine size={14} />
+                  URL
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void toggleFullscreen()}
+                  disabled={!ready}
+                  className="ml-auto border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
+                  title="Exit fullscreen"
+                >
+                  <Minimize2 size={18} />
+                </button>
+              </div>
             </div>
-          </div>
+            <div
+              className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"
+              title="Exit fullscreen"
+              onClick={() => void toggleFullscreen()}
+            />
+          </>
         )}
         {!fullscreen && (
           <>
