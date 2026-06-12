@@ -415,6 +415,24 @@ def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
     return None, "Folder picker cancelled or unavailable."
 
 
+def _reveal_path_windows(target: str) -> None:
+    """Reveal a file in Explorer and bring the window forward (Shell API)."""
+    import ctypes
+
+    abspath = os.path.abspath(target)
+    if os.path.isfile(abspath):
+        pidl = ctypes.windll.shell32.ILCreateFromPathW(abspath)
+        if pidl:
+            try:
+                ctypes.windll.shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+            finally:
+                ctypes.windll.shell32.ILFree(pidl)
+            return
+    folder = abspath if os.path.isdir(abspath) else os.path.dirname(abspath)
+    if folder and os.path.isdir(folder):
+        os.startfile(folder)
+
+
 def _open_folder_sync(path: str) -> None:
     """Reveal a file in Explorer, or open its parent folder (e.g. in-progress downloads)."""
     p = Path(path).expanduser()
@@ -422,12 +440,7 @@ def _open_folder_sync(path: str) -> None:
         target = str(p.resolve())
         if os.name == "nt":
             if p.is_file():
-                # /select,<path> must be one argument — separate args often fail or hang.
-                subprocess.Popen(
-                    ["explorer", f"/select,{target}"],
-                    close_fds=True,
-                                creationflags=_NO_WINDOW,
-                )
+                _reveal_path_windows(target)
             else:
                 os.startfile(target)
         elif sys.platform == "darwin":
@@ -1221,13 +1234,17 @@ async def download_clip(req: DownloadRequest):
     meta = await _fetch_queue_meta(req.url, platform)
     output = _build_clip_output_path(req, opts, meta)
     _safe_makedirs(Path(output).parent)
+    crop_start = req.crop_start
+    crop_end = req.crop_end
+    if crop_start is not None and crop_end is not None and crop_end <= crop_start:
+        raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
         quality=req.quality or opts.quality,
         oauth=req.oauth or opts.oauth,
-        crop_start=None,
-        crop_end=None,
+        crop_start=crop_start,
+        crop_end=crop_end,
         download_func=None,
         download_type="clip",
         settings_mgr=settings_mgr,

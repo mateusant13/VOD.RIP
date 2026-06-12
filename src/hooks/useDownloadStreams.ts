@@ -64,8 +64,8 @@ export function useDownloadStreams(
       }
     }
 
-    for (const id of wanted) {
-      if (sources.has(id)) continue;
+    const connect = (id: string) => {
+      if (sources.has(id)) return;
       const es = new EventSource(`/api/download/${encodeURIComponent(id)}/stream`);
       es.onmessage = (msg) => {
         try {
@@ -83,8 +83,17 @@ export function useDownloadStreams(
       es.onerror = () => {
         es.close();
         sources.delete(id);
+        window.setTimeout(() => {
+          if (!sourcesRef.current.has(id) && wanted.has(id)) {
+            connect(id);
+          }
+        }, 2000);
       };
       sources.set(id, es);
+    };
+
+    for (const id of wanted) {
+      connect(id);
     }
 
     return () => {

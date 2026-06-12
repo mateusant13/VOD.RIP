@@ -574,7 +574,7 @@ def _build_ydl_opts(
     encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
     if encode_args:
         opts["postprocessors"] = [
-            {"key": "FFmpegVideoConvertor", "preferedcodec": "h264"},
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ]
         opts["postprocessor_args"] = {"ffmpeg": encode_args}
 
@@ -830,7 +830,9 @@ def _download_segments(
                     "percent": completed / total * 100.0,
                 })
 
-    return [path for path in files if path]
+    if any(path is None for path in files):
+        raise RuntimeError("HLS segment download incomplete")
+    return list(files)
 
 
 def _atomic_replace(src: str, dst: str) -> None:
@@ -882,7 +884,7 @@ def _concat_and_trim(
             f.write(f"file '{posix}'\n")
 
     if progress_hook:
-        progress_hook({"status": "downloading", "percent": 92})
+        progress_hook({"status": "postprocessing", "percent": 92})
 
     cmd = [
         ffmpeg_exe, "-y", "-loglevel", "error",
@@ -906,7 +908,7 @@ def _concat_and_trim(
     _verify_output_file(tmp_out)
 
     if progress_hook:
-        progress_hook({"status": "downloading", "percent": 98})
+        progress_hook({"status": "postprocessing", "percent": 98})
 
     # Atomic replace when possible; copy fallback for cross-drive temp (Windows).
     _atomic_replace(tmp_out, output_path)

@@ -2658,6 +2658,10 @@ export default function App() {
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
     setPreviewTrimEnd(end);
+    trimStartSecRef.current = start;
+    trimEndSecRef.current = end;
+    setTrimStartSec(start);
+    setTrimEndSec(end);
     if (opts?.seek === 'in') seekPreviewVideo(start, true);
     else if (opts?.seek === 'out') seekPreviewVideo(end, true);
     else clampPreviewPlaybackToTrim();
@@ -3283,17 +3287,20 @@ export default function App() {
 
   // ── Start download ──
 
+  const effectiveDownloadTrim = useCallback(() => ({
+    start: previewOpen ? previewTrimStartRef.current : trimStartSecRef.current,
+    end: previewOpen ? previewTrimEndRef.current : trimEndSecRef.current,
+  }), [previewOpen, trimStartSec, trimEndSec, previewTrimStart, previewTrimEnd]);
+
   const promptStartDownload = useCallback(() => {
     if (!videoInfo) return;
-    const clipDownload = isClipUrl(url.trim());
-    const effectiveEnd = previewOpen ? previewTrimEndRef.current : trimEndSec;
-    const effectiveStart = previewOpen ? previewTrimStartRef.current : trimStartSec;
-    if (!clipDownload && effectiveEnd <= effectiveStart) {
+    const { start: effectiveStart, end: effectiveEnd } = effectiveDownloadTrim();
+    if (effectiveEnd <= effectiveStart) {
       setError('Set a valid trim range before downloading.');
       return;
     }
     setDownloadConfirmOpen(true);
-  }, [videoInfo, url, trimStartSec, trimEndSec, previewOpen]);
+  }, [videoInfo, effectiveDownloadTrim]);
 
   // ── Refresh downloads ──
 
@@ -3322,6 +3329,14 @@ export default function App() {
 
   useDownloadStreams(activeDownloadIds, handleDownloadSseEvent, handleDownloadTerminal);
 
+  useEffect(() => {
+    if (activeDownloadIds.length === 0) return;
+    const timer = window.setInterval(() => {
+      void refreshDownloads();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [activeDownloadIds.length, refreshDownloads]);
+
   const executeStartDownload = useCallback(async () => {
     setDownloadConfirmOpen(false);
     if (!videoInfo) return;
@@ -3331,7 +3346,8 @@ export default function App() {
       return;
     }
     const clipDownload = isClipUrl(url.trim());
-    if (!clipDownload && trimEndSec <= trimStartSec) {
+    const { start: cropStart, end: cropEnd } = effectiveDownloadTrim();
+    if (cropEnd <= cropStart) {
       setError('Set a valid trim range before downloading.');
       return;
     }
@@ -3339,17 +3355,18 @@ export default function App() {
       const endpoint = clipDownload ? '/api/download/clip' : '/api/download/video';
       const clipName = downloadFilename.trim()
         || suggestClipDownloadName(videoInfo.title, videoInfo.uploader, url.trim());
+      const trimBody = { crop_start: cropStart, crop_end: cropEnd };
       const body = clipDownload
         ? {
             url: url.trim(),
             quality: quality || undefined,
             output_file: clipName,
+            ...trimBody,
           }
         : {
             url: url.trim(),
             quality: quality || undefined,
-            crop_start: previewOpen ? previewTrimStartRef.current : trimStartSec,
-            crop_end: previewOpen ? previewTrimEndRef.current : trimEndSec,
+            ...trimBody,
           };
       await apiPost<{ download_id: string; status: string }>(endpoint, body);
       setTab('queue');
@@ -3357,33 +3374,36 @@ export default function App() {
     } catch (err: any) {
       setError(err.message);
     }
-  }, [videoInfo, url, quality, trimStartSec, trimEndSec, ensureDownloadFolder, refreshDownloads, downloadFilename]);
+  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename]);
 
   const downloadConfirmCopy = useMemo(() => {
     const clipDownload = isClipUrl(url.trim());
     const title = videoInfo?.title || 'Untitled';
+    const trimStart = previewOpen ? previewTrimStart : trimStartSec;
+    const trimEnd = previewOpen ? previewTrimEnd : trimEndSec;
+    const trimDur = Math.max(1, trimEnd - trimStart);
     if (clipDownload) {
-      const dur = videoInfo?.duration
-        ? Math.floor(videoInfo.duration)
-        : Math.max(1, trimEndSec - trimStartSec);
-      const human = formatClipDurationHuman(dur);
+      const human = formatClipDurationHuman(trimDur);
       const defaultFilename = suggestClipDownloadName(
         videoInfo?.title,
         videoInfo?.uploader,
         url.trim(),
       );
+      const rangeNote = trimDur < (videoInfo?.duration ?? trimDur)
+        ? ` (${formatHmsFull(trimStart)} → ${formatHmsFull(trimEnd)})`
+        : '';
       return {
         title: 'Download clip?',
-        message: `Save this clip (${human}). Edit the file name below if you want.`,
+        message: `Save this clip (${human})${rangeNote}. Edit the file name below if you want.`,
         defaultFilename,
       };
     }
     return {
       title: 'Download trim?',
-      message: `Download "${title}" from ${formatHmsFull(trimStartSec)} to ${formatHmsFull(trimEndSec)}?`,
+      message: `Download "${title}" from ${formatHmsFull(trimStart)} to ${formatHmsFull(trimEnd)}?`,
       defaultFilename: '',
     };
-  }, [url, videoInfo, trimStartSec, trimEndSec]);
+  }, [url, videoInfo, trimStartSec, trimEndSec, previewOpen, previewTrimStart, previewTrimEnd]);
 
   useEffect(() => {
     if (!downloadConfirmOpen) return;

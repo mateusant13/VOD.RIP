@@ -44,6 +44,9 @@ def _hook_progress_percent(d: dict) -> Optional[int]:
         return None
 
     raw = max(0.0, min(100.0, raw))
+    # FFmpeg concat/encode phases emit 91–100; do not rescale those to ~83%.
+    if d.get("status") == "postprocessing" or raw >= 91.0:
+        return min(99, round(raw))
     pct = round(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
     if pct == 0 and raw > 0:
         pct = 1
@@ -157,13 +160,15 @@ class DownloadManager:
             if pause_event.is_set():
                 raise ytdlp_service.PausedError("Download paused by user")
 
-            if d.get("status") == "downloading":
+            if d.get("status") in ("downloading", "postprocessing"):
                 pct = _hook_progress_percent(d)
                 if pct is not None:
+                    label = "Encoding" if d.get("status") == "postprocessing" else "Downloading"
                     with self._lock:
                         state.progress = pct
-                        state.status = f"Downloading {pct}%"
+                        state.status = f"{label} {pct}%"
                     self._notify_sse(download_id, "progress", pct)
+                    self._notify_sse(download_id, "status", state.status)
             elif d.get("status") == "finished":
                 with self._lock:
                     state.status = "Merging..."
@@ -407,10 +412,31 @@ class DownloadManager:
             if not queues:
                 self._sse_queues.pop(download_id, None)
 
-    def register_sse(self, download_id: str, queue):
+    def register_sse(self, download_id: str, queue) -> bool:
         with self._lock:
-            if download_id in self._sse_queues:
-                self._sse_queues[download_id].append(queue)
+            state = self._downloads.get(download_id)
+            if state is None:
+                return False
+            queues = self._sse_queues.setdefault(download_id, [])
+            if queue in queues:
+                return True
+            if state.status in _DONE_STATUSES:
+                snapshot = (
+                    ("progress", 100 if state.status == "Completed" else state.progress),
+                    ("status", state.status),
+                )
+            else:
+                queues.append(queue)
+                snapshot = (
+                    ("progress", state.progress),
+                    ("status", state.status),
+                )
+        for event_type, data in snapshot:
+            try:
+                queue.put_nowait({"type": event_type, "data": data})
+            except Exception:
+                pass
+        return True
 
     def set_max_workers(self, max_workers: int) -> None:
         max_workers = max(1, min(16, int(max_workers)))
