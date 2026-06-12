@@ -84,5 +84,14 @@ debug_full_flow.py
 # AI agent memory (not project documentation)
 backend/AGENTS.md
 
-# Generated audit reports
+# Generated audit reports / AI agent artifacts
 report/
+audit_report*.md
+audit_report_consultgpt_batches/
+retry_queue.json
+
+# README demo GIF intermediates (keep assets/readme/demo.gif)
+assets/readme/_frames/
+
+# Copied at build from assets/icon.ico
+icon.ico
