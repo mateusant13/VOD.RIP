@@ -2269,7 +2269,7 @@ export default function App() {
         setPreviewVideoLoading(false);
       };
       previewAppliedHeightRef.current = activeH;
-      attachProgressivePreview(video, playbackUrl);
+      attachProgressivePreview(video, playbackUrl, previewTrimStartRef.current);
       video.addEventListener('canplay', onCanPlay, { once: true });
       video.addEventListener('error', onVideoError, { once: true });
       cleanup = () => {
@@ -2566,6 +2566,12 @@ export default function App() {
     trimEndSecRef.current = end;
     setTrimStartSec(start);
     setTrimEndSec(end);
+    // Keep pin in sync with current values so min/max don't jump when pin is cleared
+    if (urlTrimDragPinRef.current) {
+      const updated = { ...urlTrimDragPinRef.current, fixedStart: start, fixedEnd: end };
+      urlTrimDragPinRef.current = updated;
+      setUrlTrimDragPin(updated);
+    }
     return { start, end };
   }, [vodDurationSec]);
 
@@ -2730,8 +2736,14 @@ export default function App() {
   }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance, markPreviewTrimEndpoint]);
 
   const finishUrlTrimDrag = useCallback(() => {
-    urlTrimDragPinRef.current = null;
-    setUrlTrimDragPin(null);
+    // Keep pin with current values so min/max stay stable between drags
+    const current = {
+      which: lastUrlTrimEndpointRef.current,
+      fixedStart: trimStartSecRef.current,
+      fixedEnd: trimEndSecRef.current,
+    };
+    urlTrimDragPinRef.current = current;
+    setUrlTrimDragPin(current);
     trimDragActiveRef.current = false;
     setNeedleGlance(null);
   }, []);
@@ -2743,7 +2755,7 @@ export default function App() {
   ) => {
     markUrlTrimEndpoint(which);
     const pin = urlTrimDragPinRef.current;
-    if (pin && pin.which !== which) return;
+    // Allow either slider to use the pin values regardless of which was dragged
 
     const dragOrigin = trimDragOriginRef.current;
     const applied = which === 'in'

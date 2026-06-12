@@ -21,13 +21,16 @@ export function resolvePreviewPlayback(
 }
 
 /** Load proxied MP4 into a <video> — use <source type="video/mp4"> so .m3u8 paths still play. */
-export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: string): void {
+export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: string, startTime?: number): void {
   video.innerHTML = '';
   video.removeAttribute('src');
   const source = document.createElement('source');
   source.src = playbackUrl;
   source.type = 'video/mp4';
   video.appendChild(source);
+  if (startTime != null && Number.isFinite(startTime)) {
+    video.currentTime = startTime;
+  }
   video.load();
 }
 
