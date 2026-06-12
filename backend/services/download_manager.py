@@ -276,18 +276,46 @@ class DownloadManager:
             if d.get("status") in ("downloading", "postprocessing"):
                 pct = _hook_progress_percent(d)
                 if pct is not None:
-                    label = "Encoding" if d.get("status") == "postprocessing" else "Downloading"
+                    # The new _run_ffmpeg / ytdlp pipeline supplies a
+                    # ``phase`` string ("Encoding", "Remuxing",
+                    # "Finalising", "Encoding…") plus optional ``speed``
+                    # ("1.4x") and ``eta_seconds``. We build a compact
+                    # status string so the user always sees *what* is
+                    # happening, not just "Encoding 99%" frozen.
+                    if d.get("status") == "postprocessing":
+                        label = str(d.get("phase") or "Encoding")
+                    else:
+                        label = "Downloading"
+                    extras: list[str] = []
+                    sp = d.get("speed")
+                    if sp:
+                        extras.append(str(sp))
+                    eta = d.get("eta_seconds")
+                    if isinstance(eta, (int, float)) and eta >= 0 and eta < 24 * 3600:
+                        if eta >= 60:
+                            mm, ss = divmod(int(eta), 60)
+                            extras.append(f"ETA {mm}m{ss:02d}s")
+                        else:
+                            extras.append(f"ETA {int(eta)}s")
+                    suffix = f" • {' • '.join(extras)}" if extras else ""
                     with self._lock:
+                        # Monotonic clamp: never let the bar run backwards.
+                        # yt-dlp's old postprocess placeholders (92/95/98)
+                        # can still arrive after the new 85->99 ffmpeg
+                        # range, which would otherwise cause a visible
+                        # 98 -> 85 jump in the UI.
+                        if pct < state.progress and pct < 91 and state.progress >= 91:
+                            pct = state.progress
                         state.progress = pct
-                        state.status = f"{label} {pct}%"
+                        state.status = f"{label} {pct}%{suffix}"
                     self._notify_sse(download_id, "progress", pct)
                     self._notify_sse(download_id, "status", state.status)
             elif d.get("status") == "finished":
                 with self._lock:
-                    state.status = "Merging..."
-                    state.progress = 95
-                self._notify_sse(download_id, "progress", 95)
-                self._notify_sse(download_id, "status", "Merging...")
+                    state.status = "Finalising…"
+                    state.progress = 99
+                self._notify_sse(download_id, "progress", 99)
+                self._notify_sse(download_id, "status", "Finalising…")
 
         def _cleanup_output():
             expected_duration = None

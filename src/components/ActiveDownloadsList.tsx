@@ -44,6 +44,27 @@ function ActiveDownloadsListInner({
         const isTw = dl.platform === 'Twitch';
         const isPaused = dl.status === 'Paused';
         const color = isPaused ? '#fbbf24' : (isTw ? '#9146FF' : '#53fc18');
+        // The backend status string is rich ("Encoding 87% • 1.4x • ETA 23s",
+        // "Finalising…", "Remuxing 92% • ETA 2s"). The first space-separated
+        // token is the phase label, which maps 1:1 to a stable phase_id
+        // (encoding / remuxing / finalising / merging). The id is what the
+        // UI logic branches on, so changing the display text never breaks
+        // the animation/colour contract.
+        const dlStatus = dl.status ?? '';
+        const firstToken = (dlStatus.split(/\s+/, 1)[0] || '').toLowerCase();
+        const phaseId =
+          firstToken.startsWith('finalis') ? 'finalising'
+          : firstToken.startsWith('remux') ? 'remuxing'
+          : firstToken.startsWith('merg') ? 'merging'
+          : firstToken.startsWith('encod') ? 'encoding'
+          : '';
+        const isPostProcess = phaseId !== '';
+        const isFinalising = phaseId === 'finalising';
+        const badgeText = isPaused
+          ? 'Paused'
+          : (dl.progress > 0
+              ? (isPostProcess ? dlStatus : `${dl.progress}%`)
+              : dlStatus);
         return (
           <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
             <div className="flex justify-between items-center gap-2">
@@ -53,17 +74,26 @@ function ActiveDownloadsListInner({
                   {dl.title || dl.url}
                 </span>
               </div>
-              <span className="text-[10px] font-mono shrink-0" style={{ color }}>
-                {isPaused ? 'Paused' : (dl.progress > 0 ? `${dl.progress}%` : dl.status)}
+              <span
+                className={`text-[10px] font-mono shrink-0 ${isPostProcess ? 'animate-pulse' : ''}`}
+                style={{ color }}
+              >
+                {badgeText}
               </span>
             </div>
-            <div className="w-full h-2 bg-zinc-800 border border-zinc-700">
+            <div className="w-full h-2 bg-zinc-800 border border-zinc-700 relative overflow-hidden">
               <div
                 className={`h-full transition-all duration-300 ${
                   isPaused ? 'bg-yellow-500/70' : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
                 }`}
                 style={{ width: `${Math.max(dl.progress, dl.status === 'Starting...' ? 2 : 0)}%` }}
               />
+              {isFinalising && (
+                <div
+                  className="absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-white/20 to-transparent"
+                  style={{ animation: 'shimmer 1.2s linear infinite' }}
+                />
+              )}
             </div>
             <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
               <span className="truncate">{basename(dl.output_file)}</span>

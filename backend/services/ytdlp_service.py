@@ -123,6 +123,40 @@ def _ffmpeg_cmd_with_progress(cmd: list) -> list:
     return cmd[:-1] + ["-nostats", "-progress", "pipe:2", cmd[-1]]
 
 
+def _parse_speed_multiplier(raw: Optional[str]) -> Optional[float]:
+    """Parse ffmpeg's ``speed=1.4x`` string into a float multiplier.
+
+    Returns ``None`` when the value is missing, unparseable, or "N/A" so
+    callers can fall back to the elapsed-based estimate.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip().rstrip("x").rstrip("X").strip()
+    if not s or s.upper() == "N/A":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _phase_id(label: str) -> str:
+    """Map a free-text phase label to a stable, lowercase id for UI logic.
+
+    Keeping the id in lockstep with the label means a typo in either one
+    is a single edit point, and the UI can ``switch (phase_id)`` instead
+    of doing fragile regex matching on the displayed string.
+    """
+    s = (label or "").lower().rstrip("…").rstrip(".").strip()
+    if "remux" in s:
+        return "remuxing"
+    if "finalis" in s:
+        return "finalising"
+    if "merg" in s:
+        return "merging"
+    return "encoding"
+
+
 def _run_ffmpeg(
     cmd: list,
     cancel_event: Optional[threading.Event] = None,
@@ -130,10 +164,20 @@ def _run_ffmpeg(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     progress_hook: Optional[Callable] = None,
     encode_duration: Optional[float] = None,
-    progress_from: float = 92.0,
-    progress_to: float = 98.0,
+    progress_from: float = 85.0,
+    progress_to: float = 99.0,
+    phase: str = "Encoding",
 ) -> None:
-    """Run ffmpeg, polling *cancel_event* / *pause_event* so stop can kill the process."""
+    """Run ffmpeg, polling *cancel_event* / *pause_event* so stop can kill the process.
+
+    Emits ``progress_hook`` events with a percent in the ``progress_from → progress_to``
+    range (default 85 → 99 — leaves 1% for the post-ffmpeg "Finalising…" window
+    so the bar never appears stuck at 100). The hook also receives ``speed``
+    (a string like ``"1.4x"``) and ``eta`` (seconds remaining) when both can
+    be derived from ffmpeg's ``-progress pipe:2`` output, plus a watchdog
+    event every ~3s while ffmpeg is still doing work but hasn't emitted a
+    progress line (e.g. demuxer probing, encoder warm-up).
+    """
     if not cmd:
         raise RuntimeError("FFmpeg command is empty")
     ffmpeg_bin = str(cmd[0])
@@ -169,20 +213,57 @@ def _run_ffmpeg(
     stderr_chunks: deque[bytes] = deque(maxlen=32)
     _stop_stderr = threading.Event()
     last_reported_pct = progress_from
+    start_ts = time.monotonic()
+    last_emit_ts = start_ts
+    last_known_speed: Optional[str] = None
 
     def _emit_encode_progress(out_time_ms: int) -> None:
-        nonlocal last_reported_pct
+        nonlocal last_reported_pct, last_emit_ts, last_progress_emit_wall
         if not track_encode or not progress_hook:
             return
         encoded_sec = max(0.0, out_time_ms / 1_000_000.0)
         ratio = min(1.0, encoded_sec / encode_duration)
         pct = progress_from + ratio * (progress_to - progress_from)
-        if pct >= last_reported_pct + 0.4 or pct >= progress_to - 0.1:
-            last_reported_pct = pct
-            progress_hook({"status": "postprocessing", "percent": pct})
+        # Always emit on a 0.5% step OR every ~1s, whichever comes first.
+        # The bar is now wide enough (14% by default) that this gives a
+        # smooth, sub-second update rate even for short encodes, and
+        # always shows motion while ffmpeg is alive.
+        now = time.monotonic()
+        if pct < last_reported_pct + 0.5 and (now - last_emit_ts) < 1.0:
+            return
+        last_reported_pct = pct
+        last_emit_ts = now
+        # Reset the watchdog's "last seen" wall clock. Without this the
+        # watchdog fires every 3s even when ffmpeg is actively producing
+        # progress, which is a real bug (caught by consultgpt review).
+        last_progress_emit_wall = now
+        elapsed = max(0.001, now - start_ts)
+        rate = encoded_sec / elapsed if encoded_sec > 0 else 0.0
+        remaining = max(0.0, encode_duration - encoded_sec)
+        # Prefer ffmpeg's own speed= (media-seconds-per-wall-second,
+        # already corrected for stalls and startup) over the elapsed-
+        # based estimate, which can be wildly off in the first few
+        # seconds. Fall back to elapsed-derived rate when speed isn't
+        # yet available.
+        parsed_speed = _parse_speed_multiplier(last_known_speed)
+        if parsed_speed is not None and parsed_speed > 0.05:
+            eta = remaining / parsed_speed
+        elif rate > 0.05:
+            eta = remaining / rate
+        else:
+            eta = None
+        progress_hook({
+            "status": "postprocessing",
+            "percent": pct,
+            "phase": phase,
+            "phase_id": _phase_id(phase),
+            "speed": last_known_speed,
+            "eta_seconds": eta,
+        })
 
     def _drain_stderr():
         assert proc.stderr is not None
+        nonlocal last_known_speed
         line_buf = ""
         for chunk in iter(lambda: proc.stderr.read(4096), b""):
             if _stop_stderr.is_set():
@@ -194,15 +275,32 @@ def _run_ffmpeg(
             while "\n" in line_buf:
                 line, line_buf = line_buf.split("\n", 1)
                 line = line.strip()
+                if not line:
+                    continue
                 if line.startswith("out_time_ms="):
                     try:
                         _emit_encode_progress(int(line.split("=", 1)[1]))
                     except ValueError:
                         pass
+                elif line.startswith("speed="):
+                    raw = line.split("=", 1)[1].strip()
+                    if raw and raw != "N/A":
+                        last_known_speed = raw
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
 
+    # Watchdog: while ffmpeg is still running, emit a synthetic
+    # "Encoding (probing)… N frames" event every 3s if we haven't heard
+    # from ffmpeg's progress pipe. The user sees the bar move and the
+    # status text update, which kills the "frozen at 99%" feeling during
+    # long demuxer probes (common on HLS with 1000+ segments).
+    #
+    # Disabled during Remuxing because ``-c copy`` finishes in well under
+    # 3s for typical clips, and a stream of "Remuxing… 93%" duplicates is
+    # just noise.
+    last_progress_emit_wall = start_ts
+    watchdog_enabled = track_encode and _phase_id(phase) == "encoding"
     try:
         while proc.poll() is None:
             try:
@@ -210,7 +308,38 @@ def _run_ffmpeg(
             except PausedError:
                 proc.kill()
                 raise
-            time.sleep(0.05)
+            time.sleep(0.2)
+            if watchdog_enabled and progress_hook:
+                now = time.monotonic()
+                # The progress pipe emits out_time every ~500ms; if we
+                # haven't seen one in 3s, ffmpeg is likely still demuxing
+                # or warming up the encoder — nudge the UI so the user
+                # knows the process is alive. ``last_progress_emit_wall``
+                # is updated by ``_emit_encode_progress`` on every real
+                # progress line so this only fires when ffmpeg is silent.
+                if now - last_progress_emit_wall >= 3.0:
+                    last_progress_emit_wall = now
+                    encoded_sec = max(0.0, (last_reported_pct - progress_from)
+                                       / max(0.01, (progress_to - progress_from))
+                                       * encode_duration)
+                    elapsed = max(0.001, now - start_ts)
+                    rate = encoded_sec / elapsed if encoded_sec > 0 else 0.0
+                    remaining = max(0.0, encode_duration - encoded_sec)
+                    parsed_speed = _parse_speed_multiplier(last_known_speed)
+                    if parsed_speed is not None and parsed_speed > 0.05:
+                        eta = remaining / parsed_speed
+                    elif rate > 0.05:
+                        eta = remaining / rate
+                    else:
+                        eta = None
+                    progress_hook({
+                        "status": "postprocessing",
+                        "percent": last_reported_pct,
+                        "phase": f"{phase}…",
+                        "phase_id": _phase_id(f"{phase}…"),
+                        "speed": last_known_speed,
+                        "eta_seconds": eta,
+                    })
         _stop_stderr.set()
         stderr_thread.join(timeout=2)
         stderr = b"".join(stderr_chunks)[-2000:]
@@ -612,13 +741,29 @@ def _build_ydl_opts(
         opts["progress_hooks"] = [progress_hook]
 
         def _postprocessor_hook(d: dict) -> None:
+            # yt-dlp's own postprocessor pipeline (used when we hand it
+            # the file directly, e.g. download_sections for non-HLS
+            # sources) doesn't expose a real progress stream. These
+            # placeholders are the only feedback we get; the
+            # _hook_progress_percent path in the manager applies a
+            # monotonic clamp so they don't regress the wider 85->99
+            # ffmpeg range that the HLS path uses.
             status = d.get("status")
             if status == "started":
-                progress_hook({"status": "postprocessing", "percent": 92})
+                progress_hook({
+                    "status": "postprocessing", "percent": 92,
+                    "phase": "Postprocess", "phase_id": "encoding",
+                })
             elif status == "processing":
-                progress_hook({"status": "postprocessing", "percent": 95})
+                progress_hook({
+                    "status": "postprocessing", "percent": 95,
+                    "phase": "Postprocess", "phase_id": "encoding",
+                })
             elif status == "finished":
-                progress_hook({"status": "postprocessing", "percent": 98})
+                progress_hook({
+                    "status": "postprocessing", "percent": 98,
+                    "phase": "Postprocess", "phase_id": "encoding",
+                })
 
         opts["postprocessor_hooks"] = [_postprocessor_hook]
 
@@ -949,7 +1094,20 @@ def _concat_and_trim(
             f.write(f"file '{posix}'\n")
 
     if progress_hook:
-        progress_hook({"status": "postprocessing", "percent": 92})
+        # Pick a phase label that tells the user what ffmpeg is actually
+        # doing. ``-c copy`` is a stream copy (just remux, near-instant
+        # for a clip), otherwise we're re-encoding to H.264 which can take
+        # real time on long clips.
+        encoder = resolve_video_encoder(video_encoder)
+        phase = "Remuxing" if encoder == "copy" else "Encoding"
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 85,
+            "phase": phase,
+            "phase_id": _phase_id(phase),
+            "speed": None,
+            "eta_seconds": None,
+        })
 
     cmd = [
         ffmpeg_exe, "-y", "-loglevel", "error",
@@ -972,14 +1130,26 @@ def _concat_and_trim(
         register_abort=register_abort,
         progress_hook=progress_hook,
         encode_duration=duration,
-        progress_from=92.0,
-        progress_to=98.0,
+        progress_from=85.0,
+        progress_to=99.0,
+        phase=phase,
     )
     _check_pause_cancel(cancel_event, pause_event)
     _verify_output_file(tmp_out)
 
     if progress_hook:
-        progress_hook({"status": "postprocessing", "percent": 98})
+        # Reserve 99 → 100 for the "Finalising…" window (atomic replace
+        # of multi-GB files can take 10+ seconds on a slow disk; we want
+        # the user to see explicit feedback that the bar is moving
+        # through the disk-write phase, not frozen at 99).
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 99,
+            "phase": "Finalising",
+            "phase_id": _phase_id("Finalising"),
+            "speed": None,
+            "eta_seconds": None,
+        })
 
     # Atomic replace when possible; copy fallback for cross-drive temp (Windows).
     _atomic_replace(tmp_out, output_path)

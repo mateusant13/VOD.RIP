@@ -245,6 +245,15 @@ input[type="range"].url-trim-range::-moz-range-thumb {
   animation-duration: 300ms;
 }
 
+/* Shimmer sweep used by the active-downloads progress bar during the
+ * "Finalising…" phase (atomic-replace of multi-GB files can take 10+
+ * seconds on a slow disk; the sweep tells the user the work is alive
+ * even when the percentage is pinned at 99). */
+@keyframes shimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(400%); }
+}
+
 /* Responsive type — gentle scale only (see uiScale.ts) */
 html .text-\[8px\] {
   font-size: calc(8px * var(--ui-scale)) !important;
