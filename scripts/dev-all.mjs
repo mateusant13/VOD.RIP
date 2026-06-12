@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Start FastAPI (7897) + Vite dev server (5173) together. */
 import { execSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -100,7 +101,14 @@ async function main() {
   console.log("Open UI at    -> http://localhost:5173");
   console.log("(Ctrl+C stops both)\n");
 
-  start("web", process.platform === "win32" ? "npx.cmd" : "npx", ["vite"], root);
+  const viteBin = path.join(root, "node_modules", "vite", "bin", "vite.js");
+  if (!fs.existsSync(viteBin)) {
+    console.error("[web] vite not installed — run npm install first");
+    shutdown(1);
+    return;
+  }
+  // Run vite.js with node directly — npx.cmd + shell:false throws EINVAL on Windows.
+  start("web", process.execPath, [viteBin], root);
 }
 
 main().catch((err) => {
