@@ -416,22 +416,113 @@ def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
     return None, "Folder picker cancelled or unavailable."
 
 
-def _reveal_path_windows(target: str) -> None:
-    """Reveal a file in Explorer and bring the window forward (Shell API)."""
-    import ctypes
+def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> bool:
+    """Bring the Explorer window showing ``folder_path`` to the foreground.
 
+    Returns True if a matching window was found and focused, False otherwise.
+    Best-effort UX — failures (including "no matching window") return False
+    rather than raising, so the caller can decide whether to spawn a new
+    Explorer process.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        SW_RESTORE = 9
+        GW_OWNER = 4
+
+        folder_norm = os.path.normcase(os.path.abspath(folder_path))
+        target_titles: set[str] = {
+            (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
+        }
+        if item_name:
+            target_titles.add(os.path.normcase(item_name).lower())
+
+        captured: list[int] = []
+
+        def _cb(hwnd, _lparam):
+            if captured:
+                return False
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            if user32.GetClassNameW(hwnd, cls, 256) == 0:
+                return True
+            if cls.value not in ("CabinetWClass", "ExploreWClass"):
+                return True
+            # Skip owned popups (preview pane, etc).
+            if user32.GetWindow(hwnd, GW_OWNER):
+                return True
+            title = ctypes.create_unicode_buffer(512)
+            n = user32.GetWindowTextW(hwnd, title, 512)
+            if n <= 0:
+                return True
+            tv = title.value.lower()
+            for t in target_titles:
+                if tv == t or tv.endswith(t):
+                    captured.append(hwnd)
+                    return False
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        hwnd = captured[0] if captured else 0
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        logger.debug("Could not focus Explorer window", exc_info=True)
+        return False
+
+
+def _reveal_path_windows(target: str) -> None:
+    """Reveal a file in Explorer and bring the window forward.
+
+    Uses ``explorer.exe /select,<path>`` instead of
+    ``SHOpenFolderAndSelectItems`` — the Shell COM call triggers an access
+    violation in this process when the path is on a removable/network drive
+    (ctypes mishandles the NULL PIDL array). ``explorer.exe`` is the same
+    thing Windows Explorer's "Show in folder" verb uses, and never crashes.
+    """
     abspath = os.path.abspath(target)
     if os.path.isfile(abspath):
-        pidl = ctypes.windll.shell32.ILCreateFromPathW(abspath)
-        if pidl:
-            try:
-                ctypes.windll.shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
-            finally:
-                ctypes.windll.shell32.ILFree(pidl)
-            return
-    folder = abspath if os.path.isdir(abspath) else os.path.dirname(abspath)
-    if folder and os.path.isdir(folder):
-        os.startfile(folder)
+        folder = os.path.dirname(abspath)
+        item = os.path.basename(abspath)
+    elif os.path.isdir(abspath):
+        folder = abspath
+        item = None
+    else:
+        # File doesn't exist yet (download in progress, partial file
+        # deleted, etc). Open the parent and let the user see the
+        # folder — clicking "Show in folder" while the file is still
+        # being written should at least pop the folder open.
+        parent = os.path.dirname(abspath)
+        if parent and os.path.isdir(parent):
+            folder = parent
+            item = None
+        else:
+            folder = None
+            item = None
+    if not folder:
+        return
+    # If the folder is already open in an Explorer window, just bring it
+    # forward — don't spawn a duplicate. Otherwise let explorer.exe do
+    # its thing and then locate the new window.
+    if not _focus_explorer_window(folder, item):
+        if item:
+            subprocess.Popen(
+                ["explorer.exe", f"/select,{abspath}"],
+                creationflags=_NO_WINDOW,
+            )
+        else:
+            subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
+        _focus_explorer_window(folder, item)
 
 
 def _open_folder_sync(path: str) -> None:
@@ -449,8 +540,11 @@ def _open_folder_sync(path: str) -> None:
         if os.name == "nt":
             if p.is_file():
                 _reveal_path_windows(target)
-            else:
-                os.startfile(target)
+            elif not _focus_explorer_window(target):
+                # ``explorer.exe`` (not ``os.startfile``) so the new window
+                # gets a fresh explorer process we can locate and focus.
+                subprocess.Popen(["explorer.exe", target], creationflags=_NO_WINDOW)
+                _focus_explorer_window(target)
         elif sys.platform == "darwin":
             subprocess.Popen(
                 ["open", "-R", target] if p.is_file() else ["open", target],
@@ -465,7 +559,9 @@ def _open_folder_sync(path: str) -> None:
         raise FileNotFoundError(f"Folder does not exist: {parent}")
     folder = str(parent)
     if os.name == "nt":
-        os.startfile(folder)
+        if not _focus_explorer_window(folder):
+            subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
+            _focus_explorer_window(folder)
     elif sys.platform == "darwin":
         subprocess.Popen(["open", folder], creationflags=_NO_WINDOW)
     else:

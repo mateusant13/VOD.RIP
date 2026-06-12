@@ -1,7 +1,7 @@
 {
   "name": "vod-rip",
   "private": true,
-  "version": "1.0.25",
+  "version": "1.0.26",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-all.mjs",
@@ -15,20 +15,16 @@
     "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs"
   },
   "dependencies": {
-    "clsx": "^2.1.1",
     "hls.js": "^1.6.2",
     "lucide-react": "^1.17.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "tailwind-merge": "^3.4.0"
+    "react-dom": "19.2.6"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
-    "@types/node": "22.19.17",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
-    "playwright": "^1.60.0",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.3.2",

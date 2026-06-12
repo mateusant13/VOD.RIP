@@ -1,15 +1,28 @@
-"""Download manager — manages download queue, progress, cancellation, and pause."""
+"""Download manager — manages download queue, progress, cancellation, and pause.
 
+Persists finished downloads (Completed / Failed / Cancelled) to
+``appdata/VOD.RIP/history.json`` so the queue tab survives refreshes,
+restarts, and crashes. Active downloads are not persisted: they are
+re-derivable from the OS processes and user input, and a half-finished
+``DownloadState`` on disk would be misleading (it would show 47% but
+no live worker is touching it).
+"""
+
+import json
 import logging
 import os
+import tempfile
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+
 from models.schemas import DownloadState
 from services import ytdlp_service
 from services.download_cleanup import delete_partial_output
+from services.settings import _get_appdata_dir
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
@@ -18,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DOWNLOAD_PROGRESS_CAP = 90
 _DONE_STATUSES = frozenset({"Completed", "Failed", "Cancelled"})
+_HISTORY_MAX_ENTRIES = 200  # Bound on-disk growth; UI also caps at 50.
+
+
 
 
 def _hook_progress_percent(d: dict) -> Optional[int]:
@@ -64,9 +80,97 @@ class DownloadManager:
         self._sse_queues: Dict[str, list] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = threading.Lock()
+        # Persistent history (Completed / Failed / Cancelled). Loaded on
+        # construction so the queue tab is populated immediately on startup
+        # — there is no flicker, no extra round-trip.
+        self._history_dir = _get_appdata_dir()
+        self._history_file = self._history_dir / "history.json"
+        self._history_lock = threading.Lock()
+        self._history: List[dict] = self._load_history()
+
+    # ------------------------------------------------------------------
+    # History persistence
+    # ------------------------------------------------------------------
+
+    def _load_history(self) -> List[dict]:
+        """Load persisted history from disk. Corrupt or missing file -> []."""
+        try:
+            if not self._history_file.is_file():
+                return []
+            data = json.loads(self._history_file.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return []
+            # Drop entries that don't look like a valid DownloadState — that
+            # way a hand-edited or partially-corrupt file is self-healing.
+            valid: List[dict] = []
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                if "download_id" not in entry or "status" not in entry:
+                    continue
+                if entry.get("status") not in _DONE_STATUSES:
+                    # An entry that was active when the server crashed is
+                    # better surfaced as Cancelled than silently dropped —
+                    # users can then see "it was running, what happened?".
+                    entry["status"] = "Cancelled"
+                valid.append(entry)
+            return valid[:_HISTORY_MAX_ENTRIES]
+        except Exception:
+            logger.exception("Failed to load download history; starting empty")
+            return []
+
+    def _save_history(self) -> None:
+        """Atomic write of self._history to disk. Errors are logged, not raised.
+
+        We swallow failures so a write error never breaks the running
+        download worker. Worst case the user loses the most recent entry.
+        """
+        with self._history_lock:
+            snapshot = self._history[:_HISTORY_MAX_ENTRIES]
+            try:
+                self._history_dir.mkdir(parents=True, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(self._history_dir),
+                    prefix="history_",
+                    suffix=".tmp",
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, str(self._history_file))
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                    raise
+            except Exception:
+                logger.exception("Failed to persist download history")
+
+    def _record_history(self, state: DownloadState) -> None:
+        """Insert/replace `state` in the in-memory history and flush to disk."""
+        if state.status not in _DONE_STATUSES:
+            return
+        payload = state.model_dump(mode="json")
+        with self._history_lock:
+            # Drop any prior entry for the same id (e.g. we updated the
+            # status of an existing record from Cancelled -> ... ).
+            self._history = [e for e in self._history if e.get("download_id") != state.download_id]
+            self._history.insert(0, payload)
+            self._history = self._history[:_HISTORY_MAX_ENTRIES]
+        self._save_history()
+
+    def _drop_history(self, download_id: str) -> None:
+        """Remove an entry from history and persist."""
+        with self._history_lock:
+            before = len(self._history)
+            self._history = [e for e in self._history if e.get("download_id") != download_id]
+            if len(self._history) == before:
+                return
+        self._save_history()
 
     def start_download(
-        self,
         url: str,
         output_file: str,
         quality: Optional[str] = None,
@@ -277,6 +381,18 @@ class DownloadManager:
                 _cleanup_output()
             finally:
                 with self._lock:
+                    final_state = (
+                        self._downloads.get(download_id)
+                        or DownloadState(
+                            download_id=download_id,
+                            url=params.get("url", ""),
+                            type=params.get("download_type", "video"),
+                            platform="Unknown",
+                            status=state.status,
+                            output_file=params.get("output_file", ""),
+                            started_at=state.started_at,
+                        )
+                    )
                     if state.status == "Paused":
                         self._abort_fns[download_id] = []
                         return
@@ -286,10 +402,12 @@ class DownloadManager:
                     self._abort_fns.pop(download_id, None)
                     self._cleanup_info.pop(download_id, None)
                     self._worker_params.pop(download_id, None)
-                    if state.status not in ("Completed", "Failed"):
+                    if state.status not in _DONE_STATUSES:
                         self._downloads.pop(download_id, None)
-
-        self._executor.submit(_download_worker)
+                # Persist outside the lock — disk write should never hold the
+                # download state lock.
+                if final_state.status in _DONE_STATUSES:
+                    self._record_history(final_state)
 
     def pause(self, download_id: str) -> bool:
         abort_fns: List[Callable[[], None]] = []
@@ -342,6 +460,7 @@ class DownloadManager:
     def cancel(self, download_id: str) -> bool:
         abort_fns: List[Callable[[], None]] = []
         cleanup: Optional[dict] = None
+        snapshot: Optional[DownloadState] = None
         with self._lock:
             event = self._cancel_events.get(download_id)
             pause_event = self._pause_events.get(download_id)
@@ -353,6 +472,11 @@ class DownloadManager:
             event.set()
             state.status = "Cancelled"
             state.progress = 0
+            # Snapshot before we pop — the worker's finally block will
+            # re-record this, but if the worker is mid-cancel-during-shutdown
+            # or otherwise never reaches its finally, this is our only
+            # chance to write a Cancelled entry to history.
+            snapshot = state.model_copy(deep=True)
             abort_fns = list(self._abort_fns.get(download_id, []))
             cleanup = self._cleanup_info.get(download_id)
 
@@ -372,6 +496,10 @@ class DownloadManager:
             self._worker_params.pop(download_id, None)
             self._sse_queues.pop(download_id, None)
         self._notify_sse(download_id, "status", "Cancelled")
+        if snapshot is not None:
+            # Worker finally will _also_ try to record this; ``_record_history``
+            # dedupes by id, so a double-write is a no-op rather than a duplicate.
+            self._record_history(snapshot)
         return True
 
     def get(self, download_id: str) -> Optional[DownloadState]:
@@ -387,23 +515,56 @@ class DownloadManager:
             )[:50]
 
     def get_active_and_history(self) -> dict:
+        """Return active + history lists, with history merged from disk.
+
+        In-memory history is the source of truth for entries the current
+        process touched; the on-disk file is the source of truth for
+        entries from previous runs. We union by ``download_id`` and sort
+        the union by ``started_at`` descending so the UI sees a single
+        continuous list across restarts.
+        """
         with self._lock:
-            items = sorted(
-                self._downloads.values(),
-                key=lambda d: d.started_at,
-                reverse=True,
-            )
-        active = [d for d in items if d.status not in _DONE_STATUSES][:50]
-        history = [d for d in items if d.status in _DONE_STATUSES][:50]
+            in_memory = list(self._downloads.values())
+        active = [d for d in in_memory if d.status not in _DONE_STATUSES][:50]
+
+        # Merge in-memory + on-disk, deduping by download_id (in-memory
+        # wins for a given id so the freshest record is shown).
+        in_memory_done = {d.download_id: d for d in in_memory if d.status in _DONE_STATUSES}
+        with self._history_lock:
+            disk_entries = list(self._history)
+        merged: Dict[str, DownloadState] = dict(in_memory_done)
+        for entry in disk_entries:
+            did = entry.get("download_id")
+            if not did or did in merged:
+                continue
+            try:
+                merged[did] = DownloadState(**entry)
+            except Exception:
+                logger.debug("Skipping malformed history entry %s", did, exc_info=True)
+
+        history = sorted(
+            merged.values(),
+            key=lambda d: d.started_at or "",
+            reverse=True,
+        )[:50]
         return {"active": active, "history": history}
 
     def remove_history(self, download_id: str) -> bool:
+        removed = False
         with self._lock:
             state = self._downloads.get(download_id)
-            if not state or state.status not in _DONE_STATUSES:
-                return False
-            self._downloads.pop(download_id, None)
-            return True
+            if state and state.status in _DONE_STATUSES:
+                self._downloads.pop(download_id, None)
+                removed = True
+        # Always try the disk side — even if the in-memory hit missed
+        # (e.g. the entry only exists on disk), the user expects Delete
+        # to be a hard remove.
+        with self._history_lock:
+            had_on_disk = any(e.get("download_id") == download_id for e in self._history)
+        if had_on_disk:
+            self._drop_history(download_id)
+            removed = True
+        return removed
 
     def unregister_sse(self, download_id: str, queue):
         with self._lock:

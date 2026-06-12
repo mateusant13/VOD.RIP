@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import subprocess as sp
+import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Clips shorter than this are almost certainly a broken ftyp-only placeholder.
 MIN_VALID_OUTPUT_BYTES = 50_000
 SEGMENT_DOWNLOAD_WORKERS = 8
+
+# Prevents a Windows console window from popping up around bundled ffmpeg.exe.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 # FFmpeg video encoders for H.264 output (Settings → Video encoder).
 VIDEO_ENCODER_OPTIONS: dict[str, str] = {
@@ -147,7 +151,13 @@ def _run_ffmpeg(
     run_cmd = _ffmpeg_cmd_with_progress(cmd) if track_encode else cmd
 
     try:
-        proc = sp.Popen(run_cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+        proc = sp.Popen(
+            run_cmd,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            stdin=sp.DEVNULL,
+            creationflags=_NO_WINDOW,
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(
             "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
