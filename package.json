@@ -1,7 +1,7 @@
 {
   "name": "vod-rip",
   "private": true,
-  "version": "1.0.28",
+  "version": "1.0.29",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-all.mjs",

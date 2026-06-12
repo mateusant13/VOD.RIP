@@ -235,6 +235,16 @@ class DownloadManager:
             self._cleanup_info[download_id] = {
                 "output_file": output_file,
                 "output_existed": output_existed,
+                "temp_dirs": [],
+                # Pass the expected trim length through so the cleanup
+                # helper can cross-check duration with ffprobe and avoid
+                # preserving a 100 KB partial encode.
+                "expected_duration": (
+                    (crop_end - crop_start)
+                    if (crop_start is not None and crop_end is not None
+                        and crop_end > crop_start)
+                    else None
+                ),
             }
             self._worker_params[download_id] = worker_params
 
@@ -280,7 +290,26 @@ class DownloadManager:
                 self._notify_sse(download_id, "status", "Merging...")
 
         def _cleanup_output():
-            delete_partial_output(output_file, output_existed)
+            expected_duration = None
+            with self._lock:
+                info = self._cleanup_info.get(download_id) or {}
+                expected_duration = info.get("expected_duration")
+            delete_partial_output(
+                output_file, output_existed, expected_duration=expected_duration,
+            )
+
+        def _register_temp_dir(path: str) -> None:
+            # The ytdlp pipeline hands us the exact path of every temp
+            # folder it created for THIS job. We track ownership here so
+            # the worker can clean up only its own dirs (never a sibling
+            # download's) when the job ends.
+            with self._lock:
+                info = self._cleanup_info.setdefault(
+                    download_id,
+                    {"output_file": output_file, "output_existed": output_existed,
+                     "temp_dirs": [], "expected_duration": None},
+                )
+                info.setdefault("temp_dirs", []).append(path)
 
         def _download_worker():
             try:
@@ -307,6 +336,7 @@ class DownloadManager:
                         "cancel_event": cancel_event,
                         "pause_event": pause_event,
                         "register_abort": _register_abort,
+                        "register_temp_dir": _register_temp_dir,
                         "settings_mgr": params.get("settings_mgr"),
                     }
                     kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -324,6 +354,7 @@ class DownloadManager:
                         cancel_event=cancel_event,
                         pause_event=pause_event,
                         register_abort=_register_abort,
+                        register_temp_dir=_register_temp_dir,
                     )
 
                 if cancel_event.is_set():
@@ -392,6 +423,8 @@ class DownloadManager:
                             started_at=state.started_at,
                         )
                     )
+                    cleanup = self._cleanup_info.get(download_id) or {}
+                    temp_dirs: List[str] = list(cleanup.get("temp_dirs") or [])
                     if state.status == "Paused":
                         self._abort_fns[download_id] = []
                         return
@@ -403,11 +436,12 @@ class DownloadManager:
                     self._worker_params.pop(download_id, None)
                     if state.status not in _DONE_STATUSES:
                         self._downloads.pop(download_id, None)
-                # Best-effort: wipe any leftover HLS temp folders so cancel
-                # at 99% doesn't leave a heap of empty `hls_clip_XXXX` dirs.
+                # Best-effort: wipe ONLY this job's own temp dirs so two
+                # concurrent downloads in the same output folder never
+                # accidentally nuke each other's hls_clip_XXXX dirs.
                 try:
-                    if final_state.status != "Completed":
-                        remove_temp_dirs(params.get("output_file", ""))
+                    if final_state.status != "Completed" and temp_dirs:
+                        remove_temp_dirs(temp_dirs)
                 except Exception:
                     pass
                 # Persist outside the lock — disk write should never hold the
@@ -492,7 +526,21 @@ class DownloadManager:
             except Exception:
                 pass
         if cleanup:
-            delete_partial_output(cleanup["output_file"], cleanup["output_existed"])
+            expected_duration = None
+            temp_dirs: List[str] = []
+            if isinstance(cleanup, dict):
+                expected_duration = cleanup.get("expected_duration")
+                temp_dirs = list(cleanup.get("temp_dirs") or [])
+            delete_partial_output(
+                cleanup["output_file"], cleanup["output_existed"],
+                expected_duration=expected_duration,
+            )
+            if temp_dirs:
+                remove_temp_dirs(temp_dirs)
+        # Emit the terminal "Cancelled" event BEFORE popping the queue,
+        # otherwise a connected SSE client can lose the final frame and
+        # be stuck on "Downloading..." until the next refresh.
+        self._notify_sse(download_id, "status", "Cancelled")
         with self._lock:
             self._downloads.pop(download_id, None)
             self._cancel_events.pop(download_id, None)
@@ -501,7 +549,6 @@ class DownloadManager:
             self._cleanup_info.pop(download_id, None)
             self._worker_params.pop(download_id, None)
             self._sse_queues.pop(download_id, None)
-        self._notify_sse(download_id, "status", "Cancelled")
         if snapshot is not None:
             # Worker finally will _also_ try to record this; ``_record_history``
             # dedupes by id, so a double-write is a no-op rather than a duplicate.

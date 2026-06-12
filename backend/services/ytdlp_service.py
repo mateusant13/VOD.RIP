@@ -1001,6 +1001,7 @@ def download_hls_media_clip(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    register_temp_dir: Optional[Callable[[str], None]] = None,
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
 ) -> None:
@@ -1025,11 +1026,17 @@ def download_hls_media_clip(
     out_parent = os.path.dirname(os.path.abspath(output_path))
     if out_parent:
         os.makedirs(out_parent, exist_ok=True)
-    # We don't use ``tempfile.TemporaryDirectory`` here because we need the
-    # path to remain reachable after a cancel so the cleanup pass in the
-    # download manager can wipe any leftover ``hls_clip_*`` folders the
-    # user has not asked to keep.
+    # We don't use ``tempfile.TemporaryDirectory`` because we want the path
+    # to be observable to the download manager (so it can be wiped on
+    # cancel even if ffmpeg is killed mid-encode) and we want to register
+    # ownership so concurrent downloads in the same output folder never
+    # accidentally wipe each other's temp dirs.
     tmpdir = tempfile.mkdtemp(prefix="hls_clip_", dir=out_parent or None)
+    if register_temp_dir:
+        try:
+            register_temp_dir(tmpdir)
+        except Exception:
+            pass
     try:
         files = _download_segments(
             selected, headers, tmpdir, progress_hook, cancel_event, pause_event,
@@ -1056,6 +1063,7 @@ def _download_hls_clip(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    register_temp_dir: Optional[Callable[[str], None]] = None,
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
 ) -> None:
@@ -1073,6 +1081,7 @@ def _download_hls_clip(
         cancel_event=cancel_event,
         pause_event=pause_event,
         register_abort=register_abort,
+        register_temp_dir=register_temp_dir,
         prefer_height=prefer_height,
         video_encoder=video_encoder,
     )
@@ -1126,6 +1135,7 @@ def download_video_sync(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    register_temp_dir: Optional[Callable[[str], None]] = None,
     video_encoder: Optional[str] = None,
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
@@ -1164,6 +1174,7 @@ def download_video_sync(
             register_abort=register_abort,
             prefer_height=_parse_prefer_height(quality),
             video_encoder=resolved_encoder,
+            register_temp_dir=register_temp_dir,
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)
