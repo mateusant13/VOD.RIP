@@ -1,19 +1,104 @@
 #!/usr/bin/env node
 /** Start FastAPI (7897) + Vite dev server (5173) together. */
-import { execSync, spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pyDir = path.join(root, "backend");
-const apiPort = process.env.PORT || "7897";
+const apiPort = Number(process.env.PORT || "7897");
+const vitePort = Number(process.env.VITE_PORT || "5173");
 
 const children = [];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isPortListening(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port, host: "127.0.0.1" });
+    const done = (listening) => {
+      socket.removeAllListeners();
+      try { socket.destroy(); } catch { /* ignore */ }
+      resolve(listening);
+    };
+    socket.setTimeout(600);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+async function waitPortFree(port, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await isPortListening(port))) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+function getWinPortPids(port) {
+  const result = spawnSync(
+    "powershell",
+    [
+      "-NoProfile",
+      "-Command",
+      `(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique) -join ' '`,
+    ],
+    { encoding: "utf8", windowsHide: true, timeout: 8000 },
+  );
+  const out = (result.stdout || "").trim();
+  return [...new Set(out.split(/\s+/).filter((x) => /^\d+$/.test(x)).map(Number))];
+}
+
+function killWinPid(pid) {
+  if (!pid || pid === process.pid) return;
+  for (const [cmd, args] of [
+    ["taskkill", ["/F", "/PID", String(pid)]],
+    ["taskkill", ["/F", "/T", "/PID", String(pid)]],
+    ["powershell", ["-NoProfile", "-Command", `Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`]],
+  ]) {
+    spawnSync(cmd, args, { stdio: "ignore", windowsHide: true, timeout: 5000 });
+  }
+}
+
+function releasePort(port) {
+  if (process.platform === "win32") {
+    for (const pid of getWinPortPids(port)) {
+      killWinPid(pid);
+    }
+  }
+  execSync(
+    `python -c "from services.server_lifecycle import release_api_port; release_api_port(${port}, timeout=12)"`,
+    { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(apiPort) } },
+  );
+}
+
+async function ensurePortFree(port, label) {
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    if (!(await isPortListening(port))) {
+      if (attempt > 1) console.log(`[dev] ${label} :${port} is free`);
+      return;
+    }
+    if (attempt === 1) {
+      console.log(`[dev] ${label} :${port} busy — killing listener(s)...`);
+    }
+    releasePort(port);
+    if (await waitPortFree(port, 4000)) {
+      console.log(`[dev] ${label} :${port} is free`);
+      return;
+    }
+  }
+  const pids = process.platform === "win32" ? getWinPortPids(port) : [];
+  console.error(
+    `[dev] ${label} :${port} still busy after kill attempts${pids.length ? `: [${pids.join(", ")}]` : ""} — aborting`,
+  );
+  process.exit(1);
 }
 
 function apiHealthy(port) {
@@ -30,23 +115,12 @@ function apiHealthy(port) {
   });
 }
 
-function releasePort(port) {
-  try {
-    execSync(
-      `python -c "from services.server_lifecycle import release_api_port; release_api_port(${port})"`,
-      { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(port) } },
-    );
-  } catch (err) {
-    console.warn(`[api] port :${port} release failed:`, err?.message || err);
-  }
-}
-
-function start(label, command, args, cwd) {
+function start(label, command, args, cwd, extraEnv = {}) {
   const child = spawn(command, args, {
     cwd,
     stdio: "inherit",
     shell: false,
-    env: { ...process.env, PORT: apiPort },
+    env: { ...process.env, PORT: String(apiPort), ...extraEnv },
   });
   child.on("exit", (code, signal) => {
     if (signal) return;
@@ -81,24 +155,24 @@ process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
 async function main() {
-  const port = Number(apiPort);
+  await ensurePortFree(apiPort, "API");
 
-  releasePort(port);
-
-  console.log("Starting API  -> http://localhost:" + port + "  (/api only)");
-  start("api", "python", ["run.py"], pyDir);
+  console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
+  start("api", "python", ["run.py"], pyDir, { VODRIP_SKIP_PORT_RELEASE: "1" });
 
   for (let i = 0; i < 30; i++) {
     await sleep(500);
-    if (await apiHealthy(port)) break;
+    if (await apiHealthy(apiPort)) break;
     if (i === 29) {
-      console.error(`[api] did not become ready on :${port} within 15s`);
+      console.error(`[api] did not become ready on :${apiPort} within 15s`);
       shutdown(1);
       return;
     }
   }
 
-  console.log("Open UI at    -> http://localhost:5173");
+  await ensurePortFree(vitePort, "Vite");
+
+  console.log(`Open UI at    -> http://localhost:${vitePort}`);
   console.log("(Ctrl+C stops both)\n");
 
   const viteBin = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -107,8 +181,7 @@ async function main() {
     shutdown(1);
     return;
   }
-  // Run vite.js with node directly — npx.cmd + shell:false throws EINVAL on Windows.
-  start("web", process.execPath, [viteBin], root);
+  start("web", process.execPath, [viteBin, "--port", String(vitePort), "--strictPort"], root);
 }
 
 main().catch((err) => {

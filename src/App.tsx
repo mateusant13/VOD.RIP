@@ -168,6 +168,8 @@ interface SavedChannel {
   errors?: Record<string, string>;
   updatedAt: string;
   loading?: boolean;
+  /** True after at least one clips fetch completed (success or failure). */
+  clipsFetched?: boolean;
   /** Legacy — migrated to vodVideos / clipVideos on load */
   videos?: ChannelVideo[];
 }
@@ -1328,6 +1330,7 @@ function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
     clipVideos: clipVideos ?? [],
     vodErrors: ch.vodErrors ?? legacyErrors,
     clipErrors: ch.clipErrors ?? {},
+    clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,
     loading: false,
   };
 }
@@ -1342,7 +1345,6 @@ function formatChannelErrorMessage(
   kickEnabled: boolean,
   twitchEnabled: boolean,
 ): string | null {
-  if (ch.loading) return null;
   const errs = channelPlatformErrors(ch, mode);
   const errKeys = Object.keys(errs).filter((k) => {
     if (!errs[k]) return false;
@@ -2622,6 +2624,20 @@ export default function App() {
     return { start, end };
   }, [vodDurationSec]);
 
+  const clampPreviewPlaybackToTrim = useCallback(() => {
+    const video = previewVideoRef.current;
+    if (!video || !previewVideoReady) return;
+    const start = previewTrimStartRef.current;
+    const end = previewTrimEndRef.current;
+    let t = video.currentTime;
+    if (t < start) t = start;
+    else if (t > end) t = end;
+    if (Math.abs(video.currentTime - t) > 0.05) {
+      video.currentTime = t;
+      syncPreviewTimeUi(t, true);
+    }
+  }, [previewVideoReady, syncPreviewTimeUi]);
+
   const commitPreviewTrimRange = useCallback((
     rawStart: number,
     rawEnd: number,
@@ -2642,8 +2658,9 @@ export default function App() {
     setPreviewTrimEnd(end);
     if (opts?.seek === 'in') seekPreviewVideo(start, true);
     else if (opts?.seek === 'out') seekPreviewVideo(end, true);
+    else clampPreviewPlaybackToTrim();
     return { start, end };
-  }, [vodDurationSec, seekPreviewVideo]);
+  }, [vodDurationSec, seekPreviewVideo, clampPreviewPlaybackToTrim]);
 
   const markUrlTrimEndpoint = useCallback((which: 'in' | 'out') => {
     lastUrlTrimEndpointRef.current = which;
@@ -2678,7 +2695,7 @@ export default function App() {
       which,
       trimButtonDeltaForEndpoint(which, buttonDelta),
     );
-    commitPreviewTrimRange(adjusted.start, adjusted.end, { seek: which });
+    commitPreviewTrimRange(adjusted.start, adjusted.end);
   }, [vodDurationSec, commitPreviewTrimRange]);
 
   const updateNeedleGlance = useCallback((
@@ -2753,8 +2770,8 @@ export default function App() {
       if (ev.pointerId !== pointerId) return;
       const sec = xToSec(ev.clientX);
       const applied = which === 'in'
-        ? commitPreviewTrimRange(sec, fixedEnd, { move: 'in', fixedEnd, seek: 'in' })
-        : commitPreviewTrimRange(fixedStart, sec, { move: 'out', fixedStart, seek: 'out' });
+        ? commitPreviewTrimRange(sec, fixedEnd, { move: 'in', fixedEnd })
+        : commitPreviewTrimRange(fixedStart, sec, { move: 'out', fixedStart });
       const activeSec = which === 'in' ? applied.start : applied.end;
       updateNeedleGlance(
         which,
@@ -3482,18 +3499,28 @@ export default function App() {
     setSavedChannels((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }, []);
 
+  const savedChannelsRef = useRef(savedChannels);
+  savedChannelsRef.current = savedChannels;
+
+  const channelRefreshInFlightRef = useRef<Set<string>>(new Set());
+  const clipsAutoFetchStartedRef = useRef<Set<string>>(new Set());
+
   const refreshChannel = useCallback(async (
     channelId: string,
     channelOverride?: SavedChannel,
     contentMode?: 'vods' | 'clips',
-    opts?: { incremental?: boolean },
+    opts?: { incremental?: boolean; silent?: boolean },
   ) => {
-    const ch = channelOverride ?? savedChannels.find((c) => c.id === channelId);
+    const ch = channelOverride ?? savedChannelsRef.current.find((c) => c.id === channelId);
     if (!ch) return;
     const mode = contentMode ?? channelContentFilter;
     const incremental = opts?.incremental ?? false;
+    const silent = opts?.silent ?? false;
+    const flightKey = `${channelId}:${mode}`;
+    if (!incremental && channelRefreshInFlightRef.current.has(flightKey)) return;
+    if (!incremental) channelRefreshInFlightRef.current.add(flightKey);
 
-    if (!incremental) {
+    if (!incremental && !silent) {
       updateChannel(channelId, { loading: true });
       setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
       setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
@@ -3562,6 +3589,7 @@ export default function App() {
         updateChannel(channelId, {
           clipVideos,
           clipErrors: errs,
+          clipsFetched: true,
           loading: false,
           updatedAt: new Date().toISOString(),
         });
@@ -3600,10 +3628,13 @@ export default function App() {
 
     } finally {
       if (!incremental) {
-        updateChannel(channelId, { loading: false });
+        channelRefreshInFlightRef.current.delete(flightKey);
+        if (!silent) {
+          updateChannel(channelId, { loading: false });
+        }
       }
     }
-  }, [savedChannels, updateChannel, channelContentFilter, kickEnabled, twitchEnabled]);
+  }, [updateChannel, channelContentFilter, kickEnabled, twitchEnabled]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
@@ -3619,13 +3650,15 @@ export default function App() {
     });
   }, []);
 
-  // Fetch clips once when cache is empty (filter switch uses cached list).
+  // Fetch clips once when switching to clips and cache was never loaded for this channel.
   useEffect(() => {
     if (channelContentFilter !== 'clips' || !selectedChannelId) return;
-    const ch = savedChannels.find((c) => c.id === selectedChannelId);
-    if (!ch || (ch.clipVideos?.length ?? 0) > 0) return;
-    void refreshChannel(selectedChannelId, ch, 'clips');
-  }, [channelContentFilter, selectedChannelId, savedChannels, refreshChannel]);
+    if (clipsAutoFetchStartedRef.current.has(selectedChannelId)) return;
+    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
+    if (!ch || ch.clipsFetched || (ch.clipVideos?.length ?? 0) > 0) return;
+    clipsAutoFetchStartedRef.current.add(selectedChannelId);
+    void refreshChannelRef.current(selectedChannelId, ch, 'clips', { silent: true });
+  }, [channelContentFilter, selectedChannelId]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -3654,6 +3687,7 @@ export default function App() {
     setAddChannelInput('');
     await refreshChannel(id, entry, 'vods');
     if (channelContentFilter === 'clips') {
+      clipsAutoFetchStartedRef.current.add(id);
       await refreshChannel(id, entry, 'clips');
     }
   }, [addChannelInput, savedChannels.length, refreshChannel, channelContentFilter]);
@@ -3700,20 +3734,29 @@ export default function App() {
 
     const prevSlug = editingSlug.platform === 'Kick' ? ch.kickSlug : ch.twitchSlug;
     const channelId = editingSlug.channelId;
-    const updated: SavedChannel = editingSlug.platform === 'Kick'
-      ? { ...ch, kickSlug: slug }
-      : { ...ch, twitchSlug: slug };
 
     setEditingSlug(null);
     setEditingSlugValue('');
 
     if (slug === prevSlug) return;
 
-    if (editingSlug.platform === 'Kick') {
-      updateChannel(channelId, { kickSlug: slug });
-    } else {
-      updateChannel(channelId, { twitchSlug: slug });
-    }
+    const cleared = {
+      vodVideos: [] as ChannelVideo[],
+      clipVideos: [] as ChannelVideo[],
+      vodErrors: {} as Record<string, string>,
+      clipErrors: {} as Record<string, string>,
+      clipsFetched: false,
+    };
+    const updated: SavedChannel = editingSlug.platform === 'Kick'
+      ? { ...ch, kickSlug: slug, ...cleared }
+      : { ...ch, twitchSlug: slug, ...cleared };
+
+    clipsAutoFetchStartedRef.current.delete(channelId);
+    channelRefreshInFlightRef.current.delete(`${channelId}:vods`);
+    channelRefreshInFlightRef.current.delete(`${channelId}:clips`);
+    updateChannel(channelId, editingSlug.platform === 'Kick'
+      ? { kickSlug: slug, ...cleared }
+      : { twitchSlug: slug, ...cleared });
     await refreshChannel(channelId, updated);
   }, [editingSlug, editingSlugValue, savedChannels, updateChannel, refreshChannel]);
 
@@ -4720,7 +4763,15 @@ export default function App() {
                       </button>
                     )}
                     <button type="button" title="Refresh"
-                      onClick={(e) => { e.stopPropagation(); refreshChannel(ch.id, undefined, channelContentFilter); }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        channelRefreshInFlightRef.current.delete(`${ch.id}:vods`);
+                        channelRefreshInFlightRef.current.delete(`${ch.id}:clips`);
+                        if (channelContentFilter === 'clips') {
+                          clipsAutoFetchStartedRef.current.delete(ch.id);
+                        }
+                        void refreshChannel(ch.id, undefined, channelContentFilter);
+                      }}
                       disabled={ch.loading}
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
                       {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}

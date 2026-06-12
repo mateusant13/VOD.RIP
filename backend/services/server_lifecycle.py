@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -27,31 +28,76 @@ def should_stop_supervisor() -> bool:
     return _shutdown_event.is_set()
 
 
+_WIN_LISTEN_MARKERS = (
+    "LISTENING", "OUVINDO", "ABH", "ÉCOUTE", "ESCUCHA", "IN ASCOLTO", "LISTEN",
+)
+
+
+def _local_endpoint_port(addr: str) -> Optional[int]:
+    if addr.startswith("["):
+        m = re.search(r"]:(\d+)$", addr)
+    else:
+        m = re.search(r":(\d+)$", addr)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _pids_listening_on_port_windows(port: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        ps = (
+            f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+            f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            creationflags=_NO_WINDOW,
+        )
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        if pids:
+            return list(dict.fromkeys(pids))
+    except Exception as exc:
+        _logger.debug("Get-NetTCPConnection for port %s: %s", port, exc)
+
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=_NO_WINDOW,
+        )
+        for line in (result.stdout or "").splitlines():
+            upper = line.upper()
+            if not any(marker in upper for marker in _WIN_LISTEN_MARKERS):
+                continue
+            cols = line.split()
+            if len(cols) < 5:
+                continue
+            if _local_endpoint_port(cols[1]) != port:
+                continue
+            pid = cols[-1]
+            if pid.isdigit():
+                pids.append(int(pid))
+    except Exception as exc:
+        _logger.debug("netstat for port %s: %s", port, exc)
+    return list(dict.fromkeys(pids))
+
+
 def _pids_listening_on_port(port: int) -> list[int]:
     pids: list[int] = []
     if os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                creationflags=_NO_WINDOW,
-            )
-            for line in result.stdout.splitlines():
-                if "LISTENING" not in line:
-                    continue
-                cols = line.split()
-                if len(cols) < 5:
-                    continue
-                local_addr = cols[1]
-                if not local_addr.endswith(f":{port}"):
-                    continue
-                pid = cols[-1]
-                if pid.isdigit():
-                    pids.append(int(pid))
-        except Exception as exc:
-            _logger.debug("netstat for port %s: %s", port, exc)
+        return _pids_listening_on_port_windows(port)
     else:
         try:
             result = subprocess.run(
@@ -121,19 +167,110 @@ def _wait_for_port_free(port: int, *, skip_pid: Optional[int], timeout: float) -
     return not [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
 
 
-def _kill_pid(port: int, pid: int) -> None:
+def _process_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return exit_code.value == STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_process_windows(pid: int) -> bool:
+    try:
+        import ctypes
+
+        PROCESS_TERMINATE = 0x0001
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            if not ctypes.windll.kernel32.TerminateProcess(handle, 1):
+                return False
+            ctypes.windll.kernel32.WaitForSingleObject(handle, 3000)
+            return not _process_alive(pid)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as exc:
+        _logger.debug("TerminateProcess pid %s: %s", pid, exc)
+        return False
+
+
+def _kill_pid_windows(port: int, pid: int, image: str) -> bool:
+    _logger.info("Stopping port %s listener pid %s (%s)", port, pid, image)
+    for args in (
+        ["taskkill", "/F", "/PID", str(pid)],
+        ["taskkill", "/F", "/T", "/PID", str(pid)],
+    ):
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=_NO_WINDOW,
+            )
+            if result.returncode == 0 or not _process_alive(pid):
+                return True
+            err = (result.stderr or result.stdout or "").strip()
+            if err:
+                _logger.debug("%s: %s", " ".join(args), err)
+        except subprocess.TimeoutExpired:
+            _logger.debug("%s timed out", " ".join(args))
+        if not _process_alive(pid):
+            return True
+
+    try:
+        subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        _logger.debug("Stop-Process pid %s timed out", pid)
+
+    if not _process_alive(pid):
+        return True
+    return _terminate_process_windows(pid)
+
+
+def _kill_pid(port: int, pid: int) -> bool:
+    """Force-stop *pid*. Returns True if the process is gone afterward."""
     if pid == os.getpid():
-        return
+        return True
     image = _process_image_name(pid) or "unknown"
     try:
         if os.name == "nt":
-            _logger.info("Stopping port %s listener pid %s (%s)", port, pid, image)
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-                creationflags=_NO_WINDOW,
-            )
+            if not _kill_pid_windows(port, pid, image):
+                _logger.warning(
+                    "Could not stop pid %s (%s) on port %s",
+                    pid,
+                    image,
+                    port,
+                )
+                return False
         else:
             os.kill(pid, 15)
             time.sleep(0.25)
@@ -144,11 +281,18 @@ def _kill_pid(port: int, pid: int) -> None:
                 pass
     except Exception as exc:
         _logger.debug("kill pid %s: %s", pid, exc)
+    time.sleep(0.2)
+    return not _process_alive(pid)
 
 
-def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 6.0) -> None:
-    """Free *port* for a new VOD.RIP / dev API instance (graceful first, then safe kill)."""
-    listeners = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 10.0) -> None:
+    """Free *port* for a new VOD.RIP / dev API instance (graceful first, then force kill)."""
+    deadline = time.monotonic() + timeout
+
+    def active_listeners() -> list[int]:
+        return [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+
+    listeners = active_listeners()
     if not listeners:
         return
 
@@ -158,18 +302,28 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
             _logger.info("Port %s released after graceful shutdown", port)
             return
 
-    remaining = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
-    if not remaining:
-        return
+    while time.monotonic() < deadline:
+        remaining = active_listeners()
+        if not remaining:
+            return
 
-    _logger.info("Releasing port %s — stopping listener(s): %s", port, remaining)
-    for pid in remaining:
-        _kill_pid(port, pid)
+        _logger.info("Releasing port %s — stopping listener(s): %s", port, remaining)
+        for pid in remaining:
+            if not _kill_pid(port, pid) and _process_alive(pid):
+                _logger.warning(
+                    "Could not stop pid %s (%s) on port %s",
+                    pid,
+                    _process_image_name(pid) or "unknown",
+                    port,
+                )
 
-    if not _wait_for_port_free(port, skip_pid=skip_pid, timeout=timeout):
-        still = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
-        if still:
-            _logger.warning("Port %s still busy after shutdown attempt: %s", port, still)
+        if _wait_for_port_free(port, skip_pid=skip_pid, timeout=1.5):
+            _logger.info("Port %s released", port)
+            return
+
+    still = active_listeners()
+    if still:
+        _logger.error("Port %s still busy after shutdown attempt: %s", port, still)
 
 
 def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:

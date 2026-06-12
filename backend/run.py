@@ -26,9 +26,11 @@ def main():
 
     port = int(os.environ.get("PORT", "7897"))
 
-    from services.server_lifecycle import release_api_port
+    # dev-all.mjs releases the port before spawning us; skip duplicate work unless standalone.
+    if os.environ.get("VODRIP_SKIP_PORT_RELEASE", "").strip() != "1":
+        from services.server_lifecycle import release_api_port
 
-    release_api_port(port, skip_pid=os.getpid())
+        release_api_port(port, skip_pid=os.getpid())
 
     # Install deps if needed
     try:
