@@ -1,4 +1,4 @@
-# VOD.RIP 🪦 — Twitch & Kick Downloader
+# VOD.RIP 🪦 - Twitch & Kick Downloader
 
 A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Paste a link, preview the video, trim what you need, and save.
 
@@ -8,18 +8,18 @@ A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Paste
   <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-53fc18?style=flat-square"/></a>
 </p>
 
-[Download the latest release](https://github.com/mateusant13/VOD.RIP/releases) — Windows, macOS, and Linux.
+[Download the latest release](https://github.com/mateusant13/VOD.RIP/releases) - Windows, macOS, and Linux.
 
 ![VOD.RIP main window showing video info, quality options, trim controls, and the download queue](screenshots/readme/hero.png)
 
 ## Everything you need in one window
 
-- **Download Twitch and Kick VODs** — full streams or trimmed segments
-- **Save clips and highlights** — instant captures
-- **Preview before downloading** — watch the VOD or clip inside the app
-- **Trim only what you need** — skip a 3-hour stream, keep the 10-minute moment
-- **Queue multiple downloads** — run them in parallel, track progress live
-- **Save favorite channels** — recent VODs and clips, one click away
+- **Download Twitch and Kick VODs** - full streams or trimmed segments
+- **Save clips and highlights** - instant captures
+- **Preview before downloading** - watch the VOD or clip inside the app
+- **Trim only what you need** - skip a 3-hour stream, keep the 10-minute moment
+- **Queue multiple downloads** - run them in parallel, track progress live
+- **Save favorite channels** - recent VODs and clips, one click away
 
 
 ---
@@ -38,13 +38,13 @@ Open a channel to see the latest VODs and clips in a single view. Switch between
 
 ## Preview before you download
 
-From any VOD or clip row, pop the preview out into its own window. Watch the content in a smaller overlay while you keep browsing the list — no need to commit to a full download just to check what is in it.
+From any VOD or clip row, pop the preview out into its own window. Watch the content in a smaller overlay while you keep browsing the list - no need to commit to a full download just to check what is in it.
 
 ![VOD.RIP pop-out preview window for a VOD or clip](screenshots/readme/pop-up-preview.png)
 
 ## Download, trim, and save
 
-Archiving a full stream or saving a highlight — the whole workflow lives in one window. Paste, preview, trim, download.
+Archiving a full stream or saving a highlight - the whole workflow lives in one window. Paste, preview, trim, download.
 
 ![VOD.RIP complete workflow in a single window](screenshots/readme/hero.png)
 
@@ -52,7 +52,7 @@ Archiving a full stream or saving a highlight — the whole workflow lives in on
 
 ## Ready for Premiere & other editors
 
-Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**, and other NLEs. No segment stitching, codec wrangling, or audio repackaging — VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks.
+Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**, and other NLEs. No segment stitching, codec wrangling, or audio repackaging - VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks.
 
 ---
 
