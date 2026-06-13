@@ -1,6 +1,6 @@
 # VOD.RIP 🪦 - Twitch & Kick Downloader
 
-A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Paste a link, preview the video, trim what you need, and save.
+A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Paste a link, preview the video, trim what you need, save, export to any video editor.
 
 <p>
   <a href="https://github.com/mateusant13/VOD.RIP/releases"><img src="https://img.shields.io/badge/download-Windows%20%E2%80%A2%20macOS%20%E2%80%A2%20Linux-53fc18?style=flat-square"/></a>
