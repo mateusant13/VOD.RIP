@@ -169,9 +169,16 @@ def hls_bandwidth_by_height(
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#EXT-X-STREAM-INF"):
+            avg_m = re.search(r"AVERAGE-BANDWIDTH=(\d+)", stripped)
             bw_m = re.search(r"BANDWIDTH=(\d+)", stripped)
             res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", stripped)
-            pending_bw = int(bw_m.group(1)) if bw_m else 0
+            # Peak BANDWIDTH overstates size ~2×; prefer AVERAGE-BANDWIDTH when present.
+            if avg_m:
+                pending_bw = int(avg_m.group(1))
+            elif bw_m:
+                pending_bw = int(bw_m.group(1))
+            else:
+                pending_bw = 0
             pending_h = int(res_m.group(2)) if res_m else 0
             continue
         if stripped and not stripped.startswith("#") and pending_bw > 0:

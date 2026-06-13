@@ -68,6 +68,7 @@ class AppSettings(BaseModel):
     ffmpeg_path: str = ""
     temp_folder: str = ""
     oauth: str = ""
+    mp4_faststart: bool = False
     quality: str = "1080p"
     panel_layout: Optional[Dict[str, Any]] = None
     window_geometry: Optional[Dict[str, Any]] = None
@@ -94,6 +95,7 @@ class SettingsUpdate(BaseModel):
     channel_kick_enabled: Optional[bool] = None
     channel_twitch_enabled: Optional[bool] = None
     channel_content_filter: Optional[str] = None
+    mp4_faststart: Optional[bool] = None
 
 
 class OpenFolderRequest(BaseModel):

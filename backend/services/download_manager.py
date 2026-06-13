@@ -31,6 +31,16 @@ _UNFINISHED_STATUSES = frozenset({"Failed", "Cancelled", "Interrupted"})
 _RESUMABLE_STATUSES = frozenset({"Paused", "Failed", "Cancelled", "Interrupted"})
 _HISTORY_MAX_ENTRIES = 200  # Bound on-disk growth; UI also caps at 50.
 _QUEUE_PERSIST_INTERVAL = 15.0
+_LARGE_DOWNLOAD_MIN_BYTES = 12 * 1024 * 1024 * 1024  # ~12 GB
+_LARGE_DOWNLOAD_TIMEOUT_SEC = 15 * 60  # remux + segment download for ~15 GB class
+_TRANSCODE_TIMEOUT_SEC = 10 * 60  # fail fast once GPU transcode is required
+
+
+def _download_timeout_seconds(estimated_bytes: Optional[int]) -> Optional[float]:
+    """Wall-clock budget for large VOD jobs (~12 GB+) on the remux/download path."""
+    if estimated_bytes is not None and estimated_bytes >= _LARGE_DOWNLOAD_MIN_BYTES:
+        return float(_LARGE_DOWNLOAD_TIMEOUT_SEC)
+    return None
 
 
 
@@ -308,6 +318,7 @@ class DownloadManager:
         duration: Optional[float] = None,
         duration_string: Optional[str] = None,
         download_id: Optional[str] = None,
+        estimated_bytes: Optional[int] = None,
     ) -> str:
         download_id = download_id or f"dl_{uuid.uuid4().hex[:12]}"
         platform = ytdlp_service.detect_platform(url)
@@ -349,6 +360,7 @@ class DownloadManager:
             "thumbnail": thumbnail,
             "duration": duration,
             "duration_string": duration_string,
+            "estimated_bytes": estimated_bytes,
         }
 
         with self._lock:
@@ -392,7 +404,43 @@ class DownloadManager:
         def _register_abort(fn: Callable[[], None]) -> None:
             abort_fns.append(fn)
 
+        timeout_sec = _download_timeout_seconds(params.get("estimated_bytes"))
+        job_started = time.monotonic()
+        deadline_holder: dict[str, Optional[float]] = {
+            "deadline": (job_started + timeout_sec) if timeout_sec else None,
+        }
+
+        def _enforce_deadline() -> None:
+            deadline = deadline_holder["deadline"]
+            if deadline is None or time.monotonic() <= deadline:
+                return
+            cancel_event.set()
+            for fn in list(abort_fns):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
+            raise ytdlp_service.DownloadTimeoutError(
+                f"Download timed out after {elapsed_min} minutes"
+            )
+
+        def _maybe_tighten_transcode_deadline(d: dict) -> None:
+            enc = d.get("concat_encoder")
+            if not enc or enc == "copy":
+                return
+            cap = time.monotonic() + _TRANSCODE_TIMEOUT_SEC
+            cur = deadline_holder["deadline"]
+            if cur is None or cap < cur:
+                deadline_holder["deadline"] = cap
+                logger.info(
+                    "Download %s: transcode detected (%s) — %ds wall-clock cap",
+                    download_id, enc, _TRANSCODE_TIMEOUT_SEC,
+                )
+
         def _progress_hook(d):
+            _maybe_tighten_transcode_deadline(d)
+            _enforce_deadline()
             if cancel_event.is_set():
                 raise ytdlp_service.CancelledError("Download cancelled by user")
             if pause_event.is_set():
@@ -577,6 +625,7 @@ class DownloadManager:
 
         def _download_worker():
             try:
+                _enforce_deadline()
                 if cancel_event.is_set():
                     raise ytdlp_service.CancelledError("Download cancelled by user")
                 if pause_event.is_set():
@@ -639,6 +688,12 @@ class DownloadManager:
                     self._notify_sse(download_id, "complete", 100)
                 else:
                     raise RuntimeError("Download finished but output file is missing")
+            except ytdlp_service.DownloadTimeoutError as e:
+                with self._lock:
+                    state.status = "Failed"
+                    state.error = str(e)
+                self._notify_sse(download_id, "error", str(e))
+                _cleanup_output()
             except ytdlp_service.PausedError:
                 with self._lock:
                     state.status = "Paused"
@@ -731,6 +786,8 @@ class DownloadManager:
                     self._remove_queue_entry(download_id)
                     self._record_history(final_state)
 
+        self._executor.submit(_download_worker)
+
     def pause(self, download_id: str) -> bool:
         abort_fns: List[Callable[[], None]] = []
         with self._lock:
@@ -815,6 +872,7 @@ class DownloadManager:
             thumbnail=params.get("thumbnail"),
             duration=params.get("duration"),
             duration_string=params.get("duration_string"),
+            estimated_bytes=params.get("estimated_bytes"),
         )
 
     def cancel_all(self) -> int:

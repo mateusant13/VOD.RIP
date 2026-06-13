@@ -20,6 +20,7 @@ A desktop app for downloading Twitch and Kick VODs, clips, and highlights. Built
 - **Trim only what you need** — skip a 3-hour stream, keep the 10-minute moment
 - **Queue multiple downloads** — run them in parallel, track progress live
 - **Save favorite channels** — recent VODs and clips, one click away
+- **Ready for video editors** — Kick and Twitch exports are built for Premiere, DaVinci Resolve, and similar NLEs (see below)
 
 No terminal. No browser extension. No command-line setup.
 
@@ -48,6 +49,12 @@ From any VOD or clip row, pop the preview out into its own window. Watch the con
 Whether you are archiving a full stream or saving a single highlight, the whole workflow lives in one window. Paste, preview, trim, download — done.
 
 ![VOD.RIP complete workflow in a single window](screenshots/readme/hero.png)
+
+---
+
+## Ready for Premiere & other editors
+
+Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**, and other editors. VOD.RIP handles the messy parts for you — segment stitching, codecs, audio packaging, and long-VOD timestamps — so you get an import-friendly file instead of raw chunks that other downloaders often leave behind.
 
 ---
 

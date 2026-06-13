@@ -428,12 +428,11 @@ def download_vod_sync(
         _resolve_ffmpeg_exe,
         _verify_output_file,
         download_hls_media_clip,
-        resolve_hls_concat_encoder,
     )
 
     if video_encoder is None and settings_mgr is not None:
         video_encoder = settings_mgr.get().video_encoder
-    resolved_encoder = resolve_hls_concat_encoder("Kick", video_encoder)
+    mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
 
     info = get_video_info_api(url)
     if not info.m3u8_url:
@@ -453,7 +452,8 @@ def download_vod_sync(
         pause_event=pause_event,
         register_abort=register_abort,
         prefer_height=_parse_prefer_height(quality),
-        video_encoder=resolved_encoder,
+        video_encoder=video_encoder,
+        mp4_faststart=mp4_faststart,
     )
     _verify_output_file(output_path)
     return output_path

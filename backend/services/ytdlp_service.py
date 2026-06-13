@@ -1,5 +1,6 @@
 """yt-dlp service — wraps the yt-dlp Python library directly (no subprocess)."""
 
+import json
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 # Clips shorter than this are almost certainly a broken ftyp-only placeholder.
 MIN_VALID_OUTPUT_BYTES = 50_000
 SEGMENT_DOWNLOAD_WORKERS = 8
+HLS_DOWNLOAD_AHEAD = SEGMENT_DOWNLOAD_WORKERS + 2
+HLS_MUX_STALL_SECONDS = 120
 
 # Prevents a Windows console window from popping up around bundled ffmpeg.exe.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -71,32 +74,80 @@ def resolve_video_encoder(value: Optional[str]) -> str:
     return "libx264"
 
 
-def resolve_hls_concat_encoder(platform: str, user_encoder: Optional[str] = None) -> str:
-    """Pick the video mode for HLS segment concat, per platform.
+def _codecs_from_stream_inf(line: str) -> dict:
+    """Parse ``#EXT-X-STREAM-INF`` ``CODECS=`` into normalized codec names."""
+    m = re.search(r'CODECS="([^"]+)"', line)
+    if not m:
+        return {}
+    return _parse_hls_codecs(m.group(1))
 
-    Twitch VODs are already H.264/AAC in the CDN segments — remuxing
-    with ``-c copy`` is near-instant and avoids a pointless re-encode.
 
-    Kick VODs are often HEVC (or otherwise NLE-unfriendly); always
-    transcode to H.264/AAC ``yuv420p`` so Premiere/DaVinci can import
-    them. Prefer the user's GPU encoder (NVENC/AMF/QSV) for speed.
-    """
-    plat = (platform or "").strip()
-    if plat == "Twitch":
+def _parse_hls_codecs(codecs: str) -> dict:
+    video_codec = None
+    audio_codec = None
+    for part in codecs.split(","):
+        token = part.strip()
+        if token.startswith(("avc1", "avc3")):
+            video_codec = "h264"
+        elif token.startswith(("hvc1", "hev1")):
+            video_codec = "hevc"
+        elif token.startswith("av01"):
+            video_codec = "av1"
+        elif token.startswith("mp4a"):
+            audio_codec = "aac"
+    return {
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
+        "codecs": codecs,
+    }
+
+
+def can_stream_copy(
+    playlist_info: Optional[dict] = None,
+    probe_info: Optional[dict] = None,
+) -> bool:
+    """True when segments can be remuxed (H.264 + AAC + yuv420p)."""
+    video = (probe_info or {}).get("video_codec")
+    audio = (probe_info or {}).get("audio_codec")
+    pix = (probe_info or {}).get("pix_fmt")
+    if playlist_info:
+        if not video:
+            video = playlist_info.get("video_codec")
+        if not audio:
+            audio = playlist_info.get("audio_codec")
+    if video in ("hevc", "av1", "vp9"):
+        return False
+    if video == "h264" and audio == "aac":
+        return pix in (None, "yuv420p")
+    return False
+
+
+def resolve_concat_encoder(
+    playlist_info: Optional[dict] = None,
+    probe_info: Optional[dict] = None,
+    user_encoder: Optional[str] = None,
+) -> str:
+    """Pick remux (``copy``) vs H.264 transcode from playlist CODECS and/or ffprobe."""
+    if can_stream_copy(playlist_info, probe_info):
         return "copy"
-    # Kick: never stream-copy; always produce edit-friendly H.264.
-    enc = resolve_video_encoder(user_encoder)
-    if enc in ("copy", "libx264"):
+    enc = resolve_video_encoder(user_encoder or "auto")
+    if enc == "copy":
         enc = resolve_video_encoder("auto")
     return enc
 
 
-def ffmpeg_hwaccel_input_args(encoder: str) -> list[str]:
-    """GPU decode flags to insert before ``-i`` when re-encoding.
+def resolve_hls_concat_encoder(platform: str, user_encoder: Optional[str] = None) -> str:
+    """Deprecated — kept for callers that have not migrated to ``resolve_concat_encoder``."""
+    _ = platform
+    return resolve_concat_encoder(None, None, user_encoder)
 
-    Keeps decoded frames on the GPU where possible so NVENC/AMF/QSV
-    encode does not bounce through system RAM (much faster on long
-    Kick VODs).
+
+def ffmpeg_hwaccel_input_args(encoder: str) -> list[str]:
+    """GPU decode flags for single-input transcodes (not concat demuxer).
+
+    The HLS concat path in ``_concat_and_trim`` decodes on CPU and only
+    uses the GPU for encode — concat + ``hwaccel_output_format=cuda`` fails
+    on Kick's HEVC TS segments (pixel-format mismatch).
     """
     encoder = normalize_video_encoder(encoder)
     if encoder == "h264_nvenc":
@@ -115,15 +166,22 @@ def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
     encoder = normalize_video_encoder(encoder)
     if encoder == "copy":
         return None
-    audio = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
+    nle = ["-profile:v", "high", "-pix_fmt", "yuv420p"]
+    audio = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
     if encoder == "h264_nvenc":
-        # p1 = fastest NVENC preset; Kick transcodes can be hours long.
-        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "hq", "-rc", "vbr", "-cq", "23", *audio]
+        # p1 = fastest NVENC preset; long transcodes benefit from GPU speed.
+        return [
+            "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "hq",
+            "-rc", "vbr", "-cq", "23", *nle, *audio,
+        ]
     if encoder == "h264_amf":
-        return ["-c:v", "h264_amf", "-quality", "speed", *audio]
+        return ["-c:v", "h264_amf", "-quality", "speed", *nle, *audio]
     if encoder == "h264_qsv":
-        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", *audio]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", *audio]
+        return [
+            "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23",
+            *nle, *audio,
+        ]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", *nle, *audio]
 
 import requests
 import yt_dlp
@@ -140,6 +198,11 @@ class CancelledError(Exception):
 
 class PausedError(Exception):
     """Raised when a download is paused by the user."""
+    pass
+
+
+class DownloadTimeoutError(Exception):
+    """Raised when a download exceeds its wall-clock budget."""
     pass
 
 
@@ -455,6 +518,59 @@ def _resolve_ffmpeg_exe(ffmpeg_dir: Optional[str] = None) -> str:
         "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
         "the FFmpeg folder in Settings → FFmpeg path."
     )
+
+
+def _resolve_ffprobe_exe(ffmpeg_exe: Optional[str] = None) -> Optional[str]:
+    if ffmpeg_exe:
+        parent = Path(ffmpeg_exe).parent
+        name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        candidate = parent / name
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("ffprobe")
+
+
+def probe_segment_codec(
+    segment_path: str,
+    ffmpeg_exe: Optional[str] = None,
+) -> dict:
+    """Inspect the first downloaded HLS segment via ffprobe."""
+    ffprobe = _resolve_ffprobe_exe(ffmpeg_exe)
+    if not ffprobe or not os.path.isfile(segment_path):
+        return {}
+    try:
+        out = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "stream=codec_name,codec_type,pix_fmt",
+                "-of", "json",
+                segment_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=_NO_WINDOW,
+        )
+    except Exception:
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        data = json.loads(out.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    result: dict = {}
+    for stream in data.get("streams") or []:
+        ctype = stream.get("codec_type")
+        name = (stream.get("codec_name") or "").lower()
+        if ctype == "video" and "video_codec" not in result:
+            result["video_codec"] = name
+            if stream.get("pix_fmt"):
+                result["pix_fmt"] = stream["pix_fmt"]
+        elif ctype == "audio" and "audio_codec" not in result:
+            result["audio_codec"] = name
+    return result
 
 
 def _hostname_from_url(url_str: str) -> str:
@@ -1125,11 +1241,17 @@ def _find_hls_format(info: dict) -> dict:
     return hls_formats[0]
 
 
-def _parse_prefer_height(quality: Optional[str], default: int = 720) -> int:
+def _parse_prefer_height(quality: Optional[str], default: int = 1080) -> int:
     if not quality or quality.lower() == "source":
-        return default
+        return 10_000
     m = re.search(r"(\d+)", quality)
     return int(m.group(1)) if m else default
+
+
+def prefer_height_from_quality(quality: Optional[str]) -> int:
+    """Height used for HLS variant selection and size estimates (public helper)."""
+    h = _parse_prefer_height(quality)
+    return 10_000 if h >= 10_000 else h
 
 
 def _resolve_media_playlist(
@@ -1137,7 +1259,8 @@ def _resolve_media_playlist(
     headers: dict,
     prefer_height: int = 720,
     _depth: int = 0,
-) -> str:
+    _stream_info: Optional[dict] = None,
+) -> tuple[str, dict]:
     """Follow HLS master playlists (Kick IVS, Twitch variants) to a media playlist."""
     if _depth > 10:
         raise RuntimeError(f"HLS playlist resolution exceeded max depth (10) at {media_url}")
@@ -1147,12 +1270,13 @@ def _resolve_media_playlist(
     if len(text) > 5 * 1024 * 1024:
         raise RuntimeError(f"HLS playlist too large ({len(text)} bytes) at {media_url}")
     if "#EXTINF:" in text:
-        return media_url
+        return media_url, _stream_info or {}
 
-    variants: list[tuple[int, int, str]] = []
+    variants: list[tuple[int, int, str, dict]] = []
     lines = text.splitlines()
     pending_bandwidth = 0
     pending_height = 0
+    pending_codecs: dict = {}
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("#EXT-X-STREAM-INF"):
@@ -1160,11 +1284,18 @@ def _resolve_media_playlist(
             res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", stripped)
             pending_bandwidth = int(bw_m.group(1)) if bw_m else 0
             pending_height = int(res_m.group(2)) if res_m else 0
+            pending_codecs = _codecs_from_stream_inf(stripped)
             continue
         if stripped and not stripped.startswith("#"):
-            variants.append((pending_height, pending_bandwidth, urljoin(media_url, stripped)))
+            variants.append((
+                pending_height,
+                pending_bandwidth,
+                urljoin(media_url, stripped),
+                pending_codecs,
+            ))
             pending_bandwidth = 0
             pending_height = 0
+            pending_codecs = {}
 
     if not variants:
         raise RuntimeError(f"No HLS media playlist found at {media_url}")
@@ -1183,16 +1314,18 @@ def _resolve_media_playlist(
     else:
         chosen = max(variants, key=lambda item: item[1])
 
-    return _resolve_media_playlist(chosen[2], headers, prefer_height, _depth=_depth + 1)
+    return _resolve_media_playlist(
+        chosen[2], headers, prefer_height, _depth=_depth + 1, _stream_info=chosen[3],
+    )
 
 
 def _parse_m3u8(
     media_url: str,
     headers: dict,
     prefer_height: int = 720,
-) -> list[dict]:
-    """Download and parse an HLS media playlist, return list of segment dicts."""
-    media_url = _resolve_media_playlist(media_url, headers, prefer_height)
+) -> tuple[list[dict], dict]:
+    """Download and parse an HLS media playlist, return segments and stream info."""
+    media_url, stream_info = _resolve_media_playlist(media_url, headers, prefer_height)
     r = requests.get(media_url, headers=headers, timeout=30)
     r.raise_for_status()
     lines = r.text.splitlines()
@@ -1212,7 +1345,7 @@ def _parse_m3u8(
                 "url": urljoin(media_url, line),
             })
             current_duration = None
-    return segments
+    return segments, stream_info
 
 
 def _select_segments(
@@ -1296,11 +1429,12 @@ def _download_segments(
     progress_hook: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
+    index_offset: int = 0,
 ) -> list[str]:
     """Download HLS segment files into *temp_dir* (parallel)."""
     total = len(segments)
     if total == 0:
-        raise RuntimeError("No HLS segments to download")
+        return []
 
     files: list[Optional[str]] = [None] * total
     completed = 0
@@ -1309,7 +1443,13 @@ def _download_segments(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
-                _download_one_segment, i, seg, headers, temp_dir, cancel_event, pause_event,
+                _download_one_segment,
+                index_offset + i,
+                seg,
+                headers,
+                temp_dir,
+                cancel_event,
+                pause_event,
             ): i
             for i, seg in enumerate(segments)
         }
@@ -1326,6 +1466,353 @@ def _download_segments(
     if any(path is None for path in files):
         raise RuntimeError("HLS segment download incomplete")
     return list(files)
+
+
+def _feed_path_to_stdin(
+    path: str,
+    stdin,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    on_chunk: Optional[Callable[[], None]] = None,
+) -> None:
+    with open(path, "rb") as fin:
+        while True:
+            _check_pause_cancel(cancel_event, pause_event)
+            buf = fin.read(1024 * 1024)
+            if not buf:
+                break
+            try:
+                stdin.write(buf)
+            except BrokenPipeError:
+                break
+            if on_chunk:
+                on_chunk()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _apply_mp4_faststart(
+    src: str,
+    dst: str,
+    ffmpeg_exe: str,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    """Optional second pass — moves moov atom for faster Premiere scrubbing."""
+    tmp_out = f"{dst}.faststart_{uuid.uuid4().hex}.mp4"
+    cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", src,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-f", "mp4", tmp_out,
+    ]
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 93,
+            "phase": "Optimising",
+            "phase_id": _phase_id("Optimising"),
+        })
+    _run_ffmpeg(
+        cmd,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        register_abort=register_abort,
+        progress_hook=progress_hook,
+        progress_from=93.0,
+        progress_to=97.0,
+        phase="Optimising",
+    )
+    _verify_output_file(tmp_out)
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    _atomic_replace(
+        tmp_out, dst,
+        cancel_event=cancel_event,
+        progress_hook=progress_hook,
+    )
+
+
+def _progressive_hls_copy_to_mp4(
+    segments: list[dict],
+    headers: dict,
+    temp_dir: str,
+    output_path: str,
+    offset: float,
+    duration: float,
+    ffmpeg_exe: str,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    first_segment_path: Optional[str] = None,
+    mp4_faststart: bool = False,
+) -> None:
+    """Parallel download with backpressure, piped into a Premiere-ready MP4."""
+    total = len(segments)
+    if total == 0:
+        raise RuntimeError("No HLS segments to mux")
+
+    tmp_mp4 = os.path.join(temp_dir, f"stream_{uuid.uuid4().hex}.mp4")
+    mux_cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-fflags", "+genpts+igndts",
+        "-f", "mpegts", "-i", "pipe:0",
+    ]
+    if offset > 0.001:
+        mux_cmd += ["-ss", str(offset)]
+    mux_cmd += [
+        "-t", str(duration),
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "9999",
+        "-f", "mp4", tmp_mp4,
+    ]
+    try:
+        proc = sp.Popen(
+            mux_cmd,
+            stdin=sp.PIPE,
+            stderr=sp.PIPE,
+            creationflags=_NO_WINDOW,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
+            "the FFmpeg folder in Settings → FFmpeg path."
+        ) from exc
+    if register_abort:
+        register_abort(lambda: proc.poll() is None and proc.kill())
+
+    seg_paths: list[Optional[str]] = [None] * total
+    ready = [threading.Event() for _ in range(total)]
+    errors: list[Exception] = []
+    err_lock = threading.Lock()
+    last_ffmpeg_activity = [time.monotonic()]
+    stderr_done = threading.Event()
+
+    if first_segment_path:
+        seg_paths[0] = first_segment_path
+        ready[0].set()
+
+    def _touch_ffmpeg_activity() -> None:
+        last_ffmpeg_activity[0] = time.monotonic()
+
+    def _check_ffmpeg_stall() -> None:
+        if proc.poll() is not None:
+            return
+        if time.monotonic() - last_ffmpeg_activity[0] > HLS_MUX_STALL_SECONDS:
+            proc.kill()
+            raise RuntimeError(
+                f"FFmpeg mux stalled (>{HLS_MUX_STALL_SECONDS}s without progress)"
+            )
+
+    def _drain_stderr() -> None:
+        try:
+            assert proc.stderr is not None
+            for raw in iter(proc.stderr.readline, b""):
+                if raw:
+                    _touch_ffmpeg_activity()
+        finally:
+            stderr_done.set()
+
+    def _download_idx(i: int) -> None:
+        if first_segment_path and i == 0:
+            return
+        try:
+            seg_paths[i] = _download_one_segment(
+                i, segments[i], headers, temp_dir, cancel_event, pause_event,
+            )
+        except Exception as exc:
+            with err_lock:
+                errors.append(exc)
+        finally:
+            ready[i].set()
+
+    stderr_thread = threading.Thread(target=_drain_stderr, name="hls-mux-stderr", daemon=True)
+    stderr_thread.start()
+
+    futures: dict[int, Any] = {}
+    with ThreadPoolExecutor(max_workers=min(SEGMENT_DOWNLOAD_WORKERS, total)) as pool:
+
+        def _schedule_through(cap: int) -> None:
+            for idx in range(total):
+                if idx > cap:
+                    break
+                if idx in futures or (first_segment_path and idx == 0):
+                    continue
+                futures[idx] = pool.submit(_download_idx, idx)
+
+        assert proc.stdin is not None
+        try:
+            for i in range(total):
+                _schedule_through(i + HLS_DOWNLOAD_AHEAD)
+                ready[i].wait()
+                _check_pause_cancel(cancel_event, pause_event)
+                _check_ffmpeg_stall()
+                with err_lock:
+                    if errors:
+                        raise errors[0]
+                path = seg_paths[i]
+                if not path:
+                    raise RuntimeError(f"HLS segment {i} missing after download")
+                _feed_path_to_stdin(
+                    path, proc.stdin, cancel_event, pause_event,
+                    on_chunk=_touch_ffmpeg_activity,
+                )
+                seg_paths[i] = None
+                if progress_hook:
+                    progress_hook({
+                        "status": "downloading",
+                        "percent": (i + 1) / total * 92.0,
+                        "phase": "Downloading",
+                        "concat_encoder": "copy",
+                    })
+                if proc.poll() is not None:
+                    break
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        except BrokenPipeError:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        except Exception as exc:
+            with err_lock:
+                errors.append(exc)
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            raise
+        finally:
+            for fut in futures.values():
+                fut.result()
+
+        stderr_done.wait(timeout=5)
+        stderr = proc.stderr.read() if proc.stderr else b""
+        rc = proc.wait()
+        with err_lock:
+            if errors:
+                raise errors[0]
+        if rc != 0:
+            err_tail = stderr.decode(errors="ignore")[-800:]
+            raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
+        if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
+            err_tail = stderr.decode(errors="ignore")[-800:]
+            raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
+
+    _verify_output_file(tmp_mp4)
+    if mp4_faststart:
+        fast_tmp = os.path.join(temp_dir, f"faststart_{uuid.uuid4().hex}.mp4")
+        _apply_mp4_faststart(
+            tmp_mp4, fast_tmp, ffmpeg_exe,
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+        )
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
+        if progress_hook:
+            progress_hook({
+                "status": "postprocessing",
+                "percent": 97,
+                "phase": "Finalising",
+                "phase_id": _phase_id("Finalising"),
+                "concat_encoder": "copy",
+            })
+        _atomic_replace(
+            fast_tmp, output_path,
+            cancel_event=cancel_event,
+            progress_hook=progress_hook,
+        )
+    else:
+        if progress_hook:
+            progress_hook({
+                "status": "postprocessing",
+                "percent": 97,
+                "phase": "Finalising",
+                "phase_id": _phase_id("Finalising"),
+                "concat_encoder": "copy",
+            })
+        _atomic_replace(
+            tmp_mp4, output_path,
+            cancel_event=cancel_event,
+            progress_hook=progress_hook,
+        )
+    _verify_output_file(output_path)
+
+
+def _mkv_to_premiere_mp4(
+    mkv_path: str,
+    output_path: str,
+    offset: float,
+    duration: float,
+    ffmpeg_exe: str,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    """Fallback: single-file MKV → MP4 stream copy (used only outside the progressive path)."""
+    tmp_mp4 = f"{output_path}.tmp_{uuid.uuid4().hex}.mp4"
+    cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error", "-i", mkv_path]
+    if offset > 0.001:
+        cmd += ["-ss", str(offset)]
+    cmd += [
+        "-t", str(duration),
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "9999",
+        "-f", "mp4", tmp_mp4,
+    ]
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 84,
+            "phase": "Packaging",
+            "phase_id": _phase_id("Packaging"),
+            "concat_encoder": "copy",
+        })
+    _check_pause_cancel(cancel_event, pause_event)
+    _run_ffmpeg(
+        cmd,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        register_abort=register_abort,
+        progress_hook=progress_hook,
+        encode_duration=duration,
+        progress_from=84.0,
+        progress_to=97.0,
+        phase="Packaging",
+    )
+    _verify_output_file(tmp_mp4)
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 98,
+            "phase": "Finalising",
+            "phase_id": _phase_id("Finalising"),
+        })
+    _atomic_replace(
+        tmp_mp4, output_path,
+        cancel_event=cancel_event,
+        progress_hook=progress_hook,
+    )
+    _verify_output_file(output_path)
 
 
 def _chunked_copy(
@@ -1489,8 +1976,8 @@ def _concat_and_trim(
 
     encode_args = ffmpeg_h264_encode_args(encoder)
     cmd = [ffmpeg_exe, "-y", "-loglevel", "error"]
-    if encode_args:
-        cmd += ffmpeg_hwaccel_input_args(encoder)
+    cmd += ["-fflags", "+genpts+igndts"]
+    # CPU decode for concat demuxer; NVENC/AMF/QSV still handles encode.
     cmd += ["-f", "concat", "-safe", "0", "-i", concat_txt]
     if offset > 0.001:
         cmd += ["-ss", str(offset)]
@@ -1562,12 +2049,20 @@ def download_hls_media_clip(
     register_temp_dir: Optional[Callable[[str], None]] = None,
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
+    mp4_faststart: bool = False,
 ) -> None:
     """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
     headers = headers or {}
     duration = end_sec - start_sec
-    segments = _parse_m3u8(media_url, headers, prefer_height)
+    segments, stream_info = _parse_m3u8(media_url, headers, prefer_height)
     selected, first_offset = _select_segments(segments, start_sec, end_sec)
+    playlist_encoder = resolve_concat_encoder(stream_info, None, video_encoder)
+    if progress_hook and playlist_encoder != "copy":
+        progress_hook({
+            "status": "downloading",
+            "concat_encoder": playlist_encoder,
+            "phase": "Encoding",
+        })
     selected_duration = sum(s["duration"] for s in selected)
     logger.info(
         "HLS clip %.2f-%.2fs: %d segments, %.1fs media (offset %.2fs)",
@@ -1596,16 +2091,54 @@ def download_hls_media_clip(
         except Exception:
             pass
     try:
-        files = _download_segments(
-            selected, headers, tmpdir, progress_hook, cancel_event, pause_event,
+        first_path: Optional[str] = None
+        if selected:
+            first_path = _download_one_segment(
+                0, selected[0], headers, tmpdir, cancel_event, pause_event,
+            )
+            probe_info = probe_segment_codec(first_path, resolved_ffmpeg)
+        else:
+            probe_info = {}
+        hls_encoder = resolve_concat_encoder(stream_info, probe_info, video_encoder)
+        logger.info(
+            "HLS concat: %s (playlist=%s, probe=%s)",
+            hls_encoder, stream_info or {}, probe_info or {},
         )
+        if progress_hook:
+            progress_hook({
+                "status": "downloading",
+                "concat_encoder": hls_encoder,
+                "phase": "Remuxing" if hls_encoder == "copy" else "Encoding",
+            })
+        if hls_encoder == "copy":
+            _progressive_hls_copy_to_mp4(
+                selected, headers, tmpdir, output_path,
+                first_offset, duration, resolved_ffmpeg,
+                progress_hook=progress_hook,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                register_abort=register_abort,
+                first_segment_path=first_path,
+                mp4_faststart=mp4_faststart,
+            )
+            if progress_hook:
+                progress_hook({"status": "downloading", "percent": 100})
+                progress_hook({"status": "finished"})
+            return
+
+        files = _download_segments(
+            selected[1:], headers, tmpdir, progress_hook, cancel_event, pause_event,
+            index_offset=1,
+        ) if len(selected) > 1 else []
+        if first_path:
+            files = [first_path, *files]
         _concat_and_trim(
             files, output_path, first_offset, duration, resolved_ffmpeg,
             progress_hook,
             cancel_event=cancel_event,
             pause_event=pause_event,
             register_abort=register_abort,
-            video_encoder=video_encoder,
+            video_encoder=hls_encoder,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1624,6 +2157,7 @@ def _download_hls_clip(
     register_temp_dir: Optional[Callable[[str], None]] = None,
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
+    mp4_faststart: bool = False,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
     info = _extract_hls_info(url, opts)
@@ -1642,6 +2176,7 @@ def _download_hls_clip(
         register_temp_dir=register_temp_dir,
         prefer_height=prefer_height,
         video_encoder=video_encoder,
+        mp4_faststart=mp4_faststart,
     )
 
 
@@ -1773,7 +2308,7 @@ def download_video_sync(
 
     if is_hls:
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)
-        hls_encoder = resolve_hls_concat_encoder(platform, resolved_encoder)
+        mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
         _download_hls_clip(
             full_url, output_path, start_sec, end_sec, opts,
             progress_hook=progress_hook,
@@ -1781,8 +2316,9 @@ def download_video_sync(
             pause_event=pause_event,
             register_abort=register_abort,
             prefer_height=_parse_prefer_height(quality),
-            video_encoder=hls_encoder,
+            video_encoder=resolved_encoder,
             register_temp_dir=register_temp_dir,
+            mp4_faststart=mp4_faststart,
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)

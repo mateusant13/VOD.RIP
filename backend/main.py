@@ -234,6 +234,8 @@ async def update_settings(update: SettingsUpdate):
     if update.channel_content_filter is not None:
         filt = (update.channel_content_filter or "vods").strip().lower()
         current.channel_content_filter = "clips" if filt == "clips" else "vods"
+    if update.mp4_faststart is not None:
+        current.mp4_faststart = bool(update.mp4_faststart)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
@@ -1495,6 +1497,20 @@ def _require_hls_crop(req: DownloadRequest, platform: str) -> None:
         raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
 
 
+def _trim_estimated_bytes(meta: dict, crop_start: Optional[float], crop_end: Optional[float]) -> Optional[int]:
+    """Scale full-VOD byte estimate to the requested trim window."""
+    estimated = meta.get("estimated_bytes")
+    if not estimated:
+        return None
+    duration = meta.get("duration")
+    if crop_start is None or crop_end is None or not duration or duration <= 0:
+        return int(estimated)
+    clip_sec = float(crop_end) - float(crop_start)
+    if clip_sec <= 0:
+        return int(estimated)
+    return int(int(estimated) * clip_sec / float(duration))
+
+
 @app.post("/api/download/video")
 async def download_video(req: DownloadRequest):
     opts = settings_mgr.get()
@@ -1521,6 +1537,7 @@ async def download_video(req: DownloadRequest):
         thumbnail=meta.get("thumbnail"),
         duration=meta.get("duration"),
         duration_string=meta.get("duration_string"),
+        estimated_bytes=_trim_estimated_bytes(meta, req.crop_start, req.crop_end),
     )
     return {"download_id": download_id, "status": "started"}
 @app.post("/api/download/clip")

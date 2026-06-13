@@ -640,23 +640,6 @@ const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
 const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
 
-type GpuEncoderInfo = {
-  gpus: string[];
-  vendor: string;
-  vendor_label: string;
-  detected_encoder: string;
-  ffmpeg_encoders: Record<string, boolean>;
-};
-
-const VIDEO_ENCODER_LABELS: Record<string, string> = {
-  auto: 'Auto (detect GPU)',
-  copy: 'Source (fast)',
-  libx264: 'H.264 — x264',
-  h264_nvenc: 'H.264 — NVIDIA',
-  h264_amf: 'H.264 — AMD',
-  h264_qsv: 'H.264 — Intel',
-};
-
 function readPreviewFsUiScale(): number {
   try {
     const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
@@ -1682,6 +1665,46 @@ const LEGACY_MB_PER_MIN: Record<string, number> = {
   '720p': 70, '480p': 35, '360p': 18,
 };
 
+function preferHeightFromQuality(quality: string): number {
+  const q = (quality || 'source').toLowerCase();
+  if (q === 'source') return 10_000;
+  const m = q.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 1080;
+}
+
+function pickSizeForQuality(
+  sizes: Record<string, number>,
+  quality: string,
+): number | undefined {
+  const q = (quality || 'source').toLowerCase();
+  if (sizes[quality] || sizes[q]) return sizes[quality] ?? sizes[q];
+  const preferH = preferHeightFromQuality(quality);
+  let bestKey: string | null = null;
+  let bestH = -1;
+  for (const key of Object.keys(sizes)) {
+    const m = key.match(/(\d+)/);
+    const h = m ? parseInt(m[1], 10) : (key.toLowerCase() === 'source' ? 10_000 : 0);
+    if (preferH >= 10_000) {
+      if (h > bestH) {
+        bestH = h;
+        bestKey = key;
+      }
+    } else if (h <= preferH && h > bestH) {
+      bestH = h;
+      bestKey = key;
+    }
+  }
+  if (bestKey) return sizes[bestKey];
+  if (preferH < 10_000) {
+    for (const key of Object.keys(sizes)) {
+      const m = key.match(/(\d+)/);
+      const h = m ? parseInt(m[1], 10) : 0;
+      if (h >= preferH) return sizes[key];
+    }
+  }
+  return sizes.source ?? Math.max(...Object.values(sizes));
+}
+
 function estimateDownloadBytes(
   videoInfo: VideoInfo | null,
   quality: string,
@@ -1692,18 +1715,7 @@ function estimateDownloadBytes(
   const fullDur = Math.max(clipSec, fullDurationSec || clipSec);
   const sizes = videoInfo?.size_by_quality;
   if (sizes && Object.keys(sizes).length > 0) {
-    const q = (quality || 'source').toLowerCase();
-    let fullBytes: number | undefined = sizes[quality] ?? sizes[q];
-    if (!fullBytes) {
-      const match = Object.entries(sizes).find(([k]) => {
-        const lk = k.toLowerCase();
-        return lk.startsWith(q) || q.startsWith(lk);
-      });
-      fullBytes = match?.[1];
-    }
-    if (!fullBytes) {
-      fullBytes = sizes.source ?? Math.max(...Object.values(sizes));
-    }
+    const fullBytes = pickSizeForQuality(sizes, quality);
     if (fullBytes && fullBytes > 0) {
       return Math.round(fullBytes * (clipSec / fullDur));
     }
@@ -2007,7 +2019,6 @@ export default function App() {
   // Settings
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [gpuEncoderInfo, setGpuEncoderInfo] = useState<GpuEncoderInfo | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -3851,12 +3862,8 @@ export default function App() {
 
   const loadSettings = useCallback(async () => {
     try {
-      const [s, gpu] = await Promise.all([
-        apiGet<AppSettings>('/api/settings'),
-        apiGet<GpuEncoderInfo>('/api/system/gpu-encoder').catch(() => null),
-      ]);
+      const s = await apiGet<AppSettings>('/api/settings');
       setSettings(s);
-      if (gpu) setGpuEncoderInfo(gpu);
       if (typeof s.channel_kick_enabled === 'boolean') {
         setKickEnabled(s.channel_kick_enabled);
       }
@@ -5157,7 +5164,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-1.5">
                 <FieldCaption noWrap>Download Threads</FieldCaption>
                 <input type="number" min={1} max={16}
@@ -5172,35 +5179,10 @@ export default function App() {
                   onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
                   className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
               </div>
-              <div className="flex flex-col gap-1.5">
-                <FieldCaption>Video Encoder</FieldCaption>
-                <select
-                  value={settings.video_encoder || 'auto'}
-                  onChange={(e) => setSettings({ ...settings, video_encoder: e.target.value })}
-                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs"
-                  title="H.264 encoders produce .mp4 files compatible with most editors"
-                >
-                  <option value="auto">
-                    Auto — {gpuEncoderInfo
-                      ? `${gpuEncoderInfo.vendor_label} → ${VIDEO_ENCODER_LABELS[gpuEncoderInfo.detected_encoder] ?? gpuEncoderInfo.detected_encoder}`
-                      : 'detect GPU'}
-                  </option>
-                  <option value="copy">Source (fast)</option>
-                  <option value="libx264">H.264 — x264 (software)</option>
-                  <option value="h264_nvenc">H.264 — NVIDIA</option>
-                  <option value="h264_amf">H.264 — AMD</option>
-                  <option value="h264_qsv">H.264 — Intel</option>
-                </select>
-                {gpuEncoderInfo && (
-                  <p className="text-[9px] font-mono text-zinc-600 leading-snug">
-                    GPU: {gpuEncoderInfo.gpus[0] || gpuEncoderInfo.vendor_label}
-                    {settings.video_encoder === 'auto' || !settings.video_encoder
-                      ? ` · using ${VIDEO_ENCODER_LABELS[gpuEncoderInfo.detected_encoder] ?? gpuEncoderInfo.detected_encoder}`
-                      : ''}
-                  </p>
-                )}
-              </div>
             </div>
+            <p className="text-[9px] font-mono text-zinc-600 leading-snug">
+              Kick/Twitch VODs: remux when already H.264/AAC; GPU transcode when needed.
+            </p>
 
             <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
               <span>v{appVersion ?? '…'}</span>
