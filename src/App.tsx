@@ -77,7 +77,7 @@ interface DownloadState {
 }
 
 interface DownloadsResponse {
-  active: DownloadState[];
+  queue: DownloadState[];
   history: DownloadState[];
 }
 
@@ -1922,7 +1922,7 @@ export default function App() {
   }, [previewPanelWidth, urlAsidePanelSize, mainPanelSize]);
 
   // Queue
-  const [activeDownloads, setActiveDownloads] = useState<DownloadState[]>([]);
+  const [queueDownloads, setQueueDownloads] = useState<DownloadState[]>([]);
   const [historyDownloads, setHistoryDownloads] = useState<DownloadState[]>([]);
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
@@ -3308,18 +3308,20 @@ export default function App() {
   const refreshDownloads = useCallback(async () => {
     try {
       const data = await apiGet<DownloadsResponse>('/api/downloads');
-      setActiveDownloads(data.active || []);
+      setQueueDownloads(data.queue || []);
       setHistoryDownloads(data.history || []);
     } catch {}
   }, []);
 
   const activeDownloadIds = useMemo(
-    () => activeDownloads.map((d) => d.download_id),
-    [activeDownloads],
+    () => queueDownloads
+      .filter((d) => !['Paused', 'Failed', 'Cancelled', 'Interrupted'].includes(d.status))
+      .map((d) => d.download_id),
+    [queueDownloads],
   );
 
   const handleDownloadSseEvent = useCallback((id: string, event: { type: string; data: unknown }) => {
-    setActiveDownloads((prev) =>
+    setQueueDownloads((prev) =>
       prev.map((dl) => (dl.download_id === id ? applyDownloadSseEvent(dl, event) : dl)),
     );
   }, []);
@@ -3469,6 +3471,17 @@ export default function App() {
       await apiPost(`/api/download/${id}/remove`, {});
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to remove from history';
+      setError(msg);
+      refreshDownloads();
+    }
+  }, [refreshDownloads]);
+
+  const handleRemoveFromQueue = useCallback(async (id: string) => {
+    setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    try {
+      await apiPost(`/api/download/${id}/remove`, {});
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to remove from queue';
       setError(msg);
       refreshDownloads();
     }
@@ -5053,19 +5066,20 @@ export default function App() {
           <div className="flex flex-col gap-4">
             <div className="flex items-center justify-between">
               <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Active Downloads
+                Queue
               </span>
               <button onClick={refreshDownloads} className="text-zinc-500 hover:text-white transition-colors">
                 <RefreshCw size={14} />
               </button>
             </div>
 
-            <div className="flex flex-col gap-2 max-h-[280px] overflow-y-auto pr-1 custom-scrollbar">
+            <div className="flex flex-col gap-2 max-h-[360px] overflow-y-auto pr-1 custom-scrollbar">
               <ActiveDownloadsList
-                downloads={activeDownloads}
+                downloads={queueDownloads}
                 onPause={handlePause}
                 onResume={handleResume}
                 onCancel={handleCancel}
+                onDelete={handleRemoveFromQueue}
                 onOpenFolder={openFolder}
                 basename={basename}
                 platformIcon={(platform, className) => (
@@ -5081,7 +5095,7 @@ export default function App() {
               <div className="flex flex-col gap-2 max-h-[160px] overflow-y-auto pr-1 custom-scrollbar">
                 {historyDownloads.length === 0 ? (
                   <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-                    NO HISTORY YET.
+                    NO COMPLETED DOWNLOADS YET.
                   </div>
                 ) : historyDownloads.map((dl) => (
                     <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
@@ -5092,10 +5106,7 @@ export default function App() {
                             {dl.title || dl.url}
                           </span>
                         </div>
-                        <span className={`text-[10px] font-mono shrink-0 ${
-                          dl.status === 'Completed' ? 'text-[#53fc18]' :
-                          dl.status === 'Failed' ? 'text-red-400' : 'text-yellow-400'
-                        }`}>{dl.status}</span>
+                        <span className="text-[10px] font-mono shrink-0 text-[#53fc18]">{dl.status}</span>
                       </div>
                       <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
                         <span className="truncate">{basename(dl.output_file)}</span>

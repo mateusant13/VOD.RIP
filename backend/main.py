@@ -1557,6 +1557,38 @@ async def list_downloads():
     return download_mgr.get_active_and_history()
 
 
+@app.post("/api/download/{download_id}/retry")
+async def retry_download(download_id: str):
+    """Re-queue a failed, cancelled, or interrupted download (alias for resume)."""
+    return await resume_download(download_id)
+
+
+def _download_func_for_entry(entry: dict):
+    platform = detect_platform(entry["url"])
+    dtype = entry.get("type", entry.get("download_type", "video"))
+    if platform == "Kick" and dtype == "video":
+        from services.kick_api_service import download_vod_sync as kick_download_vod
+        return kick_download_vod
+    return None
+
+
+@app.post("/api/download/{download_id}/resume")
+async def resume_download(download_id: str):
+    opts = settings_mgr.get()
+    entry = download_mgr.get_resumable_entry(download_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Download not found or not resumable")
+    new_id = download_mgr.resume(
+        download_id,
+        oauth=opts.oauth,
+        download_func=_download_func_for_entry(entry),
+        settings_mgr=settings_mgr,
+    )
+    if not new_id:
+        raise HTTPException(status_code=404, detail="Download not found or not resumable")
+    return {"download_id": new_id, "resumed": True}
+
+
 @app.get("/api/download/{download_id}")
 async def get_download(download_id: str):
     state = download_mgr.get(download_id)
@@ -1579,19 +1611,11 @@ async def pause_download(download_id: str):
     return {"paused": True}
 
 
-@app.post("/api/download/{download_id}/resume")
-async def resume_download(download_id: str):
-    success = download_mgr.resume(download_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Download not found or not paused")
-    return {"resumed": True}
-
-
 def _remove_download_history(download_id: str) -> dict:
-    if not download_mgr.remove_history(download_id):
+    if not download_mgr.discard_from_queue(download_id):
         raise HTTPException(
             status_code=404,
-            detail="Download not found or still active",
+            detail="Download not found",
         )
     return {"removed": True}
 
