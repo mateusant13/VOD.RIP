@@ -37,7 +37,8 @@ _HISTORY_MAX_ENTRIES = 200  # Bound on-disk growth; UI also caps at 50.
 
 
 def _hook_progress_percent(d: dict) -> Optional[int]:
-    if d.get("status") != "downloading":
+    status = d.get("status")
+    if status not in ("downloading", "postprocessing"):
         return None
 
     raw: Optional[float] = None
@@ -50,7 +51,7 @@ def _hook_progress_percent(d: dict) -> Optional[int]:
             raw = float(str(d["_percent_str"]).replace("%", "").strip())
         except ValueError:
             raw = None
-    if raw is None:
+    elif status == "downloading":
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         downloaded = d.get("downloaded_bytes", 0)
         if total and total > 0:
@@ -60,8 +61,9 @@ def _hook_progress_percent(d: dict) -> Optional[int]:
         return None
 
     raw = max(0.0, min(100.0, raw))
-    # FFmpeg concat/encode phases emit 91–100; do not rescale those to ~83%.
-    if d.get("status") == "postprocessing" or raw >= 91.0:
+    # FFmpeg concat/encode/finalise phases emit 85–99.9; pass through
+    # without rescaling to the download cap (90%).
+    if status == "postprocessing" or raw >= 91.0:
         return min(99, round(raw))
     pct = round(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
     if pct == 0 and raw > 0:

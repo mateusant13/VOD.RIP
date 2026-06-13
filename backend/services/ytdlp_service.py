@@ -71,6 +71,45 @@ def resolve_video_encoder(value: Optional[str]) -> str:
     return "libx264"
 
 
+def resolve_hls_concat_encoder(platform: str, user_encoder: Optional[str] = None) -> str:
+    """Pick the video mode for HLS segment concat, per platform.
+
+    Twitch VODs are already H.264/AAC in the CDN segments — remuxing
+    with ``-c copy`` is near-instant and avoids a pointless re-encode.
+
+    Kick VODs are often HEVC (or otherwise NLE-unfriendly); always
+    transcode to H.264/AAC ``yuv420p`` so Premiere/DaVinci can import
+    them. Prefer the user's GPU encoder (NVENC/AMF/QSV) for speed.
+    """
+    plat = (platform or "").strip()
+    if plat == "Twitch":
+        return "copy"
+    # Kick: never stream-copy; always produce edit-friendly H.264.
+    enc = resolve_video_encoder(user_encoder)
+    if enc in ("copy", "libx264"):
+        enc = resolve_video_encoder("auto")
+    return enc
+
+
+def ffmpeg_hwaccel_input_args(encoder: str) -> list[str]:
+    """GPU decode flags to insert before ``-i`` when re-encoding.
+
+    Keeps decoded frames on the GPU where possible so NVENC/AMF/QSV
+    encode does not bounce through system RAM (much faster on long
+    Kick VODs).
+    """
+    encoder = normalize_video_encoder(encoder)
+    if encoder == "h264_nvenc":
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    if encoder == "h264_amf":
+        return ["-hwaccel", "d3d11va"]
+    if encoder == "h264_qsv":
+        return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+    if encoder == "h264_vaapi":
+        return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+    return []
+
+
 def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
     """Return ffmpeg output args for H.264 re-encode, or None for stream copy."""
     encoder = normalize_video_encoder(encoder)
@@ -78,12 +117,13 @@ def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
         return None
     audio = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", *audio]
+        # p1 = fastest NVENC preset; Kick transcodes can be hours long.
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "hq", "-rc", "vbr", "-cq", "23", *audio]
     if encoder == "h264_amf":
-        return ["-c:v", "h264_amf", "-quality", "balanced", *audio]
+        return ["-c:v", "h264_amf", "-quality", "speed", *audio]
     if encoder == "h264_qsv":
-        return ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "23", *audio]
-    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23", *audio]
+        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", *audio]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", *audio]
 
 import requests
 import yt_dlp
@@ -1435,13 +1475,9 @@ def _concat_and_trim(
             posix = seg_path.replace("\\", "/")
             f.write(f"file '{posix}'\n")
 
+    encoder = resolve_video_encoder(video_encoder)
+    phase = "Remuxing" if encoder == "copy" else "Encoding"
     if progress_hook:
-        # Pick a phase label that tells the user what ffmpeg is actually
-        # doing. ``-c copy`` is a stream copy (just remux, near-instant
-        # for a clip), otherwise we're re-encoding to H.264 which can take
-        # real time on long clips.
-        encoder = resolve_video_encoder(video_encoder)
-        phase = "Remuxing" if encoder == "copy" else "Encoding"
         progress_hook({
             "status": "postprocessing",
             "percent": 85,
@@ -1451,18 +1487,18 @@ def _concat_and_trim(
             "eta_seconds": None,
         })
 
-    cmd = [
-        ffmpeg_exe, "-y", "-loglevel", "error",
-        "-f", "concat", "-safe", "0", "-i", concat_txt,
-    ]
+    encode_args = ffmpeg_h264_encode_args(encoder)
+    cmd = [ffmpeg_exe, "-y", "-loglevel", "error"]
+    if encode_args:
+        cmd += ffmpeg_hwaccel_input_args(encoder)
+    cmd += ["-f", "concat", "-safe", "0", "-i", concat_txt]
     if offset > 0.001:
         cmd += ["-ss", str(offset)]
     cmd += ["-t", str(duration)]
-    encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
     if encode_args:
         cmd += encode_args
     else:
-        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
     cmd += ["-f", "mp4", tmp_out]
     _check_pause_cancel(cancel_event, pause_event)
     _run_ffmpeg(
@@ -1737,6 +1773,7 @@ def download_video_sync(
 
     if is_hls:
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+        hls_encoder = resolve_hls_concat_encoder(platform, resolved_encoder)
         _download_hls_clip(
             full_url, output_path, start_sec, end_sec, opts,
             progress_hook=progress_hook,
@@ -1744,7 +1781,7 @@ def download_video_sync(
             pause_event=pause_event,
             register_abort=register_abort,
             prefer_height=_parse_prefer_height(quality),
-            video_encoder=resolved_encoder,
+            video_encoder=hls_encoder,
             register_temp_dir=register_temp_dir,
         )
     else:

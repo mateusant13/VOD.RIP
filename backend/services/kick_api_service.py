@@ -428,12 +428,12 @@ def download_vod_sync(
         _resolve_ffmpeg_exe,
         _verify_output_file,
         download_hls_media_clip,
-        resolve_video_encoder,
+        resolve_hls_concat_encoder,
     )
 
     if video_encoder is None and settings_mgr is not None:
         video_encoder = settings_mgr.get().video_encoder
-    resolved_encoder = resolve_video_encoder(video_encoder)
+    resolved_encoder = resolve_hls_concat_encoder("Kick", video_encoder)
 
     info = get_video_info_api(url)
     if not info.m3u8_url:
