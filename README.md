@@ -52,7 +52,7 @@ Archiving a full stream or saving a highlight - the whole workflow lives in one 
 
 ## Ready for Premiere & other editors
 
-Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**, and other NLEs. No segment stitching, codec wrangling, or audio repackaging - VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks.
+Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**. VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks.
 
 ---
 
