@@ -214,13 +214,15 @@ begin
   Result := '';
 end;
 
-; F4/F13 (ANTIVIRUS_AUDIT): SignTool reference kept simple. Inno Setup 6.4+
-; supports a [PostCompile] step that runs signtool.exe on the produced
-; installer. The conditional `..\signing\vodrip.pfx` test in [Setup] will
-; also add SignTool=vodrip to the build. We do NOT add a [SignTools] section
-; here because Inno's parameter-substitution syntax is version-specific; the
-; CI step in `.github/workflows/release.yml` is the source of truth and the
-; docs/SIGNING.md (added in this change) covers the local-build flow.
-; For local dev, just drop a pfx at ..\signing\vodrip.pfx and the build will
-; sign automatically.
+{
+  F4/F13 (ANTIVIRUS_AUDIT): SignTool reference kept simple. Inno Setup 6.4+
+  supports a [PostCompile] step that runs signtool.exe on the produced
+  installer. The conditional ..\signing\vodrip.pfx test in [Setup] will
+  also add SignTool=vodrip to the build. We do NOT add a [SignTools] section
+  here because Inno's parameter-substitution syntax is version-specific; the
+  CI step in .github/workflows/release.yml is the source of truth and the
+  docs/SIGNING.md covers the local-build flow.
+  For local dev, just drop a pfx at ..\signing\vodrip.pfx and the build will
+  sign automatically.
+}
 
