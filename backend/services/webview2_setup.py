@@ -56,18 +56,28 @@ _REG_HIVES_AND_KEYS: Tuple[Tuple[int, str], ...] = (
 )
 
 # Well-known install locations for msedgewebview2.exe, in priority order.
-# ``environ_keys`` are environment variable names whose value is the parent
-# of the install root. ``relpath`` is the path under that root.
+# Each entry is (set_of_env_var_names, relpath_under_env_var_value).
+#
+# Why multiple env vars per entry:
+#   * ``ProgramFiles(x86)`` = the 32-bit program files on 64-bit Windows
+#     (or the only one on 32-bit Windows).
+#   * ``ProgramFiles`` = the 32-bit program files on 32-bit Windows, or
+#     the redirected 32-bit view on WoW64 Python.
+#   * ``ProgramW64386`` = the *native* 64-bit ``C:\\Program Files`` on
+#     64-bit Windows when the current process is 32-bit (WoW64). Without
+#     this env var, a 32-bit Python on a 64-bit box would never look at
+#     the native 64-bit install dir.
+#   * ``LOCALAPPDATA`` = per-user installs.
 _KNOWN_INSTALL_ROOTS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
-    # Evergreen per-machine (the default Win11 install + bootstrapper).
-    (("ProgramFiles(x86)", "ProgramFiles"),
+    # Evergreen per-machine (the default Win10/11 install + bootstrapper).
+    (("ProgramFiles(x86)", "ProgramFiles", "ProgramW64386"),
      r"Microsoft\EdgeWebView\Application"),
-    # Evergreen per-user (manual bootstrap with /silent-install).
+    # Evergreen per-user (manual bootstrap with /silent-install /silent).
     (("LOCALAPPDATA",),
      r"Microsoft\EdgeWebView\Application"),
     # Edge (Chromium) shares its runtime with WebView2 on Win11+ — the
     # binary lives inside the Edge install tree.
-    (("ProgramFiles(x86)", "ProgramFiles"),
+    (("ProgramFiles(x86)", "ProgramFiles", "ProgramW64386"),
      r"Microsoft\Edge\Application"),
 )
 
@@ -111,29 +121,42 @@ def _binary_exists(root: Path) -> Optional[Path]:
 def _webview2_on_disk() -> Optional[Path]:
     """Return the path of msedgewebview2.exe if it exists in any well-known
     install location. Used as the **primary** detection signal.
+
+    Dedup is required because on WoW64 Python (``os.environ.get('ProgramFiles')``
+    returns the 32-bit redirected view) several env vars can resolve to the
+    same physical directory.
     """
+    seen_roots: set = set()
     for env_keys, relpath in _KNOWN_INSTALL_ROOTS:
         for env_key in env_keys:
             env_value = os.environ.get(env_key)
             if not env_value:
                 continue
-            for env_value_resolved in (_expand_env(env_value), env_value):
-                root = Path(env_value_resolved) / relpath
-                found = _binary_exists(root)
-                if found is not None:
-                    logger.debug("WebView2 found on disk: %s", found)
-                    return found
+            root = Path(env_value) / relpath
+            # Normalise to a canonical form for dedup.
+            try:
+                canonical = str(root.resolve())
+            except OSError:
+                canonical = str(root)
+            if canonical in seen_roots:
+                continue
+            seen_roots.add(canonical)
+            found = _binary_exists(root)
+            if found is not None:
+                logger.debug("WebView2 found on disk: %s", found)
+                return found
     return None
 
 
 def _registry_reported_path(hive: int, subkey: str) -> Optional[Path]:
     """Read the ``location`` value from the EdgeUpdate client key. Returns
-    the install root the runtime was installed at, or None if not set.
+    the **path to msedgewebview2.exe** if the registry points at a real
+    install, or None otherwise.
 
     Microsoft writes the install root to ``location`` (not ``path`` —
-    that was an old heuristic). This is *not* enough to declare the
-    runtime installed — EdgeUpdate leaves the value in place even when
-    the binary is gone. Use ``_verify_registry_path`` to confirm.
+    that was an older custom-install field). This function is strict:
+    it returns the path of the binary only if the file actually exists.
+    A registry entry whose binary has been removed returns None.
     """
     try:
         import winreg
@@ -163,23 +186,35 @@ def _registry_reported_path(hive: int, subkey: str) -> Optional[Path]:
     if not location:
         return None
     root = Path(_expand_env(location))
+    candidates: list = []
     if pv:
-        # Prefer the version-stamped subfolder when ``pv`` is set and
-        # the binary exists there. Fall through to the root on miss.
-        versioned = root / pv
-        if (versioned / _msedgewebview2_exe_name()).is_file():
-            return versioned / _msedgewebview2_exe_name()
-    return root
-
+        candidates.append(root / pv / _msedgewebview2_exe_name())
+    candidates.append(root / _msedgewebview2_exe_name())
+    # The "Application" dir holds versioned subfolders; if ``pv`` did
+    # not give us a hit, walk one level down to find any version subdir
+    # with the binary. This handles EdgeUpdate's behaviour of leaving
+    # ``location`` pointing at the parent directory.
+    if not any(c.is_file() for c in candidates):
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            cand = child / _msedgewebview2_exe_name()
+            if cand.is_file():
+                candidates.append(cand)
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
 
 def _registry_installed() -> bool:
     """True iff EdgeUpdate knows about a WebView2 Runtime *and* the
-    binary is actually present at the reported path."""
+    binary is actually present at the reported path.
+
+    ``_registry_reported_path`` returns the path of msedgewebview2.exe
+    (verified with ``is_file()``) or None. A non-None return is proof
+    of install.
+    """
     for hive, subkey in _REG_HIVES_AND_KEYS:
-        # _registry_reported_path already does the binary-on-disk check
-        # (returns None if the path it found doesn't actually contain
-        # msedgewebview2.exe). A non-None return is therefore proof of
-        # install.
         if _registry_reported_path(hive, subkey) is not None:
             return True
     return False
