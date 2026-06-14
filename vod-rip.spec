@@ -136,8 +136,14 @@ a = Analysis(
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
+    # F15 (ANTIVIRUS_AUDIT): noarchive=True embeds the entire archive into the
+    # single EXE rather than emitting a side-by-side VOD-RIP.pkg + _internal/
+    # directory. A single self-extracting EXE matches the well-known
+    # "PyInstaller bootloader" pattern that AV vendors explicitly model, and
+    # the directory layout was triggering a small number of YARA rules
+    # (`PyInstaller/Trojanized`) and false-positive detections in the
+    # "PUA:Win32/UncommonBinaryBundle" category.
+    noarchive=True,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)

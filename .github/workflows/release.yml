@@ -45,6 +45,11 @@ jobs:
           - os: ubuntu-22.04
             label: Linux-x64
 
+    env:
+      # Empty default; real values come from repository secrets when set.
+      VODRIP_CERT_B64: ""
+      VODRIP_CERT_PWD: ""
+      VODRIP_TIMESTAMP: ""
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -115,6 +120,48 @@ jobs:
           Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "installer\MicrosoftEdgeWebview2Setup.exe"
           choco install innosetup -y --no-progress
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$ver installer\installer.iss
+
+      # F4/F13 (ANTIVIRUS_AUDIT): sign the PyInstaller bootloader and the Inno
+      # Setup installer with an Authenticode cert if one is provided as a
+      # base64-encoded GitHub secret. Without the secret, the step is a no-op
+      # and the build proceeds unsigned (as before). See docs/SIGNING.md.
+      - name: Sign artefacts (Authenticode)
+        if: runner.os == 'Windows' && env.VODRIP_CERT_B64 != ''
+        shell: pwsh
+        env:
+          VODRIP_CERT_B64: ${{ secrets.VODRIP_CERT_B64 }}
+          VODRIP_CERT_PWD: ${{ secrets.VODRIP_CERT_PWD }}
+          VODRIP_TIMESTAMP: ${{ secrets.VODRIP_TIMESTAMP }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $timestamp = if ($env:VODRIP_TIMESTAMP) { $env:VODRIP_TIMESTAMP } else { 'http://timestamp.digicert.com' }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'vodrip.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:VODRIP_CERT_B64))
+
+          # Locate signtool.exe (Windows SDK).
+          $signtool = (Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if (-not $signtool) {
+            Write-Host "::warning::signtool.exe not found; skipping signing step"
+            exit 0
+          }
+
+          # Sign the PyInstaller bootloader.
+          $bootloader = "dist\VOD-RIP\VOD-RIP.exe"
+          if (Test-Path $bootloader) {
+            & $signtool sign /fd SHA256 /tr $timestamp /td sha256 /f $pfxPath /p $env:VODRIP_CERT_PWD $bootloader
+            Write-Host "Signed bootloader: $bootloader"
+          }
+
+          # Sign the Inno Setup installer (if produced).
+          $installer = Get-ChildItem -Path release -Filter "*-Setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($installer) {
+            & $signtool sign /fd SHA256 /tr $timestamp /td sha256 /f $pfxPath /p $env:VODRIP_CERT_PWD $installer.FullName
+            Write-Host "Signed installer: $($installer.FullName)"
+          }
+
+          # Clean up the cert on disk.
+          Remove-Item -Force $pfxPath
+
 
       - name: Package macOS zip
         if: runner.os == 'macOS'

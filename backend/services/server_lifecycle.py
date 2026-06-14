@@ -237,22 +237,10 @@ def _kill_pid_windows(port: int, pid: int, image: str) -> bool:
         if not _process_alive(pid):
             return True
 
-    try:
-        subprocess.run(
-            [
-                "powershell", "-NoProfile", "-Command",
-                f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            creationflags=_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
-        _logger.debug("Stop-Process pid %s timed out", pid)
-
-    if not _process_alive(pid):
-        return True
+    # F6 (ANTIVIRUS_AUDIT): the PowerShell `Stop-Process -Force` fallback was
+    # a top-tier EDR heuristic. `_terminate_process_windows` already uses
+    # `kernel32.TerminateProcess` directly via ctypes, which is the right
+    # primitive. Fall straight through to it.
     return _terminate_process_windows(pid)
 
 

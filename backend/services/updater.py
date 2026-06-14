@@ -29,7 +29,25 @@ CACHE_FILENAME = "update_cache.json"
 PENDING_FILENAME = "update_pending.json"
 
 logger = logging.getLogger(__name__)
+try:
+    from services._version import USER_AGENT
+except ImportError:  # pragma: no cover - dev module-load race
+    USER_AGENT = "VOD.RIP/unknown"
+
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def _terminate_for_update(reason: str) -> None:
+    """F7 (ANTIVIRUS_AUDIT): ``os._exit`` is intentional in the four
+    update-applier call sites — the live process must die so the spawned
+    robocopy/ditto/rsync can replace its own files. ``sys.exit`` is wrong
+    here because atexit handlers and finally blocks would keep files open
+    on Windows long enough for the robocopy to fail. The exit is logged
+    so EDR products that key on "parent terminates after spawning child
+    updater" can correlate the child to the explicit ``logger.info`` call.
+    """
+    logger.info("Update applicator exiting live process: %s", reason)
+    os._exit(0)
 
 
 def _install_dir() -> Path:
@@ -59,7 +77,7 @@ class UpdateChecker:
 
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=15, headers={"User-Agent": USER_AGENT})
             if resp.status_code != 200:
                 self._save_cache({"last_check": time.time(), "error": resp.status_code})
                 logger.warning("Update check HTTP %d", resp.status_code)
@@ -115,7 +133,7 @@ class UpdateChecker:
 
         logger.info("Downloading update %s ...", release_info.get("version"))
         try:
-            with requests.get(download_url, stream=True, timeout=600) as resp:
+            with requests.get(download_url, stream=True, timeout=600, headers={"User-Agent": USER_AGENT}) as resp:
                 resp.raise_for_status()
                 with open(dest, "wb") as handle:
                     for chunk in resp.iter_content(chunk_size=65536):
@@ -217,7 +235,8 @@ class UpdateChecker:
             os.startfile(str(installer))
         else:
             subprocess.Popen([str(installer)], close_fds=True)
-        os._exit(0)
+        _terminate_for_update("launching Windows installer; letting installer take over")
+        return True
 
     def _apply_zip_update(self, zip_path: Path) -> bool:
         install_dir = _install_dir()
@@ -260,7 +279,8 @@ class UpdateChecker:
             close_fds=True,
             creationflags=_NO_WINDOW,
         )
-        os._exit(0)
+        _terminate_for_update("Windows robocopy updater script spawned; releasing file locks")
+        return True
 
     def _apply_linux_zip(self, extract_dir: Path, install_dir: Path) -> bool:
         source = extract_dir
@@ -288,7 +308,8 @@ class UpdateChecker:
         )
         script.chmod(0o755)
         subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
-        os._exit(0)
+        _terminate_for_update("Linux rsync/cp updater script spawned; releasing file locks")
+        return True
 
     def _apply_macos_zip(self, extract_dir: Path, install_dir: Path) -> bool:
         app_bundle = next(extract_dir.rglob("VOD.RIP.app"), None)
@@ -311,7 +332,8 @@ class UpdateChecker:
         )
         script.chmod(0o755)
         subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
-        os._exit(0)
+        _terminate_for_update("macOS ditto updater script spawned; releasing file locks")
+        return True
 
 
 def _safe_extractall(archive: ZipFile, target: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -149,7 +150,10 @@ def request_app_exit() -> None:
             except Exception as exc:
                 _logger.debug("destroy window: %s", exc)
 
-        os._exit(0)
+        # F7 (ANTIVIRUS_AUDIT): prefer ``sys.exit`` so atexit handlers / finally
+        # blocks can run. ``os._exit`` was leaving the process tree in a state
+        # some EDR products log as "orphaned child after parent termination".
+        sys.exit(0)
 
     # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.
     threading.Thread(target=_do_exit, daemon=True).start()

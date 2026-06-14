@@ -52,7 +52,7 @@ Archiving a full stream or saving a highlight - the whole workflow lives in one 
 
 ## Ready for Premiere & other editors
 
-Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere Pro**, **DaVinci Resolve**. VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks.
+Kick and Twitch VODs download as **one `.mp4` file** you can drop straight into **Premiere**, **DaVinci Resolve**, **VEGAS Pro**, and any other. VOD.RIP handles the messy parts so you get an import-friendly file instead of raw chunks like other tools.
 
 ---
 
@@ -79,6 +79,21 @@ npm run dev
 ```
 
 Then open `http://localhost:5173`.
+
+> **Dev-mode note.** The development server (`backend/main.py`) binds
+> `uvicorn` to `0.0.0.0:7897` so a phone or second machine on the LAN can
+> hit the API for testing. The packaged app (`backend/__main_launcher__.py`)
+> binds to `127.0.0.1` only — this is intentional. AV products that flag
+> "app bound to all interfaces" warnings should be configured to ignore
+> the dev path; production builds are loopback-only.
+
+## Security & antivirus reputation
+
+VOD.RIP is regularly audited for false-positive risk. See
+[`ANTIVIRUS_AUDIT.md`](ANTIVIRUS_AUDIT.md) for the full report and
+[`docs/SIGNING.md`](docs/SIGNING.md) for the code-signing setup that
+removes the SmartScreen prompt on first install.
+
 
 ## Built with
 
