@@ -44,7 +44,7 @@ def set_flush_geometry_callback(cb: Callable[[], None]) -> None:
     _flush_geometry_cb = cb
 
 
-def _flush_frontend_state() -> None:
+def _flush_frontend_state(*, fast: bool = False) -> None:
     """Read panel layout from the UI and persist to settings.json before shutdown."""
     if _window is None or not hasattr(_window, "evaluate_js"):
         return
@@ -64,6 +64,8 @@ def _flush_frontend_state() -> None:
             current.panel_layout = layout
             mgr.save(current)
             _logger.info("Panel layout saved on exit")
+            return
+        if fast:
             return
         _window.evaluate_js(
             "(function(){try{if(window.__vodripFlushPanelLayout)"
@@ -178,7 +180,14 @@ def request_app_exit() -> None:
     _allow_close = True
 
     def _do_exit() -> None:
-        _flush_frontend_state()
+        # Hide immediately — user sees the app close without waiting for teardown.
+        if _window is not None:
+            try:
+                _window.hide()
+            except Exception as exc:
+                _logger.debug("hide window on exit: %s", exc)
+
+        _flush_frontend_state(fast=True)
         if _flush_geometry_cb:
             try:
                 _flush_geometry_cb()
@@ -201,7 +210,8 @@ def request_app_exit() -> None:
             from services.server_lifecycle import stop_api_server
 
             port = int(_os.environ.get("PORT", 7897))
-            stop_api_server(port)
+            # Process is exiting — signal uvicorn but do not wait up to 4s for the port.
+            stop_api_server(port, wait_for_port=False)
         except Exception as exc:
             _logger.debug("stop api server: %s", exc)
 
@@ -211,9 +221,6 @@ def request_app_exit() -> None:
             except Exception as exc:
                 _logger.debug("destroy window: %s", exc)
 
-        # F7 (ANTIVIRUS_AUDIT): prefer ``sys.exit`` so atexit handlers / finally
-        # blocks can run. ``os._exit`` was leaving the process tree in a state
-        # some EDR products log as "orphaned child after parent termination".
         sys.exit(0)
 
     # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.

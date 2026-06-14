@@ -350,8 +350,13 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
         _logger.error("Port %s still busy after shutdown attempt: %s", port, still)
 
 
-def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
-    """Signal uvicorn to exit and ensure *port* is no longer listening."""
+def stop_api_server(
+    port: Optional[int] = None,
+    timeout: float = 4.0,
+    *,
+    wait_for_port: bool = True,
+) -> None:
+    """Signal uvicorn to exit and optionally wait until *port* is no longer listening."""
     _shutdown_event.set()
     with _server_lock:
         server = _uvicorn_server
@@ -361,7 +366,7 @@ def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
         except Exception as exc:
             _logger.debug("uvicorn should_exit: %s", exc)
 
-    if port is None:
+    if port is None or not wait_for_port:
         return
 
     if _wait_for_port_free(port, skip_pid=os.getpid(), timeout=timeout):

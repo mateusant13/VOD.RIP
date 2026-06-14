@@ -5317,10 +5317,10 @@ export default function App() {
               {settingsSaved ? <><CheckCircle2 size={14} /> Saved!</> : 'Save Settings'}
             </button>
 
-            <button onClick={async () => {
+            <button onClick={() => {
               if (!window.confirm('Exit VOD.RIP? All downloads will be cancelled and the app will close.')) return;
               flushPanelLayoutToBackend();
-              try { await apiPost('/api/exit', {}); } catch {}
+              void apiPost('/api/exit', {}).catch(() => {});
             }}
               className="w-full bg-red-950 text-red-400 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-300 transition-colors">
               <StopCircle size={14} />
