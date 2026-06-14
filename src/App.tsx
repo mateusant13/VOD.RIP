@@ -1562,6 +1562,11 @@ function isLikelyClip(v: ChannelVideo): boolean {
     if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
     return true;
   }
+  // Twitch GQL may return clip pages as twitch.tv/{login}/clip/{slug}
+  if (v.platform === 'Twitch' && /\/clip\/[^/]+/i.test(url)) {
+    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
+    return true;
+  }
   return false;
 }
 
@@ -1632,6 +1637,35 @@ function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): Chan
   );
 }
 
+/** Merge clip feeds; incoming wins on duplicate ids. Sorted by views desc. */
+function mergeClipLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
+  const map = new Map<string, ChannelVideo>();
+  for (const v of incoming.map(mapApiChannelItem).filter(isLikelyClip)) {
+    map.set(channelVideoKey(v), v);
+  }
+  for (const v of existing.filter(isLikelyClip)) {
+    const k = channelVideoKey(v);
+    if (!map.has(k)) map.set(k, v);
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0),
+  );
+}
+
+function channelClipsMissing(
+  ch: SavedChannel,
+  kickOn: boolean,
+  twitchOn: boolean,
+): boolean {
+  const clips = ch.clipVideos ?? [];
+  if (!ch.clipsFetched && clips.length === 0) return true;
+  if (kickOn && ch.kickSlug?.trim() && !clips.some((v) => v.platform === 'Kick')) return true;
+  if (twitchOn && ch.twitchSlug?.trim() && !clips.some((v) => v.platform === 'Twitch')) {
+    return true;
+  }
+  return false;
+}
+
 function buildVodUrl(v: ChannelVideo): string {
   const isTw = v.platform === 'Twitch';
   const isClip = isLikelyClip(v);
@@ -1661,8 +1695,8 @@ function formatBytes(nbytes: number): string {
 }
 
 const LEGACY_MB_PER_MIN: Record<string, number> = {
-  source: 180, '1080p60': 180, '1080p': 120, '720p60': 70,
-  '720p': 70, '480p': 35, '360p': 18,
+  source: 112, '1080p60': 112, '1080p': 75,
+  '720p60': 44, '720p': 42, '480p': 24, '360p': 14,
 };
 
 function preferHeightFromQuality(quality: string): number {
@@ -3574,6 +3608,7 @@ export default function App() {
 
   const channelRefreshInFlightRef = useRef<Set<string>>(new Set());
   const clipsAutoFetchStartedRef = useRef<Set<string>>(new Set());
+  const vodAutoFetchStartedRef = useRef<Set<string>>(new Set());
 
   const refreshChannel = useCallback(async (
     channelId: string,
@@ -3598,68 +3633,55 @@ export default function App() {
     const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
 
-    const wantKick = kickEnabled;
-    const wantTwitch = twitchEnabled;
+    // Always fetch both platforms; Kick/Twitch toggles only filter the display.
+    const wantKick = true;
+    const wantTwitch = true;
 
     try {
       if (mode === 'clips') {
-        const fetchClips = async (platform: 'Kick' | 'Twitch', slug: string) => {
-          if (!slug?.trim()) {
-            errs[platform] = `${platform} slug is not set`;
-            return;
-          }
-          const slugParam = platform === 'Kick'
-            ? `kick_slug=${encodeURIComponent(slug)}`
-            : `twitch_login=${encodeURIComponent(slug)}`;
-          const qs = `platforms=${encodeURIComponent(platform)}&limit=10&${slugParam}`;
+        const slug = ch.kickSlug?.trim() || ch.twitchSlug?.trim() || '';
+        const params = new URLSearchParams({
+          platforms: 'Kick,Twitch',
+          limit: '10',
+          kick_slug: ch.kickSlug,
+          twitch_login: ch.twitchSlug,
+        });
+        if (slug) params.set('url', slug);
+        try {
+          let data: ChannelClipsResponse;
           try {
-            let data: ChannelClipsResponse;
-            try {
-              data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${qs}`);
-            } catch (clipErr: unknown) {
-              const msg = clipErr instanceof Error ? clipErr.message : '';
-              if (!msg.includes('Clips API not on server') && !msg.includes('Clips API unavailable')) {
-                throw clipErr;
-              }
-              const fallbackQs = new URLSearchParams({
-                url: slug,
-                platforms: platform,
-                limit: '10',
-                content: 'clips',
-                ...(platform === 'Kick'
-                  ? { kick_slug: slug }
-                  : { twitch_login: slug }),
-              });
-              data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${fallbackQs.toString()}`);
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${params}`);
+          } catch (clipErr: unknown) {
+            const msg = clipErr instanceof Error ? clipErr.message : '';
+            if (!msg.includes('Clips API not on server') && !msg.includes('Clips API unavailable')) {
+              throw clipErr;
             }
-            if (data.content && data.content !== 'clips') {
-              errs[platform] = IS_DEV_UI
-                ? 'Clips API unavailable — restart with npm run dev'
-                : 'Clips API unavailable — reopen VOD.RIP';
-              return;
-            }
-            const clips = data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? [];
-            incoming.push(...clips.map(mapApiChannelItem));
-            delete errs[platform];
-            const pe = data.per_platform_errors?.[platform];
-            if (pe) errs[platform] = pe;
-          } catch (err: unknown) {
-            errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} clips`;
+            params.set('content', 'clips');
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${params}`);
           }
-        };
-        const clipTasks: Promise<void>[] = [];
-        if (wantKick) clipTasks.push(fetchClips('Kick', ch.kickSlug));
-        if (wantTwitch) clipTasks.push(fetchClips('Twitch', ch.twitchSlug));
-        if (!wantKick) delete errs.Kick;
-        if (!wantTwitch) delete errs.Twitch;
-        await Promise.all(clipTasks);
-        const clipVideos = incoming
-          .filter(isLikelyClip)
-          .sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
+          if (data.content && data.content !== 'clips') {
+            errs.Kick = IS_DEV_UI
+              ? 'Clips API unavailable — restart with npm run dev'
+              : 'Clips API unavailable — reopen VOD.RIP';
+            errs.Twitch = errs.Kick;
+          } else {
+            incoming.push(...(data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? []).map(mapApiChannelItem));
+            for (const [platform, pe] of Object.entries(data.per_platform_errors ?? {})) {
+              if (pe) errs[platform] = pe;
+            }
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Failed to fetch clips';
+          errs.Kick = msg;
+          errs.Twitch = msg;
+        }
+        const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
+        const clipVideos = mergeClipLists(latest.clipVideos ?? [], incoming);
+        const prevClipErrors = latest.clipErrors ?? {};
         updateChannel(channelId, {
           clipVideos,
-          clipErrors: errs,
-          clipsFetched: true,
+          clipErrors: { ...prevClipErrors, ...errs },
+          clipsFetched: clipVideos.length > 0 || Object.keys(errs).length === 0,
           loading: false,
           updatedAt: new Date().toISOString(),
         });
@@ -3670,9 +3692,16 @@ export default function App() {
             errs[platform] = `${platform} slug is not set`;
             return;
           }
-          const qs = `url=${encodeURIComponent(slug)}&limit=${limit}&days=14&platforms=${encodeURIComponent(platform)}`;
+          const params = new URLSearchParams({
+            url: slug,
+            limit: String(limit),
+            days: '14',
+            platforms: platform,
+            kick_slug: ch.kickSlug,
+            twitch_login: ch.twitchSlug,
+          });
           try {
-            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${qs}`);
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}`);
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
@@ -3687,7 +3716,8 @@ export default function App() {
         if (!wantKick) delete errs.Kick;
         if (!wantTwitch) delete errs.Twitch;
         await Promise.all(vodTasks);
-        const vodVideos = mergeVodLists(ch.vodVideos ?? [], incoming);
+        const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
+        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
         updateChannel(channelId, {
           vodVideos,
           vodErrors: errs,
@@ -3704,10 +3734,39 @@ export default function App() {
         }
       }
     }
-  }, [updateChannel, channelContentFilter, kickEnabled, twitchEnabled]);
+  }, [updateChannel, channelContentFilter]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
+
+  const channelFiltersRef = useRef({
+    channelContentFilter,
+    kickEnabled,
+    twitchEnabled,
+  });
+
+  // Refetch when switching VODs/clips if that mode was never loaded for this channel.
+  useEffect(() => {
+    if (!channelUiPersistReadyRef.current || !selectedChannelId) return;
+    const prev = channelFiltersRef.current;
+    const contentChanged = prev.channelContentFilter !== channelContentFilter;
+    channelFiltersRef.current = { channelContentFilter, kickEnabled, twitchEnabled };
+    if (!contentChanged) return;
+
+    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
+    if (!ch) return;
+    const mode = channelContentFilter;
+    const needsFetch =
+      mode === 'clips'
+        ? channelClipsMissing(ch, kickEnabled, twitchEnabled)
+        : (ch.vodVideos?.length ?? 0) === 0 && !ch.updatedAt;
+    if (!needsFetch) return;
+
+    channelRefreshInFlightRef.current.delete(`${selectedChannelId}:${mode}`);
+    clipsAutoFetchStartedRef.current.delete(selectedChannelId);
+    vodAutoFetchStartedRef.current.delete(selectedChannelId);
+    void refreshChannelRef.current(selectedChannelId, undefined, mode, { silent: true });
+  }, [channelContentFilter, kickEnabled, twitchEnabled, selectedChannelId]);
 
   // On page load: cheap incremental VOD sync for every saved channel (merge new ids only).
   const incrementalSyncDoneRef = useRef(false);
@@ -3725,10 +3784,24 @@ export default function App() {
     if (channelContentFilter !== 'clips' || !selectedChannelId) return;
     if (clipsAutoFetchStartedRef.current.has(selectedChannelId)) return;
     const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
-    if (!ch || ch.clipsFetched || (ch.clipVideos?.length ?? 0) > 0) return;
+    if (!ch || !channelClipsMissing(ch, kickEnabled, twitchEnabled)) return;
     clipsAutoFetchStartedRef.current.add(selectedChannelId);
     void refreshChannelRef.current(selectedChannelId, ch, 'clips', { silent: true });
-  }, [channelContentFilter, selectedChannelId]);
+  }, [channelContentFilter, selectedChannelId, kickEnabled, twitchEnabled]);
+
+  // Retry VOD load when a newly-added channel was selected but the first fetch
+  // never completed (e.g. raced with an in-flight refresh).
+  useEffect(() => {
+    if (!selectedChannelId || channelContentFilter !== 'vods') return;
+    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
+    if (!ch || ch.loading) return;
+    const needsFetch = !ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0;
+    if (!needsFetch) return;
+    if (vodAutoFetchStartedRef.current.has(selectedChannelId)) return;
+    vodAutoFetchStartedRef.current.add(selectedChannelId);
+    channelRefreshInFlightRef.current.delete(`${selectedChannelId}:vods`);
+    void refreshChannelRef.current(selectedChannelId, undefined, 'vods');
+  }, [selectedChannelId, channelContentFilter, savedChannels]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -3751,10 +3824,13 @@ export default function App() {
       vodErrors: {},
       clipErrors: {},
       updatedAt: '',
+      loading: true,
     };
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
     setAddChannelInput('');
+    channelRefreshInFlightRef.current.delete(`${id}:vods`);
+    channelRefreshInFlightRef.current.delete(`${id}:clips`);
     await refreshChannel(id, entry, 'vods');
     if (channelContentFilter === 'clips') {
       clipsAutoFetchStartedRef.current.add(id);
@@ -4864,7 +4940,7 @@ export default function App() {
                   </div>
                   {selectedChannelId === ch.id && (
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1">
-                      <div className="flex items-center gap-2 flex-wrap">
+                      <div className="flex items-center gap-2 flex-nowrap min-h-[22px] shrink-0">
                         {(['Kick', 'Twitch'] as const).map((platform) => {
                           const isKick = platform === 'Kick';
                           const enabled = isKick ? kickEnabled : twitchEnabled;
@@ -4873,7 +4949,7 @@ export default function App() {
                           const loading = isKick ? kickBrowseLoading : twitchBrowseLoading;
                           const editing = editingSlug?.channelId === ch.id && editingSlug.platform === platform;
                           return (
-                            <div key={platform} className="group relative flex items-center">
+                            <div key={platform} className="group relative flex items-center shrink-0">
                               {editing ? (
                                 <input type="text" value={editingSlugValue}
                                   onChange={(e) => setEditingSlugValue(e.target.value)}
@@ -4905,7 +4981,9 @@ export default function App() {
                                     className="w-3 h-3 pointer-events-none" style={{ accentColor: color }} />
                                   <span>{platform}</span>
                                   <span className="text-zinc-500 normal-case font-normal">{slug}</span>
-                                  {loading && <Loader2 size={9} className="animate-spin" />}
+                                  <span className="inline-flex w-3 h-3 shrink-0 items-center justify-center">
+                                    {loading ? <Loader2 size={9} className="animate-spin" /> : null}
+                                  </span>
                                 </div>
                               )}
                               {!editing && (
@@ -4967,7 +5045,7 @@ export default function App() {
                           <p className="text-red-400 text-[10px] font-mono">{msg}</p>
                         ) : null;
                       })()}
-                      {channelsLoading ? (
+                      {channelsLoading && visibleChannelVideos.length === 0 ? (
                         <div className="flex justify-center py-4 text-zinc-500">
                           <Loader2 size={18} className="animate-spin" />
                         </div>
@@ -4976,7 +5054,7 @@ export default function App() {
                           {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
                         </p>
                       ) : (
-                        <div className="flex flex-col gap-1">
+                        <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
                           {visibleChannelVideos.map((v, i) => {
                             const fullUrl = buildVodUrl(v);
                             const subline = channelVodSubline(v);

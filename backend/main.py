@@ -5,10 +5,8 @@ import json
 import logging
 import os
 import platform
-import queue
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -18,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -30,6 +28,11 @@ from models.schemas import (
     PreviewSessionCreateRequest,
     PreviewSessionResponse,
     SettingsUpdate,
+)
+from services.os_services import (
+    open_file_or_folder,
+    pick_folder as os_pick_folder,
+    sanitize_filename_component,
 )
 from services.preview_service import (
     create_session,
@@ -51,6 +54,9 @@ from services.settings import SettingsManager
 logger = logging.getLogger(__name__)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+# Per-thread COM apartment for SHOpenFolderAndSelectItems (avoid init/uninit each click).
+_shell_com_local = threading.local() if os.name == "nt" else None
 
 from services.ytdlp_service import detect_platform, get_video_info, is_clip_url
 from services.twitch_gql_service import (
@@ -86,30 +92,9 @@ def _format_platform_error(exc: BaseException) -> str:
             "Restart the backend; if using dev mode, ensure Kick runs in a worker thread."
         )
     return name
-# Characters that Windows rejects in file paths. Anything we use as part
-# of an output path or cache dir must be stripped of these or we get
-# `[Errno 22] Invalid argument` on filesystem syscalls.
-_WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"/\\|?*')
-# Bare reserved device names that Windows treats specially. Suffixing
-# with a dot/space or appending an extension is the only way out.
-_WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-def _sanitize_path_component(value: str, fallback: str = "download") -> str:
-    """Strip characters Windows rejects from a single path component.
-    Returns `fallback` when the cleaned component is empty or matches a
-    reserved device name. Use this whenever user input flows into a path
-    segment that yt-dlp or ffmpeg will touch — `[Errno 22] Invalid
-    argument` is what you get otherwise on Windows.
-    """
-    if value is None:
-        return fallback
-    cleaned = re.sub(r"[\x00-\x1f<>:\"/\\|?*]", "_", str(value)).strip(" .")
-    if not cleaned or cleaned.upper() in _WINDOWS_RESERVED_NAMES:
-        return fallback
-    return cleaned
+# Path sanitization is now handled by ``os_services.sanitize_filename_component``
+# which only strips Windows-forbidden characters on Windows.
+# (imported at the top of the file)
 def _safe_makedirs(path: Path) -> Path:
     """`mkdir(parents=True, exist_ok=True)` with a friendlier fallback.
     If the user-configured `temp_folder` or `Path.home()` produces a path
@@ -283,7 +268,7 @@ def _resolve_output_file_override(
     if os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":"):
         return raw
     base = _download_dir(opts)
-    stem = _sanitize_path_component(Path(raw).stem, fallback="clip")
+    stem = sanitize_filename_component(Path(raw).stem, fallback="clip")
     return str(base / f"{stem}.mp4")
 
 
@@ -324,7 +309,7 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
     platform = detect_platform(req.url).lower()
     vod_id = _vod_id_from_url(req.url)
     duration = meta.get("duration")
-    parts: list[str] = [_sanitize_path_component(str(title), fallback="video")]
+    parts: list[str] = [sanitize_filename_component(str(title), fallback="video")]
     dur_tag = _clip_duration_tag(duration) if duration else ""
     if dur_tag:
         parts.append(dur_tag)
@@ -336,7 +321,7 @@ def _build_output_path(req: DownloadRequest, opts: AppSettings, meta: dict) -> s
         tag = _trim_range_tag(req.crop_start, req.crop_end)
         if tag:
             stem = f"{stem} [{tag}]"
-    stem = _sanitize_path_component(stem, fallback="video")
+    stem = sanitize_filename_component(stem, fallback="video")
     return str(base / f"{stem}.mp4")
 
 
@@ -351,8 +336,8 @@ def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict)
     title = meta.get("title") or "clip"
     duration = meta.get("duration")
     parts: list[str] = [
-        _sanitize_path_component(clipper, fallback="channel"),
-        _sanitize_path_component(title, fallback="clip"),
+        sanitize_filename_component(clipper, fallback="channel"),
+        sanitize_filename_component(title, fallback="clip"),
         _clip_duration_tag(duration) if duration else "clip",
     ]
     if req.crop_start is not None and req.crop_end is not None:
@@ -360,85 +345,25 @@ def _build_clip_output_path(req: DownloadRequest, opts: AppSettings, meta: dict)
         if tag:
             parts.append(f"[{tag}]")
     stem = " - ".join(parts)
-    stem = _sanitize_path_component(stem, fallback="clip")
+    stem = sanitize_filename_component(stem, fallback="clip")
     default_path = str(base / f"{stem}.mp4")
     return _resolve_output_file_override(req, opts, default_path)
 
 
-def _tk_pick_folder() -> Optional[str]:
-    """Native folder dialog via tkinter (STA thread on Windows)."""
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    root.update_idletasks()
-    try:
-        path = filedialog.askdirectory(title="Choose download folder", parent=root)
-        return path or None
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
-
-
 def _pick_folder_sync() -> tuple[Optional[str], Optional[str]]:
-    """Show the native folder picker. Returns (path, error_message)."""
-    err_msg: Optional[str] = None
+    """Show the native folder picker using os_services (cross-platform)."""
+    return os_pick_folder()
 
-    result_q: queue.Queue = queue.Queue(maxsize=1)
 
-    def _worker() -> None:
-        try:
-            result_q.put(("ok", _tk_pick_folder()))
-        except Exception as exc:
-            result_q.put(("err", str(exc)))
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=125)
-    if not result_q.empty():
-        kind, value = result_q.get()
-        if kind == "ok" and value:
-            return value, None
-        if kind == "err":
-            err_msg = str(value)
-
-    if os.name == "nt":
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-            "$d.Description = 'Choose download folder'; "
-            "$d.ShowNewFolderButton = $true; "
-            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
-            "  Write-Output $d.SelectedPath "
-            "}"
-        )
-        for exe in ("powershell", "pwsh"):
-            try:
-                out = subprocess.run(
-                    [exe, "-NoProfile", "-Sta", "-Command", ps],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                                creationflags=_NO_WINDOW,
-                )
-                path = (out.stdout or "").strip()
-                if path:
-                    return path, None
-                if out.returncode != 0 and out.stderr:
-                    err_msg = out.stderr.strip()
-            except FileNotFoundError:
-                continue
-            except Exception as exc:
-                err_msg = str(exc)
-                logger.warning("Folder picker %s failed: %s", exe, exc)
-
-    if err_msg:
-        return None, err_msg
-    return None, "Folder picker cancelled or unavailable."
+def _allow_foreground() -> None:
+    """Best-effort unlock so Explorer may take focus after a user click."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+    except Exception:
+        pass
 
 
 def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> bool:
@@ -463,6 +388,9 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
         SW_SHOW = 5
         GW_OWNER = 4
         GA_ROOT = 2
+        ASFW_ANY = 0xFFFFFFFF
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
 
         folder_norm = os.path.normcase(os.path.abspath(folder_path))
         folder_base = (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
@@ -480,7 +408,7 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
             for n in needles:
                 if not n:
                     continue
-                if tv == n or tv.startswith(n) or n in tv:
+                if tv == n or tv.startswith(f"{n} -") or tv.startswith(n):
                     return True
             return False
 
@@ -520,6 +448,10 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
         # briefly attach our thread input to the foreground thread so
         # the call is allowed.
         try:
+            user32.AllowSetForegroundWindow(ASFW_ANY)
+        except Exception:
+            pass
+        try:
             fg = user32.GetForegroundWindow()
             fg_thread = user32.GetWindowThreadProcessId(fg, 0)
             my_thread = kernel32.GetCurrentThreadId()
@@ -528,9 +460,14 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
                 user32.AttachThreadInput(fg_thread, my_thread, True)
                 attached = True
             try:
+                # Brief Alt tap unlocks foreground on some Win10/11 builds.
+                user32.keybd_event(VK_MENU, 0, 0, 0)
+                user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
                 user32.ShowWindow(root, SW_RESTORE)
                 user32.ShowWindow(root, SW_SHOW)
                 user32.BringWindowToTop(root)
+                if hasattr(user32, "SwitchToThisWindow"):
+                    user32.SwitchToThisWindow(root, True)
                 user32.SetForegroundWindow(root)
             finally:
                 if attached:
@@ -544,212 +481,144 @@ def _focus_explorer_window(folder_path: str, item_name: Optional[str] = None) ->
         return False
 
 
-def _reveal_path_windows(target: str) -> None:
-    """Reveal a file in Explorer and bring the window forward.
-
-    Strategy (re-tested in v1.0.33 after the v1.0.28 "silently
-    backgrounds" report):
-
-    1. ``SHOpenFolderAndSelectItems`` via ctypes — this is the same
-       Win32 call Windows Explorer's own "Show in folder" context-menu
-       item uses. It tells the shell to bring the folder forward as
-       part of the call, which sidesteps the foreground-lock race that
-       plagues ``explorer.exe /select`` + ``SetForegroundWindow`` on
-       Win10/11. The v1.0.28 comment that this "triggers an access
-       violation" was about a different code path; passing an explicit
-       ``IShellItem`` (rather than a NULL PIDL array) is the correct
-       way to do it from ctypes and does not crash.
-    2. Fallback to ``explorer.exe /select`` if the COM call fails
-       (e.g. on a system where the shell item can't be created for a
-       removable/network path). We still call
-       ``_focus_explorer_window`` afterwards to maximise the chance
-       the window comes to the front.
-    """
-    abspath = os.path.abspath(target)
-    if os.path.isfile(abspath):
-        folder = os.path.dirname(abspath)
-        item = os.path.basename(abspath)
-        reveal_target = abspath
-        reveal_item = item
-    elif os.path.isdir(abspath):
-        folder = abspath
-        item = None
-        reveal_target = abspath
-        reveal_item = None
-    else:
-        # File doesn't exist yet (download in progress, partial file
-        # deleted, etc). Open the parent and let the user see the
-        # folder — clicking "Show in folder" while the file is still
-        # being written should at least pop the folder open.
-        parent = os.path.dirname(abspath)
-        if parent and os.path.isdir(parent):
-            folder = parent
-            item = None
-            reveal_target = None
-            reveal_item = None
-        else:
+def _nudge_explorer_foreground(
+    folder_path: str,
+    item_name: Optional[str] = None,
+    *,
+    attempts: int = 1,
+    delay: float = 0.0,
+) -> None:
+    """Raise Explorer after reveal — keep short (no multi-second poll)."""
+    for i in range(max(1, attempts)):
+        if _focus_explorer_window(folder_path, item_name):
             return
-
-    # 1) Fast path: SHOpenFolderAndSelectItems via ctypes. This is the
-    #    most reliable way to bring an existing Explorer window forward
-    #    on Windows 10/11, because the call itself runs *inside* the
-    #    shell's foreground-attached thread.
-    if reveal_target is not None and _shell_reveal_in_folder(
-        reveal_target, reveal_item,
-    ):
-        # Even on the happy path, try to also raise the window in case
-        # the shell call focused an already-open window in a way the
-        # user doesn't immediately perceive (multi-monitor, behind
-        # another app, etc).
-        _focus_explorer_window(folder, item)
-        return
-
-    # 2) Fallback: classic explorer.exe. The v1.0.28 code path.
-    if _focus_explorer_window(folder, item):
-        return
-    if item:
-        subprocess.Popen(
-            ["explorer.exe", f"/select,{abspath}"],
-            creationflags=_NO_WINDOW,
-        )
-    else:
-        subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
-    for _ in range(20):
-        if _focus_explorer_window(folder, item):
-            return
-        time.sleep(0.1)
+        if i + 1 < attempts and delay > 0:
+            time.sleep(delay)
 
 
-def _shell_reveal_in_folder(path: str, item: Optional[str] = None) -> bool:
-    """Call ``SHOpenFolderAndSelectItems`` via ctypes to reveal a file.
+def _ensure_shell_com() -> bool:
+    """Initialize COM once per thread for shell reveal calls."""
+    if os.name != "nt" or _shell_com_local is None:
+        return False
+    if getattr(_shell_com_local, "ready", False):
+        return True
+    try:
+        import ctypes
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+        if hr in (0, 1):
+            _shell_com_local.ready = True
+            return True
+    except Exception:
+        logger.debug("CoInitializeEx failed", exc_info=True)
+    return False
 
-    Returns True if the shell accepted the call, False otherwise. Does
-    not raise — caller falls back to ``explorer.exe`` on failure.
 
-    Implementation notes:
-
-    * We build an ``IShellItem`` for *path* via ``SHCreateItemFromParsingName``
-      (the modern, NULL-PIDL-array-free API). The v1.0.28 attempt that
-      crashed used the old PIDL-array path; this one uses the
-      IShellItem path that Windows 7+ documents as the supported way.
-    * ``SHOpenFolderAndSelectItems`` itself walks up to the existing
-      folder window and brings it forward. We pass the IShellItem
-      array (length 1) so the file is highlighted once the window
-      appears.
-    """
+def _shell_reveal_via_pidl(path: str) -> bool:
+    """Reveal a path with ``SHOpenFolderAndSelectItems`` (shell foreground path)."""
     if os.name != "nt":
+        return False
+    if not _ensure_shell_com():
         return False
     try:
         import ctypes
         from ctypes import wintypes
 
-        ole32 = ctypes.windll.ole32
         shell32 = ctypes.windll.shell32
 
-        # Initialise the COM apartment. We're called from a threadpool
-        # context, so a STA init is required for shell item creation
-        # to work. If init fails (e.g. already initialised on this
-        # thread), RPC_E_CHANGED_MODE is acceptable: we just continue
-        # and trust the existing apartment.
-        RPC_E_CHANGED_MODE = 0x80010106
-        hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-        co_uninit = (hr == 0) or (hr == RPC_E_CHANGED_MODE and False)
-        # We *do not* uninitialise on RPC_E_CHANGED_MODE because
-        # another component on this thread owns the apartment.
-
-        try:
-            # GUID IID_IShellItem = {43826D1E-E718-42EE-BC55-A1E261C37BFE}
-            iid_shellitem = (ctypes.c_byte * 16)(
-                0x1E, 0x6D, 0x82, 0x43, 0x18, 0xE7, 0xEE, 0x42,
-                0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE,
-            )
-
-            SHCreateItemFromParsingName = shell32.SHCreateItemFromParsingName
-            SHCreateItemFromParsingName.argtypes = [
-                wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        if not getattr(shell32, "_vodrip_pidl_configured", False):
+            shell32.ILCreateFromPathW.argtypes = [wintypes.LPCWSTR]
+            shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+            shell32.ILFree.argtypes = [ctypes.c_void_p]
+            shell32.SHOpenFolderAndSelectItems.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
             ]
-            SHCreateItemFromParsingName.restype = ctypes.c_long
+            shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+            shell32._vodrip_pidl_configured = True  # type: ignore[attr-defined]
 
-            shell_item = ctypes.c_void_p()
-            hr = SHCreateItemFromParsingName(
-                ctypes.c_wchar_p(path), None, iid_shellitem, ctypes.byref(shell_item),
-            )
-            if hr != 0 or not shell_item.value:
-                return False
-
-            try:
-                # Build a C array of IShellItem* (length 1).
-                # ``ctypes.POINTER`` of an IShellItem interface can't be
-                # declared as a struct here without pulling in
-                # comtypes, but the shell accepts a pointer to a raw
-                # void* array just fine because it's a single-element
-                # C array.
-                item_array = (ctypes.c_void_p * 1)(shell_item.value)
-                SHOpenFolderAndSelectItems = shell32.SHOpenFolderAndSelectItems
-                SHOpenFolderAndSelectItems.argtypes = [
-                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
-                ]
-                SHOpenFolderAndSelectItems.restype = ctypes.c_long
-                # 0x00000002 = OFASI_SELECT, 0 = flags
-                hr = SHOpenFolderAndSelectItems(
-                    item_array, 1, None, 0x00000002 if item else 0x00000001,
-                )
-                return hr == 0
-            finally:
-                # IShellItem::Release
-                # IUnknown vtable layout: [0]=QueryInterface,
-                # [1]=AddRef, [2]=Release. We call the function at vtable
-                # slot 2.
-                try:
-                    vtbl = ctypes.c_void_p.from_address(shell_item.value).value
-                    if vtbl:
-                        release_slot = ctypes.c_void_p.from_address(
-                            vtbl + 2 * ctypes.sizeof(ctypes.c_void_p)
-                        ).value
-                        if release_slot:
-                            ctypes.WINFUNCTYPE(
-                                ctypes.c_ulong, ctypes.c_void_p,
-                            )(release_slot)(shell_item)
-                except Exception:
-                    pass
+        _allow_foreground()
+        abspath = os.path.abspath(path)
+        pidl = shell32.ILCreateFromPathW(abspath)
+        if not pidl:
+            return False
+        try:
+            result = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+            return result == 0
         finally:
-            if co_uninit:
-                try:
-                    ole32.CoUninitialize()
-                except Exception:
-                    pass
+            shell32.ILFree(pidl)
     except Exception:
-        logger.debug("SHOpenFolderAndSelectItems call failed", exc_info=True)
+        logger.debug("SHOpenFolderAndSelectItems failed", exc_info=True)
         return False
 
 
+def _explorer_select_arg(path: str) -> str:
+    """Build ``explorer.exe /select,…`` argument with proper quoting.
+
+    Commas and spaces in VOD titles break the unquoted ``/select,path``
+    form and Explorer often falls back to the user profile (Documents).
+    """
+    escaped = path.replace('"', '\\"')
+    return f'/select,"{escaped}"'
+
+
+def _reveal_path_windows(target: str) -> None:
+    """Reveal a file in Explorer and bring the window forward."""
+    _allow_foreground()
+    abspath = os.path.abspath(target)
+    if os.path.isfile(abspath):
+        folder = os.path.dirname(abspath)
+        item = os.path.basename(abspath)
+        reveal_target = abspath
+    elif os.path.isdir(abspath):
+        folder = abspath
+        item = None
+        reveal_target = abspath
+    else:
+        parent = os.path.dirname(abspath)
+        if parent and os.path.isdir(parent):
+            folder = parent
+            item = None
+            reveal_target = parent
+        else:
+            return
+
+    # Shell API — same call as Explorer's "Show in folder"; foregrounds itself.
+    if _shell_reveal_via_pidl(reveal_target):
+        _nudge_explorer_foreground(folder, item)
+        return
+
+    # Fallback: explorer.exe, then a brief focus nudge (not a multi-second poll).
+    if item and os.path.isfile(abspath):
+        subprocess.Popen(
+            ["explorer.exe", _explorer_select_arg(abspath)],
+            creationflags=_NO_WINDOW,
+        )
+    else:
+        subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
+    _nudge_explorer_foreground(folder, item, attempts=10, delay=0.05)
+
+
 def _open_folder_sync(path: str) -> None:
-    """Reveal a file in Explorer, or open its parent folder (e.g. in-progress downloads)."""
+    """Reveal a file in Explorer/Finder, or open its parent folder."""
     raw = (path or "").strip()
     if not raw:
         raise ValueError("path is required")
     p = Path(raw).expanduser()
-    for _ in range(12):
-        if p.exists():
-            break
-        time.sleep(0.25)
+    # Validation already ensured the file or parent folder exists; only
+    # wait briefly for a file that was created milliseconds ago.
+    if not p.exists():
+        for _ in range(2):
+            time.sleep(0.05)
+            if p.exists():
+                break
     if p.exists():
         target = str(p.resolve())
         if os.name == "nt":
-            if p.is_file():
-                _reveal_path_windows(target)
-            elif not _focus_explorer_window(target):
-                # ``explorer.exe`` (not ``os.startfile``) so the new window
-                # gets a fresh explorer process we can locate and focus.
-                subprocess.Popen(["explorer.exe", target], creationflags=_NO_WINDOW)
-                _focus_explorer_window(target)
-        elif sys.platform == "darwin":
-            subprocess.Popen(
-                ["open", "-R", target] if p.is_file() else ["open", target],
-                creationflags=_NO_WINDOW,
-            )
+            _reveal_path_windows(target)
         else:
-            subprocess.Popen(["xdg-open", target if p.is_dir() else str(p.parent)], creationflags=_NO_WINDOW)
+            open_file_or_folder(target, reveal=p.is_file())
         return
 
     parent = p.parent.resolve()
@@ -757,13 +626,9 @@ def _open_folder_sync(path: str) -> None:
         raise FileNotFoundError(f"Folder does not exist: {parent}")
     folder = str(parent)
     if os.name == "nt":
-        if not _focus_explorer_window(folder):
-            subprocess.Popen(["explorer.exe", folder], creationflags=_NO_WINDOW)
-            _focus_explorer_window(folder)
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", folder], creationflags=_NO_WINDOW)
+        _reveal_path_windows(folder)
     else:
-        subprocess.Popen(["xdg-open", folder], creationflags=_NO_WINDOW)
+        open_file_or_folder(folder)
 
 
 def _validate_open_folder_path(path: str) -> str:
@@ -772,6 +637,8 @@ def _validate_open_folder_path(path: str) -> str:
     if not raw:
         raise ValueError("path is required")
     p = Path(raw).expanduser()
+    if not p.is_absolute() and not (len(raw) > 1 and raw[1] == ":"):
+        p = _download_dir(settings_mgr.get()) / p
     if p.exists():
         return str(p.resolve())
     parent = p.parent.resolve()
@@ -931,8 +798,9 @@ async def preview_hls_resource(
     id: Optional[str] = None,
 ):
     range_header = request.headers.get("range")
+    loop = asyncio.get_running_loop()
     try:
-        upstream = await asyncio.get_event_loop().run_in_executor(
+        upstream = await loop.run_in_executor(
             None,
             lambda: resolve_upstream(session_id, id),
         )
@@ -943,13 +811,13 @@ async def preview_hls_resource(
 
     try:
         if _is_playlist_url(upstream):
-            data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
+            data, ctype, extra_headers, status = await loop.run_in_executor(
                 None,
                 lambda: proxy_playlist(session_id, upstream),
             )
             return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
 
-        data, ctype, extra_headers, status = await asyncio.get_event_loop().run_in_executor(
+        data, ctype, extra_headers, status = await loop.run_in_executor(
             None,
             lambda: proxy_segment(session_id, upstream, range_header=range_header),
         )
@@ -966,17 +834,26 @@ async def preview_hls_resource(
 
 @app.delete("/api/preview/session/{session_id}")
 async def preview_delete_session(session_id: str):
-    await asyncio.get_event_loop().run_in_executor(None, delete_session, session_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, delete_session, session_id)
     return {"ok": True}
 
 
 @app.post("/api/open-folder")
-async def open_folder(req: OpenFolderRequest, background_tasks: BackgroundTasks):
-    """Open Explorer/Finder on a download path. Returns immediately (non-blocking)."""
+async def open_folder(req: OpenFolderRequest):
+    """Open Explorer/Finder on a download path and bring it to the foreground."""
     raw = (req.path or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="path is required")
-    background_tasks.add_task(_open_folder_sync, raw)
+    validated = _validate_open_folder_path(raw)
+    try:
+        # Run during the click-triggered request — BackgroundTasks runs too
+        # late for Windows foreground-lock rules, so Explorer opens behind.
+        _open_folder_sync(validated)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True}
 
 # --- Channel Videos ---
@@ -1150,60 +1027,81 @@ async def channel_videos(
         all_videos: List[dict] = []
         loop = asyncio.get_running_loop()
 
-        async def _fetch_twitch() -> None:
+        async def _fetch_twitch() -> list:
+            login = twitch_ch or channel
+            if not login:
+                return []
             try:
-                vids = await loop.run_in_executor(
-                    CHANNEL_EXECUTOR, twitch_list_channel_videos_sync, channel, limit
+                vids = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR, twitch_list_channel_videos_sync, login, limit
+                    ),
+                    timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
                 )
+            except asyncio.TimeoutError:
+                per_platform_errors["Twitch"] = "VOD fetch timed out — try again"
+                return []
             except Exception as e:
                 per_platform_errors["Twitch"] = _format_platform_error(e)
-                return
-            for v in vids:
-                all_videos.append({
-                    "id": v["id"],
-                    "platform": "Twitch",
-                    "title": v.get("title") or "Untitled",
-                    "duration": v.get("duration"),
-                    "duration_string": v.get("duration_string"),
-                    "created_at": v.get("created_at"),
-                    "views": v.get("views"),
-                    "thumbnail_url": v.get("thumbnail_url"),
-                    "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
-                    "channel": channel,
-                    "content_kind": "vod",
-                })
+                return []
+            return [{
+                "id": v["id"],
+                "platform": "Twitch",
+                "title": v.get("title") or "Untitled",
+                "duration": v.get("duration"),
+                "duration_string": v.get("duration_string"),
+                "created_at": v.get("created_at"),
+                "views": v.get("views"),
+                "thumbnail_url": v.get("thumbnail_url"),
+                "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
+                "channel": channel,
+                "content_kind": "vod",
+            } for v in vids]
 
-        async def _fetch_kick() -> None:
-            videos_url = f"https://kick.com/{channel}/videos"
+        async def _fetch_kick() -> list:
+            slug = kick_ch or channel
+            if not slug:
+                return []
+            videos_url = f"https://kick.com/{slug}/videos"
             try:
-                vids = await loop.run_in_executor(
-                    CHANNEL_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
+                vids = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR, kick_list_channel_videos_sync, videos_url, limit
+                    ),
+                    timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
                 )
+            except asyncio.TimeoutError:
+                per_platform_errors["Kick"] = "VOD fetch timed out — try again"
+                return []
             except Exception as e:
                 per_platform_errors["Kick"] = _format_platform_error(e)
-                return
-            for v in vids:
-                all_videos.append({
-                    "id": v["id"],
-                    "platform": "Kick",
-                    "title": v.get("title") or "Untitled",
-                    "duration": v.get("duration"),
-                    "duration_string": v.get("duration_string"),
-                    "created_at": v.get("created_at"),
-                    "views": v.get("views"),
-                    "thumbnail_url": v.get("thumbnail"),
-                    "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
-                    "channel": channel,
-                    "content_kind": "vod",
-                })
+                return []
+            return [{
+                "id": v["id"],
+                "platform": "Kick",
+                "title": v.get("title") or "Untitled",
+                "duration": v.get("duration"),
+                "duration_string": v.get("duration_string"),
+                "created_at": v.get("created_at"),
+                "views": v.get("views"),
+                "thumbnail_url": v.get("thumbnail"),
+                "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
+                "channel": channel,
+                "content_kind": "vod",
+            } for v in vids]
 
-        tasks: List[asyncio.Task] = []
+        tasks: list[asyncio.Task[list]] = []
         if "Kick" in wanted:
             tasks.append(asyncio.create_task(_fetch_kick()))
         if "Twitch" in wanted:
             tasks.append(asyncio.create_task(_fetch_twitch()))
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, list):
+                    all_videos.extend(result)
+                elif isinstance(result, BaseException):
+                    logger.debug("Channel fetch task failed: %s", result)
 
         if cutoff is not None:
             filtered: List[dict] = []
@@ -1238,6 +1136,7 @@ async def channel_videos(
 
 
 CLIP_FETCH_TIMEOUT_SEC = 35
+CHANNEL_VOD_FETCH_TIMEOUT_SEC = 45
 
 
 async def _gather_channel_clips(

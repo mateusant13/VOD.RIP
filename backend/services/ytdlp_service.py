@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 from urllib.parse import urljoin
 
+from services.os_services import register_child_pid, unregister_child_pid
+
 logger = logging.getLogger(__name__)
 
 # Clips shorter than this are almost certainly a broken ftyp-only placeholder.
@@ -25,9 +27,21 @@ MIN_VALID_OUTPUT_BYTES = 50_000
 SEGMENT_DOWNLOAD_WORKERS = 8
 HLS_DOWNLOAD_AHEAD = SEGMENT_DOWNLOAD_WORKERS + 2
 HLS_MUX_STALL_SECONDS = 120
+# Download phase progress is capped here; mux/encode uses 90–99 (see download_manager).
+HLS_DOWNLOAD_PROGRESS_CAP = 90.0
 
 # Prevents a Windows console window from popping up around bundled ffmpeg.exe.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def _track_ffmpeg_proc(proc: sp.Popen) -> None:
+    if proc.pid:
+        register_child_pid(proc.pid)
+
+
+def _untrack_ffmpeg_proc(proc: sp.Popen) -> None:
+    if proc.pid:
+        unregister_child_pid(proc.pid)
 
 # FFmpeg video encoders for H.264 output (Settings → Video encoder).
 VIDEO_ENCODER_OPTIONS: dict[str, str] = {
@@ -185,7 +199,7 @@ def ffmpeg_h264_encode_args(encoder: str) -> Optional[list[str]]:
 
 import requests
 import yt_dlp
-from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor, FFmpegVideoConvertorPP
 import yt_dlp.postprocessor as _ytdlp_pp_pkg
 
 from models.schemas import VideoInfo
@@ -314,6 +328,7 @@ def _run_ffmpeg(
             "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
             "the FFmpeg folder in Settings → FFmpeg path."
         ) from exc
+    _track_ffmpeg_proc(proc)
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
 
@@ -459,6 +474,7 @@ def _run_ffmpeg(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+        _untrack_ffmpeg_proc(proc)
 
 
 def _normalize_crop_range(
@@ -886,11 +902,8 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
 #   3. Forward each parsed progress event to a thread-safe ``_pp_state``
 #      dict that the manager can poll from its progress thread.
 #
-# We deliberately do NOT subclass ``FFmpegVideoConvertorPP`` (which would
-# inherit convertor-specific args that we don't want) or
-# ``FFmpegMergerPP`` (which would inherit merge-only assumptions).
-# Generic ``FFmpegPostProcessor`` is the right abstraction: it runs any
-# ffmpeg command yt-dlp asks for, we just add progress plumbing.
+# Subclass ``FFmpegVideoConvertorPP`` so yt-dlp's ``preferedformat`` kwarg is
+# accepted; we only override ``real_run_ffmpeg`` for progress instrumentation.
 
 _PP_PROGRESS_STATE_ATTR = "_vodrip_progress_state"
 
@@ -912,8 +925,8 @@ def _set_pp_progress_state(pp: FFmpegPostProcessor, state: dict) -> None:
     state["pp_lock"] = state_lock
 
 
-class _InstrumentedFFmpegPP(FFmpegPostProcessor):
-    """``FFmpegPostProcessor`` that surfaces live ffmpeg progress to us.
+class _InstrumentedFFmpegPP(FFmpegVideoConvertorPP):
+    """``FFmpegVideoConvertorPP`` that surfaces live ffmpeg progress to us.
 
     All other behaviour (including the postprocessor arg parsing,
     ``-movflags +faststart`` injection, and the per-postprocessor
@@ -968,6 +981,8 @@ class _InstrumentedFFmpegPP(FFmpegPostProcessor):
                 input_path_opts, output_path_opts,
                 expected_retcodes=expected_retcodes,
             )
+
+        _track_ffmpeg_proc(proc)
 
         def _drain_stdout():
             # Reads ffmpeg's -progress key=value stream, accumulates
@@ -1024,6 +1039,8 @@ class _InstrumentedFFmpegPP(FFmpegPostProcessor):
         except KeyboardInterrupt:
             proc.kill()
             raise
+        finally:
+            _untrack_ffmpeg_proc(proc)
         t_out.join(timeout=5)
         t_err.join(timeout=5)
         if retcode not in expected_retcodes:
@@ -1122,24 +1139,22 @@ def _build_ydl_opts(
             # yt-dlp's own postprocessor pipeline (used when we hand it
             # the file directly, e.g. download_sections for non-HLS
             # sources) doesn't expose a real progress stream. These
-            # placeholders are the only feedback we get; the
-            # _hook_progress_percent path in the manager applies a
-            # monotonic clamp so they don't regress the wider 85->99
-            # ffmpeg range that the HLS path uses.
+            # placeholders are the only feedback we get; map them into
+            # the 90→99 postprocess range (download phase caps at 90).
             status = d.get("status")
             if status == "started":
                 progress_hook({
-                    "status": "postprocessing", "percent": 92,
+                    "status": "postprocessing", "percent": 90,
                     "phase": "Postprocess", "phase_id": "encoding",
                 })
             elif status == "processing":
                 progress_hook({
-                    "status": "postprocessing", "percent": 95,
+                    "status": "postprocessing", "percent": 94,
                     "phase": "Postprocess", "phase_id": "encoding",
                 })
             elif status == "finished":
                 progress_hook({
-                    "status": "postprocessing", "percent": 98,
+                    "status": "postprocessing", "percent": 97,
                     "phase": "Postprocess", "phase_id": "encoding",
                 })
 
@@ -1514,7 +1529,7 @@ def _apply_mp4_faststart(
     if progress_hook:
         progress_hook({
             "status": "postprocessing",
-            "percent": 93,
+            "percent": 91,
             "phase": "Optimising",
             "phase_id": _phase_id("Optimising"),
         })
@@ -1524,7 +1539,7 @@ def _apply_mp4_faststart(
         pause_event=pause_event,
         register_abort=register_abort,
         progress_hook=progress_hook,
-        progress_from=93.0,
+        progress_from=91.0,
         progress_to=97.0,
         phase="Optimising",
     )
@@ -1560,6 +1575,14 @@ def _progressive_hls_copy_to_mp4(
     if total == 0:
         raise RuntimeError("No HLS segments to mux")
 
+    if progress_hook:
+        progress_hook({
+            "status": "downloading",
+            "percent": 0,
+            "phase": "Downloading",
+            "phase_id": _phase_id("Downloading"),
+        })
+
     tmp_mp4 = os.path.join(temp_dir, f"stream_{uuid.uuid4().hex}.mp4")
     mux_cmd = [
         ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
@@ -1588,6 +1611,7 @@ def _progressive_hls_copy_to_mp4(
             "FFmpeg was not found. Install FFmpeg (and add it to PATH) or set "
             "the FFmpeg folder in Settings → FFmpeg path."
         ) from exc
+    _track_ffmpeg_proc(proc)
     if register_abort:
         register_abort(lambda: proc.poll() is None and proc.kill())
 
@@ -1639,77 +1663,80 @@ def _progressive_hls_copy_to_mp4(
     stderr_thread = threading.Thread(target=_drain_stderr, name="hls-mux-stderr", daemon=True)
     stderr_thread.start()
 
-    futures: dict[int, Any] = {}
-    with ThreadPoolExecutor(max_workers=min(SEGMENT_DOWNLOAD_WORKERS, total)) as pool:
+    try:
+        futures: dict[int, Any] = {}
+        with ThreadPoolExecutor(max_workers=min(SEGMENT_DOWNLOAD_WORKERS, total)) as pool:
 
-        def _schedule_through(cap: int) -> None:
-            for idx in range(total):
-                if idx > cap:
-                    break
-                if idx in futures or (first_segment_path and idx == 0):
-                    continue
-                futures[idx] = pool.submit(_download_idx, idx)
+            def _schedule_through(cap: int) -> None:
+                for idx in range(total):
+                    if idx > cap:
+                        break
+                    if idx in futures or (first_segment_path and idx == 0):
+                        continue
+                    futures[idx] = pool.submit(_download_idx, idx)
 
-        assert proc.stdin is not None
-        try:
-            for i in range(total):
-                _schedule_through(i + HLS_DOWNLOAD_AHEAD)
-                ready[i].wait()
-                _check_pause_cancel(cancel_event, pause_event)
-                _check_ffmpeg_stall()
+            assert proc.stdin is not None
+            try:
+                for i in range(total):
+                    _schedule_through(i + HLS_DOWNLOAD_AHEAD)
+                    ready[i].wait()
+                    _check_pause_cancel(cancel_event, pause_event)
+                    _check_ffmpeg_stall()
+                    with err_lock:
+                        if errors:
+                            raise errors[0]
+                    path = seg_paths[i]
+                    if not path:
+                        raise RuntimeError(f"HLS segment {i} missing after download")
+                    _feed_path_to_stdin(
+                        path, proc.stdin, cancel_event, pause_event,
+                        on_chunk=_touch_ffmpeg_activity,
+                    )
+                    seg_paths[i] = None
+                    if progress_hook:
+                        progress_hook({
+                            "status": "downloading",
+                            "percent": (i + 1) / total * HLS_DOWNLOAD_PROGRESS_CAP,
+                            "phase": "Downloading",
+                            "concat_encoder": "copy",
+                        })
+                    if proc.poll() is not None:
+                        break
+                try:
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            except BrokenPipeError:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            except Exception as exc:
                 with err_lock:
-                    if errors:
-                        raise errors[0]
-                path = seg_paths[i]
-                if not path:
-                    raise RuntimeError(f"HLS segment {i} missing after download")
-                _feed_path_to_stdin(
-                    path, proc.stdin, cancel_event, pause_event,
-                    on_chunk=_touch_ffmpeg_activity,
-                )
-                seg_paths[i] = None
-                if progress_hook:
-                    progress_hook({
-                        "status": "downloading",
-                        "percent": (i + 1) / total * 92.0,
-                        "phase": "Downloading",
-                        "concat_encoder": "copy",
-                    })
-                if proc.poll() is not None:
-                    break
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-        except BrokenPipeError:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-        except Exception as exc:
-            with err_lock:
-                errors.append(exc)
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            raise
-        finally:
-            for fut in futures.values():
-                fut.result()
+                    errors.append(exc)
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                raise
+            finally:
+                for fut in futures.values():
+                    fut.result()
 
-        stderr_done.wait(timeout=5)
-        stderr = proc.stderr.read() if proc.stderr else b""
-        rc = proc.wait()
-        with err_lock:
-            if errors:
-                raise errors[0]
-        if rc != 0:
-            err_tail = stderr.decode(errors="ignore")[-800:]
-            raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
-        if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
-            err_tail = stderr.decode(errors="ignore")[-800:]
-            raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
+            stderr_done.wait(timeout=5)
+            stderr = proc.stderr.read() if proc.stderr else b""
+            rc = proc.wait()
+            with err_lock:
+                if errors:
+                    raise errors[0]
+            if rc != 0:
+                err_tail = stderr.decode(errors="ignore")[-800:]
+                raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
+            if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
+                err_tail = stderr.decode(errors="ignore")[-800:]
+                raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
+    finally:
+        _untrack_ffmpeg_proc(proc)
 
     _verify_output_file(tmp_mp4)
     if mp4_faststart:
@@ -2295,16 +2322,17 @@ def download_video_sync(
     # to know about yt_dlp's internal state.
     opts["_vodrip_pp_state"] = pp_state
 
-    # If the caller passed a holder (a one-element dict), populate it
-    # with the state ref so they can start a polling thread.
-    if register_pp_state is not None:
+    platform = detect_platform(full_url)
+    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url)
+
+    # HLS downloads report their own 0→90% progress while segments are
+    # fetched and muxed. The yt-dlp postprocessor poller only applies to
+    # the direct yt-dlp download path (non-HLS).
+    if register_pp_state is not None and not is_hls:
         try:
             register_pp_state(pp_state)
         except Exception:
             pass
-
-    platform = detect_platform(full_url)
-    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url)
 
     if is_hls:
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)

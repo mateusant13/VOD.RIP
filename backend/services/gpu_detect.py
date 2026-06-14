@@ -13,6 +13,8 @@ import tempfile
 from functools import lru_cache
 from typing import Dict, List, Optional
 
+from services.os_services import list_gpu_names
+
 logger = logging.getLogger(__name__)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -52,49 +54,6 @@ def _run_text(cmd: List[str], timeout: float = 8.0) -> str:
         return ""
 
 
-def _gpu_names_nvidia_smi() -> List[str]:
-    names: List[str] = []
-    if not shutil.which("nvidia-smi"):
-        return names
-    out = _run_text(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
-    for line in out.splitlines():
-        line = line.strip()
-        if line and line.lower() != "name":
-            names.append(line)
-    return names
-
-
-def _gpu_names_windows() -> List[str]:
-    names: List[str] = []
-    ps = (
-        "Get-CimInstance Win32_VideoController | "
-        "Select-Object -ExpandProperty Name"
-    )
-    out = _run_text(["powershell", "-NoProfile", "-Command", ps])
-    for line in out.splitlines():
-        line = line.strip()
-        if line:
-            names.append(line)
-    if names:
-        return names
-    out = _run_text(["wmic", "path", "win32_VideoController", "get", "name"])
-    for line in out.splitlines():
-        line = line.strip()
-        if line and line.lower() != "name":
-            names.append(line)
-    return names
-
-
-def _gpu_names_unix() -> List[str]:
-    names: List[str] = []
-    if shutil.which("lspci"):
-        out = _run_text(["lspci"])
-        for line in out.splitlines():
-            if re.search(r"vga|3d|display", line, re.I):
-                names.append(line.split(":", 2)[-1].strip())
-    return names
-
-
 def _is_apple_silicon() -> bool:
     """Detect Apple Silicon (M1/M2/M3/M4) without importing platform module."""
     if sys.platform != "darwin":
@@ -103,16 +62,6 @@ def _is_apple_silicon() -> bool:
         return _platform.processor() == "arm"
     except Exception:
         return False
-
-
-def list_gpu_names() -> List[str]:
-    if os.name == "nt":
-        names = _gpu_names_windows()
-        for name in _gpu_names_nvidia_smi():
-            if name not in names:
-                names.append(name)
-        return names
-    return _gpu_names_unix()
 
 
 def detect_gpu_vendor(names: Optional[List[str]] = None) -> str:

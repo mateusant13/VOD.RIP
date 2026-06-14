@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_PROGRESS_CAP = 90
+POSTPROCESS_PROGRESS_FLOOR = DOWNLOAD_PROGRESS_CAP
+POSTPROCESS_PROGRESS_SPAN = 9.0  # 90 → 99 during mux/encode
 _DONE_STATUSES = frozenset({"Completed", "Failed", "Cancelled"})
 _UNFINISHED_STATUSES = frozenset({"Failed", "Cancelled", "Interrupted"})
 _RESUMABLE_STATUSES = frozenset({"Paused", "Failed", "Cancelled", "Interrupted"})
@@ -70,9 +72,9 @@ def _hook_progress_percent(d: dict) -> Optional[int]:
         return None
 
     raw = max(0.0, min(100.0, raw))
-    # FFmpeg concat/encode/finalise phases emit 85–99.9; pass through
+    # FFmpeg mux/encode/finalise phases emit 90–99.9; pass through
     # without rescaling to the download cap (90%).
-    if status == "postprocessing" or raw >= 91.0:
+    if status == "postprocessing" or raw >= POSTPROCESS_PROGRESS_FLOOR:
         return min(99, round(raw))
     pct = round(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
     if pct == 0 and raw > 0:
@@ -473,11 +475,7 @@ class DownloadManager:
                     suffix = f" • {' • '.join(extras)}" if extras else ""
                     with self._lock:
                         # Monotonic clamp: never let the bar run backwards.
-                        # yt-dlp's old postprocess placeholders (92/95/98)
-                        # can still arrive after the new 85->99 ffmpeg
-                        # range, which would otherwise cause a visible
-                        # 98 -> 85 jump in the UI.
-                        if pct < state.progress and pct < 91 and state.progress >= 91:
+                        if pct < state.progress:
                             pct = state.progress
                         state.progress = pct
                         state.status = f"{label} {pct}%{suffix}"
@@ -525,7 +523,7 @@ class DownloadManager:
         pp_holder: dict = {}
         pp_stop = threading.Event()
         last_emit_pct = -1.0
-        last_emit_wall = 0.0
+        last_emit_wall = time.monotonic()
         poller_thread: Optional[threading.Thread] = None
 
         def _pp_progress_poller():
@@ -552,11 +550,11 @@ class DownloadManager:
                     eta = state.get("last_eta_seconds")
                 if pct > 0.0:
                     # PP has reported something. Map the 0..1 from
-                    # out_time_ms / duration_us onto the 92..99 percent
-                    # range our manager already uses for postprocess.
-                    # The monotonic clamp in _progress_hook keeps the
-                    # bar from running backwards.
-                    ui_pct = 92.0 + min(7.0, pct * 7.0)
+                    # out_time_ms / duration_us onto the 90..99 percent
+                    # range our manager uses for postprocess.
+                    ui_pct = POSTPROCESS_PROGRESS_FLOOR + min(
+                        POSTPROCESS_PROGRESS_SPAN, pct * POSTPROCESS_PROGRESS_SPAN,
+                    )
                     # Emit at most every 0.5 s of real progress, or if
                     # the integer percent advanced.
                     now = time.monotonic()
@@ -583,16 +581,18 @@ class DownloadManager:
                             return
                 else:
                     # PP hasn't written anything yet. Heartbeat every
-                    # 3 s so the user sees the bar is still alive
-                    # during the (often 10+ s) "starting ffmpeg"
-                    # window for large VODs.
+                    # 3 s so the user sees activity during the (often
+                    # 10+ s) "starting ffmpeg" window — keep the bar at
+                    # the current download percent, never jump to 90+.
                     now = time.monotonic()
                     if (now - last_emit_wall) > 3.0:
                         last_emit_wall = now
+                        with self._lock:
+                            hb_pct = max(1, state.progress)
                         d = {
                             "status": "postprocessing",
-                            "percent": 92.0,
-                            "phase": "Muxing",
+                            "percent": hb_pct,
+                            "phase": "Muxing…",
                             "phase_id": "encoding",
                             "heartbeat": True,
                         }

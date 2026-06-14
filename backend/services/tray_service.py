@@ -132,19 +132,17 @@ class TrayService:
         folder = self.downloads_folder or self._default_downloads()
         if os.name == "nt":
             os.startfile(folder)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", folder])
         else:
-            subprocess.Popen(["xdg-open", folder])
+            from services.os_services import open_file_or_folder
+            open_file_or_folder(folder)
 
     def _on_open_log(self, icon=None, item=None):
         if self.log_path and os.path.isfile(self.log_path):
             if os.name == "nt":
                 os.startfile(self.log_path)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", self.log_path])
             else:
-                subprocess.Popen(["xdg-open", self.log_path])
+                from services.os_services import open_file_or_folder
+                open_file_or_folder(self.log_path, reveal=True)
 
     def _on_quit(self, icon=None, item=None):
         if self._icon:

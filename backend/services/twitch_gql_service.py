@@ -383,6 +383,59 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
     return recent
 
 
+def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dict, list]:
+    """HLS URL, authenticated headers, and formats from one yt-dlp probe."""
+    empty_headers: dict = {
+        "Referer": "https://www.twitch.tv/",
+        "Origin": "https://www.twitch.tv",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        import yt_dlp
+
+        url = f"https://www.twitch.tv/videos/{video_id}"
+        with yt_dlp.YoutubeDL({
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formats = list(info.get("formats") or [])
+        best_url: Optional[str] = None
+        best_height = -1
+        best_headers: dict = dict(empty_headers)
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            if fmt.get("vcodec") in (None, "none"):
+                continue
+            proto = (fmt.get("protocol") or "").lower()
+            ext = (fmt.get("ext") or "").lower()
+            if "m3u8" not in proto and ext not in ("m3u8", "mp4"):
+                continue
+            fu = (fmt.get("url") or "").strip()
+            if not fu:
+                continue
+            try:
+                height = int(fmt.get("height") or 0)
+            except (TypeError, ValueError):
+                height = 0
+            if height >= best_height:
+                best_height = height
+                best_url = fu
+                fmt_headers = fmt.get("http_headers")
+                if isinstance(fmt_headers, dict) and fmt_headers:
+                    best_headers = {**empty_headers, **fmt_headers}
+        return best_url, best_headers, formats
+    except Exception as exc:
+        logger.debug("Twitch VOD playback probe failed %s: %s", video_id, exc)
+        return None, empty_headers, []
+
+
 def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
     """Return metadata for a single Twitch VOD via GQL (~0.5-2s)."""
     vid = _extract_video_id(url_or_id)
@@ -416,5 +469,12 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
         "platform": "Twitch",
         "created_at": node.get("createdAt"),
     }
-    enrich_info_dict(payload, is_clip=False)
+    m3u8_url, m3u8_headers, formats = _twitch_vod_playback_for_estimate(vid)
+    enrich_info_dict(
+        payload,
+        formats=formats,
+        m3u8_url=m3u8_url,
+        m3u8_headers=m3u8_headers,
+        is_clip=False,
+    )
     return payload
