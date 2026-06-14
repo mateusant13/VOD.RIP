@@ -9,7 +9,7 @@
 #define AppName "VOD.RIP"
 #define AppExe "VOD-RIP.EXE"
 #define AppPublisher "mateusant13"
-#define WebView2Clsid "{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}"
+#define WebView2Clsid "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 ; F4/F13 (ANTIVIRUS_AUDIT): The installer and the packaged EXE are unsigned,
 ; which is the single largest source of "Windows protected your PC"
@@ -83,10 +83,73 @@ begin
   Result := (Version <> '') and (Version <> '0.0.0.0') and (Version <> '0.0.0');
 end;
 
+function WebView2BinaryExists: Boolean;
+var
+  Locations: array[0..5] of String;
+  I: Integer;
+  ApplicationDir: String;
+  Child: String;
+  ExePath: String;
+  FindRec: TFindRec;
+begin
+  { Returns True if msedgewebview2.exe is present in any well-known install
+    location. Mirrors the Python detector in services/webview2_setup.py.
+    On non-Windows this is unreachable (the installer only builds for
+    Windows anyway). }
+  Result := False;
+  Locations[0] := ExpandConstant('{pf32}\Microsoft\EdgeWebView\Application');
+  Locations[1] := ExpandConstant('{pf64}\Microsoft\EdgeWebView\Application');
+  Locations[2] := ExpandConstant('{localappdata}\Microsoft\EdgeWebView\Application');
+  Locations[3] := ExpandConstant('{pf32}\Microsoft\Edge\Application');
+  Locations[4] := ExpandConstant('{pf64}\Microsoft\Edge\Application');
+  Locations[5] := '';
+
+  for I := 0 to High(Locations) - 1 do
+  begin
+    ApplicationDir := Locations[I];
+    if ApplicationDir = '' then Continue;
+    if not DirExists(ApplicationDir) then Continue;
+    { Iterate versioned subfolders inside the Application dir. }
+    if FindFirst(ApplicationDir + '\*', FindRec) then
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then Continue;
+        Child := FindRec.Name;
+        if Child = '.' then Continue;
+        if Child = '..' then Continue;
+        ExePath := ApplicationDir + '\' + Child + '\msedgewebview2.exe';
+        if FileExists(ExePath) then
+        begin
+          Result := True;
+          Exit;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 function IsWebView2Installed: Boolean;
 var
   Version: String;
 begin
+  { Primary: a real msedgewebview2.exe is on disk. This is the
+    most reliable signal because EdgeUpdate sometimes leaves
+    ``pv`` set for a runtime that has been removed. }
+  if WebView2BinaryExists then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  { Fallback: EdgeUpdate knows about a WebView2 Runtime. The check is
+    per-hive (32-bit HKLM, 64-bit HKLM, HKCU). We do NOT trust ``pv``
+    alone — only the *existence* of the EdgeUpdate client key with
+    a non-empty, non-placeholder version indicates a registered install.
+    Note: {#WebView2Clsid} is the corrected WebView2 Runtime GUID
+    ending in E4C5 (the old code used the Edge browser's GUID ending
+    in 7BF5, which never matched). }
   Result := RegQueryStringValue(
     HKLM,
     'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',

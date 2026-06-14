@@ -2,75 +2,245 @@
 
 We intentionally do NOT download or execute installers from inside VOD.RIP —
 that pattern is flagged as trojan/dropper behavior by antivirus software.
+
+The detection logic was wrong in two ways that mattered to the user
+experience (ANTIVIRUS_AUDIT follow-up, 2026-06):
+
+1.  The CLSID used to look up the WebView2 Runtime in EdgeUpdate\\Clients
+    was the Edge browser's GUID ``{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}``.
+    The correct WebView2 Runtime GUID is
+    ``{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}``. With the wrong CLSID, the
+    registry check always returned False and the binary-on-disk check was
+    the only thing keeping WebView2 detection working at all.
+
+2.  Even when the registry check succeeded, ``pv`` is sometimes set to a
+    non-empty value by EdgeUpdate for a runtime that has been removed
+    (e.g. after Disk Cleanup or a manual uninstall). The runtime is
+    *registered* but the binary is *missing*. The new detector never
+    trusts ``pv`` alone — it always verifies that ``msedgewebview2.exe``
+    exists at the registry-reported path, and falls back to scanning the
+    well-known install folders.
+
+This file deliberately has zero third-party dependencies. ``winreg`` and
+``pathlib`` are stdlib; the only ctypes call is ``ExpandEnvironmentStringsW``
+which is used to expand ``%ProgramFiles%`` in a HKLM-registered custom path.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import time
 import webbrowser
 from pathlib import Path
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_WEBVIEW2_CLSID = "{F3017226-FE2A-4295-8BDF-00B3D09F7BF5}"
+# Correct CLSID for the WebView2 Runtime in EdgeUpdate\\Clients.
+# Microsoft publishes this — do not change. The earlier code in this file
+# used the Edge browser's CLSID, which always returned False from the
+# registry check. The browser's GUID ends in ``7BF5``; the WebView2
+# Runtime's GUID ends in ``E4C5``. ``7BF5 != E4C5``.
+_WEBVIEW2_RUNTIME_CLSID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 _WEBVIEW2_INSTALL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 _INVALID_VERSIONS = frozenset(("", "0.0.0.0", "0.0.0"))
 
-# Same registry locations checked by installer/installer.iss (plus 64-bit HKLM).
-_REG_PATHS = (
-    rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
-    rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
-    rf"Software\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_CLSID}",
+# EdgeUpdate registry keys (in the order Windows searches them).
+# Microsoft stores the CLSID *with* curly braces in the key name.
+_REG_HIVES_AND_KEYS: Tuple[Tuple[int, str], ...] = (
+    (0x80000002, rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_RUNTIME_CLSID}"),  # HKLM 32-bit
+    (0x80000002, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_RUNTIME_CLSID}"),            # HKLM 64-bit
+    (0x80000001, rf"Software\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_RUNTIME_CLSID}"),            # HKCU
+)
+
+# Well-known install locations for msedgewebview2.exe, in priority order.
+# ``environ_keys`` are environment variable names whose value is the parent
+# of the install root. ``relpath`` is the path under that root.
+_KNOWN_INSTALL_ROOTS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    # Evergreen per-machine (the default Win11 install + bootstrapper).
+    (("ProgramFiles(x86)", "ProgramFiles"),
+     r"Microsoft\EdgeWebView\Application"),
+    # Evergreen per-user (manual bootstrap with /silent-install).
+    (("LOCALAPPDATA",),
+     r"Microsoft\EdgeWebView\Application"),
+    # Edge (Chromium) shares its runtime with WebView2 on Win11+ — the
+    # binary lives inside the Edge install tree.
+    (("ProgramFiles(x86)", "ProgramFiles"),
+     r"Microsoft\Edge\Application"),
 )
 
 
-def _version_ok(version: object) -> bool:
-    return bool(version) and str(version) not in _INVALID_VERSIONS
+def _msedgewebview2_exe_name() -> str:
+    return "msedgewebview2.exe"
 
 
-def _reg_has_webview2(hive, subkey: str) -> bool:
+def _expand_env(value: str) -> str:
+    """Expand %FOO% in *value* via kernel32 on Windows. Returns *value*
+    unchanged on other platforms."""
+    if os.name != "nt" or "%" not in value:
+        return value
+    try:
+        kernel32 = ctypes.windll.kernel32
+        out = ctypes.create_unicode_buffer(2048)
+        n = kernel32.ExpandEnvironmentStringsW(value, out, 2048)
+        return out.value if n else value
+    except Exception:
+        return value
+
+
+def _binary_exists(root: Path) -> Optional[Path]:
+    """If *root* contains a versioned subfolder holding msedgewebview2.exe,
+    return the full path. Otherwise None. Safe on any platform (returns
+    None for non-Windows)."""
+    if os.name != "nt" or not root.is_dir():
+        return None
+    try:
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            exe = child / _msedgewebview2_exe_name()
+            if exe.is_file():
+                return exe
+    except (PermissionError, OSError) as exc:
+        logger.debug("webview2 scan %s: %s", root, exc)
+    return None
+
+
+def _webview2_on_disk() -> Optional[Path]:
+    """Return the path of msedgewebview2.exe if it exists in any well-known
+    install location. Used as the **primary** detection signal.
+    """
+    for env_keys, relpath in _KNOWN_INSTALL_ROOTS:
+        for env_key in env_keys:
+            env_value = os.environ.get(env_key)
+            if not env_value:
+                continue
+            for env_value_resolved in (_expand_env(env_value), env_value):
+                root = Path(env_value_resolved) / relpath
+                found = _binary_exists(root)
+                if found is not None:
+                    logger.debug("WebView2 found on disk: %s", found)
+                    return found
+    return None
+
+
+def _registry_reported_path(hive: int, subkey: str) -> Optional[Path]:
+    """Read the ``location`` value from the EdgeUpdate client key. Returns
+    the install root the runtime was installed at, or None if not set.
+
+    Microsoft writes the install root to ``location`` (not ``path`` —
+    that was an old heuristic). This is *not* enough to declare the
+    runtime installed — EdgeUpdate leaves the value in place even when
+    the binary is gone. Use ``_verify_registry_path`` to confirm.
+    """
     try:
         import winreg
     except ImportError:
-        return False
+        return None
     try:
         with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
-            version, _ = winreg.QueryValueEx(key, "pv")
-            return _version_ok(version)
+            # ``location`` is the canonical Microsoft key. ``path`` is an
+            # older custom-install key we still read as a fallback.
+            location: Optional[str] = None
+            pv: Optional[str] = None
+            for value_name in ("location", "path"):
+                try:
+                    value, _ = winreg.QueryValueEx(key, value_name)
+                except OSError:
+                    continue
+                if isinstance(value, str) and value and not location:
+                    location = value
+            try:
+                pv_value, _ = winreg.QueryValueEx(key, "pv")
+                if isinstance(pv_value, str) and pv_value and pv_value not in _INVALID_VERSIONS:
+                    pv = pv_value
+            except OSError:
+                pass
     except OSError:
-        return False
+        return None
+    if not location:
+        return None
+    root = Path(_expand_env(location))
+    if pv:
+        # Prefer the version-stamped subfolder when ``pv`` is set and
+        # the binary exists there. Fall through to the root on miss.
+        versioned = root / pv
+        if (versioned / _msedgewebview2_exe_name()).is_file():
+            return versioned / _msedgewebview2_exe_name()
+    return root
 
 
-def _webview2_on_disk() -> bool:
-    for env in ("ProgramFiles(x86)", "ProgramFiles"):
-        root = os.environ.get(env)
-        if not root:
-            continue
-        app_dir = Path(root) / "Microsoft" / "EdgeWebView" / "Application"
-        if not app_dir.is_dir():
-            continue
-        for child in app_dir.iterdir():
-            if child.is_dir() and (child / "msedgewebview2.exe").is_file():
-                return True
+def _registry_installed() -> bool:
+    """True iff EdgeUpdate knows about a WebView2 Runtime *and* the
+    binary is actually present at the reported path."""
+    for hive, subkey in _REG_HIVES_AND_KEYS:
+        # _registry_reported_path already does the binary-on-disk check
+        # (returns None if the path it found doesn't actually contain
+        # msedgewebview2.exe). A non-None return is therefore proof of
+        # install.
+        if _registry_reported_path(hive, subkey) is not None:
+            return True
     return False
 
 
 def webview2_installed() -> bool:
+    """Return True iff a usable WebView2 runtime is present on this machine.
+
+    Detection priority:
+        1.  Binary exists in a well-known install folder (most reliable,
+            survives EdgeUpdate registry staleness).
+        2.  EdgeUpdate registry key points at a real msedgewebview2.exe
+            (fast path on systems where the on-disk scan is slow).
+
+    Returns True on non-Windows (Linux/macOS use WebKit / Cocoa, not WV2).
+    """
     if os.name != "nt":
         return True
+
+    on_disk = _webview2_on_disk()
+    if on_disk is not None:
+        return True
+
+    # Fall back to registry; only trust it if the binary path it reports
+    # actually resolves to an existing msedgewebview2.exe. This is the case
+    # for *custom* Evergreen installs that the on-disk scan above missed
+    # (rare, but possible when the user has run the bootstrapper with a
+    # custom /install-location).
+    if _registry_installed():
+        return True
+
+    logger.debug("WebView2 not detected: no binary in known locations and registry empty")
+    return False
+
+
+def webview2_version() -> Optional[str]:
+    """Return the WebView2 Runtime version string, or None if not installed.
+
+    Useful for diagnostics and for the bootstrapper to decide whether a
+    newer download is needed.
+    """
+    if os.name != "nt":
+        return None
     try:
         import winreg
     except ImportError:
-        return True
-
-    for subkey in _REG_PATHS:
-        hive = winreg.HKEY_CURRENT_USER if subkey.startswith("Software") else winreg.HKEY_LOCAL_MACHINE
-        if _reg_has_webview2(hive, subkey):
-            return True
-
-    return _webview2_on_disk()
+        return None
+    for hive, subkey in _REG_HIVES_AND_KEYS:
+        try:
+            with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+                try:
+                    value, _ = winreg.QueryValueEx(key, "pv")
+                except OSError:
+                    continue
+                if _INVALID_VERSIONS and str(value) in _INVALID_VERSIONS:
+                    continue
+                if value:
+                    return str(value)
+        except OSError:
+            continue
+    return None
 
 
 def ensure_webview2() -> bool:
