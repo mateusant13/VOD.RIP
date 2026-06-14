@@ -142,35 +142,34 @@ begin
   end;
 end;
 
-function WebView2RegistryBinaryExists: Boolean;
-{ Mirror services/webview2_setup._registry_reported_path: trust EdgeUpdate
-  only when location/path resolves to a real msedgewebview2.exe. Never trust
-  ``pv`` alone — stale registry after uninstall caused skipped installs. }
-
-  function TryHive(const RootKey: Integer; const SubKey: String): Boolean;
-  var
-    Location, Pv, ExePath: String;
-  begin
-    Result := False;
-    Location := '';
-    if not RegQueryStringValue(RootKey, SubKey, 'location', Location) then
-      RegQueryStringValue(RootKey, SubKey, 'path', Location);
-    if Location = '' then
-      Exit;
-    Pv := '';
-    RegQueryStringValue(RootKey, SubKey, 'pv', Pv);
-    if WebView2VersionOk(Pv) then
-      ExePath := Location + '\' + Pv + '\msedgewebview2.exe'
-    else
-      ExePath := Location + '\msedgewebview2.exe';
-    Result := FileExists(ExePath);
-  end;
-
+function WebView2RegistryTryHive(const RootKey: Integer; const SubKey: String): Boolean;
+var
+  Location, Pv, ExePath: String;
 begin
+  Result := False;
+  Location := '';
+  if not RegQueryStringValue(RootKey, SubKey, 'location', Location) then
+    RegQueryStringValue(RootKey, SubKey, 'path', Location);
+  if Location = '' then
+    Exit;
+  Pv := '';
+  RegQueryStringValue(RootKey, SubKey, 'pv', Pv);
+  if WebView2VersionOk(Pv) then
+    ExePath := Location + '\' + Pv + '\msedgewebview2.exe'
+  else
+    ExePath := Location + '\msedgewebview2.exe';
+  Result := FileExists(ExePath);
+end;
+
+function WebView2RegistryBinaryExists: Boolean;
+begin
+  { Mirror services/webview2_setup._registry_reported_path: trust EdgeUpdate
+    only when location/path resolves to a real msedgewebview2.exe. Never trust
+    ``pv`` alone — stale registry after uninstall caused skipped installs. }
   Result :=
-    TryHive(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
-    TryHive(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
-    TryHive(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}');
+    WebView2RegistryTryHive(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
+    WebView2RegistryTryHive(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
+    WebView2RegistryTryHive(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}');
 end;
 
 function IsWebView2Installed: Boolean;
