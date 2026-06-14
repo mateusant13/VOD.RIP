@@ -82,9 +82,8 @@ Then open `http://localhost:5173`.
 
 ## Windows SmartScreen warning
 
-The first time you run VOD.RIP, Windows may show **"Windows protected your PC"**
-(Microsoft Defender SmartScreen). That is normal for new desktop apps that are not
-yet code-signed or have not built SmartScreen reputation.
+The first time you run VOD.RIP, Windows may show **"Windows protected your PC"**.
+This can happen with apps downloaded from the web.
 
 Only download from the [official Releases page](https://github.com/mateusant13/VOD.RIP/releases).
 
@@ -92,13 +91,6 @@ Only download from the [official Releases page](https://github.com/mateusant13/V
 
 1. On the blue warning screen, click **More info** (on some builds: **More information**).
 2. Click **Run anyway**.
-
-For the portable `.zip`, extract the folder, then run `VOD-RIP.exe`. If Windows
-blocked the download, right-click the file → **Properties** → check **Unblock** →
-**OK**, then launch again if SmartScreen still appears.
-
-Some third-party antivirus tools may also flag unsigned apps briefly. If you use
-one, allow or restore VOD.RIP when you trust the download source above.
 
 
 ## Built with
