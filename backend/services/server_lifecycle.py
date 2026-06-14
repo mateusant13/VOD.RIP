@@ -46,29 +46,9 @@ def _local_endpoint_port(addr: str) -> Optional[int]:
         return None
 
 
-def _pids_listening_on_port_windows(port: int) -> list[int]:
+def _pids_via_netstat_windows(port: int) -> list[int]:
+    """List PIDs listening on *port* via netstat (no PowerShell)."""
     pids: list[int] = []
-    try:
-        ps = (
-            f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
-            f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)"
-        )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=6,
-            creationflags=_NO_WINDOW,
-        )
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pids.append(int(line))
-        if pids:
-            return list(dict.fromkeys(pids))
-    except Exception as exc:
-        _logger.debug("Get-NetTCPConnection for port %s: %s", port, exc)
-
     try:
         result = subprocess.run(
             ["netstat", "-ano"],
@@ -91,6 +71,32 @@ def _pids_listening_on_port_windows(port: int) -> list[int]:
                 pids.append(int(pid))
     except Exception as exc:
         _logger.debug("netstat for port %s: %s", port, exc)
+    return list(dict.fromkeys(pids))
+
+
+def _pids_listening_on_port_windows(port: int) -> list[int]:
+    # Prefer netstat — avoids spawning PowerShell during startup (EDR heuristic).
+    pids = _pids_via_netstat_windows(port)
+    if pids:
+        return pids
+    try:
+        ps = (
+            f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+            f"-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            creationflags=_NO_WINDOW,
+        )
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception as exc:
+        _logger.debug("Get-NetTCPConnection for port %s: %s", port, exc)
     return list(dict.fromkeys(pids))
 
 
@@ -217,7 +223,6 @@ def _kill_pid_windows(port: int, pid: int, image: str) -> bool:
     _logger.info("Stopping port %s listener pid %s (%s)", port, pid, image)
     for args in (
         ["taskkill", "/F", "/PID", str(pid)],
-        ["taskkill", "/F", "/T", "/PID", str(pid)],
     ):
         try:
             result = subprocess.run(
@@ -273,15 +278,42 @@ def _kill_pid(port: int, pid: int) -> bool:
     return not _process_alive(pid)
 
 
+def _pid_is_vodrip_api(port: int, pid: int) -> bool:
+    """True only when *pid* is our API — never kill unrelated port listeners."""
+    image = (_process_image_name(pid) or "").upper()
+    if "VOD-RIP" in image or "VOD_RIP" in image:
+        return True
+    try:
+        import requests
+
+        info = requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
+        if info.status_code == 200 and info.json().get("name") == "VOD.RIP":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 10.0) -> None:
-    """Free *port* for a new VOD.RIP / dev API instance (graceful first, then force kill)."""
+    """Free *port* for a new VOD.RIP instance (graceful first; kill only our PIDs)."""
     deadline = time.monotonic() + timeout
 
     def active_listeners() -> list[int]:
-        return [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+        raw = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
+        return [p for p in raw if _pid_is_vodrip_api(port, p)]
 
     listeners = active_listeners()
     if not listeners:
+        raw = [
+            p for p in _pids_listening_on_port(port)
+            if skip_pid is None or p != skip_pid
+        ]
+        if raw:
+            _logger.warning(
+                "Port %s in use by non-VOD.RIP process(es) %s — not force-killing",
+                port,
+                raw,
+            )
         return
 
     _logger.info("Port %s busy — asking existing VOD.RIP API to exit", port)
@@ -295,7 +327,7 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
         if not remaining:
             return
 
-        _logger.info("Releasing port %s — stopping listener(s): %s", port, remaining)
+        _logger.info("Releasing port %s — stopping VOD.RIP listener(s): %s", port, remaining)
         for pid in remaining:
             if not _kill_pid(port, pid) and _process_alive(pid):
                 _logger.warning(
@@ -331,8 +363,11 @@ def stop_api_server(port: Optional[int] = None, timeout: float = 4.0) -> None:
     if _wait_for_port_free(port, skip_pid=os.getpid(), timeout=timeout):
         return
 
-    listeners = [p for p in _pids_listening_on_port(port) if p != os.getpid()]
+    listeners = [
+        p for p in _pids_listening_on_port(port)
+        if p != os.getpid() and _pid_is_vodrip_api(port, p)
+    ]
     if listeners:
-        _logger.info("Force-releasing port %s (pids: %s)", port, listeners)
+        _logger.info("Force-releasing port %s (VOD.RIP pids: %s)", port, listeners)
         for pid in listeners:
             _kill_pid(port, pid)

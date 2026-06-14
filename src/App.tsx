@@ -4012,11 +4012,17 @@ export default function App() {
 
   const handleApplyUpdate = useCallback(async () => {
     if (!updateInfo) return;
-    if (!window.confirm(`Install VOD.RIP v${updateInfo.version}? The app will restart.`)) return;
+    const isSetup = (updateInfo.asset_name || '').toLowerCase().includes('setup');
+    const prompt = isSetup
+      ? `Install VOD.RIP v${updateInfo.version}? The installer will open and this app will close.`
+      : `Download VOD.RIP v${updateInfo.version}? The verified zip will open in Explorer — extract it over your install folder, or use Setup.exe from GitHub.`;
+    if (!window.confirm(prompt)) return;
     setUpdateApplying(true);
     setUpdateMessage(null);
     try {
-      await apiPost('/api/update/apply', {});
+      const res = await apiPost<{ ok: boolean; message?: string }>('/api/update/apply', {});
+      setUpdateMessage(res.message || 'Update started');
+      if (!isSetup) setUpdateApplying(false);
     } catch (err: any) {
       setUpdateMessage(err.message || 'Update failed');
       setUpdateApplying(false);
@@ -5278,6 +5284,16 @@ export default function App() {
                 <>
                   <span aria-hidden>·</span>
                   <span className="text-emerald-700">v{updateInfo.version}</span>
+                  {updateInfo.release_url ? (
+                    <a
+                      href={updateInfo.release_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
+                    >
+                      release
+                    </a>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => void handleApplyUpdate()}

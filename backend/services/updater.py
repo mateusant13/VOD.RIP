@@ -2,13 +2,15 @@
 VOD.RIP — Auto-update via GitHub Releases.
 
 Supports:
-  Windows — silent Setup.exe (Inno) or portable zip in-place update
-  macOS   — replace VOD.RIP.app from release zip
-  Linux   — replace binary folder from release zip
+  Windows — Inno Setup.exe (in-app, AV-friendly) or verified portable zip
+            (download + open folder; no in-app robocopy dropper)
+  macOS   — replace VOD.RIP.app from release zip (verified)
+  Linux   — replace binary folder from release zip (verified)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 from typing import List, Optional, Tuple
@@ -35,17 +39,22 @@ except ImportError:  # pragma: no cover - dev module-load race
     USER_AGENT = "VOD.RIP/unknown"
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+_DETACHED_FLAGS = 0
+if os.name == "nt":
+    _DETACHED_FLAGS = (
+        getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    )
+
+
+@dataclass
+class UpdateApplyResult:
+    ok: bool
+    message: str = ""
 
 
 def _terminate_for_update(reason: str) -> None:
-    """F7 (ANTIVIRUS_AUDIT): ``os._exit`` is intentional in the four
-    update-applier call sites — the live process must die so the spawned
-    robocopy/ditto/rsync can replace its own files. ``sys.exit`` is wrong
-    here because atexit handlers and finally blocks would keep files open
-    on Windows long enough for the robocopy to fail. The exit is logged
-    so EDR products that key on "parent terminates after spawning child
-    updater" can correlate the child to the explicit ``logger.info`` call.
-    """
+    """F7 (ANTIVIRUS_AUDIT): ``os._exit`` only when the Inno installer takes over."""
     logger.info("Update applicator exiting live process: %s", reason)
     os._exit(0)
 
@@ -54,11 +63,38 @@ def _install_dir() -> Path:
     if getattr(sys, "frozen", False):
         if sys.platform == "darwin":
             exe = Path(sys.executable).resolve()
-            # .../VOD.RIP.app/Contents/MacOS/VOD-RIP
             if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
                 return exe.parent.parent.parent
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent.parent
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower()
+
+
+def _parse_sha256_sidecar(text: str) -> Optional[str]:
+    """Accept ``<hex>`` or ``<hex>  filename`` (GNU/BtbN style)."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        token = line.split()[0].strip().lower()
+        if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+            return token
+    return None
+
+
+def _companion_sha256_url(assets: list, asset_name: str) -> Optional[str]:
+    target = f"{asset_name}.sha256"
+    for asset in assets:
+        if (asset.get("name") or "") == target:
+            return asset.get("browser_download_url")
+    return None
 
 
 class UpdateChecker:
@@ -90,18 +126,21 @@ class UpdateChecker:
                 self._save_cache({"last_check": time.time(), "latest": latest_tag})
                 return None
 
-            asset = self._find_platform_asset(data.get("assets") or [])
+            assets = data.get("assets") or []
+            asset = self._find_platform_asset(assets)
             if not asset:
                 logger.info("No release asset for this platform (latest %s)", latest_tag)
                 return None
 
+            asset_name = asset.get("name", "")
             result = {
                 "version": latest_tag,
                 "download_url": asset["browser_download_url"],
-                "asset_name": asset.get("name", ""),
+                "asset_name": asset_name,
                 "asset_kind": asset.get("_kind", "zip"),
                 "release_url": data.get("html_url", ""),
                 "release_notes": (data.get("body") or "")[:4000],
+                "sha256_url": _companion_sha256_url(assets, asset_name),
             }
             self._save_pending(result)
             self._save_cache({"last_check": time.time(), "latest": latest_tag})
@@ -121,10 +160,10 @@ class UpdateChecker:
             pass
         return None
 
-    def download_and_install(self, release_info: dict) -> bool:
+    def download_and_install(self, release_info: dict) -> UpdateApplyResult:
         download_url = release_info.get("download_url") or ""
         if not download_url:
-            return False
+            return UpdateApplyResult(False, "No download URL")
 
         tmp_dir = Path(tempfile.gettempdir()) / "VOD.RIP-Updates"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -141,12 +180,60 @@ class UpdateChecker:
                             handle.write(chunk)
         except Exception as exc:
             logger.error("Update download failed: %s", exc)
-            return False
+            return UpdateApplyResult(False, f"Download failed: {exc}")
+
+        if not self._verify_release_checksum(dest, release_info):
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return UpdateApplyResult(
+                False,
+                "Update rejected: SHA-256 checksum missing or mismatch. "
+                "Download the release manually from GitHub.",
+            )
 
         kind = release_info.get("asset_kind") or self._guess_kind(dest.name)
         if kind == "setup":
             return self._launch_windows_setup(dest)
-        return self._apply_zip_update(dest)
+        if sys.platform == "win32":
+            return self._offer_windows_portable_update(dest, release_info)
+        if self._apply_zip_update(dest):
+            return UpdateApplyResult(True, "Installing update")
+        return UpdateApplyResult(False, "Update failed")
+
+    def _verify_release_checksum(self, dest: Path, release_info: dict) -> bool:
+        """F1: verify publisher checksum before any extract or execute.
+
+        SHA-256 proves the file was not tampered with in transit; it does NOT
+        grant SmartScreen reputation (that requires Authenticode signing).
+        """
+        sha_url = release_info.get("sha256_url")
+        if not sha_url:
+            logger.warning(
+                "No .sha256 sidecar for %s — refusing in-app apply (download from GitHub instead)",
+                release_info.get("asset_name"),
+            )
+            return False
+        try:
+            resp = requests.get(sha_url, timeout=30, headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+            expected = _parse_sha256_sidecar(resp.text)
+            if not expected:
+                logger.error("Could not parse SHA-256 sidecar from %s", sha_url)
+                return False
+            actual = _sha256_file(dest)
+            if actual != expected:
+                logger.error(
+                    "SHA-256 mismatch for %s (expected %s, got %s)",
+                    dest.name, expected, actual,
+                )
+                return False
+            logger.info("SHA-256 verified for %s", dest.name)
+            return True
+        except Exception as exc:
+            logger.error("SHA-256 verification failed: %s", exc)
+            return False
 
     # ── internals ───────────────────────────────────────────────────────
 
@@ -228,15 +315,47 @@ class UpdateChecker:
             return "setup"
         return "zip"
 
-    def _launch_windows_setup(self, installer: Path) -> bool:
+    def _launch_windows_setup(self, installer: Path) -> UpdateApplyResult:
         logger.info("Launching installer: %s", installer)
-        # Use the normal installer UI (not silent/hidden) — fewer antivirus false positives.
         if os.name == "nt":
             os.startfile(str(installer))
         else:
             subprocess.Popen([str(installer)], close_fds=True)
         _terminate_for_update("launching Windows installer; letting installer take over")
-        return True
+        return UpdateApplyResult(True, "Installer launched")
+
+    def _offer_windows_portable_update(self, archive: Path, release_info: dict) -> UpdateApplyResult:
+        """F1: no in-app robocopy/PowerShell dropper on Windows portable builds.
+
+        The verified zip is left in %TEMP%\\VOD.RIP-Updates; we open the folder
+        and the GitHub release page so the user can replace files deliberately.
+        Prefer the Inno Setup.exe asset for one-click updates.
+        """
+        release_url = (release_info.get("release_url") or "").strip()
+        if release_url:
+            try:
+                webbrowser.open(release_url)
+            except Exception:
+                logger.debug("Could not open release URL", exc_info=True)
+        if os.name == "nt":
+            try:
+                abspath = str(archive.resolve())
+                escaped = abspath.replace('"', '\\"')
+                subprocess.Popen(
+                    ["explorer.exe", f'/select,"{escaped}"'],
+                    creationflags=_NO_WINDOW,
+                )
+            except Exception:
+                try:
+                    os.startfile(str(archive.parent))
+                except Exception:
+                    logger.debug("Could not open update folder", exc_info=True)
+        msg = (
+            f"Verified update saved to {archive}. "
+            "Extract it over your VOD.RIP folder, or install the Setup.exe from the release page."
+        )
+        logger.info(msg)
+        return UpdateApplyResult(True, msg)
 
     def _apply_zip_update(self, zip_path: Path) -> bool:
         install_dir = _install_dir()
@@ -251,36 +370,8 @@ class UpdateChecker:
         if sys.platform == "darwin":
             return self._apply_macos_zip(extract_dir, install_dir)
         if sys.platform == "win32":
-            return self._apply_windows_zip(extract_dir, install_dir)
+            return False
         return self._apply_linux_zip(extract_dir, install_dir)
-
-    def _apply_windows_zip(self, extract_dir: Path, install_dir: Path) -> bool:
-        source = extract_dir
-        nested = list(extract_dir.glob("VOD-RIP.EXE")) + list(extract_dir.glob("VOD-RIP.exe"))
-        if nested:
-            source = nested[0].parent
-        exe = source / "VOD-RIP.EXE"
-        if not exe.is_file():
-            exe = source / "VOD-RIP.exe"
-        script = extract_dir.parent / "vodrip-update.ps1"
-        script.write_text(
-            "\n".join([
-                "Start-Sleep -Seconds 2",
-                f'$src = "{source}"',
-                f'$dst = "{install_dir}"',
-                "robocopy $src $dst /E /R:2 /W:2 /NFL /NDL /NJH /NJS",
-                "if ($LASTEXITCODE -ge 8) { exit 1 }",
-                f'Start-Process "{install_dir / "VOD-RIP.EXE"}"',
-            ]),
-            encoding="utf-8",
-        )
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-            close_fds=True,
-            creationflags=_NO_WINDOW,
-        )
-        _terminate_for_update("Windows robocopy updater script spawned; releasing file locks")
-        return True
 
     def _apply_linux_zip(self, extract_dir: Path, install_dir: Path) -> bool:
         source = extract_dir
@@ -339,7 +430,6 @@ class UpdateChecker:
 def _safe_extractall(archive: ZipFile, target: Path) -> None:
     """Extract zip members while validating paths to prevent Zip Slip."""
     for member in archive.infolist():
-        # Resolve the member path and ensure it stays inside target.
         member_path = target.resolve() / member.filename
         resolved = member_path.resolve()
         if not str(resolved).startswith(str(target.resolve())):
@@ -351,13 +441,3 @@ def _safe_extractall(archive: ZipFile, target: Path) -> None:
 
 class SecurityError(Exception):
     pass
-
-
-def background_check(app_data_dir: Path, current_version: str) -> None:
-    try:
-        checker = UpdateChecker(current_version, app_data_dir)
-        release = checker.check()
-        if release:
-            logger.info("Update available: v%s", release.get("version"))
-    except Exception as exc:
-        logger.debug("Background update check: %s", exc)

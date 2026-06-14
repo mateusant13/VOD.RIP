@@ -8,12 +8,11 @@ Responsibilities
 ----------------
 1. Set up logging to the platform-appropriate user data directory.
 2. Install the global crash handler.
-3. Ensure Windows Start Menu shortcuts (portable builds).
-4. Start FastAPI / uvicorn on 127.0.0.1.
-5. Wait for the server to be ready.
-6. Launch the PyWebView native desktop window with system-tray minimize.
-7. If PyWebView is unavailable, fall back to the default browser + tray icon.
-8. On Quit: cancel all downloads, kill ffmpeg, exit.
+3. Start FastAPI / uvicorn on 127.0.0.1.
+4. Wait for the server to be ready.
+5. Launch the PyWebView native desktop window with system-tray minimize.
+6. If PyWebView is unavailable, fall back to the default browser + tray icon.
+7. On Quit: cancel all downloads, kill ffmpeg, exit.
 """
 
 import logging
@@ -125,38 +124,6 @@ def _setup_environment():
     os.environ["KICK_SERVE_UI"] = "1"
     _enable_windows_dpi_awareness()
 
-
-def _ensure_start_menu_shortcuts() -> None:
-    """Create Start Menu entry on first run (portable zip users)."""
-    if os.name != "nt" or not getattr(sys, "frozen", False):
-        return
-    try:
-        from services.windows_shortcuts import (
-            ensure_windows_shortcuts,
-            install_dir_from_runtime,
-            resolve_windows_exe,
-        )
-
-        install_dir = install_dir_from_runtime()
-        ensure_windows_shortcuts(resolve_windows_exe(install_dir), install_dir)
-    except Exception as exc:
-        logging.getLogger("VOD.RIP").debug("Start Menu shortcuts: %s", exc)
-
-
-def _start_background_update_check() -> None:
-    """Check GitHub Releases once per day in packaged builds."""
-    if not getattr(sys, "frozen", False):
-        return
-    try:
-        from services.updater import background_check
-
-        threading.Thread(
-            target=background_check,
-            args=(_get_appdata_dir(), __version__),
-            daemon=True,
-        ).start()
-    except Exception as exc:
-        logging.getLogger("VOD.RIP").debug("Background update check: %s", exc)
 
 def _check_linux_webkit() -> None:
     """On Linux, check if WebKitGTK is available before PyWebView tries GTK."""
@@ -567,9 +534,6 @@ def main():
     _setup_environment()
     _set_windows_app_identity()
 
-    _ensure_start_menu_shortcuts()
-    _start_background_update_check()
-
     # Linux: warn early if PyWebView's WebKitGTK runtime is missing
     _check_linux_webkit()
 
@@ -599,46 +563,39 @@ def main():
     logger.info("Server ready — launching UI")
 
     webview2_ok = True
-    # F-up-2026-06: check WebView2 BEFORE attempting PyWebView on a packaged
-    # Windows build. If we know WebView2 is missing, going straight to the
-    # setup dialog saves a wasted PyWebView attempt (which would either fail
-    # silently with a stale EBWebView cache, or briefly open a half-broken
-    # window before crashing). The browser-mode fallback is reserved for
-    # systems where we genuinely don't know whether WebView2 is present
-    # (e.g. dev mode on Linux/macOS).
-    webview2_known_missing = False
     if os.name == "nt" and getattr(sys, "frozen", False):
         try:
-            from services.webview2_setup import webview2_installed as _w2i
-            if not _w2i():
-                logger.info("WebView2 missing at startup — showing setup guide before UI launch")
-                from services.webview2_setup import ensure_webview2
+            from services.webview2_setup import (
+                ensure_webview2,
+                wait_for_webview2,
+                webview2_installed,
+            )
+            if not webview2_installed():
+                logger.info("WebView2 not detected yet — waiting for post-install lag")
+                wait_for_webview2(timeout_sec=60.0)
+            if not webview2_installed():
+                logger.info("WebView2 still missing — setup guide (portable zip path)")
                 webview2_ok = ensure_webview2()
-                if not webview2_ok:
-                    webview2_known_missing = True
         except Exception as exc:
-            logger.warning("WebView2 pre-check failed: %s", exc)
+            logger.warning("WebView2 setup failed: %s", exc)
+            webview2_ok = False
 
-    if not webview2_known_missing:
-        if _launch_pywebview(port):
-            # Success: PyWebView window is up. Shut down the API server and exit.
-            _shutdown(port)
-            sys.exit(0)
-        if os.name == "nt" and getattr(sys, "frozen", False):
-            try:
-                from services.webview2_setup import ensure_webview2, webview2_installed
-                if not webview2_installed():
-                    webview2_ok = ensure_webview2()
-                    if webview2_ok and _launch_pywebview(port):
-                        _shutdown(port)
-                        sys.exit(0)
-            except Exception as exc:
-                logger.warning("WebView2 setup failed: %s", exc)
-                webview2_ok = False
-    else:
-        webview2_ok = False
+    if webview2_ok and _launch_pywebview(port):
+        _shutdown(port)
+        sys.exit(0)
 
-    # PyWebView never succeeded — fall back to the browser mode + tray.
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        try:
+            from services.webview2_setup import ensure_webview2, webview2_installed
+            if not webview2_installed():
+                webview2_ok = ensure_webview2()
+            if webview2_ok and _launch_pywebview(port):
+                _shutdown(port)
+                sys.exit(0)
+        except Exception as exc:
+            logger.warning("WebView2 retry failed: %s", exc)
+            webview2_ok = False
+
     _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
     _shutdown(port)
     sys.exit(0)

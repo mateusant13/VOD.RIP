@@ -1648,9 +1648,10 @@ async def update_apply():
     if not pending:
         raise HTTPException(status_code=404, detail="No update available")
 
-    if not checker.download_and_install(pending):
-        raise HTTPException(status_code=500, detail="Update failed")
-    return {"ok": True, "message": "Installing update"}
+    result = checker.download_and_install(pending)
+    if not result.ok:
+        raise HTTPException(status_code=500, detail=result.message or "Update failed")
+    return {"ok": True, "message": result.message or "Installing update"}
 
 
 @app.get("/api/ytdlp/status")

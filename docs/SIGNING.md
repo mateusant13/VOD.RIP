@@ -86,11 +86,18 @@ hurts conversion — EV is recommended.
 
 ## What this does NOT fix
 
-- The dynamic, runtime download + PowerShell + robocopy flow in
-  `services/updater.py` — see ANTIVIRUS_AUDIT F1. Even with a signed
-  binary, the in-app self-update is a top-tier EDR heuristic and should
-  be replaced with an external download page or a small signed
-  `VOD-RIP-Updater.exe` shipped beside the app.
+- **SHA-256 checksums alone** — `.sha256` sidecars prove a download was not
+  tampered with; they do **not** change antivirus heuristics. They are still
+  required so the app never applies an unverified update.
+- The in-app portable update flow — portable zip updates now **verify SHA-256**
+  and open Explorer instead of robocopy/PowerShell; Setup.exe still launches
+  the signed installer. For lowest false positives, prefer Setup.exe updates.
 - The bundled ffmpeg.exe / ffprobe.exe — see ANTIVIRUS_AUDIT F2. Bundling
   third-party unsigned binaries keeps the `PUA:Win32/BundledTool` flag
   active even when the launcher is signed.
+
+## After signing — reduce false positives faster
+
+1. Publish signed builds from CI (see `.github/workflows/release.yml`).
+2. Submit each signed release to [Microsoft Defender file submission](https://www.microsoft.com/en-us/wdsi/filesubmission) as a false positive.
+3. Attach `.sha256` files on GitHub releases so users can verify integrity manually.

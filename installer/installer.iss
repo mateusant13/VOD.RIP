@@ -142,42 +142,42 @@ begin
   end;
 end;
 
-function IsWebView2Installed: Boolean;
-var
-  Version: String;
-begin
-  { Primary: a real msedgewebview2.exe is on disk. This is the
-    most reliable signal because EdgeUpdate sometimes leaves
-    ``pv`` set for a runtime that has been removed. }
-  if WebView2BinaryExists then
+function WebView2RegistryBinaryExists: Boolean;
+{ Mirror services/webview2_setup._registry_reported_path: trust EdgeUpdate
+  only when location/path resolves to a real msedgewebview2.exe. Never trust
+  ``pv`` alone — stale registry after uninstall caused skipped installs. }
+
+  function TryHive(const RootKey: Integer; const SubKey: String): Boolean;
+  var
+    Location, Pv, ExePath: String;
   begin
-    Result := True;
-    Exit;
+    Result := False;
+    Location := '';
+    if not RegQueryStringValue(RootKey, SubKey, 'location', Location) then
+      RegQueryStringValue(RootKey, SubKey, 'path', Location);
+    if Location = '' then
+      Exit;
+    Pv := '';
+    RegQueryStringValue(RootKey, SubKey, 'pv', Pv);
+    if WebView2VersionOk(Pv) then
+      ExePath := Location + '\' + Pv + '\msedgewebview2.exe'
+    else
+      ExePath := Location + '\msedgewebview2.exe';
+    Result := FileExists(ExePath);
   end;
 
-  { Fallback: EdgeUpdate knows about a WebView2 Runtime. The check is
-    per-hive (32-bit HKLM, 64-bit HKLM, HKCU). We do NOT trust ``pv``
-    alone — only the *existence* of the EdgeUpdate client key with
-    a non-empty, non-placeholder version indicates a registered install.
-    Note: {#WebView2Clsid} is the corrected WebView2 Runtime GUID
-    ending in E4C5 (the old code used the Edge browser's GUID ending
-    in 7BF5, which never matched). }
-  Result := RegQueryStringValue(
-    HKLM,
-    'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
-    'pv', Version) and WebView2VersionOk(Version);
+begin
+  Result :=
+    TryHive(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
+    TryHive(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}') or
+    TryHive(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}');
+end;
 
-  if not Result then
-    Result := RegQueryStringValue(
-      HKLM,
-      'SOFTWARE\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
-      'pv', Version) and WebView2VersionOk(Version);
-
-  if not Result then
-    Result := RegQueryStringValue(
-      HKCU,
-      'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
-      'pv', Version) and WebView2VersionOk(Version);
+function IsWebView2Installed: Boolean;
+begin
+  { Must match webview2_setup.webview2_installed() — binary on disk first,
+    then registry only when it points at a real msedgewebview2.exe. }
+  Result := WebView2BinaryExists or WebView2RegistryBinaryExists;
 end;
 function WaitForWebView2Install(TimeoutSec: Integer): Boolean;
 { If WebView2 is currently being installed in the background (e.g. a

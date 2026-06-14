@@ -101,13 +101,6 @@ jobs:
         shell: bash
         run: pyinstaller vod-rip.spec --clean --noconfirm
 
-      - name: Package Windows zip
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/VOD-RIP/* -DestinationPath "release/VOD.RIP-${{ github.ref_name }}-${{ matrix.label }}.zip" -Force
-
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -162,6 +155,27 @@ jobs:
           # Clean up the cert on disk.
           Remove-Item -Force $pfxPath
 
+      - name: Package Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path dist/VOD-RIP/* -DestinationPath "release/VOD.RIP-${{ github.ref_name }}-${{ matrix.label }}.zip" -Force
+
+      # F1: publish SHA-256 sidecars so the in-app updater can verify downloads
+      # before extract/execute. Checksums are computed AFTER signing on Windows.
+      - name: Generate SHA-256 sidecars
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in release/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sha256) continue ;; esac
+            hash=$(sha256sum "$f" | awk '{print $1}')
+            echo "$hash" > "${f}.sha256"
+            echo "  ${f}.sha256"
+          done
+
 
       - name: Package macOS zip
         if: runner.os == 'macOS'
@@ -185,7 +199,9 @@ jobs:
           name: vod-rip-${{ matrix.label }}
           path: |
             release/*.zip
+            release/*.sha256
             release/*-Setup.exe
+            release/*-Setup.exe.sha256
           if-no-files-found: error
 
   release:

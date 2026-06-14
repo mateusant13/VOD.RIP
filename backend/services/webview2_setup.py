@@ -21,6 +21,11 @@ experience (ANTIVIRUS_AUDIT follow-up, 2026-06):
     exists at the registry-reported path, and falls back to scanning the
     well-known install folders.
 
+Detection contract (keep in sync with installer/installer.iss):
+  1. msedgewebview2.exe in well-known folders (primary).
+  2. EdgeUpdate registry location/path only when it resolves to a real binary.
+  Never trust ``pv`` alone.
+
 This file deliberately has zero third-party dependencies. ``winreg`` and
 ``pathlib`` are stdlib; the only ctypes call is ``ExpandEnvironmentStringsW``
 which is used to expand ``%ProgramFiles%`` in a HKLM-registered custom path.
@@ -250,13 +255,32 @@ def webview2_installed() -> bool:
     return False
 
 
+def wait_for_webview2(timeout_sec: float = 60.0, interval_sec: float = 0.5) -> bool:
+    """Poll until WebView2 is usable or *timeout_sec* elapses.
+
+    Handles post-install lag: Microsoft's bootstrapper can exit before
+    ``msedgewebview2.exe`` appears (same 60 s window as Inno ``PrepareToInstall``).
+    """
+    if os.name != "nt":
+        return True
+    if webview2_installed():
+        return True
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while time.monotonic() < deadline:
+        time.sleep(max(0.05, interval_sec))
+        if webview2_installed():
+            logger.info("WebView2 detected after post-install wait")
+            return True
+    return webview2_installed()
+
+
 def webview2_version() -> Optional[str]:
     """Return the WebView2 Runtime version string, or None if not installed.
 
     Useful for diagnostics and for the bootstrapper to decide whether a
     newer download is needed.
     """
-    if os.name != "nt":
+    if os.name != "nt" or not webview2_installed():
         return None
     try:
         import winreg
@@ -279,17 +303,19 @@ def webview2_version() -> Optional[str]:
 
 
 def ensure_webview2() -> bool:
-    """Return True when WebView2 is available. Otherwise show a setup dialog."""
+    """Return True when WebView2 is available.
+
+    Waits up to 60 s for post-install lag (installer bootstrapper), then shows
+    a setup dialog for portable-zip users. Does not download or execute
+    installers inside VOD.RIP.
+    """
     if webview2_installed():
         return True
     if os.name != "nt":
         return False
 
-    # Registry can lag a few seconds right after the Setup installer finishes WebView2.
-    for _ in range(8):
-        time.sleep(0.5)
-        if webview2_installed():
-            return True
+    if wait_for_webview2(timeout_sec=60.0):
+        return True
 
     return _show_setup_dialog()
 
