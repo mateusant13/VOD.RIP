@@ -105,10 +105,71 @@ def show_window() -> None:
             _window.show()
             if hasattr(_window, "restore"):
                 _window.restore()
+            _raise_window_foreground(_window)
         elif _show_window_cb:
             _show_window_cb()
     except Exception as exc:
         _logger.debug("show window: %s", exc)
+
+
+def _raise_window_foreground(window: Any) -> None:
+    """Best-effort bring the native window above other apps (Windows)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        ASFW_ANY = 0xFFFFFFFF
+        GA_ROOT = 2
+
+        try:
+            user32.AllowSetForegroundWindow(ASFW_ANY)
+        except Exception:
+            pass
+
+        hwnd = 0
+        native = getattr(window, "native", None)
+        if native is not None:
+            hwnd = int(
+                getattr(native, "Handle", None)
+                or getattr(native, "hwnd", None)
+                or native
+                or 0
+            )
+        if not hwnd:
+            hwnd = _find_vodrip_hwnd_windows()
+        if not hwnd:
+            return
+
+        root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+        user32.ShowWindow(root, SW_RESTORE)
+        user32.SetForegroundWindow(root)
+    except Exception as exc:
+        _logger.debug("raise window foreground: %s", exc)
+
+
+def _find_vodrip_hwnd_windows() -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    found: list[int] = []
+
+    def _cb(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = ctypes.create_unicode_buffer(512)
+        if user32.GetWindowTextW(hwnd, title, 512) and title.value.startswith("VOD.RIP"):
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return found[0] if found else 0
 
 
 def request_app_exit() -> None:

@@ -154,7 +154,9 @@ def _request_graceful_shutdown(port: int) -> bool:
         import requests
 
         info = requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.5)
-        if info.status_code != 200 or info.json().get("name") != "VOD.RIP":
+        from services.single_instance import is_vodrip_api_name
+
+        if info.status_code != 200 or not is_vodrip_api_name(info.json().get("name", "")):
             return False
         response = requests.post(f"http://127.0.0.1:{port}/api/exit", timeout=2)
         return response.status_code == 200
@@ -287,7 +289,9 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
         import requests
 
         info = requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
-        if info.status_code == 200 and info.json().get("name") == "VOD.RIP":
+        from services.single_instance import is_vodrip_api_name
+
+        if info.status_code == 200 and is_vodrip_api_name(info.json().get("name", "")):
             return True
     except Exception:
         pass

@@ -60,6 +60,7 @@ def _hidden_imports():
         "services.gpu_detect",
         "services.size_estimate",
         "services.kick_api_service",
+        "services.single_instance",
         "services.webview2_setup",
         "services.preview_service",
         "services.download_manager",

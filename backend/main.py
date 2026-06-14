@@ -1582,6 +1582,15 @@ async def download_stream(download_id: str, request: Request):
 # --- System ---
 
 
+@app.post("/api/focus")
+async def focus_app():
+    """Bring the desktop window to the foreground (second-instance launch)."""
+    from services.app_lifecycle import show_window
+
+    show_window()
+    return {"ok": True}
+
+
 @app.post("/api/exit")
 async def exit_app():
     """Shut down all processes and kill the server."""

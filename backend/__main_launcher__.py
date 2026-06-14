@@ -530,6 +530,17 @@ def main():
     """Application entry point."""
     multiprocessing.freeze_support()
 
+    port = int(os.environ.get("PORT", 7897))
+
+    if getattr(sys, "frozen", False):
+        try:
+            from services.single_instance import try_activate_existing
+
+            if try_activate_existing(port):
+                sys.exit(0)
+        except Exception:
+            pass
+
     log_path = _setup_logging()
     _setup_environment()
     _set_windows_app_identity()
@@ -544,7 +555,6 @@ def main():
     except Exception as exc:
         logging.getLogger("VOD.RIP").warning("Crash handler install failed: %s", exc)
 
-    port = int(os.environ.get("PORT", 7897))
     logger = logging.getLogger("VOD.RIP")
 
     logger.info("Starting FastAPI on 127.0.0.1:%d", port)
