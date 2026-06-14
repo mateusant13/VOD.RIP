@@ -599,24 +599,49 @@ def main():
     logger.info("Server ready — launching UI")
 
     webview2_ok = True
-    if not _launch_pywebview(port):
+    # F-up-2026-06: check WebView2 BEFORE attempting PyWebView on a packaged
+    # Windows build. If we know WebView2 is missing, going straight to the
+    # setup dialog saves a wasted PyWebView attempt (which would either fail
+    # silently with a stale EBWebView cache, or briefly open a half-broken
+    # window before crashing). The browser-mode fallback is reserved for
+    # systems where we genuinely don't know whether WebView2 is present
+    # (e.g. dev mode on Linux/macOS).
+    webview2_known_missing = False
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        try:
+            from services.webview2_setup import webview2_installed as _w2i
+            if not _w2i():
+                logger.info("WebView2 missing at startup — showing setup guide before UI launch")
+                from services.webview2_setup import ensure_webview2
+                webview2_ok = ensure_webview2()
+                if not webview2_ok:
+                    webview2_known_missing = True
+        except Exception as exc:
+            logger.warning("WebView2 pre-check failed: %s", exc)
+
+    if not webview2_known_missing:
+        if _launch_pywebview(port):
+            # Success: PyWebView window is up. Shut down the API server and exit.
+            _shutdown(port)
+            sys.exit(0)
         if os.name == "nt" and getattr(sys, "frozen", False):
             try:
                 from services.webview2_setup import ensure_webview2, webview2_installed
-
                 if not webview2_installed():
-                    logger.info("PyWebView failed and WebView2 missing — showing setup guide")
                     webview2_ok = ensure_webview2()
                     if webview2_ok and _launch_pywebview(port):
                         _shutdown(port)
-                        os._exit(0)
+                        sys.exit(0)
             except Exception as exc:
                 logger.warning("WebView2 setup failed: %s", exc)
                 webview2_ok = False
-        _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
+    else:
+        webview2_ok = False
 
+    # PyWebView never succeeded — fall back to the browser mode + tray.
+    _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
     _shutdown(port)
-    os._exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

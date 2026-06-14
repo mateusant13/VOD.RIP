@@ -214,6 +214,7 @@ def ensure_windows_shortcuts(exe_path: Path, working_dir: Path, *, desktop: bool
         return
     programs = _programs_dir()
     programs.mkdir(parents=True, exist_ok=True)
+    start_lnk = programs / f"{_APP_NAME}.lnk"
     description = f"{_APP_NAME} — Kick & Twitch downloader"
     ok = _create_shortcut(start_lnk, exe_path, working_dir, exe_path, description)
     if not ok:
