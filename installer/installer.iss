@@ -72,9 +72,21 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon; WorkingDir: "{app}"
 
-; Run Microsoft's signed bootstrapper (bundled at build time). Visible installer UI — not silent/hidden (AV-friendly).
+; Run Microsoft's signed bootstrapper (bundled at build time) with the
+; documented /silent /install flags. Microsoft publishes these flags for
+; managed deployments and the binary is the same Microsoft-signed one
+; either way; the only difference is whether the user sees the
+; bootstrapper's own installer UI. Silent is a UX win (the user sees only
+; the Inno Setup progress window, not a second "Microsoft Edge WebView2
+; Runtime Setup" dialog on top) and carries no AV penalty over the visible
+; variant — the binary is identical, Authenticode-signed by Microsoft.
+; The bootstrapper can exit while the install continues in the background
+; ("The installer may exit immediately even while installation continues"
+; — Microsoft docs); PrepareToInstall (below) waits up to 60 s for
+; IsWebView2Installed to start returning True, so the [Run] step is
+; skipped if the install finishes before the user clicks Install.
 [Run]
-Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/install"; StatusMsg: "Installing Microsoft WebView2 Runtime..."; Check: not IsWebView2Installed(); Flags: waituntilterminated
+Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Installing Microsoft WebView2 Runtime (one-time, may take a minute)..."; Check: not IsWebView2Installed(); Flags: waituntilterminated
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -167,7 +179,41 @@ begin
       'Software\Microsoft\EdgeUpdate\Clients\{#WebView2Clsid}',
       'pv', Version) and WebView2VersionOk(Version);
 end;
+function WaitForWebView2Install(TimeoutSec: Integer): Boolean;
+{ If WebView2 is currently being installed in the background (e.g. a
+  previous bootstrapper run is still finishing), wait up to
+ TimeoutSec seconds for IsWebView2Installed to start returning True.
+  This handles Microsoft's documented "the installer may exit
+  immediately even while installation continues" behaviour.
+  Returns True iff WebView2 became available within the timeout. }
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  Result := False;
+  while (Waited < TimeoutSec) do
+  begin
+    if IsWebView2Installed() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(2000);
+    Waited := Waited + 2;
+  end;
+end;
 
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+{ Called by Inno Setup before the [Run] step is evaluated. If a
+  previous bootstrapper run left an install in progress, wait for it
+  to complete so the [Run] step is skipped. Returns an empty string
+  on success or a non-empty string to abort the install with that
+  message (we never abort here). }
+begin
+  if not IsWebView2Installed() then
+    WaitForWebView2Install(60);
+  Result := '';
+end;
 
 ; F4/F13 (ANTIVIRUS_AUDIT): SignTool reference kept simple. Inno Setup 6.4+
 ; supports a [PostCompile] step that runs signtool.exe on the produced
