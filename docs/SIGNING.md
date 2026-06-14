@@ -1,9 +1,8 @@
 # Code signing for VOD.RIP
 
-> Closes ANTIVIRUS_AUDIT findings F4 and F13. Until this is in place, every
-> first-time installer download triggers a "Windows protected your PC"
-> SmartScreen prompt, and VirusTotal reports 5-15 detections of the
-> `PUA:Win32/UnsignedInstaller` and `RiskWare.Tool.Installer` families.
+> Until signing is in place, every first-time installer download triggers a
+> "Windows protected your PC" SmartScreen prompt. End users can bypass it with
+> **More info** → **Run anyway** (documented in the README).
 
 ## Why
 
@@ -92,9 +91,8 @@ hurts conversion — EV is recommended.
 - The in-app portable update flow — portable zip updates now **verify SHA-256**
   and open Explorer instead of robocopy/PowerShell; Setup.exe still launches
   the signed installer. For lowest false positives, prefer Setup.exe updates.
-- The bundled ffmpeg.exe / ffprobe.exe — see ANTIVIRUS_AUDIT F2. Bundling
-  third-party unsigned binaries keeps the `PUA:Win32/BundledTool` flag
-  active even when the launcher is signed.
+- The bundled ffmpeg.exe / ffprobe.exe — third-party unsigned binaries can
+  still trigger `PUA:Win32/BundledTool` even when the launcher is signed.
 
 ## After signing — reduce false positives faster
 
