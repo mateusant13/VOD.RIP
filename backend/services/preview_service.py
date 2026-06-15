@@ -711,17 +711,16 @@ def create_session(
     with _lock:
         _sessions[session_id] = session
         if len(_sessions) > _MAX_SESSIONS:
-            now = time.time()
             stale = sorted(
                 _sessions.items(),
                 key=lambda item: item[1].last_access,
             )[:len(_sessions) - _MAX_SESSIONS]
-            for sid, _ in stale:
-                _sessions.pop(sid, None)
+            for popped_sid, popped_session in stale:
+                del _sessions[popped_sid]
+                cache_dir = popped_session.cache_dir
                 threading.Thread(
-                    target=lambda: shutil.rmtree(
-                        (getattr(_sessions.get(sid), 'cache_dir', None) or Path('/dev/null')),
-                        ignore_errors=True,
+                    target=lambda d=cache_dir: shutil.rmtree(
+                        d, ignore_errors=True,
                     ),
                     daemon=True,
                 ).start()

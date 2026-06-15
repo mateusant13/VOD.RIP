@@ -4,6 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
+import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
@@ -43,9 +44,6 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 
-const API_BASE = '';
-const BACKEND_HINT =
-  'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).';
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 const PREVIEW_DEFAULT_VOLUME = 0.3;
@@ -71,51 +69,6 @@ interface ChannelExplorePopupProps {
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
   onBringToFront: () => void;
-}
-
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    throw new Error(BACKEND_HINT);
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-async function apiGet<T>(path: string): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`);
-  } catch {
-    throw new Error(BACKEND_HINT);
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-async function apiDelete(path: string): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
-  } catch {
-    throw new Error(BACKEND_HINT);
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
-  }
 }
 
 function formatHmsFull(sec: number): string {
