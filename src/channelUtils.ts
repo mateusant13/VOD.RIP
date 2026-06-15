@@ -180,7 +180,7 @@ export function parseChannelInput(raw: string): { displayName: string; kickSlug:
 /** Settings/section captions — not <label> so clicks never focus nearby inputs. */
 
 export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips'): Record<string, string> {
-  return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? ch.errors ?? {});
+  return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {});
 }
 
 export function formatChannelErrorMessage(
@@ -213,7 +213,7 @@ export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
     vodVideos = legacy.filter((v) => !isLikelyClip(v));
     clipVideos = legacy.filter(isLikelyClip);
   }
-  const legacyErrors = ch.errors ?? {};
+  const legacyErrors = (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {};
   return {
     ...rest,
     vodVideos: vodVideos ?? [],
@@ -365,6 +365,30 @@ export function estimateDownloadBytes(
   }
   const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
   return Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
+}
+
+
+export function loadStoredChannelUi(): {
+  kick: boolean;
+  twitch: boolean;
+  content: 'vods' | 'clips';
+} {
+  try {
+    const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
+    if (!raw) return { kick: true, twitch: true, content: 'vods' };
+    const p = JSON.parse(raw) as {
+      kick?: boolean;
+      twitch?: boolean;
+      content?: string;
+    };
+    return {
+      kick: p.kick !== false,
+      twitch: p.twitch !== false,
+      content: p.content === 'clips' ? 'clips' : 'vods',
+    };
+  } catch {
+    return { kick: true, twitch: true, content: 'vods' };
+  }
 }
 
 export const CHANNEL_INITIAL_VISIBLE = 5;

@@ -5,7 +5,6 @@ import { panelMaxWidthCap, readUiScale } from './uiScale';
 import { panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import type { PanelSize, PanelPos, LayoutPanelKey, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
 import type { MutableRefObject, Dispatch, SetStateAction, PointerEvent as ReactPointerEvent } from 'react';
-import { CHANNEL_UI_STORAGE_KEY } from './channelUtils';
 
 export function panelMaxW(): number {
   return panelMaxWidthCap();
@@ -374,28 +373,6 @@ export function readPreviewFsUiScale(): number {
     return PREVIEW_FS_SCALE_STEPS.includes(v as (typeof PREVIEW_FS_SCALE_STEPS)[number]) ? v : 1;
   } catch {
     return 1;
-  }
-}
-export function loadStoredChannelUi(): {
-  kick: boolean;
-  twitch: boolean;
-  content: 'vods' | 'clips';
-} {
-  try {
-    const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
-    if (!raw) return { kick: true, twitch: true, content: 'vods' };
-    const p = JSON.parse(raw) as {
-      kick?: boolean;
-      twitch?: boolean;
-      content?: string;
-    };
-    return {
-      kick: p.kick !== false,
-      twitch: p.twitch !== false,
-      content: p.content === 'clips' ? 'clips' : 'vods',
-    };
-  } catch {
-    return { kick: true, twitch: true, content: 'vods' };
   }
 }
 export const PREVIEW_KEY_SKIP_SEC = 5;

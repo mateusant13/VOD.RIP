@@ -100,8 +100,6 @@ export interface SavedChannel {
   clipVideos: ChannelVideo[];
   vodErrors?: Record<string, string>;
   clipErrors?: Record<string, string>;
-  /** @deprecated use vodErrors / clipErrors */
-  errors?: Record<string, string>;
   updatedAt: string;
   loading?: boolean;
   /** True after at least one clips fetch completed (success or failure). */
