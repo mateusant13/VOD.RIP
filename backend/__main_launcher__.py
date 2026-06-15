@@ -27,6 +27,41 @@ from pathlib import Path
 # Prevent console windows from popping up on Windows subprocess calls
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+# ---------------------------------------------------------------------------
+# Subprocess console suppression (Windows only)
+# ---------------------------------------------------------------------------
+# ytdlp, ffmpeg, ffprobe and friends spawn their own children via
+# subprocess.Popen without creationflags. On Windows a console-attached
+# process briefly shows a cmd window, even from a windowed PyInstaller
+# EXE. Subclass the real Popen and default creationflags to
+# CREATE_NO_WINDOW so every spawn (ours, ytdlp's, ffmpeg's) hides its
+# console.
+#
+# IMPORTANT: ``subprocess.Popen`` must stay a *class* — yt-dlp does
+# ``class Popen(subprocess.Popen):`` at import time inside
+# ``yt_dlp/utils/_utils.py``. Replacing the class with a function
+# breaks that subclassing with
+# ``TypeError: function() argument 'code' must be code, not str``.
+# ponytail: revert if any child process needs an attached console.
+
+if os.name == "nt":
+    _orig_popen = subprocess.Popen
+
+    class _SilentPopen(_orig_popen):  # type: ignore[misc, valid-type]
+        """Popen subclass that defaults ``creationflags`` to CREATE_NO_WINDOW.
+
+        Subclassing (instead of replacing with a function) keeps
+        ``subprocess.Popen`` a class so libraries that subclass it
+        themselves — notably yt-dlp — still import cleanly.
+        """
+
+        def __init__(self, args, *p_args, **kwargs):  # type: ignore[no-untyped-def]
+            if "creationflags" not in kwargs:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            super().__init__(args, *p_args, **kwargs)
+
+    subprocess.Popen = _SilentPopen  # type: ignore[assignment,misc]
+
 # Import shared path helper from settings (single source of truth).
 from services.settings import SettingsManager, _get_appdata_dir
 
@@ -533,12 +568,28 @@ def main():
     port = int(os.environ.get("PORT", 7897))
 
     if getattr(sys, "frozen", False):
+        # Hard process-level singleton. The file lock is held for the
+        # lifetime of the first process; a second VOD-RIP.exe cannot
+        # acquire it and must exit immediately, even during the first
+        # instance's slow cold start when the HTTP API isn't up yet.
         try:
-            from services.single_instance import try_activate_existing
+            from services.single_instance import (
+                acquire_process_lock,
+                try_activate_existing,
+            )
 
-            if try_activate_existing(port):
+            lock_token = acquire_process_lock()
+            if lock_token is None:
+                # Another VOD.RIP is already running for this user. Try
+                # to bring its window forward; if the API isn't ready
+                # yet, the launcher exits silently — the first process
+                # is the one the user actually sees.
+                try_activate_existing(port)
                 sys.exit(0)
+            # Keep the lock alive for the process lifetime.
+            globals()["_SINGLETON_LOCK"] = lock_token
         except Exception:
+            # ponytail: single-instance errors only — best-effort; continues if it fails
             pass
 
     log_path = _setup_logging()

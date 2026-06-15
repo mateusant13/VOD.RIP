@@ -960,7 +960,14 @@ class DownloadManager:
             )[:50]
 
     def get_active_and_history(self) -> dict:
-        """Return unified queue + completed history lists."""
+        """Return unified queue + completed history lists.
+
+        Active queue: in-memory + persisted queue entries that are still
+        running / paused / not yet terminal. Failed / Cancelled / Interrupted
+        belong in the *recent* section of history (with a Resume button)
+        — promoting them back into the queue created runaway duplicate rows
+        after a handful of retries, so keep them in history only.
+        """
         with self._lock:
             in_memory = list(self._downloads.values())
 
@@ -992,26 +999,41 @@ class DownloadManager:
             except Exception:
                 logger.debug("Skipping malformed history entry %s", did, exc_info=True)
 
-        for state in merged_history.values():
-            if state.status not in _UNFINISHED_STATUSES:
-                continue
-            if state.download_id not in queue_map:
-                queue_map[state.download_id] = state
-
-        queue = sorted(
+        # Dedupe by (url, unfinished_status) so the same failed URL
+        # doesn't appear N times after repeated retries.
+        sorted_queue = sorted(
             queue_map.values(),
             key=lambda d: d.started_at or "",
             reverse=True,
+        )
+        seen_unfinished: set[tuple[str, str]] = set()
+        deduped_queue: list[DownloadState] = []
+        for d in sorted_queue:
+            if d.status in _UNFINISHED_STATUSES:
+                key = (d.url, d.status)
+                if key in seen_unfinished:
+                    continue
+                seen_unfinished.add(key)
+            deduped_queue.append(d)
+            if len(deduped_queue) >= 50:
+                break
+
+        recent_history = sorted(
+            merged_history.values(),
+            key=lambda d: d.started_at or "",
+            reverse=True,
         )[:50]
-        history = [
-            d for d in sorted(
-                merged_history.values(),
-                key=lambda d: d.started_at or "",
-                reverse=True,
-            )
-            if d.status == "Completed"
-        ][:50]
-        return {"queue": queue, "history": history}
+
+        # Split recent into resumable vs completed so the UI can show
+        # a "Recent" section with Resume buttons and a "Completed" section.
+        recent_unfinished = [d for d in recent_history if d.status in _UNFINISHED_STATUSES]
+        completed_history = [d for d in recent_history if d.status == "Completed"]
+
+        return {
+            "queue": deduped_queue,
+            "recent": recent_unfinished,
+            "history": completed_history,
+        }
 
     def get_resumable_entry(self, download_id: str) -> Optional[dict]:
         """Return a resumable entry from memory, queue.json, or history."""
