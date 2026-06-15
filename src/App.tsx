@@ -39,8 +39,10 @@ import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename } from './formatters';
-import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab } from './types';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, PanelSize, LayoutPanelBoundsInput } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS } from './channelUtils';
+import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, readPreviewFsUiScale, loadStoredChannelUi, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_FS_SCALE_STEPS, PREVIEW_FS_SCALE_KEY, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import FieldCaption from './components/FieldCaption';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -49,7 +51,6 @@ import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
-import { panelMaxWidthCap, readUiScale } from './uiScale';
 import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 
@@ -58,21 +59,6 @@ const IS_DEV_UI = import.meta.env.DEV;
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-function readPreviewFsUiScale(): number {
-  try {
-    const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
-    const v = raw ? parseFloat(raw) : 1;
-    return PREVIEW_FS_SCALE_STEPS.includes(v as (typeof PREVIEW_FS_SCALE_STEPS)[number]) ? v : 1;
-  } catch {
-    return 1;
-  }
-}
-const PREVIEW_KEY_SKIP_SEC = 5;
-const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
-const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
-
-const PREVIEW_DEFAULT_VOLUME = 0.3;
 
 /** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
 function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
@@ -87,395 +73,22 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   }
   return false;
 }
-type PanelSize = { w: number; h: number };
-type PanelPos = { x: number; y: number };
 
-const PREVIEW_PANEL_DEFAULT_W = 640;
-const PREVIEW_PANEL_MIN_W = 280;
-const PREVIEW_PANEL_CHROME_H_EST = 120;
-const PREVIEW_PANEL_PAD_H = 32;
-const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
-const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
-const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
-const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 
-function panelMaxW(): number {
-  return panelMaxWidthCap();
-}
-/** Minimum clear space between panel chrome (incl. shadow) and viewport edges. */
-const VIEWPORT_EDGE_LOCK = 40;
-const EXPLORE_POPUP_Z = 9999;
-const MAX_EXPLORE_POPUPS = 5;
-const LAYOUT_ROW_GAP_TRIPLE = 12;
-const LAYOUT_ROW_GAP_SPLIT = 24;
-function panelMaxHeight() {
-  return Math.round(window.innerHeight * 0.92);
-}
+;
+;
+;
 
-type LayoutPanelKey = 'preview' | 'urlAside' | 'main';
 
-interface LayoutPanelBoundsInput {
-  previewOpen: boolean;
-  urlPanelAside: boolean;
-  preview: PanelSize;
-  urlAside: PanelSize;
-  main: PanelSize;
-}
 
-function viewportContentBox(shadowPad = panelResizeHandleInset(false)): { maxW: number; maxH: number } {
-  return {
-    maxW: Math.max(PANEL_MIN.w, window.innerWidth - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
-    maxH: Math.max(PANEL_MIN.h, window.innerHeight - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
-  };
-}
 
-function layoutRowGap(previewOpen: boolean, urlPanelAside: boolean): number {
-  const count = (previewOpen ? 1 : 0) + (urlPanelAside ? 1 : 0) + 1;
-  if (count <= 1) return 0;
-  return previewOpen && urlPanelAside ? LAYOUT_ROW_GAP_TRIPLE : LAYOUT_ROW_GAP_SPLIT;
-}
+;
 
-function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsInput): number {
-  const { maxW } = viewportContentBox();
-  const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
-  const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
-
-  let othersW = 0;
-  if (layout.previewOpen && target !== 'preview') othersW += layout.preview.w;
-  if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
-  if (target !== 'main') othersW += layout.main.w;
-
-  return Math.max(PANEL_MIN.w, Math.min(panelMaxW(), maxW - othersW - gapTotal));
-}
-
-function layoutMaxPanelHeight(): number {
-  return Math.min(panelMaxHeight(), viewportContentBox().maxH);
-}
-
-function clampPanelSizeForLayout(
-  target: LayoutPanelKey,
-  size: PanelSize,
-  layout: LayoutPanelBoundsInput,
-): PanelSize {
-  const maxW = layoutMaxPanelWidth(target, layout);
-  const maxH = layoutMaxPanelHeight();
-  return {
-    w: Math.min(maxW, Math.max(PANEL_MIN.w, size.w)),
-    h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
-  };
-}
-
-function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
-  preview: PanelSize;
-  urlAside: PanelSize;
-  main: PanelSize;
-} {
-  const maxH = layoutMaxPanelHeight();
-  let preview = { ...layout.preview };
-  let urlAside = { ...layout.urlAside };
-  let main = { ...layout.main };
-  const snapshot = (): LayoutPanelBoundsInput => ({
-    ...layout,
-    preview,
-    urlAside,
-    main,
-  });
-
-  if (layout.previewOpen) {
-    const w = clampPreviewPanelWidth(
-      preview.w,
-      PREVIEW_PANEL_CHROME_H_EST,
-      PREVIEW_VIDEO_ASPECT_DEFAULT,
-      snapshot(),
-    );
-    preview = { w, h: preview.h };
-  }
-  if (layout.urlPanelAside) {
-    urlAside = clampPanelSizeForLayout('urlAside', { ...urlAside, h: Math.min(urlAside.h, maxH) }, snapshot());
-  }
-  main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
-
-  return { preview, urlAside, main };
-}
-
-function maxPreviewPanelWidth(
-  chromeH: number,
-  aspect: number,
-  layout: LayoutPanelBoundsInput,
-): number {
-  const shadowPad = panelResizeHandleInset(true);
-  const { maxH } = viewportContentBox(shadowPad);
-  const capW = Math.min(panelMaxW(), layoutMaxPanelWidth('preview', layout));
-  const videoMaxW = capW - PREVIEW_PANEL_PAD_H;
-  const videoMaxH = Math.max(100, maxH - chromeH - PREVIEW_PANEL_PAD_H);
-  const videoMaxWFromH = videoMaxH * aspect;
-  return Math.floor(Math.min(videoMaxW, videoMaxWFromH) + PREVIEW_PANEL_PAD_H);
-}
-
-function clampPreviewPanelWidth(
-  width: number,
-  chromeH: number,
-  aspect: number,
-  layout: LayoutPanelBoundsInput,
-): number {
-  const minW = Math.min(PREVIEW_PANEL_MIN_W, maxPreviewPanelWidth(chromeH, aspect, layout));
-  const maxW = maxPreviewPanelWidth(chromeH, aspect, layout);
-  return Math.min(maxW, Math.max(minW, width));
-}
-
-function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
-  el.style.position = 'fixed';
-  el.style.top = `${pos.y}px`;
-  el.style.left = `${pos.x}px`;
-  el.style.right = 'auto';
-  el.style.bottom = 'auto';
-  el.style.zIndex = String(EXPLORE_POPUP_Z);
-}
-
-function edgeAffectsWest(edge: ResizeEdge): boolean {
-  return edge === 'w' || edge === 'nw' || edge === 'sw';
-}
-
-function edgeAffectsNorth(edge: ResizeEdge): boolean {
-  return edge === 'n' || edge === 'ne' || edge === 'nw';
-}
-
-const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {
-  n: 'ns-resize',
-  s: 'ns-resize',
-  e: 'ew-resize',
-  w: 'ew-resize',
-  ne: 'nesw-resize',
-  nw: 'nwse-resize',
-  se: 'nwse-resize',
-  sw: 'nesw-resize',
-};
-
-function calcPanelSizeFromEdge(
-  edge: ResizeEdge,
-  startW: number,
-  startH: number,
-  dx: number,
-  dy: number,
-): PanelSize {
-  let w = startW;
-  let h = startH;
-  if (edge === 'e' || edge === 'ne' || edge === 'se') w = startW + dx;
-  else if (edge === 'w' || edge === 'nw' || edge === 'sw') w = startW - dx;
-  if (edge === 's' || edge === 'se' || edge === 'sw') h = startH + dy;
-  else if (edge === 'n' || edge === 'ne' || edge === 'nw') h = startH - dy;
-  return { w, h };
-}
-
-function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: number): number {
-  switch (edge) {
-    case 'e': return dx;
-    case 'w': return -dx;
-    case 's': return dy * aspect;
-    case 'n': return -dy * aspect;
-    case 'se': return Math.max(dx, dy * aspect);
-    case 'sw': return Math.max(-dx, dy * aspect);
-    case 'ne': return Math.max(dx, -dy * aspect);
-    case 'nw': return Math.max(-dx, -dy * aspect);
-    default: return dx;
-  }
-}
-
-function applyPanelSize(el: HTMLElement, size: PanelSize) {
-  el.style.width = `${size.w}px`;
-  el.style.height = `${size.h}px`;
-}
-
-function startPanelResizeDrag(
-  e: ReactPointerEvent<HTMLDivElement>,
-  edge: ResizeEdge,
-  sizeRef: MutableRefObject<PanelSize>,
-  setSize: Dispatch<SetStateAction<PanelSize>>,
-  opts?: {
-    maxW?: number;
-    maxH?: number;
-    panelEl?: HTMLElement | null;
-    clampSize?: (size: PanelSize) => PanelSize;
-  },
-) {
-  e.preventDefault();
-  e.stopPropagation();
-  const handle = e.currentTarget;
-  handle.setPointerCapture(e.pointerId);
-
-  const startX = e.clientX;
-  const startY = e.clientY;
-  const { w: startW, h: startH } = sizeRef.current;
-  const maxW = opts?.maxW ?? panelMaxW();
-  const maxH = opts?.maxH ?? panelMaxHeight();
-  const panelEl = opts?.panelEl ?? null;
-
-  if (panelEl) {
-    panelEl.style.willChange = 'width, height';
-  }
-  const prevUserSelect = document.body.style.userSelect;
-  const prevCursor = document.body.style.cursor;
-  document.body.style.userSelect = 'none';
-  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
-
-  const calcSize = (clientX: number, clientY: number): PanelSize => {
-    const raw = calcPanelSizeFromEdge(edge, startW, startH, clientX - startX, clientY - startY);
-    return {
-      w: Math.min(maxW, Math.max(PANEL_MIN.w, raw.w)),
-      h: Math.min(maxH, Math.max(PANEL_MIN.h, raw.h)),
-    };
-  };
-
-  const onMove = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    let next = calcSize(ev.clientX, ev.clientY);
-    if (opts?.clampSize) next = opts.clampSize(next);
-    sizeRef.current = next;
-    if (panelEl) {
-      applyPanelSize(panelEl, next);
-    }
-  };
-
-  const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    handle.releasePointerCapture(e.pointerId);
-    handle.removeEventListener('pointermove', onMove);
-    handle.removeEventListener('pointerup', onUp);
-    handle.removeEventListener('pointercancel', onUp);
-    document.body.style.userSelect = prevUserSelect;
-    document.body.style.cursor = prevCursor;
-    if (panelEl) {
-      panelEl.style.willChange = '';
-    }
-    const final = opts?.clampSize ? opts.clampSize(sizeRef.current) : sizeRef.current;
-    sizeRef.current = final;
-    if (panelEl) {
-      applyPanelSize(panelEl, final);
-    }
-    setSize({ ...final });
-  };
-
-  handle.addEventListener('pointermove', onMove);
-  handle.addEventListener('pointerup', onUp);
-  handle.addEventListener('pointercancel', onUp);
-}
-
-function applyPanelWidth(el: HTMLElement, width: number) {
-  el.style.width = `${width}px`;
-  el.style.height = '';
-}
-
-function startPanelWidthResize(
-  e: ReactPointerEvent<HTMLDivElement>,
-  edge: ResizeEdge,
-  widthRef: MutableRefObject<number>,
-  setWidth: Dispatch<SetStateAction<number>>,
-  opts: {
-    panelEl: HTMLElement | null;
-    clampWidth: (w: number) => number;
-    aspect: number;
-    posRef?: MutableRefObject<PanelPos | null>;
-    setPos?: Dispatch<SetStateAction<PanelPos | null>>;
-  },
-) {
-  e.preventDefault();
-  e.stopPropagation();
-  const handle = e.currentTarget;
-  handle.setPointerCapture(e.pointerId);
-
-  const startX = e.clientX;
-  const startY = e.clientY;
-  const startW = widthRef.current;
-  const startPos = opts.posRef?.current ? { ...opts.posRef.current } : null;
-  const panelEl = opts.panelEl;
-  const clamp = opts.clampWidth;
-
-  if (panelEl) {
-    panelEl.style.willChange = 'width';
-  }
-  const prevUserSelect = document.body.style.userSelect;
-  const prevCursor = document.body.style.cursor;
-  document.body.style.userSelect = 'none';
-  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
-
-  const applyWidthAndPos = (nextW: number) => {
-    widthRef.current = nextW;
-    if (panelEl) {
-      applyPanelWidth(panelEl, nextW);
-    }
-    if (startPos && opts.posRef && panelEl) {
-      let x = startPos.x;
-      let y = startPos.y;
-      if (edgeAffectsWest(edge)) {
-        x = startPos.x + startW - nextW;
-      }
-      if (edgeAffectsNorth(edge)) {
-        y = startPos.y - (nextW - startW) / opts.aspect;
-      }
-      const pos = { x, y };
-      opts.posRef.current = pos;
-      applyExplorePopupWindowPosition(panelEl, pos);
-    }
-  };
-
-  const onMove = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
-    applyWidthAndPos(clamp(startW + delta));
-  };
-
-  const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    handle.releasePointerCapture(e.pointerId);
-    handle.removeEventListener('pointermove', onMove);
-    handle.removeEventListener('pointerup', onUp);
-    handle.removeEventListener('pointercancel', onUp);
-    document.body.style.userSelect = prevUserSelect;
-    document.body.style.cursor = prevCursor;
-    if (panelEl) {
-      panelEl.style.willChange = '';
-    }
-    const finalW = clamp(widthRef.current);
-    applyWidthAndPos(finalW);
-    setWidth(finalW);
-    if (opts.setPos && opts.posRef?.current) {
-      opts.setPos({ ...opts.posRef.current });
-    }
-  };
-
-  handle.addEventListener('pointermove', onMove);
-  handle.addEventListener('pointerup', onUp);
-  handle.addEventListener('pointercancel', onUp);
-}
 
 function sourceQualityOptionLabel(resolutionLabel: string): string {
   return `source/${resolutionLabel.toLowerCase()}`;
 }
 
-const PANEL_LAYOUT_STORAGE_KEY = 'vodrip_panel_layout';
-
-function loadStoredChannelUi(): {
-  kick: boolean;
-  twitch: boolean;
-  content: 'vods' | 'clips';
-} {
-  try {
-    const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
-    if (!raw) return { kick: true, twitch: true, content: 'vods' };
-    const p = JSON.parse(raw) as {
-      kick?: boolean;
-      twitch?: boolean;
-      content?: string;
-    };
-    return {
-      kick: p.kick !== false,
-      twitch: p.twitch !== false,
-      content: p.content === 'clips' ? 'clips' : 'vods',
-    };
-  } catch {
-    return { kick: true, twitch: true, content: 'vods' };
-  }
-}
 
 interface PersistedPanelLayout {
   previewPanelWidth: number;
@@ -483,134 +96,9 @@ interface PersistedPanelLayout {
   main: PanelSize;
 }
 
-function clampLayoutNumber(value: unknown, min: number, max: number, fallback: number): number {
-  const n = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, Math.round(n)));
-}
 
-function clampStoredPanelSize(value: unknown, fallback: PanelSize): PanelSize {
-  if (!value || typeof value !== 'object') return fallback;
-  const o = value as { w?: unknown; h?: unknown };
-  const maxH = typeof window !== 'undefined' ? panelMaxHeight() : fallback.h;
-  return {
-    w: clampLayoutNumber(o.w, PANEL_MIN.w, panelMaxW(), fallback.w),
-    h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
-  };
-}
+;
 
-function defaultPanelLayout(): PersistedPanelLayout {
-  const scale = readUiScale();
-  return {
-    previewPanelWidth: Math.round(PREVIEW_PANEL_DEFAULT_W * scale),
-    urlAside: {
-      w: Math.round(URL_ASIDE_PANEL_DEFAULT.w * scale),
-      h: Math.round(URL_ASIDE_PANEL_DEFAULT.h * scale),
-    },
-    main: {
-      w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
-      h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
-    },
-  };
-}
-
-function loadPanelLayout(): PersistedPanelLayout {
-  const fallback = defaultPanelLayout();
-  try {
-    const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<PersistedPanelLayout>;
-    return {
-      previewPanelWidth: clampLayoutNumber(
-        parsed.previewPanelWidth,
-        PREVIEW_PANEL_MIN_W,
-        panelMaxW(),
-        fallback.previewPanelWidth,
-      ),
-      urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
-      main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
-    };
-  } catch {
-    return fallback;
-  }
-}
-
-function persistPanelLayout(layout: PersistedPanelLayout) {
-  try {
-    localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
-  } catch {
-    /* quota / private mode */
-  }
-}
-
-
-type TrimRangeOpts = {
-  seek?: 'in' | 'out';
-  move?: 'in' | 'out';
-  fixedEnd?: number;
-  fixedStart?: number;
-};
-
-function clampTrimEndpoints(
-  rawStart: number,
-  rawEnd: number,
-  dur: number,
-  currentStart: number,
-  currentEnd: number,
-  opts?: TrimRangeOpts,
-): { start: number; end: number } {
-  let start: number;
-  let end: number;
-
-  if (opts?.move === 'in') {
-    const pinnedEnd = Math.min(dur, Math.max(1, Math.floor(opts.fixedEnd ?? currentEnd)));
-    end = pinnedEnd;
-    start = Math.max(0, Math.min(Math.floor(rawStart), pinnedEnd - 1));
-  } else if (opts?.move === 'out') {
-    const pinnedStart = Math.max(0, Math.min(
-      Math.floor(opts.fixedStart ?? currentStart),
-      dur - 1,
-    ));
-    start = pinnedStart;
-    end = Math.min(dur, Math.max(Math.floor(rawEnd), pinnedStart + 1));
-  } else {
-    start = Math.floor(rawStart);
-    end = Math.floor(rawEnd);
-    if (start >= end) {
-      if (opts?.seek === 'in') {
-        end = Math.min(dur, start + 1);
-      } else {
-        start = Math.max(0, end - 1);
-      }
-    }
-    start = Math.max(0, Math.min(start, dur - 1));
-    end = Math.min(dur, Math.max(end, start + 1));
-  }
-
-  return { start, end };
-}
-
-/** Start: button − extends clip (earlier), + trims. End: − trims, + extends. */
-function trimButtonDeltaForEndpoint(which: 'in' | 'out', buttonDelta: number): number {
-  return which === 'in' ? -buttonDelta : buttonDelta;
-}
-
-/** Move the active in/out endpoint by delta seconds (+ extends clip that way). */
-function adjustTrimEndpointByDelta(
-  start: number,
-  end: number,
-  dur: number,
-  which: 'in' | 'out',
-  delta: number,
-): { start: number; end: number } {
-  const minLen = 1;
-  if (which === 'in') {
-    const newStart = Math.max(0, Math.min(end - minLen, start - delta));
-    return { start: newStart, end };
-  }
-  const newEnd = Math.min(dur, Math.max(start + minLen, end + delta));
-  return { start, end: newEnd };
-}
 
 function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
   if (platform === 'kick') {
