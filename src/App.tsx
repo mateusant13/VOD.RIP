@@ -3856,13 +3856,54 @@ export default function App() {
     setEditingChannelName(ch.displayName);
   }, [savedChannels]);
 
-  const commitRenameChannel = useCallback(() => {
+  const commitRenameChannel = useCallback(async () => {
     if (!editingChannelId) return;
-    const next = editingChannelName.trim();
-    if (next) updateChannel(editingChannelId, { displayName: next });
+    const nextRaw = editingChannelName.trim();
+    const channelId = editingChannelId;
     setEditingChannelId(null);
     setEditingChannelName('');
-  }, [editingChannelId, editingChannelName, updateChannel]);
+    if (!nextRaw) return;
+    const ch = savedChannels.find((c) => c.id === channelId);
+    if (!ch) return;
+    // Re-derive slugs from the new name — pasting a Kick/Twitch URL or
+    // channel handle should rebind this saved channel to that target and
+    // re-fetch its VODs/clips, mirroring `handleAddChannel`. Without this
+    // step "rename" only changed the label and left the cached videos
+    // pointing at the old (now unrelated) channel.
+    const parsed = parseChannelInput(nextRaw);
+    const nextKick = parsed.kickSlug || ch.kickSlug;
+    const nextTwitch = parsed.twitchSlug || ch.twitchSlug;
+    const nextDisplay = parsed.displayName || nextRaw;
+    const slugChanged =
+      nextKick.toLowerCase() !== (ch.kickSlug || '').toLowerCase() ||
+      nextTwitch.toLowerCase() !== (ch.twitchSlug || '').toLowerCase();
+    if (!slugChanged) {
+      if (nextDisplay !== ch.displayName) {
+        updateChannel(channelId, { displayName: nextDisplay });
+      }
+      return;
+    }
+    const cleared = {
+      vodVideos: [] as ChannelVideo[],
+      clipVideos: [] as ChannelVideo[],
+      vodErrors: {} as Record<string, string>,
+      clipErrors: {} as Record<string, string>,
+      clipsFetched: false,
+    };
+    const updated: SavedChannel = {
+      ...ch,
+      displayName: nextDisplay,
+      kickSlug: nextKick,
+      twitchSlug: nextTwitch,
+      ...cleared,
+    };
+    clipsAutoFetchStartedRef.current.delete(channelId);
+    vodAutoFetchStartedRef.current.delete(channelId);
+    channelRefreshInFlightRef.current.delete(`${channelId}:vods`);
+    channelRefreshInFlightRef.current.delete(`${channelId}:clips`);
+    updateChannel(channelId, updated);
+    await refreshChannel(channelId, updated);
+  }, [editingChannelId, editingChannelName, savedChannels, updateChannel, refreshChannel]);
 
   const startEditPlatformSlug = useCallback((channelId: string, platform: 'Kick' | 'Twitch') => {
     const ch = savedChannels.find((c) => c.id === channelId);

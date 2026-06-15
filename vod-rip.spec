@@ -8,6 +8,7 @@ From project root::
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -180,9 +181,24 @@ coll = COLLECT(
     upx_exclude=[],
     name="VOD-RIP",
 )
-
 if _IS_MAC:
     _bundle_icon = str(_ICON_ICNS) if _ICON_ICNS.is_file() else None
+    # Pull the canonical version out of services/_version.py — the same file
+    # the Python entry point reads — so CFBundleVersion stays in lock-step
+    # with what the user sees in the UI. Parse it with a tiny regex rather
+    # than `import` (PyInstaller's spec runs before sys.path is wired up).
+    _spec_version = "1.0.0"
+    _version_py = _BACKEND_DIR / "services" / "_version.py"
+    if _version_py.is_file():
+        try:
+            _m = re.search(
+                r'__version__\s*=\s*["\']([^"\']+)["\']',
+                _version_py.read_text(encoding="utf-8", errors="replace"),
+            )
+            if _m:
+                _spec_version = _m.group(1)
+        except Exception:
+            _spec_version = "1.0.0"
     app = BUNDLE(
         coll,
         name="VOD.RIP.app",
@@ -192,8 +208,8 @@ if _IS_MAC:
             "CFBundleDisplayName": "VOD.RIP",
             "CFBundleExecutable": "VOD-RIP",
             "CFBundleName": "VOD.RIP",
-            "CFBundleVersion": "1.0.21",
-            "CFBundleShortVersionString": "1.0.21",
+            "CFBundleVersion": _spec_version,
+            "CFBundleShortVersionString": _spec_version,
             "NSHighResolutionCapable": True,
             "NSRequiresAquaSystemAppearance": False,
         },
