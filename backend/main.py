@@ -30,6 +30,7 @@ from models.schemas import (
     SettingsUpdate,
 )
 from services.os_services import (
+    _NO_WINDOW,
     open_file_or_folder,
     pick_folder as os_pick_folder,
     sanitize_filename_component,
@@ -53,8 +54,6 @@ from services.download_manager import DownloadManager
 from services.settings import SettingsManager
 
 logger = logging.getLogger(__name__)
-
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 # Per-thread COM apartment for SHOpenFolderAndSelectItems (avoid init/uninit each click).
 _shell_com_local = threading.local() if os.name == "nt" else None
@@ -111,7 +110,7 @@ def _safe_makedirs(path: Path) -> Path:
         fallback = Path(tempfile.gettempdir()) / "KickDownloader"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
-app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
+app = FastAPI(title="Kick & Twitch Downloader", version="1.0.45")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 download_mgr.apply_settings(settings_mgr)

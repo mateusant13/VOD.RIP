@@ -61,6 +61,9 @@ _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 
 _lock = threading.Lock()
 _sessions: Dict[str, "PreviewSession"] = {}
+# ponytail: hard cap on concurrent preview sessions — prevents memory exhaustion
+# from orphaned sessions if the TTL eviction doesn't keep up.
+_MAX_SESSIONS = 20
 
 
 @dataclass
@@ -707,6 +710,21 @@ def create_session(
 
     with _lock:
         _sessions[session_id] = session
+        if len(_sessions) > _MAX_SESSIONS:
+            now = time.time()
+            stale = sorted(
+                _sessions.items(),
+                key=lambda item: item[1].last_access,
+            )[:len(_sessions) - _MAX_SESSIONS]
+            for sid, _ in stale:
+                _sessions.pop(sid, None)
+                threading.Thread(
+                    target=lambda: shutil.rmtree(
+                        (getattr(_sessions.get(sid), 'cache_dir', None) or Path('/dev/null')),
+                        ignore_errors=True,
+                    ),
+                    daemon=True,
+                ).start()
     return session
 
 

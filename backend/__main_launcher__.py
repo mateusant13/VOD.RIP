@@ -24,10 +24,8 @@ import threading
 import time
 from pathlib import Path
 
-# Prevent console windows from popping up on Windows subprocess calls
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-
 # Import shared path helper from settings (single source of truth).
+from services.os_services import _NO_WINDOW
 from services.settings import SettingsManager, _get_appdata_dir
 
 # ---------------------------------------------------------------------------

@@ -13,11 +13,9 @@ import tempfile
 from functools import lru_cache
 from typing import Dict, List, Optional
 
-from services.os_services import list_gpu_names
+from services.os_services import _NO_WINDOW, list_gpu_names
 
 logger = logging.getLogger(__name__)
-
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 VENDOR_LABELS = {
     "nvidia": "NVIDIA",

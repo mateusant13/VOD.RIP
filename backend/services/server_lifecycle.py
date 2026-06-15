@@ -10,9 +10,9 @@ import threading
 import time
 from typing import Any, Optional
 
-_logger = logging.getLogger(__name__)
+from services.os_services import _NO_WINDOW
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+_logger = logging.getLogger(__name__)
 
 _shutdown_event = threading.Event()
 _uvicorn_server: Any = None

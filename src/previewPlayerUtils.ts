@@ -406,18 +406,6 @@ export function resolveHlsPreviewLevels(
   return { mapped: [], defaultIndex: 0 };
 }
 
-/** @deprecated Use resolveHlsPreviewLevels */
-export function resolvePreviewLevels(
-  levels: HlsLevelLike[],
-  defaultHeight: number,
-  fallbackHeights?: number[],
-): { mapped: PreviewLevelOption[]; defaultIndex: number } {
-  return resolveHlsPreviewLevels(levels, {
-    initialHeight: defaultHeight,
-    fallbackHeights,
-  });
-}
-
 /** Progressive / API-only quality menu (never collapse to active playback height only). */
 export function resolveProgressivePreviewLevels(
   opts: {

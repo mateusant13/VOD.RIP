@@ -18,11 +18,11 @@ def _install_fatal_hooks() -> None:
 
 def main():
     _install_fatal_hooks()
-    # Debug mode: `python run.py --debug full --spawn-server [--headed]`
+    # Debug mode removed — the `--debug` flag pointed to a missing `debug_cli.py`.
+    # ponytail: Restore when a real debug CLI is built. For now, ignore --debug.
     if "--debug" in sys.argv:
+        print("Debug mode is not available in this build.", file=sys.stderr)
         sys.argv = [a for a in sys.argv if a != "--debug"]
-        from debug_cli import main as debug_main
-        raise SystemExit(debug_main())
 
     port = int(os.environ.get("PORT", "7897"))
 

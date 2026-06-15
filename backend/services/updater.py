@@ -33,12 +33,12 @@ CACHE_FILENAME = "update_cache.json"
 PENDING_FILENAME = "update_pending.json"
 
 logger = logging.getLogger(__name__)
+from services.os_services import _NO_WINDOW
+
 try:
     from services._version import USER_AGENT
 except ImportError:  # pragma: no cover - dev module-load race
     USER_AGENT = "VOD.RIP/unknown"
-
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _DETACHED_FLAGS = 0
 if os.name == "nt":
     _DETACHED_FLAGS = (

@@ -9,6 +9,7 @@ from typing import Any, Optional
 _CACHE: dict[str, tuple[float, Any]] = {}
 _LOCK = Lock()
 _DEFAULT_TTL_SEC = 90.0
+_MAX_ENTRIES = 50  # ponytail: bounded cache — prevents unbounded growth under abuse
 
 
 def _purge_expired(now: float, ttl: float) -> None:
@@ -34,6 +35,11 @@ def get_cached(key: str, *, ttl: float = _DEFAULT_TTL_SEC) -> Optional[Any]:
 def set_cached(key: str, data: Any) -> None:
     with _LOCK:
         _CACHE[key] = (time.monotonic(), data)
+        if len(_CACHE) > _MAX_ENTRIES:
+            _purge_expired(time.monotonic(), _DEFAULT_TTL_SEC)
+        if len(_CACHE) > _MAX_ENTRIES:
+            oldest = min(_CACHE.items(), key=lambda item: item[1][0])
+            _CACHE.pop(oldest[0], None)
 
 
 def make_channel_cache_key(*parts: object) -> str:

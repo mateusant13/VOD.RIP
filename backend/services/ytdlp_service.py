@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 from urllib.parse import urljoin
 
-from services.os_services import register_child_pid, unregister_child_pid
+from services.os_services import _NO_WINDOW, register_child_pid, unregister_child_pid
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +29,6 @@ HLS_DOWNLOAD_AHEAD = SEGMENT_DOWNLOAD_WORKERS + 2
 HLS_MUX_STALL_SECONDS = 120
 # Download phase progress is capped here; mux/encode uses 90–99 (see download_manager).
 HLS_DOWNLOAD_PROGRESS_CAP = 90.0
-
-# Prevents a Windows console window from popping up around bundled ffmpeg.exe.
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def _track_ffmpeg_proc(proc: sp.Popen) -> None:
@@ -1779,66 +1776,6 @@ def _progressive_hls_copy_to_mp4(
             cancel_event=cancel_event,
             progress_hook=progress_hook,
         )
-    _verify_output_file(output_path)
-
-
-def _mkv_to_premiere_mp4(
-    mkv_path: str,
-    output_path: str,
-    offset: float,
-    duration: float,
-    ffmpeg_exe: str,
-    progress_hook: Optional[Callable] = None,
-    cancel_event: Optional[threading.Event] = None,
-    pause_event: Optional[threading.Event] = None,
-    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
-) -> None:
-    """Fallback: single-file MKV → MP4 stream copy (used only outside the progressive path)."""
-    tmp_mp4 = f"{output_path}.tmp_{uuid.uuid4().hex}.mp4"
-    cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error", "-i", mkv_path]
-    if offset > 0.001:
-        cmd += ["-ss", str(offset)]
-    cmd += [
-        "-t", str(duration),
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        "-max_muxing_queue_size", "9999",
-        "-f", "mp4", tmp_mp4,
-    ]
-    if progress_hook:
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 84,
-            "phase": "Packaging",
-            "phase_id": _phase_id("Packaging"),
-            "concat_encoder": "copy",
-        })
-    _check_pause_cancel(cancel_event, pause_event)
-    _run_ffmpeg(
-        cmd,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-        register_abort=register_abort,
-        progress_hook=progress_hook,
-        encode_duration=duration,
-        progress_from=84.0,
-        progress_to=97.0,
-        phase="Packaging",
-    )
-    _verify_output_file(tmp_mp4)
-    if progress_hook:
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 98,
-            "phase": "Finalising",
-            "phase_id": _phase_id("Finalising"),
-        })
-    _atomic_replace(
-        tmp_mp4, output_path,
-        cancel_event=cancel_event,
-        progress_hook=progress_hook,
-    )
     _verify_output_file(output_path)
 
 
