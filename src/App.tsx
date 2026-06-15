@@ -1666,6 +1666,21 @@ function channelClipsMissing(
   return false;
 }
 
+/** Mirror of `channelClipsMissing` for the VODs cache. */
+function channelVodsMissing(
+  ch: SavedChannel,
+  kickOn: boolean,
+  twitchOn: boolean,
+): boolean {
+  // Treat a never-fetched channel and a channel whose last VOD fetch
+  // returned an empty list the same way: the data is missing for the
+  // platforms the user has enabled and we should re-fetch on demand.
+  if (!ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0) return true;
+  if (kickOn && ch.kickSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Kick')) return true;
+  if (twitchOn && ch.twitchSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Twitch')) return true;
+  return false;
+}
+
 function buildVodUrl(v: ChannelVideo): string {
   const isTw = v.platform === 'Twitch';
   const isClip = isLikelyClip(v);
@@ -3607,8 +3622,6 @@ export default function App() {
   savedChannelsRef.current = savedChannels;
 
   const channelRefreshInFlightRef = useRef<Set<string>>(new Set());
-  const clipsAutoFetchStartedRef = useRef<Set<string>>(new Set());
-  const vodAutoFetchStartedRef = useRef<Set<string>>(new Set());
 
   const refreshChannel = useCallback(async (
     channelId: string,
@@ -3745,30 +3758,57 @@ export default function App() {
     twitchEnabled,
   });
 
-  // Refetch when switching VODs/clips if that mode was never loaded for this channel.
+  // Whenever the user clicks any of the four filter surfaces (channel
+  // selection, VODs/Clips toggle, Kick toggle, Twitch toggle) we
+  // re-check the displayed data is populated for the current filter
+  // combination and re-fetch anything that is missing.
+  //
+  // Why this matters: the old code had three separate useEffects, two
+  // of which were gated by Sets that persisted for the life of the
+  // page. As soon as a fetch had been kicked off once, toggling Kick /
+  // Twitch / VODs / Clips no longer triggered a re-fetch — so the user
+  // would see "No VODs" or "No clips" after clicking around the filters
+  // even when the underlying channels had plenty of content.
+  //
+  // The only guard we still need is the in-flight ref, so we don't
+  // re-fire a fetch that's already running. In-flight is keyed by
+  // `channelId:mode` so concurrent fetches for the OTHER mode (clips
+  // vs VODs) are unaffected.
   useEffect(() => {
     if (!channelUiPersistReadyRef.current || !selectedChannelId) return;
-    const prev = channelFiltersRef.current;
-    const contentChanged = prev.channelContentFilter !== channelContentFilter;
+
+    // Persist the latest filter choices to localStorage regardless of
+    // whether a fetch happens (matches the prior behaviour).
     channelFiltersRef.current = { channelContentFilter, kickEnabled, twitchEnabled };
-    if (!contentChanged) return;
 
     const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
     if (!ch) return;
     const mode = channelContentFilter;
+
     const needsFetch =
       mode === 'clips'
         ? channelClipsMissing(ch, kickEnabled, twitchEnabled)
-        : (ch.vodVideos?.length ?? 0) === 0 && !ch.updatedAt;
+        : channelVodsMissing(ch, kickEnabled, twitchEnabled);
     if (!needsFetch) return;
 
-    channelRefreshInFlightRef.current.delete(`${selectedChannelId}:${mode}`);
-    clipsAutoFetchStartedRef.current.delete(selectedChannelId);
-    vodAutoFetchStartedRef.current.delete(selectedChannelId);
+    // The in-flight Set inside `refreshChannel` is the only guard
+    // we keep: if a fetch for the same channel+mode is already
+    // running, it will pick up the latest filter state when it
+    // completes (the toggle only affects display filtering, and
+    // the underlying fetch always pulls both platforms). Letting
+    // an in-flight fetch finish is preferable to aborting and
+    // restarting it, because the response carries both Kick and
+    // Twitch entries — the next render will see the populated
+    // cache and skip the re-fetch.
     void refreshChannelRef.current(selectedChannelId, undefined, mode, { silent: true });
   }, [channelContentFilter, kickEnabled, twitchEnabled, selectedChannelId]);
 
-  // On page load: cheap incremental VOD sync for every saved channel (merge new ids only).
+  // On page load: cheap incremental VOD sync for every saved channel
+  // (merge new ids only — the full refresh is triggered by the filter
+  // useEffect above when a user actually selects a channel). This
+  // used to live in a separate useEffect gated by a ref so it would
+  // fire exactly once per page load; we keep the same shape so the
+  // behaviour survives the consolidation.
   const incrementalSyncDoneRef = useRef(false);
   useEffect(() => {
     if (incrementalSyncDoneRef.current) return;
@@ -3778,30 +3818,6 @@ export default function App() {
       void refreshChannelRef.current(c.id, c, 'vods', { incremental: true });
     });
   }, []);
-
-  // Fetch clips once when switching to clips and cache was never loaded for this channel.
-  useEffect(() => {
-    if (channelContentFilter !== 'clips' || !selectedChannelId) return;
-    if (clipsAutoFetchStartedRef.current.has(selectedChannelId)) return;
-    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
-    if (!ch || !channelClipsMissing(ch, kickEnabled, twitchEnabled)) return;
-    clipsAutoFetchStartedRef.current.add(selectedChannelId);
-    void refreshChannelRef.current(selectedChannelId, ch, 'clips', { silent: true });
-  }, [channelContentFilter, selectedChannelId, kickEnabled, twitchEnabled]);
-
-  // Retry VOD load when a newly-added channel was selected but the first fetch
-  // never completed (e.g. raced with an in-flight refresh).
-  useEffect(() => {
-    if (!selectedChannelId || channelContentFilter !== 'vods') return;
-    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
-    if (!ch || ch.loading) return;
-    const needsFetch = !ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0;
-    if (!needsFetch) return;
-    if (vodAutoFetchStartedRef.current.has(selectedChannelId)) return;
-    vodAutoFetchStartedRef.current.add(selectedChannelId);
-    channelRefreshInFlightRef.current.delete(`${selectedChannelId}:vods`);
-    void refreshChannelRef.current(selectedChannelId, undefined, 'vods');
-  }, [selectedChannelId, channelContentFilter, savedChannels]);
 
   const handleAddChannel = useCallback(async () => {
     const raw = addChannelInput.trim();
@@ -3833,7 +3849,6 @@ export default function App() {
     channelRefreshInFlightRef.current.delete(`${id}:clips`);
     await refreshChannel(id, entry, 'vods');
     if (channelContentFilter === 'clips') {
-      clipsAutoFetchStartedRef.current.add(id);
       await refreshChannel(id, entry, 'clips');
     }
   }, [addChannelInput, savedChannels.length, refreshChannel, channelContentFilter]);
@@ -3897,8 +3912,6 @@ export default function App() {
       twitchSlug: nextTwitch,
       ...cleared,
     };
-    clipsAutoFetchStartedRef.current.delete(channelId);
-    vodAutoFetchStartedRef.current.delete(channelId);
     channelRefreshInFlightRef.current.delete(`${channelId}:vods`);
     channelRefreshInFlightRef.current.delete(`${channelId}:clips`);
     updateChannel(channelId, updated);
@@ -3938,7 +3951,6 @@ export default function App() {
       ? { ...ch, kickSlug: slug, ...cleared }
       : { ...ch, twitchSlug: slug, ...cleared };
 
-    clipsAutoFetchStartedRef.current.delete(channelId);
     channelRefreshInFlightRef.current.delete(`${channelId}:vods`);
     channelRefreshInFlightRef.current.delete(`${channelId}:clips`);
     updateChannel(channelId, editingSlug.platform === 'Kick'
@@ -3951,9 +3963,7 @@ export default function App() {
     if (kickEnabled) setKickVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
     if (twitchEnabled) setTwitchVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
   }, [kickEnabled, twitchEnabled]);
-
   const removeChannel = useCallback((channelId: string) => {
-    clipsAutoFetchStartedRef.current.delete(channelId);
     setSavedChannels((prev) => {
       const next = prev.filter((c) => c.id !== channelId);
       if (selectedChannelId === channelId) {
@@ -4970,9 +4980,6 @@ export default function App() {
                         e.stopPropagation();
                         channelRefreshInFlightRef.current.delete(`${ch.id}:vods`);
                         channelRefreshInFlightRef.current.delete(`${ch.id}:clips`);
-                        if (channelContentFilter === 'clips') {
-                          clipsAutoFetchStartedRef.current.delete(ch.id);
-                        }
                         void refreshChannel(ch.id, undefined, channelContentFilter);
                       }}
                       disabled={ch.loading}
