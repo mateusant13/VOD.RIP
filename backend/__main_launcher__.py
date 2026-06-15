@@ -212,7 +212,7 @@ def _start_server(port: int):
     if should_stop_supervisor():
         return
     try:
-        from main import app
+        from app import app
         import uvicorn
     except Exception:
         logger.exception("Server thread failed to import app")
