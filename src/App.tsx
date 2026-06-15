@@ -8,8 +8,6 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical, ZoomIn, ZoomOut,
 } from 'lucide-react';
-import kickIcon from '@/assets/platforms/kick.ico';
-import twitchIcon from '@/assets/platforms/twitch.png';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
@@ -41,6 +39,7 @@ import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import FieldCaption from './components/FieldCaption';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
+import PlatformVodIcon from './components/PlatformVodIcon';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -1212,18 +1211,6 @@ function channelVodSubline(v: ChannelVideo): string {
     parts.push(`${fmtViews(Number(v.views))} views`);
   }
   return parts.join(' · ');
-}
-
-function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }: { platform: string; className?: string }) {
-  const isTw = platform === 'Twitch';
-  return (
-    <img
-      src={isTw ? twitchIcon : kickIcon}
-      alt={isTw ? 'Twitch' : 'Kick'}
-      className={`shrink-0 object-contain ${className}`}
-      draggable={false}
-    />
-  );
 }
 
 const CLIP_MAX_DURATION_SEC = 60;
