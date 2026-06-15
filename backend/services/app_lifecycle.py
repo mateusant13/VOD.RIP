@@ -225,7 +225,15 @@ def request_app_exit() -> None:
         sys.exit(0)
 
     # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.
-    threading.Thread(target=_do_exit, daemon=True).start()
+    # Non-daemon so cleanup (flush state, stop tray, kill downloads) completes before exit.
+    t = threading.Thread(target=_do_exit, daemon=False, name="app-exit-cleanup")
+    t.start()
+    # If cleanup gets stuck (e.g. _window.destroy hangs), don't wait forever.
+    t.join(timeout=8.0)
+    if t.is_alive():
+        _logger.warning("Exit cleanup timed out — forcing exit")
+        import os as _os
+        _os._exit(1)
 
 
 def read_window_geometry() -> Optional[Dict[str, Any]]:
