@@ -351,9 +351,53 @@ There is no `debug_cli.py` file in the repository. This code path crashes if `--
 
 ---
 
+### 21. `_NO_WINDOW` Constant Duplicated Across 7+ Files (Severity: Low-Medium)
+
+The Windows subprocess creation flag `subprocess.CREATE_NO_WINDOW` is defined as a module-level constant in **at least 7 files**:
+
+| File | Definition |
+|------|-----------|
+| `backend/main.py` | `_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0` |
+| `backend/services/ytdlp_service.py` | Same pattern |
+| `backend/services/server_lifecycle.py` | Same pattern |
+| `backend/services/download_cleanup.py` | Same pattern |
+| `backend/services/gpu_detect.py` | Same pattern |
+| `backend/services/updater.py` | Same pattern |
+| `backend/__main_launcher__.py` | Same pattern |
+
+**Impact:** If the flag needs to change (e.g., for a new Windows version), it must be updated in 7 places. This constant should be centralized in `os_services.py` and imported everywhere else.
+
+---
+
+### 22. Three Application Entry Points (Severity: Medium)
+
+The codebase has **three** `if __name__ == "__main__"` blocks:
+
+1. **`backend/run.py`** — Dev entry point. Auto-installs deps with pip, runs `uvicorn.run("main:app")`
+2. **`backend/__main_launcher__.py`** — Production entry point (PyInstaller target). Starts server supervisor, launches PyWebView window or browser fallback
+3. **`backend/main.py`** — Self-contained `uvicorn.run("main:app", host="0.0.0.0")` on port 7897
+
+**Impact:**
+- Confusing development setup — which script should a new contributor run?
+- Different behaviors between entry points (run.py auto-installs deps, main.py doesn't)
+- Different host bindings (run.py/__main_launcher__ use `"0.0.0.0"`, __main_launcher__ supervisor uses `"127.0.0.1"`)
+
+The dev-all.mjs script orchestrates these correctly, but a new contributor doesn't know that.
+
+---
+
+### 23. No package-lock.json Committed (Severity: Medium)
+
+There is no `package-lock.json` in the repository file tree. This means every `npm ci` (as used in CI) or `npm install` produces a non-deterministic dependency tree. Differences in transitive dependency versions between developer machines and CI can cause:
+- "Works on my machine" bugs
+- CI passing but local failing (or vice versa)
+- Security vulnerabilities introduced via unpinned transitive deps
+
+---
+
 ## Release & Deployment Findings
 
-### 21. No Code Signing — SmartScreen on Every Install (Severity: Critical for Windows)
+### 24. No Code Signing — SmartScreen on Every Install (Severity: Critical for Windows)
 
 The CI build pipeline (`release.yml`) has an **optional** code signing step that is a **no-op when secrets are not configured**:
 
@@ -373,7 +417,7 @@ Without signing secrets configured, releases are **unsigned**. The codebase has 
 
 ---
 
-### 22. Fragile Build Pipeline with Silent Failures (Severity: High)
+### 25. Fragile Build Pipeline with Silent Failures (Severity: High)
 
 CI pipeline issues:
 
@@ -390,7 +434,7 @@ CI pipeline issues:
 
 ---
 
-### 23. WebView2 Bootstrapper Downloaded at Build Time (Severity: Medium)
+### 26. WebView2 Bootstrapper Downloaded at Build Time (Severity: Medium)
 
 ```powershell
 Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "installer\MicrosoftEdgeWebview2Setup.exe"
@@ -402,13 +446,13 @@ Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutF
 
 ---
 
-### 24. No macOS Code Signing (Severity: Medium)
+### 27. No macOS Code Signing (Severity: Medium)
 
 The macOS `.app` bundle is created but never signed with an Apple Developer certificate. macOS Gatekeeper will block the app with "cannot be opened because the developer cannot be verified."
 
 ---
 
-### 25. No Version Automation (Severity: Low)
+### 28. No Version Automation (Severity: Low)
 
 `_version.py` defines `__version__ = "1.0.45"` as a hardcoded string. The CI triggers on `v*` tag pushes, but there's no workflow to:
 - Bump the version number
@@ -422,7 +466,7 @@ The `generate_release_notes: true` flag in the GitHub Release step auto-generate
 
 ## Security Findings
 
-### 26. HLS Proxy: SSRF Amplification Vector (Severity: Medium)
+### 29. HLS Proxy: SSRF Amplification Vector (Severity: Medium)
 
 The preview proxy in `preview_service.py` proxies arbitrary URLs from session resource maps. The host allow list includes:
 
@@ -439,7 +483,7 @@ These are broad enough to include arbitrary AWS-hosted content or CloudFront dis
 
 ---
 
-### 27. OAuth Token Stored Unencrypted (Severity: Medium)
+### 30. OAuth Token Stored Unencrypted (Severity: Medium)
 
 The Twitch OAuth token is stored in plaintext in `settings.json`:
 - `%APPDATA%/VOD.RIP/settings.json` (Windows)
@@ -453,7 +497,7 @@ The Twitch OAuth token is stored in plaintext in `settings.json`:
 
 ---
 
-### 28. `noarchive=True` Distributes All Python Source (Severity: Low-Medium)
+### 31. `noarchive=True` Distributes All Python Source (Severity: Low-Medium)
 
 The PyInstaller build uses `noarchive=True` which embeds all Python code as individual files in the `_internal/` directory. The comment explains this was done to avoid AV false positives, but the consequence is that all Python source code is distributed in plaintext, trivially readable by anyone who downloads the release.
 
@@ -461,7 +505,7 @@ The PyInstaller build uses `noarchive=True` which embeds all Python code as indi
 
 ## Hidden Technical Debt
 
-### 29. `pip install` at Runtime in Production Path
+### 32. `pip install` at Runtime in Production Path
 
 `run.py` auto-installs dependencies:
 
@@ -475,13 +519,13 @@ This modifies the user's Python environment at runtime with no confirmation. For
 
 ---
 
-### 30. curl_cffi Binary Dependency
+### 33. curl_cffi Binary Dependency
 
 The `curl_cffi` package requires a compiled C extension (libcurl). This is listed in `requirements.txt` but is a common source of installation failures on Windows, especially in restricted environments (corporate proxies, air-gapped machines, Windows N editions).
 
 ---
 
-### 31. `kick_models.py` — Ungated Dependency
+### 34. `kick_models.py` — Ungated Dependency
 
 Multiple Kick service files import from `services.kick_models` but this module's interface is implied rather than documented. If `kick_models.py` has a schema change, the mismatch will only be caught at runtime.
 
