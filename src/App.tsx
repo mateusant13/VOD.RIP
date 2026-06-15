@@ -14,16 +14,16 @@ import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
-  PREVIEW_MAIN_DEFAULT_HEIGHT,
-  applyHlsQualityLevel,
+
+
   attachProgressivePreview,
-  previewUrlWithPreferHeight,
+
   detachProgressivePreview,
   initialPreviewPreferHeight,
-  levelIndexForHeight,
+
   maxQualityLabelFromList,
   measurePlayerHeightCap,
-  playbackHeightFromRequest,
+
   mergeVariantHeights,
   parseQualityHeights,
   resolveHlsPreviewLevels,
@@ -41,6 +41,7 @@ import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './e
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
 import { useViewportTier } from './useViewportTier';
+import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -1702,8 +1703,6 @@ export default function App() {
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
   const [previewFsUiScale, setPreviewFsUiScale] = useState(readPreviewFsUiScale);
-  const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
-  const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
   const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
@@ -1741,6 +1740,28 @@ export default function App() {
   /** Menu selection — may exceed on-screen playback height until fullscreen. */
   const previewRequestedHeightRef = useRef(0);
   const previewAppliedHeightRef = useRef(0);
+  // ── Shared preview hook (quality state machine) ──────────────────────────
+  const {
+    previewLevels,
+    qualityLevel: previewQualityLevel,
+
+    syncPlaybackToViewport: syncPreviewPlaybackToViewport,
+    applyQuality: applyPreviewQuality,
+    setPreviewLevels,
+    setQualityLevel: setPreviewQualityLevel,
+    setHlsRef,
+  } = usePreviewPlayer({
+    videoRef: previewVideoRef,
+    playback: previewPlayback,
+    sessionId: previewSessionId,
+    isClipPreview: isClipUrl(url.trim()),
+    containerRef: previewContainerRef,
+    trimStart: previewTrimStartRef.current,
+    onPreviewError: (msg: string) => {
+      if (msg) setError(msg);
+    },
+  });
+
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
@@ -2274,6 +2295,7 @@ export default function App() {
         startPosition: previewTrimStartRef.current,
       });
       previewHlsRef.current = hls;
+      setHlsRef(hls);
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       let levelsInitialized = false;
@@ -2402,142 +2424,13 @@ export default function App() {
       setPreviewPlaying(false);
     }
   }, [previewVideoReady]);
+;
 
-  const measurePreviewPlayerCap = useCallback(
-    () => measurePlayerHeightCap(
-      previewContainerRef.current ?? previewPanelRef.current,
-      previewVideoAspectRef.current,
-    ),
-    [],
-  );
 
-  const applyPreviewPlaybackHeight = useCallback(async (
-    playbackHeight: number,
-    opts?: boolean | { userInitiated?: boolean },
-  ) => {
-    if (!playbackHeight || playbackHeight === previewAppliedHeightRef.current) return;
-    previewAppliedHeightRef.current = playbackHeight;
 
-    const userInitiated = typeof opts === 'boolean' ? opts : (opts?.userInitiated ?? false);
 
-    const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
-    const level = previewLevels[menuIndex];
-    if (!level) return;
 
-    const video = previewVideoRef.current;
-    const wasPaused = video?.paused ?? true;
-    const savedTime = video?.currentTime ?? previewTrimStartRef.current;
 
-    const syncSessionQuality = () => apiPost(
-      `/api/preview/session/${previewSessionId}/quality`,
-      { prefer_height: playbackHeight },
-    );
-
-    if (previewPlayback?.kind === 'progressive' && previewSessionId) {
-      if (!video || !previewPlayback.url) return;
-      try {
-        const targetUrl = userInitiated
-          ? previewUrlWithPreferHeight(previewPlayback.url, playbackHeight)
-          : `${previewPlayback.url}${previewPlayback.url.includes('?') ? '&' : '?'}t=${Date.now()}`;
-        attachProgressivePreview(video, targetUrl, savedTime);
-        if (!wasPaused) void video.play().catch(() => {});
-        if (userInitiated) {
-          void syncSessionQuality().catch((err: unknown) => {
-            previewAppliedHeightRef.current = 0;
-            setError(err instanceof Error ? err.message : 'Could not change preview quality');
-          });
-        } else {
-          await syncSessionQuality();
-        }
-      } catch (err: unknown) {
-        previewAppliedHeightRef.current = 0;
-        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
-        setError(msg);
-      }
-      return;
-    }
-
-    const hls = previewHlsRef.current;
-    if (!hls) return;
-
-    const hlsIndex = level.index;
-    const hlsLevel = hls.levels[hlsIndex];
-    const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
-    const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
-    const playbackUrl = previewPlayback?.url ?? '';
-
-    if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
-      applyHlsQualityLevel(hls, hlsIndex, true);
-      return;
-    }
-
-    if (needsApiSwitch && previewSessionId && playbackUrl) {
-      try {
-        if (userInitiated) {
-          hls.loadSource(previewUrlWithPreferHeight(playbackUrl, playbackHeight));
-          hls.startLoad(savedTime);
-          void syncSessionQuality().catch((err: unknown) => {
-            previewAppliedHeightRef.current = 0;
-            setError(err instanceof Error ? err.message : 'Could not change preview quality');
-          });
-        } else {
-          await syncSessionQuality();
-          hls.loadSource(playbackUrl);
-          hls.startLoad();
-        }
-      } catch (err: unknown) {
-        previewAppliedHeightRef.current = 0;
-        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
-        setError(msg);
-      }
-    } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-      applyHlsQualityLevel(hls, hlsIndex, userInitiated);
-      if (!userInitiated && wasPaused && video) {
-        previewSuppressPlayRef.current = true;
-        requestAnimationFrame(() => {
-          video.pause();
-          previewSuppressPlayRef.current = false;
-        });
-      }
-    }
-  }, [previewLevels, previewPlayback, previewSessionId]);
-
-  const syncPreviewPlaybackToViewport = useCallback(async (
-    forceLoad = false,
-    fullscreenOverride?: boolean,
-  ) => {
-    if (!previewVideoReady || !previewLevels.length) return;
-    // Progressive clips are a single MP4 — viewport sync only reloads and causes black flashes.
-    if (previewPlayback?.kind === 'progressive') return;
-    const requested = previewRequestedHeightRef.current
-      || previewLevels[previewQualityLevel]?.height
-      || PREVIEW_MAIN_DEFAULT_HEIGHT;
-    const availableHeights = previewLevels.map((l) => l.height);
-    const playbackHeight = playbackHeightFromRequest(
-      requested,
-      availableHeights,
-      measurePreviewPlayerCap(),
-      fullscreenOverride ?? previewFullscreen,
-    );
-    await applyPreviewPlaybackHeight(playbackHeight, forceLoad);
-  }, [
-    applyPreviewPlaybackHeight,
-    measurePreviewPlayerCap,
-    previewFullscreen,
-    previewLevels,
-    previewQualityLevel,
-    previewVideoReady,
-    previewPlayback?.kind,
-  ]);
-
-  const applyPreviewQuality = useCallback(async (levelIndex: number) => {
-    const level = previewLevels[levelIndex];
-    if (!level) return;
-    previewRequestedHeightRef.current = level.height;
-    setPreviewQualityLevel(levelIndex);
-    setPreviewQualityMenuOpen(false);
-    await applyPreviewPlaybackHeight(level.height, { userInitiated: true });
-  }, [previewLevels, applyPreviewPlaybackHeight]);
 
   const skipPreview = useCallback((deltaSec: number) => {
     const video = previewVideoRef.current;
@@ -2923,7 +2816,7 @@ export default function App() {
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
       requestAnimationFrame(() => {
-        void syncPreviewPlaybackToViewport(false, fs);
+        void syncPreviewPlaybackToViewport(fs);
       });
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
