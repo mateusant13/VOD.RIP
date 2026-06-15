@@ -37,6 +37,7 @@ import {
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { ActiveDownloadsList } from './components/ActiveDownloadsList';
+import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -352,82 +353,7 @@ function NeedleGlancePopup({
     </div>,
     document.body,
   );
-}
-
-function DownloadConfirmDialog({
-  open,
-  title,
-  message,
-  filenamePlaceholder,
-  filename,
-  onFilenameChange,
-  onConfirm,
-  onCancel,
-}: {
-  open: boolean;
-  title: string;
-  message: string;
-  filenamePlaceholder?: string;
-  filename: string;
-  onFilenameChange: (value: string) => void;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  if (!open) return null;
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/75 p-4"
-      onClick={onCancel}
-      role="presentation"
-    >
-      <div
-        className="border-2 border-white bg-zinc-950 max-w-md w-full p-4 font-mono shadow-[6px_6px_0px_0px_#ffffff20]"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="download-confirm-title"
-      >
-        <h3 id="download-confirm-title" className="text-sm font-black uppercase tracking-wider text-white">
-          {title}
-        </h3>
-        <p className="text-xs text-zinc-300 mt-2 leading-relaxed">{message}</p>
-        {filenamePlaceholder && (
-          <label className="block mt-3">
-            <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">File name</span>
-            <input
-              type="text"
-              value={filename}
-              onChange={(e) => onFilenameChange(e.target.value)}
-              placeholder={filenamePlaceholder}
-              className="mt-1 w-full border-2 border-zinc-700 bg-zinc-900 text-zinc-100 text-xs px-2 py-1.5 focus:border-white focus:outline-none placeholder:text-zinc-600"
-              autoFocus
-            />
-            <span className="text-[9px] text-zinc-600 mt-1 block">Saved as .mp4 in your download folder</span>
-          </label>
-        )}
-        <div className="flex gap-2 mt-4 justify-end">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="px-3 py-1.5 border-2 border-zinc-700 text-zinc-400 text-[10px] font-bold uppercase hover:border-zinc-500 hover:text-white"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className="px-3 py-1.5 border-2 border-white bg-white text-black text-[10px] font-black uppercase hover:bg-zinc-200"
-          >
-            Yes, download
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function EditableHmsTime({
+}function EditableHmsTime({
   valueSec,
   minSec,
   maxSec,
