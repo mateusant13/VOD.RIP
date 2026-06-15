@@ -77,7 +77,7 @@ def resolve_video_encoder(value: Optional[str]) -> str:
         from services.gpu_detect import get_encoder_detection
 
         detected = str(get_encoder_detection().get("detected_encoder") or "libx264")
-    # ponytail: broad except Exception — narrow to specific exception types
+    # ponytail: survival guarantee for encoder detection — yt-dlp probe may raise from various internal states
     except Exception:
         detected = "libx264"
     enc = detected.strip().lower()
@@ -566,8 +566,8 @@ def probe_segment_codec(
             timeout=30,
             creationflags=_NO_WINDOW,
         )
-    # ponytail: broad except Exception — narrow to specific exception types
-    except Exception:
+    # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return {}
     if out.returncode != 0:
         return {}
@@ -594,8 +594,8 @@ def _hostname_from_url(url_str: str) -> str:
         from urllib.parse import urlparse
         parsed = urlparse(url_str)
         return parsed.hostname or ""
-    # ponytail: broad except Exception — narrow to specific exception types
-    except Exception:
+    # ponytail: urlparse errors only — ValueError, AttributeError
+    except (ValueError, AttributeError):
         return ""
 
 
@@ -1654,7 +1654,7 @@ def _progressive_hls_copy_to_mp4(
             seg_paths[i] = _download_one_segment(
                 i, segments[i], headers, temp_dir, cancel_event, pause_event,
             )
-        # ponytail: broad except Exception — narrow to specific exception types
+        # ponytail: survival guarantee for per-segment download — segment I/O may fail in many ways; skip to next segment
         except Exception as exc:
             with err_lock:
                 errors.append(exc)
@@ -1712,8 +1712,8 @@ def _progressive_hls_copy_to_mp4(
                     proc.stdin.close()
                 except OSError:
                     pass
-            # ponytail: broad except Exception — narrow to specific exception types
-            except Exception as exc:
+            # ponytail: segment cleanup I/O errors only
+            except (OSError, AttributeError) as exc:
                 with err_lock:
                     errors.append(exc)
                 try:
@@ -2057,7 +2057,7 @@ def download_hls_media_clip(
     if register_temp_dir:
         try:
             register_temp_dir(tmpdir)
-        # ponytail: broad except Exception — narrow to specific exception types
+        # ponytail: survival guarantee for register_pp_state callback — arbitrary callback
         except Exception:
             pass
     try:
@@ -2246,9 +2246,11 @@ def download_video_sync(
             info = ydl.extract_info(full_url, download=False)
         if info:
             expected_duration = info.get("duration")
-    # ponytail: broad except Exception — narrow to specific exception types
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
         expected_duration = None
+
+
+
 
     opts = _build_ydl_opts(
         full_url, output_path, quality, oauth, progress_hook, cachedir=str(cache_dir),
@@ -2275,7 +2277,7 @@ def download_video_sync(
     if register_pp_state is not None and not is_hls:
         try:
             register_pp_state(pp_state)
-        # ponytail: broad except Exception — narrow to specific exception types
+        # ponytail: survival guarantee for register_pp_state callback — arbitrary callback
         except Exception:
             pass
 
