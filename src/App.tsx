@@ -37,6 +37,7 @@ import {
 import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
+import { formatHmsFull } from './utils';
 import FieldCaption from './components/FieldCaption';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -235,14 +236,6 @@ function fmtDateAndAgo(value: string | null | undefined): string {
   return date || ago;
 }
 
-function formatHmsFull(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${pad(h)}:${pad(m)}:${pad(s)}`;
-}
 
 function formatClipDurationHuman(sec: number): string {
   sec = Math.max(1, Math.floor(sec));

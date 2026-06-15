@@ -39,6 +39,7 @@ import {
   type PanelPos,
   type ResizeEdge,
 } from './explorePopupUtils';
+import { formatHmsFull } from './utils';
 
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
@@ -67,14 +68,6 @@ interface ChannelExplorePopupProps {
   onBringToFront: () => void;
 }
 
-function formatHmsFull(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${pad(h)}:${pad(m)}:${pad(s)}`;
-}
 
 function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   if (e.ctrlKey || e.metaKey || e.altKey) return true;

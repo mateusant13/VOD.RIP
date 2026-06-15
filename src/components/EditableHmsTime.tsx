@@ -6,13 +6,7 @@
  */
 
 import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-/** Parse an HH:MM:SS string to seconds (extracted from App.tsx helpers). */
-function parseHms(t: string): number {
-  const parts = t.split(':').map((s) => parseInt(s, 10) || 0);
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
-}
+import { parseHms, clamp } from '../utils';
 
 interface EditableHmsTimeProps {
   valueSec: number;
@@ -22,9 +16,6 @@ interface EditableHmsTimeProps {
   className?: string;
 }
 
-function clamp(v: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, v));
-}
 
 export default function EditableHmsTime({
   valueSec,

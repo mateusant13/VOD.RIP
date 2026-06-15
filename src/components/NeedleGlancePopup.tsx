@@ -1,6 +1,7 @@
 /** ponytail: extracted from App.tsx inline helper. Needle glance popup for trim start/end preview. */
 
 import { createPortal } from 'react-dom';
+import { formatHmsFull } from '../utils';
 import type { ReactNode } from 'react';
 
 export type NeedleGlanceState = {
@@ -14,14 +15,6 @@ export type NeedleGlanceState = {
   dragging: boolean;
 };
 
-function formatHmsFull(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${pad(h)}:${pad(m)}:${pad(s)}`;
-}
 
 export default function NeedleGlancePopup({
   glance,
