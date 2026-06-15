@@ -3,8 +3,8 @@ import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
   Download, Scissors, Info, Play, Pause, Link2, X, Clock,
-  Users, Database, Settings2, StopCircle, Loader2,
-  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
+  Users, Database, Settings2, Loader2,
+  AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical, ZoomIn, ZoomOut,
 } from 'lucide-react';
@@ -34,7 +34,6 @@ import {
   suggestVideoDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
-import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
@@ -44,12 +43,13 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, readPreviewFsUiScale, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_FS_SCALE_STEPS, PREVIEW_FS_SCALE_KEY, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
-import FieldCaption from './components/FieldCaption';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
 import ChannelClipThumb from './components/ChannelClipThumb';
 import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
+import QueueTab from './components/QueueTab';
+import SettingsTab from './components/SettingsTab';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
@@ -362,6 +362,7 @@ export default function App() {
 
   // Queue
   const [queueDownloads, setQueueDownloads] = useState<DownloadState[]>([]);
+  const [recentDownloads, setRecentDownloads] = useState<DownloadState[]>([]);
   const [historyDownloads, setHistoryDownloads] = useState<DownloadState[]>([]);
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
@@ -1615,6 +1616,7 @@ export default function App() {
     try {
       const data = await apiGet<DownloadsResponse>('/api/downloads');
       setQueueDownloads(data.queue || []);
+      setRecentDownloads(data.recent || []);
       setHistoryDownloads(data.history || []);
     } catch {}
   }, []);
@@ -3446,181 +3448,39 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════════════════════ QUEUE TAB ════════════════════════════ */}
         {tab === 'queue' && (
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Queue
-              </span>
-              <button onClick={refreshDownloads} className="text-zinc-500 hover:text-white transition-colors">
-                <RefreshCw size={14} />
-              </button>
-            </div>
-
-            <div className="flex flex-col gap-2 max-h-[360px] overflow-y-auto pr-1 custom-scrollbar">
-              <ActiveDownloadsList
-                downloads={queueDownloads}
-                onPause={handlePause}
-                onResume={handleResume}
-                onCancel={handleCancel}
-                onDelete={handleRemoveFromQueue}
-                onOpenFolder={openFolder}
-                basename={basename}
-                platformIcon={(platform, className) => (
-                  <PlatformVodIcon platform={platform} className={className} />
-                )}
-              />
-            </div>
-
-            <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                History
-              </span>
-              <div className="flex flex-col gap-2 max-h-[160px] overflow-y-auto pr-1 custom-scrollbar">
-                {historyDownloads.length === 0 ? (
-                  <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-                    NO COMPLETED DOWNLOADS YET.
-                  </div>
-                ) : historyDownloads.map((dl) => (
-                    <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
-                      <div className="flex justify-between items-center gap-2">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
-                          <span className="text-xs font-mono text-zinc-300 truncate">
-                            {dl.title || dl.url}
-                          </span>
-                        </div>
-                        <span className="text-[10px] font-mono shrink-0 text-[#53fc18]">{dl.status}</span>
-                      </div>
-                      <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
-                        <span className="truncate">{basename(dl.output_file)}</span>
-                        <div className="flex items-center gap-2 shrink-0">
-                          {dl.output_file && (
-                            <button
-                              type="button"
-                              onClick={() => openFolder(dl.output_file)}
-                              className="text-zinc-400 hover:text-white flex items-center gap-1"
-                              title="Show in folder"
-                            >
-                              <FolderOpen size={12} /> Folder
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteHistory(dl.download_id)}
-                            className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
-                            title="Remove from history"
-                          >
-                            <Trash2 size={12} /> Delete
-                          </button>
-                        </div>
-                      </div>
-                      {dl.error && <span className="text-[10px] text-red-400 font-mono">{dl.error}</span>}
-                    </div>
-                ))}
-              </div>
-            </div>
-          </div>
+          <QueueTab
+            queueDownloads={queueDownloads}
+            recentDownloads={recentDownloads}
+            historyDownloads={historyDownloads}
+            onPause={handlePause}
+            onResume={handleResume}
+            onCancel={handleCancel}
+            onDelete={handleRemoveFromQueue}
+            onDeleteHistory={handleDeleteHistory}
+            onOpenFolder={openFolder}
+            onRefresh={refreshDownloads}
+            basename={basename}
+          />
         )}
 
-        {/* ════════════════════════════ SETTINGS TAB ════════════════════════════ */}
         {tab === 'settings' && settings && (
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1.5">
-              <FieldCaption>Download Folder</FieldCaption>
-              <div className="flex gap-2">
-                <input type="text" value={settings.download_folder}
-                  onChange={(e) => setSettings({ ...settings, download_folder: e.target.value })}
-                  placeholder="C:\Users\...\Downloads"
-                  className="flex-1 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white" />
-                <button type="button" onClick={pickDownloadFolder} disabled={pickingFolder}
-                  className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1 disabled:opacity-50">
-                  {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-                  {pickingFolder ? '...' : 'Browse'}
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="flex flex-col gap-1.5">
-                <FieldCaption noWrap>Download Threads</FieldCaption>
-                <input type="number" min={1} max={16}
-                  value={settings.download_threads}
-                  onChange={(e) => setSettings({ ...settings, download_threads: Math.max(1, Math.min(16, parseInt(e.target.value) || 4)) })}
-                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <FieldCaption>Max Cache (MB)</FieldCaption>
-                <input type="number" min={50} max={2000}
-                  value={settings.max_cache_mb}
-                  onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
-                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-              </div>
-            </div>
-            <p className="text-[9px] font-mono text-zinc-600 leading-snug">
-              Kick/Twitch VODs: remux when already H.264/AAC; GPU transcode when needed.
-            </p>
-
-            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
-              <span>v{appVersion ?? '…'}</span>
-              <span aria-hidden>·</span>
-              <button
-                type="button"
-                onClick={() => void handleCheckUpdate()}
-                disabled={updateChecking}
-                className="text-zinc-600 hover:text-zinc-400 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
-              >
-                {updateChecking ? <Loader2 size={8} className="animate-spin" /> : null}
-                {updateChecking ? 'checking' : 'check for updates'}
-              </button>
-              {updateInfo ? (
-                <>
-                  <span aria-hidden>·</span>
-                  <span className="text-emerald-700">v{updateInfo.version}</span>
-                  {updateInfo.release_url ? (
-                    <a
-                      href={updateInfo.release_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
-                    >
-                      release
-                    </a>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={() => void handleApplyUpdate()}
-                    disabled={updateApplying}
-                    className="text-emerald-700 hover:text-emerald-500 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
-                  >
-                    {updateApplying ? <Loader2 size={8} className="animate-spin" /> : null}
-                    {updateApplying ? 'installing' : 'install'}
-                  </button>
-                </>
-              ) : updateMessage ? (
-                <>
-                  <span aria-hidden>·</span>
-                  <span className="text-zinc-600">{updateMessage}</span>
-                </>
-              ) : null}
-            </div>
-
-            <button onClick={handleSaveSettings}
-              className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">
-              {settingsSaved ? <><CheckCircle2 size={14} /> Saved!</> : 'Save Settings'}
-            </button>
-
-            <button onClick={() => {
-              if (!window.confirm('Exit VOD.RIP? All downloads will be cancelled and the app will close.')) return;
-              flushPanelLayoutToBackend();
-              void apiPost('/api/exit', {}).catch(() => {});
-            }}
-              className="w-full bg-red-950 text-red-400 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-300 transition-colors">
-              <StopCircle size={14} />
-              Exit VOD.RIP
-            </button>
-          </div>
+          <SettingsTab
+            settings={settings}
+            setSettings={setSettings}
+            appVersion={appVersion}
+            updateInfo={updateInfo}
+            updateChecking={updateChecking}
+            updateApplying={updateApplying}
+            updateMessage={updateMessage}
+            pickingFolder={pickingFolder}
+            settingsSaved={settingsSaved}
+            onPickFolder={pickDownloadFolder}
+            onSave={handleSaveSettings}
+            onCheckUpdate={handleCheckUpdate}
+            onApplyUpdate={handleApplyUpdate}
+            onFlushPanelLayout={flushPanelLayoutToBackend}
+          />
         )}
 
         <PanelResizeHandles onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />

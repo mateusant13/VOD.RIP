@@ -28,6 +28,27 @@ from pathlib import Path
 from services.os_services import _NO_WINDOW
 from services.settings import SettingsManager, _get_appdata_dir
 
+
+# ---------------------------------------------------------------------------
+# Subprocess console suppression (Windows only)
+# ---------------------------------------------------------------------------
+# ytdlp, ffmpeg, ffprobe and friends spawn their own children via
+# subprocess.Popen without creationflags. On Windows a console-attached
+# process briefly shows a cmd window, even from a windowed PyInstaller
+# EXE. Patch Popen to default to CREATE_NO_WINDOW when the caller did
+# not pass any creationflags.
+# ponytail: revert if any child process needs an attached console.
+
+if os.name == "nt" and getattr(subprocess, "Popen", None) is not None:
+    _orig_popen = subprocess.Popen
+
+    def _silent_popen(args, *p_args, **kwargs):  # type: ignore[no-untyped-def]
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return _orig_popen(args, *p_args, **kwargs)
+
+    subprocess.Popen = _silent_popen  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Version (single source of truth)
 # ---------------------------------------------------------------------------
@@ -547,13 +568,28 @@ def main():
     port = int(os.environ.get("PORT", 7897))
 
     if getattr(sys, "frozen", False):
+        # Hard process-level singleton. The file lock is held for the
+        # lifetime of the first process; a second VOD-RIP.exe cannot
+        # acquire it and must exit immediately, even during the first
+        # instance's slow cold start when the HTTP API isn't up yet.
         try:
-            from services.single_instance import try_activate_existing
+            from services.single_instance import (
+                acquire_process_lock,
+                try_activate_existing,
+            )
 
-            if try_activate_existing(port):
+            lock_token = acquire_process_lock()
+            if lock_token is None:
+                # Another VOD.RIP is already running for this user. Try
+                # to bring its window forward; if the API isn't ready
+                # yet, the launcher exits silently — the first process
+                # is the one the user actually sees.
+                try_activate_existing(port)
                 sys.exit(0)
+            # Keep the lock alive for the process lifetime.
+            globals()["_SINGLETON_LOCK"] = lock_token
         except Exception:
-        # ponytail: single-instance errors only — best-effort activation; continues if it fails
+        # ponytail: single-instance errors only — best-effort; continues if it fails
             pass
 
     log_path = _setup_logging()

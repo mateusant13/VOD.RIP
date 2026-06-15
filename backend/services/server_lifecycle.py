@@ -47,6 +47,22 @@ def _local_endpoint_port(addr: str) -> Optional[int]:
         return None
 
 
+def _port_has_listener(port: int) -> bool:
+    """Fast TCP-connect probe. Returns True if *port* is already in use.
+
+    Avoids the 5-second ``netstat`` round-trip during cold start when
+    nothing is listening on the port.
+    """
+    import socket as _socket
+
+    try:
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.settimeout(0.25)
+            return s.connect_ex(("127.0.0.1", int(port))) == 0
+    except (OSError, ValueError):
+        return False
+
+
 def _pids_via_netstat_windows(port: int) -> list[int]:
     """List PIDs listening on *port* via netstat (no PowerShell)."""
     pids: list[int] = []
@@ -311,6 +327,10 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
 
 def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 10.0) -> None:
     """Free *port* for a new VOD.RIP instance (graceful first; kill only our PIDs)."""
+    # Fast path: nothing is listening, so we don't even need netstat/tasklist.
+    if not _port_has_listener(port):
+        return
+
     deadline = time.monotonic() + timeout
 
     def active_listeners() -> list[int]:

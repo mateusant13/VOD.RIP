@@ -36,6 +36,8 @@ export interface DownloadState {
 
 export interface DownloadsResponse {
   queue: DownloadState[];
+  /** Failed / Cancelled / Interrupted entries — resumable, but not "active". */
+  recent?: DownloadState[];
   history: DownloadState[];
 }
 
