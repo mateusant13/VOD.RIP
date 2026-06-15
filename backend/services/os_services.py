@@ -376,6 +376,7 @@ def pick_folder() -> tuple[Optional[str], Optional[str]]:
             result_q.put(("ok", path))
         # ponytail: survival guarantee for daemon thread worker — catch all to report on result queue
         except Exception as exc:
+        # ponytail: best-effort — result_q.put(("ok", path))
             result_q.put(("err", str(exc)))
 
     t = threading.Thread(target=_tk_worker, daemon=True)

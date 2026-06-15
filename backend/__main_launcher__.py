@@ -111,9 +111,13 @@ def _enable_windows_dpi_awareness() -> None:
     except (AttributeError, OSError):
         try:
             ctypes.windll.user32.SetProcessDPIAware()
+        # ponytail: ctypes/Win32 API errors only — best-effort DPI fallback
         except Exception:
+        # ponytail: ctypes/Win32 API errors only — best-effort DPI fallback
             pass
+    # ponytail: ctypes/Win32 API errors only — best-effort DPI awareness
     except Exception:
+    # ponytail: best-effort — pass
         pass
 
 
@@ -146,6 +150,7 @@ def _check_linux_webkit() -> None:
                 "or sudo dnf install python3-gobject webkit2gtk4.1 (Fedora)"
             )
     except Exception:
+    # ponytail: PyGObject/WebKitGTK import errors only — best-effort detection
         pass
 
 
@@ -161,6 +166,7 @@ def _set_windows_app_identity() -> None:
 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_WINDOWS_APP_ID)
     except Exception as exc:
+    # ponytail: ctypes/Win32 API errors only — best-effort app identity
         logging.getLogger("VOD.RIP").debug("AppUserModelID: %s", exc)
 
 
@@ -215,6 +221,7 @@ def _start_server(port: int):
         from app import app
         import uvicorn
     except Exception:
+    # ponytail: import errors only — re-raised so supervisor restarts server
         logger.exception("Server thread failed to import app")
         raise
 
@@ -232,6 +239,7 @@ def _start_server(port: int):
     try:
         server.run()
     except Exception:
+    # ponytail: uvicorn runtime errors only — re-raised so supervisor restarts server
         logger.exception("Uvicorn server stopped with an error")
         raise
 
@@ -248,6 +256,7 @@ def _server_supervisor(port: int):
                 break
             logger.error("Uvicorn exited unexpectedly — restarting in 2s")
         except Exception:
+        # ponytail: survival guarantee — supervisor catches server crashes and restarts
             if should_stop_supervisor():
                 break
             logger.exception("Server thread crashed — restarting in 2s")
@@ -268,6 +277,7 @@ def _wait_for_server(port: int, timeout_sec: int = 15) -> bool:
             if r.status_code == 200:
                 return True
         except Exception:
+        # ponytail: network errors only — best-effort polling
             pass
         time.sleep(0.05)
     return False
@@ -296,6 +306,7 @@ def _sanitized_window_geometry(wg: dict) -> dict:
                 out.pop("x", None)
                 out.pop("y", None)
     except Exception:
+    # ponytail: type/value errors only — malformed geometry returns empty dict
         return {}
     return out
 
@@ -316,6 +327,7 @@ def _make_geometry_saver(settings_mgr: SettingsManager):
             current.window_geometry = geom
             settings_mgr.save(current)
         except Exception as exc:
+        # ponytail: settings persistence errors only — best-effort geometry save
             logging.getLogger("VOD.RIP").debug("save window geometry: %s", exc)
 
     def save():
@@ -445,14 +457,17 @@ def _launch_pywebview(port: int) -> bool:
             logger.info("PyWebView closed normally")
             return True
         except Exception as exc:
+        # ponytail: PyWebView backend errors only — each failure tries the next backend
             logger.warning("PyWebView backend %s failed: %s", backend or "auto", exc)
             try:
                 webview._state = type(webview._state)() if hasattr(webview, "_state") else None
             except Exception:
+            # ponytail: survival guarantee — best-effort PyWebView state reset
                 pass
             try:
                 webview.windows = []
             except Exception:
+            # ponytail: survival guarantee — best-effort PyWebView windows reset
                 pass
             continue
 
@@ -484,6 +499,7 @@ def _launch_browser_and_tray(port: int, *, webview2_missing: bool = False):
             )
             root.destroy()
         except Exception:
+        # ponytail: tkinter GUI errors only — best-effort WebView2 warning dialog
             pass
 
     webbrowser.open(f"http://127.0.0.1:{port}")
@@ -537,6 +553,7 @@ def main():
             if try_activate_existing(port):
                 sys.exit(0)
         except Exception:
+        # ponytail: single-instance errors only — best-effort activation; continues if it fails
             pass
 
     log_path = _setup_logging()
@@ -551,6 +568,7 @@ def main():
         from services.crash_handler import install_crash_handler
         install_crash_handler(app_data)
     except Exception as exc:
+    # ponytail: crash handler install errors only — non-fatal; continues without crash handler
         logging.getLogger("VOD.RIP").warning("Crash handler install failed: %s", exc)
 
     logger = logging.getLogger("VOD.RIP")
@@ -585,6 +603,7 @@ def main():
                 logger.info("WebView2 still missing — setup guide (portable zip path)")
                 webview2_ok = ensure_webview2()
         except Exception as exc:
+        # ponytail: WebView2 setup errors only — falls back to browser+tray
             logger.warning("WebView2 setup failed: %s", exc)
             webview2_ok = False
 
@@ -601,6 +620,7 @@ def main():
                 _shutdown(port)
                 sys.exit(0)
         except Exception as exc:
+        # ponytail: best-effort — sys.exit(0)
             logger.warning("WebView2 retry failed: %s", exc)
             webview2_ok = False
 

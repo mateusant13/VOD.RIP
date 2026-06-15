@@ -431,6 +431,7 @@ class DownloadManager:
                     fn()
                 # ponytail: survival guarantee for arbitrary abort callbacks
                 except Exception:
+                # ponytail: survival guarantee — deadline enforcement errors must not block cleanup
                     pass
             elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
             raise ytdlp_service.DownloadTimeoutError(
@@ -586,6 +587,7 @@ class DownloadManager:
                         _progress_hook(d)
                     # ponytail: survival guarantee for PP poller — _progress_hook raises CancelledError/PausedError on cancel/pause; unexpected errors must also stop the poller
                     except Exception:
+                    # ponytail: best-effort — _progress_hook(d)
                         # _progress_hook raises on cancel/pause;
                         # propagate so the poller exits too.
                         pp_stop.set()
@@ -611,6 +613,7 @@ class DownloadManager:
                             _progress_hook(d)
                         # ponytail: survival guarantee for PP poller — same rationale as above
                         except Exception:
+                        # ponytail: survival guarantee — PP poller errors must not crash the worker
                             pp_stop.set()
                             return
                 pp_stop.wait(0.25)
@@ -720,6 +723,7 @@ class DownloadManager:
                 _cleanup_output()
             # ponytail: survival guarantee for download worker — catches ANY unexpected exception in the download pipeline and converts to Failed status
             except Exception as e:
+            # ponytail: survival guarantee — download_func errors must be caught and reported
                 if pause_event.is_set() and not cancel_event.is_set():
                     with self._lock:
                         state.status = "Paused"
@@ -820,6 +824,7 @@ class DownloadManager:
                 fn()
             # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
+            # ponytail: cleanup survival — temp dir removal errors don't affect the final state
                 pass
         with self._lock:
             state = self._downloads.get(download_id)
@@ -930,6 +935,7 @@ class DownloadManager:
                 fn()
             # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
+            # ponytail: survival guarantee — individual cancel failures don't block other cancels
                 pass
         if cleanup:
             expected_duration = None
@@ -1098,6 +1104,7 @@ class DownloadManager:
                         fn()
                     # ponytail: survival guarantee for arbitrary abort callbacks
                     except Exception:
+                    # ponytail: best-effort — fn()
                         pass
                 if cleanup:
                     delete_partial_output(
@@ -1173,6 +1180,7 @@ class DownloadManager:
                 queue.put_nowait({"type": event_type, "data": data})
             # ponytail: survival guarantee for SSE notification — queue put_nowait can raise Full, ValueError, or OverflowError depending on queue implementation
             except Exception:
+            # ponytail: best-effort — queue.put_nowait({"type": event_type, "data": data
                 pass
         return True
 
@@ -1193,4 +1201,5 @@ class DownloadManager:
                 q.put_nowait({"type": event_type, "data": data})
             # ponytail: survival guarantee for SSE notification — same rationale as register_sse
             except Exception:
+            # ponytail: survival guarantee — SSE queue errors must not interrupt the download
                 pass

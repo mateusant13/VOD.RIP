@@ -84,6 +84,7 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -98,6 +99,7 @@ async def preview_set_quality(session_id: str, req: PreviewQualityUpdateRequest)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -127,6 +129,7 @@ async def _preview_master_response(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=500, detail=str(e))
     body: any = data
     response_headers = dict(extra_headers or {})
@@ -189,6 +192,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     except RuntimeError as e:
         raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=502, detail=str(e))
 
 

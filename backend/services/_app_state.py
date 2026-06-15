@@ -36,5 +36,6 @@ def cancel_all_downloads() -> int:
     try:
         return mgr.cancel_all()
     except Exception as exc:
+    # ponytail: best-effort — return mgr.cancel_all()
         _logger.warning("Error cancelling downloads: %s", exc)
         return 0

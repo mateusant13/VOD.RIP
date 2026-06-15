@@ -102,6 +102,7 @@ def _expand_env(value: str) -> str:
         n = kernel32.ExpandEnvironmentStringsW(value, out, 2048)
         return out.value if n else value
     except Exception:
+    # ponytail: best-effort — return out.value if n else value
         return value
 
 
@@ -341,6 +342,7 @@ def _show_setup_dialog() -> bool:
     try:
         root.attributes("-topmost", True)
     except Exception:
+    # ponytail: best-effort — root.attributes("-topmost", True)
         pass
 
     result = {"ok": False}
@@ -401,6 +403,7 @@ def _show_setup_dialog() -> bool:
     try:
         style.theme_use("clam")
     except Exception:
+    # ponytail: best-effort — style.theme_use("clam")
         pass
 
     ttk.Button(btn_row, text="Open Microsoft installer", command=on_download).pack(side="left", padx=(0, 8))

@@ -336,6 +336,7 @@ def resolve_stream_info(
                 headers = clip_info.get("http_headers") or headers
         # ponytail: survival guarantee for yt-dlp resolve — best-effort fallback; GQL is next
         except Exception as exc:
+        # ponytail: best-effort — network errors only
             logger.debug("Twitch clip yt-dlp resolve failed: %s", exc)
 
         # GQL fallback — faster but URLs may require auth cookies.
@@ -346,6 +347,7 @@ def resolve_stream_info(
                 variants = get_clip_progressive_variants_sync(url)
             # ponytail: survival guarantee for GQL fallback — best-effort; clip will fail with RuntimeError if both resolvers fail
             except Exception as exc:
+            # ponytail: best-effort — variants = get_clip_progressive_variants_sync(url)
                 logger.debug("Twitch clip GQL fallback failed: %s", exc)
 
         if not variants:
@@ -627,6 +629,7 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
                 proxy_segment(session_id, upstream)
             # ponytail: survival guarantee for prewarm segment — best-effort; skip failed segments silently
             except Exception as exc:
+            # ponytail: best-effort — proxy_segment(session_id, upstream)
                 logger.debug("Prewarm segment skipped %s: %s", upstream[:80], exc)
 
         logger.info(
@@ -638,6 +641,7 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
         )
     # ponytail: survival guarantee for prewarm — best-effort; warn on failure but don't abort session creation
     except Exception as exc:
+    # ponytail: best-effort — )
         logger.warning("Prewarm failed session=%s: %s", session_id[:8], exc)
 
 def create_session(
@@ -703,6 +707,7 @@ def create_session(
                 proxy_playlist(session_id, session.entry_url)
         # ponytail: survival guarantee for playlist warm — best-effort; session works without it
         except Exception as exc:
+        # ponytail: best-effort — proxy_playlist(session_id, session.entry_url)
             logger.warning("Playlist warm failed: %s", exc)
 
         threading.Thread(
@@ -782,6 +787,7 @@ def session_variant_heights(session: PreviewSession) -> List[int]:
                 return heights
         # ponytail: survival guarantee for height detection — best-effort; returns empty list on failure
         except Exception:
+        # ponytail: best-effort — return heights
             pass
     if session.kind == "progressive" and session.entry_url:
         m = re.search(r"/(\d{3,4})/", session.entry_url)

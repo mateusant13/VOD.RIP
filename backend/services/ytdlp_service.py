@@ -79,6 +79,7 @@ def resolve_video_encoder(value: Optional[str]) -> str:
         detected = str(get_encoder_detection().get("detected_encoder") or "libx264")
     # ponytail: survival guarantee for encoder detection — yt-dlp probe may raise from various internal states
     except Exception:
+    # ponytail: best-effort — detected = str(get_encoder_detection().get("detect
         detected = "libx264"
     enc = detected.strip().lower()
     if enc in VIDEO_ENCODER_OPTIONS and enc != "auto":
@@ -1656,6 +1657,7 @@ def _progressive_hls_copy_to_mp4(
             )
         # ponytail: survival guarantee for per-segment download — segment I/O may fail in many ways; skip to next segment
         except Exception as exc:
+        # ponytail: subprocess/codec errors only — best-effort encoder detection
             with err_lock:
                 errors.append(exc)
         finally:
@@ -2059,6 +2061,7 @@ def download_hls_media_clip(
             register_temp_dir(tmpdir)
         # ponytail: survival guarantee for register_pp_state callback — arbitrary callback
         except Exception:
+        # ponytail: best-effort — register_temp_dir(tmpdir)
             pass
     try:
         first_path: Optional[str] = None
@@ -2279,6 +2282,7 @@ def download_video_sync(
             register_pp_state(pp_state)
         # ponytail: survival guarantee for register_pp_state callback — arbitrary callback
         except Exception:
+        # ponytail: best-effort — register_pp_state(pp_state)
             pass
 
     if is_hls:

@@ -69,6 +69,7 @@ class TrayService:
                 if path:
                     return path
         except Exception:
+        # ponytail: best-effort — return path
             pass
         return str(Path.home() / "Downloads")
 
@@ -113,6 +114,7 @@ class TrayService:
                     return Image.open(path)
 
         except Exception as exc:
+        # ponytail: best-effort — I/O errors only
             logger.debug("Could not load tray icon image: %s", exc)
 
         # Fallback: tiny green square
@@ -120,6 +122,7 @@ class TrayService:
             from PIL import Image
             return Image.new("RGB", (16, 16), color="#53fc18")
         except Exception:
+        # ponytail: best-effort — return Image.new("RGB", (16, 16), color="#53fc18")
             return None
 
     def _on_open_ui(self, icon=None, item=None):

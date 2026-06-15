@@ -71,6 +71,7 @@ async def _gather_channel_clips(
             per_platform_errors["Twitch"] = "Clip fetch timed out — try again"
             return
         except Exception as e:
+        # ponytail: best-effort — return
             per_platform_errors["Twitch"] = format_platform_error(e)
             return
         for v in vids:
@@ -106,6 +107,7 @@ async def _gather_channel_clips(
             per_platform_errors["Kick"] = "Clip fetch timed out — try again"
             return
         except Exception as e:
+        # ponytail: best-effort — return
             per_platform_errors["Kick"] = format_platform_error(e)
             return
         for v in vids:
@@ -214,6 +216,7 @@ async def channel_videos(
                 per_platform_errors["Twitch"] = "VOD fetch timed out — try again"
                 return []
             except Exception as e:
+            # ponytail: best-effort — return []
                 per_platform_errors["Twitch"] = format_platform_error(e)
                 return []
             return [{
@@ -246,6 +249,7 @@ async def channel_videos(
                 per_platform_errors["Kick"] = "VOD fetch timed out — try again"
                 return []
             except Exception as e:
+            # ponytail: best-effort — return []
                 per_platform_errors["Kick"] = format_platform_error(e)
                 return []
             return [{
@@ -304,6 +308,7 @@ async def channel_videos(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -356,4 +361,5 @@ async def channel_clips(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=400, detail=str(e))

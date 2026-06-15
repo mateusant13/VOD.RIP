@@ -49,6 +49,7 @@ def extract_slug(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
     except Exception:
+    # ponytail: best-effort — parsed = urlparse(url)
         return None
     if "kick.com" not in (parsed.netloc or "").lower():
         return None

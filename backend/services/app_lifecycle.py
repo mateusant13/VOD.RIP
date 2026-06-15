@@ -214,6 +214,7 @@ def request_app_exit() -> None:
             stop_api_server(port, wait_for_port=False)
         # ponytail: survival guarantee during shutdown — catch all to prevent blocking exit
         except Exception as exc:
+        # ponytail: best-effort — stop_api_server(port, wait_for_port=False)
             _logger.debug("stop api server: %s", exc)
 
         if _window is not None:

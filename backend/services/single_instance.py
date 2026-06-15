@@ -26,6 +26,7 @@ def is_vodrip_running(port: int) -> bool:
             return False
         return is_vodrip_api_name(resp.json().get("name", ""))
     except Exception:
+    # ponytail: best-effort — return is_vodrip_api_name(resp.json().get("name",
         return False
 
 
@@ -41,5 +42,6 @@ def try_activate_existing(port: int) -> bool:
             logger.info("Focused existing VOD.RIP instance on port %s", port)
             return True
     except Exception as exc:
+    # ponytail: best-effort — return True
         logger.debug("Focus existing instance failed: %s", exc)
     return False

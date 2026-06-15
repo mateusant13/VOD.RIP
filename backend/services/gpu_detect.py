@@ -59,6 +59,7 @@ def _is_apple_silicon() -> bool:
     try:
         return _platform.processor() == "arm"
     except Exception:
+    # ponytail: subprocess errors only — best-effort GPU encoder detection
         return False
 
 
@@ -117,11 +118,13 @@ def _encoder_usable(encoder: str, ffmpeg_bin: str) -> bool:
         )
         return result.returncode == 0
     except Exception:
+    # ponytail: best-effort — return result.returncode == 0
         return False
     finally:
         try:
             os.unlink(tmp_path)
         except Exception:
+        # ponytail: best-effort — I/O errors only
             pass
 
 
@@ -235,6 +238,7 @@ def get_encoder_detection(ffmpeg_bin: Optional[str] = None, *, fresh: bool = Fal
 
             ffmpeg_bin = _resolve_ffmpeg_exe()
         except Exception:
+        # ponytail: best-effort — ffmpeg_bin = _resolve_ffmpeg_exe()
             ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
     if fresh:
         clear_encoder_detection_cache()

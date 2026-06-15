@@ -40,6 +40,7 @@ async def info_video(id: str):
     except OSError as e:
         raise HTTPException(status_code=400, detail=explain_oserror(e))
     except Exception as e:
+    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=404, detail=str(e))
 
 
@@ -55,4 +56,5 @@ async def info_clip(id: str):
         info = await get_video_info(id)
         return info
     except Exception as e:
+    # ponytail: best-effort — return info
         raise HTTPException(status_code=404, detail=str(e))

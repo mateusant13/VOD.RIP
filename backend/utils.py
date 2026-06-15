@@ -210,6 +210,7 @@ def allow_foreground() -> None:
         import ctypes
         ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
     except Exception:
+    # ponytail: ctypes/Win32 API errors only — best-effort foreground unlock
         pass
 
 
@@ -272,6 +273,7 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
         try:
             user32.AllowSetForegroundWindow(ASFW_ANY)
         except Exception:
+        # ponytail: ctypes/Win32 API errors only — best-effort foreground focus
             pass
         try:
             fg = user32.GetForegroundWindow()
@@ -294,10 +296,12 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
                 if attached:
                     user32.AttachThreadInput(fg_thread, my_thread, False)
         except Exception:
+        # ponytail: ctypes/Win32 API errors only — best-effort window focus
             user32.ShowWindow(root, SW_RESTORE)
             user32.SetForegroundWindow(root)
         return True
     except Exception:
+    # ponytail: best-effort — return True
         logger.debug("Could not focus Explorer window", exc_info=True)
         return False
 
@@ -331,6 +335,7 @@ def ensure_shell_com() -> bool:
             _shell_com_local.ready = True
             return True
     except Exception:
+    # ponytail: ctypes/COM errors only — best-effort COM init per thread
         logger.debug("CoInitializeEx failed", exc_info=True)
     return False
 
@@ -365,6 +370,7 @@ def shell_reveal_via_pidl(path: str) -> bool:
         finally:
             shell32.ILFree(pidl)
     except Exception:
+    # ponytail: ctypes/Win32 API errors only — best-effort shell reveal
         logger.debug("SHOpenFolderAndSelectItems failed", exc_info=True)
         return False
 
@@ -610,6 +616,7 @@ async def fetch_queue_meta(url: str, platform: str) -> dict:
             "duration_string": info.get("duration_string"),
         }
     except Exception:
+    # ponytail: network/metadata errors only — returns empty dict on failure
         return {}
 
 

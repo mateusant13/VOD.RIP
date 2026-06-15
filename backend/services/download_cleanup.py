@@ -172,6 +172,7 @@ def _probe_duration_seconds(output_file: str) -> Optional[float]:
             creationflags=_NO_WINDOW,
         )
     except Exception:
+    # ponytail: best-effort — )
         return None
     if out.returncode != 0:
         return None
