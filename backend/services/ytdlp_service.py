@@ -907,22 +907,25 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
 
 _PP_PROGRESS_STATE_ATTR = "_vodrip_progress_state"
 
+# Module-level "current" slot for the in-flight download's PP state.
+# Populated by download_video_sync before it calls ydl.download() and
+# consumed by the instrumented _InstrumentedFFmpegPP on its first
+# real_run_ffmpeg call. We can't rely on the postprocessor hook to hand
+# us the PP instance any more — modern yt-dlp passes the pp_key string,
+# not the object — so we plumb it through this slot instead.
+_CURRENT_PP_STATE: dict = {}
 
-def _set_pp_progress_state(pp: FFmpegPostProcessor, state: dict) -> None:
-    """Attach a thread-safe progress-state dict to a postprocessor instance.
 
-    The postprocessor lives inside the yt-dlp download thread. We use a
-    plain ``dict`` + a ``threading.Lock`` for the cross-thread handoff
-    because the manager's progress thread polls every 250 ms and yt-dlp
-    may invoke the postprocessor from a different thread (e.g. the
-    file-download thread). Lock contention is essentially zero because
-    the post is a single dict-set and the reads are dict-gets.
-    """
+def _set_current_pp_state(state: dict) -> None:
+    """Register *state* as the live PP state for the next download."""
     state_lock = state.setdefault("lock", threading.Lock())
-    setattr(pp, _PP_PROGRESS_STATE_ATTR, state)
-    # Keep a back-reference so we can reach the lock from the manager
-    # without poking the private attribute twice.
+    _CURRENT_PP_STATE["state"] = state
     state["pp_lock"] = state_lock
+
+
+def _consume_current_pp_state() -> Optional[dict]:
+    """Read and clear the live PP state (idempotent)."""
+    return _CURRENT_PP_STATE.pop("state", None)
 
 
 class _InstrumentedFFmpegPP(FFmpegVideoConvertorPP):
@@ -941,6 +944,14 @@ class _InstrumentedFFmpegPP(FFmpegVideoConvertorPP):
         import shlex
 
         state = getattr(self, _PP_PROGRESS_STATE_ATTR, None)
+        if state is None:
+            # Modern yt-dlp hands the postprocessor hook a pp-key string
+            # rather than the PP instance, so we can't attach state from
+            # the hook. Fall back to the module-level "current" slot
+            # populated by download_video_sync for this download.
+            state = _consume_current_pp_state()
+            if state is not None:
+                setattr(self, _PP_PROGRESS_STATE_ATTR, state)
         # No state attached = manager doesn't want our progress events
         # (e.g. during format-probing or an early test path). Fall back
         # to the stock behaviour so we never accidentally break callers
@@ -1126,15 +1137,11 @@ def _build_ydl_opts(
         opts["progress_hooks"] = [progress_hook]
 
         def _postprocessor_hook(d: dict) -> None:
-            # Attach the progress-state dict to the postprocessor
-            # instance the first time we see it. The instrumented PP
-            # (``_InstrumentedFFmpegPP``) writes its real out_time_ms
-            # into this state, which the manager polls from its
-            # progress thread. We do the attach here (not in the PP
-            # constructor) so the state lives only for this download.
-            pp = d.get("postprocessor")
-            if pp_state is not None and pp is not None:
-                _set_pp_progress_state(pp, pp_state)
+            # NOTE: ``d["postprocessor"]`` in modern yt-dlp is a pp-key
+            # string (e.g. ``"FFmpegVideoConvertor"``), NOT the PP
+            # instance. We can't setattr on a string. The instrumented
+            # PP picks the state up from the module-level slot populated
+            # by download_video_sync via _set_current_pp_state() below.
 
             # yt-dlp's own postprocessor pipeline (used when we hand it
             # the file directly, e.g. download_sections for non-HLS
@@ -2333,6 +2340,13 @@ def download_video_sync(
             register_pp_state(pp_state)
         except Exception:
             pass
+
+    # Register the PP state on the module-level slot consumed by
+    # _InstrumentedFFmpegPP. Done right before ydl.download() so the
+    # state is unambiguous per download (and not lingering from the
+    # previous one if a previous run errored out mid-merge).
+    if not is_hls:
+        _set_current_pp_state(pp_state)
 
     if is_hls:
         start_sec, end_sec = _require_crop_range(crop_start, crop_end)
