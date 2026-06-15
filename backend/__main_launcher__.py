@@ -37,17 +37,31 @@ from services.settings import SettingsManager, _get_appdata_dir
 # process briefly shows a cmd window, even from a windowed PyInstaller
 # EXE. Patch Popen to default to CREATE_NO_WINDOW when the caller did
 # not pass any creationflags.
+#
+# IMPORTANT: ``subprocess.Popen`` must stay a *class* — yt-dlp does
+# ``class Popen(subprocess.Popen):`` at import time inside
+# ``yt_dlp/utils/_utils.py``. Replacing the class with a function
+# breaks that subclassing with
+# ``TypeError: function() argument 'code' must be code, not str``.
 # ponytail: revert if any child process needs an attached console.
 
-if os.name == "nt" and getattr(subprocess, "Popen", None) is not None:
+if os.name == "nt":
     _orig_popen = subprocess.Popen
 
-    def _silent_popen(args, *p_args, **kwargs):  # type: ignore[no-untyped-def]
-        if "creationflags" not in kwargs:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        return _orig_popen(args, *p_args, **kwargs)
+    class _SilentPopen(_orig_popen):  # type: ignore[misc, valid-type]
+        """Popen subclass that defaults ``creationflags`` to CREATE_NO_WINDOW.
 
-    subprocess.Popen = _silent_popen  # type: ignore[assignment]
+        Subclassing (instead of replacing with a function) keeps
+        ``subprocess.Popen`` a class so libraries that subclass it
+        themselves — notably yt-dlp — still import cleanly.
+        """
+
+        def __init__(self, args, *p_args, **kwargs):  # type: ignore[no-untyped-def]
+            if "creationflags" not in kwargs:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            super().__init__(args, *p_args, **kwargs)
+
+    subprocess.Popen = _SilentPopen  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Version (single source of truth)
