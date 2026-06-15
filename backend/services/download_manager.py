@@ -133,8 +133,8 @@ class DownloadManager:
                     entry["status"] = "Cancelled"
                 valid.append(entry)
             return valid[:_HISTORY_MAX_ENTRIES]
-        # ponytail: broad except Exception — narrow to specific exception types
-        except Exception:
+        # ponytail: I/O + JSON decode errors only
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
             logger.exception("Failed to load download history; starting empty")
             return []
 
@@ -157,17 +157,17 @@ class DownloadManager:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(snapshot, f, ensure_ascii=False, indent=2)
                     os.replace(tmp_path, str(self._history_file))
-                # ponytail: broad except Exception — narrow to specific exception types
-                except Exception:
+                # ponytail: I/O errors only — re-raises to outer handler
+                except (OSError, TypeError, ValueError):
                     if os.path.exists(tmp_path):
                         try:
                             os.unlink(tmp_path)
-                        # ponytail: broad except Exception — narrow to specific exception types
-                        except Exception:
+                        # ponytail: cleanup survival — os.unlink
+                        except OSError:
                             pass
                     raise
-            # ponytail: broad except Exception — narrow to specific exception types
-            except Exception:
+            # ponytail: I/O + serialization errors only
+            except (OSError, TypeError, ValueError):
                 logger.exception("Failed to persist download history")
 
     def _record_history(self, state: DownloadState) -> None:
@@ -208,8 +208,8 @@ class DownloadManager:
                     continue
                 valid.append(entry)
             return valid[:_HISTORY_MAX_ENTRIES]
-        # ponytail: broad except Exception — narrow to specific exception types
-        except Exception:
+        # ponytail: I/O + JSON decode errors only
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
             logger.exception("Failed to load download queue; starting empty")
             return []
 
@@ -227,17 +227,17 @@ class DownloadManager:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(snapshot, f, ensure_ascii=False, indent=2)
                     os.replace(tmp_path, str(self._queue_file))
-                # ponytail: broad except Exception — narrow to specific exception types
-                except Exception:
+                # ponytail: I/O errors only — re-raises to outer handler
+                except (OSError, TypeError, ValueError):
                     if os.path.exists(tmp_path):
                         try:
                             os.unlink(tmp_path)
-                        # ponytail: broad except Exception — narrow to specific exception types
-                        except Exception:
+                        # ponytail: cleanup survival — os.unlink
+                        except OSError:
                             pass
                     raise
-            # ponytail: broad except Exception — narrow to specific exception types
-            except Exception:
+            # ponytail: I/O + serialization errors only
+            except (OSError, TypeError, ValueError):
                 logger.exception("Failed to persist download queue")
 
     def _serializable_worker_params(self, params: dict) -> dict:
@@ -307,8 +307,8 @@ class DownloadManager:
         try:
             data = {k: v for k, v in entry.items() if k != "_params"}
             return DownloadState(**data)
-        # ponytail: broad except Exception — narrow to specific exception types
-        except Exception:
+        # ponytail: Pydantic validation errors only
+        except (ValueError, TypeError, RuntimeError):
             logger.debug("Skipping malformed queue entry", exc_info=True)
             return None
 
@@ -429,7 +429,7 @@ class DownloadManager:
             for fn in list(abort_fns):
                 try:
                     fn()
-                # ponytail: broad except Exception — narrow to specific exception types
+                # ponytail: survival guarantee for arbitrary abort callbacks
                 except Exception:
                     pass
             elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
@@ -582,14 +582,14 @@ class DownloadManager:
                             "speed": speed or None,
                             "eta_seconds": eta,
                         }
-                        try:
-                            _progress_hook(d)
-                        # ponytail: broad except Exception — narrow to specific exception types
-                        except Exception:
-                            # _progress_hook raises on cancel/pause;
-                            # propagate so the poller exits too.
-                            pp_stop.set()
-                            return
+                    try:
+                        _progress_hook(d)
+                    # ponytail: survival guarantee for PP poller — _progress_hook raises CancelledError/PausedError on cancel/pause; unexpected errors must also stop the poller
+                    except Exception:
+                        # _progress_hook raises on cancel/pause;
+                        # propagate so the poller exits too.
+                        pp_stop.set()
+                        return
                 else:
                     # PP hasn't written anything yet. Heartbeat every
                     # 3 s so the user sees activity during the (often
@@ -609,7 +609,7 @@ class DownloadManager:
                         }
                         try:
                             _progress_hook(d)
-                        # ponytail: broad except Exception — narrow to specific exception types
+                        # ponytail: survival guarantee for PP poller — same rationale as above
                         except Exception:
                             pp_stop.set()
                             return
@@ -718,7 +718,7 @@ class DownloadManager:
                         state.status = "Cancelled"
                         self._notify_sse(download_id, "status", "Cancelled")
                 _cleanup_output()
-            # ponytail: broad except Exception — narrow to specific exception types
+            # ponytail: survival guarantee for download worker — catches ANY unexpected exception in the download pipeline and converts to Failed status
             except Exception as e:
                 if pause_event.is_set() and not cancel_event.is_set():
                     with self._lock:
@@ -727,25 +727,24 @@ class DownloadManager:
                     self._upsert_queue_entry(state, params_snapshot or None)
                     self._notify_sse(download_id, "status", "Paused")
                     return
-                with self._lock:
-                    state.status = "Failed"
-                    state.error = str(e)
-                self._notify_sse(download_id, "error", str(e))
-                _cleanup_output()
-            except BaseException as e:
-                if pause_event.is_set() and not cancel_event.is_set():
-                    with self._lock:
-                        state.status = "Paused"
-                        params_snapshot = dict(self._worker_params.get(download_id) or {})
-                    self._upsert_queue_entry(state, params_snapshot or None)
-                    self._notify_sse(download_id, "status", "Paused")
-                    return
                 logger.exception(
-                    "Fatal download worker failure for %s", download_id, exc_info=e
+                    "Download worker failure for %s", download_id, exc_info=e
                 )
                 with self._lock:
                     state.status = "Failed"
                     state.error = f"{type(e).__name__}: {e}"
+                self._notify_sse(download_id, "error", state.error)
+                _cleanup_output()
+            # ponytail: bare except for catastrophic shutdown — catches KeyboardInterrupt/SystemExit during worker failure; logs and converts to Failed
+            except:
+                import sys
+                _exc_type, _exc_val, _exc_tb = sys.exc_info()
+                logger.exception(
+                    "Fatal download worker failure for %s", download_id,
+                )
+                with self._lock:
+                    state.status = "Failed"
+                    state.error = f"{type(_exc_val).__name__}: {_exc_val}" if _exc_val else "Unknown fatal error"
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             finally:
@@ -784,8 +783,8 @@ class DownloadManager:
                 try:
                     if final_state.status != "Completed" and temp_dirs:
                         remove_temp_dirs(temp_dirs)
-                # ponytail: broad except Exception — narrow to specific exception types
-                except Exception:
+                # ponytail: cleanup survival — remove_temp_dirs can raise OSError from file I/O
+                except OSError:
                     pass
                 # Stop the postprocess progress poller (if it was
                 # started). The thread is daemon=True so it would exit
@@ -819,7 +818,7 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
-            # ponytail: broad except Exception — narrow to specific exception types
+            # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
                 pass
         with self._lock:
@@ -929,7 +928,7 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
-            # ponytail: broad except Exception — narrow to specific exception types
+            # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
                 pass
         if cleanup:
@@ -1005,8 +1004,8 @@ class DownloadManager:
                 continue
             try:
                 merged_history[did] = DownloadState(**entry)
-            # ponytail: broad except Exception — narrow to specific exception types
-            except Exception:
+            # ponytail: Pydantic validation errors only
+            except (ValueError, TypeError, RuntimeError):
                 logger.debug("Skipping malformed history entry %s", did, exc_info=True)
 
         for state in merged_history.values():
@@ -1097,7 +1096,7 @@ class DownloadManager:
                 for fn in abort_fns:
                     try:
                         fn()
-                    # ponytail: broad except Exception — narrow to specific exception types
+                    # ponytail: survival guarantee for arbitrary abort callbacks
                     except Exception:
                         pass
                 if cleanup:
@@ -1172,7 +1171,7 @@ class DownloadManager:
         for event_type, data in snapshot:
             try:
                 queue.put_nowait({"type": event_type, "data": data})
-            # ponytail: broad except Exception — narrow to specific exception types
+            # ponytail: survival guarantee for SSE notification — queue put_nowait can raise Full, ValueError, or OverflowError depending on queue implementation
             except Exception:
                 pass
         return True
@@ -1192,6 +1191,6 @@ class DownloadManager:
         for q in queues:
             try:
                 q.put_nowait({"type": event_type, "data": data})
-            # ponytail: broad except Exception — narrow to specific exception types
+            # ponytail: survival guarantee for SSE notification — same rationale as register_sse
             except Exception:
                 pass
