@@ -66,6 +66,11 @@ interface PreviewPlayerOptions {
    * calculations reflect the actual available space.
    */
   containerRef: React.RefObject<HTMLElement | null>;
+  /**
+   * Called when applyPlaybackHeight encounters an error.
+   * If not provided, errors are silently swallowed.
+   */
+  onPreviewError?: (message: string) => void;
 }
 
 /**
@@ -80,7 +85,8 @@ export function usePreviewPlayer({
   isClipPreview,
   trimStart = 0,
   containerRef,
-}: PreviewPlayerOptions): PreviewPlayerState & PreviewPlayerActions {
+  onPreviewError,
+}: PreviewPlayerOptions): PreviewPlayerState & PreviewPlayerActions & { setHlsRef: (hls: Hls | null) => void; } {
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [qualityLevel, setQualityLevel] = useState(0);
 
@@ -93,6 +99,11 @@ export function usePreviewPlayer({
   const setLevels = useCallback((levels: PreviewLevelOption[]) => {
     previewLevelsRef.current = levels;
     setPreviewLevels(levels);
+  }, []);
+
+  /** Registered by the consumer after creating an Hls instance. */
+  const setHlsRef = useCallback((hls: Hls | null) => {
+    hlsRef.current = hls;
   }, []);
 
   const apiPost = useCallback(async <T,>(path: string, body: unknown): Promise<T> => {
@@ -157,8 +168,9 @@ export function usePreviewPlayer({
         } else {
           await syncSessionQuality();
         }
-      } catch {
+      } catch (err: unknown) {
         appliedHeightRef.current = 0;
+        onPreviewError?.(err instanceof Error ? err.message : 'Could not change preview quality');
       }
       return;
     }
@@ -189,8 +201,9 @@ export function usePreviewPlayer({
           hls.loadSource(playbackUrl);
           hls.startLoad();
         }
-      } catch {
+      } catch (err: unknown) {
         appliedHeightRef.current = 0;
+        onPreviewError?.(err instanceof Error ? err.message : 'Could not change preview quality');
       }
     } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
       applyHlsQualityLevel(hls, hlsIndex, userInitiated);
@@ -271,11 +284,14 @@ export function usePreviewPlayer({
     applyQuality,
     setPreviewLevels: setLevels,
     setQualityLevel,
+    // Hls instance ref — consumer sets this after creating the player
+    setHlsRef,
     // Internal helpers for consumer setup
     syncProgressiveLevels,
     resolveAndSyncProgressive,
     resolveAndSyncHls,
   } as PreviewPlayerState & PreviewPlayerActions & {
+    setHlsRef: (hls: Hls | null) => void;
     syncProgressiveLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
     resolveAndSyncProgressive: typeof resolveAndSyncProgressive;
     resolveAndSyncHls: typeof resolveAndSyncHls;

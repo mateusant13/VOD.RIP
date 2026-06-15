@@ -9,6 +9,14 @@
 const API_BASE = '';
 const API_TIMEOUT_MS = 60_000;
 
+const IS_DEV_UI = import.meta.env.DEV;
+const TIMEOUT_HINT = IS_DEV_UI
+  ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
+  : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
+const BACKEND_HINT = IS_DEV_UI
+  ? 'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).'
+  : 'API not reachable. Quit VOD.RIP from the tray and reopen the app.';
+
 function formatApiDetail(detail: unknown): string {
   if (detail == null) return '';
   if (typeof detail === 'string') return detail;
@@ -49,14 +57,6 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
   }
   return fallback;
 }
-
-const IS_DEV_UI = import.meta.env.DEV;
-const TIMEOUT_HINT = IS_DEV_UI
-  ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
-  : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
-const BACKEND_HINT = IS_DEV_UI
-  ? 'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).'
-  : 'API not reachable. Quit VOD.RIP from the tray and reopen the app.';
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const attempt = async (): Promise<Response> => {
@@ -105,7 +105,7 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail));
+    throw new Error(apiErrorMessage(res, detail, path));
   }
   return res.json();
 }
