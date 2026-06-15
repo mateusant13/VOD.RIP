@@ -162,6 +162,7 @@ def hls_bandwidth_by_height(
         r = requests.get(master_url, headers=headers, timeout=timeout)
         r.raise_for_status()
         text = r.text
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("HLS master fetch failed %s: %s", master_url, exc)
         return {}
@@ -206,6 +207,7 @@ def _parse_media_playlist_segments(
         r = requests.get(playlist_url, headers=headers, timeout=timeout)
         r.raise_for_status()
         text = r.text
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("HLS media playlist fetch failed %s: %s", playlist_url, exc)
         return []
@@ -269,6 +271,7 @@ def _resolve_hls_master_to_media(
         r = requests.get(playlist_url, headers=headers, timeout=12.0)
         r.raise_for_status()
         text = r.text
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("HLS playlist fetch failed %s: %s", playlist_url, exc)
         return None, 0
@@ -378,6 +381,7 @@ def probe_url_content_length(url: str, headers: Optional[dict] = None) -> Option
         cl = r.headers.get("Content-Length") or r.headers.get("content-length")
         if cl and str(cl).isdigit():
             return int(cl)
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("HEAD probe failed %s: %s", url, exc)
     return None
@@ -401,6 +405,7 @@ def _probe_segment_size(url: str, headers: Optional[dict] = None) -> Optional[in
             return int(m.group(1))
         if r.status_code == 200 and r.content:
             return len(r.content)
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("segment probe failed %s: %s", url, exc)
     return None

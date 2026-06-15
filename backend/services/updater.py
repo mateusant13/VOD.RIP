@@ -156,6 +156,7 @@ class UpdateChecker:
             data = json.loads(self.pending_path.read_text(encoding="utf-8"))
             if data.get("version") and self._is_newer(data["version"], self.current_version):
                 return data
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
         return None
@@ -178,6 +179,7 @@ class UpdateChecker:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             handle.write(chunk)
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.error("Update download failed: %s", exc)
             return UpdateApplyResult(False, f"Download failed: {exc}")
@@ -231,6 +233,7 @@ class UpdateChecker:
                 return False
             logger.info("SHA-256 verified for %s", dest.name)
             return True
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.error("SHA-256 verification failed: %s", exc)
             return False
@@ -259,6 +262,7 @@ class UpdateChecker:
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             return (time.time() - float(data.get("last_check", 0))) > CHECK_INTERVAL_SEC
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             return True
 
@@ -266,6 +270,7 @@ class UpdateChecker:
         try:
             self.app_data_dir.mkdir(parents=True, exist_ok=True)
             self.cache_path.write_text(json.dumps(data), encoding="utf-8")
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
 
@@ -273,6 +278,7 @@ class UpdateChecker:
         try:
             self.app_data_dir.mkdir(parents=True, exist_ok=True)
             self.pending_path.write_text(json.dumps(data), encoding="utf-8")
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
 
@@ -280,6 +286,7 @@ class UpdateChecker:
         try:
             if self.pending_path.is_file():
                 self.pending_path.unlink()
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
 
@@ -335,6 +342,7 @@ class UpdateChecker:
         if release_url:
             try:
                 webbrowser.open(release_url)
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 logger.debug("Could not open release URL", exc_info=True)
         if os.name == "nt":
@@ -345,9 +353,11 @@ class UpdateChecker:
                     ["explorer.exe", f'/select,"{escaped}"'],
                     creationflags=_NO_WINDOW,
                 )
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 try:
                     os.startfile(str(archive.parent))
+                # ponytail: broad except Exception — narrow to specific exception types
                 except Exception:
                     logger.debug("Could not open update folder", exc_info=True)
         msg = (

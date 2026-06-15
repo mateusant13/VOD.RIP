@@ -374,6 +374,7 @@ def pick_folder() -> tuple[Optional[str], Optional[str]]:
         try:
             path = _tk_pick_folder()
             result_q.put(("ok", path))
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             result_q.put(("err", str(exc)))
 
@@ -419,6 +420,7 @@ def _tk_pick_folder() -> Optional[str]:
     finally:
         try:
             root.destroy()
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
 
@@ -440,6 +442,7 @@ def _pick_folder_macos_fallback() -> Optional[str]:
         )
         path = (out.stdout or "").strip()
         return path if path else None
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.debug("osascript folder picker failed: %s", exc)
         return None
@@ -458,6 +461,7 @@ def _pick_folder_linux_fallback() -> Optional[str]:
             )
             path = (out.stdout or "").strip()
             return path if path else None
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.debug("zenity folder picker failed: %s", exc)
     if shutil.which("kdialog"):
@@ -470,6 +474,7 @@ def _pick_folder_linux_fallback() -> Optional[str]:
             )
             path = (out.stdout or "").strip()
             return path if path else None
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.debug("kdialog folder picker failed: %s", exc)
     return None

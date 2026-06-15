@@ -77,6 +77,7 @@ def resolve_video_encoder(value: Optional[str]) -> str:
         from services.gpu_detect import get_encoder_detection
 
         detected = str(get_encoder_detection().get("detected_encoder") or "libx264")
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception:
         detected = "libx264"
     enc = detected.strip().lower()
@@ -565,6 +566,7 @@ def probe_segment_codec(
             timeout=30,
             creationflags=_NO_WINDOW,
         )
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception:
         return {}
     if out.returncode != 0:
@@ -592,6 +594,7 @@ def _hostname_from_url(url_str: str) -> str:
         from urllib.parse import urlparse
         parsed = urlparse(url_str)
         return parsed.hostname or ""
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception:
         return ""
 
@@ -1651,6 +1654,7 @@ def _progressive_hls_copy_to_mp4(
             seg_paths[i] = _download_one_segment(
                 i, segments[i], headers, temp_dir, cancel_event, pause_event,
             )
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             with err_lock:
                 errors.append(exc)
@@ -1708,6 +1712,7 @@ def _progressive_hls_copy_to_mp4(
                     proc.stdin.close()
                 except OSError:
                     pass
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception as exc:
                 with err_lock:
                     errors.append(exc)
@@ -2052,6 +2057,7 @@ def download_hls_media_clip(
     if register_temp_dir:
         try:
             register_temp_dir(tmpdir)
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
     try:
@@ -2240,6 +2246,7 @@ def download_video_sync(
             info = ydl.extract_info(full_url, download=False)
         if info:
             expected_duration = info.get("duration")
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception:
         expected_duration = None
 
@@ -2268,6 +2275,7 @@ def download_video_sync(
     if register_pp_state is not None and not is_hls:
         try:
             register_pp_state(pp_state)
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
 

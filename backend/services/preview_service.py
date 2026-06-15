@@ -334,6 +334,7 @@ def resolve_stream_info(
                 headers = first_with_headers.get("http_headers") or {}
             else:
                 headers = clip_info.get("http_headers") or headers
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.debug("Twitch clip yt-dlp resolve failed: %s", exc)
 
@@ -343,6 +344,7 @@ def resolve_stream_info(
                 from services.twitch_gql_service import get_clip_progressive_variants_sync
 
                 variants = get_clip_progressive_variants_sync(url)
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception as exc:
                 logger.debug("Twitch clip GQL fallback failed: %s", exc)
 
@@ -623,6 +625,7 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
         for upstream in targets:
             try:
                 proxy_segment(session_id, upstream)
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception as exc:
                 logger.debug("Prewarm segment skipped %s: %s", upstream[:80], exc)
 
@@ -633,6 +636,7 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
             len(inits),
             crop_start,
         )
+    # ponytail: broad except Exception — narrow to specific exception types
     except Exception as exc:
         logger.warning("Prewarm failed session=%s: %s", session_id[:8], exc)
 
@@ -697,6 +701,7 @@ def create_session(
             proxy_playlist(session_id, session.master_url)
             if session.entry_url != session.master_url:
                 proxy_playlist(session_id, session.entry_url)
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception as exc:
             logger.warning("Playlist warm failed: %s", exc)
 
@@ -775,6 +780,7 @@ def session_variant_heights(session: PreviewSession) -> List[int]:
             heights = _heights_from_master_text(text)
             if heights:
                 return heights
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             pass
     if session.kind == "progressive" and session.entry_url:

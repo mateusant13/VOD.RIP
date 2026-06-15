@@ -133,6 +133,7 @@ class DownloadManager:
                     entry["status"] = "Cancelled"
                 valid.append(entry)
             return valid[:_HISTORY_MAX_ENTRIES]
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             logger.exception("Failed to load download history; starting empty")
             return []
@@ -156,13 +157,16 @@ class DownloadManager:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(snapshot, f, ensure_ascii=False, indent=2)
                     os.replace(tmp_path, str(self._history_file))
+                # ponytail: broad except Exception — narrow to specific exception types
                 except Exception:
                     if os.path.exists(tmp_path):
                         try:
                             os.unlink(tmp_path)
+                        # ponytail: broad except Exception — narrow to specific exception types
                         except Exception:
                             pass
                     raise
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 logger.exception("Failed to persist download history")
 
@@ -204,6 +208,7 @@ class DownloadManager:
                     continue
                 valid.append(entry)
             return valid[:_HISTORY_MAX_ENTRIES]
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             logger.exception("Failed to load download queue; starting empty")
             return []
@@ -222,13 +227,16 @@ class DownloadManager:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(snapshot, f, ensure_ascii=False, indent=2)
                     os.replace(tmp_path, str(self._queue_file))
+                # ponytail: broad except Exception — narrow to specific exception types
                 except Exception:
                     if os.path.exists(tmp_path):
                         try:
                             os.unlink(tmp_path)
+                        # ponytail: broad except Exception — narrow to specific exception types
                         except Exception:
                             pass
                     raise
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 logger.exception("Failed to persist download queue")
 
@@ -299,6 +307,7 @@ class DownloadManager:
         try:
             data = {k: v for k, v in entry.items() if k != "_params"}
             return DownloadState(**data)
+        # ponytail: broad except Exception — narrow to specific exception types
         except Exception:
             logger.debug("Skipping malformed queue entry", exc_info=True)
             return None
@@ -420,6 +429,7 @@ class DownloadManager:
             for fn in list(abort_fns):
                 try:
                     fn()
+                # ponytail: broad except Exception — narrow to specific exception types
                 except Exception:
                     pass
             elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
@@ -574,6 +584,7 @@ class DownloadManager:
                         }
                         try:
                             _progress_hook(d)
+                        # ponytail: broad except Exception — narrow to specific exception types
                         except Exception:
                             # _progress_hook raises on cancel/pause;
                             # propagate so the poller exits too.
@@ -598,6 +609,7 @@ class DownloadManager:
                         }
                         try:
                             _progress_hook(d)
+                        # ponytail: broad except Exception — narrow to specific exception types
                         except Exception:
                             pp_stop.set()
                             return
@@ -706,6 +718,7 @@ class DownloadManager:
                         state.status = "Cancelled"
                         self._notify_sse(download_id, "status", "Cancelled")
                 _cleanup_output()
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception as e:
                 if pause_event.is_set() and not cancel_event.is_set():
                     with self._lock:
@@ -771,6 +784,7 @@ class DownloadManager:
                 try:
                     if final_state.status != "Completed" and temp_dirs:
                         remove_temp_dirs(temp_dirs)
+                # ponytail: broad except Exception — narrow to specific exception types
                 except Exception:
                     pass
                 # Stop the postprocess progress poller (if it was
@@ -805,6 +819,7 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 pass
         with self._lock:
@@ -914,6 +929,7 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 pass
         if cleanup:
@@ -989,6 +1005,7 @@ class DownloadManager:
                 continue
             try:
                 merged_history[did] = DownloadState(**entry)
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 logger.debug("Skipping malformed history entry %s", did, exc_info=True)
 
@@ -1080,6 +1097,7 @@ class DownloadManager:
                 for fn in abort_fns:
                     try:
                         fn()
+                    # ponytail: broad except Exception — narrow to specific exception types
                     except Exception:
                         pass
                 if cleanup:
@@ -1154,6 +1172,7 @@ class DownloadManager:
         for event_type, data in snapshot:
             try:
                 queue.put_nowait({"type": event_type, "data": data})
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 pass
         return True
@@ -1173,5 +1192,6 @@ class DownloadManager:
         for q in queues:
             try:
                 q.put_nowait({"type": event_type, "data": data})
+            # ponytail: broad except Exception — narrow to specific exception types
             except Exception:
                 pass
