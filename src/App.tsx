@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -38,6 +38,7 @@ import {
 } from './previewPlayerUtils';
 import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
+import EditableHmsTime from './components/EditableHmsTime';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -253,12 +254,6 @@ function fmtDateAndAgo(value: string | null | undefined): string {
   return date || ago;
 }
 
-function parseHms(t: string): number {
-  const p = t.split(':').map(Number);
-  if (p.length !== 3 || p.some(isNaN)) return 0;
-  return p[0] * 3600 + p[1] * 60 + p[2];
-}
-
 function formatHmsFull(sec: number): string {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600);
@@ -353,111 +348,7 @@ function NeedleGlancePopup({
     </div>,
     document.body,
   );
-}function EditableHmsTime({
-  valueSec,
-  minSec,
-  maxSec,
-  onChange,
-  className = '',
-}: {
-  valueSec: number;
-  minSec: number;
-  maxSec: number;
-  onChange: (sec: number) => void;
-  className?: string;
-}) {
-  const [editing, setEditing] = useState(false);
-  const ref = useRef<HTMLSpanElement>(null);
-
-  const clamp = useCallback(
-    (sec: number) => Math.max(minSec, Math.min(maxSec, Math.floor(sec))),
-    [minSec, maxSec],
-  );
-
-  const commit = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    const parsed = parseHms((el.textContent || '').trim());
-    onChange(clamp(parsed));
-    setEditing(false);
-  }, [clamp, onChange]);
-
-  useLayoutEffect(() => {
-    if (!editing || !ref.current) return;
-    ref.current.textContent = formatHmsFull(valueSec);
-    const el = ref.current;
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-    el.focus();
-  }, [editing, valueSec]);
-
-  if (!editing) {
-    return (
-      <span
-        role="button"
-        tabIndex={0}
-        title="Click to edit (HH:MM:SS)"
-        className={`cursor-text rounded px-0.5 hover:bg-zinc-800/80 focus:outline-none focus:ring-1 focus:ring-zinc-600 ${className}`}
-        onClick={() => setEditing(true)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setEditing(true);
-          }
-          if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            onChange(clamp(valueSec + 1));
-          }
-          if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            onChange(clamp(valueSec - 1));
-          }
-        }}
-      >
-        {formatHmsFull(valueSec)}
-      </span>
-    );
-  }
-
-  return (
-    <span
-      ref={ref}
-      contentEditable
-      suppressContentEditableWarning
-      className={`rounded px-0.5 bg-zinc-800 outline-none ring-1 ring-zinc-500 ${className}`}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          commit();
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          setEditing(false);
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          onChange(clamp(valueSec + 1));
-          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec + 1));
-        }
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          onChange(clamp(valueSec - 1));
-          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec - 1));
-        }
-      }}
-    />
-  );
 }
-
-const PREVIEW_KEY_SKIP_SEC = 5;
-const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
-const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
-
 function readPreviewFsUiScale(): number {
   try {
     const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
@@ -467,6 +358,11 @@ function readPreviewFsUiScale(): number {
     return 1;
   }
 }
+const PREVIEW_KEY_SKIP_SEC = 5;
+const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
+const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
+const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
+
 const PREVIEW_DEFAULT_VOLUME = 0.3;
 
 /** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
