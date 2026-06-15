@@ -25,7 +25,12 @@ from routers import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Kick & Twitch Downloader", version="1.0.45")
+try:
+    from services._version import __version__
+except ImportError:
+    __version__ = "0.0.0"
+
+app = FastAPI(title="Kick & Twitch Downloader", version=__version__)
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"

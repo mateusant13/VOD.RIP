@@ -646,4 +646,8 @@ def download_video_sync(
 
 
 # Install the instrumented FFmpeg postprocessor at module import time.
-_ytdlp_pp_pkg.postprocessors.value["FFmpegVideoConvertorPP"] = _InstrumentedFFmpegPP
+# ponytail: survival guarantee for PP swap — yt-dlp may change the postprocessors registry format in future versions
+if hasattr(_ytdlp_pp_pkg, "postprocessors") and hasattr(_ytdlp_pp_pkg.postprocessors, "value"):
+    _ytdlp_pp_pkg.postprocessors.value["FFmpegVideoConvertorPP"] = _InstrumentedFFmpegPP
+else:
+    logger.warning("yt-dlp postprocessors registry not found — FFmpeg progress instrumentation disabled")
