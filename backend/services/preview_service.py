@@ -66,6 +66,150 @@ _sessions: Dict[str, "PreviewSession"] = {}
 _MAX_SESSIONS = 20
 
 
+
+
+class PreviewManager:
+    _max_sessions = 20
+
+    """Manages preview session lifecycle — create, get, delete, cleanup."""
+
+    # ponytail: _sessions dict + _lock moved from module-level into a class.
+    # This bounds the state to a manager instance, making it testable and
+    # preventing stale state across test runs or single-instance redirects.
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions: Dict[str, "PreviewSession"] = {}
+
+    def _cleanup_stale_sessions(self, ) -> None:
+            now = time.time()
+            stale = [sid for sid, s in _sessions.items() if now - s.last_access > SESSION_TTL_SEC]
+            for sid in stale:
+                    self.delete_session(sid)
+
+
+
+
+    def delete_session(self, session_id: str) -> bool:
+            with self._lock:
+                    session = _sessions.pop(session_id, None)
+            if not session:
+                    return False
+            try:
+                    import shutil
+                    if session.cache_dir.is_dir():
+                            shutil.rmtree(session.cache_dir, ignore_errors=True)
+            except OSError:
+                    pass
+            return True
+
+
+
+
+    def get_session(self, session_id: str) -> Optional[PreviewSession]:
+            with self._lock:
+                    session = _sessions.get(session_id)
+            if session:
+                    session.touch()
+            return session
+
+
+
+
+    def create_session(self, 
+            url: str,
+            crop_start: float = 0.0,
+            crop_end: float = 0.0,
+            oauth: Optional[str] = None,
+            prefer_height: int = 480,
+    ) -> PreviewSession:
+            del crop_end
+            self._cleanup_stale_sessions()
+            raw_entry, headers, platform, variant_formats, kind = resolve_stream_info(
+                    url, oauth=oauth, prefer_height=prefer_height,
+            )
+            session_id = secrets.token_hex(8)
+            cache_dir = _PREVIEW_ROOT / session_id
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # For progressive sources (Twitch clips) the "master" is a single MP4
+            # we'll route through the proxy; the master endpoint then streams the
+            # bytes with video/mp4 so the frontend can use a native <video> element.
+            proxy_master_url: Optional[str] = None
+            if kind == "progressive":
+                    proxy_master_url = f"/api/preview/hls/{session_id}/master.m3u8"
+
+            session = PreviewSession(
+                    session_id=session_id,
+                    vod_url=url,
+                    master_url=proxy_master_url or raw_entry,
+                    entry_url=raw_entry,
+                    platform=platform,
+                    http_headers=headers,
+                    allowed_hosts=_hosts_for_url(raw_entry),
+                    cache_dir=cache_dir,
+                    kind=kind,
+            )
+
+            if variant_formats:
+                    session.variant_entries = [
+                            (int(fmt.get("height") or 0), fmt.get("url") or "")
+                            for fmt in variant_formats
+                            if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+                    ]
+                    if kind == "hls" and len(session.variant_entries) >= 2:
+                            session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
+                            for _height, upstream in session.variant_entries:
+                                    session.allowed_hosts.update(_hosts_for_url(upstream))
+            if kind == "progressive":
+                    # For Twitch clips the entry URL is the MP4 itself. No playlist to
+                    # walk, no segment prewarm — the frontend plays the file directly.
+                    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+            else:
+                    session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
+                    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+
+                    with self._lock:
+                            self._sessions[session_id] = session
+
+                    # Warm master + default variant playlists so the first hls.js fetches are instant.
+                    try:
+                            proxy_playlist(session_id, session.master_url)
+                            if session.entry_url != session.master_url:
+                                    proxy_playlist(session_id, session.entry_url)
+                    # ponytail: survival guarantee for playlist warm — best-effort; session works without it
+                    except Exception as exc:
+                    # ponytail: best-effort — proxy_playlist(session_id, session.entry_url)
+                            logger.warning("Playlist warm failed: %s", exc)
+
+                    threading.Thread(
+                            target=_prewarm_session,
+                            args=(session_id, crop_start),
+                            daemon=True,
+                            name=f"kd-prewarm-{session_id[:8]}",
+                    ).start()
+                    return session
+
+            with self._lock:
+                    self._sessions[session_id] = session
+                    if len(self._sessions) > self._max_sessions:
+                            stale = sorted(
+                                    _sessions.items(),
+                                    key=lambda item: item[1].last_access,
+                            )[:len(self._sessions) - self._max_sessions]
+                            for popped_sid, popped_session in stale:
+                                    del self._sessions[popped_sid]
+                                    cache_dir = popped_session.cache_dir
+                                    threading.Thread(
+                                            target=lambda d=cache_dir: shutil.rmtree(
+                                                    d, ignore_errors=True,
+                                            ),
+                                            daemon=True,
+                                    ).start()
+            return session
+
+
+
 @dataclass
 class PreviewSession:
     session_id: str
@@ -581,27 +725,6 @@ def _write_cache(session: PreviewSession, url: str, data: bytes) -> None:
         pass
 
 
-def _cleanup_stale_sessions() -> None:
-    now = time.time()
-    stale = [sid for sid, s in _sessions.items() if now - s.last_access > SESSION_TTL_SEC]
-    for sid in stale:
-        delete_session(sid)
-
-
-def delete_session(session_id: str) -> bool:
-    with _lock:
-        session = _sessions.pop(session_id, None)
-    if not session:
-        return False
-    try:
-        import shutil
-        if session.cache_dir.is_dir():
-            shutil.rmtree(session.cache_dir, ignore_errors=True)
-    except OSError:
-        pass
-    return True
-
-
 def _prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache rewritten playlist + segments near trim start."""
     try:
@@ -643,107 +766,6 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
     except Exception as exc:
     # ponytail: best-effort — )
         logger.warning("Prewarm failed session=%s: %s", session_id[:8], exc)
-
-def create_session(
-    url: str,
-    crop_start: float = 0.0,
-    crop_end: float = 0.0,
-    oauth: Optional[str] = None,
-    prefer_height: int = 480,
-) -> PreviewSession:
-    del crop_end
-    _cleanup_stale_sessions()
-    raw_entry, headers, platform, variant_formats, kind = resolve_stream_info(
-        url, oauth=oauth, prefer_height=prefer_height,
-    )
-    session_id = secrets.token_hex(8)
-    cache_dir = _PREVIEW_ROOT / session_id
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # For progressive sources (Twitch clips) the "master" is a single MP4
-    # we'll route through the proxy; the master endpoint then streams the
-    # bytes with video/mp4 so the frontend can use a native <video> element.
-    proxy_master_url: Optional[str] = None
-    if kind == "progressive":
-        proxy_master_url = f"/api/preview/hls/{session_id}/master.m3u8"
-
-    session = PreviewSession(
-        session_id=session_id,
-        vod_url=url,
-        master_url=proxy_master_url or raw_entry,
-        entry_url=raw_entry,
-        platform=platform,
-        http_headers=headers,
-        allowed_hosts=_hosts_for_url(raw_entry),
-        cache_dir=cache_dir,
-        kind=kind,
-    )
-
-    if variant_formats:
-        session.variant_entries = [
-            (int(fmt.get("height") or 0), fmt.get("url") or "")
-            for fmt in variant_formats
-            if int(fmt.get("height") or 0) > 0 and fmt.get("url")
-        ]
-        if kind == "hls" and len(session.variant_entries) >= 2:
-            session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
-            for _height, upstream in session.variant_entries:
-                session.allowed_hosts.update(_hosts_for_url(upstream))
-    if kind == "progressive":
-        # For Twitch clips the entry URL is the MP4 itself. No playlist to
-        # walk, no segment prewarm — the frontend plays the file directly.
-        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-    else:
-        session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
-        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-
-        with _lock:
-            _sessions[session_id] = session
-
-        # Warm master + default variant playlists so the first hls.js fetches are instant.
-        try:
-            proxy_playlist(session_id, session.master_url)
-            if session.entry_url != session.master_url:
-                proxy_playlist(session_id, session.entry_url)
-        # ponytail: survival guarantee for playlist warm — best-effort; session works without it
-        except Exception as exc:
-        # ponytail: best-effort — proxy_playlist(session_id, session.entry_url)
-            logger.warning("Playlist warm failed: %s", exc)
-
-        threading.Thread(
-            target=_prewarm_session,
-            args=(session_id, crop_start),
-            daemon=True,
-            name=f"kd-prewarm-{session_id[:8]}",
-        ).start()
-        return session
-
-    with _lock:
-        _sessions[session_id] = session
-        if len(_sessions) > _MAX_SESSIONS:
-            stale = sorted(
-                _sessions.items(),
-                key=lambda item: item[1].last_access,
-            )[:len(_sessions) - _MAX_SESSIONS]
-            for popped_sid, popped_session in stale:
-                del _sessions[popped_sid]
-                cache_dir = popped_session.cache_dir
-                threading.Thread(
-                    target=lambda d=cache_dir: shutil.rmtree(
-                        d, ignore_errors=True,
-                    ),
-                    daemon=True,
-                ).start()
-    return session
-
-
-def get_session(session_id: str) -> Optional[PreviewSession]:
-    with _lock:
-        session = _sessions.get(session_id)
-    if session:
-        session.touch()
-    return session
-
 
 def _heights_from_master_text(text: str) -> List[int]:
     heights: List[int] = []
@@ -926,3 +948,12 @@ def proxy_segment(
         headers["Cache-Control"] = "public, max-age=3600"
 
     return data, ctype, headers, status
+
+
+# Module-level singleton — existing importers use ``from services.preview_service import create_session``.
+# ponytail: module-level singleton — one manager per process; safe because the app runs a single backend server.
+_manager = PreviewManager()
+_cleanup_stale_sessions = _manager._cleanup_stale_sessions
+delete_session = _manager.delete_session
+get_session = _manager.get_session
+create_session = _manager.create_session
