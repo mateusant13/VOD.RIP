@@ -2017,6 +2017,7 @@ export default function App() {
     if (previewHlsRef.current) {
       previewHlsRef.current.destroy();
       previewHlsRef.current = null;
+        setHlsRef(null);
     }
     const video = previewVideoRef.current;
     if (video) {

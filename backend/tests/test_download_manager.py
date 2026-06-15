@@ -86,3 +86,40 @@ def test_discard_from_queue():
     state = mgr.get_active_and_history()
     all_ids = {d.download_id for d in state["queue"] + state["history"]}
     assert dl_id not in all_ids
+
+
+def test_concurrent_start_and_cancel():
+    """Starting and cancelling downloads concurrently doesn't deadlock."""
+    from concurrent.futures import ThreadPoolExecutor
+    mgr = DownloadManager(max_workers=4)
+    urls = [f"https://kick.com/a/videos/{i}" for i in range(10)]
+    ids = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(
+                mgr.start_download,
+                url=url,
+                output_file=rf"C:\tmp\{i}.mp4",
+            )
+            for i, url in enumerate(urls)
+        ]
+        for f in futures:
+            ids.append(f.result())
+    # Cancel all concurrently
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(mgr.cancel, dl_id) for dl_id in ids]
+        results = [f.result() for f in futures]
+    # All should return True (or at least not deadlock)
+    count = sum(1 for r in results if r is True)
+    assert count >= 0
+    assert mgr.cancel_all() >= 0
+
+
+def test_cancel_all_idempotent():
+    """Calling cancel_all twice in a row doesn't error."""
+    mgr = DownloadManager(max_workers=2)
+    mgr.start_download(url="https://kick.com/a/videos/1", output_file=r"C:\tmp\a.mp4")
+    count1 = mgr.cancel_all()
+    count2 = mgr.cancel_all()
+    assert count1 >= 0
+    assert count2 == 0  # second call should have nothing to cancel

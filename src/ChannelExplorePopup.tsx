@@ -133,10 +133,11 @@ export default function ChannelExplorePopup({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  // Reset on VOD change — hook manages the runtime copies, but the
+  // setup effect needs to clear these before initialising a new preview.
+  // ponytail: keep in sync with hook's internal requestedHeightRef + appliedHeightRef
   const requestedHeightRef = useRef(0);
   const appliedHeightRef = useRef(0);
-  // ponytail: local appliedHeightRef never syncs to hook's internal copy — first
-  // quality switch always re-applies. Refactor syncPreviewLevels to flow through hook.
   const sessionIdRef = useRef<string | null>(null);
   const sessionMetaRef = useRef<{
     variantHeights: number[];
@@ -160,6 +161,7 @@ export default function ChannelExplorePopup({
     setPreviewLevels,
     setQualityLevel,
     setHlsRef,
+    syncHlsLevels,
   } = usePreviewPlayer({
     videoRef,
     playback,
@@ -583,7 +585,6 @@ export default function ChannelExplorePopup({
           fallbackHeights,
         });
         if (!mapped.length) return;
-        setPreviewLevels(mapped);
         if (!levelsInitialized || applyDefault) {
           levelsInitialized = true;
           const hlsIndex = mapped[defaultIndex]?.index ?? defaultIndex;
@@ -591,12 +592,11 @@ export default function ChannelExplorePopup({
             const levelHeight = inferLevelHeight(hls.levels[hlsIndex]);
             if (levelHeight > 0) {
               hls.loadLevel = hlsIndex;
-              appliedHeightRef.current = levelHeight;
             }
           }
-          setQualityLevel(defaultIndex);
-          const picked = mapped[defaultIndex];
-          if (picked?.height) requestedHeightRef.current = picked.height;
+          syncHlsLevels(mapped, defaultIndex);
+        } else {
+          setPreviewLevels(mapped);
         }
       };
 

@@ -86,7 +86,13 @@ export function usePreviewPlayer({
   trimStart = 0,
   containerRef,
   onPreviewError,
-}: PreviewPlayerOptions): PreviewPlayerState & PreviewPlayerActions & { setHlsRef: (hls: Hls | null) => void; } {
+}: PreviewPlayerOptions): PreviewPlayerState & PreviewPlayerActions & {
+  setHlsRef: (hls: Hls | null) => void;
+  syncProgressiveLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
+  syncHlsLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
+  resolveAndSyncProgressive: typeof resolveAndSyncProgressive;
+  resolveAndSyncHls: typeof resolveAndSyncHls;
+} {
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [qualityLevel, setQualityLevel] = useState(0);
 
@@ -239,6 +245,26 @@ export function usePreviewPlayer({
     if (picked?.height) requestedHeightRef.current = picked.height;
   }, [setLevels]);
 
+  /**
+   * HLS variant of syncProgressiveLevels.
+   * Sets both requestedHeightRef and appliedHeightRef so the first
+   * quality switch doesn't re-apply the same height.
+   * ponytail: extracted to fix the ref sync gap — was previously
+   * handled inline with local refs that never synced back to the hook.
+   */
+  const syncHlsLevels = useCallback((
+    mapped: PreviewLevelOption[],
+    defaultIndex: number,
+  ) => {
+    setLevels(mapped);
+    setQualityLevel(defaultIndex);
+    const picked = mapped[defaultIndex];
+    if (picked?.height) {
+      requestedHeightRef.current = picked.height;
+      appliedHeightRef.current = picked.height;
+    }
+  }, [setLevels]);
+
   const resolveAndSyncProgressive = useCallback(async (
     pageUrl: string,
     meta: {
@@ -288,11 +314,13 @@ export function usePreviewPlayer({
     setHlsRef,
     // Internal helpers for consumer setup
     syncProgressiveLevels,
+    syncHlsLevels,
     resolveAndSyncProgressive,
     resolveAndSyncHls,
   } as PreviewPlayerState & PreviewPlayerActions & {
     setHlsRef: (hls: Hls | null) => void;
     syncProgressiveLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
+    syncHlsLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
     resolveAndSyncProgressive: typeof resolveAndSyncProgressive;
     resolveAndSyncHls: typeof resolveAndSyncHls;
   };
