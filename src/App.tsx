@@ -40,6 +40,7 @@ import EditableHmsTime from './components/EditableHmsTime';
 import FieldCaption from './components/FieldCaption';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
+import ChannelClipThumb from './components/ChannelClipThumb';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -1246,47 +1247,6 @@ function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null }): Cha
     ...v,
     thumbnail_url: v.thumbnail_url ?? v.thumbnail ?? null,
   };
-}
-
-/** Twitch clip/VOD thumbs often use `{width}` / `%{width}` placeholders. */
-function resolveChannelThumbnail(
-  url: string | null | undefined,
-  width = 160,
-  height = 90,
-): string | null {
-  if (!url?.trim()) return null;
-  const w = String(width);
-  const h = String(height);
-  return url
-    .replace(/%\{width\}/g, w)
-    .replace(/%\{height\}/g, h)
-    .replace(/\{width\}/g, w)
-    .replace(/\{height\}/g, h);
-}
-
-function ChannelClipThumb({ video }: { video: ChannelVideo }) {
-  const [failed, setFailed] = useState(false);
-  const src = resolveChannelThumbnail(video.thumbnail_url);
-  if (!src || failed) {
-    return (
-      <div
-        className="shrink-0 w-16 h-9 border border-zinc-800 bg-zinc-900 flex items-center justify-center"
-        aria-hidden
-      >
-        <Play size={11} className="text-zinc-600" />
-      </div>
-    );
-  }
-  return (
-    <img
-      src={src}
-      alt=""
-      loading="lazy"
-      decoding="async"
-      onError={() => setFailed(true)}
-      className="shrink-0 w-16 h-9 object-cover border border-zinc-800 bg-zinc-900"
-    />
-  );
 }
 
 /** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
