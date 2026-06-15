@@ -38,8 +38,9 @@ import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
-import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename } from './formatters';
-import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, PanelSize, LayoutPanelBoundsInput } from './types';
+import { actionBtnHover, platformCardShadow } from './platformStyles';
+import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, readPreviewFsUiScale, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_FS_SCALE_STEPS, PREVIEW_FS_SCALE_KEY, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
@@ -50,6 +51,7 @@ import ChannelClipThumb from './components/ChannelClipThumb';
 import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
+import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
@@ -61,67 +63,10 @@ const IS_DEV_UI = import.meta.env.DEV;
 
 
 /** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
-function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
-  if (e.ctrlKey || e.metaKey || e.altKey) return true;
-  const el = e.target as HTMLElement;
-  if (el.isContentEditable) return true;
-  const tag = el.tagName;
-  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  if (tag === 'INPUT') {
-    const type = (el as HTMLInputElement).type;
-    return type !== 'range' && type !== 'checkbox' && type !== 'radio';
-  }
-  return false;
-}
-
-
-;
-;
-;
-
-
-
 
 ;
 
-
-function sourceQualityOptionLabel(resolutionLabel: string): string {
-  return `source/${resolutionLabel.toLowerCase()}`;
-}
-
-
-interface PersistedPanelLayout {
-  previewPanelWidth: number;
-  urlAside: PanelSize;
-  main: PanelSize;
-}
-
-
 ;
-
-
-function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
-  if (platform === 'kick') {
-    return 'hover:bg-[#53fc18] hover:text-black hover:border-[#53fc18] hover:shadow-[4px_4px_0px_0px_#53fc18]';
-  }
-  if (platform === 'twitch') {
-    return 'hover:bg-[#9146FF] hover:text-black hover:border-[#9146FF] hover:shadow-[4px_4px_0px_0px_#9146FF]';
-  }
-  return 'hover:bg-white hover:text-black hover:border-white';
-}
-
-
-function platformCardShadow(platform: 'kick' | 'twitch' | null, compact = false): string {
-  if (platform === 'kick') {
-    return compact ? 'shadow-[4px_4px_0px_0px_#53fc18]' : 'shadow-[6px_6px_0px_0px_#53fc18]';
-  }
-  if (platform === 'twitch') {
-    return compact ? 'shadow-[4px_4px_0px_0px_#9146FF]' : 'shadow-[6px_6px_0px_0px_#9146FF]';
-  }
-  return compact
-    ? 'shadow-[4px_4px_0px_0px_#53fc18,6px_6px_0px_0px_#9146FF]'
-    : 'shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF]';
-}
 
 
 function startChannelReorderDrag(

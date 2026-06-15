@@ -114,6 +114,10 @@ export function formatBytes(nbytes: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.max(1, Math.round(mb))} MB`;
 }
 
+export function sourceQualityOptionLabel(resolutionLabel: string): string {
+  return `source/${resolutionLabel.toLowerCase()}`;
+}
+
 export function basename(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
