@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
+# ponytail: _sessions module-level dict + _lock is a global mutable singleton.
+# If the app ever needs multiple preview contexts (unlikely but possible),
+# this should move into a SessionManager class. For now, one global cache
+# is the simplest correct solution.
+
 from services.ytdlp_service import (
     _build_ydl_opts,
     _extract_hls_info,

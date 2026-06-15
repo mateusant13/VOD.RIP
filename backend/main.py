@@ -34,6 +34,7 @@ from services.os_services import (
     pick_folder as os_pick_folder,
     sanitize_filename_component,
 )
+from services._app_state import set_download_manager
 from services.preview_service import (
     create_session,
     delete_session,
@@ -114,6 +115,7 @@ app = FastAPI(title="Kick & Twitch Downloader", version="2.0.0")
 settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 download_mgr.apply_settings(settings_mgr)
+set_download_manager(download_mgr)
 # Metadata fetches use their own pool so hung yt-dlp downloads
 # cannot starve /api/info/* and /api/channel/videos.
 INFO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="info")

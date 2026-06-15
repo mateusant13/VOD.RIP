@@ -25,6 +25,7 @@ import {
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
+// ponytail: usePreviewPlayer hook exists but not wired; remove when App.tsx idem
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
