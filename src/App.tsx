@@ -40,6 +40,7 @@ import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import FieldCaption from './components/FieldCaption';
+import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -109,29 +110,6 @@ interface ChannelPreviewBadge {
   platform: string;
   platformListIndex: number;
   isClip: boolean;
-}
-
-function ChannelListIndexBadge({
-  platform,
-  index,
-  size = 'sm',
-}: {
-  platform: string;
-  index: number;
-  size?: 'sm' | 'md';
-}) {
-  const isKick = platform === 'Kick';
-  const dim = size === 'md' ? 'w-5 text-[11px] leading-tight pt-0.5' : 'w-4 text-[9px]';
-  return (
-    <span
-      className={`shrink-0 text-center font-mono font-bold tabular-nums ${dim} ${
-        isKick ? 'text-[#53fc18]' : 'text-[#9146FF]'
-      }`}
-      title={`${platform} #${index}`}
-    >
-      {index}
-    </span>
-  );
 }
 
 interface AppSettings {
