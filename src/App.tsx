@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -39,6 +39,7 @@ import {
 import { ActiveDownloadsList } from './components/ActiveDownloadsList';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
+import FieldCaption from './components/FieldCaption';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { panelMaxWidthCap, readUiScale } from './uiScale';
@@ -1202,19 +1203,6 @@ function parseChannelInput(raw: string): { displayName: string; kickSlug: string
 }
 
 /** Settings/section captions — not <label> so clicks never focus nearby inputs. */
-function FieldCaption({ children, noWrap }: { children: ReactNode; noWrap?: boolean }) {
-  return (
-    <span
-      className={`text-[9px] font-bold uppercase tracking-widest text-zinc-500 block min-w-0 ${
-        noWrap ? 'whitespace-nowrap overflow-hidden text-ellipsis' : ''
-      }`}
-      style={noWrap ? { fontSize: 'clamp(7px, 2.4vw, 9px)' } : undefined}
-    >
-      {children}
-    </span>
-  );
-}
-
 function basename(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
