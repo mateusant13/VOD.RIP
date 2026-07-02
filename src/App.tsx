@@ -2741,7 +2741,7 @@ export default function App() {
           </span>
           <div
             ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 h-3 ${
+            className={`preview-needle-rail relative flex-1 min-h-[12px] ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
@@ -2778,13 +2778,6 @@ export default function App() {
               style={{ left: `${previewClipPct.end}%` }}
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
             />
-          </div>
-          <ClipDurationAdjustButtons
-            compact
-            onAdjust={adjustPreviewClipDuration}
-            activeEndpoint={lastPreviewTrimEndpoint}
-            disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
-          />
           <div
             className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
             onPointerDown={(e) => {
@@ -2811,6 +2804,13 @@ export default function App() {
           >
             <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
           </div>
+        </div>
+          <ClipDurationAdjustButtons
+            compact
+            onAdjust={adjustPreviewClipDuration}
+            activeEndpoint={lastPreviewTrimEndpoint}
+            disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
+          />
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
           }`}>
