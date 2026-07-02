@@ -2729,18 +2729,18 @@ export default function App() {
     : { start: 0, end: 100, play: 0 };
 
   const previewTimelineUi = (
-    <div className="flex flex-col gap-0.5 w-full">
+    <div className="flex flex-col gap-0.5 w-full"
+      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px', overflowY: 'auto' } : undefined}>
       {vodDurationSec > 0 && (
-        <div className="flex items-center gap-2"
-          style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px' } : undefined}>
-          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider ${
+        <div className="flex items-stretch gap-2 flex-1 min-h-0">
+          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider self-center ${
             previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
           }`}>
             Clip
           </span>
           <div
             ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 self-stretch h-full ${
+            className={`preview-needle-rail relative flex-1 ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
@@ -2809,6 +2809,7 @@ export default function App() {
             onAdjust={adjustPreviewClipDuration}
             activeEndpoint={lastPreviewTrimEndpoint}
             disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
+            className="self-center"
           />
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
