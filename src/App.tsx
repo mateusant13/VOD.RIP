@@ -2729,11 +2729,10 @@ export default function App() {
     : { start: 0, end: 100, play: 0 };
 
   const previewTimelineUi = (
-    <div className="flex flex-col gap-0.5 w-full"
-      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px', overflowY: 'auto' } : undefined}
-    >
+    <div className="flex flex-col gap-0.5 w-full">
       {vodDurationSec > 0 && (
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2"
+          style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px' } : undefined}>
           <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider ${
             previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
           }`}>
@@ -2741,7 +2740,7 @@ export default function App() {
           </span>
           <div
             ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 min-h-[12px] ${
+            className={`preview-needle-rail relative flex-1 h-full ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
