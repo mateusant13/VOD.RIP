@@ -5,7 +5,9 @@ Download routes — start, cancel, pause, resume, SSE streaming.
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -29,10 +31,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["downloads"])
 
 
+# Ponytail: validate URL is a supported Kick/Twitch URL before starting download
+# This prevents "not-a-url" entries from polluting the queue/history
+def _validate_download_url(url: str) -> str:
+    """Validate URL is a supported Kick/Twitch URL. Returns platform."""
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(status_code=400, detail="URL must be http or https")
+        host = parsed.netloc.lower()
+        # Kick
+        if host in ("kick.com", "www.kick.com") or host.endswith(".kick.com"):
+            return "Kick"
+        # Twitch
+        if host in ("twitch.tv", "www.twitch.tv", "clips.twitch.tv") or host.endswith(".twitch.tv"):
+            return "Twitch"
+        # UUID (Kick VOD ID) or numeric (Twitch VOD ID)
+        path = parsed.path.strip("/")
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", path):
+            return "Kick"
+        if re.match(r"^\d+$", path):
+            return "Twitch"
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    raise HTTPException(status_code=400, detail="Unsupported URL — only Kick and Twitch URLs are accepted")
+
+
 @router.post("/api/download/video")
 async def download_video(req: DownloadRequest):
     opts = settings_mgr.get()
-    platform = detect_platform(req.url)
+    platform = _validate_download_url(req.url)
     require_hls_crop(req, platform)
     meta = await fetch_queue_meta(req.url, platform)
     output = build_output_path(req, opts, meta)
@@ -63,7 +93,7 @@ async def download_video(req: DownloadRequest):
 @router.post("/api/download/clip")
 async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
-    platform = detect_platform(req.url)
+    platform = _validate_download_url(req.url)
     meta = await fetch_queue_meta(req.url, platform)
     output = build_clip_output_path(req, opts, meta)
     safe_makedirs(Path(output).parent)
@@ -143,13 +173,15 @@ async def pause_download(download_id: str):
 @router.post("/api/download/{download_id}/remove")
 async def remove_download_history(download_id: str):
     """Remove a finished download from history."""
-    return remove_download_history(download_id, download_mgr)
+    from utils import remove_download_history as remove_dl_history
+    return remove_dl_history(download_id, download_mgr)
 
 
 @router.delete("/api/download/{download_id}")
 async def delete_download_history(download_id: str):
     """Remove a finished download from history."""
-    return remove_download_history(download_id, download_mgr)
+    from utils import remove_download_history as remove_dl_history
+    return remove_dl_history(download_id, download_mgr)
 
 
 @router.get("/api/download/{download_id}/stream")

@@ -2639,7 +2639,8 @@ export default function App() {
 
           <button
             onClick={promptStartDownload}
-            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
+            disabled={loading || !videoInfo}
+            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
                 : urlPlatform === 'twitch'
@@ -2869,7 +2870,7 @@ export default function App() {
         <button
           type="button"
           onClick={promptStartDownload}
-          disabled={!previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
+          disabled={loading || !previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
           className={previewCtrlBtn(previewFullscreen, true)}
           title={currentIsClip ? 'Download clip' : 'Download selected trim'}
         >

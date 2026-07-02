@@ -418,7 +418,9 @@ def _build_ydl_opts(
             # progress thread. We do the attach here (not in the PP
             # constructor) so the state lives only for this download.
             pp = d.get("postprocessor")
-            if pp_state is not None and pp is not None:
+            # yt-dlp may provide either a PostProcessor instance or a string name.
+            # Only attach state to real objects that support instance attributes.
+            if pp_state is not None and pp is not None and hasattr(pp, "__dict__"):
                 _set_pp_progress_state(pp, pp_state)
 
             # yt-dlp's own postprocessor pipeline (used when we hand it
