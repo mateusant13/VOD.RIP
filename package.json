@@ -12,7 +12,9 @@
     "build-copy": "vite build && node -e \"const fs=require('fs');const d='backend/static';fs.mkdirSync(d,{recursive:true});fs.copyFileSync('dist/index.html',d+'/index.html')\"",
     "preview": "vite preview",
     "sync-icon": "python scripts/generate-icon.py",
-    "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs"
+    "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs",
+    "test:e2e": "playwright test --config=e2e/playwright.config.ts",
+    "test:e2e:list": "playwright test --config=e2e/playwright.config.ts --list"
   },
   "dependencies": {
     "hls.js": "^1.6.2",
@@ -21,6 +23,7 @@
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "4.1.17",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

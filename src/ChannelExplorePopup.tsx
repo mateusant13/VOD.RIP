@@ -43,7 +43,7 @@ import { formatHmsFull } from './utils';
 
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const PREVIEW_DEFAULT_VOLUME = 0.3;
+const PREVIEW_DEFAULT_VOLUME = 0.1;
 
 export interface ExplorePopupVod {
   url: string;

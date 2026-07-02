@@ -367,6 +367,28 @@ export function estimateDownloadBytes(
   return Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
 }
 
+/**
+ * Returns a cap-adjusted trim window when the estimated download exceeds 1 GB.
+ * Returns null when no cap is needed.
+ */
+export function capDownloadToMaxBytes(
+  estimatedBytes: number,
+  durationSec: number,
+  trimStartSec: number,
+  trimEndSec: number,
+): { trimEnd: number; estimatedBytes: number } | null {
+  if (estimatedBytes <= MAX_DOWNLOAD_BYTES) return null;
+  const clipSec = Math.max(1, trimEndSec - trimStartSec);
+  const ratio = MAX_DOWNLOAD_BYTES / estimatedBytes;
+  const newClipSec = Math.floor(clipSec * ratio);
+  const newTrimEnd = trimStartSec + newClipSec;
+  if (newTrimEnd <= trimStartSec) return null;
+  return {
+    trimEnd: newTrimEnd,
+    estimatedBytes: Math.floor(estimatedBytes * ratio),
+  };
+}
+
 
 export function loadStoredChannelUi(): {
   kick: boolean;
@@ -408,6 +430,10 @@ export const MAX_SAVED_CHANNELS = 10;
 /** Highest quality from API list, or source when none listed (Kick). */
 
 export const CLIP_MAX_DURATION_SEC = 60;
+
+/** 1 GB download cap — when estimated size exceeds this, the UI warns. */
+export const MAX_DOWNLOAD_BYTES = 1_073_741_824;
+
 
 export const LEGACY_MB_PER_MIN: Record<string, number> = {
   source: 112, '1080p60': 112, '1080p': 75,

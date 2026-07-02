@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -26,6 +27,39 @@ if TYPE_CHECKING:
     from services.settings import SettingsManager
 
 logger = logging.getLogger(__name__)
+
+
+# ponytail: minimum plausible VOD id length to filter test/junk URLs from history
+_KICK_VOD_ID_MIN = 100_000
+_TWITCH_VOD_PREFIX = "v"
+
+def _is_sensible_vod_url(url: str) -> bool:
+    """Return False for obviously bogus VOD/clip URLs (test URLs, single-digit ids).
+
+    Valid Kick VOD:  https://kick.com/{channel}/videos/{id}       (id >= 100_000)
+    Valid Kick clip: https://kick.com/{channel}/clips/{id}
+    Valid Twitch:    https://www.twitch.tv/videos/{id}            (id >= 1_000_000)
+    Valid Twitch clip: https://clips.twitch.tv/{id}
+    """
+    if not url or not isinstance(url, str):
+        return False
+    lower = url.lower().strip()
+    if "kick.com" in lower:
+        m = re.search(r"/videos/(\d+)", lower)
+        if m:
+            return int(m.group(1)) >= _KICK_VOD_ID_MIN
+        # Kick clips always OK (short clip ids are normal)
+        if "/clips/" in lower:
+            return True
+        # Unknown format — allow through
+        return True
+    if "twitch.tv" in lower or "clips.twitch.tv" in lower:
+        m = re.search(r"/videos/(\d+)", lower)
+        if m:
+            return int(m.group(1)) >= 1_000_000
+        return True
+    # Non-platform URLs — allow through
+    return True
 
 
 class DownloadPersistence:
@@ -104,6 +138,10 @@ class DownloadPersistence:
     def record_history(self, state: DownloadState) -> None:
         """Insert/replace `state` in the in-memory history and flush to disk."""
         if state.status not in _DONE_STATUSES:
+            return
+        # ponytail: skip junk URLs that slipped into downloads (test VODs, single-digit ids)
+        if not _is_sensible_vod_url(state.url):
+            logger.info("Skipping history entry for non-sensible URL: %s", state.url[:80])
             return
         payload = state.model_dump(mode="json")
         with self._history_lock:
@@ -193,6 +231,10 @@ class DownloadPersistence:
         worker_params: dict | None = None,
     ) -> None:
         if state.status == "Completed":
+            return
+        # ponytail: skip junk URLs that slipped into the queue
+        if not _is_sensible_vod_url(state.url):
+            logger.info("Skipping queue entry for non-sensible URL: %s", state.url[:80])
             return
         payload = state.model_dump(mode="json")
         if worker_params:

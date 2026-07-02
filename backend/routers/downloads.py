@@ -33,6 +33,38 @@ router = APIRouter(tags=["downloads"])
 
 # Ponytail: validate URL is a supported Kick/Twitch URL before starting download
 # This prevents "not-a-url" entries from polluting the queue/history
+def _cap_estimated_bytes(
+    estimated_bytes: int | None,
+    duration: float | None,
+    crop_start: float | None,
+    crop_end: float | None,
+) -> tuple[int | None, float | None, float | None, str]:
+    """Enforce a 1 GB cap on downloads by auto-adjusting the trim window.
+
+    Returns (capped_bytes, adjusted_crop_start, adjusted_crop_end, warning_msg).
+    """
+    if estimated_bytes is None or estimated_bytes <= 0:
+        return estimated_bytes, crop_start, crop_end, ""
+    if estimated_bytes <= MAX_DOWNLOAD_BYTES:
+        return estimated_bytes, crop_start, crop_end, ""
+    if not duration or duration <= 0 or crop_start is None or crop_end is None:
+        return None, crop_start, crop_end, ""
+    clip_sec = crop_end - crop_start
+    if clip_sec <= 0:
+        return None, crop_start, crop_end, ""
+    ratio = MAX_DOWNLOAD_BYTES / float(estimated_bytes)
+    new_clip_sec = clip_sec * ratio
+    new_crop_end = crop_start + new_clip_sec
+    if new_crop_end <= crop_start:
+        return None, crop_start, crop_end, ""
+    capped = int(estimated_bytes * ratio)
+    gb = estimated_bytes / (1024 * 1024 * 1024)
+    return (
+        capped, crop_start, new_crop_end,
+        f"Download capped at 1 GB (was {gb:.1f} GB). Trim adjusted to {new_clip_sec:.0f}s.",
+    )
+
+
 def _validate_download_url(url: str) -> str:
     """Validate URL is a supported Kick/Twitch URL. Returns platform."""
     try:
@@ -71,6 +103,16 @@ async def download_video(req: DownloadRequest):
     if platform == "Kick":
         from services.kick_api_service import download_vod_sync as kick_download_vod
         download_func = kick_download_vod
+    # 1GB download cap: auto-adjust trim if estimated size exceeds limit
+    raw_estimated = trim_estimated_bytes(meta, req.crop_start, req.crop_end)
+    capped_bytes, adj_start, adj_end, cap_warning = _cap_estimated_bytes(
+        raw_estimated, meta.get("duration"), req.crop_start, req.crop_end,
+    )
+    if cap_warning:
+        req.crop_start = adj_start
+        req.crop_end = adj_end
+        logger.info("Download capped: %s", cap_warning)
+    est = capped_bytes if cap_warning else raw_estimated
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -85,9 +127,9 @@ async def download_video(req: DownloadRequest):
         thumbnail=meta.get("thumbnail"),
         duration=meta.get("duration"),
         duration_string=meta.get("duration_string"),
-        estimated_bytes=trim_estimated_bytes(meta, req.crop_start, req.crop_end),
+        estimated_bytes=est,
     )
-    return {"download_id": download_id, "status": "started"}
+    return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
 
 
 @router.post("/api/download/clip")
@@ -101,6 +143,16 @@ async def download_clip(req: DownloadRequest):
     crop_end = req.crop_end
     if crop_start is not None and crop_end is not None and crop_end <= crop_start:
         raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
+    # 1GB download cap for clips
+    raw_estimated = trim_estimated_bytes(meta, crop_start, crop_end)
+    capped_bytes, adj_start, adj_end, cap_warning = _cap_estimated_bytes(
+        raw_estimated, meta.get("duration"), crop_start, crop_end,
+    )
+    if cap_warning:
+        crop_start = adj_start
+        crop_end = adj_end
+        logger.info("Clip download capped: %s", cap_warning)
+    est = capped_bytes if cap_warning else raw_estimated
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -116,8 +168,9 @@ async def download_clip(req: DownloadRequest):
         thumbnail=meta.get("thumbnail"),
         duration=meta.get("duration"),
         duration_string=meta.get("duration_string"),
+        estimated_bytes=est,
     )
-    return {"download_id": download_id, "status": "started"}
+    return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
 
 
 @router.get("/api/downloads")

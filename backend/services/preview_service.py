@@ -59,8 +59,6 @@ _URI_IN_TAG = re.compile(r'URI="([^"]+)"')
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 
-_lock = threading.Lock()
-_sessions: Dict[str, "PreviewSession"] = {}
 # ponytail: hard cap on concurrent preview sessions — prevents memory exhaustion
 # from orphaned sessions if the TTL eviction doesn't keep up.
 _MAX_SESSIONS = 20
@@ -83,7 +81,7 @@ class PreviewManager:
 
     def _cleanup_stale_sessions(self, ) -> None:
             now = time.time()
-            stale = [sid for sid, s in _sessions.items() if now - s.last_access > SESSION_TTL_SEC]
+            stale = [sid for sid, s in self._sessions.items() if now - s.last_access > SESSION_TTL_SEC]
             for sid in stale:
                     self.delete_session(sid)
 
@@ -92,7 +90,7 @@ class PreviewManager:
 
     def delete_session(self, session_id: str) -> bool:
             with self._lock:
-                    session = _sessions.pop(session_id, None)
+                    session = self._sessions.pop(session_id, None)
             if not session:
                     return False
             try:
@@ -108,7 +106,7 @@ class PreviewManager:
 
     def get_session(self, session_id: str) -> Optional[PreviewSession]:
             with self._lock:
-                    session = _sessions.get(session_id)
+                    session = self._sessions.get(session_id)
             if session:
                     session.touch()
             return session
@@ -194,7 +192,7 @@ class PreviewManager:
                     self._sessions[session_id] = session
                     if len(self._sessions) > self._max_sessions:
                             stale = sorted(
-                                    _sessions.items(),
+                                    self._sessions.items(),
                                     key=lambda item: item[1].last_access,
                             )[:len(self._sessions) - self._max_sessions]
                             for popped_sid, popped_session in stale:

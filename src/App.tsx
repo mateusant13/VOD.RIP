@@ -6,7 +6,7 @@ import {
   Users, Database, Settings2, Loader2,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical, ZoomIn, ZoomOut,
+  GripVertical,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -42,7 +42,7 @@ import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDat
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, readPreviewFsUiScale, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_FS_SCALE_STEPS, PREVIEW_FS_SCALE_KEY, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
 import ChannelClipThumb from './components/ChannelClipThumb';
@@ -151,6 +151,7 @@ export default function App() {
   const urlPlatform = detectUrlPlatform(url);
   const [trimStartSec, setTrimStartSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(3600);
+  const [trimPanelHeight, setTrimPanelHeight] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSessionId, setPreviewSessionId] = useState<string | null>(null);
   const [previewPlayback, setPreviewPlayback] = useState<{
@@ -168,7 +169,6 @@ export default function App() {
   const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
-  const [previewFsUiScale, setPreviewFsUiScale] = useState(readPreviewFsUiScale);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
   const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
@@ -235,6 +235,8 @@ export default function App() {
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
+  const trimPanelResizeRef = useRef(false);
+  const previewOpenRef = useRef(false);
   /** True while dragging URL trim sliders or preview in/out needles. */
   const trimDragActiveRef = useRef(false);
   /** Opposite trim endpoint pinned for the duration of a URL slider drag. */
@@ -475,6 +477,11 @@ export default function App() {
     vodDurationSecRef.current = vodDurationSec;
   }, [vodDurationSec]);
 
+  // Keep previewOpenRef in sync
+  useEffect(() => {
+    previewOpenRef.current = previewOpen;
+  }, [previewOpen]);
+
   const previewDurationSec = useMemo(
     () => Math.max(1, previewTrimEnd - previewTrimStart),
     [previewTrimStart, previewTrimEnd],
@@ -508,6 +515,7 @@ export default function App() {
     setPreviewTimeUi(0);
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
+    setTrimPanelHeight(0);
     setPreviewLevels([]);
     setPreviewQualityLevel(0);
     setPreviewQualityMenuOpen(false);
@@ -929,6 +937,13 @@ export default function App() {
     trimEndSecRef.current = end;
     setTrimStartSec(start);
     setTrimEndSec(end);
+    // Sync preview trim when preview is open
+    if (previewOpenRef.current) {
+      previewTrimStartRef.current = start;
+      previewTrimEndRef.current = end;
+      setPreviewTrimStart(start);
+      setPreviewTrimEnd(end);
+    }
     // Pin endpoints are frozen at pointerdown — updating them during drag shifts the
     // other slider's min/max and makes its thumb appear to move the wrong way.
     return { start, end };
@@ -1184,20 +1199,6 @@ export default function App() {
     }
   }, [previewFullscreen]);
 
-  const adjustPreviewFsUiScale = useCallback((delta: number) => {
-    setPreviewFsUiScale((prev) => {
-      const idx = PREVIEW_FS_SCALE_STEPS.indexOf(prev as (typeof PREVIEW_FS_SCALE_STEPS)[number]);
-      const base = idx >= 0 ? idx : 0;
-      const next = PREVIEW_FS_SCALE_STEPS[Math.max(0, Math.min(PREVIEW_FS_SCALE_STEPS.length - 1, base + delta))];
-      try {
-        localStorage.setItem(PREVIEW_FS_SCALE_KEY, String(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-    bumpPreviewFsControls();
-  }, [bumpPreviewFsControls]);
 
   const focusPreviewPlayer = useCallback(() => {
     previewContainerRef.current?.focus();
@@ -1208,6 +1209,7 @@ export default function App() {
     if (!container || !previewVideoReady) return;
     try {
       if (!document.fullscreenElement) {
+        setTrimPanelHeight(0);
         await container.requestFullscreen();
       } else {
         await document.exitFullscreen();
@@ -2635,6 +2637,7 @@ export default function App() {
               {previewVideoLoading ? <Loader2 size={11} className="animate-spin" /> : <Eye size={11} />}
               Preview
             </button>
+
           </div>
 
           <button
@@ -2726,7 +2729,9 @@ export default function App() {
     : { start: 0, end: 100, play: 0 };
 
   const previewTimelineUi = (
-    <div className="flex flex-col gap-0.5 w-full">
+    <div className="flex flex-col gap-0.5 w-full"
+      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px', overflowY: 'auto' } : undefined}
+    >
       {vodDurationSec > 0 && (
         <div className="flex items-center gap-2">
           <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider ${
@@ -2780,6 +2785,32 @@ export default function App() {
             activeEndpoint={lastPreviewTrimEndpoint}
             disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
           />
+          <div
+            className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              trimPanelResizeRef.current = true;
+            }}
+            onPointerMove={(e) => {
+              if (!trimPanelResizeRef.current) return;
+              const panel = e.currentTarget.parentElement;
+              if (!panel) return;
+              const rect = panel.getBoundingClientRect();
+              const h = Math.max(100, e.clientY - rect.top);
+              setTrimPanelHeight(h);
+            }}
+            onPointerUp={(e) => {
+              trimPanelResizeRef.current = false;
+              try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+            }}
+            onPointerCancel={(e) => {
+              trimPanelResizeRef.current = false;
+              try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+            }}
+          >
+            <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
+          </div>
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
           }`}>
@@ -2842,31 +2873,6 @@ export default function App() {
         />
       </div>
       <div className="flex items-center gap-1.5 ml-auto">
-        {opts.fsCornerExit && (
-          <div className="flex items-center gap-0.5 mr-1">
-            <button
-              type="button"
-              onClick={() => adjustPreviewFsUiScale(-1)}
-              disabled={previewFsUiScale <= PREVIEW_FS_SCALE_STEPS[0]}
-              className={previewCtrlBtn(previewFullscreen)}
-              title="Smaller controls"
-            >
-              <ZoomOut size={16} />
-            </button>
-            <span className="text-[9px] font-mono text-zinc-400 tabular-nums min-w-[2.25rem] text-center">
-              {Math.round(previewFsUiScale * 100)}%
-            </span>
-            <button
-              type="button"
-              onClick={() => adjustPreviewFsUiScale(1)}
-              disabled={previewFsUiScale >= PREVIEW_FS_SCALE_STEPS[PREVIEW_FS_SCALE_STEPS.length - 1]}
-              className={previewCtrlBtn(previewFullscreen)}
-              title="Larger controls & trim needles"
-            >
-              <ZoomIn size={16} />
-            </button>
-          </div>
-        )}
         <button
           type="button"
           onClick={promptStartDownload}
@@ -3004,7 +3010,7 @@ export default function App() {
                 ref={previewControlsRef}
                 data-player-controls
                 data-preview-fs-ui={previewFullscreen ? '' : undefined}
-                style={previewFullscreen ? ({ '--preview-fs-scale': previewFsUiScale } as CSSProperties) : undefined}
+
                 className={
                   previewFullscreen
                     ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
@@ -3385,7 +3391,7 @@ export default function App() {
                                 }}
                                 className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                               >
-                                {isClipItem && <ChannelClipThumb video={v} />}
+                                <ChannelClipThumb video={v} />
                                 <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
                                 <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                                   <span className="truncate flex items-center gap-1">

@@ -366,20 +366,9 @@ export function clampStoredPanelSize(value: unknown, fallback: PanelSize): Panel
     h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
   };
 }
-export function readPreviewFsUiScale(): number {
-  try {
-    const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
-    const v = raw ? parseFloat(raw) : 1;
-    return PREVIEW_FS_SCALE_STEPS.includes(v as (typeof PREVIEW_FS_SCALE_STEPS)[number]) ? v : 1;
-  } catch {
-    return 1;
-  }
-}
 export const PREVIEW_KEY_SKIP_SEC = 5;
 export const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-export const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
-export const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
-export const PREVIEW_DEFAULT_VOLUME = 0.3;
+export const PREVIEW_DEFAULT_VOLUME = 0.1;
 export const PREVIEW_PANEL_DEFAULT_W = 640;
 export const PREVIEW_PANEL_MIN_W = 280;
 export const PREVIEW_PANEL_CHROME_H_EST = 120;
