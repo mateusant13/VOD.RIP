@@ -235,7 +235,7 @@ export default function App() {
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
-  const trimPanelResizeRef = useRef(false);
+  const trimPanelResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const previewOpenRef = useRef(false);
   /** True while dragging URL trim sliders or preview in/out needles. */
   const trimDragActiveRef = useRef(false);
@@ -2740,7 +2740,7 @@ export default function App() {
           </span>
           <div
             ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 h-full ${
+            className={`preview-needle-rail relative flex-1 self-stretch h-full ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
@@ -2782,22 +2782,22 @@ export default function App() {
             onPointerDown={(e) => {
               e.preventDefault();
               e.currentTarget.setPointerCapture(e.pointerId);
-              trimPanelResizeRef.current = true;
+              trimPanelResizeRef.current = { startY: e.clientY, startHeight: trimPanelHeight };
             }}
             onPointerMove={(e) => {
               if (!trimPanelResizeRef.current) return;
-              const panel = e.currentTarget.parentElement;
-              if (!panel) return;
-              const rect = panel.getBoundingClientRect();
-              const h = Math.max(100, e.clientY - rect.top);
+              const startY = trimPanelResizeRef.current.startY;
+              const startH = trimPanelResizeRef.current.startHeight;
+              const delta = e.clientY - startY;
+              const h = Math.max(40, startH + delta);
               setTrimPanelHeight(h);
             }}
             onPointerUp={(e) => {
-              trimPanelResizeRef.current = false;
+              trimPanelResizeRef.current = null;
               try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
             }}
             onPointerCancel={(e) => {
-              trimPanelResizeRef.current = false;
+              trimPanelResizeRef.current = null;
               try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
             }}
           >
