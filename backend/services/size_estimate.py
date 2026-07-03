@@ -13,20 +13,21 @@ logger = logging.getLogger(__name__)
 
 # Total Mbps (video+audio) when no metadata — tuned for HLS remux (not peak BANDWIDTH).
 _FALLBACK_MBPS: Dict[str, float] = {
-    "source": 5.5,
-    "1080p60": 6.5,
-    "1080p": 5.0,
-    "720p60": 3.5,
-    "720p": 2.8,
-    "480p": 1.6,
-    "360p": 0.9,
-    "240p": 0.5,
+    "source": 4.5,
+    "1080p60": 5.5,
+    "1080p": 4.2,
+    "720p60": 3.0,
+    "720p": 2.4,
+    "480p": 1.4,
+    "360p": 0.8,
+    "240p": 0.4,
 }
 
 # Peak HLS BANDWIDTH (no AVERAGE-BANDWIDTH) overstates remux size ~1.5–1.7×.
 _PEAK_BANDWIDTH_TO_AVG = 0.62
-# Even AVERAGE-BANDWIDTH on Twitch/Kick manifests runs ~1.4–1.6× above remuxed MP4.
-_MANIFEST_TO_REMUX_SCALE = 0.68
+# AVERAGE-BANDWIDTH on Twitch/Kick manifests overstates remux size ~1.1–1.3×
+# after accounting for container overhead; peak BANDWIDTH needs a separate scale.
+_MANIFEST_TO_REMUX_SCALE = 0.58
 
 _DEFAULT_AUDIO_KBPS = 160.0
 

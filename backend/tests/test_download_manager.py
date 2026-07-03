@@ -76,7 +76,7 @@ def test_discard_from_queue():
     """discard_from_queue removes an entry from both memory and queue.json."""
     mgr = DownloadManager(max_workers=2)
     dl_id = mgr.start_download(
-        url="https://kick.com/x/videos/3",
+        url="https://kick.com/x/videos/123456",
         output_file=r"C:\tmp\x.mp4",
     )
     mgr.cancel(dl_id)
@@ -92,7 +92,7 @@ def test_concurrent_start_and_cancel():
     """Starting and cancelling downloads concurrently doesn't deadlock."""
     from concurrent.futures import ThreadPoolExecutor
     mgr = DownloadManager(max_workers=4)
-    urls = [f"https://kick.com/a/videos/{i}" for i in range(10)]
+    urls = [f"https://kick.com/a/videos/{100000 + i}" for i in range(10)]
     ids = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
@@ -118,7 +118,7 @@ def test_concurrent_start_and_cancel():
 def test_cancel_all_idempotent():
     """Calling cancel_all twice in a row doesn't error."""
     mgr = DownloadManager(max_workers=2)
-    mgr.start_download(url="https://kick.com/a/videos/1", output_file=r"C:\tmp\a.mp4")
+    mgr.start_download(url="https://kick.com/a/videos/100001", output_file=r"C:\tmp\a.mp4")
     count1 = mgr.cancel_all()
     count2 = mgr.cancel_all()
     assert count1 >= 0

@@ -424,7 +424,6 @@ def download_vod_sync(
     """Download a Kick VOD clip via the fast JSON API + HLS segments (no browser)."""
     from services.ytdlp_service import (
         _parse_prefer_height,
-        _require_crop_range,
         _resolve_ffmpeg_exe,
         _verify_output_file,
         download_hls_media_clip,
@@ -434,10 +433,19 @@ def download_vod_sync(
         video_encoder = settings_mgr.get().video_encoder
     mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
 
-    info = get_video_info_api(url)
+    info = resolve_kick_stream_api(url)
     if not info.m3u8_url:
-        raise RuntimeError("Kick API returned no HLS source for this VOD")
-    start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+        raise RuntimeError("Kick API returned no HLS source for this Kick content")
+    from services.ytdlp_ffmpeg import _normalize_crop_range
+    crop = _normalize_crop_range(crop_start, crop_end)
+    if crop is not None:
+        start_sec, end_sec = crop
+    else:
+        # Full VOD download — use known duration or large fallback.
+        # download_hls_media_clip caps end_sec at actual segment length,
+        # so a large fallback is safe (ffmpeg stops at EOF anyway).
+        start_sec = 0.0
+        end_sec = info.duration if info.duration and info.duration > 0 else 1e18
     page_url = info.url or url
     headers = {"referer": page_url, "origin": _BASE}
     download_hls_media_clip(

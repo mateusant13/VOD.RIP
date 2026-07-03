@@ -134,7 +134,8 @@ class TrayService:
     def _on_open_downloads(self, icon=None, item=None):
         folder = self.downloads_folder or self._default_downloads()
         if os.name == "nt":
-            os.startfile(folder)
+            from utils import reveal_path_windows
+            reveal_path_windows(folder)
         else:
             from services.os_services import open_file_or_folder
             open_file_or_folder(folder)
@@ -142,7 +143,8 @@ class TrayService:
     def _on_open_log(self, icon=None, item=None):
         if self.log_path and os.path.isfile(self.log_path):
             if os.name == "nt":
-                os.startfile(self.log_path)
+                from utils import reveal_path_windows
+                reveal_path_windows(self.log_path)
             else:
                 from services.os_services import open_file_or_folder
                 open_file_or_folder(self.log_path, reveal=True)

@@ -618,7 +618,15 @@ def download_video_sync(
             pass
 
     if is_hls:
-        start_sec, end_sec = _require_crop_range(crop_start, crop_end)
+        crop = _normalize_crop_range(crop_start, crop_end)
+        if crop is not None:
+            start_sec, end_sec = crop
+        else:
+            # Full VOD download — start at 0, end at known duration.
+            # download_hls_media_clip caps end_sec at actual segment length,
+            # so a large fallback is safe (ffmpeg stops at EOF anyway).
+            start_sec = 0.0
+            end_sec = expected_duration if expected_duration and expected_duration > 0 else 1e18
         mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
         _download_hls_clip(
             full_url, output_path, start_sec, end_sec, opts,

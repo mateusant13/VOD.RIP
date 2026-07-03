@@ -366,6 +366,10 @@ export default function App() {
   const [queueDownloads, setQueueDownloads] = useState<DownloadState[]>([]);
   const [recentDownloads, setRecentDownloads] = useState<DownloadState[]>([]);
   const [historyDownloads, setHistoryDownloads] = useState<DownloadState[]>([]);
+  const [selectedQueueIds, setSelectedQueueIds] = useState<Set<string>>(new Set());
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
+  const [selectedRecentIds, setSelectedRecentIds] = useState<Set<string>>(new Set());
+  const [selectedChannelVodUrls, setSelectedChannelVodUrls] = useState<Set<string>>(new Set());
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
@@ -1465,6 +1469,8 @@ export default function App() {
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    // ponytail: pass empty layout so preview can grow freely - other panels shrink on drag end
+    const emptyLayout = { previewOpen: false, urlPanelAside: false, preview: { w: 0, h: 0 }, urlAside: { w: 0, h: 0 }, main: { w: 0, h: 0 } };
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
       aspect: previewVideoAspectRef.current,
@@ -1472,8 +1478,22 @@ export default function App() {
         w,
         previewChromeHRef.current,
         previewVideoAspectRef.current,
-        layoutBoundsInput(),
+        emptyLayout,
       ),
+      onResizeEnd: () => {
+        // Re-clamp urlAside and main to fit alongside the new preview width
+        const layout = layoutBoundsInput();
+        if (layout.urlPanelAside) {
+          const clamped = clampPanelSizeForLayout('urlAside', urlAsidePanelSizeRef.current, layout);
+          urlAsidePanelSizeRef.current = clamped;
+          setUrlAsidePanelSize(clamped);
+          if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, clamped);
+        }
+        const clampedMain = clampPanelSizeForLayout('main', mainPanelSizeRef.current, layout);
+        mainPanelSizeRef.current = clampedMain;
+        setMainPanelSize(clampedMain);
+        if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clampedMain);
+      },
     });
   }, [layoutBoundsInput]);
 
@@ -1776,6 +1796,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleDeleteHistory = useCallback(async (id: string) => {
+    if (!window.confirm('Remove this download from history?')) return;
     setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -1787,6 +1808,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleRemoveFromQueue = useCallback(async (id: string) => {
+    if (!window.confirm('Remove this download from the queue?')) return;
     setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -1796,6 +1818,98 @@ export default function App() {
       refreshDownloads();
     }
   }, [refreshDownloads]);
+
+  const toggleQueueSelection = useCallback((id: string) => {
+    setSelectedQueueIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleHistorySelection = useCallback((id: string) => {
+    setSelectedHistoryIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleRecentSelection = useCallback((id: string) => {
+    setSelectedRecentIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleBulkDeleteRecent = useCallback(async () => {
+    if (selectedRecentIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent?`)) return;
+    const ids = [...selectedRecentIds];
+    setSelectedRecentIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedRecentIds, refreshDownloads]);
+
+  const handleBulkDeleteQueue = useCallback(async () => {
+    if (selectedQueueIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue?`)) return;
+    const ids = [...selectedQueueIds];
+    setSelectedQueueIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedQueueIds, refreshDownloads]);
+
+  const handleBulkDeleteHistory = useCallback(async () => {
+    if (selectedHistoryIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history?`)) return;
+    const ids = [...selectedHistoryIds];
+    setSelectedHistoryIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedHistoryIds, refreshDownloads]);
+
+  const handleBulkDownloadChannelVods = useCallback(async () => {
+    if (selectedChannelVodUrls.size === 0) return;
+    const count = selectedChannelVodUrls.size;
+    if (!window.confirm(`Download ${count} selected item(s)?\n\nEach will download at source quality with no trim.`)) return;
+    if (!(await ensureDownloadFolder())) {
+      setError('Choose a download folder to continue.');
+      return;
+    }
+    setError(null);
+    const urls = [...selectedChannelVodUrls];
+    setSelectedChannelVodUrls(new Set());
+    for (const vodUrl of urls) {
+      try {
+        const dlEndpoint = isClipUrl(vodUrl) ? '/api/download/clip' : '/api/download/video';
+        await apiPost<{ download_id: string }>(dlEndpoint, {
+          url: vodUrl,
+          quality: 'source',
+        });
+      } catch (err: any) {
+        setError(err.message || 'Failed to start download');
+        break;
+      }
+    }
+    setTab('queue');
+    refreshDownloads();
+  }, [selectedChannelVodUrls, ensureDownloadFolder, refreshDownloads]);
+
+  const toggleChannelVodSelection = useCallback((vodUrl: string) => {
+    setSelectedChannelVodUrls((prev) => {
+      const next = new Set(prev);
+      if (next.has(vodUrl)) next.delete(vodUrl); else next.add(vodUrl);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     void refreshDownloads();
@@ -2059,13 +2173,19 @@ export default function App() {
   // used to live in a separate useEffect gated by a ref so it would
   // fire exactly once per page load; we keep the same shape so the
   // behaviour survives the consolidation.
+  // On page load: show cached channel data immediately, then silently
+  // refetch every channel in the background (both VODs and clips).
+  // The merge functions (mergeVodLists/mergeClipLists) do incoming-wins
+  // merge, so the cached data stays visible until fresh data arrives.
   const incrementalSyncDoneRef = useRef(false);
   useEffect(() => {
     if (incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
     const channels = loadSavedChannels();
     channels.forEach((c) => {
-      void refreshChannelRef.current(c.id, c, 'vods', { incremental: true });
+      // silent: true -> no loading spinner, cached data stays visible
+      // undefined contentMode -> uses current filter (VODs or clips)
+      void refreshChannelRef.current(c.id, c, undefined, { silent: true });
     });
   }, []);
 
@@ -3357,7 +3477,7 @@ export default function App() {
                                 : 'border-zinc-700 text-zinc-500 hover:text-white'
                             }`}
                           >
-                            Only clips
+                            Clips
                           </button>
                         </div>
                       </div>
@@ -3381,7 +3501,34 @@ export default function App() {
                           {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
                         </p>
                       ) : (
-                        <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
+                        <div className="flex flex-col gap-1">
+                          {selectedChannelVodUrls.size > 0 && (
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500 cursor-pointer hover:text-zinc-300">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedChannelVodUrls.size === visibleChannelVideos.length}
+                                  onChange={() => {
+                                    if (selectedChannelVodUrls.size === visibleChannelVideos.length) {
+                                      setSelectedChannelVodUrls(new Set());
+                                    } else {
+                                      setSelectedChannelVodUrls(new Set(visibleChannelVideos.map(v => buildVodUrl(v))));
+                                    }
+                                  }}
+                                  className="accent-[#53fc18]"
+                                />
+                                Select all
+                              </label>
+                              <button
+                                type="button"
+                                onClick={handleBulkDownloadChannelVods}
+                                className="border border-[#53fc18] bg-[#53fc18]/10 text-[#53fc18] hover:bg-[#53fc18]/20 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider flex items-center gap-1"
+                              >
+                                <Download size={10} /> Download {selectedChannelVodUrls.size}
+                              </button>
+                            </div>
+                          )}
+                          <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
                           {visibleChannelVideos.map((v, i) => {
                             const fullUrl = buildVodUrl(v);
                             const subline = channelVodSubline(v);
@@ -3409,6 +3556,13 @@ export default function App() {
                                 }}
                                 className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                               >
+                                <input
+                                  type="checkbox"
+                                  checked={selectedChannelVodUrls.has(fullUrl)}
+                                  onChange={() => toggleChannelVodSelection(fullUrl)}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="accent-[#53fc18] shrink-0"
+                                />
                                 <ChannelClipThumb video={v} />
                                 <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
                                 <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
@@ -3456,6 +3610,7 @@ export default function App() {
                             );
                           })}
                         </div>
+                      </div>
                       )}
                       {canExpandChannelList && (
                         <button type="button" onClick={handleExpandChannelList}
@@ -3486,6 +3641,15 @@ export default function App() {
             onOpenFolder={openFolder}
             onRefresh={refreshDownloads}
             basename={basename}
+            selectedQueueIds={selectedQueueIds}
+            selectedHistoryIds={selectedHistoryIds}
+            onToggleQueueSelection={toggleQueueSelection}
+            onToggleHistorySelection={toggleHistorySelection}
+            onBulkDeleteQueue={handleBulkDeleteQueue}
+            onBulkDeleteHistory={handleBulkDeleteHistory}
+            selectedRecentIds={selectedRecentIds}
+            onToggleRecentSelection={toggleRecentSelection}
+            onBulkDeleteRecent={handleBulkDeleteRecent}
           />
         )}
 

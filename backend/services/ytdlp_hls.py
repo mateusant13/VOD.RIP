@@ -682,8 +682,19 @@ def download_hls_media_clip(
 ) -> None:
     """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
     headers = headers or {}
-    duration = end_sec - start_sec
     segments, stream_info = _parse_m3u8(media_url, headers, prefer_height)
+    # Compute actual total duration from parsed segments so we never
+    # rely on the caller's end_sec (which may be a sentinel like 999999).
+    total_duration = sum(s["duration"] for s in segments)
+    # Cap end_sec at the actual media length — prevents sentinel values
+    # from inflating the duration used for ffmpeg -t and progress math.
+    if end_sec > total_duration + 1.0:
+        end_sec = total_duration
+    duration = end_sec - start_sec
+    if duration <= 0:
+        raise RuntimeError(
+            f"HLS trim range {start_sec}-{end_sec} results in non-positive duration"
+        )
     selected, first_offset = _select_segments(segments, start_sec, end_sec)
     playlist_encoder = resolve_concat_encoder(stream_info, None, video_encoder)
     if progress_hook and playlist_encoder != "copy":

@@ -280,10 +280,15 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
             fg_thread = user32.GetWindowThreadProcessId(fg, 0)
             my_thread = kernel32.GetCurrentThreadId()
             attached = False
+            # ponytail: AttachThreadInput(idAttach, idAttachTo, fAttach)
+            # idAttach = OUR thread, idAttachTo = foreground thread.
+            # Previous code had these swapped, which silently fails.
             if fg_thread and fg_thread != my_thread:
-                user32.AttachThreadInput(fg_thread, my_thread, True)
+                user32.AttachThreadInput(my_thread, fg_thread, True)
                 attached = True
             try:
+                # ALT key trick: simulating an Alt press/release satisfies
+                # the Windows foreground activation prerequisite.
                 user32.keybd_event(VK_MENU, 0, 0, 0)
                 user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
                 user32.ShowWindow(root, SW_RESTORE)
@@ -294,11 +299,22 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
                 user32.SetForegroundWindow(root)
             finally:
                 if attached:
-                    user32.AttachThreadInput(fg_thread, my_thread, False)
+                    user32.AttachThreadInput(my_thread, fg_thread, False)
         except Exception:
-        # ponytail: ctypes/Win32 API errors only — best-effort window focus
-            user32.ShowWindow(root, SW_RESTORE)
-            user32.SetForegroundWindow(root)
+            pass
+        # SetWindowPos TOPMOST trick: force window on top as a fallback.
+        # This doesn't give keyboard focus but at least makes the window
+        # visible on top of other windows.
+        try:
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(root, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetWindowPos(root, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        except Exception:
+            pass  # ponytail: SetWindowPos already failed, nothing more to try
         return True
     except Exception:
     # ponytail: best-effort — return True
@@ -313,7 +329,12 @@ def nudge_explorer_foreground(
     attempts: int = 1,
     delay: float = 0.0,
 ) -> None:
-    """Raise Explorer after reveal."""
+    """Raise Explorer after reveal.
+
+    shell_reveal_via_pidl opens Explorer asynchronously, so the window
+    may not exist yet.  We retry with a short delay to let the window
+    appear before trying to focus it.
+    """
     for i in range(max(1, attempts)):
         if focus_explorer_window(folder_path, item_name):
             return
@@ -402,7 +423,9 @@ def reveal_path_windows(target: str) -> None:
         else:
             return
     if shell_reveal_via_pidl(reveal_target):
-        nudge_explorer_foreground(folder, item)
+        # ponytail: SHOpenFolderAndSelectItems is async — Explorer may not
+        # have created the window yet.  Retry for up to 2 seconds.
+        nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
         return
     if item and os.path.isfile(abspath):
         subprocess.Popen(
@@ -414,7 +437,7 @@ def reveal_path_windows(target: str) -> None:
             ["explorer.exe", folder],
             creationflags=_NO_WINDOW,
         )
-    nudge_explorer_foreground(folder, item, attempts=10, delay=0.05)
+    nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
 
 
 def open_folder_sync(path: str) -> None:
@@ -549,17 +572,25 @@ def parse_video_date(value) -> Optional[datetime]:
 
 
 def require_hls_crop(req, platform: str) -> None:
-    """Validate that crop_start/crop_end are provided for HLS downloads."""
+    """Validate that crop_start/crop_end are provided for HLS downloads.
+
+    Full-VOD downloads (both None) are allowed — the HLS path will
+    download the entire stream.  Partial trim (one provided, one missing)
+    is rejected.
+    """
     from services.ytdlp_service import is_clip_url
     if is_clip_url(req.url):
         return
     if platform not in ("Twitch", "Kick"):
         return
+    # Both None = full VOD download — allowed
+    if req.crop_start is None and req.crop_end is None:
+        return
     if req.crop_start is None or req.crop_end is None:
         from fastapi import HTTPException
         raise HTTPException(
             status_code=400,
-            detail="crop_start and crop_end are required for Twitch/Kick downloads",
+            detail="crop_start and crop_end are required for trimmed downloads",
         )
     if req.crop_end <= req.crop_start:
         from fastapi import HTTPException
@@ -624,7 +655,7 @@ def download_func_for_entry(entry: dict):
     from services.ytdlp_service import detect_platform
     platform = detect_platform(entry["url"])
     dtype = entry.get("type", entry.get("download_type", "video"))
-    if platform == "Kick" and dtype == "video":
+    if platform == "Kick" and dtype in ("video", "clip"):
         from services.kick_api_service import download_vod_sync as kick_download_vod
         return kick_download_vod
     return None

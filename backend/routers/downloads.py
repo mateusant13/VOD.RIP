@@ -153,6 +153,12 @@ async def download_clip(req: DownloadRequest):
         crop_end = adj_end
         logger.info("Clip download capped: %s", cap_warning)
     est = capped_bytes if cap_warning else raw_estimated
+    # Kick clips are HLS streams — route through kick_download_vod
+    # (same proven path as Kick VODs) instead of yt-dlp.
+    download_func = None
+    if platform == "Kick":
+        from services.kick_api_service import download_vod_sync as kick_download_vod
+        download_func = kick_download_vod
     download_id = download_mgr.start_download(
         url=req.url,
         output_file=output,
@@ -160,7 +166,7 @@ async def download_clip(req: DownloadRequest):
         oauth=req.oauth or opts.oauth,
         crop_start=crop_start,
         crop_end=crop_end,
-        download_func=None,
+        download_func=download_func,
         download_type="clip",
         settings_mgr=settings_mgr,
         title=meta.get("title"),

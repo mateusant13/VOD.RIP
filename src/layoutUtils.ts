@@ -240,6 +240,7 @@ export function startPanelWidthResize(
     aspect: number;
     posRef?: MutableRefObject<PanelPos | null>;
     setPos?: Dispatch<SetStateAction<PanelPos | null>>;
+    onResizeEnd?: () => void;
   },
 ) {
   e.preventDefault();
@@ -302,6 +303,7 @@ export function startPanelWidthResize(
     const finalW = clamp(widthRef.current);
     applyWidthAndPos(finalW);
     setWidth(finalW);
+    opts.onResizeEnd?.();
     if (opts.setPos && opts.posRef?.current) {
       opts.setPos({ ...opts.posRef.current });
     }
