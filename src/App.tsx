@@ -2730,7 +2730,7 @@ export default function App() {
 
   const previewTimelineUi = (
     <div className="flex flex-col gap-0.5 w-full"
-      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px', overflowY: 'auto' } : undefined}>
+      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px' } : undefined}>
       {vodDurationSec > 0 && (
         <div className="flex items-stretch gap-2 flex-1 min-h-0">
           <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider self-center ${
@@ -2744,6 +2744,14 @@ export default function App() {
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
+            onClick={(e) => {
+              if (e.target !== e.currentTarget) return;
+              const rail = previewNeedleRailRef.current;
+              if (!rail || vodDurationSec <= 0) return;
+              const rect = rail.getBoundingClientRect();
+              const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              seekPreviewVideo(frac * vodDurationSec);
+            }}
           >
             <div
               className="preview-needle-region absolute top-1/2 -translate-y-1/2 h-1 pointer-events-none"
@@ -2777,32 +2785,6 @@ export default function App() {
               style={{ left: `${previewClipPct.end}%` }}
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
             />
-          <div
-            className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
-            onPointerDown={(e) => {
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
-              trimPanelResizeRef.current = { startY: e.clientY, startHeight: trimPanelHeight };
-            }}
-            onPointerMove={(e) => {
-              if (!trimPanelResizeRef.current) return;
-              const startY = trimPanelResizeRef.current.startY;
-              const startH = trimPanelResizeRef.current.startHeight;
-              const delta = e.clientY - startY;
-              const h = Math.max(40, startH + delta);
-              setTrimPanelHeight(h);
-            }}
-            onPointerUp={(e) => {
-              trimPanelResizeRef.current = null;
-              try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-            }}
-            onPointerCancel={(e) => {
-              trimPanelResizeRef.current = null;
-              try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-            }}
-          >
-            <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
-          </div>
         </div>
           <ClipDurationAdjustButtons
             compact
@@ -2816,6 +2798,41 @@ export default function App() {
           }`}>
             {formatHmsFull(previewTrimEnd - previewTrimStart)}
           </span>
+        </div>
+      )}
+      {vodDurationSec > 0 && (
+        <div
+          className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
+          onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            trimPanelResizeRef.current = { startY: e.clientY, startHeight: trimPanelHeight };
+            trimDragActiveRef.current = true;
+            bumpPreviewFsControls();
+          }}
+          onPointerMove={(e) => {
+            if (!trimPanelResizeRef.current) return;
+            const startY = trimPanelResizeRef.current.startY;
+            const startH = trimPanelResizeRef.current.startHeight;
+            const delta = e.clientY - startY;
+            const minH = previewFullscreen ? 60 : 40;
+            const maxH = previewFullscreen ? Math.floor(window.innerHeight * 0.5) : Infinity;
+            const h = Math.min(maxH, Math.max(minH, startH - delta));
+            setTrimPanelHeight(h);
+          }}
+          onPointerUp={(e) => {
+            trimPanelResizeRef.current = null;
+            trimDragActiveRef.current = false;
+            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+          }}
+          onPointerCancel={(e) => {
+            trimPanelResizeRef.current = null;
+            trimDragActiveRef.current = false;
+            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+          }}
+        >
+          <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
         </div>
       )}
       <div className="flex items-center gap-2">
@@ -2973,12 +2990,13 @@ export default function App() {
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
+              style={!previewFullscreen ? { aspectRatio: previewVideoAspect } : undefined}
             >
               <div
                 className={`relative bg-black overflow-hidden cursor-pointer ${
-                  previewFullscreen ? 'absolute inset-0 z-0' : 'w-full shrink-0'
+                  'absolute inset-0 z-0'
                 }`}
-                style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
+
                 onClick={() => {
                   focusPreviewPlayer();
                   togglePreviewPlay();
@@ -3013,10 +3031,10 @@ export default function App() {
 
                 className={
                   previewFullscreen
-                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 max-h-[50vh] overflow-hidden bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
                       previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                     }`
-                    : 'flex flex-col gap-1.5 w-full shrink-0'
+                    : 'absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-2 pb-2 pt-2 bg-gradient-to-t from-black/80 to-black/50'
                 }
                 onClick={previewFullscreen ? (e) => e.stopPropagation() : undefined}
                 onPointerDown={previewFullscreen ? (e) => e.stopPropagation() : undefined}
