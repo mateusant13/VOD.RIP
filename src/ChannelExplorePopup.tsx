@@ -40,6 +40,15 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
+import { platformCardShadow, type PlatformStyleKey } from './platformStyles';
+import { platformAccentColor } from './platformColors';
+
+function explorePlatformKey(raw: string): PlatformStyleKey {
+  const p = raw.toLowerCase();
+  if (p === 'twitch') return 'twitch';
+  if (p === 'youtube') return 'youtube';
+  return 'kick';
+}
 
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
@@ -80,12 +89,6 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
     return type !== 'range' && type !== 'checkbox' && type !== 'radio';
   }
   return false;
-}
-
-function platformCardShadow(platform: 'kick' | 'twitch' | null): string {
-  if (platform === 'kick') return 'shadow-[4px_4px_0px_0px_#53fc18]';
-  if (platform === 'twitch') return 'shadow-[4px_4px_0px_0px_#9146FF]';
-  return 'shadow-[4px_4px_0px_0px_#53fc18]';
 }
 
 export default function ChannelExplorePopup({
@@ -165,7 +168,7 @@ export default function ChannelExplorePopup({
   });
 
 
-  const platform = vod.platform === 'Twitch' ? 'twitch' : 'kick';
+  const platform = explorePlatformKey(vod.platform);
 
   useEffect(() => {
     const pause = () => {
@@ -785,9 +788,8 @@ export default function ChannelExplorePopup({
           <div className="flex items-start justify-between gap-2 shrink-0">
             <div className="min-w-0 flex items-start gap-1.5">
               <span
-                className={`shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5 ${
-                  platform === 'kick' ? 'text-[#53fc18]' : 'text-[#9146FF]'
-                }`}
+                className="shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5"
+                style={{ color: platformAccentColor(platform) }}
                 title={`${vod.platform} #${vod.platformListIndex}`}
               >
                 {vod.platformListIndex}

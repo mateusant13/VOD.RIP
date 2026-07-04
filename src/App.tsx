@@ -43,7 +43,7 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { YOUTUBE_COLOR, platformAccentColor } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import { readUiScale } from './uiScale';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
@@ -1528,65 +1528,104 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen, videoInfo]);
 
+  const layoutRowHasMultiplePanels = useCallback(() => {
+    const layout = layoutBoundsInput();
+    let count = 1;
+    if (layout.previewOpen) count += 1;
+    if (layout.urlPanelAside) count += 1;
+    return count > 1;
+  }, [layoutBoundsInput]);
+
+  const applyLayoutRowSizes = useCallback((fitted: {
+    preview: { w: number; h: number };
+    urlAside: { w: number; h: number };
+    main: { w: number; h: number };
+  }) => {
+    const layout = layoutBoundsInput();
+    if (layout.previewOpen) {
+      previewPanelWidthRef.current = fitted.preview.w;
+      setPreviewPanelWidth(fitted.preview.w);
+      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
+    }
+    urlAsidePanelSizeRef.current = fitted.urlAside;
+    setUrlAsidePanelSize(fitted.urlAside);
+    if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
+    mainPanelSizeRef.current = fitted.main;
+    setMainPanelSize(fitted.main);
+    if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
+  }, [layoutBoundsInput]);
+
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
-    const channelPreview = Boolean(previewChannelBadge);
-    const emptyLayout = { previewOpen: false, urlPanelAside: false, preview: { w: 0, h: 0 }, urlAside: { w: 0, h: 0 }, main: { w: 0, h: 0 } };
     const chromeH = previewChromeHRef.current;
     const aspect = previewVideoAspectRef.current;
-
-    const applySiblingPanels = (fitted: ReturnType<typeof resizeLayoutWithPreviewWidth>) => {
-      urlAsidePanelSizeRef.current = fitted.urlAside;
-      setUrlAsidePanelSize(fitted.urlAside);
-      if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
-      mainPanelSizeRef.current = fitted.main;
-      setMainPanelSize(fitted.main);
-      if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
-    };
+    const coupled = layoutRowHasMultiplePanels();
 
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
       aspect,
       clampWidth: (w) => {
-        const layout = channelPreview ? layoutBoundsInput() : emptyLayout;
+        const layout = layoutBoundsInput();
         const aspectW = clampPreviewPanelWidth(w, chromeH, aspect, layout);
-        if (!channelPreview) return aspectW;
-        return resizeLayoutWithPreviewWidth(layoutBoundsInput(), aspectW).preview.w;
+        if (!coupled) return aspectW;
+        return resizeLayoutGivingWidthTo(layout, 'preview', aspectW).preview.w;
       },
-      onResizeMove: channelPreview
+      onResizeMove: coupled
         ? (w) => {
-            const fitted = resizeLayoutWithPreviewWidth(layoutBoundsInput(), w);
-            previewPanelWidthRef.current = fitted.preview.w;
-            if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
-            applySiblingPanels(fitted);
+            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'preview', w);
+            applyLayoutRowSizes(fitted);
           }
         : undefined,
       onResizeEnd: () => {
         applyLayoutPanelClamps();
       },
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps, previewChannelBadge]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
-    const layout = layoutBoundsInput();
+    const coupled = layoutRowHasMultiplePanels();
     startPanelResizeDrag(e, edge, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
       panelEl: urlAsidePanelRef.current,
-      maxW: layoutMaxPanelWidth('urlAside', layout),
+      maxW: layoutMaxPanelWidth('urlAside', layoutBoundsInput()),
       maxH: layoutMaxPanelHeight(),
-      clampSize: (s) => clampPanelSizeForLayout('urlAside', s, layoutBoundsInput()),
+      clampSize: (s) => {
+        const layout = layoutBoundsInput();
+        const base = clampPanelSizeForLayout('urlAside', s, layout);
+        if (!coupled) return base;
+        const fitted = resizeLayoutGivingWidthTo(layout, 'urlAside', base.w);
+        return { w: fitted.urlAside.w, h: base.h };
+      },
+      onResizeMove: coupled
+        ? (next) => {
+            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'urlAside', next.w);
+            applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } });
+          }
+        : undefined,
       onResizeEnd: () => applyLayoutPanelClamps(),
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
-    const layout = layoutBoundsInput();
+    const coupled = layoutRowHasMultiplePanels();
     startPanelResizeDrag(e, edge, mainPanelSizeRef, setMainPanelSize, {
       panelEl: mainPanelRef.current,
-      maxW: layoutMaxPanelWidth('main', layout),
+      maxW: layoutMaxPanelWidth('main', layoutBoundsInput()),
       maxH: layoutMaxPanelHeight(),
-      clampSize: (s) => clampPanelSizeForLayout('main', s, layoutBoundsInput()),
+      clampSize: (s) => {
+        const layout = layoutBoundsInput();
+        const base = clampPanelSizeForLayout('main', s, layout);
+        if (!coupled) return base;
+        const fitted = resizeLayoutGivingWidthTo(layout, 'main', base.w);
+        return { w: fitted.main.w, h: base.h };
+      },
+      onResizeMove: coupled
+        ? (next) => {
+            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'main', next.w);
+            applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } });
+          }
+        : undefined,
       onResizeEnd: () => applyLayoutPanelClamps(),
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
 
   useEffect(() => {
     if (!previewOpen || previewFullscreen || !previewPanelRef.current || !previewContainerRef.current) return;

@@ -69,37 +69,61 @@ function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
   return usableWidth - gapTotal;
 }
 
-/** Shrink siblings when preview grows so the row stays within the viewport budget. */
-export function resizeLayoutWithPreviewWidth(
+/** Shrink siblings when one panel grows so the row stays within the viewport budget. */
+export function resizeLayoutGivingWidthTo(
   layout: LayoutPanelBoundsInput,
-  desiredPreviewW: number,
+  target: LayoutPanelKey,
+  desiredW: number,
 ): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
-  let preview = { ...layout.preview, w: desiredPreviewW };
+  let preview = { ...layout.preview };
   let urlAside = { ...layout.urlAside };
   let main = { ...layout.main };
 
+  const minWFor = (key: LayoutPanelKey) =>
+    key === 'preview' ? PREVIEW_PANEL_MIN_W : PANEL_MIN.w;
+
+  const getW = (key: LayoutPanelKey) => {
+    if (key === 'preview') return preview.w;
+    if (key === 'urlAside') return urlAside.w;
+    return main.w;
+  };
+
+  const setW = (key: LayoutPanelKey, w: number) => {
+    if (key === 'preview') preview = { ...preview, w };
+    else if (key === 'urlAside') urlAside = { ...urlAside, w };
+    else main = { ...main, w };
+  };
+
+  const snap = (): LayoutPanelBoundsInput => ({ ...layout, preview, urlAside, main });
+  const maxTarget = layoutMaxPanelWidth(target, snap());
+  setW(target, Math.min(maxTarget, Math.max(minWFor(target), desiredW)));
+
   type Slot = { get: () => number; set: (w: number) => void; minW: number };
   const siblingSlots: Slot[] = [];
-  if (layout.urlPanelAside) {
+  if (layout.previewOpen && target !== 'preview') {
+    siblingSlots.push({
+      get: () => preview.w,
+      set: (w) => { preview = { ...preview, w }; },
+      minW: PREVIEW_PANEL_MIN_W,
+    });
+  }
+  if (layout.urlPanelAside && target !== 'urlAside') {
     siblingSlots.push({
       get: () => urlAside.w,
       set: (w) => { urlAside = { ...urlAside, w }; },
       minW: PANEL_MIN.w,
     });
   }
-  siblingSlots.push({
-    get: () => main.w,
-    set: (w) => { main = { ...main, w }; },
-    minW: PANEL_MIN.w,
-  });
+  if (target !== 'main') {
+    siblingSlots.push({
+      get: () => main.w,
+      set: (w) => { main = { ...main, w }; },
+      minW: PANEL_MIN.w,
+    });
+  }
 
   const budget = layoutRowWidthBudget(layout);
-  const minPreviewW = PREVIEW_PANEL_MIN_W;
-  const minSiblingTotal = siblingSlots.reduce((sum, slot) => sum + slot.minW, 0);
-  const maxPreview = Math.max(minPreviewW, budget - minSiblingTotal);
-  preview = { ...preview, w: Math.min(preview.w, maxPreview) };
-
-  let total = preview.w + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
+  let total = getW(target) + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
   if (total <= budget) {
     return { preview, urlAside, main };
   }
@@ -115,6 +139,14 @@ export function resizeLayoutWithPreviewWidth(
   }
 
   return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
+}
+
+/** Shrink siblings when preview grows so the row stays within the viewport budget. */
+export function resizeLayoutWithPreviewWidth(
+  layout: LayoutPanelBoundsInput,
+  desiredPreviewW: number,
+): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
+  return resizeLayoutGivingWidthTo(layout, 'preview', desiredPreviewW);
 }
 
 /** Shrink visible panel widths proportionally when the row exceeds the viewport. */
@@ -301,6 +333,7 @@ export function startPanelResizeDrag(
     maxH?: number;
     panelEl?: HTMLElement | null;
     clampSize?: (size: PanelSize) => PanelSize;
+    onResizeMove?: (size: PanelSize) => void;
     onResizeEnd?: () => void;
   },
 ) {
@@ -340,6 +373,7 @@ export function startPanelResizeDrag(
     if (panelEl) {
       applyPanelSize(panelEl, next);
     }
+    opts?.onResizeMove?.(next);
   };
 
   const onUp = (ev: PointerEvent) => {
