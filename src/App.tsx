@@ -2,7 +2,7 @@ import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type CSSPr
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
-  Download, Scissors, Info, Play, Pause, Link2, X, Clock,
+  Download, Info, Play, Pause, Link2, X, Clock,
   Users, Database, Settings2, Loader2,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
@@ -40,7 +40,7 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformCardShadow } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
@@ -145,6 +145,7 @@ export default function App() {
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [videoInfoThumbFailed, setVideoInfoThumbFailed] = useState(false);
 
   // Download options
   const [quality, setQuality] = useState('source');
@@ -2608,6 +2609,17 @@ export default function App() {
     ? 'w-full bg-zinc-950 border border-zinc-800 text-zinc-400 font-mono placeholder:text-zinc-600 pl-7 pr-7 py-1 focus:outline-none focus:border-zinc-500 transition-colors text-[10px] truncate'
     : 'w-full bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 pl-10 pr-10 py-3 focus:outline-none focus:border-white transition-colors uppercase text-sm';
 
+  const videoInfoThumbSrc = useMemo(() => {
+    const fromInfo = resolveVideoThumbnail(videoInfo?.thumbnail, 48, 36);
+    if (fromInfo) return fromInfo;
+    const cached = findCachedVideoThumbnail(url, savedChannels);
+    return resolveVideoThumbnail(cached, 48, 36);
+  }, [videoInfo?.thumbnail, url, savedChannels]);
+
+  useEffect(() => {
+    setVideoInfoThumbFailed(false);
+  }, [videoInfoThumbSrc]);
+
   const urlTabContent = (
     <div className="flex flex-col gap-2 min-h-0 h-full">
       <div className="flex flex-col gap-1 shrink-0">
@@ -2663,8 +2675,13 @@ export default function App() {
               videoInfo.platform?.toLowerCase() === 'kick' ? 'bg-[#53fc18]' : 'bg-[#9146FF]'
             }`} />
             <div className="w-12 h-9 bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 overflow-hidden">
-              {videoInfo.thumbnail ? (
-                <img src={videoInfo.thumbnail} alt="" className="w-full h-full object-cover" />
+              {videoInfoThumbSrc && !videoInfoThumbFailed ? (
+                <img
+                  src={videoInfoThumbSrc}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  onError={() => setVideoInfoThumbFailed(true)}
+                />
               ) : (
                 <Play size={12} className="text-zinc-500" />
               )}
@@ -3102,6 +3119,8 @@ export default function App() {
           popoverFs: previewFullscreen,
           onMenuOpen: () => setPreviewQualityMenuOpen(false),
         })}
+      </div>
+      <div className="flex items-center gap-1.5 ml-auto">
         <PreviewQualityMenu
           levels={previewLevels}
           currentLevel={previewQualityLevel}
@@ -3115,17 +3134,6 @@ export default function App() {
             ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
             : 'border-2 border-zinc-600 bg-zinc-950'}
         />
-      </div>
-      <div className="flex items-center gap-1.5 ml-auto">
-        <button
-          type="button"
-          onClick={promptStartDownload}
-          disabled={loading || !previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
-          className={previewCtrlBtn(previewFullscreen, true)}
-          title={currentIsClip ? 'Download clip' : 'Download selected trim'}
-        >
-          <Scissors size={18} />
-        </button>
         {opts.fsCornerExit ? (
           <button type="button" onClick={() => void togglePreviewFullscreen()}
             disabled={!previewVideoReady}

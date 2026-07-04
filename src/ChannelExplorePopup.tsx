@@ -888,30 +888,34 @@ export default function ChannelExplorePopup({
               onMouseMove={bumpFsControls}
             >
               {timelineUi}
-              <div className="flex items-center gap-2">
-                <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
-                  {playing ? <Pause size={18} /> : <Play size={18} />}
-                </button>
-                {volumeUi(true)}
-                {qualityUi(true)}
-                <button
-                  type="button"
-                  onClick={() => onCarryToUrl(vod)}
-                  className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                  title="Send to URL panel for rip"
-                >
-                  <ArrowRightToLine size={14} />
-                  URL
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void toggleFullscreen()}
-                  disabled={!ready}
-                  className="ml-auto border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
-                  title="Exit fullscreen"
-                >
-                  <Minimize2 size={18} />
-                </button>
+              <div className="flex items-center gap-2 justify-between">
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={togglePlay} disabled={!ready} className={fsCtrlBtn}>
+                    {playing ? <Pause size={18} /> : <Play size={18} />}
+                  </button>
+                  {volumeUi(true)}
+                  <button
+                    type="button"
+                    onClick={() => onCarryToUrl(vod)}
+                    className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                    title="Send to URL panel for rip"
+                  >
+                    <ArrowRightToLine size={14} />
+                    URL
+                  </button>
+                </div>
+                <div className="flex items-center gap-1.5 ml-auto">
+                  {qualityUi(true)}
+                  <button
+                    type="button"
+                    onClick={() => void toggleFullscreen()}
+                    disabled={!ready}
+                    className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
+                    title="Exit fullscreen"
+                  >
+                    <Minimize2 size={18} />
+                  </button>
+                </div>
               </div>
             </div>
             <div
@@ -933,7 +937,6 @@ export default function ChannelExplorePopup({
                   {playing ? <Pause size={18} /> : <Play size={18} />}
                 </button>
                 {volumeUi(false)}
-                {qualityUi(false)}
                 <button
                   type="button"
                   onClick={() => onCarryToUrl(vod)}
@@ -944,15 +947,18 @@ export default function ChannelExplorePopup({
                   URL
                 </button>
               </div>
-              <button
-                type="button"
-                onClick={() => void toggleFullscreen()}
-                disabled={!ready}
-                className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
-                title="Fullscreen"
-              >
-                <Maximize2 size={18} />
-              </button>
+              <div className="flex items-center gap-1.5 ml-auto">
+                {qualityUi(false)}
+                <button
+                  type="button"
+                  onClick={() => void toggleFullscreen()}
+                  disabled={!ready}
+                  className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
+                  title="Fullscreen"
+                >
+                  <Maximize2 size={18} />
+                </button>
+              </div>
             </div>
           </>
         )}
