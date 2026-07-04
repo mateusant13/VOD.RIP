@@ -288,6 +288,13 @@ def _guess_content_type(url: str, header_ct: str = "") -> str:
     return "application/octet-stream"
 
 
+def _is_rangeable_cdn_media(url: str) -> bool:
+    """True for CDN URLs that must be fetched with Range (never buffer whole file)."""
+    lower = url.lower()
+    host = urlparse(url).hostname or ""
+    return "googlevideo.com" in host or "videoplayback" in lower
+
+
 def _http_get_bytes(
     session: PreviewSession,
     url: str,
@@ -297,6 +304,10 @@ def _http_get_bytes(
     host = urlparse(url).hostname or ""
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
+
+    if range_header is None and _is_rangeable_cdn_media(url):
+        # ponytail: YouTube googlevideo URLs are 100MB+ — browsers range-request; never pull whole file
+        range_header = "bytes=0-2097151"
 
     headers = _request_headers(session, range_header)
     try:
@@ -324,7 +335,10 @@ def _http_get_bytes(
     if not out_headers.get("Content-Length") and data:
         out_headers["Content-Length"] = str(len(data))
     session.touch()
-    return data, ctype, out_headers, resp.status_code
+    status = resp.status_code
+    if range_header and status == 200:
+        status = 206
+    return data, ctype, out_headers, status
 
 
 def _deduped_hls_variants(info: dict) -> List[dict]:

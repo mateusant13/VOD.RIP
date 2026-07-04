@@ -272,10 +272,36 @@ def _instrumented_real_run_ffmpeg(
     oldest_mtime = min(
         os.stat(path).st_mtime for path, _ in input_path_opts if path
     )
+
+    state_lock = state.get("lock") or state.get("pp_lock")
+    cancel_event = state.get("cancel_event")
+    pause_event = state.get("pause_event")
+    register_abort = state.get("register_abort")
+
+    # ponytail: yt-dlp merge graphs — custom argv rebuild can hang; use stock ffmpeg for multi-input
+    input_count = sum(1 for path, _ in input_path_opts if path)
+    if input_count > 1:
+        def _run_merge_original():
+            _check_pause_cancel(cancel_event, pause_event)
+            return _ORIGINAL_REAL_RUN_FFMPEG(
+                self, input_path_opts, output_path_opts,
+                expected_retcodes=expected_retcodes,
+            )
+        try:
+            result = _run_merge_original()
+        except Exception:
+            raise
+        finally:
+            with state_lock:
+                state["last_percent"] = 1.0
+                state["last_speed"] = ""
+                state["last_eta_seconds"] = 0
+                state["last_emit_wall"] = time.monotonic()
+        return result
+
     cmd = _build_ffmpeg_progress_cmd(self.executable, input_path_opts, output_path_opts)
     self.write_debug(f"instrumented ffmpeg command line: {shlex.join(cmd)}")
 
-    state_lock = state.get("lock") or state.get("pp_lock")
     duration_us = state.get("duration_us") or 0
 
     try:
@@ -283,7 +309,7 @@ def _instrumented_real_run_ffmpeg(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
             creationflags=_NO_WINDOW,
@@ -293,10 +319,6 @@ def _instrumented_real_run_ffmpeg(
             self, input_path_opts, output_path_opts,
             expected_retcodes=expected_retcodes,
         )
-
-    cancel_event = state.get("cancel_event")
-    pause_event = state.get("pause_event")
-    register_abort = state.get("register_abort")
 
     def _kill_proc() -> None:
         if proc.poll() is None:
