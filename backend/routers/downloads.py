@@ -30,6 +30,8 @@ from utils import (
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["downloads"])
 
+MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
+
 
 # Ponytail: validate URL is a supported Kick/Twitch URL before starting download
 # This prevents "not-a-url" entries from polluting the queue/history

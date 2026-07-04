@@ -51,6 +51,85 @@ export function clampPanelSizeForLayout(
     h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
   };
 }
+function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
+  const { maxW } = viewportContentBox();
+  const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
+  const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
+  return maxW - gapTotal;
+}
+
+/** Shrink visible panel widths proportionally when the row exceeds the viewport. */
+export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
+  preview: PanelSize;
+  urlAside: PanelSize;
+  main: PanelSize;
+} {
+  let preview = { ...layout.preview };
+  let urlAside = { ...layout.urlAside };
+  let main = { ...layout.main };
+
+  type Slot = {
+    get: () => number;
+    set: (w: number) => void;
+    minW: number;
+  };
+  const slots: Slot[] = [];
+  if (layout.previewOpen) {
+    slots.push({
+      get: () => preview.w,
+      set: (w) => { preview = { ...preview, w }; },
+      minW: PREVIEW_PANEL_MIN_W,
+    });
+  }
+  if (layout.urlPanelAside) {
+    slots.push({
+      get: () => urlAside.w,
+      set: (w) => { urlAside = { ...urlAside, w }; },
+      minW: PANEL_MIN.w,
+    });
+  }
+  slots.push({
+    get: () => main.w,
+    set: (w) => { main = { ...main, w }; },
+    minW: PANEL_MIN.w,
+  });
+
+  const available = layoutRowWidthBudget(layout);
+  let total = slots.reduce((sum, slot) => sum + slot.get(), 0);
+  if (total <= available) return { preview, urlAside, main };
+
+  const scale = available / total;
+  for (const slot of slots) {
+    slot.set(Math.max(slot.minW, Math.floor(slot.get() * scale)));
+  }
+  total = slots.reduce((sum, slot) => sum + slot.get(), 0);
+
+  let guard = 0;
+  while (total > available && guard++ < 64) {
+    const overflow = total - available;
+    const flexible = slots.filter((slot) => slot.get() > slot.minW);
+    if (flexible.length === 0) break;
+    const flexTotal = flexible.reduce((sum, slot) => sum + (slot.get() - slot.minW), 0);
+    if (flexTotal <= 0) break;
+    for (const slot of flexible) {
+      const excess = slot.get() - slot.minW;
+      const shave = Math.min(excess, Math.ceil(overflow * (excess / flexTotal)));
+      slot.set(slot.get() - shave);
+    }
+    total = slots.reduce((sum, slot) => sum + slot.get(), 0);
+  }
+
+  const result = { preview, urlAside, main };
+  if (typeof window !== 'undefined') {
+    let rowTotal = 0;
+    if (layout.previewOpen) rowTotal += result.preview.w;
+    if (layout.urlPanelAside) rowTotal += result.urlAside.w;
+    rowTotal += result.main.w;
+    console.assert(rowTotal <= layoutRowWidthBudget(layout), 'shrinkLayoutPanelsToFit overflow');
+  }
+  return result;
+}
+
 export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
   urlAside: PanelSize;
@@ -81,7 +160,7 @@ export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   }
   main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
 
-  return { preview, urlAside, main };
+  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
 }
 export function maxPreviewPanelWidth(
   chromeH: number,
@@ -162,6 +241,7 @@ export function startPanelResizeDrag(
     maxH?: number;
     panelEl?: HTMLElement | null;
     clampSize?: (size: PanelSize) => PanelSize;
+    onResizeEnd?: () => void;
   },
 ) {
   e.preventDefault();
@@ -219,6 +299,7 @@ export function startPanelResizeDrag(
       applyPanelSize(panelEl, final);
     }
     setSize({ ...final });
+    opts?.onResizeEnd?.();
   };
 
   handle.addEventListener('pointermove', onMove);

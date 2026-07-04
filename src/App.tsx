@@ -1440,12 +1440,18 @@ export default function App() {
   const applyLayoutPanelClamps = useCallback(() => {
     const layout = layoutBoundsInput();
     const clamped = clampAllLayoutPanels(layout);
+    const nextLayout: LayoutPanelBoundsInput = {
+      ...layout,
+      preview: clamped.preview,
+      urlAside: clamped.urlAside,
+      main: clamped.main,
+    };
     if (layout.previewOpen) {
       const w = clampPreviewPanelWidth(
         clamped.preview.w,
         previewChromeHRef.current,
         previewVideoAspectRef.current,
-        layout,
+        nextLayout,
       );
       previewPanelWidthRef.current = w;
       setPreviewPanelWidth(w);
@@ -1481,21 +1487,10 @@ export default function App() {
         emptyLayout,
       ),
       onResizeEnd: () => {
-        // Re-clamp urlAside and main to fit alongside the new preview width
-        const layout = layoutBoundsInput();
-        if (layout.urlPanelAside) {
-          const clamped = clampPanelSizeForLayout('urlAside', urlAsidePanelSizeRef.current, layout);
-          urlAsidePanelSizeRef.current = clamped;
-          setUrlAsidePanelSize(clamped);
-          if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, clamped);
-        }
-        const clampedMain = clampPanelSizeForLayout('main', mainPanelSizeRef.current, layout);
-        mainPanelSizeRef.current = clampedMain;
-        setMainPanelSize(clampedMain);
-        if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clampedMain);
+        applyLayoutPanelClamps();
       },
     });
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps]);
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const layout = layoutBoundsInput();
@@ -1504,8 +1499,9 @@ export default function App() {
       maxW: layoutMaxPanelWidth('urlAside', layout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => clampPanelSizeForLayout('urlAside', s, layoutBoundsInput()),
+      onResizeEnd: () => applyLayoutPanelClamps(),
     });
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps]);
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const layout = layoutBoundsInput();
@@ -1514,8 +1510,9 @@ export default function App() {
       maxW: layoutMaxPanelWidth('main', layout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => clampPanelSizeForLayout('main', s, layoutBoundsInput()),
+      onResizeEnd: () => applyLayoutPanelClamps(),
     });
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps]);
 
   useEffect(() => {
     if (!previewOpen || previewFullscreen || !previewPanelRef.current || !previewContainerRef.current) return;
@@ -2506,15 +2503,22 @@ export default function App() {
   const urlTrimEndMin = Math.min(vodDurationSec, trimStartSec + 1);
 
   // ── Size estimate ──
-  const clipSec = currentIsClip && videoInfo?.duration
-    ? Math.max(1, Math.floor(videoInfo.duration))
-    : Math.max(0, trimEndSec - trimStartSec);
+  const estTrimStart = previewOpen ? previewTrimStart : trimStartSec;
+  const estTrimEnd = previewOpen ? previewTrimEnd : trimEndSec;
+  const effectiveTrimSec = Math.max(0, estTrimEnd - estTrimStart);
+  const fullDur = videoInfo?.duration ?? 0;
+  const trimActive = fullDur > 0 && (estTrimStart > 0 || estTrimEnd < fullDur);
+  const clipSec = trimActive
+    ? effectiveTrimSec
+    : currentIsClip && fullDur > 0
+      ? Math.max(1, Math.floor(fullDur))
+      : effectiveTrimSec;
 
   const estBytes = estimateDownloadBytes(
     videoInfo,
     quality,
     clipSec,
-    videoInfo?.duration ?? clipSec,
+    fullDur || clipSec,
   );
 
   const sourceQualityLabel = useMemo(
