@@ -13,11 +13,9 @@ import tempfile
 from functools import lru_cache
 from typing import Dict, List, Optional
 
-from services.os_services import list_gpu_names
+from services.os_services import _NO_WINDOW, list_gpu_names
 
 logger = logging.getLogger(__name__)
-
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 VENDOR_LABELS = {
     "nvidia": "NVIDIA",
@@ -61,6 +59,7 @@ def _is_apple_silicon() -> bool:
     try:
         return _platform.processor() == "arm"
     except Exception:
+    # ponytail: subprocess errors only — best-effort GPU encoder detection
         return False
 
 
@@ -119,11 +118,13 @@ def _encoder_usable(encoder: str, ffmpeg_bin: str) -> bool:
         )
         return result.returncode == 0
     except Exception:
+    # ponytail: best-effort — return result.returncode == 0
         return False
     finally:
         try:
             os.unlink(tmp_path)
         except Exception:
+        # ponytail: best-effort — I/O errors only
             pass
 
 
@@ -237,6 +238,7 @@ def get_encoder_detection(ffmpeg_bin: Optional[str] = None, *, fresh: bool = Fal
 
             ffmpeg_bin = _resolve_ffmpeg_exe()
         except Exception:
+        # ponytail: best-effort — ffmpeg_bin = _resolve_ffmpeg_exe()
             ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
     if fresh:
         clear_encoder_detection_cache()

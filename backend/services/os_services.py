@@ -241,37 +241,17 @@ def platform_label() -> str:
 
 
 # ===================================================================
-# BUG 6: Extended GPU detection for FreeBSD/Cygwin
+# Centralised subprocess CREATE_NO_WINDOW flag (Windows only)
 # ===================================================================
 
-def _gpu_names_freebsd() -> List[str]:
-    """Fetch GPU names on FreeBSD via ``pciconf -lv`` (native FreeBSD tool)."""
-    names: list[str] = []
-    if shutil.which("pciconf"):
-        out = _run_text(["pciconf", "-lv"])
-        for line in out.splitlines():
-            # Look for chip = "..." lines after a VGA device
-            if 'chip = "' in line or 'vendor = "' in line:
-                m = re.search(r'["\']([^"\']+)["\']', line)
-                if m:
-                    names.append(m.group(1).strip())
-    return names
+# Prevents a console window from popping up around subprocesses on Windows.
+# Previously duplicated in 7 files — centralised here.
+# ponytail: If Windows ever removes CREATE_NO_WINDOW, this becomes a no-op.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
-
-def _gpu_names_cygwin() -> List[str]:
-    """Fetch GPU names on Cygwin/MSYS2 via Windows WMI (via PowerShell)."""
-    names: list[str] = []
-    ps = (
-        "Get-CimInstance Win32_VideoController | "
-        "Select-Object -ExpandProperty Name"
-    )
-    out = _run_text(["powershell.exe", "-NoProfile", "-Command", ps])
-    for line in out.splitlines():
-        line = line.strip()
-        if line:
-            names.append(line)
-    return names
-
+# ===================================================================
+# GPU detection
+# ===================================================================
 
 def _gpu_names_linux() -> List[str]:
     names: list[str] = []
@@ -308,13 +288,6 @@ def list_gpu_names() -> List[str]:
         return names
     if is_macos():
         return _gpu_names_macos()
-    if is_cygwin_or_msys():
-        return _gpu_names_cygwin()
-    if is_freebsd():
-        names = _gpu_names_freebsd()
-        if names:
-            return names
-        return _gpu_names_linux()
     return _gpu_names_linux()
 
 
@@ -401,7 +374,9 @@ def pick_folder() -> tuple[Optional[str], Optional[str]]:
         try:
             path = _tk_pick_folder()
             result_q.put(("ok", path))
+        # ponytail: survival guarantee for daemon thread worker — catch all to report on result queue
         except Exception as exc:
+        # ponytail: best-effort — result_q.put(("ok", path))
             result_q.put(("err", str(exc)))
 
     t = threading.Thread(target=_tk_worker, daemon=True)
@@ -446,7 +421,7 @@ def _tk_pick_folder() -> Optional[str]:
     finally:
         try:
             root.destroy()
-        except Exception:
+        except (tk.TclError, RuntimeError):
             pass
 
 def _pick_folder_macos_fallback() -> Optional[str]:
@@ -467,7 +442,7 @@ def _pick_folder_macos_fallback() -> Optional[str]:
         )
         path = (out.stdout or "").strip()
         return path if path else None
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         logger.debug("osascript folder picker failed: %s", exc)
         return None
 
@@ -485,7 +460,7 @@ def _pick_folder_linux_fallback() -> Optional[str]:
             )
             path = (out.stdout or "").strip()
             return path if path else None
-        except Exception as exc:
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
             logger.debug("zenity folder picker failed: %s", exc)
     if shutil.which("kdialog"):
         try:
@@ -497,6 +472,6 @@ def _pick_folder_linux_fallback() -> Optional[str]:
             )
             path = (out.stdout or "").strip()
             return path if path else None
-        except Exception as exc:
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
             logger.debug("kdialog folder picker failed: %s", exc)
     return None

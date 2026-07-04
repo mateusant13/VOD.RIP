@@ -72,7 +72,7 @@ def _flush_frontend_state(*, fast: bool = False) -> None:
             "window.__vodripFlushPanelLayout();}catch(e){}})();"
         )
         time.sleep(0.35)
-    except Exception as exc:
+    except (json.JSONDecodeError, TypeError, ValueError, OSError, RuntimeError, AttributeError) as exc:
         _logger.debug("flush frontend state: %s", exc)
 
 
@@ -86,17 +86,17 @@ def on_user_close_attempt() -> bool:
     if _flush_geometry_cb:
         try:
             _flush_geometry_cb()
-        except Exception as exc:
+        except (OSError, RuntimeError) as exc:
             _logger.debug("flush geometry on hide: %s", exc)
     elif _save_geometry_cb:
         try:
             _save_geometry_cb()
-        except Exception as exc:
+        except (OSError, RuntimeError) as exc:
             _logger.debug("save geometry on hide: %s", exc)
     try:
         if _window is not None:
             _window.hide()
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
         _logger.debug("hide window: %s", exc)
     return False
 
@@ -110,7 +110,7 @@ def show_window() -> None:
             _raise_window_foreground(_window)
         elif _show_window_cb:
             _show_window_cb()
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
         _logger.debug("show window: %s", exc)
 
 
@@ -129,7 +129,7 @@ def _raise_window_foreground(window: Any) -> None:
 
         try:
             user32.AllowSetForegroundWindow(ASFW_ANY)
-        except Exception:
+        except OSError:
             pass
 
         hwnd = 0
@@ -149,7 +149,7 @@ def _raise_window_foreground(window: Any) -> None:
         root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
         user32.ShowWindow(root, SW_RESTORE)
         user32.SetForegroundWindow(root)
-    except Exception as exc:
+    except OSError as exc:
         _logger.debug("raise window foreground: %s", exc)
 
 
@@ -184,20 +184,20 @@ def request_app_exit() -> None:
         if _window is not None:
             try:
                 _window.hide()
-            except Exception as exc:
+            except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("hide window on exit: %s", exc)
 
         _flush_frontend_state(fast=True)
         if _flush_geometry_cb:
             try:
                 _flush_geometry_cb()
-            except Exception as exc:
+            except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("flush geometry on exit: %s", exc)
 
         if _tray is not None:
             try:
                 _tray.stop()
-            except Exception as exc:
+            except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("stop tray: %s", exc)
 
         from services.shutdown_util import shutdown_downloads_and_children
@@ -212,19 +212,29 @@ def request_app_exit() -> None:
             port = int(_os.environ.get("PORT", 7897))
             # Process is exiting — signal uvicorn but do not wait up to 4s for the port.
             stop_api_server(port, wait_for_port=False)
+        # ponytail: survival guarantee during shutdown — catch all to prevent blocking exit
         except Exception as exc:
+        # ponytail: best-effort — stop_api_server(port, wait_for_port=False)
             _logger.debug("stop api server: %s", exc)
 
         if _window is not None:
             try:
                 _window.destroy()
-            except Exception as exc:
+            except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("destroy window: %s", exc)
 
         sys.exit(0)
 
     # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.
-    threading.Thread(target=_do_exit, daemon=True).start()
+    # Non-daemon so cleanup (flush state, stop tray, kill downloads) completes before exit.
+    t = threading.Thread(target=_do_exit, daemon=False, name="app-exit-cleanup")
+    t.start()
+    # If cleanup gets stuck (e.g. _window.destroy hangs), don't wait forever.
+    t.join(timeout=8.0)
+    if t.is_alive():
+        _logger.warning("Exit cleanup timed out — forcing exit")
+        import os as _os
+        _os._exit(1)
 
 
 def read_window_geometry() -> Optional[Dict[str, Any]]:
@@ -241,6 +251,6 @@ def read_window_geometry() -> Optional[Dict[str, Any]]:
             geom["x"] = int(_window.x)
         if hasattr(_window, "y") and _window.y is not None:
             geom["y"] = int(_window.y)
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError, ValueError) as exc:
         _logger.debug("read window geometry: %s", exc)
     return geom or None

@@ -32,6 +32,7 @@ def install_crash_handler(app_data_dir: Path):
             with open(fh_path, "a", encoding="utf-8") as fh_file:
                 faulthandler.enable(file=fh_file, all_threads=True)
         except Exception:
+        # ponytail: traceback/type errors only — best-effort crash info extraction
             pass
 
     # Python-level crash handler
@@ -60,6 +61,7 @@ def install_crash_handler(app_data_dir: Path):
                     traceback.print_stack(frame, file=f)
 
         except Exception:
+        # ponytail: best-effort — traceback.print_stack(frame, file=f)
             pass
 
     sys.excepthook = _handle_uncaught
@@ -70,4 +72,5 @@ def _get_version() -> str:
         from services._version import __version__
         return __version__
     except Exception:
+    # ponytail: crash handler setup errors only — non-fatal
         return "unknown"

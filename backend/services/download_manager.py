@@ -1,85 +1,39 @@
 """Download manager — manages download queue, progress, cancellation, and pause.
 
 Persists finished downloads to ``history.json`` and resumable queue entries
-to ``queue.json`` so paused or interrupted jobs survive restarts.
+to ``queue.json`` via the ``DownloadPersistence`` helper class.
 """
 
-import json
 import logging
 import os
-import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from models.schemas import DownloadState
 from services import ytdlp_service
 from services.download_cleanup import delete_partial_output, remove_temp_dirs
-from services.settings import _get_appdata_dir
+from services.download_persistence import DownloadPersistence
+from services.download_utils import (
+    DOWNLOAD_PROGRESS_CAP,
+    POSTPROCESS_PROGRESS_FLOOR,
+    POSTPROCESS_PROGRESS_SPAN,
+    _DONE_STATUSES,
+    _UNFINISHED_STATUSES,
+    _RESUMABLE_STATUSES,
+    _QUEUE_PERSIST_INTERVAL,
+    _TRANSCODE_TIMEOUT_SEC,
+    _download_timeout_seconds,
+    _hook_progress_percent,
+)
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
 
 logger = logging.getLogger(__name__)
-
-DOWNLOAD_PROGRESS_CAP = 90
-POSTPROCESS_PROGRESS_FLOOR = DOWNLOAD_PROGRESS_CAP
-POSTPROCESS_PROGRESS_SPAN = 9.0  # 90 → 99 during mux/encode
-_DONE_STATUSES = frozenset({"Completed", "Failed", "Cancelled"})
-_UNFINISHED_STATUSES = frozenset({"Failed", "Cancelled", "Interrupted"})
-_RESUMABLE_STATUSES = frozenset({"Paused", "Failed", "Cancelled", "Interrupted"})
-_HISTORY_MAX_ENTRIES = 200  # Bound on-disk growth; UI also caps at 50.
-_QUEUE_PERSIST_INTERVAL = 15.0
-_LARGE_DOWNLOAD_MIN_BYTES = 12 * 1024 * 1024 * 1024  # ~12 GB
-_LARGE_DOWNLOAD_TIMEOUT_SEC = 15 * 60  # remux + segment download for ~15 GB class
-_TRANSCODE_TIMEOUT_SEC = 10 * 60  # fail fast once GPU transcode is required
-
-
-def _download_timeout_seconds(estimated_bytes: Optional[int]) -> Optional[float]:
-    """Wall-clock budget for large VOD jobs (~12 GB+) on the remux/download path."""
-    if estimated_bytes is not None and estimated_bytes >= _LARGE_DOWNLOAD_MIN_BYTES:
-        return float(_LARGE_DOWNLOAD_TIMEOUT_SEC)
-    return None
-
-
-
-
-def _hook_progress_percent(d: dict) -> Optional[int]:
-    status = d.get("status")
-    if status not in ("downloading", "postprocessing"):
-        return None
-
-    raw: Optional[float] = None
-    if d.get("percent") is not None:
-        raw = float(d["percent"])
-    elif d.get("_percent") is not None:
-        raw = float(d["_percent"])
-    elif d.get("_percent_str"):
-        try:
-            raw = float(str(d["_percent_str"]).replace("%", "").strip())
-        except ValueError:
-            raw = None
-    elif status == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        downloaded = d.get("downloaded_bytes", 0)
-        if total and total > 0:
-            raw = downloaded / float(total) * 100.0
-
-    if raw is None:
-        return None
-
-    raw = max(0.0, min(100.0, raw))
-    # FFmpeg mux/encode/finalise phases emit 90–99.9; pass through
-    # without rescaling to the download cap (90%).
-    if status == "postprocessing" or raw >= POSTPROCESS_PROGRESS_FLOOR:
-        return min(99, round(raw))
-    pct = round(raw * DOWNLOAD_PROGRESS_CAP / 100.0)
-    if pct == 0 and raw > 0:
-        pct = 1
-    return min(DOWNLOAD_PROGRESS_CAP, pct)
 
 
 class DownloadManager:
@@ -93,215 +47,9 @@ class DownloadManager:
         self._sse_queues: Dict[str, list] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = threading.Lock()
-        # Persistent history (Completed / Failed / Cancelled). Loaded on
-        # construction so the queue tab is populated immediately on startup
-        # — there is no flicker, no extra round-trip.
-        self._history_dir = _get_appdata_dir()
-        self._history_file = self._history_dir / "history.json"
-        self._queue_file = self._history_dir / "queue.json"
-        self._history_lock = threading.Lock()
-        self._queue_lock = threading.Lock()
-        self._history: List[dict] = self._load_history()
-        self._queue: List[dict] = self._load_queue()
-        self._queue_last_persist: Dict[str, float] = {}
-        self._reconcile_queue_on_startup()
-
-    # ------------------------------------------------------------------
-    # History persistence
-    # ------------------------------------------------------------------
-
-    def _load_history(self) -> List[dict]:
-        """Load persisted history from disk. Corrupt or missing file -> []."""
-        try:
-            if not self._history_file.is_file():
-                return []
-            data = json.loads(self._history_file.read_text(encoding="utf-8"))
-            if not isinstance(data, list):
-                return []
-            # Drop entries that don't look like a valid DownloadState — that
-            # way a hand-edited or partially-corrupt file is self-healing.
-            valid: List[dict] = []
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                if "download_id" not in entry or "status" not in entry:
-                    continue
-                if entry.get("status") not in _DONE_STATUSES:
-                    # An entry that was active when the server crashed is
-                    # better surfaced as Cancelled than silently dropped —
-                    # users can then see "it was running, what happened?".
-                    entry["status"] = "Cancelled"
-                valid.append(entry)
-            return valid[:_HISTORY_MAX_ENTRIES]
-        except Exception:
-            logger.exception("Failed to load download history; starting empty")
-            return []
-
-    def _save_history(self) -> None:
-        """Atomic write of self._history to disk. Errors are logged, not raised.
-
-        We swallow failures so a write error never breaks the running
-        download worker. Worst case the user loses the most recent entry.
-        """
-        with self._history_lock:
-            snapshot = self._history[:_HISTORY_MAX_ENTRIES]
-            try:
-                self._history_dir.mkdir(parents=True, exist_ok=True)
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=str(self._history_dir),
-                    prefix="history_",
-                    suffix=".tmp",
-                )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                    os.replace(tmp_path, str(self._history_file))
-                except Exception:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.unlink(tmp_path)
-                        except Exception:
-                            pass
-                    raise
-            except Exception:
-                logger.exception("Failed to persist download history")
-
-    def _record_history(self, state: DownloadState) -> None:
-        """Insert/replace `state` in the in-memory history and flush to disk."""
-        if state.status not in _DONE_STATUSES:
-            return
-        payload = state.model_dump(mode="json")
-        with self._history_lock:
-            # Drop any prior entry for the same id (e.g. we updated the
-            # status of an existing record from Cancelled -> ... ).
-            self._history = [e for e in self._history if e.get("download_id") != state.download_id]
-            self._history.insert(0, payload)
-            self._history = self._history[:_HISTORY_MAX_ENTRIES]
-        self._save_history()
-
-    def _drop_history(self, download_id: str) -> None:
-        """Remove an entry from history and persist."""
-        with self._history_lock:
-            before = len(self._history)
-            self._history = [e for e in self._history if e.get("download_id") != download_id]
-            if len(self._history) == before:
-                return
-        self._save_history()
-
-    def _load_queue(self) -> List[dict]:
-        """Load resumable queue entries from disk."""
-        try:
-            if not self._queue_file.is_file():
-                return []
-            data = json.loads(self._queue_file.read_text(encoding="utf-8"))
-            if not isinstance(data, list):
-                return []
-            valid: List[dict] = []
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                if "download_id" not in entry or "url" not in entry:
-                    continue
-                valid.append(entry)
-            return valid[:_HISTORY_MAX_ENTRIES]
-        except Exception:
-            logger.exception("Failed to load download queue; starting empty")
-            return []
-
-    def _save_queue(self) -> None:
-        with self._queue_lock:
-            snapshot = self._queue[:_HISTORY_MAX_ENTRIES]
-            try:
-                self._history_dir.mkdir(parents=True, exist_ok=True)
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=str(self._history_dir),
-                    prefix="queue_",
-                    suffix=".tmp",
-                )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                    os.replace(tmp_path, str(self._queue_file))
-                except Exception:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.unlink(tmp_path)
-                        except Exception:
-                            pass
-                    raise
-            except Exception:
-                logger.exception("Failed to persist download queue")
-
-    def _serializable_worker_params(self, params: dict) -> dict:
-        skip = {"download_func", "settings_mgr"}
-        out: dict[str, Any] = {}
-        for key, value in params.items():
-            if key in skip:
-                continue
-            if callable(value):
-                continue
-            out[key] = value
-        return out
-
-    def _upsert_queue_entry(
-        self,
-        state: DownloadState,
-        worker_params: Optional[dict] = None,
-    ) -> None:
-        if state.status == "Completed":
-            return
-        payload = state.model_dump(mode="json")
-        if worker_params:
-            payload["_params"] = self._serializable_worker_params(worker_params)
-        with self._queue_lock:
-            self._queue = [
-                e for e in self._queue if e.get("download_id") != state.download_id
-            ]
-            self._queue.insert(0, payload)
-            self._queue = self._queue[:_HISTORY_MAX_ENTRIES]
-        self._save_queue()
-
-    def _remove_queue_entry(self, download_id: str) -> None:
-        with self._queue_lock:
-            before = len(self._queue)
-            self._queue = [
-                e for e in self._queue if e.get("download_id") != download_id
-            ]
-            if len(self._queue) == before:
-                return
-        self._queue_last_persist.pop(download_id, None)
-        self._save_queue()
-
-    def _maybe_persist_queue_progress(self, download_id: str, state: DownloadState) -> None:
-        now = time.monotonic()
-        last = self._queue_last_persist.get(download_id, 0.0)
-        if now - last < _QUEUE_PERSIST_INTERVAL:
-            return
-        self._queue_last_persist[download_id] = now
-        with self._lock:
-            params = self._worker_params.get(download_id)
-        self._upsert_queue_entry(state, params)
-
-    def _reconcile_queue_on_startup(self) -> None:
-        """Mark orphaned in-flight jobs as Interrupted so the UI can resume."""
-        changed = False
-        with self._queue_lock:
-            for entry in self._queue:
-                status = entry.get("status", "")
-                if status in _DONE_STATUSES or status in ("Paused", "Interrupted"):
-                    continue
-                entry["status"] = "Interrupted"
-                changed = True
-        if changed:
-            self._save_queue()
-
-    def _queue_entry_to_state(self, entry: dict) -> Optional[DownloadState]:
-        try:
-            data = {k: v for k, v in entry.items() if k != "_params"}
-            return DownloadState(**data)
-        except Exception:
-            logger.debug("Skipping malformed queue entry", exc_info=True)
-            return None
+        # Persistent history + queue — loaded on construction so the queue
+        # tab is populated immediately on startup.
+        self._db = DownloadPersistence()
 
     def start_download(
         self,
@@ -374,9 +122,6 @@ class DownloadManager:
                 "output_file": output_file,
                 "output_existed": output_existed,
                 "temp_dirs": [],
-                # Pass the expected trim length through so the cleanup
-                # helper can cross-check duration with ffprobe and avoid
-                # preserving a 100 KB partial encode.
                 "expected_duration": (
                     (crop_end - crop_start)
                     if (crop_start is not None and crop_end is not None
@@ -386,7 +131,7 @@ class DownloadManager:
             }
             self._worker_params[download_id] = worker_params
 
-        self._upsert_queue_entry(state, worker_params)
+        self._db.upsert_queue_entry(state, worker_params)
         self._spawn_worker(download_id)
         return download_id
 
@@ -420,7 +165,9 @@ class DownloadManager:
             for fn in list(abort_fns):
                 try:
                     fn()
+                # ponytail: survival guarantee for arbitrary abort callbacks
                 except Exception:
+                # ponytail: survival guarantee — deadline enforcement errors must not block cleanup
                     pass
             elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
             raise ytdlp_service.DownloadTimeoutError(
@@ -451,12 +198,6 @@ class DownloadManager:
             if d.get("status") in ("downloading", "postprocessing"):
                 pct = _hook_progress_percent(d)
                 if pct is not None:
-                    # The new _run_ffmpeg / ytdlp pipeline supplies a
-                    # ``phase`` string ("Encoding", "Remuxing",
-                    # "Finalising", "Encoding…") plus optional ``speed``
-                    # ("1.4x") and ``eta_seconds``. We build a compact
-                    # status string so the user always sees *what* is
-                    # happening, not just "Encoding 99%" frozen.
                     if d.get("status") == "postprocessing":
                         label = str(d.get("phase") or "Encoding")
                     else:
@@ -472,22 +213,25 @@ class DownloadManager:
                             extras.append(f"ETA {mm}m{ss:02d}s")
                         else:
                             extras.append(f"ETA {int(eta)}s")
-                    suffix = f" • {' • '.join(extras)}" if extras else ""
+                    sep = " \u2022 "
+                    suffix = f"{sep}{sep.join(extras)}" if extras else ""
                     with self._lock:
-                        # Monotonic clamp: never let the bar run backwards.
                         if pct < state.progress:
                             pct = state.progress
                         state.progress = pct
                         state.status = f"{label} {pct}%{suffix}"
                     self._notify_sse(download_id, "progress", pct)
                     self._notify_sse(download_id, "status", state.status)
-                    self._maybe_persist_queue_progress(download_id, state)
+                    self._db.maybe_persist_queue_progress(
+                        download_id, state,
+                        self._worker_params.get(download_id),
+                    )
             elif d.get("status") == "finished":
                 with self._lock:
-                    state.status = "Finalising…"
+                    state.status = "Finalising\u2026"
                     state.progress = 99
                 self._notify_sse(download_id, "progress", 99)
-                self._notify_sse(download_id, "status", "Finalising…")
+                self._notify_sse(download_id, "status", "Finalising\u2026")
 
         def _cleanup_output():
             expected_duration = None
@@ -499,10 +243,6 @@ class DownloadManager:
             )
 
         def _register_temp_dir(path: str) -> None:
-            # The ytdlp pipeline hands us the exact path of every temp
-            # folder it created for THIS job. We track ownership here so
-            # the worker can clean up only its own dirs (never a sibling
-            # download's) when the job ends.
             with self._lock:
                 info = self._cleanup_info.setdefault(
                     download_id,
@@ -512,14 +252,6 @@ class DownloadManager:
                 info.setdefault("temp_dirs", []).append(path)
 
         # PP-state progress poller
-        # ------------------------
-        # yt-dlp's stock postprocessor hides the ffmpeg merge in a
-        # synchronous Popen.run and only fires started/finished hooks.
-        # The custom ``_InstrumentedFFmpegPP`` overrides that to emit
-        # -progress pipe:2 lines into a state dict, but the manager's
-        # own progress_hook is never told about those events. We bridge
-        # the gap with a background poller that watches the state dict
-        # every 250 ms and synthesises a real progress_hook call.
         pp_holder: dict = {}
         pp_stop = threading.Event()
         last_emit_pct = -1.0
@@ -527,36 +259,20 @@ class DownloadManager:
         poller_thread: Optional[threading.Thread] = None
 
         def _pp_progress_poller():
-            """Translate ``pp_state`` updates into progress_hook events.
-
-            The poller never invents progress on its own — it only
-            re-emits whatever the instrumented PP wrote into
-            ``last_percent``. A separate heartbeat fires every 3 s
-            (with the existing "Working…" pattern) only if the PP
-            hasn't written anything in that window. This keeps the
-            user informed without lying about percent.
-            """
             nonlocal last_emit_pct, last_emit_wall
-            # Wait for the PP to be constructed (state is empty until
-            # then) and to make first progress.
             while not pp_stop.is_set():
-                state = pp_holder.get("state")
-                if state is None:
+                pp_state = pp_holder.get("state")
+                if pp_state is None:
                     pp_stop.wait(0.25)
                     continue
-                with state["lock"]:
-                    pct = state.get("last_percent") or 0.0
-                    speed = state.get("last_speed") or ""
-                    eta = state.get("last_eta_seconds")
+                with pp_state["lock"]:
+                    pct = pp_state.get("last_percent") or 0.0
+                    speed = pp_state.get("last_speed") or ""
+                    eta = pp_state.get("last_eta_seconds")
                 if pct > 0.0:
-                    # PP has reported something. Map the 0..1 from
-                    # out_time_ms / duration_us onto the 90..99 percent
-                    # range our manager uses for postprocess.
                     ui_pct = POSTPROCESS_PROGRESS_FLOOR + min(
                         POSTPROCESS_PROGRESS_SPAN, pct * POSTPROCESS_PROGRESS_SPAN,
                     )
-                    # Emit at most every 0.5 s of real progress, or if
-                    # the integer percent advanced.
                     now = time.monotonic()
                     if (
                         int(ui_pct) != int(last_emit_pct)
@@ -572,18 +288,13 @@ class DownloadManager:
                             "speed": speed or None,
                             "eta_seconds": eta,
                         }
-                        try:
-                            _progress_hook(d)
-                        except Exception:
-                            # _progress_hook raises on cancel/pause;
-                            # propagate so the poller exits too.
-                            pp_stop.set()
-                            return
+                    try:
+                        _progress_hook(d)
+                    # ponytail: survival guarantee for PP poller
+                    except Exception:
+                        pp_stop.set()
+                        return
                 else:
-                    # PP hasn't written anything yet. Heartbeat every
-                    # 3 s so the user sees activity during the (often
-                    # 10+ s) "starting ffmpeg" window — keep the bar at
-                    # the current download percent, never jump to 90+.
                     now = time.monotonic()
                     if (now - last_emit_wall) > 3.0:
                         last_emit_wall = now
@@ -592,12 +303,13 @@ class DownloadManager:
                         d = {
                             "status": "postprocessing",
                             "percent": hb_pct,
-                            "phase": "Muxing…",
+                            "phase": "Muxing\u2026",
                             "phase_id": "encoding",
                             "heartbeat": True,
                         }
                         try:
                             _progress_hook(d)
+                        # ponytail: survival guarantee for PP poller
                         except Exception:
                             pp_stop.set()
                             return
@@ -619,7 +331,6 @@ class DownloadManager:
                 poller_thread.join(timeout=2)
 
         def _register_pp_state(state: dict) -> None:
-            """Called by ytdlp_service after it builds the state dict."""
             pp_holder["state"] = state
             _start_poller()
 
@@ -698,7 +409,7 @@ class DownloadManager:
                 with self._lock:
                     state.status = "Paused"
                     params_snapshot = dict(self._worker_params.get(download_id) or {})
-                self._upsert_queue_entry(state, params_snapshot or None)
+                self._db.upsert_queue_entry(state, params_snapshot or None)
                 self._notify_sse(download_id, "status", "Paused")
             except ytdlp_service.CancelledError:
                 with self._lock:
@@ -706,33 +417,33 @@ class DownloadManager:
                         state.status = "Cancelled"
                         self._notify_sse(download_id, "status", "Cancelled")
                 _cleanup_output()
+            # ponytail: survival guarantee for download worker
             except Exception as e:
                 if pause_event.is_set() and not cancel_event.is_set():
                     with self._lock:
                         state.status = "Paused"
                         params_snapshot = dict(self._worker_params.get(download_id) or {})
-                    self._upsert_queue_entry(state, params_snapshot or None)
-                    self._notify_sse(download_id, "status", "Paused")
-                    return
-                with self._lock:
-                    state.status = "Failed"
-                    state.error = str(e)
-                self._notify_sse(download_id, "error", str(e))
-                _cleanup_output()
-            except BaseException as e:
-                if pause_event.is_set() and not cancel_event.is_set():
-                    with self._lock:
-                        state.status = "Paused"
-                        params_snapshot = dict(self._worker_params.get(download_id) or {})
-                    self._upsert_queue_entry(state, params_snapshot or None)
+                    self._db.upsert_queue_entry(state, params_snapshot or None)
                     self._notify_sse(download_id, "status", "Paused")
                     return
                 logger.exception(
-                    "Fatal download worker failure for %s", download_id, exc_info=e
+                    "Download worker failure for %s", download_id, exc_info=e
                 )
                 with self._lock:
                     state.status = "Failed"
                     state.error = f"{type(e).__name__}: {e}"
+                self._notify_sse(download_id, "error", state.error)
+                _cleanup_output()
+            # ponytail: bare except for catastrophic shutdown
+            except:
+                import sys
+                _exc_type, _exc_val, _exc_tb = sys.exc_info()
+                logger.exception(
+                    "Fatal download worker failure for %s", download_id,
+                )
+                with self._lock:
+                    state.status = "Failed"
+                    state.error = f"{type(_exc_val).__name__}: {_exc_val}" if _exc_val else "Unknown fatal error"
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             finally:
@@ -755,7 +466,7 @@ class DownloadManager:
                         self._abort_fns[download_id] = []
                         with self._lock:
                             params_snapshot = dict(self._worker_params.get(download_id) or {})
-                        self._upsert_queue_entry(final_state, params_snapshot or None)
+                        self._db.upsert_queue_entry(final_state, params_snapshot or None)
                         return
                     self._sse_queues.pop(download_id, None)
                     self._cancel_events.pop(download_id, None)
@@ -765,26 +476,16 @@ class DownloadManager:
                     self._worker_params.pop(download_id, None)
                     if state.status not in _DONE_STATUSES:
                         self._downloads.pop(download_id, None)
-                # Best-effort: wipe ONLY this job's own temp dirs so two
-                # concurrent downloads in the same output folder never
-                # accidentally nuke each other's hls_clip_XXXX dirs.
                 try:
                     if final_state.status != "Completed" and temp_dirs:
                         remove_temp_dirs(temp_dirs)
-                except Exception:
+                # ponytail: cleanup survival — remove_temp_dirs can raise OSError
+                except OSError:
                     pass
-                # Stop the postprocess progress poller (if it was
-                # started). The thread is daemon=True so it would exit
-                # on its own when the worker thread ends, but stopping
-                # it explicitly prevents a brief "Completed, 100%
-                # [no, Muxing 98%]" flicker if the poller ticks one
-                # more time after we've set Completed.
                 _stop_poller()
-                # Persist outside the lock — disk write should never hold the
-                # download state lock.
                 if final_state.status in _DONE_STATUSES:
-                    self._remove_queue_entry(download_id)
-                    self._record_history(final_state)
+                    self._db.remove_queue_entry(download_id)
+                    self._db.record_history(final_state)
 
         self._executor.submit(_download_worker)
 
@@ -805,12 +506,13 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
+            # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
                 pass
         with self._lock:
             state = self._downloads.get(download_id)
             if state:
-                self._upsert_queue_entry(state, params_snapshot or None)
+                self._db.upsert_queue_entry(state, params_snapshot or None)
         self._notify_sse(download_id, "status", "Paused")
         return True
 
@@ -832,7 +534,7 @@ class DownloadManager:
                 params_snapshot = dict(self._worker_params.get(download_id) or {})
                 live_resume = True
         if live_resume:
-            self._upsert_queue_entry(state, params_snapshot or None)
+            self._db.upsert_queue_entry(state, params_snapshot or None)
             self._notify_sse(download_id, "status", "Starting...")
             self._spawn_worker(download_id)
             return download_id
@@ -854,7 +556,7 @@ class DownloadManager:
         if not entry:
             return None
         params = entry.get("_params") or entry
-        self._remove_queue_entry(download_id)
+        self._db.remove_queue_entry(download_id)
         self.remove_history(download_id)
         return self.start_download(
             download_id=download_id,
@@ -903,10 +605,6 @@ class DownloadManager:
             event.set()
             state.status = "Cancelled"
             state.progress = 0
-            # Snapshot before we pop — the worker's finally block will
-            # re-record this, but if the worker is mid-cancel-during-shutdown
-            # or otherwise never reaches its finally, this is our only
-            # chance to write a Cancelled entry to history.
             snapshot = state.model_copy(deep=True)
             abort_fns = list(self._abort_fns.get(download_id, []))
             cleanup = self._cleanup_info.get(download_id)
@@ -914,6 +612,7 @@ class DownloadManager:
         for fn in abort_fns:
             try:
                 fn()
+            # ponytail: survival guarantee for arbitrary abort callbacks
             except Exception:
                 pass
         if cleanup:
@@ -928,9 +627,6 @@ class DownloadManager:
             )
             if temp_dirs:
                 remove_temp_dirs(temp_dirs)
-        # Emit the terminal "Cancelled" event BEFORE popping the queue,
-        # otherwise a connected SSE client can lose the final frame and
-        # be stuck on "Downloading..." until the next refresh.
         self._notify_sse(download_id, "status", "Cancelled")
         with self._lock:
             self._downloads.pop(download_id, None)
@@ -941,10 +637,8 @@ class DownloadManager:
             self._worker_params.pop(download_id, None)
             self._sse_queues.pop(download_id, None)
         if snapshot is not None:
-            # Worker finally will _also_ try to record this; ``_record_history``
-            # dedupes by id, so a double-write is a no-op rather than a duplicate.
-            self._remove_queue_entry(download_id)
-            self._record_history(snapshot)
+            self._db.remove_queue_entry(download_id)
+            self._db.record_history(snapshot)
         return True
 
     def get(self, download_id: str) -> Optional[DownloadState]:
@@ -976,39 +670,36 @@ class DownloadManager:
             if state.status not in _DONE_STATUSES:
                 queue_map[state.download_id] = state
 
-        with self._queue_lock:
-            disk_queue = list(self._queue)
-        for entry in disk_queue:
+        for entry in self._db.queue:
             did = entry.get("download_id")
             if not did or did in queue_map:
                 continue
-            state = self._queue_entry_to_state(entry)
+            state = self._db.queue_entry_to_state(entry)
             if state and state.status not in _DONE_STATUSES:
                 queue_map[did] = state
 
         in_memory_done = {d.download_id: d for d in in_memory if d.status in _DONE_STATUSES}
-        with self._history_lock:
-            disk_entries = list(self._history)
         merged_history: Dict[str, DownloadState] = dict(in_memory_done)
-        for entry in disk_entries:
+        for entry in self._db.history:
             did = entry.get("download_id")
             if not did or did in merged_history:
                 continue
             try:
                 merged_history[did] = DownloadState(**entry)
-            except Exception:
+            # ponytail: Pydantic validation errors only
+            except (ValueError, TypeError, RuntimeError):
                 logger.debug("Skipping malformed history entry %s", did, exc_info=True)
 
-        # Dedupe by (url, unfinished_status) so the same failed URL
-        # doesn't appear N times after repeated retries.
-        sorted_queue = sorted(
+        # Dedupe by (url, status in {_UNFINISHED_STATUSES_}) so the same
+        # failed URL doesn't appear N times after repeated retries.
+        queue_list = sorted(
             queue_map.values(),
             key=lambda d: d.started_at or "",
             reverse=True,
         )
         seen_unfinished: set[tuple[str, str]] = set()
         deduped_queue: list[DownloadState] = []
-        for d in sorted_queue:
+        for d in queue_list:
             if d.status in _UNFINISHED_STATUSES:
                 key = (d.url, d.status)
                 if key in seen_unfinished:
@@ -1043,23 +734,20 @@ class DownloadManager:
                 payload = state.model_dump(mode="json")
                 params = self._worker_params.get(download_id)
                 if params:
-                    payload["_params"] = self._serializable_worker_params(params)
+                    payload["_params"] = self._db._serializable_worker_params(params)
                 return payload
-        with self._queue_lock:
-            for entry in self._queue:
-                if entry.get("download_id") == download_id:
-                    return dict(entry)
-        with self._history_lock:
-            for entry in self._history:
-                if entry.get("download_id") != download_id:
-                    continue
-                if entry.get("status") in _RESUMABLE_STATUSES | _UNFINISHED_STATUSES:
-                    return dict(entry)
-                return None
+        for entry in self._db.queue:
+            if entry.get("download_id") == download_id:
+                return dict(entry)
+        for entry in self._db.history:
+            if entry.get("download_id") != download_id:
+                continue
+            if entry.get("status") in _RESUMABLE_STATUSES | _UNFINISHED_STATUSES:
+                return dict(entry)
+            return None
         return None
 
     def get_history_entry(self, download_id: str) -> Optional[dict]:
-        """Return a retryable Failed/Cancelled/Interrupted entry."""
         entry = self.get_resumable_entry(download_id)
         if not entry:
             return None
@@ -1075,7 +763,6 @@ class DownloadManager:
         download_func: Optional[Callable[..., str]] = None,
         settings_mgr: Optional["SettingsManager"] = None,
     ) -> str:
-        """Re-queue a failed, cancelled, or interrupted download."""
         new_id = self._restart_resumable(
             download_id,
             oauth=oauth,
@@ -1087,7 +774,6 @@ class DownloadManager:
         return new_id
 
     def discard_from_queue(self, download_id: str) -> bool:
-        """Remove a queue entry without recording it in history."""
         with self._lock:
             state = self._downloads.get(download_id)
             if state and state.status not in _DONE_STATUSES:
@@ -1102,6 +788,7 @@ class DownloadManager:
                 for fn in abort_fns:
                     try:
                         fn()
+                    # ponytail: survival guarantee for arbitrary abort callbacks
                     except Exception:
                         pass
                 if cleanup:
@@ -1120,7 +807,7 @@ class DownloadManager:
                 self._cleanup_info.pop(download_id, None)
                 self._worker_params.pop(download_id, None)
                 self._sse_queues.pop(download_id, None)
-                self._remove_queue_entry(download_id)
+                self._db.remove_queue_entry(download_id)
                 return True
         return self.remove_history(download_id)
 
@@ -1131,18 +818,13 @@ class DownloadManager:
             if state and state.status in _DONE_STATUSES:
                 self._downloads.pop(download_id, None)
                 removed = True
-        # Always try the disk side — even if the in-memory hit missed
-        # (e.g. the entry only exists on disk), the user expects Delete
-        # to be a hard remove.
-        with self._history_lock:
-            had_on_disk = any(e.get("download_id") == download_id for e in self._history)
+        had_on_disk = any(e.get("download_id") == download_id for e in self._db.history)
         if had_on_disk:
-            self._drop_history(download_id)
+            self._db.drop_history(download_id)
             removed = True
-        with self._queue_lock:
-            had_queue = any(e.get("download_id") == download_id for e in self._queue)
+        had_queue = any(e.get("download_id") == download_id for e in self._db.queue)
         if had_queue:
-            self._remove_queue_entry(download_id)
+            self._db.remove_queue_entry(download_id)
             removed = True
         return removed
 
@@ -1176,6 +858,7 @@ class DownloadManager:
         for event_type, data in snapshot:
             try:
                 queue.put_nowait({"type": event_type, "data": data})
+            # ponytail: survival guarantee for SSE notification
             except Exception:
                 pass
         return True
@@ -1195,5 +878,6 @@ class DownloadManager:
         for q in queues:
             try:
                 q.put_nowait({"type": event_type, "data": data})
+            # ponytail: survival guarantee for SSE notification
             except Exception:
                 pass

@@ -432,6 +432,7 @@ def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dic
                     best_headers = {**empty_headers, **fmt_headers}
         return best_url, best_headers, formats
     except Exception as exc:
+    # ponytail: best-effort — return best_url, best_headers, formats
         logger.debug("Twitch VOD playback probe failed %s: %s", video_id, exc)
         return None, empty_headers, []
 

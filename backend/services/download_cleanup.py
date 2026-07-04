@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from services.os_services import _NO_WINDOW
+
 
 def _partial_output_candidates(output_file: str) -> List[str]:
     """Return the absolute paths of every partial file a cancelled/failed
@@ -145,9 +147,6 @@ def remove_temp_dirs(paths: Optional[Iterable[str]] = None) -> int:
     return removed
 
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-
-
 def _probe_duration_seconds(output_file: str) -> Optional[float]:
     """Return the container duration in seconds via ffprobe, or None on failure.
 
@@ -173,6 +172,7 @@ def _probe_duration_seconds(output_file: str) -> Optional[float]:
             creationflags=_NO_WINDOW,
         )
     except Exception:
+    # ponytail: best-effort — )
         return None
     if out.returncode != 0:
         return None

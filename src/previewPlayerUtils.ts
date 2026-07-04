@@ -276,12 +276,11 @@ type HlsLevelLike = {
   attrs?: { RESOLUTION?: string };
 };
 
-export function previewLevelLabel(height: number, bitrate?: number, isSourceLevel = false): string {
+export function previewLevelLabel(height: number, _bitrate?: number, isSourceLevel = false): string {
   if (!height) return 'Auto';
   const res = `${height}p`;
   if (isSourceLevel) return `source/${res}`;
-  const kbps = bitrate ? Math.round(bitrate / 1000) : 0;
-  return kbps > 0 ? `${res} · ${kbps}k` : res;
+  return res;
 }
 
 export function levelIndexForHeight(levels: PreviewLevelOption[], target: number): number {
@@ -404,18 +403,6 @@ export function resolveHlsPreviewLevels(
   }
 
   return { mapped: [], defaultIndex: 0 };
-}
-
-/** @deprecated Use resolveHlsPreviewLevels */
-export function resolvePreviewLevels(
-  levels: HlsLevelLike[],
-  defaultHeight: number,
-  fallbackHeights?: number[],
-): { mapped: PreviewLevelOption[]; defaultIndex: number } {
-  return resolveHlsPreviewLevels(levels, {
-    initialHeight: defaultHeight,
-    fallbackHeights,
-  });
 }
 
 /** Progressive / API-only quality menu (never collapse to active playback height only). */

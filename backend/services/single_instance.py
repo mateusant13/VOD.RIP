@@ -46,6 +46,7 @@ def is_vodrip_running(port: int) -> bool:
         if resp.status_code != 200:
             return False
         return is_vodrip_api_name(resp.json().get("name", ""))
+    # ponytail: best-effort — return False on any error
     except Exception:
         return False
 
@@ -167,6 +168,7 @@ def try_activate_existing(port: int) -> bool:
                 if resp.status_code == 200:
                     logger.info("Focused existing VOD.RIP instance on port %s", port)
                     return True
+            # ponytail: best-effort — break to fall through to "no other instance" path
             except Exception as exc:
                 logger.debug("Focus existing instance failed: %s", exc)
             # Got a 200-shaped response but focus didn't take — stop polling.

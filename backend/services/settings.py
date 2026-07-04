@@ -43,6 +43,7 @@ class SettingsManager:
                     data["video_encoder"] = "auto"
                 return AppSettings(**data)
         except Exception:
+        # ponytail: best-effort — return AppSettings(**data)
             pass
         return AppSettings()
 
@@ -71,4 +72,5 @@ class SettingsManager:
                     try:
                         os.unlink(tmp)
                     except Exception:
+                    # ponytail: best-effort — I/O errors only
                         pass

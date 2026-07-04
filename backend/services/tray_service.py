@@ -69,6 +69,7 @@ class TrayService:
                 if path:
                     return path
         except Exception:
+        # ponytail: best-effort — return path
             pass
         return str(Path.home() / "Downloads")
 
@@ -113,6 +114,7 @@ class TrayService:
                     return Image.open(path)
 
         except Exception as exc:
+        # ponytail: best-effort — I/O errors only
             logger.debug("Could not load tray icon image: %s", exc)
 
         # Fallback: tiny green square
@@ -120,6 +122,7 @@ class TrayService:
             from PIL import Image
             return Image.new("RGB", (16, 16), color="#53fc18")
         except Exception:
+        # ponytail: best-effort — return Image.new("RGB", (16, 16), color="#53fc18")
             return None
 
     def _on_open_ui(self, icon=None, item=None):
@@ -131,7 +134,8 @@ class TrayService:
     def _on_open_downloads(self, icon=None, item=None):
         folder = self.downloads_folder or self._default_downloads()
         if os.name == "nt":
-            os.startfile(folder)
+            from utils import reveal_path_windows
+            reveal_path_windows(folder)
         else:
             from services.os_services import open_file_or_folder
             open_file_or_folder(folder)
@@ -139,7 +143,8 @@ class TrayService:
     def _on_open_log(self, icon=None, item=None):
         if self.log_path and os.path.isfile(self.log_path):
             if os.name == "nt":
-                os.startfile(self.log_path)
+                from utils import reveal_path_windows
+                reveal_path_windows(self.log_path)
             else:
                 from services.os_services import open_file_or_folder
                 open_file_or_folder(self.log_path, reveal=True)

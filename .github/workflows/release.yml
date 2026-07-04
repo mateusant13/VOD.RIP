@@ -26,11 +26,16 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r backend/requirements.txt
+          pip install pytest
           npm ci
       - name: Type-check frontend
         run: npx tsc --noEmit
       - name: Python syntax check
         run: python -m compileall -q backend
+      - name: Run backend tests
+        run: |
+          cd backend
+          python -m pytest tests/ -v --tb=short
 
   build:
     needs: [lint]

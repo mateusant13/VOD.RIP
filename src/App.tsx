@@ -1,29 +1,27 @@
-import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from 'react';
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
   Download, Scissors, Info, Play, Pause, Link2, X, Clock,
-  Users, Database, Settings2, StopCircle, Loader2,
-  CheckCircle2, AlertCircle, RefreshCw, FolderOpen, Pencil, Plus, Trash2,
+  Users, Database, Settings2, Loader2,
+  AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical, ZoomIn, ZoomOut,
+  GripVertical,
 } from 'lucide-react';
-import kickIcon from '@/assets/platforms/kick.ico';
-import twitchIcon from '@/assets/platforms/twitch.png';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
-  PREVIEW_MAIN_DEFAULT_HEIGHT,
-  applyHlsQualityLevel,
+
+
   attachProgressivePreview,
-  previewUrlWithPreferHeight,
+
   detachProgressivePreview,
   initialPreviewPreferHeight,
-  levelIndexForHeight,
+
   maxQualityLabelFromList,
   measurePlayerHeightCap,
-  playbackHeightFromRequest,
+
   mergeVariantHeights,
   parseQualityHeights,
   resolveHlsPreviewLevels,
@@ -36,1374 +34,40 @@ import {
   suggestVideoDownloadName,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
-import { ActiveDownloadsList } from './components/ActiveDownloadsList';
+import DownloadConfirmDialog from './components/DownloadConfirmDialog';
+import EditableHmsTime from './components/EditableHmsTime';
+import { formatHmsFull } from './utils';
+import { actionBtnHover, platformCardShadow } from './platformStyles';
+import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import ChannelListIndexBadge from './components/ChannelListIndexBadge';
+import PlatformVodIcon from './components/PlatformVodIcon';
+import ChannelClipThumb from './components/ChannelClipThumb';
+import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
+import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
+import QueueTab from './components/QueueTab';
+import SettingsTab from './components/SettingsTab';
 import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
-import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';
-import { panelMaxWidthCap, readUiScale } from './uiScale';
+import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
+import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
+import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 
-// ─── TYPES ───────────────────────────────────────────────────────────────────
-
-interface VideoInfo {
-  id: string;
-  title: string | null;
-  duration: number | null;
-  duration_string: string | null;
-  uploader: string | null;
-  thumbnail: string | null;
-  webpage_url: string | null;
-  extractor: string | null;
-  is_live: boolean | null;
-  qualities: string[];
-  platform: string | null;
-  created_at?: string | null;
-  size_by_quality?: Record<string, number>;
-  estimated_bytes?: number;
-  bitrate_kbps?: number;
-}
-
-interface DownloadState {
-  download_id: string;
-  url: string;
-  type: string;
-  platform: string;
-  status: string;
-  progress: number;
-  output_file: string;
-  error: string | null;
-  started_at: string;
-  title?: string | null;
-  channel?: string | null;
-}
-
-interface DownloadsResponse {
-  queue: DownloadState[];
-  history: DownloadState[];
-}
-
-interface ChannelVideo {
-  id: string;
-  platform: string;
-  title: string;
-  duration: number | null;
-  duration_string?: string | null;
-  created_at: string | null;
-  views: number | null;
-  thumbnail_url: string | null;
-  url: string;
-  channel: string;
-  content_kind?: 'vod' | 'clip';
-}
-
-interface ListedChannelVideo extends ChannelVideo {
-  /** 1-based index within the currently visible list for this platform. */
-  platformListIndex: number;
-}
-
-/** Channel list row badge shown on main preview when opened from Channels. */
-interface ChannelPreviewBadge {
-  platform: string;
-  platformListIndex: number;
-  isClip: boolean;
-}
-
-function ChannelListIndexBadge({
-  platform,
-  index,
-  size = 'sm',
-}: {
-  platform: string;
-  index: number;
-  size?: 'sm' | 'md';
-}) {
-  const isKick = platform === 'Kick';
-  const dim = size === 'md' ? 'w-5 text-[11px] leading-tight pt-0.5' : 'w-4 text-[9px]';
-  return (
-    <span
-      className={`shrink-0 text-center font-mono font-bold tabular-nums ${dim} ${
-        isKick ? 'text-[#53fc18]' : 'text-[#9146FF]'
-      }`}
-      title={`${platform} #${index}`}
-    >
-      {index}
-    </span>
-  );
-}
-
-interface AppSettings {
-  download_folder: string;
-  download_folder_confirmed?: boolean;
-  download_threads: number;
-  max_cache_mb: number;
-  video_encoder?: string;
-  throttle_kib: number;
-  ffmpeg_path: string;
-  temp_folder: string;
-  oauth: string;
-  quality: string;
-  panel_layout?: PersistedPanelLayout | null;
-  window_geometry?: Record<string, number | boolean> | null;
-  saved_channels?: SavedChannel[] | null;
-  channel_kick_enabled?: boolean;
-  channel_twitch_enabled?: boolean;
-  channel_content_filter?: 'vods' | 'clips';
-}
-
-interface UpdateInfo {
-  version: string;
-  release_notes?: string;
-  release_url?: string;
-  asset_name?: string;
-}
-
-interface SavedChannel {
-  id: string;
-  displayName: string;
-  kickSlug: string;
-  twitchSlug: string;
-  vodVideos: ChannelVideo[];
-  clipVideos: ChannelVideo[];
-  vodErrors?: Record<string, string>;
-  clipErrors?: Record<string, string>;
-  /** @deprecated use vodErrors / clipErrors */
-  errors?: Record<string, string>;
-  updatedAt: string;
-  loading?: boolean;
-  /** True after at least one clips fetch completed (success or failure). */
-  clipsFetched?: boolean;
-  /** Legacy — migrated to vodVideos / clipVideos on load */
-  videos?: ChannelVideo[];
-}
-
-type Tab = 'url' | 'channels' | 'queue' | 'settings';
-
-// ─── API ─────────────────────────────────────────────────────────────────────
-
-const API_BASE = '';
-const API_TIMEOUT_MS = 60_000;
+// ─── TYPES (migrated to src/types.ts) ───────────────
 const IS_DEV_UI = import.meta.env.DEV;
-
-const BACKEND_HINT_DEV =
-  'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).';
-const BACKEND_HINT_APP =
-  'API not reachable. Quit VOD.RIP from the tray and reopen the app.';
-const BACKEND_HINT = IS_DEV_UI ? BACKEND_HINT_DEV : BACKEND_HINT_APP;
-const TIMEOUT_HINT = IS_DEV_UI
-  ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
-  : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
-
-function formatApiDetail(detail: unknown): string {
-  if (detail == null) return '';
-  if (typeof detail === 'string') return detail;
-  if (Array.isArray(detail)) {
-    return detail
-      .map((item) => {
-        if (item && typeof item === 'object' && 'msg' in item) {
-          return String((item as { msg?: string }).msg ?? item);
-        }
-        return String(item);
-      })
-      .filter(Boolean)
-      .join('; ');
-  }
-  if (typeof detail === 'object') return JSON.stringify(detail);
-  return String(detail);
-}
-
-function apiErrorMessage(res: Response, fallback: string, path?: string): string {
-  if (res.status === 500 || res.status === 502 || res.status === 503) {
-    return BACKEND_HINT;
-  }
-  if (res.status === 404) {
-    const p = path ?? '';
-    const fb = String(fallback).toLowerCase();
-    if (p.includes('/api/channel/clips') || fb === 'not found') {
-      return IS_DEV_UI
-        ? 'Clips API not on server — restart with npm run dev'
-        : 'Clips API unavailable — quit VOD.RIP from the tray and reopen the app';
-    }
-  }
-  if (res.status === 405) {
-    return IS_DEV_UI
-      ? 'API method not supported — restart with npm run dev'
-      : 'API method not supported — reopen VOD.RIP';
-  }
-  return fallback;
-}
-
-async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const attempt = async (): Promise<Response> => {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-    try {
-      return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
-    } finally {
-      window.clearTimeout(timer);
-    }
-  };
-  try {
-    return await attempt();
-  } catch (err: unknown) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error(TIMEOUT_HINT);
-    }
-    try {
-      await new Promise((resolve) => window.setTimeout(resolve, 400));
-      return await attempt();
-    } catch (retryErr: unknown) {
-      if (retryErr instanceof DOMException && retryErr.name === 'AbortError') {
-        throw new Error(TIMEOUT_HINT);
-      }
-      throw new Error(BACKEND_HINT);
-    }
-  }
-}
-
-async function apiGet<T>(path: string): Promise<T> {
-  const res = await apiFetch(path);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail, path));
-  }
-  return res.json();
-}
-
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const res = await apiFetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail));
-  }
-  return res.json();
-}
-
-async function apiDelete(path: string): Promise<void> {
-  const res = await apiFetch(path, { method: 'DELETE' });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail));
-  }
-}
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-function fmtDuration(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-}
-function fmtShort(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-function fmtClipDuration(sec: number): string {
-  return `${Math.max(0, Math.floor(sec))}s`;
-}
-// Format a VOD's `created_at` for display. Backend returns either an ISO
-// string (Kick) or YYYYMMDD (Twitch) — normalize to YYYY-MM-DD and drop
-// anything we can't parse. Returns empty string when no date is present
-// so the row can hide the date cell.
-function normalizeVideoDateInput(value: string): string {
-  const raw = value.trim();
-  // Kick API: "YYYY-MM-DD HH:MM:SS"
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
-    return `${raw.replace(' ', 'T')}Z`;
-  }
-  // ISO without timezone
-  if (/^\d{4}-\d{2}-\d{2}T/.test(raw) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw)) {
-    return `${raw}Z`;
-  }
-  return raw;
-}
-
-function fmtDate(value: string | null | undefined): string {
-  if (!value) return '';
-  const raw = String(value).trim();
-  if (!raw) return '';
-  // Twitch yt-dlp: YYYYMMDD
-  if (/^\d{8}$/.test(raw)) {
-    return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
-  }
-  const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : '';
-}
-
-function fmtRelativeAgo(value: string | null | undefined): string {
-  const ts = parseVideoTs(value);
-  if (!ts) return '';
-  const diffMs = Math.max(0, Date.now() - ts);
-  const hours = Math.floor(diffMs / (1000 * 60 * 60));
-  const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-  if (days >= 1) return days === 1 ? '1 day ago' : `${days} days ago`;
-  if (hours >= 1) return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
-  const mins = Math.floor(diffMs / (1000 * 60));
-  if (mins >= 1) return mins === 1 ? '1 min ago' : `${mins} mins ago`;
-  return 'just now';
-}
-
-function fmtDateAndAgo(value: string | null | undefined): string {
-  const date = fmtDate(value);
-  const ago = fmtRelativeAgo(value);
-  if (date && ago) return `${date} · ${ago}`;
-  return date || ago;
-}
-
-function parseHms(t: string): number {
-  const p = t.split(':').map(Number);
-  if (p.length !== 3 || p.some(isNaN)) return 0;
-  return p[0] * 3600 + p[1] * 60 + p[2];
-}
-
-function formatHmsFull(sec: number): string {
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${pad(h)}:${pad(m)}:${pad(s)}`;
-}
-
-function formatClipDurationHuman(sec: number): string {
-  sec = Math.max(1, Math.floor(sec));
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m > 0) return `${m}:${s.toString().padStart(2, '0')}`;
-  return `${s}s`;
-}
-
-type NeedleGlanceState = {
-  which: 'in' | 'out';
-  x: number;
-  y: number;
-  sec: number;
-  rangeStart: number;
-  rangeEnd: number;
-  deltaSec: number;
-  dragging: boolean;
-};
-
-function NeedleGlancePopup({
-  glance,
-  vodDurationSec,
-}: {
-  glance: NeedleGlanceState | null;
-  vodDurationSec: number;
-}) {
-  if (!glance || vodDurationSec <= 0) return null;
-
-  const clipLen = Math.max(1, glance.rangeEnd - glance.rangeStart);
-  const winDur = Math.max(1, vodDurationSec);
-  const needlePct = (glance.sec / winDur) * 100;
-  const selStartPct = (glance.rangeStart / winDur) * 100;
-  const selEndPct = (glance.rangeEnd / winDur) * 100;
-
-  const deltaLabel = glance.deltaSec === 0
-    ? null
-    : `${glance.deltaSec > 0 ? '+' : '−'}${Math.abs(glance.deltaSec)}s`;
-
-  const popupLeft = Math.min(glance.x + 14, window.innerWidth - 200);
-  const popupTop = Math.max(12, glance.y - 96);
-
-  return createPortal(
-    <div
-      className={`needle-glance-popup fixed z-[500] pointer-events-none select-none ${
-        glance.dragging ? 'needle-glance-popup--drag' : 'needle-glance-popup--idle'
-      }`}
-      style={{ left: popupLeft, top: popupTop }}
-    >
-      <div className="border-2 border-zinc-500 bg-zinc-950/95 px-3 py-2 shadow-[4px_4px_0px_0px_rgba(113,113,122,0.5)] min-w-[168px]">
-        <div className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
-          {glance.which === 'in' ? 'Trim start' : 'Trim end'}
-        </div>
-        <div className="text-2xl font-mono font-bold text-white tabular-nums leading-none">
-          {formatHmsFull(glance.sec)}
-        </div>
-        <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
-          <span>Clip length</span>
-          <span className="text-zinc-200">{formatHmsFull(clipLen)}</span>
-        </div>
-        {deltaLabel && (
-          <div className="text-[10px] font-mono text-zinc-400 mt-0.5">
-            <span className="text-white">{deltaLabel}</span>
-            {' '}from drag start
-          </div>
-        )}
-        <div className="needle-glance-zoom-rail relative h-5 mt-2 rounded-sm bg-zinc-800 overflow-hidden">
-          <div
-            className="absolute top-1 bottom-1 bg-zinc-500/35 border-y border-zinc-400/50"
-            style={{ left: `${selStartPct}%`, width: `${Math.max(2, selEndPct - selStartPct)}%` }}
-          />
-          <div
-            className={`absolute top-0 bottom-0 w-0.5 -translate-x-1/2 ${
-              glance.which === 'in' ? 'bg-white' : 'bg-zinc-400'
-            }`}
-            style={{ left: `${needlePct}%` }}
-          />
-        </div>
-        <div className="flex justify-between text-[8px] font-mono text-zinc-600 mt-0.5 tabular-nums">
-          <span>0:00</span>
-          <span>{formatHmsFull(vodDurationSec)}</span>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function DownloadConfirmDialog({
-  open,
-  title,
-  message,
-  filenamePlaceholder,
-  filename,
-  onFilenameChange,
-  onConfirm,
-  onCancel,
-}: {
-  open: boolean;
-  title: string;
-  message: string;
-  filenamePlaceholder?: string;
-  filename: string;
-  onFilenameChange: (value: string) => void;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  if (!open) return null;
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/75 p-4"
-      onClick={onCancel}
-      role="presentation"
-    >
-      <div
-        className="border-2 border-white bg-zinc-950 max-w-md w-full p-4 font-mono shadow-[6px_6px_0px_0px_#ffffff20]"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="download-confirm-title"
-      >
-        <h3 id="download-confirm-title" className="text-sm font-black uppercase tracking-wider text-white">
-          {title}
-        </h3>
-        <p className="text-xs text-zinc-300 mt-2 leading-relaxed">{message}</p>
-        {filenamePlaceholder && (
-          <label className="block mt-3">
-            <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">File name</span>
-            <input
-              type="text"
-              value={filename}
-              onChange={(e) => onFilenameChange(e.target.value)}
-              placeholder={filenamePlaceholder}
-              className="mt-1 w-full border-2 border-zinc-700 bg-zinc-900 text-zinc-100 text-xs px-2 py-1.5 focus:border-white focus:outline-none placeholder:text-zinc-600"
-              autoFocus
-            />
-            <span className="text-[9px] text-zinc-600 mt-1 block">Saved as .mp4 in your download folder</span>
-          </label>
-        )}
-        <div className="flex gap-2 mt-4 justify-end">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="px-3 py-1.5 border-2 border-zinc-700 text-zinc-400 text-[10px] font-bold uppercase hover:border-zinc-500 hover:text-white"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className="px-3 py-1.5 border-2 border-white bg-white text-black text-[10px] font-black uppercase hover:bg-zinc-200"
-          >
-            Yes, download
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function EditableHmsTime({
-  valueSec,
-  minSec,
-  maxSec,
-  onChange,
-  className = '',
-}: {
-  valueSec: number;
-  minSec: number;
-  maxSec: number;
-  onChange: (sec: number) => void;
-  className?: string;
-}) {
-  const [editing, setEditing] = useState(false);
-  const ref = useRef<HTMLSpanElement>(null);
-
-  const clamp = useCallback(
-    (sec: number) => Math.max(minSec, Math.min(maxSec, Math.floor(sec))),
-    [minSec, maxSec],
-  );
-
-  const commit = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    const parsed = parseHms((el.textContent || '').trim());
-    onChange(clamp(parsed));
-    setEditing(false);
-  }, [clamp, onChange]);
-
-  useLayoutEffect(() => {
-    if (!editing || !ref.current) return;
-    ref.current.textContent = formatHmsFull(valueSec);
-    const el = ref.current;
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-    el.focus();
-  }, [editing, valueSec]);
-
-  if (!editing) {
-    return (
-      <span
-        role="button"
-        tabIndex={0}
-        title="Click to edit (HH:MM:SS)"
-        className={`cursor-text rounded px-0.5 hover:bg-zinc-800/80 focus:outline-none focus:ring-1 focus:ring-zinc-600 ${className}`}
-        onClick={() => setEditing(true)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setEditing(true);
-          }
-          if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            onChange(clamp(valueSec + 1));
-          }
-          if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            onChange(clamp(valueSec - 1));
-          }
-        }}
-      >
-        {formatHmsFull(valueSec)}
-      </span>
-    );
-  }
-
-  return (
-    <span
-      ref={ref}
-      contentEditable
-      suppressContentEditableWarning
-      className={`rounded px-0.5 bg-zinc-800 outline-none ring-1 ring-zinc-500 ${className}`}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          commit();
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          setEditing(false);
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          onChange(clamp(valueSec + 1));
-          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec + 1));
-        }
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          onChange(clamp(valueSec - 1));
-          if (ref.current) ref.current.textContent = formatHmsFull(clamp(valueSec - 1));
-        }
-      }}
-    />
-  );
-}
-
-const PREVIEW_KEY_SKIP_SEC = 5;
-const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const PREVIEW_FS_SCALE_STEPS = [1, 1.25, 1.5, 1.75, 2] as const;
-const PREVIEW_FS_SCALE_KEY = 'vodrip.previewFsUiScale';
-
-function readPreviewFsUiScale(): number {
-  try {
-    const raw = localStorage.getItem(PREVIEW_FS_SCALE_KEY);
-    const v = raw ? parseFloat(raw) : 1;
-    return PREVIEW_FS_SCALE_STEPS.includes(v as (typeof PREVIEW_FS_SCALE_STEPS)[number]) ? v : 1;
-  } catch {
-    return 1;
-  }
-}
-const PREVIEW_DEFAULT_VOLUME = 0.3;
 
 /** Let text fields, modifiers (Ctrl+A, etc.), and contenteditable keep native behavior. */
-function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
-  if (e.ctrlKey || e.metaKey || e.altKey) return true;
-  const el = e.target as HTMLElement;
-  if (el.isContentEditable) return true;
-  const tag = el.tagName;
-  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  if (tag === 'INPUT') {
-    const type = (el as HTMLInputElement).type;
-    return type !== 'range' && type !== 'checkbox' && type !== 'radio';
-  }
-  return false;
-}
-type PanelSize = { w: number; h: number };
-type PanelPos = { x: number; y: number };
 
-const PREVIEW_PANEL_DEFAULT_W = 640;
-const PREVIEW_PANEL_MIN_W = 280;
-const PREVIEW_PANEL_CHROME_H_EST = 120;
-const PREVIEW_PANEL_PAD_H = 32;
-const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
-const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
-const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
-const PANEL_MIN: PanelSize = { w: 200, h: 180 };
+;
 
-function panelMaxW(): number {
-  return panelMaxWidthCap();
-}
-/** Minimum clear space between panel chrome (incl. shadow) and viewport edges. */
-const VIEWPORT_EDGE_LOCK = 40;
-const EXPLORE_POPUP_Z = 9999;
-const MAX_EXPLORE_POPUPS = 5;
-const LAYOUT_ROW_GAP_TRIPLE = 12;
-const LAYOUT_ROW_GAP_SPLIT = 24;
-function panelMaxHeight() {
-  return Math.round(window.innerHeight * 0.92);
-}
+;
 
-type LayoutPanelKey = 'preview' | 'urlAside' | 'main';
-
-interface LayoutPanelBoundsInput {
-  previewOpen: boolean;
-  urlPanelAside: boolean;
-  preview: PanelSize;
-  urlAside: PanelSize;
-  main: PanelSize;
-}
-
-function viewportContentBox(shadowPad = panelResizeHandleInset(false)): { maxW: number; maxH: number } {
-  return {
-    maxW: Math.max(PANEL_MIN.w, window.innerWidth - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
-    maxH: Math.max(PANEL_MIN.h, window.innerHeight - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
-  };
-}
-
-function layoutRowGap(previewOpen: boolean, urlPanelAside: boolean): number {
-  const count = (previewOpen ? 1 : 0) + (urlPanelAside ? 1 : 0) + 1;
-  if (count <= 1) return 0;
-  return previewOpen && urlPanelAside ? LAYOUT_ROW_GAP_TRIPLE : LAYOUT_ROW_GAP_SPLIT;
-}
-
-function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsInput): number {
-  const { maxW } = viewportContentBox();
-  const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
-  const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
-
-  let othersW = 0;
-  if (layout.previewOpen && target !== 'preview') othersW += layout.preview.w;
-  if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
-  if (target !== 'main') othersW += layout.main.w;
-
-  return Math.max(PANEL_MIN.w, Math.min(panelMaxW(), maxW - othersW - gapTotal));
-}
-
-function layoutMaxPanelHeight(): number {
-  return Math.min(panelMaxHeight(), viewportContentBox().maxH);
-}
-
-function clampPanelSizeForLayout(
-  target: LayoutPanelKey,
-  size: PanelSize,
-  layout: LayoutPanelBoundsInput,
-): PanelSize {
-  const maxW = layoutMaxPanelWidth(target, layout);
-  const maxH = layoutMaxPanelHeight();
-  return {
-    w: Math.min(maxW, Math.max(PANEL_MIN.w, size.w)),
-    h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
-  };
-}
-
-function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
-  preview: PanelSize;
-  urlAside: PanelSize;
-  main: PanelSize;
-} {
-  const maxH = layoutMaxPanelHeight();
-  let preview = { ...layout.preview };
-  let urlAside = { ...layout.urlAside };
-  let main = { ...layout.main };
-  const snapshot = (): LayoutPanelBoundsInput => ({
-    ...layout,
-    preview,
-    urlAside,
-    main,
-  });
-
-  if (layout.previewOpen) {
-    const w = clampPreviewPanelWidth(
-      preview.w,
-      PREVIEW_PANEL_CHROME_H_EST,
-      PREVIEW_VIDEO_ASPECT_DEFAULT,
-      snapshot(),
-    );
-    preview = { w, h: preview.h };
-  }
-  if (layout.urlPanelAside) {
-    urlAside = clampPanelSizeForLayout('urlAside', { ...urlAside, h: Math.min(urlAside.h, maxH) }, snapshot());
-  }
-  main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
-
-  return { preview, urlAside, main };
-}
-
-function maxPreviewPanelWidth(
-  chromeH: number,
-  aspect: number,
-  layout: LayoutPanelBoundsInput,
-): number {
-  const shadowPad = panelResizeHandleInset(true);
-  const { maxH } = viewportContentBox(shadowPad);
-  const capW = Math.min(panelMaxW(), layoutMaxPanelWidth('preview', layout));
-  const videoMaxW = capW - PREVIEW_PANEL_PAD_H;
-  const videoMaxH = Math.max(100, maxH - chromeH - PREVIEW_PANEL_PAD_H);
-  const videoMaxWFromH = videoMaxH * aspect;
-  return Math.floor(Math.min(videoMaxW, videoMaxWFromH) + PREVIEW_PANEL_PAD_H);
-}
-
-function clampPreviewPanelWidth(
-  width: number,
-  chromeH: number,
-  aspect: number,
-  layout: LayoutPanelBoundsInput,
-): number {
-  const minW = Math.min(PREVIEW_PANEL_MIN_W, maxPreviewPanelWidth(chromeH, aspect, layout));
-  const maxW = maxPreviewPanelWidth(chromeH, aspect, layout);
-  return Math.min(maxW, Math.max(minW, width));
-}
-
-function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
-  el.style.position = 'fixed';
-  el.style.top = `${pos.y}px`;
-  el.style.left = `${pos.x}px`;
-  el.style.right = 'auto';
-  el.style.bottom = 'auto';
-  el.style.zIndex = String(EXPLORE_POPUP_Z);
-}
-
-function edgeAffectsWest(edge: ResizeEdge): boolean {
-  return edge === 'w' || edge === 'nw' || edge === 'sw';
-}
-
-function edgeAffectsNorth(edge: ResizeEdge): boolean {
-  return edge === 'n' || edge === 'ne' || edge === 'nw';
-}
-
-const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {
-  n: 'ns-resize',
-  s: 'ns-resize',
-  e: 'ew-resize',
-  w: 'ew-resize',
-  ne: 'nesw-resize',
-  nw: 'nwse-resize',
-  se: 'nwse-resize',
-  sw: 'nesw-resize',
-};
-
-function calcPanelSizeFromEdge(
-  edge: ResizeEdge,
-  startW: number,
-  startH: number,
-  dx: number,
-  dy: number,
-): PanelSize {
-  let w = startW;
-  let h = startH;
-  if (edge === 'e' || edge === 'ne' || edge === 'se') w = startW + dx;
-  else if (edge === 'w' || edge === 'nw' || edge === 'sw') w = startW - dx;
-  if (edge === 's' || edge === 'se' || edge === 'sw') h = startH + dy;
-  else if (edge === 'n' || edge === 'ne' || edge === 'nw') h = startH - dy;
-  return { w, h };
-}
-
-function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: number): number {
-  switch (edge) {
-    case 'e': return dx;
-    case 'w': return -dx;
-    case 's': return dy * aspect;
-    case 'n': return -dy * aspect;
-    case 'se': return Math.max(dx, dy * aspect);
-    case 'sw': return Math.max(-dx, dy * aspect);
-    case 'ne': return Math.max(dx, -dy * aspect);
-    case 'nw': return Math.max(-dx, -dy * aspect);
-    default: return dx;
-  }
-}
-
-function applyPanelSize(el: HTMLElement, size: PanelSize) {
-  el.style.width = `${size.w}px`;
-  el.style.height = `${size.h}px`;
-}
-
-function startPanelResizeDrag(
-  e: ReactPointerEvent<HTMLDivElement>,
-  edge: ResizeEdge,
-  sizeRef: MutableRefObject<PanelSize>,
-  setSize: Dispatch<SetStateAction<PanelSize>>,
-  opts?: {
-    maxW?: number;
-    maxH?: number;
-    panelEl?: HTMLElement | null;
-    clampSize?: (size: PanelSize) => PanelSize;
-  },
-) {
-  e.preventDefault();
-  e.stopPropagation();
-  const handle = e.currentTarget;
-  handle.setPointerCapture(e.pointerId);
-
-  const startX = e.clientX;
-  const startY = e.clientY;
-  const { w: startW, h: startH } = sizeRef.current;
-  const maxW = opts?.maxW ?? panelMaxW();
-  const maxH = opts?.maxH ?? panelMaxHeight();
-  const panelEl = opts?.panelEl ?? null;
-
-  if (panelEl) {
-    panelEl.style.willChange = 'width, height';
-  }
-  const prevUserSelect = document.body.style.userSelect;
-  const prevCursor = document.body.style.cursor;
-  document.body.style.userSelect = 'none';
-  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
-
-  const calcSize = (clientX: number, clientY: number): PanelSize => {
-    const raw = calcPanelSizeFromEdge(edge, startW, startH, clientX - startX, clientY - startY);
-    return {
-      w: Math.min(maxW, Math.max(PANEL_MIN.w, raw.w)),
-      h: Math.min(maxH, Math.max(PANEL_MIN.h, raw.h)),
-    };
-  };
-
-  const onMove = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    let next = calcSize(ev.clientX, ev.clientY);
-    if (opts?.clampSize) next = opts.clampSize(next);
-    sizeRef.current = next;
-    if (panelEl) {
-      applyPanelSize(panelEl, next);
-    }
-  };
-
-  const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    handle.releasePointerCapture(e.pointerId);
-    handle.removeEventListener('pointermove', onMove);
-    handle.removeEventListener('pointerup', onUp);
-    handle.removeEventListener('pointercancel', onUp);
-    document.body.style.userSelect = prevUserSelect;
-    document.body.style.cursor = prevCursor;
-    if (panelEl) {
-      panelEl.style.willChange = '';
-    }
-    const final = opts?.clampSize ? opts.clampSize(sizeRef.current) : sizeRef.current;
-    sizeRef.current = final;
-    if (panelEl) {
-      applyPanelSize(panelEl, final);
-    }
-    setSize({ ...final });
-  };
-
-  handle.addEventListener('pointermove', onMove);
-  handle.addEventListener('pointerup', onUp);
-  handle.addEventListener('pointercancel', onUp);
-}
-
-function applyPanelWidth(el: HTMLElement, width: number) {
-  el.style.width = `${width}px`;
-  el.style.height = '';
-}
-
-function startPanelWidthResize(
-  e: ReactPointerEvent<HTMLDivElement>,
-  edge: ResizeEdge,
-  widthRef: MutableRefObject<number>,
-  setWidth: Dispatch<SetStateAction<number>>,
-  opts: {
-    panelEl: HTMLElement | null;
-    clampWidth: (w: number) => number;
-    aspect: number;
-    posRef?: MutableRefObject<PanelPos | null>;
-    setPos?: Dispatch<SetStateAction<PanelPos | null>>;
-  },
-) {
-  e.preventDefault();
-  e.stopPropagation();
-  const handle = e.currentTarget;
-  handle.setPointerCapture(e.pointerId);
-
-  const startX = e.clientX;
-  const startY = e.clientY;
-  const startW = widthRef.current;
-  const startPos = opts.posRef?.current ? { ...opts.posRef.current } : null;
-  const panelEl = opts.panelEl;
-  const clamp = opts.clampWidth;
-
-  if (panelEl) {
-    panelEl.style.willChange = 'width';
-  }
-  const prevUserSelect = document.body.style.userSelect;
-  const prevCursor = document.body.style.cursor;
-  document.body.style.userSelect = 'none';
-  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
-
-  const applyWidthAndPos = (nextW: number) => {
-    widthRef.current = nextW;
-    if (panelEl) {
-      applyPanelWidth(panelEl, nextW);
-    }
-    if (startPos && opts.posRef && panelEl) {
-      let x = startPos.x;
-      let y = startPos.y;
-      if (edgeAffectsWest(edge)) {
-        x = startPos.x + startW - nextW;
-      }
-      if (edgeAffectsNorth(edge)) {
-        y = startPos.y - (nextW - startW) / opts.aspect;
-      }
-      const pos = { x, y };
-      opts.posRef.current = pos;
-      applyExplorePopupWindowPosition(panelEl, pos);
-    }
-  };
-
-  const onMove = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
-    applyWidthAndPos(clamp(startW + delta));
-  };
-
-  const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    handle.releasePointerCapture(e.pointerId);
-    handle.removeEventListener('pointermove', onMove);
-    handle.removeEventListener('pointerup', onUp);
-    handle.removeEventListener('pointercancel', onUp);
-    document.body.style.userSelect = prevUserSelect;
-    document.body.style.cursor = prevCursor;
-    if (panelEl) {
-      panelEl.style.willChange = '';
-    }
-    const finalW = clamp(widthRef.current);
-    applyWidthAndPos(finalW);
-    setWidth(finalW);
-    if (opts.setPos && opts.posRef?.current) {
-      opts.setPos({ ...opts.posRef.current });
-    }
-  };
-
-  handle.addEventListener('pointermove', onMove);
-  handle.addEventListener('pointerup', onUp);
-  handle.addEventListener('pointercancel', onUp);
-}
-
-function sourceQualityOptionLabel(resolutionLabel: string): string {
-  return `source/${resolutionLabel.toLowerCase()}`;
-}
-
-const CHANNEL_INITIAL_VISIBLE = 5;
-const CHANNEL_EXPAND_STEP = 10;
-const CHANNEL_FETCH_LIMIT = 100;
-/** Cheap head fetch on page load — merge only ids not already cached. */
-const CHANNEL_INCREMENTAL_LIMIT = 25;
-const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
-const CHANNEL_UI_STORAGE_KEY = 'vodrip_channel_ui';
-const PANEL_LAYOUT_STORAGE_KEY = 'vodrip_panel_layout';
-
-function loadStoredChannelUi(): {
-  kick: boolean;
-  twitch: boolean;
-  content: 'vods' | 'clips';
-} {
-  try {
-    const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
-    if (!raw) return { kick: true, twitch: true, content: 'vods' };
-    const p = JSON.parse(raw) as {
-      kick?: boolean;
-      twitch?: boolean;
-      content?: string;
-    };
-    return {
-      kick: p.kick !== false,
-      twitch: p.twitch !== false,
-      content: p.content === 'clips' ? 'clips' : 'vods',
-    };
-  } catch {
-    return { kick: true, twitch: true, content: 'vods' };
-  }
-}
-
-interface PersistedPanelLayout {
-  previewPanelWidth: number;
-  urlAside: PanelSize;
-  main: PanelSize;
-}
-
-function clampLayoutNumber(value: unknown, min: number, max: number, fallback: number): number {
-  const n = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, Math.round(n)));
-}
-
-function clampStoredPanelSize(value: unknown, fallback: PanelSize): PanelSize {
-  if (!value || typeof value !== 'object') return fallback;
-  const o = value as { w?: unknown; h?: unknown };
-  const maxH = typeof window !== 'undefined' ? panelMaxHeight() : fallback.h;
-  return {
-    w: clampLayoutNumber(o.w, PANEL_MIN.w, panelMaxW(), fallback.w),
-    h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
-  };
-}
-
-function defaultPanelLayout(): PersistedPanelLayout {
-  const scale = readUiScale();
-  return {
-    previewPanelWidth: Math.round(PREVIEW_PANEL_DEFAULT_W * scale),
-    urlAside: {
-      w: Math.round(URL_ASIDE_PANEL_DEFAULT.w * scale),
-      h: Math.round(URL_ASIDE_PANEL_DEFAULT.h * scale),
-    },
-    main: {
-      w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
-      h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
-    },
-  };
-}
-
-function loadPanelLayout(): PersistedPanelLayout {
-  const fallback = defaultPanelLayout();
-  try {
-    const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<PersistedPanelLayout>;
-    return {
-      previewPanelWidth: clampLayoutNumber(
-        parsed.previewPanelWidth,
-        PREVIEW_PANEL_MIN_W,
-        panelMaxW(),
-        fallback.previewPanelWidth,
-      ),
-      urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
-      main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
-    };
-  } catch {
-    return fallback;
-  }
-}
-
-function persistPanelLayout(layout: PersistedPanelLayout) {
-  try {
-    localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
-  } catch {
-    /* quota / private mode */
-  }
-}
-const MAX_SAVED_CHANNELS = 10;
-/** Highest quality from API list, or source when none listed (Kick). */
-function bestAvailableQuality(info: VideoInfo): string {
-  if (info.qualities?.length) {
-    return info.qualities[0].toLowerCase();
-  }
-  return 'source';
-}
-
-function detectUrlPlatform(u: string): 'kick' | 'twitch' | null {
-  const l = u.toLowerCase();
-  if (l.includes('kick.com')) return 'kick';
-  if (l.includes('twitch.tv')) return 'twitch';
-  return null;
-}
-
-function isClipUrl(u: string): boolean {
-  const l = u.toLowerCase();
-  if (l.includes('clips.twitch.tv')) return true;
-  if (l.includes('twitch.tv') && l.includes('/clip/')) return true;
-  if (l.includes('kick.com') && l.includes('/clips/')) return true;
-  return false;
-}
-
-function parseHmsDurationString(s: string): number | null {
-  const parts = s.split(':').map(Number);
-  if (parts.length === 3 && parts.every((n) => !Number.isNaN(n))) {
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  }
-  if (parts.length === 2 && parts.every((n) => !Number.isNaN(n))) {
-    return parts[0] * 60 + parts[1];
-  }
-  return null;
-}
-
-function channelVideoDurationSec(v: ChannelVideo): number | null {
-  if (v.duration != null && v.duration > 0) return Math.floor(v.duration);
-  if (v.duration_string) return parseHmsDurationString(v.duration_string);
-  return null;
-}
-
-/** Full VOD length for trim sliders — never derived from the current trim end. */
-function videoInfoDurationSec(info: VideoInfo | null | undefined): number {
-  if (!info) return 3600;
-  if (info.duration != null && info.duration > 0) return Math.floor(info.duration);
-  const parsed = info.duration_string ? parseHmsDurationString(info.duration_string) : null;
-  return parsed != null && parsed > 0 ? parsed : 3600;
-}
-
-type TrimRangeOpts = {
-  seek?: 'in' | 'out';
-  move?: 'in' | 'out';
-  fixedEnd?: number;
-  fixedStart?: number;
-};
-
-function clampTrimEndpoints(
-  rawStart: number,
-  rawEnd: number,
-  dur: number,
-  currentStart: number,
-  currentEnd: number,
-  opts?: TrimRangeOpts,
-): { start: number; end: number } {
-  let start: number;
-  let end: number;
-
-  if (opts?.move === 'in') {
-    const pinnedEnd = Math.min(dur, Math.max(1, Math.floor(opts.fixedEnd ?? currentEnd)));
-    end = pinnedEnd;
-    start = Math.max(0, Math.min(Math.floor(rawStart), pinnedEnd - 1));
-  } else if (opts?.move === 'out') {
-    const pinnedStart = Math.max(0, Math.min(
-      Math.floor(opts.fixedStart ?? currentStart),
-      dur - 1,
-    ));
-    start = pinnedStart;
-    end = Math.min(dur, Math.max(Math.floor(rawEnd), pinnedStart + 1));
-  } else {
-    start = Math.floor(rawStart);
-    end = Math.floor(rawEnd);
-    if (start >= end) {
-      if (opts?.seek === 'in') {
-        end = Math.min(dur, start + 1);
-      } else {
-        start = Math.max(0, end - 1);
-      }
-    }
-    start = Math.max(0, Math.min(start, dur - 1));
-    end = Math.min(dur, Math.max(end, start + 1));
-  }
-
-  return { start, end };
-}
-
-/** Start: button − extends clip (earlier), + trims. End: − trims, + extends. */
-function trimButtonDeltaForEndpoint(which: 'in' | 'out', buttonDelta: number): number {
-  return which === 'in' ? -buttonDelta : buttonDelta;
-}
-
-/** Move the active in/out endpoint by delta seconds (+ extends clip that way). */
-function adjustTrimEndpointByDelta(
-  start: number,
-  end: number,
-  dur: number,
-  which: 'in' | 'out',
-  delta: number,
-): { start: number; end: number } {
-  const minLen = 1;
-  if (which === 'in') {
-    const newStart = Math.max(0, Math.min(end - minLen, start - delta));
-    return { start: newStart, end };
-  }
-  const newEnd = Math.min(dur, Math.max(start + minLen, end + delta));
-  return { start, end: newEnd };
-}
-
-function ClipDurationAdjustButtons({
-  onAdjust,
-  disabled,
-  compact,
-  activeEndpoint,
-}: {
-  onAdjust: (deltaSec: number) => void;
-  disabled?: boolean;
-  compact?: boolean;
-  activeEndpoint: 'in' | 'out';
-}) {
-  const btnClass = compact
-    ? 'px-1 py-0 text-[7px] font-mono font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white disabled:opacity-30 disabled:pointer-events-none'
-    : 'px-1.5 py-0.5 text-[8px] font-mono font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white disabled:opacity-30 disabled:pointer-events-none';
-  const titles = activeEndpoint === 'in'
-    ? { m5: 'Extend clip 5s at start', m1: 'Extend clip 1s at start', p1: 'Trim 1s from start', p5: 'Trim 5s from start' }
-    : { m5: 'Trim 5s from end', m1: 'Trim 1s from end', p1: 'Extend clip 1s at end', p5: 'Extend clip 5s at end' };
-  return (
-    <div className={`flex items-center gap-0.5 shrink-0 ${compact ? '' : 'justify-end'}`}>
-      <button type="button" disabled={disabled} onClick={() => onAdjust(-5)} className={btnClass} title={titles.m5}>-5s</button>
-      <button type="button" disabled={disabled} onClick={() => onAdjust(-1)} className={btnClass} title={titles.m1}>-1s</button>
-      <button type="button" disabled={disabled} onClick={() => onAdjust(1)} className={btnClass} title={titles.p1}>+1s</button>
-      <button type="button" disabled={disabled} onClick={() => onAdjust(5)} className={btnClass} title={titles.p5}>+5s</button>
-    </div>
-  );
-}
-
-function actionBtnHover(platform: 'kick' | 'twitch' | null): string {
-  if (platform === 'kick') {
-    return 'hover:bg-[#53fc18] hover:text-black hover:border-[#53fc18] hover:shadow-[4px_4px_0px_0px_#53fc18]';
-  }
-  if (platform === 'twitch') {
-    return 'hover:bg-[#9146FF] hover:text-black hover:border-[#9146FF] hover:shadow-[4px_4px_0px_0px_#9146FF]';
-  }
-  return 'hover:bg-white hover:text-black hover:border-white';
-}
-
-function detectVideoPlatform(info: VideoInfo | null, url: string): 'kick' | 'twitch' | null {
-  const p = info?.platform?.toLowerCase();
-  if (p === 'kick') return 'kick';
-  if (p === 'twitch') return 'twitch';
-  return detectUrlPlatform(url);
-}
-
-function platformCardShadow(platform: 'kick' | 'twitch' | null, compact = false): string {
-  if (platform === 'kick') {
-    return compact ? 'shadow-[4px_4px_0px_0px_#53fc18]' : 'shadow-[6px_6px_0px_0px_#53fc18]';
-  }
-  if (platform === 'twitch') {
-    return compact ? 'shadow-[4px_4px_0px_0px_#9146FF]' : 'shadow-[6px_6px_0px_0px_#9146FF]';
-  }
-  return compact
-    ? 'shadow-[4px_4px_0px_0px_#53fc18,6px_6px_0px_0px_#9146FF]'
-    : 'shadow-[6px_6px_0px_0px_#53fc18,12px_12px_0px_0px_#9146FF]';
-}
-
-function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
-  const { videos: legacy, ...rest } = ch;
-  let vodVideos = ch.vodVideos;
-  let clipVideos = ch.clipVideos;
-  if (vodVideos === undefined && clipVideos === undefined && Array.isArray(legacy)) {
-    vodVideos = legacy.filter((v) => !isLikelyClip(v));
-    clipVideos = legacy.filter(isLikelyClip);
-  }
-  const legacyErrors = ch.errors ?? {};
-  return {
-    ...rest,
-    vodVideos: vodVideos ?? [],
-    clipVideos: clipVideos ?? [],
-    vodErrors: ch.vodErrors ?? legacyErrors,
-    clipErrors: ch.clipErrors ?? {},
-    clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,
-    loading: false,
-  };
-}
-
-function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips'): Record<string, string> {
-  return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? ch.errors ?? {});
-}
-
-function formatChannelErrorMessage(
-  ch: SavedChannel,
-  mode: 'vods' | 'clips',
-  kickEnabled: boolean,
-  twitchEnabled: boolean,
-): string | null {
-  const errs = channelPlatformErrors(ch, mode);
-  const errKeys = Object.keys(errs).filter((k) => {
-    if (!errs[k]) return false;
-    if (k === 'Kick' && !kickEnabled) return false;
-    if (k === 'Twitch' && !twitchEnabled) return false;
-    return true;
-  });
-  if (errKeys.length === 0) return null;
-  const hasItems = mode === 'clips'
-    ? (ch.clipVideos?.length ?? 0) > 0
-    : (ch.vodVideos?.length ?? 0) > 0;
-  return hasItems
-    ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
-    : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ');
-}
-
-function loadSavedChannels(): SavedChannel[] {
-  try {
-    const raw = localStorage.getItem(CHANNELS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map((ch) => normalizeSavedChannel(ch as SavedChannel));
-  } catch {
-    return [];
-  }
-}
-
-function persistChannels(channels: SavedChannel[]) {
-  const toStore = channels.map(({ loading: _loading, ...ch }) => ch);
-  localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(toStore));
-}
-
-/** Insert-before index (0..rowCount) from pointer Y — stable while the list is not reordered mid-drag. */
-function channelInsertIndex(listEl: HTMLElement, clientY: number): number {
-  const rows = [...listEl.querySelectorAll<HTMLElement>('[data-channel-row]')];
-  if (!rows.length) return 0;
-
-  let bestIndex = rows.length;
-  let bestDist = Infinity;
-  for (let i = 0; i <= rows.length; i++) {
-    let boundaryY: number;
-    if (i === 0) {
-      boundaryY = rows[0].getBoundingClientRect().top;
-    } else if (i === rows.length) {
-      boundaryY = rows[rows.length - 1].getBoundingClientRect().bottom;
-    } else {
-      const above = rows[i - 1].getBoundingClientRect();
-      const below = rows[i].getBoundingClientRect();
-      boundaryY = (above.bottom + below.top) / 2;
-    }
-    const dist = Math.abs(clientY - boundaryY);
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
-}
-
-function reorderChannelsById(
-  channels: SavedChannel[],
-  channelId: string,
-  insertBefore: number,
-): SavedChannel[] {
-  const from = channels.findIndex((c) => c.id === channelId);
-  if (from < 0) return channels;
-  let to = Math.max(0, Math.min(insertBefore, channels.length));
-  if (from < to) to -= 1;
-  if (from === to) return channels;
-  const next = [...channels];
-  const [item] = next.splice(from, 1);
-  next.splice(to, 0, item);
-  return next;
-}
 
 function startChannelReorderDrag(
   e: ReactPointerEvent<HTMLButtonElement>,
@@ -1469,312 +133,6 @@ function startChannelReorderDrag(
   handle.addEventListener('pointercancel', onUp);
 }
 
-function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
-  const trimmed = raw.trim();
-  if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '' };
-  const lower = trimmed.toLowerCase();
-  if (lower.includes('kick.com')) {
-    const m = trimmed.match(/kick\.com\/([^/?#]+)/i);
-    const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
-  }
-  if (lower.includes('twitch.tv')) {
-    const m = trimmed.match(/twitch\.tv\/([^/?#]+)/i);
-    const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
-  }
-  const slug = trimmed.replace(/^https?:\/\//, '').split('/').pop()?.split('?')[0] || trimmed;
-  return { displayName: slug, kickSlug: slug, twitchSlug: slug };
-}
-
-/** Settings/section captions — not <label> so clicks never focus nearby inputs. */
-function FieldCaption({ children, noWrap }: { children: ReactNode; noWrap?: boolean }) {
-  return (
-    <span
-      className={`text-[9px] font-bold uppercase tracking-widest text-zinc-500 block min-w-0 ${
-        noWrap ? 'whitespace-nowrap overflow-hidden text-ellipsis' : ''
-      }`}
-      style={noWrap ? { fontSize: 'clamp(7px, 2.4vw, 9px)' } : undefined}
-    >
-      {children}
-    </span>
-  );
-}
-
-function basename(path: string): string {
-  return path.split(/[/\\]/).pop() || path;
-}
-
-function parseVideoTs(value: string | null | undefined): number {
-  if (!value) return 0;
-  const raw = String(value).trim();
-  if (!raw) return 0;
-  if (/^\d{8}$/.test(raw)) {
-    return new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T00:00:00Z`).getTime() || 0;
-  }
-  const t = Date.parse(normalizeVideoDateInput(raw));
-  return Number.isNaN(t) ? 0 : t;
-}
-
-function fmtViews(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
-  return String(n);
-}
-
-function channelVodSubline(v: ChannelVideo): string {
-  const parts: string[] = [];
-  const when = fmtDateAndAgo(v.created_at);
-  if (when) parts.push(when);
-  const durSec = channelVideoDurationSec(v);
-  if (durSec != null) parts.push(fmtDuration(durSec));
-  if (v.views != null && Number(v.views) > 0) {
-    parts.push(`${fmtViews(Number(v.views))} views`);
-  }
-  return parts.join(' · ');
-}
-
-function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }: { platform: string; className?: string }) {
-  const isTw = platform === 'Twitch';
-  return (
-    <img
-      src={isTw ? twitchIcon : kickIcon}
-      alt={isTw ? 'Twitch' : 'Kick'}
-      className={`shrink-0 object-contain ${className}`}
-      draggable={false}
-    />
-  );
-}
-
-const CLIP_MAX_DURATION_SEC = 60;
-
-function isLikelyClip(v: ChannelVideo): boolean {
-  if (v.content_kind === 'clip') {
-    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
-    return true;
-  }
-  if (v.platform === 'Kick' && v.id.toLowerCase().startsWith('clip_')) return true;
-  const url = (v.url || '').toLowerCase();
-  if (url.includes('/videos/') && !url.includes('/clips/') && !url.includes('/clip/')) {
-    return false;
-  }
-  if (url.includes('/clips/') || url.includes('clips.twitch.tv') || url.includes('/clip/')) {
-    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
-    return true;
-  }
-  // Twitch GQL may return clip pages as twitch.tv/{login}/clip/{slug}
-  if (v.platform === 'Twitch' && /\/clip\/[^/]+/i.test(url)) {
-    if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
-    return true;
-  }
-  return false;
-}
-
-function channelVideoKey(v: ChannelVideo): string {
-  return `${v.platform}:${v.id}`;
-}
-
-function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null }): ChannelVideo {
-  return {
-    ...v,
-    thumbnail_url: v.thumbnail_url ?? v.thumbnail ?? null,
-  };
-}
-
-/** Twitch clip/VOD thumbs often use `{width}` / `%{width}` placeholders. */
-function resolveChannelThumbnail(
-  url: string | null | undefined,
-  width = 160,
-  height = 90,
-): string | null {
-  if (!url?.trim()) return null;
-  const w = String(width);
-  const h = String(height);
-  return url
-    .replace(/%\{width\}/g, w)
-    .replace(/%\{height\}/g, h)
-    .replace(/\{width\}/g, w)
-    .replace(/\{height\}/g, h);
-}
-
-function ChannelClipThumb({ video }: { video: ChannelVideo }) {
-  const [failed, setFailed] = useState(false);
-  const src = resolveChannelThumbnail(video.thumbnail_url);
-  if (!src || failed) {
-    return (
-      <div
-        className="shrink-0 w-16 h-9 border border-zinc-800 bg-zinc-900 flex items-center justify-center"
-        aria-hidden
-      >
-        <Play size={11} className="text-zinc-600" />
-      </div>
-    );
-  }
-  return (
-    <img
-      src={src}
-      alt=""
-      loading="lazy"
-      decoding="async"
-      onError={() => setFailed(true)}
-      className="shrink-0 w-16 h-9 object-cover border border-zinc-800 bg-zinc-900"
-    />
-  );
-}
-
-/** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
-function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
-  const map = new Map<string, ChannelVideo>();
-  for (const v of incoming.map(mapApiChannelItem)) {
-    map.set(channelVideoKey(v), v);
-  }
-  for (const v of existing) {
-    const k = channelVideoKey(v);
-    if (!map.has(k)) map.set(k, v);
-  }
-  return Array.from(map.values()).sort(
-    (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
-  );
-}
-
-/** Merge clip feeds; incoming wins on duplicate ids. Sorted by views desc. */
-function mergeClipLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
-  const map = new Map<string, ChannelVideo>();
-  for (const v of incoming.map(mapApiChannelItem).filter(isLikelyClip)) {
-    map.set(channelVideoKey(v), v);
-  }
-  for (const v of existing.filter(isLikelyClip)) {
-    const k = channelVideoKey(v);
-    if (!map.has(k)) map.set(k, v);
-  }
-  return Array.from(map.values()).sort(
-    (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0),
-  );
-}
-
-function channelClipsMissing(
-  ch: SavedChannel,
-  kickOn: boolean,
-  twitchOn: boolean,
-): boolean {
-  const clips = ch.clipVideos ?? [];
-  if (!ch.clipsFetched && clips.length === 0) return true;
-  if (kickOn && ch.kickSlug?.trim() && !clips.some((v) => v.platform === 'Kick')) return true;
-  if (twitchOn && ch.twitchSlug?.trim() && !clips.some((v) => v.platform === 'Twitch')) {
-    return true;
-  }
-  return false;
-}
-
-/** Mirror of `channelClipsMissing` for the VODs cache. */
-function channelVodsMissing(
-  ch: SavedChannel,
-  kickOn: boolean,
-  twitchOn: boolean,
-): boolean {
-  // Treat a never-fetched channel and a channel whose last VOD fetch
-  // returned an empty list the same way: the data is missing for the
-  // platforms the user has enabled and we should re-fetch on demand.
-  if (!ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0) return true;
-  if (kickOn && ch.kickSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Kick')) return true;
-  if (twitchOn && ch.twitchSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Twitch')) return true;
-  return false;
-}
-
-function buildVodUrl(v: ChannelVideo): string {
-  const isTw = v.platform === 'Twitch';
-  const isClip = isLikelyClip(v);
-  const twitchId = isTw && v.id.startsWith('v') ? v.id.slice(1) : v.id;
-  if (v.url) {
-    const u = v.url;
-    if (!isTw && isClip && u.includes('/videos/') && !u.includes('/clips/')) {
-      const slug = v.channel || u.match(/kick\.com\/([^/]+)/i)?.[1] || '';
-      return `https://kick.com/${slug}/clips/${v.id}`;
-    }
-    return u;
-  }
-  if (isTw) {
-    return isClip
-      ? `https://clips.twitch.tv/${twitchId}`
-      : `https://www.twitch.tv/videos/${twitchId}`;
-  }
-  return isClip
-    ? `https://kick.com/${v.channel || ''}/clips/${v.id}`
-    : `https://kick.com/${v.channel || ''}/videos/${v.id}`;
-}
-
-function formatBytes(nbytes: number): string {
-  if (!Number.isFinite(nbytes) || nbytes <= 0) return '—';
-  const mb = nbytes / (1024 * 1024);
-  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.max(1, Math.round(mb))} MB`;
-}
-
-const LEGACY_MB_PER_MIN: Record<string, number> = {
-  source: 112, '1080p60': 112, '1080p': 75,
-  '720p60': 44, '720p': 42, '480p': 24, '360p': 14,
-};
-
-function preferHeightFromQuality(quality: string): number {
-  const q = (quality || 'source').toLowerCase();
-  if (q === 'source') return 10_000;
-  const m = q.match(/(\d+)/);
-  return m ? parseInt(m[1], 10) : 1080;
-}
-
-function pickSizeForQuality(
-  sizes: Record<string, number>,
-  quality: string,
-): number | undefined {
-  const q = (quality || 'source').toLowerCase();
-  if (sizes[quality] || sizes[q]) return sizes[quality] ?? sizes[q];
-  const preferH = preferHeightFromQuality(quality);
-  let bestKey: string | null = null;
-  let bestH = -1;
-  for (const key of Object.keys(sizes)) {
-    const m = key.match(/(\d+)/);
-    const h = m ? parseInt(m[1], 10) : (key.toLowerCase() === 'source' ? 10_000 : 0);
-    if (preferH >= 10_000) {
-      if (h > bestH) {
-        bestH = h;
-        bestKey = key;
-      }
-    } else if (h <= preferH && h > bestH) {
-      bestH = h;
-      bestKey = key;
-    }
-  }
-  if (bestKey) return sizes[bestKey];
-  if (preferH < 10_000) {
-    for (const key of Object.keys(sizes)) {
-      const m = key.match(/(\d+)/);
-      const h = m ? parseInt(m[1], 10) : 0;
-      if (h >= preferH) return sizes[key];
-    }
-  }
-  return sizes.source ?? Math.max(...Object.values(sizes));
-}
-
-function estimateDownloadBytes(
-  videoInfo: VideoInfo | null,
-  quality: string,
-  clipSec: number,
-  fullDurationSec: number,
-): number {
-  if (clipSec <= 0) return 0;
-  const fullDur = Math.max(clipSec, fullDurationSec || clipSec);
-  const sizes = videoInfo?.size_by_quality;
-  if (sizes && Object.keys(sizes).length > 0) {
-    const fullBytes = pickSizeForQuality(sizes, quality);
-    if (fullBytes && fullBytes > 0) {
-      return Math.round(fullBytes * (clipSec / fullDur));
-    }
-  }
-  if (videoInfo?.estimated_bytes && fullDur > 0) {
-    return Math.round(videoInfo.estimated_bytes * (clipSec / fullDur));
-  }
-  const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
-  return Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
-}
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
@@ -1793,6 +151,7 @@ export default function App() {
   const urlPlatform = detectUrlPlatform(url);
   const [trimStartSec, setTrimStartSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(3600);
+  const [trimPanelHeight, setTrimPanelHeight] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSessionId, setPreviewSessionId] = useState<string | null>(null);
   const [previewPlayback, setPreviewPlayback] = useState<{
@@ -1810,9 +169,6 @@ export default function App() {
   const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
-  const [previewFsUiScale, setPreviewFsUiScale] = useState(readPreviewFsUiScale);
-  const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
-  const [previewQualityLevel, setPreviewQualityLevel] = useState(0);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
   const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
@@ -1850,6 +206,28 @@ export default function App() {
   /** Menu selection — may exceed on-screen playback height until fullscreen. */
   const previewRequestedHeightRef = useRef(0);
   const previewAppliedHeightRef = useRef(0);
+  // ── Shared preview hook (quality state machine) ──────────────────────────
+  const {
+    previewLevels,
+    qualityLevel: previewQualityLevel,
+
+    syncPlaybackToViewport: syncPreviewPlaybackToViewport,
+    applyQuality: applyPreviewQuality,
+    setPreviewLevels,
+    setQualityLevel: setPreviewQualityLevel,
+    setHlsRef,
+  } = usePreviewPlayer({
+    videoRef: previewVideoRef,
+    playback: previewPlayback,
+    sessionId: previewSessionId,
+    isClipPreview: isClipUrl(url.trim()),
+    containerRef: previewContainerRef,
+    trimStart: previewTrimStartRef.current,
+    onPreviewError: (msg: string) => {
+      if (msg) setError(msg);
+    },
+  });
+
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
@@ -1857,6 +235,8 @@ export default function App() {
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
+  const trimPanelResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const previewOpenRef = useRef(false);
   /** True while dragging URL trim sliders or preview in/out needles. */
   const trimDragActiveRef = useRef(false);
   /** Opposite trim endpoint pinned for the duration of a URL slider drag. */
@@ -1984,7 +364,12 @@ export default function App() {
 
   // Queue
   const [queueDownloads, setQueueDownloads] = useState<DownloadState[]>([]);
+  const [recentDownloads, setRecentDownloads] = useState<DownloadState[]>([]);
   const [historyDownloads, setHistoryDownloads] = useState<DownloadState[]>([]);
+  const [selectedQueueIds, setSelectedQueueIds] = useState<Set<string>>(new Set());
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
+  const [selectedRecentIds, setSelectedRecentIds] = useState<Set<string>>(new Set());
+  const [selectedChannelVodUrls, setSelectedChannelVodUrls] = useState<Set<string>>(new Set());
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
@@ -2096,6 +481,11 @@ export default function App() {
     vodDurationSecRef.current = vodDurationSec;
   }, [vodDurationSec]);
 
+  // Keep previewOpenRef in sync
+  useEffect(() => {
+    previewOpenRef.current = previewOpen;
+  }, [previewOpen]);
+
   const previewDurationSec = useMemo(
     () => Math.max(1, previewTrimEnd - previewTrimStart),
     [previewTrimStart, previewTrimEnd],
@@ -2105,6 +495,7 @@ export default function App() {
     if (previewHlsRef.current) {
       previewHlsRef.current.destroy();
       previewHlsRef.current = null;
+        setHlsRef(null);
     }
     const video = previewVideoRef.current;
     if (video) {
@@ -2128,6 +519,7 @@ export default function App() {
     setPreviewTimeUi(0);
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
+    setTrimPanelHeight(0);
     setPreviewLevels([]);
     setPreviewQualityLevel(0);
     setPreviewQualityMenuOpen(false);
@@ -2383,6 +775,7 @@ export default function App() {
         startPosition: previewTrimStartRef.current,
       });
       previewHlsRef.current = hls;
+      setHlsRef(hls);
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       let levelsInitialized = false;
@@ -2511,142 +904,8 @@ export default function App() {
       setPreviewPlaying(false);
     }
   }, [previewVideoReady]);
+;
 
-  const measurePreviewPlayerCap = useCallback(
-    () => measurePlayerHeightCap(
-      previewContainerRef.current ?? previewPanelRef.current,
-      previewVideoAspectRef.current,
-    ),
-    [],
-  );
-
-  const applyPreviewPlaybackHeight = useCallback(async (
-    playbackHeight: number,
-    opts?: boolean | { userInitiated?: boolean },
-  ) => {
-    if (!playbackHeight || playbackHeight === previewAppliedHeightRef.current) return;
-    previewAppliedHeightRef.current = playbackHeight;
-
-    const userInitiated = typeof opts === 'boolean' ? opts : (opts?.userInitiated ?? false);
-
-    const menuIndex = levelIndexForHeight(previewLevels, playbackHeight);
-    const level = previewLevels[menuIndex];
-    if (!level) return;
-
-    const video = previewVideoRef.current;
-    const wasPaused = video?.paused ?? true;
-    const savedTime = video?.currentTime ?? previewTrimStartRef.current;
-
-    const syncSessionQuality = () => apiPost(
-      `/api/preview/session/${previewSessionId}/quality`,
-      { prefer_height: playbackHeight },
-    );
-
-    if (previewPlayback?.kind === 'progressive' && previewSessionId) {
-      if (!video || !previewPlayback.url) return;
-      try {
-        const targetUrl = userInitiated
-          ? previewUrlWithPreferHeight(previewPlayback.url, playbackHeight)
-          : `${previewPlayback.url}${previewPlayback.url.includes('?') ? '&' : '?'}t=${Date.now()}`;
-        attachProgressivePreview(video, targetUrl, savedTime);
-        if (!wasPaused) void video.play().catch(() => {});
-        if (userInitiated) {
-          void syncSessionQuality().catch((err: unknown) => {
-            previewAppliedHeightRef.current = 0;
-            setError(err instanceof Error ? err.message : 'Could not change preview quality');
-          });
-        } else {
-          await syncSessionQuality();
-        }
-      } catch (err: unknown) {
-        previewAppliedHeightRef.current = 0;
-        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
-        setError(msg);
-      }
-      return;
-    }
-
-    const hls = previewHlsRef.current;
-    if (!hls) return;
-
-    const hlsIndex = level.index;
-    const hlsLevel = hls.levels[hlsIndex];
-    const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
-    const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
-    const playbackUrl = previewPlayback?.url ?? '';
-
-    if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
-      applyHlsQualityLevel(hls, hlsIndex, true);
-      return;
-    }
-
-    if (needsApiSwitch && previewSessionId && playbackUrl) {
-      try {
-        if (userInitiated) {
-          hls.loadSource(previewUrlWithPreferHeight(playbackUrl, playbackHeight));
-          hls.startLoad(savedTime);
-          void syncSessionQuality().catch((err: unknown) => {
-            previewAppliedHeightRef.current = 0;
-            setError(err instanceof Error ? err.message : 'Could not change preview quality');
-          });
-        } else {
-          await syncSessionQuality();
-          hls.loadSource(playbackUrl);
-          hls.startLoad();
-        }
-      } catch (err: unknown) {
-        previewAppliedHeightRef.current = 0;
-        const msg = err instanceof Error ? err.message : 'Could not change preview quality';
-        setError(msg);
-      }
-    } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-      applyHlsQualityLevel(hls, hlsIndex, userInitiated);
-      if (!userInitiated && wasPaused && video) {
-        previewSuppressPlayRef.current = true;
-        requestAnimationFrame(() => {
-          video.pause();
-          previewSuppressPlayRef.current = false;
-        });
-      }
-    }
-  }, [previewLevels, previewPlayback, previewSessionId]);
-
-  const syncPreviewPlaybackToViewport = useCallback(async (
-    forceLoad = false,
-    fullscreenOverride?: boolean,
-  ) => {
-    if (!previewVideoReady || !previewLevels.length) return;
-    // Progressive clips are a single MP4 — viewport sync only reloads and causes black flashes.
-    if (previewPlayback?.kind === 'progressive') return;
-    const requested = previewRequestedHeightRef.current
-      || previewLevels[previewQualityLevel]?.height
-      || PREVIEW_MAIN_DEFAULT_HEIGHT;
-    const availableHeights = previewLevels.map((l) => l.height);
-    const playbackHeight = playbackHeightFromRequest(
-      requested,
-      availableHeights,
-      measurePreviewPlayerCap(),
-      fullscreenOverride ?? previewFullscreen,
-    );
-    await applyPreviewPlaybackHeight(playbackHeight, forceLoad);
-  }, [
-    applyPreviewPlaybackHeight,
-    measurePreviewPlayerCap,
-    previewFullscreen,
-    previewLevels,
-    previewQualityLevel,
-    previewVideoReady,
-    previewPlayback?.kind,
-  ]);
-
-  const applyPreviewQuality = useCallback(async (levelIndex: number) => {
-    const level = previewLevels[levelIndex];
-    if (!level) return;
-    previewRequestedHeightRef.current = level.height;
-    setPreviewQualityLevel(levelIndex);
-    setPreviewQualityMenuOpen(false);
-    await applyPreviewPlaybackHeight(level.height, { userInitiated: true });
-  }, [previewLevels, applyPreviewPlaybackHeight]);
 
   const skipPreview = useCallback((deltaSec: number) => {
     const video = previewVideoRef.current;
@@ -2682,6 +941,13 @@ export default function App() {
     trimEndSecRef.current = end;
     setTrimStartSec(start);
     setTrimEndSec(end);
+    // Sync preview trim when preview is open
+    if (previewOpenRef.current) {
+      previewTrimStartRef.current = start;
+      previewTrimEndRef.current = end;
+      setPreviewTrimStart(start);
+      setPreviewTrimEnd(end);
+    }
     // Pin endpoints are frozen at pointerdown — updating them during drag shifts the
     // other slider's min/max and makes its thumb appear to move the wrong way.
     return { start, end };
@@ -2937,20 +1203,6 @@ export default function App() {
     }
   }, [previewFullscreen]);
 
-  const adjustPreviewFsUiScale = useCallback((delta: number) => {
-    setPreviewFsUiScale((prev) => {
-      const idx = PREVIEW_FS_SCALE_STEPS.indexOf(prev as (typeof PREVIEW_FS_SCALE_STEPS)[number]);
-      const base = idx >= 0 ? idx : 0;
-      const next = PREVIEW_FS_SCALE_STEPS[Math.max(0, Math.min(PREVIEW_FS_SCALE_STEPS.length - 1, base + delta))];
-      try {
-        localStorage.setItem(PREVIEW_FS_SCALE_KEY, String(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-    bumpPreviewFsControls();
-  }, [bumpPreviewFsControls]);
 
   const focusPreviewPlayer = useCallback(() => {
     previewContainerRef.current?.focus();
@@ -2961,6 +1213,7 @@ export default function App() {
     if (!container || !previewVideoReady) return;
     try {
       if (!document.fullscreenElement) {
+        setTrimPanelHeight(0);
         await container.requestFullscreen();
       } else {
         await document.exitFullscreen();
@@ -3032,7 +1285,7 @@ export default function App() {
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
       requestAnimationFrame(() => {
-        void syncPreviewPlaybackToViewport(false, fs);
+        void syncPreviewPlaybackToViewport(fs);
       });
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
@@ -3216,6 +1469,8 @@ export default function App() {
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    // ponytail: pass empty layout so preview can grow freely - other panels shrink on drag end
+    const emptyLayout = { previewOpen: false, urlPanelAside: false, preview: { w: 0, h: 0 }, urlAside: { w: 0, h: 0 }, main: { w: 0, h: 0 } };
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
       aspect: previewVideoAspectRef.current,
@@ -3223,8 +1478,22 @@ export default function App() {
         w,
         previewChromeHRef.current,
         previewVideoAspectRef.current,
-        layoutBoundsInput(),
+        emptyLayout,
       ),
+      onResizeEnd: () => {
+        // Re-clamp urlAside and main to fit alongside the new preview width
+        const layout = layoutBoundsInput();
+        if (layout.urlPanelAside) {
+          const clamped = clampPanelSizeForLayout('urlAside', urlAsidePanelSizeRef.current, layout);
+          urlAsidePanelSizeRef.current = clamped;
+          setUrlAsidePanelSize(clamped);
+          if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, clamped);
+        }
+        const clampedMain = clampPanelSizeForLayout('main', mainPanelSizeRef.current, layout);
+        mainPanelSizeRef.current = clampedMain;
+        setMainPanelSize(clampedMain);
+        if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clampedMain);
+      },
     });
   }, [layoutBoundsInput]);
 
@@ -3369,6 +1638,7 @@ export default function App() {
     try {
       const data = await apiGet<DownloadsResponse>('/api/downloads');
       setQueueDownloads(data.queue || []);
+      setRecentDownloads(data.recent || []);
       setHistoryDownloads(data.history || []);
     } catch {}
   }, []);
@@ -3526,6 +1796,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleDeleteHistory = useCallback(async (id: string) => {
+    if (!window.confirm('Remove this download from history?')) return;
     setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -3537,6 +1808,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleRemoveFromQueue = useCallback(async (id: string) => {
+    if (!window.confirm('Remove this download from the queue?')) return;
     setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -3546,6 +1818,98 @@ export default function App() {
       refreshDownloads();
     }
   }, [refreshDownloads]);
+
+  const toggleQueueSelection = useCallback((id: string) => {
+    setSelectedQueueIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleHistorySelection = useCallback((id: string) => {
+    setSelectedHistoryIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleRecentSelection = useCallback((id: string) => {
+    setSelectedRecentIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleBulkDeleteRecent = useCallback(async () => {
+    if (selectedRecentIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent?`)) return;
+    const ids = [...selectedRecentIds];
+    setSelectedRecentIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedRecentIds, refreshDownloads]);
+
+  const handleBulkDeleteQueue = useCallback(async () => {
+    if (selectedQueueIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue?`)) return;
+    const ids = [...selectedQueueIds];
+    setSelectedQueueIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedQueueIds, refreshDownloads]);
+
+  const handleBulkDeleteHistory = useCallback(async () => {
+    if (selectedHistoryIds.size === 0) return;
+    if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history?`)) return;
+    const ids = [...selectedHistoryIds];
+    setSelectedHistoryIds(new Set());
+    await Promise.allSettled(ids.map((id) =>
+      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
+    ));
+    refreshDownloads();
+  }, [selectedHistoryIds, refreshDownloads]);
+
+  const handleBulkDownloadChannelVods = useCallback(async () => {
+    if (selectedChannelVodUrls.size === 0) return;
+    const count = selectedChannelVodUrls.size;
+    if (!window.confirm(`Download ${count} selected item(s)?\n\nEach will download at source quality with no trim.`)) return;
+    if (!(await ensureDownloadFolder())) {
+      setError('Choose a download folder to continue.');
+      return;
+    }
+    setError(null);
+    const urls = [...selectedChannelVodUrls];
+    setSelectedChannelVodUrls(new Set());
+    for (const vodUrl of urls) {
+      try {
+        const dlEndpoint = isClipUrl(vodUrl) ? '/api/download/clip' : '/api/download/video';
+        await apiPost<{ download_id: string }>(dlEndpoint, {
+          url: vodUrl,
+          quality: 'source',
+        });
+      } catch (err: any) {
+        setError(err.message || 'Failed to start download');
+        break;
+      }
+    }
+    setTab('queue');
+    refreshDownloads();
+  }, [selectedChannelVodUrls, ensureDownloadFolder, refreshDownloads]);
+
+  const toggleChannelVodSelection = useCallback((vodUrl: string) => {
+    setSelectedChannelVodUrls((prev) => {
+      const next = new Set(prev);
+      if (next.has(vodUrl)) next.delete(vodUrl); else next.add(vodUrl);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     void refreshDownloads();
@@ -3809,13 +2173,19 @@ export default function App() {
   // used to live in a separate useEffect gated by a ref so it would
   // fire exactly once per page load; we keep the same shape so the
   // behaviour survives the consolidation.
+  // On page load: show cached channel data immediately, then silently
+  // refetch every channel in the background (both VODs and clips).
+  // The merge functions (mergeVodLists/mergeClipLists) do incoming-wins
+  // merge, so the cached data stays visible until fresh data arrives.
   const incrementalSyncDoneRef = useRef(false);
   useEffect(() => {
     if (incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
     const channels = loadSavedChannels();
     channels.forEach((c) => {
-      void refreshChannelRef.current(c.id, c, 'vods', { incremental: true });
+      // silent: true -> no loading spinner, cached data stays visible
+      // undefined contentMode -> uses current filter (VODs or clips)
+      void refreshChannelRef.current(c.id, c, undefined, { silent: true });
     });
   }, []);
 
@@ -4387,11 +2757,13 @@ export default function App() {
               {previewVideoLoading ? <Loader2 size={11} className="animate-spin" /> : <Eye size={11} />}
               Preview
             </button>
+
           </div>
 
           <button
             onClick={promptStartDownload}
-            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black ${
+            disabled={loading || !videoInfo}
+            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
                 : urlPlatform === 'twitch'
@@ -4477,20 +2849,29 @@ export default function App() {
     : { start: 0, end: 100, play: 0 };
 
   const previewTimelineUi = (
-    <div className="flex flex-col gap-0.5 w-full">
+    <div className="flex flex-col gap-0.5 w-full"
+      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px' } : undefined}>
       {vodDurationSec > 0 && (
-        <div className="flex items-center gap-2">
-          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider ${
+        <div className="flex items-stretch gap-2 flex-1 min-h-0">
+          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider self-center ${
             previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
           }`}>
             Clip
           </span>
           <div
             ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 h-3 ${
+            className={`preview-needle-rail relative flex-1 ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
             title="Drag needles to set preview clip range"
+            onClick={(e) => {
+              if (e.target !== e.currentTarget) return;
+              const rail = previewNeedleRailRef.current;
+              if (!rail || vodDurationSec <= 0) return;
+              const rect = rail.getBoundingClientRect();
+              const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              seekPreviewVideo(frac * vodDurationSec);
+            }}
           >
             <div
               className="preview-needle-region absolute top-1/2 -translate-y-1/2 h-1 pointer-events-none"
@@ -4524,18 +2905,54 @@ export default function App() {
               style={{ left: `${previewClipPct.end}%` }}
               onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
             />
-          </div>
+        </div>
           <ClipDurationAdjustButtons
             compact
             onAdjust={adjustPreviewClipDuration}
             activeEndpoint={lastPreviewTrimEndpoint}
             disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
+            className="self-center"
           />
           <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
             previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
           }`}>
             {formatHmsFull(previewTrimEnd - previewTrimStart)}
           </span>
+        </div>
+      )}
+      {vodDurationSec > 0 && (
+        <div
+          className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
+          onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            trimPanelResizeRef.current = { startY: e.clientY, startHeight: trimPanelHeight };
+            trimDragActiveRef.current = true;
+            bumpPreviewFsControls();
+          }}
+          onPointerMove={(e) => {
+            if (!trimPanelResizeRef.current) return;
+            const startY = trimPanelResizeRef.current.startY;
+            const startH = trimPanelResizeRef.current.startHeight;
+            const delta = e.clientY - startY;
+            const minH = previewFullscreen ? 60 : 40;
+            const maxH = previewFullscreen ? Math.floor(window.innerHeight * 0.5) : Infinity;
+            const h = Math.min(maxH, Math.max(minH, startH - delta));
+            setTrimPanelHeight(h);
+          }}
+          onPointerUp={(e) => {
+            trimPanelResizeRef.current = null;
+            trimDragActiveRef.current = false;
+            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+          }}
+          onPointerCancel={(e) => {
+            trimPanelResizeRef.current = null;
+            trimDragActiveRef.current = false;
+            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+          }}
+        >
+          <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
         </div>
       )}
       <div className="flex items-center gap-2">
@@ -4593,35 +3010,10 @@ export default function App() {
         />
       </div>
       <div className="flex items-center gap-1.5 ml-auto">
-        {opts.fsCornerExit && (
-          <div className="flex items-center gap-0.5 mr-1">
-            <button
-              type="button"
-              onClick={() => adjustPreviewFsUiScale(-1)}
-              disabled={previewFsUiScale <= PREVIEW_FS_SCALE_STEPS[0]}
-              className={previewCtrlBtn(previewFullscreen)}
-              title="Smaller controls"
-            >
-              <ZoomOut size={16} />
-            </button>
-            <span className="text-[9px] font-mono text-zinc-400 tabular-nums min-w-[2.25rem] text-center">
-              {Math.round(previewFsUiScale * 100)}%
-            </span>
-            <button
-              type="button"
-              onClick={() => adjustPreviewFsUiScale(1)}
-              disabled={previewFsUiScale >= PREVIEW_FS_SCALE_STEPS[PREVIEW_FS_SCALE_STEPS.length - 1]}
-              className={previewCtrlBtn(previewFullscreen)}
-              title="Larger controls & trim needles"
-            >
-              <ZoomIn size={16} />
-            </button>
-          </div>
-        )}
         <button
           type="button"
           onClick={promptStartDownload}
-          disabled={!previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
+          disabled={loading || !previewVideoReady || !videoInfo || (!currentIsClip && (previewOpen ? previewTrimEndRef.current <= previewTrimStartRef.current : trimEndSec <= trimStartSec))}
           className={previewCtrlBtn(previewFullscreen, true)}
           title={currentIsClip ? 'Download clip' : 'Download selected trim'}
         >
@@ -4718,12 +3110,13 @@ export default function App() {
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
+              style={!previewFullscreen ? { aspectRatio: previewVideoAspect } : undefined}
             >
               <div
                 className={`relative bg-black overflow-hidden cursor-pointer ${
-                  previewFullscreen ? 'absolute inset-0 z-0' : 'w-full shrink-0'
+                  'absolute inset-0 z-0'
                 }`}
-                style={previewFullscreen ? undefined : { aspectRatio: previewVideoAspect }}
+
                 onClick={() => {
                   focusPreviewPlayer();
                   togglePreviewPlay();
@@ -4755,13 +3148,13 @@ export default function App() {
                 ref={previewControlsRef}
                 data-player-controls
                 data-preview-fs-ui={previewFullscreen ? '' : undefined}
-                style={previewFullscreen ? ({ '--preview-fs-scale': previewFsUiScale } as CSSProperties) : undefined}
+
                 className={
                   previewFullscreen
-                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 max-h-[50vh] overflow-hidden bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
                       previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                     }`
-                    : 'flex flex-col gap-1.5 w-full shrink-0'
+                    : 'absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-2 pb-2 pt-2 bg-gradient-to-t from-black/80 to-black/50'
                 }
                 onClick={previewFullscreen ? (e) => e.stopPropagation() : undefined}
                 onPointerDown={previewFullscreen ? (e) => e.stopPropagation() : undefined}
@@ -5084,7 +3477,7 @@ export default function App() {
                                 : 'border-zinc-700 text-zinc-500 hover:text-white'
                             }`}
                           >
-                            Only clips
+                            Clips
                           </button>
                         </div>
                       </div>
@@ -5108,7 +3501,34 @@ export default function App() {
                           {channelContentFilter === 'clips' ? 'No clips' : 'No VODs'}
                         </p>
                       ) : (
-                        <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
+                        <div className="flex flex-col gap-1">
+                          {selectedChannelVodUrls.size > 0 && (
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500 cursor-pointer hover:text-zinc-300">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedChannelVodUrls.size === visibleChannelVideos.length}
+                                  onChange={() => {
+                                    if (selectedChannelVodUrls.size === visibleChannelVideos.length) {
+                                      setSelectedChannelVodUrls(new Set());
+                                    } else {
+                                      setSelectedChannelVodUrls(new Set(visibleChannelVideos.map(v => buildVodUrl(v))));
+                                    }
+                                  }}
+                                  className="accent-[#53fc18]"
+                                />
+                                Select all
+                              </label>
+                              <button
+                                type="button"
+                                onClick={handleBulkDownloadChannelVods}
+                                className="border border-[#53fc18] bg-[#53fc18]/10 text-[#53fc18] hover:bg-[#53fc18]/20 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider flex items-center gap-1"
+                              >
+                                <Download size={10} /> Download {selectedChannelVodUrls.size}
+                              </button>
+                            </div>
+                          )}
+                          <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
                           {visibleChannelVideos.map((v, i) => {
                             const fullUrl = buildVodUrl(v);
                             const subline = channelVodSubline(v);
@@ -5136,7 +3556,14 @@ export default function App() {
                                 }}
                                 className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                               >
-                                {isClipItem && <ChannelClipThumb video={v} />}
+                                <input
+                                  type="checkbox"
+                                  checked={selectedChannelVodUrls.has(fullUrl)}
+                                  onChange={() => toggleChannelVodSelection(fullUrl)}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="accent-[#53fc18] shrink-0"
+                                />
+                                <ChannelClipThumb video={v} />
                                 <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
                                 <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                                   <span className="truncate flex items-center gap-1">
@@ -5183,6 +3610,7 @@ export default function App() {
                             );
                           })}
                         </div>
+                      </div>
                       )}
                       {canExpandChannelList && (
                         <button type="button" onClick={handleExpandChannelList}
@@ -5200,181 +3628,48 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════════════════════ QUEUE TAB ════════════════════════════ */}
         {tab === 'queue' && (
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                Queue
-              </span>
-              <button onClick={refreshDownloads} className="text-zinc-500 hover:text-white transition-colors">
-                <RefreshCw size={14} />
-              </button>
-            </div>
-
-            <div className="flex flex-col gap-2 max-h-[360px] overflow-y-auto pr-1 custom-scrollbar">
-              <ActiveDownloadsList
-                downloads={queueDownloads}
-                onPause={handlePause}
-                onResume={handleResume}
-                onCancel={handleCancel}
-                onDelete={handleRemoveFromQueue}
-                onOpenFolder={openFolder}
-                basename={basename}
-                platformIcon={(platform, className) => (
-                  <PlatformVodIcon platform={platform} className={className} />
-                )}
-              />
-            </div>
-
-            <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                History
-              </span>
-              <div className="flex flex-col gap-2 max-h-[160px] overflow-y-auto pr-1 custom-scrollbar">
-                {historyDownloads.length === 0 ? (
-                  <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-                    NO COMPLETED DOWNLOADS YET.
-                  </div>
-                ) : historyDownloads.map((dl) => (
-                    <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
-                      <div className="flex justify-between items-center gap-2">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
-                          <span className="text-xs font-mono text-zinc-300 truncate">
-                            {dl.title || dl.url}
-                          </span>
-                        </div>
-                        <span className="text-[10px] font-mono shrink-0 text-[#53fc18]">{dl.status}</span>
-                      </div>
-                      <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
-                        <span className="truncate">{basename(dl.output_file)}</span>
-                        <div className="flex items-center gap-2 shrink-0">
-                          {dl.output_file && (
-                            <button
-                              type="button"
-                              onClick={() => openFolder(dl.output_file)}
-                              className="text-zinc-400 hover:text-white flex items-center gap-1"
-                              title="Show in folder"
-                            >
-                              <FolderOpen size={12} /> Folder
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteHistory(dl.download_id)}
-                            className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
-                            title="Remove from history"
-                          >
-                            <Trash2 size={12} /> Delete
-                          </button>
-                        </div>
-                      </div>
-                      {dl.error && <span className="text-[10px] text-red-400 font-mono">{dl.error}</span>}
-                    </div>
-                ))}
-              </div>
-            </div>
-          </div>
+          <QueueTab
+            queueDownloads={queueDownloads}
+            recentDownloads={recentDownloads}
+            historyDownloads={historyDownloads}
+            onPause={handlePause}
+            onResume={handleResume}
+            onCancel={handleCancel}
+            onDelete={handleRemoveFromQueue}
+            onDeleteHistory={handleDeleteHistory}
+            onOpenFolder={openFolder}
+            onRefresh={refreshDownloads}
+            basename={basename}
+            selectedQueueIds={selectedQueueIds}
+            selectedHistoryIds={selectedHistoryIds}
+            onToggleQueueSelection={toggleQueueSelection}
+            onToggleHistorySelection={toggleHistorySelection}
+            onBulkDeleteQueue={handleBulkDeleteQueue}
+            onBulkDeleteHistory={handleBulkDeleteHistory}
+            selectedRecentIds={selectedRecentIds}
+            onToggleRecentSelection={toggleRecentSelection}
+            onBulkDeleteRecent={handleBulkDeleteRecent}
+          />
         )}
 
-        {/* ════════════════════════════ SETTINGS TAB ════════════════════════════ */}
         {tab === 'settings' && settings && (
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1.5">
-              <FieldCaption>Download Folder</FieldCaption>
-              <div className="flex gap-2">
-                <input type="text" value={settings.download_folder}
-                  onChange={(e) => setSettings({ ...settings, download_folder: e.target.value })}
-                  placeholder="C:\Users\...\Downloads"
-                  className="flex-1 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white" />
-                <button type="button" onClick={pickDownloadFolder} disabled={pickingFolder}
-                  className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1 disabled:opacity-50">
-                  {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-                  {pickingFolder ? '...' : 'Browse'}
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="flex flex-col gap-1.5">
-                <FieldCaption noWrap>Download Threads</FieldCaption>
-                <input type="number" min={1} max={16}
-                  value={settings.download_threads}
-                  onChange={(e) => setSettings({ ...settings, download_threads: Math.max(1, Math.min(16, parseInt(e.target.value) || 4)) })}
-                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <FieldCaption>Max Cache (MB)</FieldCaption>
-                <input type="number" min={50} max={2000}
-                  value={settings.max_cache_mb}
-                  onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
-                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
-              </div>
-            </div>
-            <p className="text-[9px] font-mono text-zinc-600 leading-snug">
-              Kick/Twitch VODs: remux when already H.264/AAC; GPU transcode when needed.
-            </p>
-
-            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
-              <span>v{appVersion ?? '…'}</span>
-              <span aria-hidden>·</span>
-              <button
-                type="button"
-                onClick={() => void handleCheckUpdate()}
-                disabled={updateChecking}
-                className="text-zinc-600 hover:text-zinc-400 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
-              >
-                {updateChecking ? <Loader2 size={8} className="animate-spin" /> : null}
-                {updateChecking ? 'checking' : 'check for updates'}
-              </button>
-              {updateInfo ? (
-                <>
-                  <span aria-hidden>·</span>
-                  <span className="text-emerald-700">v{updateInfo.version}</span>
-                  {updateInfo.release_url ? (
-                    <a
-                      href={updateInfo.release_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
-                    >
-                      release
-                    </a>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={() => void handleApplyUpdate()}
-                    disabled={updateApplying}
-                    className="text-emerald-700 hover:text-emerald-500 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[9px] inline-flex items-center gap-0.5"
-                  >
-                    {updateApplying ? <Loader2 size={8} className="animate-spin" /> : null}
-                    {updateApplying ? 'installing' : 'install'}
-                  </button>
-                </>
-              ) : updateMessage ? (
-                <>
-                  <span aria-hidden>·</span>
-                  <span className="text-zinc-600">{updateMessage}</span>
-                </>
-              ) : null}
-            </div>
-
-            <button onClick={handleSaveSettings}
-              className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">
-              {settingsSaved ? <><CheckCircle2 size={14} /> Saved!</> : 'Save Settings'}
-            </button>
-
-            <button onClick={() => {
-              if (!window.confirm('Exit VOD.RIP? All downloads will be cancelled and the app will close.')) return;
-              flushPanelLayoutToBackend();
-              void apiPost('/api/exit', {}).catch(() => {});
-            }}
-              className="w-full bg-red-950 text-red-400 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-300 transition-colors">
-              <StopCircle size={14} />
-              Exit VOD.RIP
-            </button>
-          </div>
+          <SettingsTab
+            settings={settings}
+            setSettings={setSettings}
+            appVersion={appVersion}
+            updateInfo={updateInfo}
+            updateChecking={updateChecking}
+            updateApplying={updateApplying}
+            updateMessage={updateMessage}
+            pickingFolder={pickingFolder}
+            settingsSaved={settingsSaved}
+            onPickFolder={pickDownloadFolder}
+            onSave={handleSaveSettings}
+            onCheckUpdate={handleCheckUpdate}
+            onApplyUpdate={handleApplyUpdate}
+            onFlushPanelLayout={flushPanelLayoutToBackend}
+          />
         )}
 
         <PanelResizeHandles onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />

@@ -23,6 +23,9 @@ type Props = {
   onOpenFolder: (path: string) => void;
   basename: (path: string) => string;
   platformIcon: (platform: string, className: string) => ReactNode;
+  showCheckbox?: boolean;
+  selectedIds?: Set<string>;
+  onToggleSelect?: (id: string) => void;
 };
 
 function ActiveDownloadsListInner({
@@ -34,6 +37,9 @@ function ActiveDownloadsListInner({
   onOpenFolder,
   basename,
   platformIcon,
+  showCheckbox,
+  selectedIds,
+  onToggleSelect,
 }: Props) {
   if (downloads.length === 0) {
     return (
@@ -70,10 +76,20 @@ function ActiveDownloadsListInner({
             : (dl.progress > 0
                 ? (isPostProcess ? dlStatus : `${dl.progress}%`)
                 : dlStatus);
+        const checked = showCheckbox && selectedIds?.has(dl.download_id);
         return (
           <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
             <div className="flex justify-between items-center gap-2">
               <div className="flex items-center gap-2 min-w-0">
+                {showCheckbox && (
+                  <input
+                    type="checkbox"
+                    checked={!!checked}
+                    onChange={() => onToggleSelect?.(dl.download_id)}
+                    onClick={(e) => e.stopPropagation()}
+                    className="accent-[#53fc18] shrink-0"
+                  />
+                )}
                 {platformIcon(dl.platform, 'w-4 h-4')}
                 <span className="text-xs font-mono text-zinc-300 truncate">
                   {dl.title || dl.url}

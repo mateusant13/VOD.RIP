@@ -33,12 +33,12 @@ CACHE_FILENAME = "update_cache.json"
 PENDING_FILENAME = "update_pending.json"
 
 logger = logging.getLogger(__name__)
+from services.os_services import _NO_WINDOW
+
 try:
     from services._version import USER_AGENT
 except ImportError:  # pragma: no cover - dev module-load race
     USER_AGENT = "VOD.RIP/unknown"
-
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _DETACHED_FLAGS = 0
 if os.name == "nt":
     _DETACHED_FLAGS = (
@@ -156,7 +156,8 @@ class UpdateChecker:
             data = json.loads(self.pending_path.read_text(encoding="utf-8"))
             if data.get("version") and self._is_newer(data["version"], self.current_version):
                 return data
-        except Exception:
+        # ponytail: I/O + JSON decode errors only
+        except (OSError, json.JSONDecodeError, ValueError):
             pass
         return None
 
@@ -178,7 +179,8 @@ class UpdateChecker:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             handle.write(chunk)
-        except Exception as exc:
+        # ponytail: request errors only
+        except (requests.RequestException, OSError) as exc:
             logger.error("Update download failed: %s", exc)
             return UpdateApplyResult(False, f"Download failed: {exc}")
 
@@ -231,7 +233,8 @@ class UpdateChecker:
                 return False
             logger.info("SHA-256 verified for %s", dest.name)
             return True
-        except Exception as exc:
+        # ponytail: request + I/O errors only
+        except (requests.RequestException, OSError, ValueError) as exc:
             logger.error("SHA-256 verification failed: %s", exc)
             return False
 
@@ -259,28 +262,32 @@ class UpdateChecker:
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             return (time.time() - float(data.get("last_check", 0))) > CHECK_INTERVAL_SEC
-        except Exception:
+        # ponytail: I/O + JSON decode errors only
+        except (OSError, json.JSONDecodeError, ValueError):
             return True
 
     def _save_cache(self, data: dict) -> None:
         try:
             self.app_data_dir.mkdir(parents=True, exist_ok=True)
             self.cache_path.write_text(json.dumps(data), encoding="utf-8")
-        except Exception:
+        # ponytail: I/O errors only
+        except OSError:
             pass
 
     def _save_pending(self, data: dict) -> None:
         try:
             self.app_data_dir.mkdir(parents=True, exist_ok=True)
             self.pending_path.write_text(json.dumps(data), encoding="utf-8")
-        except Exception:
+        # ponytail: I/O errors only
+        except OSError:
             pass
 
     def _clear_pending(self) -> None:
         try:
             if self.pending_path.is_file():
                 self.pending_path.unlink()
-        except Exception:
+        # ponytail: I/O errors only
+        except OSError:
             pass
 
     def _platform_keywords(self) -> Tuple[List[str], List[str]]:
@@ -335,7 +342,8 @@ class UpdateChecker:
         if release_url:
             try:
                 webbrowser.open(release_url)
-            except Exception:
+            # ponytail: webbrowser/OS errors only
+            except OSError:
                 logger.debug("Could not open release URL", exc_info=True)
         if os.name == "nt":
             try:
@@ -345,10 +353,12 @@ class UpdateChecker:
                     ["explorer.exe", f'/select,"{escaped}"'],
                     creationflags=_NO_WINDOW,
                 )
-            except Exception:
+            # ponytail: subprocess + OS errors only
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
                 try:
                     os.startfile(str(archive.parent))
-                except Exception:
+                # ponytail: OS errors only
+                except OSError:
                     logger.debug("Could not open update folder", exc_info=True)
         msg = (
             f"Verified update saved to {archive}. "

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -10,9 +11,9 @@ import threading
 import time
 from typing import Any, Optional
 
-_logger = logging.getLogger(__name__)
+from services.os_services import _NO_WINDOW
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+_logger = logging.getLogger(__name__)
 
 _shutdown_event = threading.Event()
 _uvicorn_server: Any = None
@@ -85,7 +86,8 @@ def _pids_via_netstat_windows(port: int) -> list[int]:
             pid = cols[-1]
             if pid.isdigit():
                 pids.append(int(pid))
-    except Exception as exc:
+    # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         _logger.debug("netstat for port %s: %s", port, exc)
     return list(dict.fromkeys(pids))
 
@@ -111,7 +113,8 @@ def _pids_listening_on_port_windows(port: int) -> list[int]:
             line = line.strip()
             if line.isdigit():
                 pids.append(int(line))
-    except Exception as exc:
+    # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         _logger.debug("Get-NetTCPConnection for port %s: %s", port, exc)
     return list(dict.fromkeys(pids))
 
@@ -131,7 +134,8 @@ def _pids_listening_on_port(port: int) -> list[int]:
             for part in result.stdout.split():
                 if part.strip().isdigit():
                     pids.append(int(part.strip()))
-        except Exception as exc:
+        # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
             _logger.debug("lsof for port %s: %s", port, exc)
     return list(dict.fromkeys(pids))
 
@@ -147,7 +151,8 @@ def _process_image_name(pid: int) -> Optional[str]:
             )
             name = result.stdout.strip()
             return name or None
-        except Exception:
+        # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
             return None
     try:
         result = subprocess.run(
@@ -161,7 +166,8 @@ def _process_image_name(pid: int) -> Optional[str]:
         if not line or line.upper().startswith("INFO:"):
             return None
         return line.split(",")[0].strip().strip('"') or None
-    except Exception:
+    # ponytail: subprocess errors only — OSError, timeout, CalledProcessError
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return None
 
 
@@ -176,7 +182,8 @@ def _request_graceful_shutdown(port: int) -> bool:
             return False
         response = requests.post(f"http://127.0.0.1:{port}/api/exit", timeout=2)
         return response.status_code == 200
-    except Exception as exc:
+    # ponytail: best-effort graceful shutdown — import/requests/json errors handled gracefully
+    except (ImportError, OSError, requests.RequestException, json.JSONDecodeError) as exc:
         _logger.debug("graceful shutdown on port %s: %s", port, exc)
         return False
 
@@ -207,7 +214,8 @@ def _process_alive(pid: int) -> bool:
             ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
             ctypes.windll.kernel32.CloseHandle(handle)
             return exit_code.value == STILL_ACTIVE
-        except Exception:
+        # ponytail: ctypes/Win32 API errors only
+        except (ImportError, OSError, AttributeError, ValueError):
             return False
     try:
         os.kill(pid, 0)
@@ -232,7 +240,8 @@ def _terminate_process_windows(pid: int) -> bool:
             return not _process_alive(pid)
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
-    except Exception as exc:
+    # ponytail: ctypes/Win32 API errors only
+    except (ImportError, OSError, AttributeError, ValueError) as exc:
         _logger.debug("TerminateProcess pid %s: %s", pid, exc)
         return False
 
@@ -290,7 +299,8 @@ def _kill_pid(port: int, pid: int) -> bool:
                 os.kill(pid, 9)
             except OSError:
                 pass
-    except Exception as exc:
+    # ponytail: os.kill/os errors only — OSError, AttributeError
+    except (OSError, AttributeError) as exc:
         _logger.debug("kill pid %s: %s", pid, exc)
     time.sleep(0.2)
     return not _process_alive(pid)
@@ -309,7 +319,8 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
 
         if info.status_code == 200 and is_vodrip_api_name(info.json().get("name", "")):
             return True
-    except Exception:
+    # ponytail: best-effort API identity check — any error means not-our-API
+    except (ImportError, OSError, requests.RequestException, json.JSONDecodeError, KeyError):
         pass
     return False
 
@@ -383,7 +394,8 @@ def stop_api_server(
     if server is not None:
         try:
             server.should_exit = True
-        except Exception as exc:
+        # ponytail: uvicorn attribute/set error only
+        except (AttributeError, RuntimeError) as exc:
             _logger.debug("uvicorn should_exit: %s", exc)
 
     if port is None or not wait_for_port:
