@@ -395,6 +395,9 @@ def _run_ffmpeg(
         while proc.poll() is None:
             try:
                 _check_pause_cancel(cancel_event, pause_event)
+            except CancelledError:
+                proc.kill()
+                raise
             except PausedError:
                 proc.kill()
                 raise

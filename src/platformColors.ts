@@ -1,7 +1,7 @@
 /** Shared platform accent colors — YouTube red toned down vs pure #FF0000. */
 export const KICK_COLOR = '#53fc18';
 export const TWITCH_COLOR = '#9146FF';
-export const YOUTUBE_COLOR = '#E03E3E';
+export const YOUTUBE_COLOR = '#EB2828';
 
 export function platformAccentColor(platform: string): string {
   const p = platform.toLowerCase();

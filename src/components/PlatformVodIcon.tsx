@@ -11,7 +11,7 @@ export default function PlatformVodIcon({ platform, className = 'w-3.5 h-3.5' }:
   const isYt = platform === 'YouTube';
   if (isYt) {
     return (
-      <svg viewBox="0 0 24 24" className={`shrink-0 fill-[#E03E3E] ${className}`} aria-label="YouTube">
+      <svg viewBox="0 0 24 24" className={`shrink-0 fill-[#EB2828] ${className}`} aria-label="YouTube">
         <path d={YT_PATH} />
       </svg>
     );

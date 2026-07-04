@@ -48,7 +48,7 @@ from services.ytdlp_cache import (    # noqa: F401, F811
 )
 from services.ytdlp_download import ( # noqa: F401, F811
     _build_ydl_opts, _wrap_progress_hook,
-    _ydl_download, _InstrumentedFFmpegPP,
+    _ydl_download, kill_pp_state_procs,
     _qualities_from_formats,
     _hostname_from_url,
     _set_pp_progress_state,

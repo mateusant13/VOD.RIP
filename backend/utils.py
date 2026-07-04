@@ -685,13 +685,13 @@ async def fetch_queue_meta(url: str, platform: str) -> dict:
             elif platform == "Twitch":
                 info = await loop.run_in_executor(INFO_EXECUTOR, twitch_clip, url)
             else:
-                info = await loop.run_in_executor(INFO_EXECUTOR, get_video_info, url)
+                info = await get_video_info(url)
         elif platform == "Kick":
             info = await loop.run_in_executor(INFO_EXECUTOR, kick_video, url)
         elif platform == "Twitch":
             info = await loop.run_in_executor(INFO_EXECUTOR, twitch_video, url)
         else:
-            info = await loop.run_in_executor(INFO_EXECUTOR, get_video_info, url)
+            info = await get_video_info(url)
         if info is None:
             return {}
         if hasattr(info, "model_dump"):

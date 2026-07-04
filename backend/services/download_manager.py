@@ -34,6 +34,7 @@ from services.download_utils import (
     _download_timeout_seconds,
     _hook_progress_percent,
 )
+from services.ytdlp_download import kill_pp_state_procs
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
@@ -281,6 +282,7 @@ class DownloadManager:
                         POSTPROCESS_PROGRESS_SPAN, pct * POSTPROCESS_PROGRESS_SPAN,
                     )
                     now = time.monotonic()
+                    d = None
                     if (
                         int(ui_pct) != int(last_emit_pct)
                         or (now - last_emit_wall) > 0.5
@@ -295,12 +297,13 @@ class DownloadManager:
                             "speed": speed or None,
                             "eta_seconds": eta,
                         }
-                    try:
-                        _progress_hook(d)
-                    # ponytail: survival guarantee for PP poller
-                    except Exception:
-                        pp_stop.set()
-                        return
+                    if d is not None:
+                        try:
+                            _progress_hook(d)
+                        # ponytail: survival guarantee for PP poller
+                        except Exception:
+                            pp_stop.set()
+                            return
                 else:
                     now = time.monotonic()
                     if (now - last_emit_wall) > 3.0:
@@ -339,6 +342,10 @@ class DownloadManager:
 
         def _register_pp_state(state: dict) -> None:
             pp_holder["state"] = state
+            with self._lock:
+                info = self._cleanup_info.get(download_id)
+                if info is not None:
+                    info["pp_state"] = state
             _start_poller()
 
         def _download_worker():
@@ -599,36 +606,18 @@ class DownloadManager:
         return cancelled
 
     def cancel(self, download_id: str) -> bool:
-        abort_fns: List[Callable[[], None]] = []
-        cleanup: Optional[dict] = None
         snapshot: Optional[DownloadState] = None
         with self._lock:
-            event = self._cancel_events.get(download_id)
-            pause_event = self._pause_events.get(download_id)
             state = self._downloads.get(download_id)
-            if not event or not state or state.status in _DONE_STATUSES:
+            if not state or state.status in _DONE_STATUSES:
                 return False
-            if pause_event:
-                pause_event.clear()
-            event.set()
             state.status = "Cancelled"
             state.progress = 0
             snapshot = state.model_copy(deep=True)
-            abort_fns = list(self._abort_fns.get(download_id, []))
-            cleanup = self._cleanup_info.get(download_id)
-
-        for fn in abort_fns:
-            try:
-                fn()
-            # ponytail: survival guarantee for arbitrary abort callbacks
-            except Exception:
-                pass
+        cleanup = self._force_stop_download(download_id)
         if cleanup:
-            expected_duration = None
-            temp_dirs: List[str] = []
-            if isinstance(cleanup, dict):
-                expected_duration = cleanup.get("expected_duration")
-                temp_dirs = list(cleanup.get("temp_dirs") or [])
+            expected_duration = cleanup.get("expected_duration")
+            temp_dirs = list(cleanup.get("temp_dirs") or [])
             delete_partial_output(
                 cleanup["output_file"], cleanup["output_existed"],
                 expected_duration=expected_duration,
@@ -636,14 +625,7 @@ class DownloadManager:
             if temp_dirs:
                 remove_temp_dirs(temp_dirs)
         self._notify_sse(download_id, "status", "Cancelled")
-        with self._lock:
-            self._downloads.pop(download_id, None)
-            self._cancel_events.pop(download_id, None)
-            self._pause_events.pop(download_id, None)
-            self._abort_fns.pop(download_id, None)
-            self._cleanup_info.pop(download_id, None)
-            self._worker_params.pop(download_id, None)
-            self._sse_queues.pop(download_id, None)
+        self._purge_download_runtime(download_id)
         if snapshot is not None:
             self._db.remove_queue_entry(download_id)
             self._db.record_history(snapshot)
@@ -787,45 +769,86 @@ class DownloadManager:
             raise ValueError("Download not found or not retryable")
         return new_id
 
-    def discard_from_queue(self, download_id: str) -> bool:
+    def _has_active_runtime(self, download_id: str) -> bool:
         with self._lock:
             state = self._downloads.get(download_id)
             if state and state.status not in _DONE_STATUSES:
-                event = self._cancel_events.get(download_id)
-                pause_event = self._pause_events.get(download_id)
-                if pause_event:
-                    pause_event.clear()
-                if event:
-                    event.set()
-                abort_fns = list(self._abort_fns.get(download_id, []))
-                cleanup = self._cleanup_info.get(download_id)
-                for fn in abort_fns:
-                    try:
-                        fn()
-                    # ponytail: survival guarantee for arbitrary abort callbacks
-                    except Exception:
-                        pass
-                if cleanup:
-                    delete_partial_output(
-                        cleanup["output_file"],
-                        cleanup["output_existed"],
-                        expected_duration=cleanup.get("expected_duration"),
-                    )
-                    temp_dirs = list(cleanup.get("temp_dirs") or [])
-                    if temp_dirs:
-                        remove_temp_dirs(temp_dirs)
-                self._downloads.pop(download_id, None)
-                self._cancel_events.pop(download_id, None)
-                self._pause_events.pop(download_id, None)
-                self._abort_fns.pop(download_id, None)
-                self._cleanup_info.pop(download_id, None)
-                self._worker_params.pop(download_id, None)
-                self._sse_queues.pop(download_id, None)
-                self._db.remove_queue_entry(download_id)
                 return True
+            if download_id in self._worker_params:
+                return True
+            if self._cancel_events.get(download_id):
+                return True
+            return False
+
+    def _force_stop_download(self, download_id: str) -> Optional[dict]:
+        """Cancel worker, run abort hooks, kill tracked ffmpeg. Returns cleanup info."""
+        abort_fns: List[Callable[[], None]] = []
+        cleanup: Optional[dict] = None
+        pp_state = None
+        with self._lock:
+            pause_event = self._pause_events.get(download_id)
+            event = self._cancel_events.get(download_id)
+            if pause_event:
+                pause_event.clear()
+            if event:
+                event.set()
+            abort_fns = list(self._abort_fns.get(download_id, []))
+            raw_cleanup = self._cleanup_info.get(download_id)
+            if raw_cleanup:
+                cleanup = dict(raw_cleanup)
+                pp_state = cleanup.get("pp_state")
+        for fn in abort_fns:
+            try:
+                fn()
+            # ponytail: survival guarantee for arbitrary abort callbacks
+            except Exception:
+                pass
+        kill_pp_state_procs(pp_state)
+        if abort_fns or pp_state:
+            time.sleep(0.35)
+        return cleanup
+
+    def _purge_download_runtime(self, download_id: str) -> None:
+        with self._lock:
+            self._downloads.pop(download_id, None)
+            self._cancel_events.pop(download_id, None)
+            self._pause_events.pop(download_id, None)
+            self._abort_fns.pop(download_id, None)
+            self._cleanup_info.pop(download_id, None)
+            self._worker_params.pop(download_id, None)
+            self._sse_queues.pop(download_id, None)
+
+    def discard_from_queue(self, download_id: str) -> bool:
+        if self._has_active_runtime(download_id):
+            cleanup = self._force_stop_download(download_id)
+            if cleanup:
+                delete_partial_output(
+                    cleanup["output_file"],
+                    cleanup["output_existed"],
+                    expected_duration=cleanup.get("expected_duration"),
+                )
+                temp_dirs = list(cleanup.get("temp_dirs") or [])
+                if temp_dirs:
+                    remove_temp_dirs(temp_dirs)
+            self._purge_download_runtime(download_id)
+            self._db.remove_queue_entry(download_id)
+            return True
         return self.remove_history(download_id)
 
     def remove_history(self, download_id: str) -> bool:
+        cleanup = self._force_stop_download(download_id)
+        if self._has_active_runtime(download_id):
+            if cleanup:
+                delete_partial_output(
+                    cleanup["output_file"],
+                    cleanup["output_existed"],
+                    expected_duration=cleanup.get("expected_duration"),
+                )
+                temp_dirs = list(cleanup.get("temp_dirs") or [])
+                if temp_dirs:
+                    remove_temp_dirs(temp_dirs)
+            self._purge_download_runtime(download_id)
+            self._db.remove_queue_entry(download_id)
         output_file: Optional[str] = None
         status: Optional[str] = None
         cleanup: Optional[dict] = None

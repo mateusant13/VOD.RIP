@@ -15,8 +15,7 @@ import time
 
 import requests
 import yt_dlp
-from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor, FFmpegVideoConvertorPP
-import yt_dlp.postprocessor as _ytdlp_pp_pkg
+from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
 from models.schemas import VideoInfo
 
@@ -216,162 +215,186 @@ def _set_pp_progress_state(pp: FFmpegPostProcessor, state: dict) -> None:
     # without poking the private attribute twice.
     state["pp_lock"] = state_lock
 
-class _InstrumentedFFmpegPP(FFmpegVideoConvertorPP):
-    """``FFmpegVideoConvertorPP`` that surfaces live ffmpeg progress to us.
+def kill_pp_state_procs(pp_state: Optional[dict]) -> None:
+    """Kill every ffmpeg Popen tracked for one download (cancel/remove)."""
+    if not pp_state:
+        return
+    for proc in list(pp_state.get("active_procs") or []):
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    pp_state["active_procs"] = []
 
-    All other behaviour (including the postprocessor arg parsing,
-    ``-movflags +faststart`` injection, and the per-postprocessor
-    ``_configuration_args`` lookup) is inherited unchanged. We only
-    override ``real_run_ffmpeg``.
-    """
+_ORIGINAL_REAL_RUN_FFMPEG = FFmpegPostProcessor.real_run_ffmpeg
 
-    # ``real_run_ffmpeg`` is what every ffmpeg-bound postprocessor in
-    # yt-dlp ultimately calls, so overriding it gives us visibility into
-    # the merge, convert, and audio-extract steps with one change.
-    def real_run_ffmpeg(self, input_path_opts, output_path_opts, *, expected_retcodes=(0,)):
-        import shlex
+def _build_ffmpeg_progress_cmd(
+    executable: str,
+    input_path_opts,
+    output_path_opts,
+) -> list:
+    """ffmpeg argv with ``-progress pipe:2`` for live mux/encode percent."""
+    cmd = [executable, "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:2"]
+    for path, opts in input_path_opts:
+        if not path:
+            continue
+        cmd += ["-i", f"file:{path}"]
+        for opt in (opts or []):
+            cmd += [opt] if isinstance(opt, str) else list(opt)
+    for path, opts in output_path_opts:
+        if not path:
+            continue
+        for opt in (opts or []):
+            cmd += [opt] if isinstance(opt, str) else list(opt)
+        cmd += ["-movflags", "+faststart", path]
+    return cmd
 
-        state = getattr(self, _PP_PROGRESS_STATE_ATTR, None)
-        # No state attached = manager doesn't want our progress events
-        # (e.g. during format-probing or an early test path). Fall back
-        # to the stock behaviour so we never accidentally break callers
-        # that don't opt in.
-        if state is None:
-            return super().real_run_ffmpeg(
-                input_path_opts, output_path_opts,
-                expected_retcodes=expected_retcodes,
-            )
+def _instrumented_real_run_ffmpeg(
+    self,
+    input_path_opts,
+    output_path_opts,
+    *,
+    expected_retcodes=(0,),
+):
+    """Patch all ffmpeg postprocessors (merge, convert, extract) for progress."""
+    import shlex
 
-        self.check_version()
-
-        oldest_mtime = min(
-            os.stat(path).st_mtime for path, _ in input_path_opts if path
+    state = getattr(self, _PP_PROGRESS_STATE_ATTR, None)
+    if state is None:
+        return _ORIGINAL_REAL_RUN_FFMPEG(
+            self, input_path_opts, output_path_opts,
+            expected_retcodes=expected_retcodes,
         )
 
-        cmd = self._build_progress_cmd(input_path_opts, output_path_opts)
-        self.write_debug(f"instrumented ffmpeg command line: {shlex.join(cmd)}")
+    self.check_version()
+    oldest_mtime = min(
+        os.stat(path).st_mtime for path, _ in input_path_opts if path
+    )
+    cmd = _build_ffmpeg_progress_cmd(self.executable, input_path_opts, output_path_opts)
+    self.write_debug(f"instrumented ffmpeg command line: {shlex.join(cmd)}")
 
-        # Total expected duration in microseconds, if we know it. We
-        # compute it once from the input files' probe info (best-effort
-        # via ffprobe below) so the percent math has a real denominator.
-        state_lock = state.get("lock") or state.get("pp_lock")
-        duration_us = state.get("duration_us") or 0
+    state_lock = state.get("lock") or state.get("pp_lock")
+    duration_us = state.get("duration_us") or 0
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                creationflags=_NO_WINDOW,
-            )
-        except FileNotFoundError:
-            return super().real_run_ffmpeg(
-                input_path_opts, output_path_opts,
-                expected_retcodes=expected_retcodes,
-            )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            creationflags=_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return _ORIGINAL_REAL_RUN_FFMPEG(
+            self, input_path_opts, output_path_opts,
+            expected_retcodes=expected_retcodes,
+        )
 
-        _track_ffmpeg_proc(proc)
+    cancel_event = state.get("cancel_event")
+    pause_event = state.get("pause_event")
+    register_abort = state.get("register_abort")
 
-        def _drain_stdout():
-            # Reads ffmpeg's -progress key=value stream, accumulates
-            # the latest ``out_time_ms`` and ``speed`` values, and on
-            # every ``progress=continue`` snapshot updates the
-            # shared state dict for the manager's poller.
-            last_speed = ""
-            last_progress_us = 0
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.strip()
-                if line.startswith("out_time_ms="):
-                    try:
-                        last_progress_us = int(line.split("=", 1)[1])
-                    except ValueError:
-                        pass
-                elif line.startswith("speed="):
-                    raw = line.split("=", 1)[1].strip()
-                    if raw and raw != "N/A":
-                        last_speed = raw
-                elif line.startswith("progress="):
-                    with state_lock:
-                        if duration_us > 0 and last_progress_us > 0:
-                            pct = min(0.99, last_progress_us / duration_us)
-                            state["last_percent"] = pct
-                            state["last_speed"] = last_speed
-                            state["last_eta_seconds"] = (
-                                (duration_us - last_progress_us) / 1_000_000
-                                / max(0.01, _parse_speed_multiplier(last_speed) or 1.0)
-                                if last_speed else None
-                            )
-                            state["last_emit_wall"] = time.monotonic()
-
-        def _drain_stderr():
-            # Swallow ffmpeg's normal log output (we still want it in
-            # the yt-dlp debug log via the original ``Popen.run``-style
-            # write_debug path, but here we just drain to keep the pipe
-            # from blocking).
-            assert proc.stderr is not None
-            for _line in proc.stderr:
+    def _kill_proc() -> None:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
 
-        t_out = threading.Thread(target=_drain_stdout, daemon=True)
-        t_err = threading.Thread(target=_drain_stderr, daemon=True)
-        t_out.start()
-        t_err.start()
+    _track_ffmpeg_proc(proc)
+    state.setdefault("active_procs", []).append(proc)
+    if callable(register_abort):
+        register_abort(_kill_proc)
 
-        # Heartbeat: keep the progress-state dict fresh even when
-        # ffmpeg is silent (e.g. probing large HLS segments). The
-        # manager polls ``last_emit_wall`` to decide whether to show
-        # the user "Muxing 98% (working...)" or freeze.
-        try:
-            retcode = proc.wait()
-        except KeyboardInterrupt:
-            proc.kill()
-            raise
-        finally:
-            _untrack_ffmpeg_proc(proc)
-        t_out.join(timeout=5)
-        t_err.join(timeout=5)
-        if retcode not in expected_retcodes:
-            raise Exception(f"ffmpeg failed (rc={retcode})")
-        for out_path, _ in output_path_opts:
-            if out_path:
-                self.try_utime(out_path, oldest_mtime, oldest_mtime)
-        with state_lock:
-            state["last_percent"] = 0.999
-            state["last_speed"] = ""
-            state["last_eta_seconds"] = 0
-            state["last_emit_wall"] = time.monotonic()
-        return ""
+    def _drain_stdout():
+        last_speed = ""
+        last_progress_us = 0
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    last_progress_us = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("speed="):
+                raw = line.split("=", 1)[1].strip()
+                if raw and raw != "N/A":
+                    last_speed = raw
+            elif line.startswith("progress="):
+                with state_lock:
+                    if duration_us > 0 and last_progress_us > 0:
+                        pct = min(0.99, last_progress_us / duration_us)
+                    elif line.endswith("end"):
+                        pct = 0.999
+                    else:
+                        pct = state.get("last_percent") or 0.0
+                    state["last_percent"] = pct
+                    state["last_speed"] = last_speed
+                    if duration_us > 0 and last_progress_us > 0 and last_speed:
+                        state["last_eta_seconds"] = (
+                            (duration_us - last_progress_us) / 1_000_000
+                            / max(0.01, _parse_speed_multiplier(last_speed) or 1.0)
+                        )
+                    else:
+                        state["last_eta_seconds"] = None
+                    state["last_emit_wall"] = time.monotonic()
 
-    def _build_progress_cmd(
-        self, input_path_opts, output_path_opts,
-    ) -> list:
-        """Build the ffmpeg command with -progress pipe:2 injected.
+    def _drain_stderr():
+        assert proc.stderr is not None
+        for _line in proc.stderr:
+            pass
 
-        We rebuild the command from scratch (instead of mutating the
-        stock ``real_run_ffmpeg`` output) so we can guarantee the
-        ``-progress`` flag sits in a stable position, just after
-        ``-loglevel info`` and ``-nostats``. Input / output options
-        are mirrored from the stock path.
-        """
-        cmd = [self.executable, "-y", "-loglevel", "info",
-               "-nostats", "-progress", "pipe:2"]
-        for path, opts in input_path_opts:
-            if not path:
-                continue
-            cmd += ["-i", f"file:{path}"]
-            for opt in (opts or []):
-                cmd += [opt] if isinstance(opt, str) else list(opt)
-        for path, opts in output_path_opts:
-            if not path:
-                continue
-            for opt in (opts or []):
-                cmd += [opt] if isinstance(opt, str) else list(opt)
-            cmd += ["-movflags", "+faststart", path]
-        return cmd
+    t_out = threading.Thread(target=_drain_stdout, daemon=True)
+    t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+    retcode = 0
+    try:
+        while proc.poll() is None:
+            try:
+                _check_pause_cancel(cancel_event, pause_event)
+            except PausedError:
+                _kill_proc()
+                raise
+            except CancelledError:
+                _kill_proc()
+                raise
+            time.sleep(0.15)
+        retcode = proc.returncode or 0
+    except KeyboardInterrupt:
+        _kill_proc()
+        raise
+    finally:
+        if proc.poll() is None:
+            _kill_proc()
+        _untrack_ffmpeg_proc(proc)
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+    if retcode not in expected_retcodes:
+        raise Exception(f"ffmpeg failed (rc={retcode})")
+    for out_path, _ in output_path_opts:
+        if out_path:
+            self.try_utime(out_path, oldest_mtime, oldest_mtime)
+    with state_lock:
+        state["last_percent"] = 1.0
+        state["last_speed"] = ""
+        state["last_eta_seconds"] = 0
+        state["last_emit_wall"] = time.monotonic()
+    return ""
+
+FFmpegPostProcessor.real_run_ffmpeg = _instrumented_real_run_ffmpeg
+
+def _youtube_remux_by_default(encoder: Optional[str]) -> bool:
+    """YouTube with auto/copy skips H.264 re-encode — merge-only is seconds."""
+    return (encoder or "auto").strip().lower() in ("auto", "copy", "")
+
+assert _youtube_remux_by_default("auto") and not _youtube_remux_by_default("libx264")
 
 def _build_ydl_opts(
     url: str,
@@ -393,6 +416,7 @@ def _build_ydl_opts(
         "noplaylist": True,
         "no_warnings": True,
         "quiet": True,
+        "concurrent_fragment_downloads": 8,
     }
     if not audio_only:
         opts["merge_output_format"] = "mp4"
@@ -454,9 +478,14 @@ def _build_ydl_opts(
                     "phase": "Postprocess", "phase_id": "encoding",
                 })
             elif status == "finished":
+                if pp_state is not None:
+                    lock = pp_state.get("lock") or pp_state.get("pp_lock")
+                    with lock:
+                        pp_state["last_percent"] = 1.0
+                        pp_state["last_emit_wall"] = time.monotonic()
                 progress_hook({
-                    "status": "postprocessing", "percent": 97,
-                    "phase": "Postprocess", "phase_id": "encoding",
+                    "status": "postprocessing", "percent": 99,
+                    "phase": "Finalising", "phase_id": "encoding",
                 })
 
         opts["postprocessor_hooks"] = [_postprocessor_hook]
@@ -475,17 +504,15 @@ def _build_ydl_opts(
             else os.path.dirname(resolved_ffmpeg)
         )
 
-    encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
-    if not audio_only:
-        if encode_args:
-            opts["postprocessors"] = [
-                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-            ]
-            opts["postprocessor_args"] = {"ffmpeg": encode_args}
-        else:
-            opts["postprocessors"] = [
-                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-            ]
+    encoder_setting = (video_encoder or "auto").strip().lower()
+    wants_transcode = not audio_only and encoder_setting not in ("auto", "copy", "")
+    if not audio_only and wants_transcode:
+        encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
+        opts["postprocessors"] = [
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+        ]
+        opts["postprocessor_args"] = {"ffmpeg": encode_args}
+    # ponytail: YouTube auto/copy — merge_output_format mp4 only (no re-encode pass)
 
     if pp_state is not None:
         # Populate the state dict the manager will poll. The total
@@ -593,8 +620,9 @@ def download_video_sync(
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         expected_duration = None
 
-
-
+    trim = _normalize_crop_range(crop_start, crop_end)
+    if trim:
+        expected_duration = trim[1] - trim[0]
 
     opts = _build_ydl_opts(
         full_url, output_path, quality, oauth, progress_hook, cachedir=str(cache_dir),
@@ -607,19 +635,34 @@ def download_video_sync(
         audio_only=audio_only,
     )
 
+    platform = detect_platform(full_url)
+    if (
+        platform == "YouTube"
+        and not audio_only
+        and _youtube_remux_by_default(resolved_encoder)
+        and not opts.get("format")
+    ):
+        # ponytail: remux-only download path — merge with -c copy when codecs allow
+        opts["format"] = "bv*+ba/b"
+
+    if register_abort is not None:
+        register_abort(lambda: kill_pp_state_procs(pp_state))
+
     # The download manager will poll the state dict to synthesise
     # real-time progress events for the postprocess phase. We expose
     # it via the opts dict so the manager can find it without having
     # to know about yt_dlp's internal state.
     opts["_vodrip_pp_state"] = pp_state
 
-    platform = detect_platform(full_url)
     is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url) and not audio_only
 
     # HLS downloads report their own 0→90% progress while segments are
     # fetched and muxed. The yt-dlp postprocessor poller only applies to
     # the direct yt-dlp download path (non-HLS).
     if register_pp_state is not None and not is_hls:
+        pp_state["cancel_event"] = cancel_event
+        pp_state["pause_event"] = pause_event
+        pp_state["register_abort"] = register_abort
         try:
             register_pp_state(pp_state)
         # ponytail: survival guarantee for register_pp_state callback — arbitrary callback
@@ -663,11 +706,3 @@ def download_video_sync(
 
     _verify_output_file(output_path)
     return output_path
-
-
-# Install the instrumented FFmpeg postprocessor at module import time.
-# ponytail: survival guarantee for PP swap — yt-dlp may change the postprocessors registry format in future versions
-if hasattr(_ytdlp_pp_pkg, "postprocessors") and hasattr(_ytdlp_pp_pkg.postprocessors, "value"):
-    _ytdlp_pp_pkg.postprocessors.value["FFmpegVideoConvertorPP"] = _InstrumentedFFmpegPP
-else:
-    logger.warning("yt-dlp postprocessors registry not found — FFmpeg progress instrumentation disabled")

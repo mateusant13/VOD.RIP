@@ -14,6 +14,7 @@ interface DownloadConfirmDialogProps {
   open: boolean;
   title: string;
   message: string;
+  accentColor?: string;
   filenamePlaceholder?: string;
   filename?: string;
   onFilenameChange?: (value: string) => void;
@@ -25,6 +26,7 @@ export default function DownloadConfirmDialog({
   open,
   title,
   message,
+  accentColor = '#53fc18',
   filenamePlaceholder,
   filename,
   onFilenameChange,
@@ -38,7 +40,8 @@ export default function DownloadConfirmDialog({
       onClick={onCancel}
     >
       <div
-        className="bg-zinc-950 border-2 border-white p-5 shadow-[4px_4px_0px_0px_#53fc18] font-mono text-sm flex flex-col gap-3 min-w-[22rem] max-w-[28rem]"
+        className="bg-zinc-950 border-2 border-white p-5 font-mono text-sm flex flex-col gap-3 min-w-[22rem] max-w-[28rem]"
+        style={{ boxShadow: `4px 4px 0px 0px ${accentColor}` }}
         onClick={(e) => e.stopPropagation()}
       >
         <p className="text-zinc-200 text-[10px] font-bold uppercase tracking-widest">
@@ -67,7 +70,8 @@ export default function DownloadConfirmDialog({
           <button
             type="button"
             onClick={onConfirm}
-            className="border-2 border-white bg-white text-black hover:bg-zinc-200 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider shadow-[2px_2px_0px_0px_#53fc18]"
+            className="border-2 border-white bg-white text-black hover:bg-zinc-200 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider"
+            style={{ boxShadow: `2px 2px 0px 0px ${accentColor}` }}
           >
             Yes, download
           </button>

@@ -553,7 +553,9 @@ export const PREVIEW_PANEL_MIN_W = 280;
 export const PREVIEW_PANEL_CHROME_H_EST = 120;
 export const PREVIEW_PANEL_PAD_H = 32;
 export const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
-export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 320, h: 440 };
+export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
+/** Min height when trim UI + action buttons must stay visible. */
+export const URL_ASIDE_TRIM_MIN_H = 414;
 export const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
 export const PANEL_MIN: PanelSize = { w: 200, h: 180 };
 export const VIEWPORT_EDGE_LOCK = 40;

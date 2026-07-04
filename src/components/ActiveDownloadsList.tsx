@@ -60,7 +60,7 @@ function ActiveDownloadsListInner({
           : platformAccentColor(dl.platform);
         const barClass = isResumable || isPaused
           ? 'bg-yellow-500/70'
-          : 'bg-gradient-to-r from-[#53fc18] via-[#9146FF] to-[#E03E3E]';
+          : 'bg-gradient-to-r from-[#53fc18] via-[#9146FF] to-[#EB2828]';
         const dlStatus = dl.status ?? '';
         const firstToken = (dlStatus.split(/\s+/, 1)[0] || '').toLowerCase();
         const phaseId =

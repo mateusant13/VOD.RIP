@@ -43,7 +43,8 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { YOUTUBE_COLOR, platformAccentColor } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { readUiScale } from './uiScale';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -1484,6 +1485,15 @@ export default function App() {
   const applyLayoutPanelClamps = useCallback(() => {
     const layout = layoutBoundsInput();
     const clamped = clampAllLayoutPanels(layout);
+    if (layout.urlPanelAside && videoInfo) {
+      const minTrimH = Math.min(
+        layoutMaxPanelHeight(),
+        Math.round(URL_ASIDE_TRIM_MIN_H * readUiScale()),
+      );
+      if (clamped.urlAside.h < minTrimH) {
+        clamped.urlAside = { ...clamped.urlAside, h: minTrimH };
+      }
+    }
     const nextLayout: LayoutPanelBoundsInput = {
       ...layout,
       preview: clamped.preview,
@@ -1509,14 +1519,14 @@ export default function App() {
     mainPanelSizeRef.current = clamped.main;
     setMainPanelSize(clamped.main);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clamped.main);
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, videoInfo]);
 
   useEffect(() => {
     applyLayoutPanelClamps();
     const onResize = () => applyLayoutPanelClamps();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
+  }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen, videoInfo]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const channelPreview = Boolean(previewChannelBadge);
@@ -2844,7 +2854,7 @@ export default function App() {
               videoInfo.platform?.toLowerCase() === 'kick'
                 ? 'bg-[#53fc18]'
                 : videoInfo.platform?.toLowerCase() === 'youtube'
-                  ? 'bg-[#E03E3E]'
+                  ? 'bg-[#EB2828]'
                   : 'bg-[#9146FF]'
             }`} />
             <div className="w-12 h-9 bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 overflow-hidden">
@@ -2876,7 +2886,7 @@ export default function App() {
                     videoInfo.platform?.toLowerCase() === 'kick'
                       ? 'text-[#53fc18]'
                       : videoInfo.platform?.toLowerCase() === 'youtube'
-                        ? 'text-[#E03E3E]'
+                        ? 'text-[#EB2828]'
                         : 'text-[#9146FF]'
                   } /> {formatBytes(estBytes)}
                 </span>
@@ -2948,7 +2958,7 @@ export default function App() {
                     }
                   }}
                   placeholder="@handle or UC… from channel URL"
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#E03E3E] text-[10px]"
+                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#EB2828] text-[10px]"
                 />
               </label>
               <div className="flex gap-2">
@@ -3119,7 +3129,7 @@ export default function App() {
               onClick={openPreview}
               disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
               title="Open a live stream preview — scrub your trim range before downloading"
-              className={`w-full border-2 font-mono text-[10px] uppercase font-bold py-1.5 flex items-center justify-center gap-1.5 disabled:opacity-40 transition-[transform,box-shadow,background-color,color,border-color] duration-150 ${
+              className={`w-full border-2 font-mono uppercase font-bold py-[clamp(0.3rem,1.5vh,0.625rem)] text-[clamp(9px,calc(10px*var(--ui-scale)),12px)] flex items-center justify-center gap-1.5 disabled:opacity-40 transition-[transform,box-shadow,background-color,color,border-color] duration-150 ${
                 previewOpen
                   ? 'border-white bg-zinc-900 text-white shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)]'
                   : urlPlatform === 'kick'
@@ -3127,7 +3137,7 @@ export default function App() {
                     : urlPlatform === 'twitch'
                       ? 'border-[#9146FF]/70 text-[#9146FF] bg-[#9146FF]/5 hover:border-[#9146FF] hover:bg-[#9146FF]/15 shadow-[2px_2px_0px_0px_#9146FF] hover:shadow-[1px_1px_0px_0px_#9146FF] hover:translate-x-0.5 hover:translate-y-0.5'
                       : urlPlatform === 'youtube'
-                        ? 'border-[#E03E3E]/70 text-[#E03E3E] bg-[#E03E3E]/5 hover:border-[#E03E3E] hover:bg-[#E03E3E]/15 shadow-[2px_2px_0px_0px_#E03E3E] hover:shadow-[1px_1px_0px_0px_#E03E3E] hover:translate-x-0.5 hover:translate-y-0.5'
+                        ? 'border-[#EB2828]/70 text-[#EB2828] bg-[#EB2828]/5 hover:border-[#EB2828] hover:bg-[#EB2828]/15 shadow-[2px_2px_0px_0px_#EB2828] hover:shadow-[1px_1px_0px_0px_#EB2828] hover:translate-x-0.5 hover:translate-y-0.5'
                         : 'border-zinc-500 text-zinc-200 bg-zinc-900/50 hover:border-white hover:text-white shadow-[2px_2px_0px_0px_#52525b] hover:shadow-[1px_1px_0px_0px_#52525b] hover:translate-x-0.5 hover:translate-y-0.5'
               }`}
             >
@@ -3144,13 +3154,13 @@ export default function App() {
           <button
             onClick={promptStartDownload}
             disabled={loading || !videoInfo}
-            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed ${
+            className={`w-full mt-auto shrink-0 border-2 border-white bg-black py-[clamp(0.4rem,2vh,0.5rem)] flex items-center justify-center gap-2 text-[clamp(10px,calc(12px*var(--ui-scale)),14px)] font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed ${
               urlPlatform === 'kick'
                 ? 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
                 : urlPlatform === 'twitch'
                   ? 'shadow-[3px_3px_0px_0px_#9146FF] hover:shadow-[2px_2px_0px_0px_#9146FF] hover:translate-x-0.5 hover:translate-y-0.5'
                   : urlPlatform === 'youtube'
-                    ? 'shadow-[3px_3px_0px_0px_#E03E3E] hover:shadow-[2px_2px_0px_0px_#E03E3E] hover:translate-x-0.5 hover:translate-y-0.5'
+                    ? 'shadow-[3px_3px_0px_0px_#EB2828] hover:shadow-[2px_2px_0px_0px_#EB2828] hover:translate-x-0.5 hover:translate-y-0.5'
                     : 'shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-0.5 hover:translate-y-0.5'
             }`}
           >
@@ -3418,7 +3428,7 @@ export default function App() {
     </div>
   );
 
-  const edgePinnedRow = triplePanelLayout || (splitLayout && previewOpen);
+  const edgePinnedRow = triplePanelLayout;
   const rowEdgeInsets = edgePinnedRow ? layoutRowEdgeInsets() : null;
 
   return (
@@ -3430,14 +3440,16 @@ export default function App() {
       }}
     >
       <div
-        className={`vod-layout-row flex items-start max-w-full min-w-0 ${
-        edgePinnedRow
-          ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-between`
-          : triplePanelLayout
-            ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-center`
-            : splitLayout
-              ? `w-full ${viewportTier === 'narrow' ? 'gap-3' : 'gap-6'} justify-center`
-              : `w-full ${viewportTier === 'wide' ? 'max-w-lg' : 'max-w-md'} justify-center gap-6`
+        className={`vod-layout-row flex items-start max-w-full min-w-0 w-full justify-center ${
+        triplePanelLayout || splitLayout
+          ? viewportTier === 'narrow'
+            ? 'gap-2'
+            : triplePanelLayout
+              ? 'gap-3'
+              : 'gap-6'
+          : viewportTier === 'wide'
+            ? 'max-w-lg gap-6'
+            : 'max-w-md gap-6'
       }`}
         style={rowEdgeInsets ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth } : undefined}
       >
@@ -3619,12 +3631,12 @@ export default function App() {
             </h1>
             {!mainCardHeaderCompact && (
               <p className="text-zinc-400 text-[10px] font-mono tracking-widest uppercase mt-1">
-                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#E03E3E]">YouTube</span> Downloader
+                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#EB2828]">YouTube</span> Downloader
               </p>
             )}
             {triplePanelLayout && !urlMainCompact && (
               <p className="text-zinc-500 text-[9px] font-mono tracking-widest uppercase mt-0.5 truncate">
-                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#E03E3E]">YouTube</span>
+                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#EB2828]">YouTube</span>
               </p>
             )}
           </div>
@@ -3702,7 +3714,7 @@ export default function App() {
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') void commitPendingYoutubeChannelAdd(true);
                   }}
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#E03E3E] text-[10px]"
+                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#EB2828] text-[10px]"
                 />
                 <div className="flex gap-2">
                   <button
@@ -4216,6 +4228,7 @@ export default function App() {
         open={downloadConfirmOpen}
         title={downloadConfirmCopy.title}
         message={downloadConfirmCopy.message}
+        accentColor={platformAccentColor(urlPlatform || activePlatform || 'kick')}
         filenamePlaceholder={
           downloadConfirmCopy.defaultFilename
             ? downloadConfirmCopy.defaultFilename

@@ -31,13 +31,19 @@ def delete_download_output(output_file: str | None) -> bool:
     ]
     removed_main = False
     for candidate in candidates:
-        try:
-            existed = candidate.is_file()
-            candidate.unlink(missing_ok=True)
-            if existed and candidate == path:
-                removed_main = True
-        except OSError as exc:
-            logger.warning("Failed to delete %s: %s", candidate, exc)
+        for attempt in range(6):
+            try:
+                existed = candidate.is_file()
+                candidate.unlink(missing_ok=True)
+                if existed and candidate == path:
+                    removed_main = True
+                break
+            except OSError as exc:
+                if attempt < 5 and getattr(exc, "winerror", None) == 32:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                logger.warning("Failed to delete %s: %s", candidate, exc)
+                break
     return removed_main
 
 
