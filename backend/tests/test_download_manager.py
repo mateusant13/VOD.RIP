@@ -6,6 +6,9 @@ spawning real yt-dlp workers (no network).
 
 from services.download_manager import DownloadManager
 
+_VALID_KICK_VOD = "https://kick.com/realchannel/videos/100000"
+_VALID_TWITCH_VOD = "https://twitch.tv/videos/1000001"
+
 
 def test_download_manager_initial_state():
     """A fresh manager exposes queue and history lists with valid entries.
@@ -30,7 +33,7 @@ def test_start_download_adds_to_active():
     """start_download creates a download id and adds to active list."""
     mgr = DownloadManager(max_workers=2)
     dl_id = mgr.start_download(
-        url="https://kick.com/test/videos/abc-123",
+        url=_VALID_KICK_VOD,
         output_file=r"C:\tmp\test.mp4",
     )
     assert dl_id.startswith("dl_")
@@ -42,7 +45,7 @@ def test_start_download_adds_to_active():
     ours = [d for d in queue if d.download_id == dl_id]
     assert len(ours) == 1
     assert ours[0].status in ("Starting...", "Downloading...")
-    assert ours[0].url == "https://kick.com/test/videos/abc-123"
+    assert ours[0].url == _VALID_KICK_VOD
 
 
 def test_cancel_nonexistent_returns_false():
@@ -55,11 +58,11 @@ def test_cancel_count_equals_active():
     """cancel_all returns a non-negative count (1+ per active download)."""
     mgr = DownloadManager(max_workers=2)
     id1 = mgr.start_download(
-        url="https://kick.com/a/videos/1",
+        url="https://kick.com/realchannel/videos/100001",
         output_file=r"C:\tmp\a.mp4",
     )
     id2 = mgr.start_download(
-        url="https://twitch.tv/b/videos/2",
+        url=_VALID_TWITCH_VOD,
         output_file=r"C:\tmp\b.mp4",
     )
     count = mgr.cancel_all()
@@ -76,7 +79,7 @@ def test_discard_from_queue():
     """discard_from_queue removes an entry from both memory and queue.json."""
     mgr = DownloadManager(max_workers=2)
     dl_id = mgr.start_download(
-        url="https://kick.com/x/videos/123456",
+        url="https://kick.com/realchannel/videos/123456",
         output_file=r"C:\tmp\x.mp4",
     )
     mgr.cancel(dl_id)
@@ -92,7 +95,7 @@ def test_concurrent_start_and_cancel():
     """Starting and cancelling downloads concurrently doesn't deadlock."""
     from concurrent.futures import ThreadPoolExecutor
     mgr = DownloadManager(max_workers=4)
-    urls = [f"https://kick.com/a/videos/{100000 + i}" for i in range(10)]
+    urls = [f"https://kick.com/realchannel/videos/{100000 + i}" for i in range(10)]
     ids = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
@@ -118,7 +121,7 @@ def test_concurrent_start_and_cancel():
 def test_cancel_all_idempotent():
     """Calling cancel_all twice in a row doesn't error."""
     mgr = DownloadManager(max_workers=2)
-    mgr.start_download(url="https://kick.com/a/videos/100001", output_file=r"C:\tmp\a.mp4")
+    mgr.start_download(url="https://kick.com/realchannel/videos/100001", output_file=r"C:\tmp\a.mp4")
     count1 = mgr.cancel_all()
     count2 = mgr.cancel_all()
     assert count1 >= 0

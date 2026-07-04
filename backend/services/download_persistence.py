@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import tempfile
 import threading
 import time
@@ -22,44 +21,12 @@ from services.download_utils import (
     _QUEUE_PERSIST_INTERVAL,
 )
 from services.settings import _get_appdata_dir
+from services.url_validation import is_sensible_vod_url
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
 
 logger = logging.getLogger(__name__)
-
-
-# ponytail: minimum plausible VOD id length to filter test/junk URLs from history
-_KICK_VOD_ID_MIN = 100_000
-_TWITCH_VOD_PREFIX = "v"
-
-def _is_sensible_vod_url(url: str) -> bool:
-    """Return False for obviously bogus VOD/clip URLs (test URLs, single-digit ids).
-
-    Valid Kick VOD:  https://kick.com/{channel}/videos/{id}       (id >= 100_000)
-    Valid Kick clip: https://kick.com/{channel}/clips/{id}
-    Valid Twitch:    https://www.twitch.tv/videos/{id}            (id >= 1_000_000)
-    Valid Twitch clip: https://clips.twitch.tv/{id}
-    """
-    if not url or not isinstance(url, str):
-        return False
-    lower = url.lower().strip()
-    if "kick.com" in lower:
-        m = re.search(r"/videos/(\d+)", lower)
-        if m:
-            return int(m.group(1)) >= _KICK_VOD_ID_MIN
-        # Kick clips always OK (short clip ids are normal)
-        if "/clips/" in lower:
-            return True
-        # Unknown format — allow through
-        return True
-    if "twitch.tv" in lower or "clips.twitch.tv" in lower:
-        m = re.search(r"/videos/(\d+)", lower)
-        if m:
-            return int(m.group(1)) >= 1_000_000
-        return True
-    # Non-platform URLs — allow through
-    return True
 
 
 class DownloadPersistence:
@@ -76,23 +43,27 @@ class DownloadPersistence:
         self._queue_file = self._history_dir / "queue.json"
         self._history_lock = threading.Lock()
         self._queue_lock = threading.Lock()
-        self._history: List[dict] = self._load_history()
-        self._queue: List[dict] = self._load_queue()
+        self._history, history_dirty = self._load_history()
+        self._queue, queue_dirty = self._load_queue()
         self._queue_last_persist: Dict[str, float] = {}
+        if history_dirty:
+            self._save_history()
+        if queue_dirty:
+            self._save_queue()
         self._reconcile_queue_on_startup()
 
     # ------------------------------------------------------------------
     # History persistence
     # ------------------------------------------------------------------
 
-    def _load_history(self) -> List[dict]:
-        """Load persisted history from disk. Corrupt or missing file -> []."""
+    def _load_history(self) -> tuple[List[dict], bool]:
+        """Load persisted history from disk. Corrupt or missing file -> ([], False)."""
         try:
             if not self._history_file.is_file():
-                return []
+                return [], False
             data = json.loads(self._history_file.read_text(encoding="utf-8"))
             if not isinstance(data, list):
-                return []
+                return [], False
             valid: List[dict] = []
             for entry in data:
                 if not isinstance(entry, dict):
@@ -102,11 +73,20 @@ class DownloadPersistence:
                 if entry.get("status") not in _DONE_STATUSES:
                     entry["status"] = "Cancelled"
                 valid.append(entry)
-            return valid[:_HISTORY_MAX_ENTRIES]
+            filtered = [
+                e for e in valid if is_sensible_vod_url(e.get("url", ""))
+            ]
+            dirty = len(filtered) < len(valid)
+            if dirty:
+                logger.info(
+                    "Dropped %d invalid history entries on load",
+                    len(valid) - len(filtered),
+                )
+            return filtered[:_HISTORY_MAX_ENTRIES], dirty
         # ponytail: I/O + JSON decode errors only
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
             logger.exception("Failed to load download history; starting empty")
-            return []
+            return [], False
 
     def _save_history(self) -> None:
         with self._history_lock:
@@ -140,7 +120,7 @@ class DownloadPersistence:
         if state.status not in _DONE_STATUSES:
             return
         # ponytail: skip junk URLs that slipped into downloads (test VODs, single-digit ids)
-        if not _is_sensible_vod_url(state.url):
+        if not is_sensible_vod_url(state.url):
             logger.info("Skipping history entry for non-sensible URL: %s", state.url[:80])
             return
         payload = state.model_dump(mode="json")
@@ -167,13 +147,13 @@ class DownloadPersistence:
     # Queue persistence
     # ------------------------------------------------------------------
 
-    def _load_queue(self) -> List[dict]:
+    def _load_queue(self) -> tuple[List[dict], bool]:
         try:
             if not self._queue_file.is_file():
-                return []
+                return [], False
             data = json.loads(self._queue_file.read_text(encoding="utf-8"))
             if not isinstance(data, list):
-                return []
+                return [], False
             valid: List[dict] = []
             for entry in data:
                 if not isinstance(entry, dict):
@@ -181,11 +161,20 @@ class DownloadPersistence:
                 if "download_id" not in entry or "url" not in entry:
                     continue
                 valid.append(entry)
-            return valid[:_HISTORY_MAX_ENTRIES]
+            filtered = [
+                e for e in valid if is_sensible_vod_url(e.get("url", ""))
+            ]
+            dirty = len(filtered) < len(valid)
+            if dirty:
+                logger.info(
+                    "Dropped %d invalid queue entries on load",
+                    len(valid) - len(filtered),
+                )
+            return filtered[:_HISTORY_MAX_ENTRIES], dirty
         # ponytail: I/O + JSON decode errors only
         except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
             logger.exception("Failed to load download queue; starting empty")
-            return []
+            return [], False
 
     def _save_queue(self) -> None:
         with self._queue_lock:
@@ -233,7 +222,7 @@ class DownloadPersistence:
         if state.status == "Completed":
             return
         # ponytail: skip junk URLs that slipped into the queue
-        if not _is_sensible_vod_url(state.url):
+        if not is_sensible_vod_url(state.url):
             logger.info("Skipping queue entry for non-sensible URL: %s", state.url[:80])
             return
         payload = state.model_dump(mode="json")

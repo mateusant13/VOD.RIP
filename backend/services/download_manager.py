@@ -17,6 +17,7 @@ from models.schemas import DownloadState
 from services import ytdlp_service
 from services.download_cleanup import delete_partial_output, remove_temp_dirs
 from services.download_persistence import DownloadPersistence
+from services.url_validation import is_sensible_vod_url
 from services.download_utils import (
     DOWNLOAD_PROGRESS_CAP,
     POSTPROCESS_PROGRESS_FLOOR,
@@ -717,11 +718,17 @@ class DownloadManager:
 
         # Split recent into resumable vs completed so the UI can show
         # a "Recent" section with Resume buttons and a "Completed" section.
-        recent_unfinished = [d for d in recent_history if d.status in _UNFINISHED_STATUSES]
-        completed_history = [d for d in recent_history if d.status == "Completed"]
+        recent_unfinished = [
+            d for d in recent_history
+            if d.status in _UNFINISHED_STATUSES and is_sensible_vod_url(d.url)
+        ]
+        completed_history = [
+            d for d in recent_history
+            if d.status == "Completed" and is_sensible_vod_url(d.url)
+        ]
 
         return {
-            "queue": deduped_queue,
+            "queue": [d for d in deduped_queue if is_sensible_vod_url(d.url)],
             "recent": recent_unfinished,
             "history": completed_history,
         }

@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from models.schemas import DownloadRequest
 
 from deps import download_mgr, settings_mgr, INFO_EXECUTOR
+from services.url_validation import is_sensible_vod_url
 from services.ytdlp_service import detect_platform
 from utils import (
     build_clip_output_path,
@@ -72,17 +73,29 @@ def _validate_download_url(url: str) -> str:
         if parsed.scheme not in ("http", "https"):
             raise HTTPException(status_code=400, detail="URL must be http or https")
         host = parsed.netloc.lower()
-        # Kick
         if host in ("kick.com", "www.kick.com") or host.endswith(".kick.com"):
+            if not is_sensible_vod_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Kick URL — use /videos/{id} (numeric >= 100,000 or UUID) or /clips/",
+                )
             return "Kick"
-        # Twitch
         if host in ("twitch.tv", "www.twitch.tv", "clips.twitch.tv") or host.endswith(".twitch.tv"):
+            if not is_sensible_vod_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Twitch URL — VOD id must be numeric >= 1,000,000 or a clip URL",
+                )
             return "Twitch"
-        # UUID (Kick VOD ID) or numeric (Twitch VOD ID)
         path = parsed.path.strip("/")
         if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", path):
             return "Kick"
         if re.match(r"^\d+$", path):
+            if not is_sensible_vod_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Twitch URL — VOD id must be numeric >= 1,000,000",
+                )
             return "Twitch"
     except HTTPException:
         raise
