@@ -218,16 +218,26 @@ export default function QueueTab({
               <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
                 <div className="flex justify-between items-center gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    {onToggleHistorySelection && (
-                      <input
-                        type="checkbox"
-                        checked={!!checked}
-                        onChange={() => onToggleHistorySelection(dl.download_id)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="accent-[#53fc18] shrink-0"
-                      />
+                    {onToggleHistorySelection ? (
+                      <label
+                        className="flex items-center gap-2 shrink-0 cursor-pointer"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onToggleHistorySelection(dl.download_id);
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!checked}
+                          readOnly
+                          tabIndex={-1}
+                          className="accent-[#53fc18] shrink-0 pointer-events-none"
+                        />
+                        <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
+                      </label>
+                    ) : (
+                      <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                     )}
-                    <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                     <span className="text-xs font-mono text-zinc-300 truncate">
                       {dl.title || dl.url}
                     </span>
