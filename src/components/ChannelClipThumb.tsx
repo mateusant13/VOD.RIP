@@ -20,7 +20,10 @@ interface ChannelVideo {
 
 export default function ChannelClipThumb({ video }: { video: ChannelVideo }): ReactNode {
   const [failed, setFailed] = useState(false);
-  const src = resolveVideoThumbnail(video.thumbnail_url);
+  let src = resolveVideoThumbnail(video.thumbnail_url);
+  if (!src && video.platform === 'YouTube' && video.id) {
+    src = `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`;
+  }
   if (!src || failed) {
     return (
       <div

@@ -53,6 +53,11 @@ _ALLOWED_HOST_SUFFIXES = (
     "fastly.net",
     "llnwi.net",
     "edgecastcdn.net",
+    "googlevideo.com",
+    "googleusercontent.com",
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
 )
 
 _URI_IN_TAG = re.compile(r'URI="([^"]+)"')
@@ -501,6 +506,49 @@ def resolve_stream_info(
         if not chosen_url:
             raise RuntimeError("Twitch clip has no progressive URL")
         return chosen_url, headers, platform, variants, "progressive"
+
+    if platform == "YouTube":
+        opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+        info = _extract_hls_info(full_url, opts)
+        headers = info.get("http_headers") or {
+            "Referer": "https://www.youtube.com/",
+            "Origin": "https://www.youtube.com",
+        }
+        progressive = _deduped_progressive_variants(info)
+        if not progressive:
+            # ponytail: YouTube DASH — pick any https video format with a direct URL
+            for fmt in sorted(
+                info.get("formats") or [],
+                key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
+                reverse=True,
+            ):
+                if (fmt.get("vcodec") or "none") == "none":
+                    continue
+                stream_url = fmt.get("url") or ""
+                if not stream_url:
+                    continue
+                proto = (fmt.get("protocol") or "").lower()
+                if "m3u8" in proto or "dash" in proto:
+                    continue
+                progressive = [fmt]
+                break
+        if progressive:
+            chosen_url = _pick_variant_by_height(
+                [(int(v.get("height") or 0), v.get("url") or "") for v in progressive],
+                prefer_height=prefer_height,
+            )
+            if chosen_url:
+                return chosen_url, headers, platform, progressive, "progressive"
+        hls_variants = _deduped_hls_variants(info)
+        if hls_variants:
+            first = hls_variants[0]
+            stream_url = first.get("url") or ""
+            if stream_url:
+                return stream_url, headers, platform, hls_variants, "hls"
+        direct = info.get("url") or ""
+        if direct:
+            return direct, headers, platform, [], "progressive"
+        raise RuntimeError("YouTube video has no playable stream URL")
 
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)

@@ -1,5 +1,6 @@
 import { memo, type ReactNode } from 'react';
 import { FolderOpen, Pause, Play, StopCircle, Trash2 } from 'lucide-react';
+import { platformAccentColor } from '../platformColors';
 
 export type ActiveDownloadRow = {
   download_id: string;
@@ -52,12 +53,14 @@ function ActiveDownloadsListInner({
   return (
     <>
       {downloads.map((dl) => {
-        const isTw = dl.platform === 'Twitch';
         const isResumable = RESUMABLE_STATUSES.has(dl.status);
         const isPaused = dl.status === 'Paused';
         const color = isResumable
           ? (dl.status === 'Failed' ? '#f87171' : '#fbbf24')
-          : (isTw ? '#9146FF' : '#53fc18');
+          : platformAccentColor(dl.platform);
+        const barClass = isResumable || isPaused
+          ? 'bg-yellow-500/70'
+          : 'bg-gradient-to-r from-[#53fc18] via-[#9146FF] to-[#E03E3E]';
         const dlStatus = dl.status ?? '';
         const firstToken = (dlStatus.split(/\s+/, 1)[0] || '').toLowerCase();
         const phaseId =
@@ -114,11 +117,7 @@ function ActiveDownloadsListInner({
             </div>
             <div className="w-full h-2 bg-zinc-800 border border-zinc-700 relative overflow-hidden">
               <div
-                className={`h-full transition-all duration-300 ${
-                  isResumable || isPaused
-                    ? 'bg-yellow-500/70'
-                    : 'bg-gradient-to-r from-[#53fc18] to-[#9146FF]'
-                }`}
+                className={`h-full transition-all duration-300 ${barClass}`}
                 style={{ width: `${Math.max(dl.progress, dl.status === 'Starting...' ? 2 : 0)}%` }}
               />
               {isFinalising && (

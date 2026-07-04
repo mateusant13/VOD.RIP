@@ -33,6 +33,9 @@ async def info_video(id: str):
         loop = asyncio.get_running_loop()
         if "kick.com" in lowered:
             return await loop.run_in_executor(INFO_EXECUTOR, kick_get_video_info_sync, id)
+        if "youtube.com" in lowered or "youtu.be" in lowered:
+            info = await get_video_info(id)
+            return info
         if "twitch.tv" in lowered or re.search(r"^\d+$", id.strip()):
             return await loop.run_in_executor(INFO_EXECUTOR, twitch_get_video_info_sync, id)
         info = await get_video_info(id)

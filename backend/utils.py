@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -166,7 +167,8 @@ def build_output_path(req, opts, meta: dict) -> str:
         if tag:
             stem = f"{stem} [{tag}]"
     stem = sanitize_filename_component(stem, fallback="video")
-    return str(base / f"{stem}.mp4")
+    ext = "mp3" if getattr(req, "audio_only", False) else "mp4"
+    return str(base / f"{stem}.{ext}")
 
 
 def build_clip_output_path(req, opts, meta: dict) -> str:
@@ -214,6 +216,47 @@ def allow_foreground() -> None:
         pass
 
 
+def _explorer_title_matches(title: str, needles: set[str]) -> bool:
+    """Match Explorer window titles (localized suffixes, file/folder names)."""
+    tv = (title or "").lower()
+    if not tv:
+        return False
+    for n in needles:
+        if not n:
+            continue
+        if tv == n or tv.startswith(f"{n} -") or tv.startswith(n) or n in tv:
+            return True
+    return False
+
+
+assert _explorer_title_matches("Downloads - File Explorer", {"downloads"})
+assert _explorer_title_matches("clip.mp4 - Explorador de Arquivos", {"clip.mp4"})
+assert not _explorer_title_matches("File Explorer", {"missing"})
+
+
+def _topmost_explorer_hwnd(user32, ctypes, wintypes) -> int:
+    """First visible top-level Explorer folder window (EnumWindows z-order)."""
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    GW_OWNER = 4
+    found: list[int] = []
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        if user32.GetClassNameW(hwnd, cls, 256) == 0:
+            return True
+        if cls.value not in ("CabinetWClass", "ExploreWClass"):
+            return True
+        if user32.GetWindow(hwnd, GW_OWNER):
+            return True
+        found.append(hwnd)
+        return False
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return found[0] if found else 0
+
+
 def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> bool:
     """Bring the Explorer window showing folder_path to the foreground."""
     if os.name != "nt":
@@ -236,14 +279,6 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
         needles: set[str] = {folder_base}
         if item_name:
             needles.add(os.path.normcase(item_name).lower())
-        def _title_matches(tv: str) -> bool:
-            tv = tv.lower()
-            for n in needles:
-                if not n:
-                    continue
-                if tv == n or tv.startswith(f"{n} -") or tv.startswith(n):
-                    return True
-            return False
         captured: list[int] = []
         def _cb(hwnd, _lparam):
             if captured:
@@ -261,17 +296,21 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
             n = user32.GetWindowTextW(hwnd, title, 512)
             if n <= 0:
                 return True
-            if _title_matches(title.value):
+            if _explorer_title_matches(title.value, needles):
                 captured.append(hwnd)
                 return False
             return True
         user32.EnumWindows(WNDENUMPROC(_cb), 0)
-        hwnd = captured[0] if captured else 0
+        hwnd = captured[0] if captured else _topmost_explorer_hwnd(user32, ctypes, wintypes)
         if not hwnd:
             return False
         root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
         try:
             user32.AllowSetForegroundWindow(ASFW_ANY)
+            explorer_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(root, ctypes.byref(explorer_pid))
+            if explorer_pid.value:
+                user32.AllowSetForegroundWindow(explorer_pid.value)
         except Exception:
         # ponytail: ctypes/Win32 API errors only — best-effort foreground focus
             pass
@@ -340,6 +379,21 @@ def nudge_explorer_foreground(
             return
         if i + 1 < attempts and delay > 0:
             time.sleep(delay)
+
+
+def _schedule_explorer_foreground(folder_path: str, item_name: Optional[str] = None) -> None:
+    """Focus Explorer now and again after the WebView steals focus back."""
+    nudge_explorer_foreground(folder_path, item_name, attempts=20, delay=0.1)
+
+    def _delayed() -> None:
+        # ponytail: pywebview refocuses after the click handler — retry focus
+        for wait in (0.35, 0.55):
+            time.sleep(wait)
+            if focus_explorer_window(folder_path, item_name):
+                return
+            nudge_explorer_foreground(folder_path, item_name, attempts=8, delay=0.08)
+
+    threading.Thread(target=_delayed, daemon=True, name="explorer-focus").start()
 
 
 def ensure_shell_com() -> bool:
@@ -423,9 +477,7 @@ def reveal_path_windows(target: str) -> None:
         else:
             return
     if shell_reveal_via_pidl(reveal_target):
-        # ponytail: SHOpenFolderAndSelectItems is async — Explorer may not
-        # have created the window yet.  Retry for up to 2 seconds.
-        nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
+        _schedule_explorer_foreground(folder, item)
         return
     if item and os.path.isfile(abspath):
         subprocess.Popen(
@@ -437,7 +489,7 @@ def reveal_path_windows(target: str) -> None:
             ["explorer.exe", folder],
             creationflags=_NO_WINDOW,
         )
-    nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
+    _schedule_explorer_foreground(folder, item)
 
 
 def open_folder_sync(path: str) -> None:
@@ -527,6 +579,13 @@ def resolve_channel_slug(raw: str) -> str:
     elif platform_hint == "Kick":
         m = re.search(r"kick\.com/([a-zA-Z0-9_]+)", raw)
         channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
+    elif platform_hint == "YouTube":
+        m = re.search(r"youtube\.com/@([^/?#]+)", raw, re.I)
+        if m:
+            channel = m.group(1)
+        else:
+            m = re.search(r"youtube\.com/channel/([^/?#]+)", raw, re.I)
+            channel = m.group(1) if m else raw.strip().rstrip("/").split("/")[-1]
     else:
         channel = raw.strip().rstrip("/").split("/")[-1] or raw.strip()
         if channel.startswith(("http://", "https://")):

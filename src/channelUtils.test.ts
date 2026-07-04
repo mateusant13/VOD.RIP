@@ -10,9 +10,12 @@ import {
   mergeClipLists,
   channelClipsMissing,
   channelVodsMissing,
+  channelStreamsMissing,
   buildVodUrl,
   slugFromVideoUrl,
+  youtubeSlugFromChannelUrl,
   isChannelAlreadySaved,
+  deriveChannelDisplayName,
   resolveVideoThumbnail,
   findCachedVideoThumbnail,
 } from './channelUtils';
@@ -226,12 +229,30 @@ describe('buildVodUrl', () => {
 describe('slugFromVideoUrl', () => {
   it('extracts Kick slug from VOD URL', () => {
     const s = slugFromVideoUrl('https://kick.com/xqc/videos/abc', 'kick');
-    expect(s).toEqual({ kickSlug: 'xqc', twitchSlug: 'xqc' });
+    expect(s).toEqual({ kickSlug: 'xqc', twitchSlug: 'xqc', youtubeSlug: 'xqc' });
   });
 
   it('uses channel login for Twitch /videos/ URLs', () => {
-    const s = slugFromVideoUrl('https://twitch.tv/videos/1', 'twitch', 'Display', 'login');
-    expect(s.twitchSlug).toBe('login');
+    const s = slugFromVideoUrl('https://twitch.tv/videos/1', 'twitch', 'Display', 'cellbit');
+    expect(s).toEqual({ kickSlug: 'cellbit', twitchSlug: 'cellbit', youtubeSlug: 'cellbit' });
+  });
+
+  it('extracts YouTube handle from watch URL metadata', () => {
+    const s = slugFromVideoUrl('https://youtube.com/watch?v=abc', 'youtube', 'Cellbit', 'cellbit');
+    expect(s.youtubeSlug).toBe('cellbit');
+  });
+});
+
+describe('deriveChannelDisplayName', () => {
+  it('returns single slug when only one platform', () => {
+    expect(deriveChannelDisplayName('cellbit', '', '')).toBe('cellbit');
+    expect(deriveChannelDisplayName('', 'xqc', '')).toBe('xqc');
+    expect(deriveChannelDisplayName('', '', 'mkbhd')).toBe('mkbhd');
+  });
+
+  it('joins different slugs without duplicates', () => {
+    expect(deriveChannelDisplayName('xqc', 'cellbit', '')).toBe('cellbit / xqc');
+    expect(deriveChannelDisplayName('cellbit', 'cellbit', 'cellbit')).toBe('cellbit');
   });
 });
 
@@ -273,6 +294,7 @@ describe('isChannelAlreadySaved', () => {
     displayName: 'F',
     kickSlug: 'Foo',
     twitchSlug: 'bar',
+    youtubeSlug: '',
     vodVideos: [],
     clipVideos: [],
     updatedAt: '',
@@ -284,5 +306,39 @@ describe('isChannelAlreadySaved', () => {
 
   it('returns false for unknown slug', () => {
     expect(isChannelAlreadySaved('other', '', channels)).toBe(false);
+  });
+});
+
+describe('youtubeSlugFromChannelUrl', () => {
+  it('parses @handle, /channel/UC, and /c/ URLs', () => {
+    expect(youtubeSlugFromChannelUrl('https://youtube.com/@LinusTechTips')).toBe('LinusTechTips');
+    expect(youtubeSlugFromChannelUrl('https://youtube.com/channel/UC1234567890')).toBe('UC1234567890');
+    expect(youtubeSlugFromChannelUrl('https://youtube.com/c/LinusTechTips/videos')).toBe('LinusTechTips');
+  });
+
+  it('ignores watch URLs', () => {
+    expect(youtubeSlugFromChannelUrl('https://www.youtube.com/watch?v=dQw4w9WgXcQ')).toBe('');
+  });
+});
+
+describe('channelStreamsMissing', () => {
+  const base: SavedChannel = {
+    id: '1',
+    displayName: 'yt',
+    kickSlug: '',
+    twitchSlug: '',
+    youtubeSlug: 'UCtest',
+    vodVideos: [],
+    clipVideos: [],
+    updatedAt: '',
+    streamsFetched: true,
+  };
+
+  it('stops refetching after streamsFetched even when list is empty', () => {
+    expect(channelStreamsMissing(base, true)).toBe(false);
+  });
+
+  it('requests fetch before streamsFetched', () => {
+    expect(channelStreamsMissing({ ...base, streamsFetched: false }, true)).toBe(true);
   });
 });

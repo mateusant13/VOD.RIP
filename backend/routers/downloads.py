@@ -99,11 +99,18 @@ def _validate_download_url(url: str) -> str:
                     detail="Invalid Twitch URL — VOD id must be numeric >= 1,000,000",
                 )
             return "Twitch"
+        if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com") or host == "youtu.be":
+            if not is_sensible_vod_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid YouTube URL — use watch, shorts, or youtu.be links",
+                )
+            return "YouTube"
     except HTTPException:
         raise
     except Exception:
         pass
-    raise HTTPException(status_code=400, detail="Unsupported URL — only Kick and Twitch URLs are accepted")
+    raise HTTPException(status_code=400, detail="Unsupported URL — only Kick, Twitch, and YouTube URLs are accepted")
 
 
 @router.post("/api/download/video")
@@ -136,6 +143,8 @@ async def download_video(req: DownloadRequest):
         crop_start=req.crop_start,
         crop_end=req.crop_end,
         download_func=download_func,
+        download_type="audio" if req.audio_only else "video",
+        audio_only=req.audio_only,
         settings_mgr=settings_mgr,
         title=meta.get("title"),
         channel=meta.get("channel"),

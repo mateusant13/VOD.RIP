@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import PlatformVodIcon from "./PlatformVodIcon";
 
-// Mock image imports (vite handles these as strings)
 vi.mock("@/assets/platforms/kick.ico", () => ({ default: "kick.ico" }));
 vi.mock("@/assets/platforms/twitch.png", () => ({ default: "twitch.png" }));
 
@@ -21,9 +20,8 @@ describe("PlatformVodIcon", () => {
     expect(img).toHaveAttribute("src", "kick.ico");
   });
 
-  it("renders Kick icon for unknown platform", () => {
+  it("renders YouTube icon for YouTube platform", () => {
     render(<PlatformVodIcon platform="YouTube" />);
-    const img = screen.getByAltText("Kick");
-    expect(img).toBeInTheDocument();
+    expect(screen.getByLabelText("YouTube")).toBeInTheDocument();
   });
 });

@@ -75,6 +75,8 @@ def is_clip_url(url: str) -> bool:
 
 def detect_platform(url: str) -> str:
     host = _hostname_from_url(url)
+    if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com") or host == "youtu.be":
+        return "YouTube"
     if host in ("clips.twitch.tv", "twitch.tv", "www.twitch.tv") or host.endswith(".twitch.tv"):
         return "Twitch"
     if host in ("kick.com", "www.kick.com") or host.endswith(".kick.com"):
@@ -97,6 +99,8 @@ def build_url(id_or_url: str, platform: Optional[str] = None) -> str:
         if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", id_or_url):
             return f"https://kick.com/video/{id_or_url}"
         return f"https://kick.com/{id_or_url}/videos"
+    if detected == "YouTube" and id_or_url.startswith("http"):
+        return id_or_url
     return id_or_url
 
 def _qualities_from_formats(formats: list, is_clip: bool = False) -> list[str]:
@@ -178,6 +182,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         "duration": info.get("duration"),
         "duration_string": info.get("duration_string"),
         "uploader": info.get("uploader"),
+        "channel": info.get("channel") or info.get("channel_id") or info.get("uploader"),
         "thumbnail": info.get("thumbnail"),
         "webpage_url": info.get("webpage_url"),
         "extractor": info.get("extractor"),
@@ -381,21 +386,30 @@ def _build_ydl_opts(
     video_encoder: Optional[str] = None,
     pp_state: Optional[dict] = None,
     expected_duration: Optional[float] = None,
+    audio_only: bool = False,
 ) -> dict:
     opts = {
         "outtmpl": output_path,
-        "merge_output_format": "mp4",
         "noplaylist": True,
         "no_warnings": True,
         "quiet": True,
     }
+    if not audio_only:
+        opts["merge_output_format"] = "mp4"
 
     if cachedir:
         opts["cachedir"] = cachedir
 
     # UI default is "source" — not a valid yt-dlp format id; omit so HLS clip
     # extraction picks the best m3u8 variant (same as test_downloads.py).
-    if quality and quality.lower() != "source":
+    if audio_only:
+        opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    elif quality and quality.lower() != "source":
         m = re.search(r"(\d+)p?", quality)
         if m:
             height = m.group(1)
@@ -462,22 +476,16 @@ def _build_ydl_opts(
         )
 
     encode_args = ffmpeg_h264_encode_args(resolve_video_encoder(video_encoder))
-    # The postprocessor swap (FFmpegVideoConvertor -> _InstrumentedFFmpegPP)
-    # is performed once at module import time (see the bottom of this
-    # file). This process is single-tenant for yt-dlp, so a process-wide
-    # swap is safe and avoids the overhead of mutating a global dict on
-    # every download.
-    if encode_args:
-        opts["postprocessors"] = [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-        ]
-        opts["postprocessor_args"] = {"ffmpeg": encode_args}
-    else:
-        # No re-encode requested: still want real progress through the
-        # internal merge (bestvideo + bestaudio mux).
-        opts["postprocessors"] = [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-        ]
+    if not audio_only:
+        if encode_args:
+            opts["postprocessors"] = [
+                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+            ]
+            opts["postprocessor_args"] = {"ffmpeg": encode_args}
+        else:
+            opts["postprocessors"] = [
+                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+            ]
 
     if pp_state is not None:
         # Populate the state dict the manager will poll. The total
@@ -536,6 +544,7 @@ def download_video_sync(
     register_temp_dir: Optional[Callable[[str], None]] = None,
     video_encoder: Optional[str] = None,
     register_pp_state: Optional[Callable[[dict], None]] = None,
+    audio_only: bool = False,
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
@@ -595,6 +604,7 @@ def download_video_sync(
         video_encoder=resolved_encoder,
         pp_state=pp_state,
         expected_duration=expected_duration,
+        audio_only=audio_only,
     )
 
     # The download manager will poll the state dict to synthesise
@@ -604,7 +614,7 @@ def download_video_sync(
     opts["_vodrip_pp_state"] = pp_state
 
     platform = detect_platform(full_url)
-    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url)
+    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url) and not audio_only
 
     # HLS downloads report their own 0→90% progress while segments are
     # fetched and muxed. The yt-dlp postprocessor poller only applies to

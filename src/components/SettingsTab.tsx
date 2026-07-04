@@ -72,9 +72,6 @@ export default function SettingsTab({
             className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
         </div>
       </div>
-      <p className="text-[9px] font-mono text-zinc-600 leading-snug">
-        Kick/Twitch VODs: remux when already H.264/AAC; GPU transcode when needed.
-      </p>
 
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
         <span>v{appVersion ?? '…'}</span>

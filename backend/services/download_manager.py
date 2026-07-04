@@ -65,6 +65,7 @@ class DownloadManager:
         crop_start: Optional[float] = None,
         crop_end: Optional[float] = None,
         download_type: str = "video",
+        audio_only: bool = False,
         download_func: Optional[Callable[..., str]] = None,
         settings_mgr: Optional["SettingsManager"] = None,
         title: Optional[str] = None,
@@ -108,6 +109,7 @@ class DownloadManager:
             "crop_start": crop_start,
             "crop_end": crop_end,
             "download_type": download_type,
+            "audio_only": audio_only,
             "download_func": download_func,
             "settings_mgr": settings_mgr,
             "title": title,
@@ -385,6 +387,7 @@ class DownloadManager:
                         register_abort=_register_abort,
                         register_temp_dir=_register_temp_dir,
                         register_pp_state=_register_pp_state,
+                        audio_only=bool(params.get("audio_only")),
                     )
 
                 if cancel_event.is_set():

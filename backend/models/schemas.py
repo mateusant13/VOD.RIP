@@ -27,6 +27,7 @@ class DownloadRequest(BaseModel):
     oauth: Optional[str] = None
     crop_start: Optional[float] = None
     crop_end: Optional[float] = None
+    audio_only: bool = False
 
 
 class DownloadState(BaseModel):
@@ -75,6 +76,7 @@ class AppSettings(BaseModel):
     saved_channels: Optional[List[Dict[str, Any]]] = None
     channel_kick_enabled: bool = True
     channel_twitch_enabled: bool = True
+    channel_youtube_enabled: bool = True
     channel_content_filter: str = "vods"
 
 
@@ -94,6 +96,7 @@ class SettingsUpdate(BaseModel):
     saved_channels: Optional[List[Dict[str, Any]]] = None
     channel_kick_enabled: Optional[bool] = None
     channel_twitch_enabled: Optional[bool] = None
+    channel_youtube_enabled: Optional[bool] = None
     channel_content_filter: Optional[str] = None
     mp4_faststart: Optional[bool] = None
 

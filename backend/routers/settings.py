@@ -105,7 +105,8 @@ async def open_folder(req: OpenFolderRequest):
         raise HTTPException(status_code=400, detail="path is required")
     validated = validate_open_folder_path(raw, settings_mgr)
     try:
-        open_folder_sync(validated)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(OS_EXECUTOR, open_folder_sync, validated)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:

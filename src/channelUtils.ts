@@ -12,10 +12,11 @@ export function bestAvailableQuality(info: VideoInfo): string {
   return 'source';
 }
 
-export function detectUrlPlatform(u: string): 'kick' | 'twitch' | null {
+export function detectUrlPlatform(u: string): 'kick' | 'twitch' | 'youtube' | null {
   const l = u.toLowerCase();
   if (l.includes('kick.com')) return 'kick';
   if (l.includes('twitch.tv')) return 'twitch';
+  if (l.includes('youtube.com') || l.includes('youtu.be')) return 'youtube';
   return null;
 }
 
@@ -111,6 +112,7 @@ export function channelClipsMissing(
   ch: SavedChannel,
   kickOn: boolean,
   twitchOn: boolean,
+  youtubeOn = false,
 ): boolean {
   const clips = ch.clipVideos ?? [];
   if (!ch.clipsFetched && clips.length === 0) return true;
@@ -118,6 +120,17 @@ export function channelClipsMissing(
   if (twitchOn && ch.twitchSlug?.trim() && !clips.some((v) => v.platform === 'Twitch')) {
     return true;
   }
+  if (youtubeOn && ch.youtubeSlug?.trim() && !clips.some((v) => v.platform === 'YouTube')) return true;
+  return false;
+}
+
+/** YouTube stream archives (/streams) — stored in vodVideos with content_kind stream. */
+export function channelStreamsMissing(
+  ch: SavedChannel,
+  youtubeOn: boolean,
+): boolean {
+  if (!youtubeOn || !ch.youtubeSlug?.trim()) return false;
+  if (!ch.streamsFetched) return true;
   return false;
 }
 
@@ -127,13 +140,15 @@ export function channelVodsMissing(
   ch: SavedChannel,
   kickOn: boolean,
   twitchOn: boolean,
+  youtubeOn = false,
 ): boolean {
-  // Treat a never-fetched channel and a channel whose last VOD fetch
-  // returned an empty list the same way: the data is missing for the
-  // platforms the user has enabled and we should re-fetch on demand.
   if (!ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0) return true;
   if (kickOn && ch.kickSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Kick')) return true;
   if (twitchOn && ch.twitchSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Twitch')) return true;
+  if (youtubeOn && ch.youtubeSlug?.trim()
+    && !ch.vodVideos?.some((v) => v.platform === 'YouTube' && v.content_kind !== 'stream')) {
+    return true;
+  }
   return false;
 }
 
@@ -188,9 +203,31 @@ export function buildVodUrl(v: ChannelVideo): string {
       ? `https://clips.twitch.tv/${twitchId}`
       : `https://www.twitch.tv/videos/${twitchId}`;
   }
+  if (v.platform === 'YouTube') {
+    return v.url || `https://www.youtube.com/watch?v=${v.id}`;
+  }
   return isClip
     ? `https://kick.com/${v.channel || ''}/clips/${v.id}`
     : `https://kick.com/${v.channel || ''}/videos/${v.id}`;
+}
+
+/** Display name stored on SavedChannel — derived from per-platform slugs. */
+export function deriveChannelDisplayName(
+  kickSlug: string,
+  twitchSlug: string,
+  youtubeSlug = '',
+): string {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [twitchSlug, kickSlug, youtubeSlug]) {
+    const s = raw.trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parts.push(s);
+  }
+  return parts.join(' / ');
 }
 
 /** Slugs for a VOD/clip URL — Twitch /videos/{id} needs channelLogin from API metadata. */
@@ -199,10 +236,20 @@ export function slugFromVideoUrl(
   platform: 'kick' | 'twitch' | null,
   uploader?: string | null,
   channelLogin?: string | null,
-): { kickSlug: string; twitchSlug: string } {
+): { kickSlug: string; twitchSlug: string; youtubeSlug: string } {
   const trimmed = url.trim();
   const lower = trimmed.toLowerCase();
   const login = (channelLogin || uploader || '').trim();
+  const all = (slug: string) => ({ kickSlug: slug, twitchSlug: slug, youtubeSlug: slug });
+
+  if (platform === 'youtube' || lower.includes('youtube.com') || lower.includes('youtu.be')) {
+    const fromUrl = youtubeSlugFromChannelUrl(trimmed);
+    if (fromUrl) return { kickSlug: '', twitchSlug: '', youtubeSlug: fromUrl };
+    const handle = trimmed.match(/youtube\.com\/@([^/?#]+)/i)?.[1];
+    const slug = handle || login;
+    if (slug) return all(slug);
+    return { kickSlug: '', twitchSlug: '', youtubeSlug: '' };
+  }
 
   if (platform === 'kick' || lower.includes('kick.com')) {
     const path = trimmed.match(/kick\.com\/([^/?#]+)(?:\/([^/?#]+))?/i);
@@ -210,85 +257,124 @@ export function slugFromVideoUrl(
     const seg2 = (path?.[2] ?? '').toLowerCase();
     if (seg1 && !['videos', 'clips'].includes(seg1.toLowerCase())) {
       if (!seg2 || seg2 === 'videos' || seg2 === 'clips') {
-        return { kickSlug: seg1, twitchSlug: seg1 };
+        return all(seg1);
       }
     }
-    if (login) return { kickSlug: login, twitchSlug: login };
-    return { kickSlug: '', twitchSlug: '' };
+    if (login) return all(login);
+    return { kickSlug: '', twitchSlug: '', youtubeSlug: '' };
   }
 
   if (platform === 'twitch' || lower.includes('twitch.tv')) {
     const loginPath = trimmed.match(/twitch\.tv\/([^/?#]+)\/clip\//i);
     const loginSeg = loginPath?.[1]?.toLowerCase();
     if (loginSeg && !['videos', 'clip', 'directory', 'clips'].includes(loginSeg)) {
-      return { kickSlug: loginPath![1], twitchSlug: loginPath![1] };
+      return all(loginPath![1]);
     }
-    if (login) return { kickSlug: login, twitchSlug: login };
-    return { kickSlug: '', twitchSlug: '' };
+    if (login) return all(login);
+    return { kickSlug: '', twitchSlug: '', youtubeSlug: '' };
   }
 
-  if (login) return { kickSlug: login, twitchSlug: login };
-  return { kickSlug: '', twitchSlug: '' };
+  if (login) return all(login);
+  return { kickSlug: '', twitchSlug: '', youtubeSlug: '' };
 }
 
 export function isChannelAlreadySaved(
   kickSlug: string,
   twitchSlug: string,
   channels: SavedChannel[],
+  youtubeSlug = '',
 ): boolean {
   const k = kickSlug.trim().toLowerCase();
   const t = twitchSlug.trim().toLowerCase();
-  if (!k && !t) return false;
+  const y = youtubeSlug.trim().toLowerCase();
+  if (!k && !t && !y) return false;
   return channels.some((ch) => {
     const ck = (ch.kickSlug || '').toLowerCase();
     const ct = (ch.twitchSlug || '').toLowerCase();
-    if (k && (ck === k || ct === k)) return true;
-    if (t && (ck === t || ct === t)) return true;
+    const cy = (ch.youtubeSlug || '').toLowerCase();
+    for (const slug of [k, t, y]) {
+      if (!slug) continue;
+      if (slug === ck || slug === ct || slug === cy) return true;
+    }
     return false;
   });
 }
 
-export function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
+/** Parse YouTube channel handle/id from a channel URL (not watch/shorts links). */
+export function youtubeSlugFromChannelUrl(raw: string): string {
   const trimmed = raw.trim();
-  if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '' };
+  const lower = trimmed.toLowerCase();
+  if (!lower.includes('youtube.com') && !lower.includes('youtu.be')) return '';
+  const handle = trimmed.match(/youtube\.com\/@([^/?#]+)/i)?.[1];
+  if (handle) return handle;
+  const channelId = trimmed.match(/youtube\.com\/channel\/(UC[^/?#]+)/i)?.[1];
+  if (channelId) return channelId;
+  const custom = trimmed.match(/youtube\.com\/c\/([^/?#]+)/i)?.[1];
+  if (custom) return custom;
+  const user = trimmed.match(/youtube\.com\/user\/([^/?#]+)/i)?.[1];
+  if (user) return user;
+  return '';
+}
+
+export function parseChannelInput(raw: string): {
+  displayName: string;
+  kickSlug: string;
+  twitchSlug: string;
+  youtubeSlug: string;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '', youtubeSlug: '' };
   const lower = trimmed.toLowerCase();
   if (lower.includes('kick.com')) {
     const m = trimmed.match(/kick\.com\/([^/?#]+)/i);
     const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+    return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: slug };
   }
   if (lower.includes('twitch.tv')) {
     const m = trimmed.match(/twitch\.tv\/([^/?#]+)/i);
     const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+    return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: slug };
+  }
+  if (lower.includes('youtube.com') || lower.includes('youtu.be')) {
+    const yt = youtubeSlugFromChannelUrl(trimmed);
+    if (yt) return { displayName: yt, kickSlug: '', twitchSlug: '', youtubeSlug: yt };
+    const tail = trimmed.replace(/^https?:\/\//, '').split('/').pop()?.split('?')[0] || trimmed;
+    if (['videos', 'shorts', 'streams', 'featured', 'playlists', 'watch'].includes(tail.toLowerCase())) {
+      return { displayName: '', kickSlug: '', twitchSlug: '', youtubeSlug: '' };
+    }
+    return { displayName: tail, kickSlug: '', twitchSlug: '', youtubeSlug: tail };
   }
   const slug = trimmed.replace(/^https?:\/\//, '').split('/').pop()?.split('?')[0] || trimmed;
-  return { displayName: slug, kickSlug: slug, twitchSlug: slug };
+  return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: '' };
 }
 
 /** Settings/section captions — not <label> so clicks never focus nearby inputs. */
 
-export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips'): Record<string, string> {
+export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips' | 'streams'): Record<string, string> {
   return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {});
 }
 
 export function formatChannelErrorMessage(
   ch: SavedChannel,
-  mode: 'vods' | 'clips',
+  mode: 'vods' | 'clips' | 'streams',
   kickEnabled: boolean,
   twitchEnabled: boolean,
+  youtubeEnabled = false,
 ): string | null {
   const errs = channelPlatformErrors(ch, mode);
   const errKeys = Object.keys(errs).filter((k) => {
     if (!errs[k]) return false;
     if (k === 'Kick' && !kickEnabled) return false;
     if (k === 'Twitch' && !twitchEnabled) return false;
+    if (k === 'YouTube' && !youtubeEnabled) return false;
     return true;
   });
   if (errKeys.length === 0) return null;
   const hasItems = mode === 'clips'
     ? (ch.clipVideos?.length ?? 0) > 0
-    : (ch.vodVideos?.length ?? 0) > 0;
+    : mode === 'streams'
+      ? (ch.vodVideos ?? []).some((v) => v.content_kind === 'stream')
+      : (ch.vodVideos ?? []).some((v) => v.content_kind !== 'stream');
   return hasItems
     ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
     : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ');
@@ -305,11 +391,13 @@ export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
   const legacyErrors = (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {};
   return {
     ...rest,
+    youtubeSlug: ch.youtubeSlug ?? '',
     vodVideos: vodVideos ?? [],
     clipVideos: clipVideos ?? [],
     vodErrors: ch.vodErrors ?? legacyErrors,
     clipErrors: ch.clipErrors ?? {},
     clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,
+    streamsFetched: ch.streamsFetched ?? (vodVideos?.some((v) => v.content_kind === 'stream') ?? false),
     loading: false,
   };
 }
@@ -387,10 +475,11 @@ export function channelVodSubline(v: ChannelVideo): string {
   return parts.join(' · ');
 }
 
-export function detectVideoPlatform(info: VideoInfo | null, url: string): 'kick' | 'twitch' | null {
+export function detectVideoPlatform(info: VideoInfo | null, url: string): 'kick' | 'twitch' | 'youtube' | null {
   const p = info?.platform?.toLowerCase();
   if (p === 'kick') return 'kick';
   if (p === 'twitch') return 'twitch';
+  if (p === 'youtube') return 'youtube';
   return detectUrlPlatform(url);
 }
 
@@ -439,6 +528,7 @@ export function estimateDownloadBytes(
   quality: string,
   clipSec: number,
   fullDurationSec: number,
+  audioOnly = false,
 ): number {
   if (clipSec <= 0) return 0;
   const fullDur = Math.max(clipSec, fullDurationSec || clipSec);
@@ -455,7 +545,10 @@ export function estimateDownloadBytes(
     const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
     raw = Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
   }
-  // ponytail: remux/container overhead discount — match backend manifest scale tune
+  if (audioOnly) {
+    // ponytail: ~128kbps MP3 vs typical 1080p video — rough 8% of video estimate
+    raw = Math.round(raw * 0.08);
+  }
   return raw > 0 ? Math.round(raw * 0.97) : 0;
 }
 
@@ -485,23 +578,27 @@ export function capDownloadToMaxBytes(
 export function loadStoredChannelUi(): {
   kick: boolean;
   twitch: boolean;
-  content: 'vods' | 'clips';
+  youtube: boolean;
+  content: 'vods' | 'clips' | 'streams';
 } {
   try {
     const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
-    if (!raw) return { kick: true, twitch: true, content: 'vods' };
+    if (!raw) return { kick: true, twitch: true, youtube: true, content: 'vods' };
     const p = JSON.parse(raw) as {
       kick?: boolean;
       twitch?: boolean;
+      youtube?: boolean;
       content?: string;
     };
+    const content = p.content === 'clips' ? 'clips' : p.content === 'streams' ? 'streams' : 'vods';
     return {
       kick: p.kick !== false,
       twitch: p.twitch !== false,
-      content: p.content === 'clips' ? 'clips' : 'vods',
+      youtube: p.youtube !== false,
+      content,
     };
   } catch {
-    return { kick: true, twitch: true, content: 'vods' };
+    return { kick: true, twitch: true, youtube: true, content: 'vods' };
   }
 }
 

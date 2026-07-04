@@ -1,4 +1,4 @@
-"""Kick/Twitch VOD URL sanity checks for queue, history, and API validation."""
+"""Kick/Twitch/YouTube VOD URL sanity checks for queue, history, and API validation."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def _bad_kick_slug(slug: str | None) -> bool:
 
 
 def is_sensible_vod_url(url: str) -> bool:
-    """Return False for bogus Kick/Twitch VOD URLs (test slugs, junk ids)."""
+    """Return False for bogus Kick/Twitch/YouTube VOD URLs (test slugs, junk ids)."""
     if not url or not isinstance(url, str):
         return False
     lower = url.lower().strip()
@@ -47,6 +47,12 @@ def is_sensible_vod_url(url: str) -> bool:
         m = re.search(r"/videos/(\d+)", lower)
         if m:
             return int(m.group(1)) >= _TWITCH_VOD_ID_MIN
+        return False
+    if "youtube.com" in lower or "youtu.be" in lower:
+        if "watch?v=" in lower or "/shorts/" in lower:
+            return True
+        if "youtu.be/" in lower:
+            return len(lower.split("youtu.be/")[-1].split("?")[0].strip("/")) >= 6
         return False
     return True
 

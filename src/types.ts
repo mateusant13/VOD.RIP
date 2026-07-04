@@ -54,7 +54,7 @@ export interface ChannelVideo {
   thumbnail_url: string | null;
   url: string;
   channel: string;
-  content_kind?: 'vod' | 'clip';
+  content_kind?: 'vod' | 'clip' | 'stream';
 }
 
 export interface ListedChannelVideo extends ChannelVideo {
@@ -85,7 +85,8 @@ export interface AppSettings {
   saved_channels?: SavedChannel[] | null;
   channel_kick_enabled?: boolean;
   channel_twitch_enabled?: boolean;
-  channel_content_filter?: 'vods' | 'clips';
+  channel_youtube_enabled?: boolean;
+  channel_content_filter?: 'vods' | 'clips' | 'streams';
 }
 
 export interface UpdateInfo {
@@ -100,6 +101,7 @@ export interface SavedChannel {
   displayName: string;
   kickSlug: string;
   twitchSlug: string;
+  youtubeSlug: string;
   vodVideos: ChannelVideo[];
   clipVideos: ChannelVideo[];
   vodErrors?: Record<string, string>;
@@ -108,6 +110,8 @@ export interface SavedChannel {
   loading?: boolean;
   /** True after at least one clips fetch completed (success or failure). */
   clipsFetched?: boolean;
+  /** True after at least one YouTube /streams fetch completed. */
+  streamsFetched?: boolean;
   /** Legacy — migrated to vodVideos / clipVideos on load */
   videos?: ChannelVideo[];
 }
