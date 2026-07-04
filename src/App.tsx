@@ -3679,13 +3679,22 @@ export default function App() {
                                 }}
                                 className="flex items-center gap-1.5 border border-zinc-800 bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group"
                               >
-                                <input
-                                  type="checkbox"
-                                  checked={selectedChannelVodUrls.has(fullUrl)}
-                                  onChange={() => toggleChannelVodSelection(fullUrl)}
-                                  onClick={(e) => e.stopPropagation()}
-                                  className="accent-[#53fc18] shrink-0"
-                                />
+                                <label
+                                  className="flex items-center self-stretch pl-2 -ml-2 pr-1 cursor-pointer"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    toggleChannelVodSelection(fullUrl);
+                                  }}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedChannelVodUrls.has(fullUrl)}
+                                    readOnly
+                                    tabIndex={-1}
+                                    className="accent-[#53fc18] shrink-0 pointer-events-none"
+                                  />
+                                </label>
                                 <ChannelClipThumb video={v} />
                                 <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
                                 <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
