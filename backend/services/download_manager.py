@@ -15,7 +15,11 @@ from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from models.schemas import DownloadState
 from services import ytdlp_service
-from services.download_cleanup import delete_partial_output, remove_temp_dirs
+from services.download_cleanup import (
+    delete_download_output,
+    delete_partial_output,
+    remove_temp_dirs,
+)
 from services.download_persistence import DownloadPersistence
 from services.url_validation import is_sensible_vod_url
 from services.download_utils import (
@@ -819,12 +823,41 @@ class DownloadManager:
         return self.remove_history(download_id)
 
     def remove_history(self, download_id: str) -> bool:
+        output_file: Optional[str] = None
+        status: Optional[str] = None
+        cleanup: Optional[dict] = None
         removed = False
         with self._lock:
             state = self._downloads.get(download_id)
+            if state:
+                output_file = state.output_file or None
+                status = state.status
+            cleanup = self._cleanup_info.get(download_id)
             if state and state.status in _DONE_STATUSES:
                 self._downloads.pop(download_id, None)
                 removed = True
+        if not output_file:
+            for entry in self._db.history:
+                if entry.get("download_id") == download_id:
+                    output_file = entry.get("output_file") or None
+                    status = status or entry.get("status")
+                    break
+        if not output_file:
+            for entry in self._db.queue:
+                if entry.get("download_id") == download_id:
+                    output_file = entry.get("output_file") or None
+                    status = status or entry.get("status")
+                    break
+        if output_file:
+            if status in ("Failed", "Cancelled"):
+                output_existed = bool(cleanup and cleanup.get("output_existed"))
+                expected_duration = cleanup.get("expected_duration") if cleanup else None
+                delete_partial_output(
+                    output_file,
+                    output_existed,
+                    expected_duration=expected_duration,
+                )
+            delete_download_output(output_file)
         had_on_disk = any(e.get("download_id") == download_id for e in self._db.history)
         if had_on_disk:
             self._db.drop_history(download_id)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,33 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from services.os_services import _NO_WINDOW
+
+logger = logging.getLogger(__name__)
+
+
+def delete_download_output(output_file: str | None) -> bool:
+    """Delete completed download file and common sidecars. Returns True if file was removed."""
+    if not output_file:
+        return False
+    path = Path(output_file)
+    base = path.with_suffix("")
+    ext = path.suffix
+    candidates = [
+        path,
+        Path(output_file + ".part"),
+        Path(output_file + ".ytdl"),
+        base.with_name(base.name + ".temp" + ext) if ext else Path(output_file + ".temp"),
+    ]
+    removed_main = False
+    for candidate in candidates:
+        try:
+            existed = candidate.is_file()
+            candidate.unlink(missing_ok=True)
+            if existed and candidate == path:
+                removed_main = True
+        except OSError as exc:
+            logger.warning("Failed to delete %s: %s", candidate, exc)
+    return removed_main
 
 
 def _partial_output_candidates(output_file: str) -> List[str]:

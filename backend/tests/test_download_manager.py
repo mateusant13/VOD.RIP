@@ -4,6 +4,9 @@ Tests the state-machine and concurrency primitives without
 spawning real yt-dlp workers (no network).
 """
 
+from datetime import datetime, timezone
+
+from models.schemas import DownloadState
 from services.download_manager import DownloadManager
 
 _VALID_KICK_VOD = "https://kick.com/realchannel/videos/100000"
@@ -116,6 +119,27 @@ def test_concurrent_start_and_cancel():
     count = sum(1 for r in results if r is True)
     assert count >= 0
     assert mgr.cancel_all() >= 0
+
+
+def test_remove_history_deletes_output_file(tmp_path):
+    """remove_history deletes the completed download file from disk."""
+    output = tmp_path / "completed.mp4"
+    output.write_bytes(b"x" * 1000)
+    assert output.is_file()
+
+    mgr = DownloadManager(max_workers=2)
+    dl_id = "dl_test_remove_file_001"
+    state = DownloadState(
+        download_id=dl_id,
+        url=_VALID_KICK_VOD,
+        status="Completed",
+        output_file=str(output),
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    mgr._db.record_history(state)
+
+    assert mgr.remove_history(dl_id) is True
+    assert not output.is_file()
 
 
 def test_cancel_all_idempotent():
