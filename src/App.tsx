@@ -492,10 +492,13 @@ export default function App() {
     previewOpenRef.current = previewOpen;
   }, [previewOpen]);
 
-  const previewDurationSec = useMemo(
-    () => Math.max(1, previewTrimEnd - previewTrimStart),
-    [previewTrimStart, previewTrimEnd],
-  );
+  /** Selected clip length in preview (not full VOD duration). */
+  const previewClipLengthSec = useMemo(() => {
+    if (needleGlance?.dragging) {
+      return Math.max(0, needleGlance.rangeEnd - needleGlance.rangeStart);
+    }
+    return Math.max(0, previewTrimEnd - previewTrimStart);
+  }, [previewTrimStart, previewTrimEnd, needleGlance]);
 
   const destroyPreviewPlayer = useCallback(() => {
     if (previewHlsRef.current) {
@@ -562,8 +565,8 @@ export default function App() {
 
     // Cancel any previously in-flight openPreview
     const gen = ++previewGenRef.current;
-    const start = trimStartSec;
-    const end = trimEndSec;
+    const start = trimStartSecRef.current;
+    const end = trimEndSecRef.current;
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
@@ -1567,12 +1570,11 @@ export default function App() {
       trimEndSecRef.current = end;
       setTrimStartSec(0);
       setTrimEndSec(end);
-      // Keep the current preview playing until the user hits Preview on the new VOD.
+      previewTrimStartRef.current = 0;
+      previewTrimEndRef.current = end;
+      setPreviewTrimStart(0);
+      setPreviewTrimEnd(end);
       if (!previewOpen) {
-        previewTrimStartRef.current = 0;
-        previewTrimEndRef.current = end;
-        setPreviewTrimStart(0);
-        setPreviewTrimEnd(end);
         void resetPreview();
       }
       const isMediaUrl = isClipUrl(trimmed) || /\/videos\//i.test(trimmed) || /^\d+$/.test(trimmed);
@@ -3037,10 +3039,13 @@ export default function App() {
             disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
             className="self-center"
           />
-          <span className={`text-[8px] font-mono w-11 shrink-0 text-right ${
-            previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
-          }`}>
-            {formatHmsFull(previewTrimEnd - previewTrimStart)}
+          <span
+            className={`text-[8px] font-mono w-11 shrink-0 text-right ${
+              previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
+            }`}
+            title="Selected clip length"
+          >
+            {formatHmsFull(previewClipLengthSec)}
           </span>
         </div>
       )}
@@ -3089,12 +3094,15 @@ export default function App() {
           max={previewTrimEnd}
           step={0.25}
           value={Math.min(Math.max(previewTimeUi, previewTrimStart), previewTrimEnd)}
-          disabled={!previewVideoReady || previewDurationSec <= 0}
+          disabled={!previewVideoReady || previewClipLengthSec <= 0}
           onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
           className="flex-1 accent-white disabled:opacity-40"
         />
-        <span className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
-          {formatHmsFull(previewDurationSec)}
+        <span
+          className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}
+          title="Selected clip length"
+        >
+          {formatHmsFull(previewClipLengthSec)}
         </span>
       </div>
     </div>
