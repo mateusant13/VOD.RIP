@@ -11,6 +11,8 @@ import {
   channelClipsMissing,
   channelVodsMissing,
   buildVodUrl,
+  slugFromVideoUrl,
+  isChannelAlreadySaved,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel } from './types';
 
@@ -216,5 +218,37 @@ describe('buildVodUrl', () => {
   it('strips v prefix for Twitch VODs', () => {
     const v = makeVod({ id: 'v123456', url: '' });
     expect(buildVodUrl(v)).toBe('https://www.twitch.tv/videos/123456');
+  });
+});
+
+describe('slugFromVideoUrl', () => {
+  it('extracts Kick slug from VOD URL', () => {
+    const s = slugFromVideoUrl('https://kick.com/xqc/videos/abc', 'kick');
+    expect(s).toEqual({ kickSlug: 'xqc', twitchSlug: 'xqc' });
+  });
+
+  it('uses channel login for Twitch /videos/ URLs', () => {
+    const s = slugFromVideoUrl('https://twitch.tv/videos/1', 'twitch', 'Display', 'login');
+    expect(s.twitchSlug).toBe('login');
+  });
+});
+
+describe('isChannelAlreadySaved', () => {
+  const channels: SavedChannel[] = [{
+    id: '1',
+    displayName: 'F',
+    kickSlug: 'Foo',
+    twitchSlug: 'bar',
+    vodVideos: [],
+    clipVideos: [],
+    updatedAt: '',
+  }];
+
+  it('matches kick slug case-insensitively', () => {
+    expect(isChannelAlreadySaved('foo', '', channels)).toBe(true);
+  });
+
+  it('returns false for unknown slug', () => {
+    expect(isChannelAlreadySaved('other', '', channels)).toBe(false);
   });
 });

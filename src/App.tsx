@@ -40,7 +40,7 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformCardShadow } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
@@ -379,6 +379,11 @@ export default function App() {
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
+  const [pendingAddChannel, setPendingAddChannel] = useState<{
+    displayName: string;
+    kickSlug: string;
+    twitchSlug: string;
+  } | null>(null);
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
@@ -1532,6 +1537,7 @@ export default function App() {
     if (!trimmed) return;
     setLoading(true);
     setError(null);
+    setPendingAddChannel(null);
     try {
       const infoPath = isClipUrl(trimmed) ? '/api/info/clip' : '/api/info/video';
       const info = await apiGet<VideoInfo>(`${infoPath}?id=${encodeURIComponent(trimmed)}`);
@@ -1551,12 +1557,32 @@ export default function App() {
         setPreviewTrimEnd(end);
         void resetPreview();
       }
+      const isMediaUrl = isClipUrl(trimmed) || /\/videos\//i.test(trimmed) || /^\d+$/.test(trimmed);
+      if (isMediaUrl && savedChannels.length < MAX_SAVED_CHANNELS) {
+        const platform = detectUrlPlatform(trimmed) ?? detectVideoPlatform(info, trimmed);
+        const { kickSlug, twitchSlug } = slugFromVideoUrl(
+          trimmed,
+          platform,
+          info.uploader,
+          info.channel ?? info.uploader,
+        );
+        if (
+          kickSlug
+          && !isChannelAlreadySaved(kickSlug, twitchSlug, savedChannels)
+        ) {
+          setPendingAddChannel({
+            displayName: info.uploader?.trim() || kickSlug,
+            kickSlug,
+            twitchSlug,
+          });
+        }
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [previewOpen, resetPreview]);
+  }, [previewOpen, resetPreview, savedChannels]);
 
   const handleGetInfo = useCallback(() => {
     previewStartedRef.current = false;
@@ -2189,20 +2215,21 @@ export default function App() {
     });
   }, []);
 
-  const handleAddChannel = useCallback(async () => {
-    const raw = addChannelInput.trim();
-    if (!raw) return;
+  const addChannelFromSlugs = useCallback(async (
+    displayName: string,
+    kickSlug: string,
+    twitchSlug: string,
+  ) => {
+    if (!kickSlug) return;
     if (savedChannels.length >= MAX_SAVED_CHANNELS) {
       setAddChannelNotice(`Max ${MAX_SAVED_CHANNELS} channels.`);
       return;
     }
     setAddChannelNotice(null);
-    const { displayName, kickSlug, twitchSlug } = parseChannelInput(raw);
-    if (!kickSlug) return;
     const id = `ch_${Date.now().toString(36)}`;
     const entry: SavedChannel = {
       id,
-      displayName,
+      displayName: displayName.trim() || kickSlug,
       kickSlug,
       twitchSlug,
       vodVideos: [],
@@ -2214,14 +2241,21 @@ export default function App() {
     };
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
-    setAddChannelInput('');
     channelRefreshInFlightRef.current.delete(`${id}:vods`);
     channelRefreshInFlightRef.current.delete(`${id}:clips`);
     await refreshChannel(id, entry, 'vods');
     if (channelContentFilter === 'clips') {
       await refreshChannel(id, entry, 'clips');
     }
-  }, [addChannelInput, savedChannels.length, refreshChannel, channelContentFilter]);
+  }, [savedChannels.length, refreshChannel, channelContentFilter]);
+
+  const handleAddChannel = useCallback(async () => {
+    const raw = addChannelInput.trim();
+    if (!raw) return;
+    const { displayName, kickSlug, twitchSlug } = parseChannelInput(raw);
+    await addChannelFromSlugs(displayName, kickSlug, twitchSlug);
+    setAddChannelInput('');
+  }, [addChannelInput, addChannelFromSlugs]);
 
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {
@@ -2631,6 +2665,55 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {pendingAddChannel && (
+            <div className="border border-zinc-700 bg-zinc-900/90 p-2 flex flex-col gap-2 shrink-0">
+              <p className="text-[10px] font-mono text-zinc-400">
+                Add {pendingAddChannel.displayName} to channels?
+              </p>
+              <input
+                type="text"
+                value={pendingAddChannel.displayName}
+                onChange={(e) => setPendingAddChannel((prev) => (
+                  prev ? { ...prev, displayName: e.target.value } : prev
+                ))}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    void addChannelFromSlugs(
+                      pendingAddChannel.displayName,
+                      pendingAddChannel.kickSlug,
+                      pendingAddChannel.twitchSlug,
+                    );
+                    setPendingAddChannel(null);
+                  }
+                }}
+                className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-white text-[10px]"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    void addChannelFromSlugs(
+                      pendingAddChannel.displayName,
+                      pendingAddChannel.kickSlug,
+                      pendingAddChannel.twitchSlug,
+                    );
+                    setPendingAddChannel(null);
+                  }}
+                  className="flex-1 bg-white text-black font-black uppercase py-1 text-[10px] border-2 border-white"
+                >
+                  Add
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPendingAddChannel(null)}
+                  className="flex-1 bg-zinc-800 text-zinc-300 font-black uppercase py-1 text-[10px] border-2 border-zinc-700"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-2 shrink-0">
             <div className="flex flex-col gap-0.5">
