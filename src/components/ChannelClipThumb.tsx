@@ -2,6 +2,7 @@
 
 import { useState, type ReactNode } from 'react';
 import { Play } from 'lucide-react';
+import { resolveVideoThumbnail } from '../channelUtils';
 
 interface ChannelVideo {
   id: string;
@@ -17,24 +18,9 @@ interface ChannelVideo {
   content_kind?: 'vod' | 'clip';
 }
 
-function resolveChannelThumbnail(
-  url: string | null | undefined,
-  width = 160,
-  height = 90,
-): string | null {
-  if (!url?.trim()) return null;
-  const w = String(width);
-  const h = String(height);
-  return url
-    .replace(/%\{width\}/g, w)
-    .replace(/%\{height\}/g, h)
-    .replace(/\{width\}/g, w)
-    .replace(/\{height\}/g, h);
-}
-
 export default function ChannelClipThumb({ video }: { video: ChannelVideo }): ReactNode {
   const [failed, setFailed] = useState(false);
-  const src = resolveChannelThumbnail(video.thumbnail_url);
+  const src = resolveVideoThumbnail(video.thumbnail_url);
   if (!src || failed) {
     return (
       <div

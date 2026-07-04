@@ -137,6 +137,40 @@ export function channelVodsMissing(
   return false;
 }
 
+/** Resolve Twitch/Kick thumbnail templates with width/height placeholders. */
+export function resolveVideoThumbnail(
+  url: string | null | undefined,
+  width = 160,
+  height = 90,
+): string | null {
+  if (!url?.trim()) return null;
+  const w = String(width);
+  const h = String(height);
+  return url
+    .replace(/%\{width\}/g, w)
+    .replace(/%\{height\}/g, h)
+    .replace(/\{width\}/g, w)
+    .replace(/\{height\}/g, h);
+}
+
+/** Cached channel VOD/clip thumbnail for a URL (buildVodUrl match). */
+export function findCachedVideoThumbnail(
+  videoUrl: string,
+  channels: SavedChannel[],
+): string | null {
+  const needle = videoUrl.trim().toLowerCase();
+  if (!needle) return null;
+  for (const ch of channels) {
+    const videos = [...(ch.vodVideos ?? []), ...(ch.clipVideos ?? [])];
+    for (const v of videos) {
+      if (buildVodUrl(v).trim().toLowerCase() === needle) {
+        return v.thumbnail_url ?? null;
+      }
+    }
+  }
+  return null;
+}
+
 export function buildVodUrl(v: ChannelVideo): string {
   const isTw = v.platform === 'Twitch';
   const isClip = isLikelyClip(v);

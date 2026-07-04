@@ -13,6 +13,8 @@ import {
   buildVodUrl,
   slugFromVideoUrl,
   isChannelAlreadySaved,
+  resolveVideoThumbnail,
+  findCachedVideoThumbnail,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel } from './types';
 
@@ -230,6 +232,38 @@ describe('slugFromVideoUrl', () => {
   it('uses channel login for Twitch /videos/ URLs', () => {
     const s = slugFromVideoUrl('https://twitch.tv/videos/1', 'twitch', 'Display', 'login');
     expect(s.twitchSlug).toBe('login');
+  });
+});
+
+describe('resolveVideoThumbnail', () => {
+  it('substitutes width/height placeholders', () => {
+    expect(resolveVideoThumbnail('https://x/%{width}x%{height}', 48, 36)).toBe('https://x/48x36');
+    expect(resolveVideoThumbnail('https://x/{width}x{height}', 160, 90)).toBe('https://x/160x90');
+  });
+
+  it('returns null for empty input', () => {
+    expect(resolveVideoThumbnail(null)).toBeNull();
+    expect(resolveVideoThumbnail('  ')).toBeNull();
+  });
+});
+
+describe('findCachedVideoThumbnail', () => {
+  const channels: SavedChannel[] = [{
+    id: '1',
+    displayName: 'F',
+    kickSlug: 'foo',
+    twitchSlug: 'bar',
+    vodVideos: [makeVod({ url: 'https://twitch.tv/videos/999', thumbnail_url: 'https://cdn/thumb.jpg' })],
+    clipVideos: [],
+    updatedAt: '',
+  }];
+
+  it('finds thumbnail by buildVodUrl match', () => {
+    expect(findCachedVideoThumbnail('https://twitch.tv/videos/999', channels)).toBe('https://cdn/thumb.jpg');
+  });
+
+  it('returns null when no match', () => {
+    expect(findCachedVideoThumbnail('https://other', channels)).toBeNull();
   });
 });
 
