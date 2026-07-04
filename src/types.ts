@@ -8,6 +8,8 @@ export interface VideoInfo {
   duration: number | null;
   duration_string: string | null;
   uploader: string | null;
+  /** Broadcaster login/slug when returned by the API (e.g. Twitch VOD owner login). */
+  channel?: string | null;
   thumbnail: string | null;
   webpage_url: string | null;
   extractor: string | null;

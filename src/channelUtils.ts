@@ -159,6 +159,61 @@ export function buildVodUrl(v: ChannelVideo): string {
     : `https://kick.com/${v.channel || ''}/videos/${v.id}`;
 }
 
+/** Slugs for a VOD/clip URL — Twitch /videos/{id} needs channelLogin from API metadata. */
+export function slugFromVideoUrl(
+  url: string,
+  platform: 'kick' | 'twitch' | null,
+  uploader?: string | null,
+  channelLogin?: string | null,
+): { kickSlug: string; twitchSlug: string } {
+  const trimmed = url.trim();
+  const lower = trimmed.toLowerCase();
+  const login = (channelLogin || uploader || '').trim();
+
+  if (platform === 'kick' || lower.includes('kick.com')) {
+    const path = trimmed.match(/kick\.com\/([^/?#]+)(?:\/([^/?#]+))?/i);
+    const seg1 = path?.[1] ?? '';
+    const seg2 = (path?.[2] ?? '').toLowerCase();
+    if (seg1 && !['videos', 'clips'].includes(seg1.toLowerCase())) {
+      if (!seg2 || seg2 === 'videos' || seg2 === 'clips') {
+        return { kickSlug: seg1, twitchSlug: seg1 };
+      }
+    }
+    if (login) return { kickSlug: login, twitchSlug: login };
+    return { kickSlug: '', twitchSlug: '' };
+  }
+
+  if (platform === 'twitch' || lower.includes('twitch.tv')) {
+    const loginPath = trimmed.match(/twitch\.tv\/([^/?#]+)\/clip\//i);
+    const loginSeg = loginPath?.[1]?.toLowerCase();
+    if (loginSeg && !['videos', 'clip', 'directory', 'clips'].includes(loginSeg)) {
+      return { kickSlug: loginPath![1], twitchSlug: loginPath![1] };
+    }
+    if (login) return { kickSlug: login, twitchSlug: login };
+    return { kickSlug: '', twitchSlug: '' };
+  }
+
+  if (login) return { kickSlug: login, twitchSlug: login };
+  return { kickSlug: '', twitchSlug: '' };
+}
+
+export function isChannelAlreadySaved(
+  kickSlug: string,
+  twitchSlug: string,
+  channels: SavedChannel[],
+): boolean {
+  const k = kickSlug.trim().toLowerCase();
+  const t = twitchSlug.trim().toLowerCase();
+  if (!k && !t) return false;
+  return channels.some((ch) => {
+    const ck = (ch.kickSlug || '').toLowerCase();
+    const ct = (ch.twitchSlug || '').toLowerCase();
+    if (k && (ck === k || ct === k)) return true;
+    if (t && (ck === t || ct === t)) return true;
+    return false;
+  });
+}
+
 export function parseChannelInput(raw: string): { displayName: string; kickSlug: string; twitchSlug: string } {
   const trimmed = raw.trim();
   if (!trimmed) return { displayName: '', kickSlug: '', twitchSlug: '' };
