@@ -14,10 +14,21 @@ export function panelMaxHeight() {
   return Math.round(window.innerHeight * 0.92);
 }
 export function viewportContentBox(shadowPad = panelResizeHandleInset(false)): { maxW: number; maxH: number } {
+  const { usableWidth } = layoutRowEdgeInsets(shadowPad);
   return {
-    maxW: Math.max(PANEL_MIN.w, window.innerWidth - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
+    maxW: Math.max(PANEL_MIN.w, usableWidth),
     maxH: Math.max(PANEL_MIN.h, window.innerHeight - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
   };
+}
+export function layoutRowEdgeInsets(shadowPad = panelResizeHandleInset(false)): {
+  left: number;
+  right: number;
+  usableWidth: number;
+} {
+  const left = VIEWPORT_EDGE_LOCK + shadowPad;
+  const right = VIEWPORT_EDGE_LOCK + shadowPad;
+  const usableWidth = Math.max(PANEL_MIN.w, window.innerWidth - left - right);
+  return { left, right, usableWidth };
 }
 export function layoutRowGap(previewOpen: boolean, urlPanelAside: boolean): number {
   const count = (previewOpen ? 1 : 0) + (urlPanelAside ? 1 : 0) + 1;
@@ -52,10 +63,58 @@ export function clampPanelSizeForLayout(
   };
 }
 function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
-  const { maxW } = viewportContentBox();
+  const { usableWidth } = layoutRowEdgeInsets();
   const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
   const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
-  return maxW - gapTotal;
+  return usableWidth - gapTotal;
+}
+
+/** Shrink siblings when preview grows so the row stays within the viewport budget. */
+export function resizeLayoutWithPreviewWidth(
+  layout: LayoutPanelBoundsInput,
+  desiredPreviewW: number,
+): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
+  let preview = { ...layout.preview, w: desiredPreviewW };
+  let urlAside = { ...layout.urlAside };
+  let main = { ...layout.main };
+
+  type Slot = { get: () => number; set: (w: number) => void; minW: number };
+  const siblingSlots: Slot[] = [];
+  if (layout.urlPanelAside) {
+    siblingSlots.push({
+      get: () => urlAside.w,
+      set: (w) => { urlAside = { ...urlAside, w }; },
+      minW: PANEL_MIN.w,
+    });
+  }
+  siblingSlots.push({
+    get: () => main.w,
+    set: (w) => { main = { ...main, w }; },
+    minW: PANEL_MIN.w,
+  });
+
+  const budget = layoutRowWidthBudget(layout);
+  const minPreviewW = PREVIEW_PANEL_MIN_W;
+  const minSiblingTotal = siblingSlots.reduce((sum, slot) => sum + slot.minW, 0);
+  const maxPreview = Math.max(minPreviewW, budget - minSiblingTotal);
+  preview = { ...preview, w: Math.min(preview.w, maxPreview) };
+
+  let total = preview.w + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
+  if (total <= budget) {
+    return { preview, urlAside, main };
+  }
+
+  let overflow = total - budget;
+  const flexTotal = siblingSlots.reduce((sum, slot) => sum + (slot.get() - slot.minW), 0);
+  if (flexTotal > 0) {
+    for (const slot of siblingSlots) {
+      const excess = slot.get() - slot.minW;
+      const shave = Math.min(excess, Math.ceil(overflow * (excess / flexTotal)));
+      slot.set(slot.get() - shave);
+    }
+  }
+
+  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
 }
 
 /** Shrink visible panel widths proportionally when the row exceeds the viewport. */
@@ -125,7 +184,8 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
     if (layout.previewOpen) rowTotal += result.preview.w;
     if (layout.urlPanelAside) rowTotal += result.urlAside.w;
     rowTotal += result.main.w;
-    console.assert(rowTotal <= layoutRowWidthBudget(layout), 'shrinkLayoutPanelsToFit overflow');
+    const budget = layoutRowWidthBudget(layout);
+    console.assert(rowTotal <= budget, 'shrinkLayoutPanelsToFit overflow');
   }
   return result;
 }
@@ -322,6 +382,7 @@ export function startPanelWidthResize(
     posRef?: MutableRefObject<PanelPos | null>;
     setPos?: Dispatch<SetStateAction<PanelPos | null>>;
     onResizeEnd?: () => void;
+    onResizeMove?: (w: number) => void;
   },
 ) {
   e.preventDefault();
@@ -344,12 +405,14 @@ export function startPanelWidthResize(
   document.body.style.userSelect = 'none';
   document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
 
-  const applyWidthAndPos = (nextW: number) => {
-    widthRef.current = nextW;
+  const applyWidthAndPos = (rawNextW: number) => {
+    let nextW = clamp(rawNextW);
     if (panelEl) {
       applyPanelWidth(panelEl, nextW);
     }
     if (startPos && opts.posRef && panelEl) {
+      const inset = panelResizeHandleInset(true);
+      const margin = VIEWPORT_EDGE_LOCK + inset;
       let x = startPos.x;
       let y = startPos.y;
       if (edgeAffectsWest(edge)) {
@@ -358,10 +421,43 @@ export function startPanelWidthResize(
       if (edgeAffectsNorth(edge)) {
         y = startPos.y - (nextW - startW) / opts.aspect;
       }
+
+      const minX = margin;
+      const maxX = window.innerWidth - margin - nextW;
+      if (edgeAffectsWest(edge)) {
+        if (x < minX) {
+          x = minX;
+          nextW = clamp(startPos.x + startW - x);
+          x = startPos.x + startW - nextW;
+        }
+      } else {
+        x = Math.max(minX, Math.min(x, maxX));
+        const rightBound = window.innerWidth - margin;
+        if (x + nextW > rightBound) {
+          nextW = clamp(rightBound - x);
+        }
+      }
+
+      const panelH = panelEl.offsetHeight || 1;
+      const minY = margin;
+      const maxY = window.innerHeight - margin - panelH;
+      if (edgeAffectsNorth(edge) && y < minY) {
+        y = minY;
+      } else {
+        y = Math.max(minY, Math.min(y, maxY));
+      }
+
+      widthRef.current = nextW;
+      if (panelEl) {
+        applyPanelWidth(panelEl, nextW);
+      }
       const pos = { x, y };
       opts.posRef.current = pos;
       applyExplorePopupWindowPosition(panelEl, pos);
+    } else {
+      widthRef.current = nextW;
     }
+    opts.onResizeMove?.(nextW);
   };
 
   const onMove = (ev: PointerEvent) => {

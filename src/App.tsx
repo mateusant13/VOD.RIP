@@ -42,7 +42,7 @@ import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDat
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutWithPreviewWidth, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import PlatformVodIcon from './components/PlatformVodIcon';
 import ChannelClipThumb from './components/ChannelClipThumb';
@@ -1480,22 +1480,42 @@ export default function App() {
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
-    // ponytail: pass empty layout so preview can grow freely - other panels shrink on drag end
+    const channelPreview = Boolean(previewChannelBadge);
     const emptyLayout = { previewOpen: false, urlPanelAside: false, preview: { w: 0, h: 0 }, urlAside: { w: 0, h: 0 }, main: { w: 0, h: 0 } };
+    const chromeH = previewChromeHRef.current;
+    const aspect = previewVideoAspectRef.current;
+
+    const applySiblingPanels = (fitted: ReturnType<typeof resizeLayoutWithPreviewWidth>) => {
+      urlAsidePanelSizeRef.current = fitted.urlAside;
+      setUrlAsidePanelSize(fitted.urlAside);
+      if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
+      mainPanelSizeRef.current = fitted.main;
+      setMainPanelSize(fitted.main);
+      if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
+    };
+
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
-      aspect: previewVideoAspectRef.current,
-      clampWidth: (w) => clampPreviewPanelWidth(
-        w,
-        previewChromeHRef.current,
-        previewVideoAspectRef.current,
-        emptyLayout,
-      ),
+      aspect,
+      clampWidth: (w) => {
+        const layout = channelPreview ? layoutBoundsInput() : emptyLayout;
+        const aspectW = clampPreviewPanelWidth(w, chromeH, aspect, layout);
+        if (!channelPreview) return aspectW;
+        return resizeLayoutWithPreviewWidth(layoutBoundsInput(), aspectW).preview.w;
+      },
+      onResizeMove: channelPreview
+        ? (w) => {
+            const fitted = resizeLayoutWithPreviewWidth(layoutBoundsInput(), w);
+            previewPanelWidthRef.current = fitted.preview.w;
+            if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
+            applySiblingPanels(fitted);
+          }
+        : undefined,
       onResizeEnd: () => {
         applyLayoutPanelClamps();
       },
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, previewChannelBadge]);
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const layout = layoutBoundsInput();
@@ -3125,6 +3145,9 @@ export default function App() {
     </div>
   );
 
+  const edgePinnedRow = triplePanelLayout || (splitLayout && previewOpen);
+  const rowEdgeInsets = edgePinnedRow ? layoutRowEdgeInsets() : null;
+
   return (
     <div
       className="vod-app-shell h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
@@ -3133,13 +3156,18 @@ export default function App() {
         backgroundSize: 'calc(24px * var(--ui-scale)) calc(24px * var(--ui-scale))',
       }}
     >
-      <div className={`vod-layout-row flex items-start max-w-full min-w-0 ${
-        triplePanelLayout
-          ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-center`
-          : splitLayout
-            ? `w-full ${viewportTier === 'narrow' ? 'gap-3' : 'gap-6'} justify-center`
-            : `w-full ${viewportTier === 'wide' ? 'max-w-lg' : 'max-w-md'} justify-center gap-6`
-      }`}>
+      <div
+        className={`vod-layout-row flex items-start max-w-full min-w-0 ${
+        edgePinnedRow
+          ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-between`
+          : triplePanelLayout
+            ? `w-full ${viewportTier === 'narrow' ? 'gap-2' : 'gap-3'} justify-center`
+            : splitLayout
+              ? `w-full ${viewportTier === 'narrow' ? 'gap-3' : 'gap-6'} justify-center`
+              : `w-full ${viewportTier === 'wide' ? 'max-w-lg' : 'max-w-md'} justify-center gap-6`
+      }`}
+        style={rowEdgeInsets ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth } : undefined}
+      >
       {previewOpen && (
         <div
           ref={previewPanelRef}

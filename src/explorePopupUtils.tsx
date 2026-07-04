@@ -186,13 +186,15 @@ export function startExplorePanelWidthResize(
   document.body.style.userSelect = 'none';
   document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
 
-  const applyWidthAndPos = (nextW: number) => {
-    widthRef.current = nextW;
+  const applyWidthAndPos = (rawNextW: number) => {
+    let nextW = clamp(rawNextW);
     if (panelEl) {
       panelEl.style.width = `${nextW}px`;
       panelEl.style.height = '';
     }
     if (startPos && opts.posRef && panelEl) {
+      const inset = panelResizeHandleInset(true);
+      const margin = VIEWPORT_EDGE_LOCK + inset;
       let x = startPos.x;
       let y = startPos.y;
       if (edgeAffectsWest(edge)) {
@@ -201,9 +203,41 @@ export function startExplorePanelWidthResize(
       if (edgeAffectsNorth(edge)) {
         y = startPos.y - (nextW - startW) / opts.aspect;
       }
+
+      const minX = margin;
+      const maxX = window.innerWidth - margin - nextW;
+      if (edgeAffectsWest(edge)) {
+        if (x < minX) {
+          x = minX;
+          nextW = clamp(startPos.x + startW - x);
+          x = startPos.x + startW - nextW;
+        }
+      } else {
+        x = Math.max(minX, Math.min(x, maxX));
+        const rightBound = window.innerWidth - margin;
+        if (x + nextW > rightBound) {
+          nextW = clamp(rightBound - x);
+        }
+      }
+
+      const panelH = panelEl.offsetHeight || 1;
+      const minY = margin;
+      const maxY = window.innerHeight - margin - panelH;
+      if (edgeAffectsNorth(edge) && y < minY) {
+        y = minY;
+      } else {
+        y = Math.max(minY, Math.min(y, maxY));
+      }
+
+      widthRef.current = nextW;
+      if (panelEl) {
+        panelEl.style.width = `${nextW}px`;
+      }
       const pos = { x, y };
       opts.posRef.current = pos;
       applyExplorePopupWindowPosition(panelEl, pos);
+    } else {
+      widthRef.current = nextW;
     }
   };
 
@@ -261,12 +295,27 @@ export function startFloatingPanelDrag(
   document.body.style.userSelect = 'none';
   document.body.style.cursor = 'grabbing';
 
+  const clampFloatingPos = (next: PanelPos): PanelPos => {
+    const inset = panelResizeHandleInset(true);
+    const margin = VIEWPORT_EDGE_LOCK + inset;
+    const w = panelEl?.offsetWidth ?? 0;
+    const h = panelEl?.offsetHeight ?? 0;
+    const minX = margin;
+    const minY = margin;
+    const maxX = window.innerWidth - margin - w;
+    const maxY = window.innerHeight - margin - h;
+    return {
+      x: Math.max(minX, Math.min(next.x, maxX)),
+      y: Math.max(minY, Math.min(next.y, maxY)),
+    };
+  };
+
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
-    const next = {
+    const next = clampFloatingPos({
       x: startPos.x + ev.clientX - startX,
       y: startPos.y + ev.clientY - startY,
-    };
+    });
     posRef.current = next;
     if (panelEl) {
       applyExplorePopupWindowPosition(panelEl, next);
