@@ -2,6 +2,7 @@
 HLS playlist parsing, segment downloading, and clip assembly — the segment-level
 HLS downloader that avoids yt-dlp for Twitch/Kick VODs.
 """
+import errno
 import json
 import logging
 import os
@@ -317,6 +318,18 @@ def _download_segments(
         raise RuntimeError("HLS segment download incomplete")
     return list(files)
 
+
+def _is_broken_pipe_error(exc: BaseException) -> bool:
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if isinstance(exc, OSError):
+        if exc.errno in (errno.EINVAL, 22):
+            return True
+        if getattr(exc, "winerror", None) == 233:
+            return True
+    return False
+
+
 def _feed_path_to_stdin(
     path: str,
     stdin,
@@ -334,6 +347,10 @@ def _feed_path_to_stdin(
                 stdin.write(buf)
             except BrokenPipeError:
                 break
+            except OSError as exc:
+                if _is_broken_pipe_error(exc):
+                    break
+                raise
             if on_chunk:
                 on_chunk()
     try:
@@ -464,6 +481,7 @@ def _progressive_hls_copy_to_mp4(
                     futures[idx] = pool.submit(_download_idx, idx)
 
             assert proc.stdin is not None
+            pipe_eof_exc: Optional[Exception] = None
             try:
                 for i in range(total):
                     _schedule_through(i + HLS_DOWNLOAD_AHEAD)
@@ -476,6 +494,8 @@ def _progressive_hls_copy_to_mp4(
                     path = seg_paths[i]
                     if not path:
                         raise RuntimeError(f"HLS segment {i} missing after download")
+                    if proc.poll() is not None:
+                        break
                     _feed_path_to_stdin(
                         path, proc.stdin, cancel_event, pause_event,
                         on_chunk=_touch_ffmpeg_activity,
@@ -488,8 +508,6 @@ def _progressive_hls_copy_to_mp4(
                             "phase": "Downloading",
                             "concat_encoder": "copy",
                         })
-                    if proc.poll() is not None:
-                        break
                 try:
                     proc.stdin.close()
                 except (BrokenPipeError, OSError):
@@ -501,13 +519,16 @@ def _progressive_hls_copy_to_mp4(
                     pass
             # ponytail: segment cleanup I/O errors only
             except (OSError, AttributeError) as exc:
-                with err_lock:
-                    errors.append(exc)
                 try:
                     proc.stdin.close()
                 except OSError:
                     pass
-                raise
+                if _is_broken_pipe_error(exc):
+                    pipe_eof_exc = exc
+                else:
+                    with err_lock:
+                        errors.append(exc)
+                    raise
             finally:
                 for fut in futures.values():
                     fut.result()
@@ -515,15 +536,22 @@ def _progressive_hls_copy_to_mp4(
             stderr_done.wait(timeout=5)
             stderr = proc.stderr.read() if proc.stderr else b""
             rc = proc.wait()
-            with err_lock:
-                if errors:
-                    raise errors[0]
-            if rc != 0:
-                err_tail = stderr.decode(errors="ignore")[-800:]
-                raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
-            if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
-                err_tail = stderr.decode(errors="ignore")[-800:]
-                raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
+            if pipe_eof_exc is not None:
+                if not (
+                    os.path.isfile(tmp_mp4)
+                    and os.path.getsize(tmp_mp4) >= MIN_VALID_OUTPUT_BYTES
+                ):
+                    raise pipe_eof_exc
+            else:
+                with err_lock:
+                    if errors:
+                        raise errors[0]
+                if rc != 0:
+                    err_tail = stderr.decode(errors="ignore")[-800:]
+                    raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
+                if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
+                    err_tail = stderr.decode(errors="ignore")[-800:]
+                    raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
     finally:
         _untrack_ffmpeg_proc(proc)
 
@@ -819,3 +847,11 @@ def _download_hls_clip(
         video_encoder=video_encoder,
         mp4_faststart=mp4_faststart,
     )
+
+
+if __name__ == "__main__":
+    assert _is_broken_pipe_error(BrokenPipeError())
+    assert _is_broken_pipe_error(OSError(errno.EINVAL, "Invalid argument"))
+    if os.name == "nt":
+        assert _is_broken_pipe_error(OSError(22, "Invalid argument"))
+        assert _is_broken_pipe_error(OSError(0, "pipe ended", None, 233))
