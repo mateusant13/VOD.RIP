@@ -1839,7 +1839,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleDeleteHistory = useCallback(async (id: string) => {
-    if (!window.confirm('Remove this download from history?')) return;
+    if (!window.confirm('Remove this download from history? The file on disk will also be deleted.')) return;
     setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -1851,7 +1851,7 @@ export default function App() {
   }, [refreshDownloads]);
 
   const handleRemoveFromQueue = useCallback(async (id: string) => {
-    if (!window.confirm('Remove this download from the queue?')) return;
+    if (!window.confirm('Remove this download from the queue? Any partial file on disk will also be deleted.')) return;
     setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
     try {
       await apiPost(`/api/download/${id}/remove`, {});
@@ -1888,7 +1888,7 @@ export default function App() {
 
   const handleBulkDeleteRecent = useCallback(async () => {
     if (selectedRecentIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent?`)) return;
+    if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent? Files on disk will also be deleted.`)) return;
     const ids = [...selectedRecentIds];
     setSelectedRecentIds(new Set());
     await Promise.allSettled(ids.map((id) =>
@@ -1899,7 +1899,7 @@ export default function App() {
 
   const handleBulkDeleteQueue = useCallback(async () => {
     if (selectedQueueIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue?`)) return;
+    if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue? Partial files on disk will also be deleted.`)) return;
     const ids = [...selectedQueueIds];
     setSelectedQueueIds(new Set());
     await Promise.allSettled(ids.map((id) =>
@@ -1910,7 +1910,7 @@ export default function App() {
 
   const handleBulkDeleteHistory = useCallback(async () => {
     if (selectedHistoryIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history?`)) return;
+    if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history? Files on disk will also be deleted.`)) return;
     const ids = [...selectedHistoryIds];
     setSelectedHistoryIds(new Set());
     await Promise.allSettled(ids.map((id) =>

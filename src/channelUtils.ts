@@ -408,18 +408,21 @@ export function estimateDownloadBytes(
 ): number {
   if (clipSec <= 0) return 0;
   const fullDur = Math.max(clipSec, fullDurationSec || clipSec);
+  let raw = 0;
   const sizes = videoInfo?.size_by_quality;
   if (sizes && Object.keys(sizes).length > 0) {
     const fullBytes = pickSizeForQuality(sizes, quality);
     if (fullBytes && fullBytes > 0) {
-      return Math.round(fullBytes * (clipSec / fullDur));
+      raw = Math.round(fullBytes * (clipSec / fullDur));
     }
+  } else if (videoInfo?.estimated_bytes && fullDur > 0) {
+    raw = Math.round(videoInfo.estimated_bytes * (clipSec / fullDur));
+  } else {
+    const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
+    raw = Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
   }
-  if (videoInfo?.estimated_bytes && fullDur > 0) {
-    return Math.round(videoInfo.estimated_bytes * (clipSec / fullDur));
-  }
-  const mbPerMin = LEGACY_MB_PER_MIN[quality] || 70;
-  return Math.round((clipSec / 60) * mbPerMin * 1024 * 1024);
+  // ponytail: remux/container overhead discount — match backend manifest scale tune
+  return raw > 0 ? Math.round(raw * 0.97) : 0;
 }
 
 /**

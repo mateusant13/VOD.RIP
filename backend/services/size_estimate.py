@@ -27,7 +27,7 @@ _FALLBACK_MBPS: Dict[str, float] = {
 _PEAK_BANDWIDTH_TO_AVG = 0.62
 # AVERAGE-BANDWIDTH on Twitch/Kick manifests overstates remux size ~1.1–1.3×
 # after accounting for container overhead; peak BANDWIDTH needs a separate scale.
-_MANIFEST_TO_REMUX_SCALE = 0.58
+_MANIFEST_TO_REMUX_SCALE = 0.55
 
 _DEFAULT_AUDIO_KBPS = 160.0
 
@@ -513,7 +513,9 @@ def enrich_info_dict(
             labels = [*labels, "source"]
         for label in labels:
             mbps = _fallback_mbps(str(label))
-            size_map[str(label)] = bytes_from_bitrate_kbps(mbps * 1000.0, dur)
+            size_map[str(label)] = bytes_from_bitrate_kbps(
+                mbps * 1000.0 * _MANIFEST_TO_REMUX_SCALE, dur,
+            )
 
     if size_map:
         info["size_by_quality"] = size_map
