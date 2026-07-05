@@ -256,21 +256,23 @@ def _pick_format_by_height(formats: list, prefer_height: int) -> dict:
 
 
 def _pick_youtube_clip_video_format(formats: list, prefer_height: int) -> dict:
-    """Pick video for trimmed download — muxed MP4 when height tier is webm-only."""
+    """Pick video for trimmed download — prefer muxed MP4, then h264 DASH at height."""
     candidates = [
         f for f in formats
         if f.get("url") and int(f.get("height") or 0) > 0
     ]
     if not candidates:
         raise RuntimeError("No video formats with height")
-    target = _pick_format_by_height(candidates, prefer_height)
-    if _is_muxed_progressive(target) or not _is_webm_video_format(target):
-        return target
-    muxed = [f for f in candidates if _is_muxed_progressive(f)]
-    if muxed:
-        at = [f for f in muxed if int(f["height"]) <= prefer_height]
-        return max(at or muxed, key=lambda f: int(f["height"]))
-    return target
+    at_height = [f for f in candidates if int(f["height"]) == prefer_height]
+    if at_height:
+        muxed = [f for f in at_height if _is_muxed_progressive(f)]
+        if muxed:
+            return max(muxed, key=lambda f: f.get("tbr") or 0)
+        mp4 = [f for f in at_height if not _is_webm_video_format(f)]
+        if mp4:
+            return max(mp4, key=lambda f: f.get("tbr") or 0)
+        return max(at_height, key=lambda f: f.get("tbr") or 0)
+    return _pick_format_by_height(candidates, prefer_height)
 
 
 def _youtube_format_playable(fmt: dict) -> bool:
@@ -1382,6 +1384,20 @@ def _download_progressive_clip(
         progress_hook({"status": "finished"})
 
 
+def _dash_video_needs_transcode(video_url: str) -> bool:
+    """VP9/AV1/webm cannot be copied into MP4."""
+    u = (video_url or "").lower()
+    if "mime=video%2fwebm" in u or "mime=video/webm" in u:
+        return True
+    if "itag/313" in u or "itag/315" in u or "itag/401" in u:
+        return True
+    return False
+
+
+def _ffmpeg_reconnect_args() -> list[str]:
+    return ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+
+
 def _download_muxed_dash_clip(
     video_url: str,
     audio_url: str,
@@ -1401,12 +1417,19 @@ def _download_muxed_dash_clip(
     duration = max(0.1, end_sec - start_sec)
     resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
     hdr = _ffmpeg_input_headers(headers or {})
+    reconnect = _ffmpeg_reconnect_args()
+    probe = ["-probesize", "32M", "-analyzeduration", "5M"]
     cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
-    cmd += hdr + ["-ss", str(start_sec), "-i", video_url]
-    cmd += hdr + ["-ss", str(start_sec), "-i", audio_url]
+    cmd += probe + hdr + reconnect + ["-ss", str(start_sec), "-i", video_url]
+    cmd += probe + hdr + reconnect + ["-ss", str(start_sec), "-i", audio_url]
     cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
     enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
-    cmd += enc_args if enc_args else ["-c", "copy"]
+    if enc_args:
+        cmd += enc_args
+    elif _dash_video_needs_transcode(video_url) and output_path.lower().endswith(".mp4"):
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
+    else:
+        cmd += ["-c", "copy"]
     if mp4_faststart:
         cmd += ["-movflags", "+faststart"]
     cmd.append(output_path)

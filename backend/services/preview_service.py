@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_TTL_SEC = 30 * 60
 PLAYLIST_REWRITE_TTL_SEC = 20 * 60
+_MAX_PLAYLIST_FETCH_BYTES = 512 * 1024
 PREWARM_SEGMENT_COUNT = 3
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
@@ -200,7 +201,11 @@ class PreviewManager:
             if kind == "progressive":
                     return session
 
-            if session.platform == "YouTube" and session.entry_url:
+            if (
+                    session.platform == "YouTube"
+                    and session.entry_url
+                    and not session.custom_master
+            ):
                     for attempt in range(2):
                             try:
                                     proxy_playlist(session_id, session.entry_url)
@@ -599,6 +604,12 @@ def _http_get_bytes(
         raise PermissionError(f"URL host not allowed for preview: {host}")
 
     headers = _request_headers(session, range_header)
+    is_playlist = _is_playlist_url(url)
+    max_bytes = (
+        MAX_SEGMENT_BYTES
+        if range_header
+        else (_MAX_PLAYLIST_FETCH_BYTES if is_playlist else MAX_SEGMENT_BYTES)
+    )
     try:
         from curl_cffi import requests as cffi_requests
 
@@ -606,24 +617,43 @@ def _http_get_bytes(
             url,
             headers=headers,
             impersonate="chrome",
-            stream=False,
+            stream=True,
             timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 90),
         )
     except ImportError:
         import requests
 
-        resp = requests.get(url, headers=headers, timeout=60)
+        resp = requests.get(url, headers=headers, stream=True, timeout=60)
 
     if resp.status_code in _AUTH_ERROR_CODES:
         if not _retried and session.platform == "YouTube":
             new_url = _youtube_refresh_and_remap(session, url)
             if new_url:
+                try:
+                    resp.close()
+                except OSError:
+                    pass
                 return _http_get_bytes(
                     session, new_url, range_header, _retried=True,
                 )
         raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     resp.raise_for_status()
-    data = resp.content or b""
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(
+                f"Upstream response exceeds {max_bytes} byte cap for preview fetch"
+            )
+    try:
+        resp.close()
+    except OSError:
+        pass
+    data = b"".join(chunks)
     ctype = _guess_content_type(url, resp.headers.get("Content-Type", ""))
     out_headers: dict = {"Accept-Ranges": "bytes"}
     for key in ("Content-Range", "Content-Length"):

@@ -1,6 +1,7 @@
 """YouTube preview smoke — real InnerTube, no browser spawn."""
 from __future__ import annotations
 
+import pytest
 from starlette.testclient import TestClient
 
 from app import app
@@ -12,6 +13,7 @@ URLS = [
 ]
 
 
+@pytest.mark.timeout(300)
 def test_youtube_preview_no_500():
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE
 

@@ -39,6 +39,34 @@ def test_classify_playability_login_retries():
     assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
 
 
+def test_dedupe_prefers_mp4_over_webm_at_same_height():
+    from services.youtube_innertube import _dedupe_youtube_formats
+
+    formats = [
+        {
+            "format_id": "adaptive-302",
+            "height": 720,
+            "url": "https://x/v?id=1&mime=video%2Fwebm",
+            "vcodec": "vp9",
+            "acodec": "none",
+            "tbr": 3000,
+            "protocol": "https",
+        },
+        {
+            "format_id": "adaptive-298",
+            "height": 720,
+            "url": "https://x/v?id=2&mime=video%2Fmp4",
+            "vcodec": "avc1",
+            "acodec": "none",
+            "tbr": 2500,
+            "protocol": "https",
+        },
+    ]
+    merged = _dedupe_youtube_formats(formats)
+    assert len(merged) == 1
+    assert merged[0]["format_id"] == "adaptive-298"
+
+
 def test_innertube_falls_through_clients_on_403():
     master = (
         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720\n"
@@ -58,7 +86,13 @@ def test_innertube_falls_through_clients_on_403():
     get_resp.raise_for_status = MagicMock()
 
     mock_http = MagicMock()
-    mock_http.post.side_effect = [post_resp_fail, post_resp_ok, post_resp_ok]
+    _post_calls = {"n": 0}
+
+    def _post_side_effect(*_args, **_kwargs):
+        _post_calls["n"] += 1
+        return post_resp_fail if _post_calls["n"] == 1 else post_resp_ok
+
+    mock_http.post.side_effect = _post_side_effect
     mock_http.get.return_value = get_resp
     session = YouTubeSession(visitor_data="test-visitor", cookie_header="YSC=test")
 

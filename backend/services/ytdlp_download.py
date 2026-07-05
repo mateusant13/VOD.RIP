@@ -966,11 +966,29 @@ def download_video_sync(
         )
     )
     if platform == "YouTube":
-        from services.ytdlp_hls import _youtube_info_has_hls, cached_extract_info, _youtube_info_use_clip_path
+        from services.ytdlp_hls import (
+            _youtube_info_use_clip_path,
+            cached_extract_info,
+            _pick_youtube_clip_video_format,
+            _is_muxed_progressive,
+        )
 
         try:
             probe = cached_extract_info(full_url, opts)
             is_hls = _youtube_info_use_clip_path(probe)
+            trim = _normalize_crop_range(crop_start, crop_end)
+            if trim and is_hls:
+                fmts = [
+                    f for f in probe.get("formats") or []
+                    if f.get("url") and int(f.get("height") or 0) > 0
+                ]
+                if fmts:
+                    vf = _pick_youtube_clip_video_format(
+                        fmts, _parse_prefer_height(quality),
+                    )
+                    if not _is_muxed_progressive(vf):
+                        # ponytail: yt-dlp download_sections — ffmpeg DASH on multi-GB googlevideo is too slow
+                        is_hls = False
         except Exception as exc:
             logger.debug("YouTube probe failed, preferring clip path over yt-dlp: %s", exc)
             is_hls = True

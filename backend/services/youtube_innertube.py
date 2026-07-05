@@ -345,11 +345,17 @@ def _dedupe_youtube_formats(formats: list[dict[str, Any]]) -> list[dict[str, Any
     by_height: dict[int, dict[str, Any]] = {}
     extras: list[dict[str, Any]] = []
 
-    def _score(fmt: dict) -> tuple[int, int]:
+    def _score(fmt: dict) -> tuple[int, int, int]:
         muxed = fmt.get("acodec") not in ("none", None)
         proto = (fmt.get("protocol") or "").lower()
         hls = proto in ("m3u8", "m3u8_native", "m3u8_ffmpeg") or fmt.get("format_id") == "hls-master"
-        return (2 if hls else 1 if muxed else 0, int(fmt.get("tbr") or 0))
+        url = (fmt.get("url") or "").lower()
+        webm = "mime=video%2fwebm" in url or "mime=video/webm" in url
+        return (
+            2 if hls else 1 if muxed else 0,
+            0 if webm else 1,
+            int(fmt.get("tbr") or 0),
+        )
 
     for fmt in formats:
         url = (fmt.get("url") or "").strip()
