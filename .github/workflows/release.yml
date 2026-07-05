@@ -26,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r backend/requirements.txt
-          pip install pytest
+          pip install pytest pytest-asyncio
           npm ci
       - name: Type-check frontend
         run: npx tsc --noEmit
