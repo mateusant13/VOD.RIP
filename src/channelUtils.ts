@@ -233,7 +233,7 @@ export function deriveChannelDisplayName(
 /** Slugs for a VOD/clip URL — Twitch /videos/{id} needs channelLogin from API metadata. */
 export function slugFromVideoUrl(
   url: string,
-  platform: 'kick' | 'twitch' | null,
+  platform: 'kick' | 'twitch' | 'youtube' | null,
   uploader?: string | null,
   channelLogin?: string | null,
 ): { kickSlug: string; twitchSlug: string; youtubeSlug: string } {
@@ -558,7 +558,7 @@ export function estimateDownloadBytes(
  */
 export function capDownloadToMaxBytes(
   estimatedBytes: number,
-  durationSec: number,
+  _durationSec: number,
   trimStartSec: number,
   trimEndSec: number,
 ): { trimEnd: number; estimatedBytes: number } | null {

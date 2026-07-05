@@ -19,7 +19,6 @@ import {
   applyHlsQualityLevel,
   attachProgressivePreview,
   inferLevelHeight,
-  initialPreviewPreferHeight,
   resolveInitialHlsPreviewHeight,
   levelIndexForHeight,
   playbackHeightFromRequest,

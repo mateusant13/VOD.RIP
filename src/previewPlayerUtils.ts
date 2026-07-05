@@ -520,8 +520,6 @@ export interface HlsLevelController {
   stopLoad?: () => void;
   loadSource?: (url: string) => void;
   startLoad?: (startPosition?: number) => void;
-  on?: (event: string, cb: () => void) => void;
-  off?: (event: string, cb: () => void) => void;
 }
 
 /** Switch HLS quality — immediate reloads current fragment at new level. */

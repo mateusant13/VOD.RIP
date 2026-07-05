@@ -4,19 +4,7 @@ import { useState, type ReactNode } from 'react';
 import { Play } from 'lucide-react';
 import { resolveVideoThumbnail } from '../channelUtils';
 
-interface ChannelVideo {
-  id: string;
-  platform: string;
-  title: string;
-  duration: number | null;
-  duration_string?: string | null;
-  created_at: string | null;
-  views: number | null;
-  thumbnail_url: string | null;
-  url: string;
-  channel: string;
-  content_kind?: 'vod' | 'clip';
-}
+import type { ChannelVideo } from '../types';
 
 export default function ChannelClipThumb({ video }: { video: ChannelVideo }): ReactNode {
   const [failed, setFailed] = useState(false);

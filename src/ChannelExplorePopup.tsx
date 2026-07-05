@@ -801,7 +801,7 @@ export default function ChannelExplorePopup({
             <div className="min-w-0 flex items-start gap-1.5">
               <span
                 className="shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5"
-                style={{ color: platformAccentColor(platform) }}
+                style={{ color: platformAccentColor(platform ?? 'kick') }}
                 title={`${vod.platform} #${vod.platformListIndex}`}
               >
                 {vod.platformListIndex}

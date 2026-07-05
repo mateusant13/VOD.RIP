@@ -1,4 +1,6 @@
 /** Shared platform accent colors — YouTube red toned down vs pure #FF0000. */
+import type { CSSProperties } from 'react';
+
 export const KICK_COLOR = '#53fc18';
 export const TWITCH_COLOR = '#9146FF';
 export const YOUTUBE_COLOR = '#F03030';
@@ -20,9 +22,9 @@ export function platformAccentColor(platform: string): string {
   return TWITCH_COLOR;
 }
 
-/** Inline style for custom `.vod-cb` checkboxes — pass platform accent or neutral zinc. */
-export function vodCheckboxStyle(accent: string): { '--vod-cb-accent': string } {
-  return { '--vod-cb-accent': accent };
+/** Inline style for custom checkboxes — pass platform accent or neutral zinc. */
+export function vodCheckboxStyle(accent: string): CSSProperties {
+  return { '--vod-cb-accent': accent } as CSSProperties;
 }
 
 export function platformActiveBorder(platform: string | null | undefined): string {
