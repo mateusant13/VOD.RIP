@@ -1,0 +1,59 @@
+---
+description: Verify before ship — run real tests yourself; never ask the user to be your QA for things you can prove in the shell.
+alwaysApply: true
+---
+
+# Verify before ship
+
+**Default:** You prove it works. The user is not your manual tester for backend, network, or playback paths you can exercise with tools.
+
+## Definition of done
+
+A task is not done until **you** ran the strictest applicable check and it passed — or you report a concrete blocker you could not automate.
+
+Do **not** end with "restart and try it" as the main proof. That is a last resort, not standard building.
+
+## Test tiers (know which you ran)
+
+| Tier | What | Ship proof? |
+|------|------|-------------|
+| Unit / mocked | Logic, fake data, patched externals | **No** |
+| Integration real | Live API, real URLs, real network | **Yes** (if assertions are strict) |
+| Content / playback | Body is actually what the consumer needs | **Required** for streams, files, proxies |
+
+Mocks are for speed and isolation — not for claiming preview, download, or auth "works."
+
+## Strict assertions (VOD.RIP lessons)
+
+Shallow checks lie. Prefer content over status codes:
+
+```python
+# BAD — passes on SABR/protobuf garbage
+assert resp.status_code in (200, 206) and resp.content
+
+# GOOD — preview must be playable shape
+assert text.lstrip().startswith("#EXTM3U")          # HLS master
+assert b"ftyp" in body[:32]                         # progressive MP4
+assert "application/vnd.yt-ump" not in ctype        # not YouTube SABR blob
+```
+
+For side effects: count `chrome.exe` with `uc_` profiles before/after — spawning Chrome is a test failure unless explicitly testing WPC opt-in.
+
+## Workflow (every non-trivial fix)
+
+1. Implement the smallest correct change.
+2. Run the **strictest** test you can (prefer `tests/test_*_e2e_real.py`, live smoke, or a one-off script with real URLs).
+3. **Fail → debug → fix → re-run** until green. Do not hand off a broken state.
+4. Report honestly: command run, pass/fail, what was real vs mocked, what you could not verify.
+
+## When asking the user is OK
+
+- Their **saved settings** or running process you cannot see (old server, `youtube_wpc_pot` in their `settings.json`).
+- **Subjective UI** (layout feel, animation polish).
+- **Credentials** only they hold.
+
+Never OK: "check if preview works" when you can `pytest` against real YouTube URLs or hit the API with `TestClient`.
+
+## New tests for network features
+
+Add or extend a `test_*_e2e_real.py` (real network, minimal mocks, strict body checks). Keep existing unit tests — they guard logic, not reality.

@@ -920,7 +920,7 @@ def download_video_sync(
     )
     from services.youtube_session import (
         youtube_session_from_settings,
-        ytdlp_youtube_extractor_args,
+        ytdlp_extractor_args,
         resolve_ytdlp_cookiefile,
     )
     from services.youtube_innertube import extract_video_id
@@ -932,13 +932,19 @@ def download_video_sync(
     cookie_path = resolve_ytdlp_cookiefile(yt_session, cookies_file)
     if cookie_path:
         opts["cookiefile"] = cookie_path
+    try:
+        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+    except Exception:
+        auto_auth = True
     if platform == "YouTube":
+        ext_args = ytdlp_extractor_args(yt_session, auto_auth=auto_auth)
         yt_args = opts.get("extractor_args") or {}
         opts["extractor_args"] = {
             **yt_args,
+            **ext_args,
             "youtube": {
                 **(yt_args.get("youtube") or {}),
-                **ytdlp_youtube_extractor_args(yt_session),
+                **ext_args["youtube"],
             },
         }
 
@@ -959,6 +965,15 @@ def download_video_sync(
             and not is_clip_url(full_url)
         )
     )
+    if platform == "YouTube":
+        from services.ytdlp_hls import _youtube_info_has_hls, cached_extract_info, _youtube_info_use_clip_path
+
+        try:
+            probe = cached_extract_info(full_url, opts)
+            is_hls = _youtube_info_use_clip_path(probe)
+        except Exception as exc:
+            logger.debug("YouTube probe failed, preferring clip path over yt-dlp: %s", exc)
+            is_hls = True
 
     # HLS downloads report their own 0→90% progress while segments are
     # fetched and muxed. The yt-dlp postprocessor poller only applies to

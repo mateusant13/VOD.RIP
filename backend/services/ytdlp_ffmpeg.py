@@ -446,7 +446,9 @@ def _run_ffmpeg(
     # 3s for typical clips, and a stream of "Remuxing… 93%" duplicates is
     # just noise.
     last_progress_emit_wall = start_ts
-    watchdog_enabled = track_encode and _phase_id(phase) == "encoding"
+    watchdog_enabled = track_encode and _phase_id(phase) in (
+        "encoding", "remuxing", "muxing",
+    )
     try:
         while proc.poll() is None:
             try:

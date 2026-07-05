@@ -9,6 +9,7 @@ from services.youtube_innertube import (
     innertube_extract_info,
     _parse_hls_variants,
 )
+from services.youtube_session import YouTubeSession
 
 
 def test_extract_video_id_watch():
@@ -56,12 +57,14 @@ def test_innertube_falls_through_clients_on_403():
     get_resp = MagicMock(status_code=200, text=master)
     get_resp.raise_for_status = MagicMock()
 
-    with patch("services.youtube_innertube.requests.post") as mock_post, patch(
-        "services.youtube_innertube.requests.get", return_value=get_resp,
-    ):
-        mock_post.side_effect = [post_resp_fail, post_resp_ok]
-        info = innertube_extract_info("dQw4w9WgXcQ")
+    mock_http = MagicMock()
+    mock_http.post.side_effect = [post_resp_fail, post_resp_ok, post_resp_ok]
+    mock_http.get.return_value = get_resp
+    session = YouTubeSession(visitor_data="test-visitor", cookie_header="YSC=test")
+
+    with patch("services.youtube_innertube._http_for", return_value=mock_http):
+        info = innertube_extract_info("dQw4w9WgXcQ", session=session)
     assert info is not None
     assert info["title"] == "t"
-    assert mock_post.call_count == 2
+    assert mock_http.post.call_count >= 2
     assert len(_CLIENT_PROFILES) >= 2

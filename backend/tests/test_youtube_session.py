@@ -9,7 +9,7 @@ from services.youtube_session import (
 
 
 def test_bootstrap_anonymous_session():
-    vd, cookies, cookie_file = bootstrap_anonymous_session()
+    vd, cookies, cookie_file, _http = bootstrap_anonymous_session()
     assert vd is None or len(vd) > 8
     assert cookies is None or "YSC" in cookies or "VISITOR" in cookies
     if cookie_file:

@@ -21,6 +21,7 @@ Before writing code, stop at the first rung that holds:
 - One `assert`-based self-check per non-trivial change (no test frameworks)
 - Mark shortcuts with `ponytail:` comment naming the upgrade path
 - See `report.md` for the 34 audit findings — reduce the count with every change
+- **Verify before ship** — `.cursor/rules/verify-before-ship.mdc`: real integration tests, strict assertions, fix on sight; user is not your QA
 - **Simple ≠ incomplete** — fix obvious siblings on the same surface; never defer improvements that belong in the same pass (`→ skipped:` is for genuinely out-of-scope work only)
 
-**Not lazy about:** input validation, data-loss prevention, security, accessibility.
+**Not lazy about:** input validation, data-loss prevention, security, accessibility, **running real verification before claiming done**.

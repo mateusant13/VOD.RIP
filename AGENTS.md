@@ -19,6 +19,7 @@ Before writing any code, stop at the first rung that holds:
 - **Do NOT create abstractions.** This codebase is drowning in them: a preview module that is also a full HTTP proxy, a download manager with 5 separate lock dictionaries, a 6,000-line component. The fix is deletion, not wrapping.
 - **Delete before you add.** Found dead code? Delete it. Found duplicated logic? Delete one copy, not wrap both. The audit flagged deprecated, never-called functions — remove them.
 - **One test per non-trivial change.** Not a test suite. Not a framework. One `assert`-based self-check or one small `test_*.py` that runs with `python -m pytest` (no fixtures, no mocks unless the code can't run without them). Trivial one-liners need no test.
+- **Verify before ship** — see `.cursor/rules/verify-before-ship.mdc`. Run **real** integration checks yourself (live URLs, strict body assertions). Mocks prove logic, not that preview/download works. Never ask the user to be your QA for paths you can hit in the shell. Fail → fix → re-run until green, then report what you actually ran.
 - **Mark every shortcut with `ponytail:`** — If you defer something, leave a `# ponytail: <what, upgrade path>` comment. The audit identifies the ceilings; use them.
 
 ## Not lazy about
@@ -28,6 +29,7 @@ Before writing any code, stop at the first rung that holds:
 - Security (OAuth tokens in plaintext settings.json is a known issue, do not make it worse)
 - Accessibility (the UI is a native desktop app + browser — keyboard nav, screen reader labels)
 - Anything explicitly requested by the user
+- **Verification** — real tests you run yourself before claiming success (see `verify-before-ship.mdc`)
 
 ## The audit as your guide
 

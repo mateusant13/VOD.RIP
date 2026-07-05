@@ -242,9 +242,14 @@ class DownloadManager:
             elif d.get("status") == "finished":
                 with self._lock:
                     state.status = "Finalising\u2026"
-                    state.progress = 99
-                self._notify_sse(download_id, "progress", 99)
-                self._notify_sse(download_id, "status", "Finalising\u2026")
+                    # Clip path emits finished after ffmpeg; jump to 100 if output exists.
+                    out = params.get("output_file") or ""
+                    if out and os.path.isfile(out) and os.path.getsize(out) >= 1024:
+                        state.progress = 100
+                    else:
+                        state.progress = 99
+                self._notify_sse(download_id, "progress", state.progress)
+                self._notify_sse(download_id, "status", state.status)
 
         def _cleanup_output():
             expected_duration = None

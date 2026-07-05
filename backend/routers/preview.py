@@ -9,23 +9,27 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse
+from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewWarmRequest
 
 from deps import INFO_EXECUTOR
 from services.preview_service import (
+    StalePreviewUrls,
     create_session,
     delete_session,
     open_progressive_proxy,
+    open_segment_proxy,
     preview_session_kind,
     proxy_master,
     proxy_playlist,
     proxy_segment,
+    refresh_youtube_preview_session,
     resolve_upstream,
     session_active_height,
     session_quality_labels,
     session_variant_heights,
     set_session_prefer_height,
     _is_playlist_url,
+    _is_rangeable_cdn_media,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +64,30 @@ def _parse_prefer_height_query(request: Request) -> Optional[int]:
     return height if height > 0 else None
 
 
+@router.post("/api/preview/warm")
+async def preview_warm(req: PreviewWarmRequest):
+    """Fire-and-forget InnerTube/yt-dlp cache warm — safe on hover or URL paste."""
+    url = (req.url or "").strip()
+    if not url:
+        return {"warmed": False, "reason": "empty"}
+    from services.ytdlp_service import detect_platform
+    if detect_platform(url) != "YouTube":
+        return {"warmed": False, "reason": "not_youtube"}
+    from deps import settings_mgr
+    opts = settings_mgr.get()
+
+    def _run() -> None:
+        from services.ytdlp_hls import warm_youtube_extract
+        warm_youtube_extract(
+            url,
+            oauth=opts.oauth or None,
+            cookies_file=opts.youtube_cookies_file or None,
+        )
+
+    asyncio.get_running_loop().run_in_executor(INFO_EXECUTOR, _run)
+    return {"warmed": True}
+
+
 @router.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
     if req.crop_end <= req.crop_start:
@@ -89,6 +117,22 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
     # ponytail: best-effort — network errors only
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/preview/session/{session_id}/refresh")
+async def preview_refresh_session(session_id: str, request: Request):
+    """Re-resolve expired YouTube googlevideo URLs for an active preview session."""
+    prefer_height = _parse_prefer_height_query(request) or 480
+    try:
+        session = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR,
+            lambda: refresh_youtube_preview_session(session_id, prefer_height=prefer_height),
+        )
+        return _preview_session_response(session)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -212,6 +256,21 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
                 lambda: proxy_playlist(session_id, upstream),
             )
             return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
+        if _is_rangeable_cdn_media(upstream):
+            generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
+                INFO_EXECUTOR,
+                lambda: open_segment_proxy(session_id, upstream, range_header),
+            )
+            response_headers = dict(extra_headers or {})
+            if ctype and ctype != "application/octet-stream":
+                response_headers.setdefault("Content-Type", ctype)
+            return StreamingResponse(
+                generate(),
+                media_type=ctype or "application/octet-stream",
+                status_code=status,
+                headers=response_headers,
+                background=BackgroundTask(cleanup),
+            )
         data, ctype, extra_headers, status = await loop.run_in_executor(
             INFO_EXECUTOR,
             lambda: proxy_segment(session_id, upstream, range_header),
@@ -229,6 +288,8 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except StalePreviewUrls as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:

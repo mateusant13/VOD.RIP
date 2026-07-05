@@ -34,6 +34,9 @@ import {
   inferLevelHeight,
   suggestClipDownloadName,
   suggestVideoDownloadName,
+  warmYoutubePreview,
+  warmYoutubePreviewBatch,
+  bindYoutubeChannelScrollWarm,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
@@ -203,6 +206,7 @@ export default function App() {
   const previewGenRef = useRef(0);
   /** Cancels debounced YouTube metadata prefetch when URL changes. */
   const youtubePrefetchGenRef = useRef(0);
+  const channelsScrollRef = useRef<HTMLDivElement>(null);
   /** True while a preview is active (loaded or loading) — blocks re-clicks. */
   const previewStartedRef = useRef(false);
   /** URL currently loaded in the preview player (may differ from `url` while browsing channel VODs). */
@@ -694,7 +698,8 @@ export default function App() {
         youtube: youtubePreview,
       });
       let qualityLabels = videoInfo?.qualities;
-      const res = await apiPost<{
+      if (youtubePreview) warmYoutubePreview(trimmedUrl);
+      const sessionPromise = apiPost<{
         session_id: string;
         master_url: string;
         playback_url?: string;
@@ -708,17 +713,13 @@ export default function App() {
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
+      const res = await sessionPromise;
       if (gen !== previewGenRef.current) return;
       const clipInfo = clipPreview && !qualityLabels?.length
         ? await apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
         : null;
-      const youtubeInfo = youtubePreview && !clipPreview && !videoInfo?.title
-        ? await apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
-        : null;
       if (clipInfo?.qualities?.length) {
         qualityLabels = clipInfo.qualities;
-      } else if (youtubeInfo?.qualities?.length) {
-        qualityLabels = youtubeInfo.qualities;
       }
       const mergedQualityLabels = qualityLabels?.length
         ? qualityLabels
@@ -755,10 +756,32 @@ export default function App() {
     const gen = ++youtubePrefetchGenRef.current;
     const timer = window.setTimeout(() => {
       if (gen !== youtubePrefetchGenRef.current) return;
-      void apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmed)}`).catch(() => {});
+      warmYoutubePreview(trimmed, 0);
     }, 450);
     return () => window.clearTimeout(timer);
   }, [url, videoInfo?.title, loading]);
+
+  // Channel list: warm first YouTube rows + IntersectionObserver on scroll.
+  useEffect(() => {
+    if (tab !== 'channels' || !selectedChannelId || !youtubeEnabled) return;
+    const root = channelsScrollRef.current;
+    if (!root) return;
+
+    const youtubeUrls = visibleChannelVideos
+      .filter((v) => v.platform === 'youtube')
+      .map((v) => buildVodUrl(v));
+    warmYoutubePreviewBatch(youtubeUrls, 6, 90);
+
+    let cleanup: (() => void) | undefined;
+    const raf = requestAnimationFrame(() => {
+      const rows = Array.from(root.querySelectorAll<HTMLElement>('[data-youtube-warm]'));
+      cleanup = bindYoutubeChannelScrollWarm(root, rows);
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      cleanup?.();
+    };
+  }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -856,6 +879,20 @@ export default function App() {
         }
       }).catch(() => { /* keep immediate levels */ });
       const onVideoError = () => {
+        const sid = previewSessionId;
+        if (youtubePreview && sid) {
+          void apiPost(`/api/preview/session/${sid}/refresh`, {})
+            .then(() => {
+              if (cancelled) return;
+              attachProgressivePreview(video, playbackUrl, previewTrimStartRef.current);
+              void video.play().catch(() => {});
+            })
+            .catch(() => {
+              setError('Clip preview failed — try again');
+              setPreviewVideoLoading(false);
+            });
+          return;
+        }
         setError('Clip preview failed — try again');
         setPreviewVideoLoading(false);
       };
@@ -889,6 +926,8 @@ export default function App() {
       setHlsRef(hls);
       hls.attachMedia(video);
       let networkRetries = 0;
+      let urlRefreshTried = false;
+      const sid = previewSessionId;
       const loadPlayback = () => {
         if (cancelled) return;
         hls.loadSource(playbackUrl);
@@ -954,6 +993,24 @@ export default function App() {
               }, networkRetries * 500);
               break;
             }
+            if (youtubePreview && sid && !urlRefreshTried) {
+              urlRefreshTried = true;
+              networkRetries = 0;
+              void apiPost(`/api/preview/session/${sid}/refresh`, {})
+                .then(() => {
+                  if (cancelled) return;
+                  hls.loadSource(playbackUrl);
+                  hls.startLoad();
+                })
+                .catch(() => {
+                  setError('Preview playback failed — try again');
+                  setPreviewVideoLoading(false);
+                  previewStartedRef.current = false;
+                  hls.destroy();
+                  previewHlsRef.current = null;
+                });
+              break;
+            }
             setError('Preview playback failed — try again');
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
@@ -1006,7 +1063,7 @@ export default function App() {
       cancelled = true;
       cleanup?.();
     };
-  }, [previewOpen, previewPlayback]);
+  }, [previewOpen, previewPlayback, previewSessionId]);
 
   const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
@@ -1518,6 +1575,8 @@ export default function App() {
 
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
     pauseAllExplorePopups();
+    const vodUrl = buildVodUrl(v);
+    if (v.platform === 'youtube') warmYoutubePreview(vodUrl);
     const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips' || isLikelyClip(v);
     const vod: ExplorePopupVod = {
       url: buildVodUrl(v),
@@ -3359,6 +3418,12 @@ export default function App() {
               className="url-trim-range w-full accent-zinc-400" />
             <button
               type="button"
+              onMouseEnter={() => {
+                const trimmed = url.trim();
+                if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
+                  warmYoutubePreview(trimmed);
+                }
+              }}
               onClick={openPreview}
               disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
               className={`w-full font-mono uppercase font-bold py-[clamp(0.3rem,1.5vh,0.625rem)] text-[clamp(9px,calc(10px*var(--ui-scale)),12px)] flex items-center justify-center gap-1.5 disabled:opacity-40 ${platformWatchPreviewBtn(urlActionPlatform, previewOpen)}`}
@@ -3888,7 +3953,9 @@ export default function App() {
           </div>
         )}
 
-        <div className={`flex-1 min-h-0 ${
+        <div
+          ref={channelsScrollRef}
+          className={`flex-1 min-h-0 ${
           showUrlInMainCard
             ? 'overflow-hidden flex flex-col'
             : 'overflow-y-auto overflow-x-hidden custom-scrollbar pr-1 pb-2 overscroll-y-contain'
@@ -4243,11 +4310,15 @@ export default function App() {
                                 key={`${v.platform}-${v.id}-${i}`}
                                 role="button"
                                 tabIndex={0}
+                                data-youtube-warm={v.platform === 'youtube' ? fullUrl : undefined}
                                 onClick={() => selectVod(fullUrl, {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,
                                   isClip: isClipItem,
                                 })}
+                                onMouseEnter={() => {
+                                  if (v.platform === 'youtube') warmYoutubePreview(fullUrl);
+                                }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Enter' || e.key === ' ') {
                                     e.preventDefault();
@@ -4302,6 +4373,9 @@ export default function App() {
                                 <button
                                   type="button"
                                   title={isClipItem ? 'Preview clip' : 'Preview VOD'}
+                                  onMouseEnter={() => {
+                                    if (v.platform === 'youtube') warmYoutubePreview(fullUrl);
+                                  }}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     void openExplorePlayer(v);

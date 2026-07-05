@@ -39,6 +39,23 @@ async def system_gpu_encoder():
     )
 
 
+@router.get("/api/settings/youtube-auth")
+async def youtube_auth_status():
+    """Which browser / PO providers auto-auth will use (diagnostics for Settings)."""
+    from deps import INFO_EXECUTOR
+    from services.youtube_auth import auth_status
+
+    s = settings_mgr.get()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        INFO_EXECUTOR,
+        lambda: auth_status(
+            getattr(s, "youtube_auto_auth", True),
+            s.youtube_cookies_browser or "",
+        ),
+    )
+
+
 @router.post("/api/settings", response_model=AppSettings)
 async def update_settings(update: SettingsUpdate):
     current = settings_mgr.get()
@@ -73,6 +90,12 @@ async def update_settings(update: SettingsUpdate):
         current.youtube_po_token = update.youtube_po_token.strip()
     if update.youtube_tokens_file is not None:
         current.youtube_tokens_file = update.youtube_tokens_file.strip()
+    if update.youtube_auto_auth is not None:
+        current.youtube_auto_auth = update.youtube_auto_auth
+    if update.youtube_pot_headless is not None:
+        current.youtube_pot_headless = update.youtube_pot_headless
+    if update.youtube_wpc_pot is not None:
+        current.youtube_wpc_pot = bool(update.youtube_wpc_pot)
     if update.quality is not None:
         current.quality = update.quality
     if update.panel_layout is not None:
@@ -110,13 +133,15 @@ async def pick_folder():
 
 @router.post("/api/open-folder")
 async def open_folder(req: OpenFolderRequest):
+    from utils import allow_foreground
+
+    allow_foreground()
     raw = (req.path or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="path is required")
     validated = validate_open_folder_path(raw, settings_mgr)
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(OS_EXECUTOR, open_folder_sync, validated)
+        open_folder_sync(validated)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:

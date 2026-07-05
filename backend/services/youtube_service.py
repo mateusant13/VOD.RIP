@@ -51,11 +51,17 @@ def list_channel_videos_sync(
     from services.youtube_session import (
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
-        ytdlp_youtube_extractor_args,
+        ytdlp_extractor_args,
     )
 
     url = channel_playlist_url(channel_ref, playlist)
     session = youtube_session_from_settings()
+    try:
+        from deps import settings_mgr
+        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+    except Exception:
+        auto_auth = True
+    ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
     opts: dict[str, Any] = {
         "extract_flat": "in_playlist",
         "playlistend": max(1, min(int(limit), 100)),
@@ -66,14 +72,17 @@ def list_channel_videos_sync(
         "socket_timeout": 12,
         "extractor_args": {
             "youtube": {
-                **ytdlp_youtube_extractor_args(session),
+                **ext_args["youtube"],
                 "player_client": ["ios", "mweb", "web"],
             },
+            **{k: v for k, v in ext_args.items() if k != "youtube"},
         },
     }
     cookie_path = resolve_ytdlp_cookiefile(session, None)
     if cookie_path:
         opts["cookiefile"] = cookie_path
+    if session.cookies_from_browser:
+        opts["cookiesfrombrowser"] = (session.cookies_from_browser,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries") or []

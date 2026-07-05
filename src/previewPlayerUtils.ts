@@ -1,3 +1,63 @@
+import { apiPost } from './hooks/useApiClient';
+import { detectUrlPlatform, isClipUrl } from './channelUtils';
+
+const _warmInflight = new Set<string>();
+const _warmTimers = new Map<string, number>();
+
+/** Debounced fire-and-forget InnerTube cache warm (hover, URL paste, preview intent). */
+export function warmYoutubePreview(url: string, delayMs = 0): void {
+  const trimmed = url.trim();
+  if (!trimmed || detectUrlPlatform(trimmed) !== 'youtube' || isClipUrl(trimmed)) return;
+  if (_warmInflight.has(trimmed)) return;
+
+  const existing = _warmTimers.get(trimmed);
+  if (existing != null) window.clearTimeout(existing);
+
+  const run = () => {
+    _warmTimers.delete(trimmed);
+    if (_warmInflight.has(trimmed)) return;
+    _warmInflight.add(trimmed);
+    void apiPost<{ warmed?: boolean }>('/api/preview/warm', { url: trimmed })
+      .catch(() => {})
+      .finally(() => { _warmInflight.delete(trimmed); });
+  };
+
+  if (delayMs <= 0) run();
+  else _warmTimers.set(trimmed, window.setTimeout(run, delayMs));
+}
+
+/** Stagger warm for first N YouTube URLs (channel list load / filter change). */
+export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 90): void {
+  let n = 0;
+  for (const raw of urls) {
+    if (n >= max) break;
+    const trimmed = raw.trim();
+    if (!trimmed || detectUrlPlatform(trimmed) !== 'youtube' || isClipUrl(trimmed)) continue;
+    warmYoutubePreview(trimmed, n * staggerMs);
+    n += 1;
+  }
+}
+
+/** Warm YouTube rows as they scroll into the channel list viewport. */
+export function bindYoutubeChannelScrollWarm(
+  scrollRoot: Element | null,
+  rowNodes: HTMLElement[],
+): () => void {
+  if (!scrollRoot || typeof IntersectionObserver === 'undefined') return () => {};
+  const observer = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const url = (entry.target as HTMLElement).dataset.youtubeWarm;
+        if (url) warmYoutubePreview(url);
+      }
+    },
+    { root: scrollRoot, rootMargin: '240px 0px', threshold: 0.01 },
+  );
+  for (const el of rowNodes) observer.observe(el);
+  return () => observer.disconnect();
+}
+
 export const PREVIEW_MAIN_DEFAULT_HEIGHT = 480;
 export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 360;
 export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
@@ -541,6 +601,10 @@ export function applyHlsQualityLevel(
 }
 
 void (() => {
+  console.assert(
+    warmYoutubePreviewBatch(['https://www.youtube.com/watch?v=dQw4w9WgXcQ'], 1) === undefined,
+    'batch warm is fire-and-forget',
+  );
   const cap = 360;
   console.assert(
     initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) === 1080,

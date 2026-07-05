@@ -85,6 +85,9 @@ export interface AppSettings {
   youtube_visitor_data?: string;
   youtube_po_token?: string;
   youtube_tokens_file?: string;
+  youtube_auto_auth?: boolean;
+  youtube_pot_headless?: boolean;
+  youtube_wpc_pot?: boolean;
   quality: string;
   panel_layout?: PersistedPanelLayout | null;
   window_geometry?: Record<string, number | boolean> | null;

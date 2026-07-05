@@ -8,7 +8,7 @@ import re
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any, Optional
@@ -23,15 +23,17 @@ _YT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+_CONNECT_TIMEOUT_SEC = 0.9
+_READ_TIMEOUT_SEC = 6.0
 _ANON_LOCK = threading.Lock()
 _ANON_TTL_SEC = 25 * 60
 _ANON_BOOT_EVENT: Optional[threading.Event] = None
-# ponytail: incognito-without-login jar — same cookies a fresh browser tab gets
 _ANON_CACHE: dict[str, Any] = {
     "ts": 0.0,
     "visitor_data": None,
     "cookie_header": None,
     "cookie_file": None,
+    "http_session": None,
     "touched_videos": set(),
 }
 
@@ -44,6 +46,28 @@ class YouTubeSession:
     cookies_from_browser: Optional[str] = None
     anonymous: bool = False
     cookie_file: Optional[str] = None
+    http_session: Optional[requests.Session] = field(default=None, compare=False, repr=False)
+
+
+def http_session_for(session: Optional[YouTubeSession]) -> requests.Session:
+    """Reuse TLS + cookies across bootstrap, InnerTube player, and manifest fetches."""
+    if session and session.http_session is not None:
+        return session.http_session
+    with _ANON_LOCK:
+        cached = _ANON_CACHE.get("http_session")
+        if isinstance(cached, requests.Session):
+            return cached
+    http = requests.Session()
+    http.headers.update({
+        "User-Agent": _YT_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return http
+
+
+def _attach_anon_http(http: requests.Session) -> None:
+    with _ANON_LOCK:
+        _ANON_CACHE["http_session"] = http
 
 
 def _cookie_header_from_jar(jar: requests.cookies.RequestsCookieJar) -> str:
@@ -86,14 +110,21 @@ def invalidate_anonymous_session() -> None:
     """Drop cached anonymous jar so the next extract gets a fresh cold visit."""
     with _ANON_LOCK:
         old_file = _ANON_CACHE.get("cookie_file")
+        old_http = _ANON_CACHE.get("http_session")
         _ANON_CACHE["ts"] = 0.0
         _ANON_CACHE["visitor_data"] = None
         _ANON_CACHE["cookie_header"] = None
         _ANON_CACHE["cookie_file"] = None
+        _ANON_CACHE["http_session"] = None
         _ANON_CACHE["touched_videos"] = set()
     if old_file:
         try:
             os.unlink(old_file)
+        except OSError:
+            pass
+    if isinstance(old_http, requests.Session):
+        try:
+            old_http.close()
         except OSError:
             pass
 
@@ -101,16 +132,17 @@ def invalidate_anonymous_session() -> None:
 def _bootstrap_network(
     video_id: Optional[str],
     timeout: float,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    session = requests.Session()
-    session.headers.update({
+) -> tuple[Optional[str], Optional[str], Optional[str], requests.Session]:
+    http = requests.Session()
+    http.headers.update({
         "User-Agent": _YT_UA,
         "Accept-Language": "en-US,en;q=0.9",
     })
-    session.get("https://www.youtube.com/", timeout=timeout)
+    req_timeout = (_CONNECT_TIMEOUT_SEC, timeout)
+    http.get("https://www.youtube.com/", timeout=req_timeout)
     if video_id:
-        session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=timeout)
-    vid_resp = session.post(
+        http.get(f"https://www.youtube.com/watch?v={video_id}", timeout=req_timeout)
+    vid_resp = http.post(
         _VISITOR_ID_URL,
         json={
             "context": {
@@ -123,20 +155,21 @@ def _bootstrap_network(
             }
         },
         headers={"Content-Type": "application/json"},
-        timeout=timeout,
+        timeout=req_timeout,
     )
     vid_resp.raise_for_status()
     visitor_data = (vid_resp.json().get("responseContext") or {}).get("visitorData")
-    cookie_header = _cookie_header_from_jar(session.cookies)
-    cookie_file = _write_netscape_cookiefile(session.cookies)
-    return visitor_data, cookie_header, cookie_file
+    cookie_header = _cookie_header_from_jar(http.cookies)
+    cookie_file = _write_netscape_cookiefile(http.cookies)
+    _attach_anon_http(http)
+    return visitor_data, cookie_header, cookie_file, http
 
 
 def bootstrap_anonymous_session(
     video_id: Optional[str] = None,
-    timeout: float = 12.0,
+    timeout: float = _READ_TIMEOUT_SEC,
     force: bool = False,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[requests.Session]]:
     """Cold YouTube visit — incognito-style, no Google login required."""
     global _ANON_BOOT_EVENT
     now = time.time()
@@ -148,6 +181,7 @@ def bootstrap_anonymous_session(
                     _ANON_CACHE.get("visitor_data"),
                     _ANON_CACHE.get("cookie_header"),
                     _ANON_CACHE.get("cookie_file"),
+                    _ANON_CACHE.get("http_session"),
                 )
         inflight = _ANON_BOOT_EVENT
         if inflight is not None:
@@ -164,16 +198,19 @@ def bootstrap_anonymous_session(
                 _ANON_CACHE.get("visitor_data"),
                 _ANON_CACHE.get("cookie_header"),
                 _ANON_CACHE.get("cookie_file"),
+                _ANON_CACHE.get("http_session"),
             )
 
     old_file = _ANON_CACHE.get("cookie_file")
+    old_http = _ANON_CACHE.get("http_session")
     visitor_data: Optional[str] = None
     cookie_header: Optional[str] = None
     cookie_file: Optional[str] = None
+    http_session: Optional[requests.Session] = None
     try:
         for attempt in range(3):
             try:
-                visitor_data, cookie_header, cookie_file = _bootstrap_network(
+                visitor_data, cookie_header, cookie_file, http_session = _bootstrap_network(
                     video_id, timeout,
                 )
                 if cookie_header and visitor_data:
@@ -197,18 +234,29 @@ def bootstrap_anonymous_session(
                     os.unlink(old_file)
                 except OSError:
                     pass
+            if isinstance(old_http, requests.Session) and old_http is not http_session:
+                try:
+                    old_http.close()
+                except OSError:
+                    pass
             if cookie_header:
                 _ANON_CACHE["ts"] = time.time()
                 _ANON_CACHE["visitor_data"] = visitor_data
                 _ANON_CACHE["cookie_header"] = cookie_header
                 _ANON_CACHE["cookie_file"] = cookie_file
+                _ANON_CACHE["http_session"] = http_session
             _ANON_BOOT_EVENT = None
         inflight.set()
 
-    return visitor_data, cookie_header, cookie_file
+    return visitor_data, cookie_header, cookie_file, http_session
 
 
-def _touch_video_page(video_id: str, cookie_header: str, timeout: float = 10.0) -> None:
+def _touch_video_page(
+    video_id: str,
+    cookie_header: str,
+    http: Optional[requests.Session] = None,
+    timeout: float = 5.0,
+) -> None:
     """Watch-page visit on a warm jar — InnerTube often needs video-bound context."""
     if not video_id or not cookie_header:
         return
@@ -216,11 +264,12 @@ def _touch_video_page(video_id: str, cookie_header: str, timeout: float = 10.0) 
         touched: set = _ANON_CACHE.setdefault("touched_videos", set())
         if video_id in touched:
             return
+    client = http or http_session_for(None)
     try:
-        requests.get(
+        client.get(
             f"https://www.youtube.com/watch?v={video_id}",
-            headers={"User-Agent": _YT_UA, "Cookie": cookie_header},
-            timeout=timeout,
+            headers={"Cookie": cookie_header},
+            timeout=(_CONNECT_TIMEOUT_SEC, timeout),
         )
         with _ANON_LOCK:
             _ANON_CACHE.setdefault("touched_videos", set()).add(video_id)
@@ -233,9 +282,9 @@ def warm_youtube_session(video_id: Optional[str] = None) -> None:
     bootstrap_anonymous_session(video_id=video_id, force=True)
 
 
-def fetch_visitor_data(timeout: float = 12.0) -> Optional[str]:
+def fetch_visitor_data(timeout: float = _READ_TIMEOUT_SEC) -> Optional[str]:
     """Session-bound visitorData (visitor_id API), not a stale homepage scrape."""
-    vd, _, _ = bootstrap_anonymous_session(timeout=timeout)
+    vd, _, _, _ = bootstrap_anonymous_session(timeout=timeout)
     return vd
 
 
@@ -277,6 +326,7 @@ def youtube_session_from_values(
     tokens_file: Optional[str] = None,
     cookies_from_browser: Optional[str] = None,
     video_id: Optional[str] = None,
+    auto_auth: bool = True,
 ) -> YouTubeSession:
     vd = (visitor_data or "").strip() or None
     pt = (po_token or "").strip() or None
@@ -285,33 +335,49 @@ def youtube_session_from_values(
         vd = vd or file_vd
         pt = pt or file_pt
 
+    browser_for_ytdlp = (cookies_from_browser or "").strip().lower() or None
+
     cookie_header: Optional[str] = None
     cookie_file: Optional[str] = None
+    http_session: Optional[requests.Session] = None
     anonymous = False
     manual_cookie = (cookies_file or "").strip()
     if manual_cookie and Path(manual_cookie).is_file():
         cookie_header = _cookie_header_from_file(manual_cookie)
         cookie_file = manual_cookie
-    elif not (cookies_from_browser or "").strip():
-        anon_vd, anon_cookie, anon_file = bootstrap_anonymous_session(video_id=video_id)
+        http_session = http_session_for(None)
+        if cookie_header:
+            http_session.headers["Cookie"] = cookie_header
+    elif browser_for_ytdlp:
+        from services.youtube_auth import load_best_browser_session
+
+        _loaded, cookie_header, http_session = load_best_browser_session(browser_for_ytdlp, False)
+
+    if not cookie_header:
+        anon_vd, anon_cookie, anon_file, anon_http = bootstrap_anonymous_session(
+            video_id=video_id,
+        )
         vd = vd or anon_vd
         cookie_header = anon_cookie
         cookie_file = anon_file
+        http_session = anon_http
         anonymous = bool(anon_cookie)
         if video_id and anon_cookie:
-            _touch_video_page(video_id, anon_cookie)
+            _touch_video_page(video_id, anon_cookie, http=anon_http)
+    elif not vd:
+        vd = fetch_visitor_data()
 
     if not vd:
         vd = fetch_visitor_data()
 
-    browser = (cookies_from_browser or "").strip().lower() or None
     return YouTubeSession(
         visitor_data=vd,
         po_token=pt,
         cookie_header=cookie_header,
-        cookies_from_browser=browser,
+        cookies_from_browser=browser_for_ytdlp,
         anonymous=anonymous,
-        cookie_file=cookie_file if not browser else None,
+        cookie_file=cookie_file if not browser_for_ytdlp else None,
+        http_session=http_session,
     )
 
 
@@ -323,6 +389,7 @@ def youtube_session_from_settings(
         from deps import settings_mgr as sm
         settings_mgr = sm
     s = settings_mgr.get()
+    auto_auth = getattr(s, "youtube_auto_auth", True)
     return youtube_session_from_values(
         visitor_data=getattr(s, "youtube_visitor_data", "") or None,
         po_token=getattr(s, "youtube_po_token", "") or None,
@@ -330,21 +397,39 @@ def youtube_session_from_settings(
         tokens_file=getattr(s, "youtube_tokens_file", "") or None,
         cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
         video_id=video_id,
+        auto_auth=auto_auth,
     )
 
 
-def ytdlp_youtube_extractor_args(session: YouTubeSession) -> dict[str, list[str]]:
+def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = True) -> dict[str, list[str]]:
     """Map session into yt-dlp youtube extractor_args."""
+    # ponytail: yt-dlp must never spawn WPC/Chrome — fetch_pot is always never
     args: dict[str, list[str]] = {
-        "player_client": ["web_safari", "ios", "mweb"],
-        "fetch_pot": ["auto"],
+        "player_client": ["tv", "web_safari", "mweb", "ios"],
+        "fetch_pot": ["never"],
     }
     if session.visitor_data:
         args["visitor_data"] = [session.visitor_data]
     if session.po_token:
         token = session.po_token
-        args["po_token"] = [f"web.player+{token}", f"web.gvs+{token}"]
+        args["po_token"] = [
+            f"web.player+{token}",
+            f"web.gvs+{token}",
+            f"mweb.gvs+{token}",
+        ]
+        args["player_client"] = ["tv", "mweb", "web_safari", "ios"]
     return args
+
+
+def ytdlp_extractor_args(
+    session: YouTubeSession,
+    *,
+    auto_auth: bool = True,
+) -> dict[str, dict[str, list[str]]]:
+    """youtube extractor_args for yt-dlp opts."""
+    return {
+        "youtube": ytdlp_youtube_extractor_args(session, auto_auth=auto_auth),
+    }
 
 
 def resolve_ytdlp_cookiefile(session: YouTubeSession, explicit: Optional[str] = None) -> Optional[str]:
@@ -358,6 +443,6 @@ def resolve_ytdlp_cookiefile(session: YouTubeSession, explicit: Optional[str] = 
     return None
 
 
-assert youtube_session_from_values(visitor_data="abc").visitor_data == "abc"
-_anon_vd, _anon_ch, _ = bootstrap_anonymous_session()
+assert youtube_session_from_values(visitor_data="abc", auto_auth=False).visitor_data == "abc"
+_anon_vd, _anon_ch, _, _anon_http = bootstrap_anonymous_session()
 assert _anon_ch is None or "VISITOR" in _anon_ch or "YSC" in _anon_ch or len(_anon_ch) > 0

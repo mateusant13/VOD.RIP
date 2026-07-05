@@ -435,6 +435,59 @@ def _raise_hwnd_foreground(root: int, user32, kernel32, ctypes, wintypes) -> Non
         pass
 
 
+def _explorer_hwnd_by_title(folder_path: str, item_name: Optional[str] = None) -> int:
+    """Fallback: match Explorer window by title when Shell path lookup fails."""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        GW_OWNER = 4
+        folder_norm = os.path.normcase(os.path.abspath(folder_path))
+        folder_base = (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
+        needles: set[str] = {folder_base}
+        if item_name:
+            needles.add(os.path.normcase(item_name).lower())
+        captured: list[int] = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def _title_matches(tv: str) -> bool:
+            tv = tv.lower()
+            for n in needles:
+                if not n:
+                    continue
+                if tv == n or tv.startswith(f"{n} -") or tv.startswith(n):
+                    return True
+            return False
+
+        def _cb(hwnd, _lparam):
+            if captured:
+                return False
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            if user32.GetClassNameW(hwnd, cls, 256) == 0:
+                return True
+            if cls.value not in ("CabinetWClass", "ExploreWClass"):
+                return True
+            if user32.GetWindow(hwnd, GW_OWNER):
+                return True
+            title = ctypes.create_unicode_buffer(512)
+            n = user32.GetWindowTextW(hwnd, title, 512)
+            if n <= 0:
+                return True
+            if _title_matches(title.value):
+                captured.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        return captured[0] if captured else 0
+    except Exception:
+        return 0
+
+
 def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> bool:
     """Bring the Explorer window showing folder_path to the foreground."""
     if os.name != "nt":
@@ -445,8 +498,11 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         GA_ROOT = 2
-        hwnds = _explorer_hwnds_for_folder(folder_path)
-        hwnd = _pick_topmost_hwnd(user32, ctypes, wintypes, hwnds)
+        # Title match first — SHOpenFolderAndSelectItems window appears before Shell path lookup.
+        hwnd = _explorer_hwnd_by_title(folder_path, item_name)
+        if not hwnd:
+            hwnds = _explorer_hwnds_for_folder(folder_path)
+            hwnd = _pick_topmost_hwnd(user32, ctypes, wintypes, hwnds)
         if not hwnd:
             return False
         root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
@@ -475,19 +531,6 @@ def nudge_explorer_foreground(
             return
         if i + 1 < attempts and delay > 0:
             time.sleep(delay)
-
-
-def _schedule_explorer_foreground(folder_path: str, item_name: Optional[str] = None) -> None:
-    """Focus the Explorer window once it exists (pywebview steals focus on click)."""
-
-    def _work() -> None:
-        for wait in (0.05, 0.15, 0.3, 0.5, 0.75, 1.0, 1.4, 1.9, 2.5, 3.2, 4.0, 5.0):
-            time.sleep(wait)
-            if focus_explorer_window(folder_path, item_name):
-                return
-        nudge_explorer_foreground(folder_path, item_name, attempts=20, delay=0.15)
-
-    threading.Thread(target=_work, daemon=True, name="explorer-focus").start()
 
 
 def ensure_shell_com() -> bool:
@@ -571,7 +614,7 @@ def reveal_path_windows(target: str) -> None:
         else:
             return
     if shell_reveal_via_pidl(reveal_target):
-        _schedule_explorer_foreground(folder, item)
+        nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
         return
     if item and os.path.isfile(abspath):
         subprocess.Popen(
@@ -583,7 +626,7 @@ def reveal_path_windows(target: str) -> None:
             ["explorer.exe", folder],
             creationflags=_NO_WINDOW,
         )
-    _schedule_explorer_foreground(folder, item)
+    nudge_explorer_foreground(folder, item, attempts=20, delay=0.1)
 
 
 def open_folder_sync(path: str) -> None:

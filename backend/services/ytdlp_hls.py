@@ -166,14 +166,16 @@ def youtube_preview_ytdl_opts(
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
         youtube_session_from_values,
-        ytdlp_youtube_extractor_args,
+        ytdlp_extractor_args,
     )
 
     vid = extract_video_id(full_url)
+    auto_auth = True
     if session is None:
         try:
             from deps import settings_mgr
             s = settings_mgr.get()
+            auto_auth = getattr(s, "youtube_auto_auth", True)
             session = youtube_session_from_values(
                 visitor_data=getattr(s, "youtube_visitor_data", "") or None,
                 po_token=getattr(s, "youtube_po_token", "") or None,
@@ -181,12 +183,14 @@ def youtube_preview_ytdl_opts(
                 tokens_file=getattr(s, "youtube_tokens_file", "") or None,
                 cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
                 video_id=vid,
+                auto_auth=auto_auth,
             )
         except Exception:
             session = youtube_session_from_settings(video_id=vid)
+            auto_auth = True
 
     opts: dict = {
-        "extractor_args": {"youtube": ytdlp_youtube_extractor_args(session)},
+        "extractor_args": ytdlp_extractor_args(session, auto_auth=auto_auth),
         "cachedir": str(cachedir or _get_cache_dir()),
         "_youtube_session": session,
         "socket_timeout": 10,
@@ -208,22 +212,103 @@ def youtube_preview_ytdl_opts(
 def _youtube_info_has_hls(info: dict) -> bool:
     """Preview needs m3u8 ladder — progressive-only yt-dlp hits must not be cached."""
     for fmt in info.get("formats") or []:
-        if fmt.get("url") and fmt.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg"):
+        if not fmt.get("url"):
+            continue
+        fid = (fmt.get("format_id") or "").lower()
+        if fid == "hls-master":
+            return True
+        if fmt.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg"):
             return True
     return False
+
+
+def _youtube_info_use_clip_path(info: dict) -> bool:
+    """Route YouTube through clip downloader (HLS or InnerTube direct googlevideo URLs)."""
+    if _youtube_info_has_hls(info):
+        return True
+    return any(
+        int(f.get("height") or 0) > 0
+        and (f.get("protocol") or "").lower() in ("https", "http")
+        for f in info.get("formats") or []
+        if f.get("url")
+    )
+
+
+def _is_webm_video_format(fmt: dict) -> bool:
+    url = (fmt.get("url") or "").lower()
+    if "mime=video%2fwebm" in url or "mime=video/webm" in url:
+        return True
+    vc = (fmt.get("vcodec") or "").lower()
+    return vc.startswith("vp9") or vc.startswith("av01")
+
+
+def _pick_format_by_height(formats: list, prefer_height: int) -> dict:
+    with_h = [f for f in formats if int(f.get("height") or 0) > 0]
+    if not with_h:
+        raise RuntimeError("No video formats with height")
+    exact = [f for f in with_h if int(f["height"]) == prefer_height]
+    if exact:
+        return max(exact, key=lambda f: f.get("tbr") or 0)
+    at_or_below = [f for f in with_h if int(f["height"]) <= prefer_height]
+    if at_or_below:
+        return max(at_or_below, key=lambda f: int(f["height"]))
+    return min(with_h, key=lambda f: int(f["height"]))
+
+
+def _pick_youtube_clip_video_format(formats: list, prefer_height: int) -> dict:
+    """Pick video for trimmed download — muxed MP4 when height tier is webm-only."""
+    candidates = [
+        f for f in formats
+        if f.get("url") and int(f.get("height") or 0) > 0
+    ]
+    if not candidates:
+        raise RuntimeError("No video formats with height")
+    target = _pick_format_by_height(candidates, prefer_height)
+    if _is_muxed_progressive(target) or not _is_webm_video_format(target):
+        return target
+    muxed = [f for f in candidates if _is_muxed_progressive(f)]
+    if muxed:
+        at = [f for f in muxed if int(f["height"]) <= prefer_height]
+        return max(at or muxed, key=lambda f: int(f["height"]))
+    return target
+
+
+def _youtube_format_playable(fmt: dict) -> bool:
+    if not fmt.get("url"):
+        return False
+    fid = (fmt.get("format_id") or "").lower()
+    if fid == "hls-master":
+        return True
+    if fid == "abr-muxed":
+        return False
+    proto = (fmt.get("protocol") or "").lower()
+    if proto in ("m3u8", "m3u8_native", "m3u8_ffmpeg"):
+        return True
+    if proto not in ("https", "http"):
+        return False
+    if int(fmt.get("height") or 0) > 0:
+        return True
+    return fmt.get("acodec") not in (None, "none") and fmt.get("vcodec") not in (None, "none")
+
+
+def _youtube_info_playable(info: dict) -> bool:
+    """HLS, muxed ABR, or direct progressive URL."""
+    if _youtube_info_has_hls(info):
+        return True
+    return any(_youtube_format_playable(f) for f in info.get("formats") or [])
 
 
 def _youtube_cache_ok(url: str, opts: dict, info: dict) -> bool:
     if not _youtube_url_from_opts(url, opts):
         return True
-    return _youtube_info_has_hls(info)
+    return _youtube_info_playable(info)
 
 
-def _try_innertube_info_retry(url: str, attempts: int = 3, session=None) -> Optional[dict]:
-    """InnerTube multi-client chain (IOS → ANDROID → MWEB → TVHTML5 → WEB)."""
+def _try_innertube_info_retry(url: str, attempts: int = 1, session=None) -> Optional[dict]:
+    """InnerTube multi-client chain — one pass; outer extract loop handles retries."""
     for i in range(attempts):
         info = _try_innertube_info(url, session=session)
-        if info and _youtube_info_has_hls(info):
+        if info and _youtube_info_playable(info):
             return info
         if i + 1 < attempts:
             time.sleep(0.12 * (i + 1))
@@ -237,14 +322,19 @@ def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
         invalidate_anonymous_session,
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
-        ytdlp_youtube_extractor_args,
+        ytdlp_extractor_args,
     )
 
     invalidate_anonymous_session()
     fresh = youtube_session_from_settings(video_id=extract_video_id(url))
     merged = dict(opts)
     merged["_youtube_session"] = fresh
-    merged["extractor_args"] = {"youtube": ytdlp_youtube_extractor_args(fresh)}
+    try:
+        from deps import settings_mgr
+        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+    except Exception:
+        auto_auth = True
+    merged["extractor_args"] = ytdlp_extractor_args(fresh, auto_auth=auto_auth)
     cookie_path = resolve_ytdlp_cookiefile(fresh, merged.get("cookiefile"))
     if cookie_path:
         merged["cookiefile"] = cookie_path
@@ -260,29 +350,28 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
     info = _try_innertube_info_retry(url, session=yt_session)
     if info:
         return info
-    no_cookie = {k: v for k, v in opts.items() if k != "cookiefile"}
-    info = _extract_hls_info_quiet(url, no_cookie)
-    if info:
-        return info
+    # Cookie jar (anonymous or exported) is usually the fast yt-dlp path — try before bare.
     if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
-        return _extract_hls_info_quiet(url, opts)
-    return None
+        info = _extract_hls_info_quiet(url, opts)
+        if info:
+            return info
+    return _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
 
 
-def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 4) -> dict:
+def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> dict:
     working = dict(opts)
     last_err: Optional[BaseException] = None
     for i in range(attempts):
         try:
             info = _youtube_extract_pass(url, working)
-            if info and _youtube_info_has_hls(info):
+            if info and _youtube_info_playable(info):
                 return info
         except Exception as exc:
             last_err = exc
         if i + 1 < attempts:
             if i % 2 == 1:
                 working = _merge_fresh_youtube_session(working, url)
-            time.sleep(0.2 * (i + 1))
+            time.sleep(0.12 * (i + 1))
     if last_err is not None:
         raise last_err
     raise RuntimeError(
@@ -290,7 +379,7 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 4) -> di
     )
 
 
-assert _try_innertube_info_retry.__name__ == "_try_innertube_info_retry"
+assert _youtube_format_playable({"format_id": "hls-master", "url": "https://x/master.m3u8", "protocol": "m3u8_native"}) is True
 
 
 def _cache_extract_result(key: str, info: dict) -> None:
@@ -348,8 +437,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             raise RuntimeError(
                 "YouTube blocked this video — add cookies, browser cookies, or po_token in Settings"
             )
-        if _youtube_url_from_opts(url, opts) and not _youtube_info_has_hls(info):
-            raise RuntimeError("YouTube extract returned no HLS formats")
+        if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
+            raise RuntimeError("YouTube extract returned no playable formats")
         box["result"] = info
         if _youtube_cache_ok(url, opts, info):
             _cache_extract_result(key, info)
@@ -365,7 +454,23 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
 assert cached_extract_info.__name__ == "cached_extract_info"
 assert _youtube_info_has_hls({"formats": [{"url": "https://x/a.m3u8", "protocol": "m3u8_native"}]})
-assert not _youtube_info_has_hls({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "ext": "mp4"}]})
+assert _youtube_info_use_clip_path({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
+assert _youtube_info_playable({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
+
+
+def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None) -> bool:
+    """Populate shared extract cache (InnerTube first). Cheap — safe to call from hover/prefetch."""
+    from services.youtube_innertube import extract_video_id
+
+    if not extract_video_id(url):
+        return False
+    try:
+        opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
+        cached_extract_info(url, opts)
+        return True
+    except Exception as exc:
+        logger.debug("YouTube warm extract skipped for %s: %s", url[:80], exc)
+        return False
 
 
 def _extract_hls_info_quiet(url: str, opts: dict) -> Optional[dict]:
@@ -421,6 +526,42 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         if ydl_log.lines and logger.isEnabledFor(logging.DEBUG):
             logger.debug("yt-dlp: %s", "\n".join(ydl_log.lines))
 
+def _is_muxed_progressive(fmt: dict) -> bool:
+    fid = (fmt.get("format_id") or "").lower()
+    if fid == "hls-master":
+        return True
+    if fid == "abr-muxed":
+        return False
+    ac = fmt.get("acodec")
+    vc = fmt.get("vcodec")
+    if ac in ("none", None) or vc in ("none", None):
+        return False
+    return True
+
+
+def _find_progressive_format(info: dict) -> dict:
+    formats = info.get("formats") or []
+    prog = [
+        f for f in formats
+        if f.get("url")
+        and (f.get("protocol") or "").lower() in ("https", "http")
+        and int(f.get("height") or 0) > 0
+        and _is_muxed_progressive(f)
+    ]
+    if not prog:
+        raise RuntimeError("No progressive format found in video info")
+    prog.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    return prog[0]
+
+
+def _find_media_format(info: dict) -> dict:
+    """HLS first; YouTube InnerTube often returns progressive-only."""
+    try:
+        return _find_hls_format(info)
+    except RuntimeError:
+        return _find_progressive_format(info)
+
+
 def _find_hls_format(info: dict) -> dict:
     """Pick the best HLS (m3u8) format matching the user's quality preference.
 
@@ -432,6 +573,7 @@ def _find_hls_format(info: dict) -> dict:
     hls_formats = [
         f for f in formats
         if f.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg")
+        or (f.get("format_id") or "").lower() == "hls-master"
     ]
     if not hls_formats:
         raise RuntimeError("No HLS format found in video info")
@@ -1171,6 +1313,132 @@ def _extract_hls_audio(video_path: str, output_path: str, ffmpeg_exe: Optional[s
     _verify_output_file(output_path)
 
 
+def _ffmpeg_input_headers(headers: dict) -> list[str]:
+    if not headers:
+        return []
+    return ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+
+
+def _download_progressive_clip(
+    media_url: str,
+    output_path: str,
+    start_sec: float,
+    end_sec: float,
+    headers: Optional[dict] = None,
+    ffmpeg_exe: Optional[str] = None,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    prefer_height: int = 720,
+    video_encoder: Optional[str] = None,
+    mp4_faststart: bool = False,
+    audio_only: bool = False,
+) -> None:
+    """Trim a direct MP4 URL (YouTube adaptiveFormats) via ffmpeg."""
+    del prefer_height
+    duration = max(0.1, end_sec - start_sec)
+    resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
+    cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd += _ffmpeg_input_headers(headers or {})
+    cmd += ["-ss", str(start_sec), "-i", media_url, "-t", str(duration)]
+    if audio_only:
+        cmd += ["-vn", "-acodec", "libmp3lame", "-b:a", "192k", output_path]
+    else:
+        enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
+        if enc_args:
+            cmd += enc_args
+        else:
+            cmd += ["-c", "copy"]
+        if mp4_faststart:
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(output_path)
+    if progress_hook:
+        progress_hook({
+            "status": "downloading",
+            "percent": 5,
+            "phase": "Downloading",
+            "phase_id": _phase_id("Downloading"),
+        })
+    _run_ffmpeg(
+        cmd,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        register_abort=register_abort,
+        progress_hook=progress_hook,
+        encode_duration=duration,
+        progress_from=10.0,
+        progress_to=92.0,
+        phase="Remuxing" if (video_encoder or "copy") == "copy" else "Encoding",
+    )
+    _verify_output_file(output_path)
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 99,
+            "phase": "Finalising",
+            "phase_id": _phase_id("Finalising"),
+        })
+        progress_hook({"status": "finished"})
+
+
+def _download_muxed_dash_clip(
+    video_url: str,
+    audio_url: str,
+    output_path: str,
+    start_sec: float,
+    end_sec: float,
+    headers: Optional[dict] = None,
+    ffmpeg_exe: Optional[str] = None,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+    video_encoder: Optional[str] = None,
+    mp4_faststart: bool = False,
+) -> None:
+    """Trim separate video+audio googlevideo URLs and mux to MP4."""
+    duration = max(0.1, end_sec - start_sec)
+    resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
+    hdr = _ffmpeg_input_headers(headers or {})
+    cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd += hdr + ["-ss", str(start_sec), "-i", video_url]
+    cmd += hdr + ["-ss", str(start_sec), "-i", audio_url]
+    cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
+    enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
+    cmd += enc_args if enc_args else ["-c", "copy"]
+    if mp4_faststart:
+        cmd += ["-movflags", "+faststart"]
+    cmd.append(output_path)
+    if progress_hook:
+        progress_hook({
+            "status": "downloading",
+            "percent": 5,
+            "phase": "Downloading",
+            "phase_id": _phase_id("Downloading"),
+        })
+    _run_ffmpeg(
+        cmd,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        register_abort=register_abort,
+        progress_hook=progress_hook,
+        encode_duration=duration,
+        progress_from=10.0,
+        progress_to=92.0,
+        phase="Muxing",
+    )
+    _verify_output_file(output_path)
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 99,
+            "phase": "Finalising",
+            "phase_id": _phase_id("Finalising"),
+        })
+        progress_hook({"status": "finished"})
+
+
 def _download_hls_clip(
     url: str,
     output_path: str,
@@ -1202,10 +1470,67 @@ def _download_hls_clip(
         info = cached_extract_info(url, extract_opts)
     else:
         info = _extract_hls_info(url, opts)
-    fmt = _find_hls_format(info)
-    media_url = fmt["url"]
-    headers = fmt.get("http_headers") or info.get("http_headers") or {}
+    headers = info.get("http_headers") or {}
     ffmpeg_exe = _resolve_ffmpeg_exe(opts.get("ffmpeg_location"))
+
+    if extract_video_id(url) and not _youtube_info_has_hls(info):
+        https_formats = [
+            f for f in info.get("formats") or []
+            if f.get("url")
+            and int(f.get("height") or 0) > 0
+            and (f.get("protocol") or "").lower() in ("https", "http")
+        ]
+        if https_formats:
+            video_fmt = _pick_youtube_clip_video_format(https_formats, prefer_height)
+            vheaders = video_fmt.get("http_headers") or headers
+            if _is_muxed_progressive(video_fmt):
+                _download_progressive_clip(
+                    video_fmt["url"], output_path, start_sec, end_sec, headers=vheaders,
+                    ffmpeg_exe=ffmpeg_exe,
+                    progress_hook=progress_hook,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    register_abort=register_abort,
+                    prefer_height=prefer_height,
+                    video_encoder=video_encoder,
+                    mp4_faststart=mp4_faststart,
+                    audio_only=audio_only,
+                )
+                return
+            audio_fmt = info.get("_preview_audio_format")
+            if audio_fmt and audio_fmt.get("url") and not audio_only:
+                _download_muxed_dash_clip(
+                    video_fmt["url"], audio_fmt["url"], output_path,
+                    start_sec, end_sec, headers=vheaders,
+                    ffmpeg_exe=ffmpeg_exe,
+                    progress_hook=progress_hook,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    register_abort=register_abort,
+                    video_encoder=video_encoder,
+                    mp4_faststart=mp4_faststart,
+                )
+                return
+
+    fmt = _find_media_format(info)
+    media_url = fmt["url"]
+    headers = fmt.get("http_headers") or headers
+    is_progressive = (fmt.get("protocol") or "").lower() in ("https", "http")
+
+    if is_progressive and extract_video_id(url):
+        _download_progressive_clip(
+            media_url, output_path, start_sec, end_sec, headers=headers,
+            ffmpeg_exe=ffmpeg_exe,
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            prefer_height=prefer_height,
+            video_encoder=video_encoder,
+            mp4_faststart=mp4_faststart,
+            audio_only=audio_only,
+        )
+        return
 
     clip_target = output_path
     temp_video: Optional[str] = None
@@ -1233,6 +1558,15 @@ def _download_hls_clip(
             os.unlink(temp_video)
 
 
+assert _find_media_format({
+    "formats": [{
+        "url": "https://x/v.mp4",
+        "protocol": "https",
+        "height": 720,
+        "vcodec": "avc1",
+        "acodec": "mp4a",
+    }],
+}).get("height") == 720
 if __name__ == "__main__":
     assert _is_broken_pipe_error(BrokenPipeError())
     assert _is_broken_pipe_error(OSError(errno.EINVAL, "Invalid argument"))

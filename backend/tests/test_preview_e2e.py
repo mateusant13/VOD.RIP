@@ -32,7 +32,7 @@ class TestIsPlaylistUrl:
 class TestYouTubePreviewResolve:
     """YouTube preview must stay on HLS — progressive googlevideo URLs 403 in-browser."""
 
-    def test_progressive_only_metadata_rejected(self):
+    def test_progressive_only_metadata_accepted(self):
         from unittest.mock import patch
 
         from services.preview_service import resolve_stream_info
@@ -53,8 +53,10 @@ class TestYouTubePreviewResolve:
             "services.preview_service._extract_youtube_preview_info",
             return_value=prog_only,
         ):
-            with pytest.raises(RuntimeError, match="HLS"):
-                resolve_stream_info(url)
+            entry, _hdrs, platform, _variants, kind = resolve_stream_info(url)
+        assert platform == "YouTube"
+        assert kind == "progressive"
+        assert "googlevideo.com" in entry
 
     def test_hls_metadata_used(self):
         from unittest.mock import patch

@@ -50,6 +50,7 @@ app.include_router(system.router)
 def _warm_youtube_session() -> None:
     try:
         from services.youtube_session import warm_youtube_session
+
         warm_youtube_session()
         logger.info("YouTube anonymous session pre-warmed")
     except Exception:

@@ -21,6 +21,7 @@ import {
   resolvePreviewPlayback,
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
+  warmYoutubePreview,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
@@ -213,6 +214,7 @@ export default function ChannelExplorePopup({
             `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
           ).catch(() => null)
           : Promise.resolve(null);
+        if (platform === 'youtube') warmYoutubePreview(vod.url);
         const sessionPromise = apiPost<{
           session_id: string;
           master_url: string;

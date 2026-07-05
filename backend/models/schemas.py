@@ -79,6 +79,9 @@ class AppSettings(BaseModel):
     youtube_visitor_data: str = ""
     youtube_po_token: str = ""
     youtube_tokens_file: str = ""
+    youtube_auto_auth: bool = True
+    youtube_pot_headless: bool = True
+    youtube_wpc_pot: bool = False
     mp4_faststart: bool = False
     quality: str = "1080p"
     panel_layout: Optional[Dict[str, Any]] = None
@@ -105,6 +108,9 @@ class SettingsUpdate(BaseModel):
     youtube_visitor_data: Optional[str] = None
     youtube_po_token: Optional[str] = None
     youtube_tokens_file: Optional[str] = None
+    youtube_auto_auth: Optional[bool] = None
+    youtube_pot_headless: Optional[bool] = None
+    youtube_wpc_pot: Optional[bool] = None
     quality: Optional[str] = None
     panel_layout: Optional[Dict[str, Any]] = None
     window_geometry: Optional[Dict[str, Any]] = None
@@ -118,6 +124,10 @@ class SettingsUpdate(BaseModel):
 
 class OpenFolderRequest(BaseModel):
     path: str
+
+
+class PreviewWarmRequest(BaseModel):
+    url: str
 
 
 class PreviewSessionCreateRequest(BaseModel):

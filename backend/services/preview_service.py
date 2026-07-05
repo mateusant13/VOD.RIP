@@ -170,6 +170,12 @@ class PreviewManager:
                     # For Twitch clips the entry URL is the MP4 itself. No playlist to
                     # walk, no segment prewarm — the frontend plays the file directly.
                     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+            elif session.custom_master:
+                    if session.variant_entries:
+                            session.entry_url = _pick_variant_by_height(
+                                    session.variant_entries, prefer_height,
+                            ) or session.variant_entries[0][1]
+                    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
             else:
                     session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
                     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
@@ -303,10 +309,54 @@ def _is_rangeable_cdn_media(url: str) -> bool:
     return "googlevideo.com" in host or "videoplayback" in lower
 
 
+_AUTH_ERROR_CODES = frozenset({403, 404, 410})
+
+
+class StalePreviewUrls(RuntimeError):
+    """YouTube googlevideo URLs expired — client must reload the preview manifest."""
+
+
+def _clear_preview_url_caches(session: PreviewSession) -> None:
+    session.resource_map.clear()
+    session.rewritten_playlists.clear()
+
+
+def _remap_youtube_url_after_refresh(
+    old_url: str,
+    old_entry: str,
+    old_variants: List[Tuple[int, str]],
+    session: PreviewSession,
+) -> Optional[str]:
+    if old_url == old_entry:
+        return session.entry_url
+    for height, upstream in old_variants:
+        if upstream == old_url:
+            for h2, u2 in session.variant_entries:
+                if h2 == height:
+                    return u2
+            return session.entry_url or None
+    return None
+
+
+def _youtube_refresh_and_remap(
+    session: PreviewSession,
+    failed_url: str,
+    prefer_height: int = 480,
+) -> Optional[str]:
+    if session.platform != "YouTube":
+        return None
+    old_entry = session.entry_url
+    old_variants = list(session.variant_entries)
+    _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
+    return _remap_youtube_url_after_refresh(failed_url, old_entry, old_variants, session)
+
+
 def _open_upstream_stream(
     session: PreviewSession,
     url: str,
     range_header: Optional[str] = None,
+    *,
+    _retried: bool = False,
 ):
     """Open a streaming HTTP GET to *url*; caller must close the response."""
     host = urlparse(url).hostname or ""
@@ -332,6 +382,18 @@ def _open_upstream_stream(
             stream=True,
             timeout=_UPSTREAM_CONNECT_TIMEOUT_SEC,
         )
+    if resp.status_code in _AUTH_ERROR_CODES:
+        try:
+            resp.close()
+        except OSError:
+            pass
+        if not _retried and session.platform == "YouTube":
+            new_url = _youtube_refresh_and_remap(session, url)
+            if new_url:
+                return _open_upstream_stream(
+                    session, new_url, range_header, _retried=True,
+                )
+        raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     resp.raise_for_status()
     session.touch()
     return resp
@@ -359,6 +421,65 @@ def preview_session_kind(session_id: str) -> Optional[str]:
     return session.kind if session else None
 
 
+def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 480) -> None:
+    """Re-resolve googlevideo URLs — they expire; stale URLs cause preview 403/500."""
+    if session.platform != "YouTube":
+        return
+    try:
+        from deps import settings_mgr
+        oauth = settings_mgr.get().oauth or None
+    except Exception:
+        oauth = None
+    raw_entry, headers, _platform, variant_formats, kind = resolve_stream_info(
+        session.vod_url, oauth=oauth, prefer_height=prefer_height,
+    )
+    proxy_master_url: Optional[str] = None
+    if kind == "progressive":
+        proxy_master_url = f"/api/preview/hls/{session.session_id}/master.m3u8"
+    session.kind = kind
+    session.entry_url = raw_entry
+    session.master_url = proxy_master_url or raw_entry
+    session.http_headers = headers
+    session.allowed_hosts = _hosts_for_url(raw_entry)
+    session.variant_entries = [
+        (int(fmt.get("height") or 0), fmt.get("url") or "")
+        for fmt in variant_formats
+        if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+    ]
+    session.custom_master = None
+    if kind == "hls" and len(session.variant_entries) >= 2:
+        session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
+    elif kind == "hls" and raw_entry:
+        session.custom_master = None
+    for _height, upstream in session.variant_entries:
+        session.allowed_hosts.update(_hosts_for_url(upstream))
+    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    if kind == "hls" and not session.custom_master:
+        session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    elif session.custom_master and session.variant_entries:
+        session.entry_url = _pick_variant_by_height(
+            session.variant_entries, prefer_height,
+        ) or session.variant_entries[0][1]
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    _clear_preview_url_caches(session)
+    session.touch()
+
+
+def refresh_youtube_preview_session(
+    session_id: str,
+    prefer_height: int = 480,
+) -> PreviewSession:
+    """Refresh expired YouTube stream URLs for an active preview session."""
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if session.platform != "YouTube":
+        return session
+    _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
+    return session
+
+
 def open_progressive_proxy(
     session_id: str,
     range_header: Optional[str] = None,
@@ -370,7 +491,26 @@ def open_progressive_proxy(
     if session.kind != "progressive":
         raise ValueError("Preview session is not progressive")
     upstream = session.entry_url
-    resp = _open_upstream_stream(session, upstream, range_header)
+    prefer_h = 0
+    if session.variant_entries and session.entry_url:
+        for height, url in session.variant_entries:
+            if url == session.entry_url and height > 0:
+                prefer_h = height
+                break
+    try:
+        resp = _open_upstream_stream(session, upstream, range_header)
+    except Exception as first_exc:
+        if session.platform != "YouTube":
+            raise
+        logger.debug("progressive proxy refresh after error session=%s: %s", session_id[:8], first_exc)
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 480)
+        upstream = session.entry_url
+        resp = _open_upstream_stream(session, upstream, range_header)
+    if resp.status_code in (403, 404, 410) and session.platform == "YouTube":
+        resp.close()
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 480)
+        upstream = session.entry_url
+        resp = _open_upstream_stream(session, upstream, range_header)
     ctype, hdrs, status = _upstream_response_meta(resp, upstream, range_header)
 
     def _close_upstream() -> None:
@@ -450,6 +590,8 @@ def _http_get_bytes(
     session: PreviewSession,
     url: str,
     range_header: Optional[str] = None,
+    *,
+    _retried: bool = False,
 ) -> Tuple[bytes, str, dict, int]:
     """Fetch upstream bytes. curl_cffi must use stream=False or .content is empty."""
     host = urlparse(url).hostname or ""
@@ -472,6 +614,14 @@ def _http_get_bytes(
 
         resp = requests.get(url, headers=headers, timeout=60)
 
+    if resp.status_code in _AUTH_ERROR_CODES:
+        if not _retried and session.platform == "YouTube":
+            new_url = _youtube_refresh_and_remap(session, url)
+            if new_url:
+                return _http_get_bytes(
+                    session, new_url, range_header, _retried=True,
+                )
+        raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     resp.raise_for_status()
     data = resp.content or b""
     ctype = _guess_content_type(url, resp.headers.get("Content-Type", ""))
@@ -517,6 +667,25 @@ def _deduped_hls_variants(info: dict) -> List[dict]:
             seen_heights.add(height)
         out.append(fmt)
     return out
+def _is_muxed_format(fmt: dict) -> bool:
+    """True when format carries both audio and video (not DASH video-only or SABR)."""
+    url = (fmt.get("url") or "").strip()
+    if url:
+        from services.youtube_innertube import _is_sabr_stream_url
+        if _is_sabr_stream_url(url):
+            return False
+    fid = (fmt.get("format_id") or "").lower()
+    if fid == "hls-master":
+        return True
+    if fid == "abr-muxed":
+        return False  # SABR — never progressive preview
+    ac = fmt.get("acodec")
+    vc = fmt.get("vcodec")
+    if ac in ("none", None) or vc in ("none", None):
+        return False
+    return True
+
+
 def _deduped_progressive_variants(info: dict) -> List[dict]:
     """Pick distinct heights from yt-dlp's progressive (direct MP4) formats.
 
@@ -544,6 +713,8 @@ def _deduped_progressive_variants(info: dict) -> List[dict]:
         # Twitch clips also ship vertical ``portrait-*`` renditions — prefer landscape.
         fid = (f.get("format_id") or "").lower()
         if fid.startswith("portrait"):
+            continue
+        if not _is_muxed_format(f):
             continue
         progressive.append(f)
 
@@ -586,6 +757,17 @@ def _pick_variant_by_height(entries: List[Tuple[int, str]], prefer_height: int) 
 
 
 def _build_synthetic_master_playlist(session: PreviewSession, variants: List[dict]) -> str:
+    audio_fmt = None
+    if session.platform == "YouTube":
+        try:
+            info = _extract_youtube_preview_info(session.vod_url, None)
+            audio_fmt = info.get("_preview_audio_format")
+        except Exception:
+            audio_fmt = None
+        if audio_fmt or any(
+            f.get("acodec") in ("none", None) for f in variants if int(f.get("height") or 0) > 0
+        ):
+            return _build_youtube_synthetic_hls_master(session, variants, audio_fmt)
     lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS"]
     for fmt in variants:
         height = int(fmt.get("height") or 0)
@@ -598,6 +780,41 @@ def _build_synthetic_master_playlist(session: PreviewSession, variants: List[dic
         upstream = fmt.get("url") or ""
         session.allowed_hosts.update(_hosts_for_url(upstream))
         lines.append(f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height}")
+        lines.append(_proxy_url(session, upstream))
+    return "\n".join(lines) + "\n"
+
+
+def _build_youtube_synthetic_hls_master(
+    session: PreviewSession,
+    variants: List[dict],
+    audio_fmt: Optional[dict] = None,
+) -> str:
+    """HLS master from direct googlevideo URLs + optional separate audio (IOS DASH)."""
+    group = "yt-audio"
+    lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    video_variants = [f for f in variants if int(f.get("height") or 0) > 0 and f.get("url")]
+    needs_audio = audio_fmt and any(f.get("acodec") in ("none", None) for f in video_variants)
+    if needs_audio and audio_fmt:
+        audio_url = audio_fmt.get("url") or ""
+        if audio_url:
+            session.allowed_hosts.update(_hosts_for_url(audio_url))
+            lines.append(
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="{group}",NAME="main",'
+                f'DEFAULT=YES,AUTOSELECT=YES,URI="{_proxy_url(session, audio_url)}"'
+            )
+    for fmt in video_variants:
+        height = int(fmt.get("height") or 0)
+        width = int(fmt.get("width") or 0) or int(height * 16 / 9)
+        bandwidth = int((fmt.get("tbr") or 0) * 1000) or 1_000_000
+        upstream = fmt.get("url") or ""
+        session.allowed_hosts.update(_hosts_for_url(upstream))
+        muxed = fmt.get("acodec") not in ("none", None)
+        codecs = "avc1.4d401e,mp4a.40.2" if muxed else "avc1.4d401e"
+        audio_attr = "" if muxed or not needs_audio else f',AUDIO="{group}"'
+        lines.append(
+            f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height},"
+            f'CODECS="{codecs}"{audio_attr}'
+        )
         lines.append(_proxy_url(session, upstream))
     return "\n".join(lines) + "\n"
 
@@ -681,13 +898,24 @@ def resolve_stream_info(
         return chosen_url, headers, platform, variants, "progressive"
 
     if platform == "YouTube":
+        from services.youtube_innertube import _dedupe_youtube_formats
+
         info = _extract_youtube_preview_info(full_url, oauth)
         headers = info.get("http_headers") or {
             "Referer": "https://www.youtube.com/",
             "Origin": "https://www.youtube.com",
         }
-        hls_variants = _deduped_hls_variants(info)
+        merged = _dedupe_youtube_formats(info.get("formats") or [])
+        hls_variants = _deduped_hls_variants({"formats": merged})
         with_height = [f for f in hls_variants if int(f.get("height") or 0) > 0]
+        # Unparsed master (height=0) — still valid HLS with audio + seek.
+        if not with_height and hls_variants:
+            master_fmt = hls_variants[0]
+            stream_url = master_fmt.get("url") or ""
+            if stream_url:
+                if master_fmt.get("http_headers"):
+                    headers = {**headers, **master_fmt["http_headers"]}
+                return stream_url, headers, platform, hls_variants, "hls"
         if with_height:
             for fmt in hls_variants:
                 stream_url = fmt.get("url") or ""
@@ -699,7 +927,26 @@ def resolve_stream_info(
             )
             if chosen_url:
                 return chosen_url, headers, platform, with_height, "hls"
-        raise RuntimeError("YouTube video has no playable HLS stream URL")
+        video_heights = [f for f in merged if int(f.get("height") or 0) > 0]
+        if len(video_heights) >= 2:
+            chosen_url = _pick_variant_by_height(
+                [(int(v.get("height") or 0), v.get("url") or "") for v in video_heights],
+                prefer_height=prefer_height,
+            )
+            if chosen_url:
+                return chosen_url, headers, platform, video_heights, "hls"
+        progressive = _deduped_progressive_variants({"formats": merged})
+        if progressive:
+            heights_urls = [(int(v.get("height") or 0), v.get("url") or "") for v in progressive]
+            chosen_url = _pick_variant_by_height(heights_urls, prefer_height=prefer_height)
+            if not chosen_url and progressive:
+                chosen_url = progressive[0].get("url") or ""
+            if chosen_url:
+                picked = next((f for f in progressive if f.get("url") == chosen_url), None)
+                if picked and picked.get("http_headers"):
+                    headers = {**headers, **picked["http_headers"]}
+                return chosen_url, headers, platform, progressive, "progressive"
+        raise RuntimeError("YouTube video has no playable stream URL")
 
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)
@@ -930,7 +1177,7 @@ def _warm_and_prewarm_session(session_id: str, crop_start: float) -> None:
             return
         try:
             if session.custom_master:
-                proxy_playlist(session_id, session.entry_url)
+                pass  # synthetic master — entry URLs are multi-GB VOD files, never buffer
             else:
                 proxy_playlist(session_id, session.master_url)
                 if session.entry_url != session.master_url:
@@ -946,7 +1193,7 @@ def _prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache rewritten playlist + segments near trim start."""
     try:
         session = get_session(session_id)
-        if not session:
+        if not session or session.custom_master:
             return
 
         raw, _, _, _ = _http_get_bytes(session, session.entry_url)
@@ -1050,6 +1297,14 @@ def set_session_prefer_height(session_id: str, prefer_height: int) -> PreviewSes
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+    if session.platform == "YouTube":
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
+        if session.variant_entries:
+            picked = _pick_variant_by_height(session.variant_entries, prefer_height)
+            if picked:
+                session.entry_url = picked
+                session.allowed_hosts.update(_hosts_for_url(picked))
+        return session
     if session.variant_entries:
         picked = _pick_variant_by_height(session.variant_entries, prefer_height)
         if not picked:
@@ -1179,3 +1434,4 @@ assert not _is_playlist_url(
     "/source/youtube/playlist/index.m3u8/seg.ts"
 )
 assert _is_playlist_url("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/master.m3u8")
+assert issubclass(StalePreviewUrls, RuntimeError)

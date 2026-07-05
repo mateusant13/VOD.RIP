@@ -32,6 +32,23 @@ _MANIFEST_TO_REMUX_SCALE = 0.55
 _DEFAULT_AUDIO_KBPS = 160.0
 
 
+def _clen_bytes_from_url(url: str) -> Optional[int]:
+    """Parse ``clen=`` from googlevideo videoplayback URLs (exact file size)."""
+    if not url:
+        return None
+    m = re.search(r"[?&]clen=(\d+)", url, re.I)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _is_googlevideo_url(url: str) -> bool:
+    return "googlevideo.com" in (url or "").lower()
+
+
 def _label_from_height(height: int, fps: Optional[float] = None) -> str:
     fps_suffix = "60" if fps and float(fps) > 30 else ""
     return f"{int(height)}p{fps_suffix}"
@@ -134,11 +151,27 @@ def size_by_quality_from_formats(
             continue
 
         label = _label_from_height(int(height), fmt.get("fps"))
+        url = (fmt.get("url") or "").strip()
+        is_video_only = (
+            fmt.get("acodec") in ("none", None)
+            and fmt.get("vcodec") not in ("none", None)
+        )
+
+        clen = _clen_bytes_from_url(url)
+        if clen and clen > 0:
+            total = clen
+            if is_video_only:
+                total += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
+            by_label[label] = max(by_label.get(label, 0), total)
+            continue
+
         filesize = fmt.get("filesize") or fmt.get("filesize_approx")
         if filesize:
             try:
                 fs = float(filesize)
                 if fs > 0:
+                    if is_video_only:
+                        fs += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
                     by_label[label] = max(by_label.get(label, 0), fs)
                     continue
             except (TypeError, ValueError):
@@ -146,7 +179,12 @@ def size_by_quality_from_formats(
 
         kbps = _format_bitrate_kbps(fmt)
         if kbps:
-            est = bytes_from_bitrate_kbps(kbps * _MANIFEST_TO_REMUX_SCALE, dur)
+            total_kbps = float(kbps)
+            if is_video_only:
+                total_kbps += _DEFAULT_AUDIO_KBPS
+            # googlevideo tbr/clen is direct CDN — don't shrink like HLS manifest BANDWIDTH.
+            scale = 1.0 if _is_googlevideo_url(url) else _MANIFEST_TO_REMUX_SCALE
+            est = bytes_from_bitrate_kbps(total_kbps * scale, dur)
             by_label[label] = max(by_label.get(label, 0), est)
 
     return {k: int(v) for k, v in by_label.items() if v > 0}

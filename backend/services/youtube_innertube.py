@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -19,12 +19,16 @@ _INNERTUBE_PLAYER_URL = (
 _STREAM_HEADERS = {
     "Referer": "https://www.youtube.com/",
     "Origin": "https://www.youtube.com",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 _VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
-_PLAYER_TIMEOUT_SEC = 12.0
-_MANIFEST_TIMEOUT_SEC = 20.0
+_CONNECT_TIMEOUT_SEC = 0.9
+_READ_TIMEOUT_PLAYER_SEC = 2.0
+_READ_TIMEOUT_MANIFEST_SEC = 8.0
+_TV_TIMEOUT_SEC = 1.1
+_RACE_TIMEOUT_SEC = 2.5
 
 if TYPE_CHECKING:
     from services.youtube_session import YouTubeSession
@@ -39,42 +43,19 @@ class _ClientProfile:
     headers: dict[str, str]
 
 
-# IOS → ANDROID → MWEB → TVHTML5 → WEB — each with matching UA + client context.
 _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
     _ClientProfile(
-        "IOS",
+        "TVHTML5",
         {
-            "clientName": "IOS",
-            "clientVersion": "20.03.02",
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone16,2",
-            "osName": "iOS",
-            "osVersion": "17.5.1.21F90",
+            "clientName": "TVHTML5",
+            "clientVersion": "7.20250312.16.00",
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "com.google.ios.youtube/20.03.02"
-                " (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"
-            ),
-        },
-    ),
-    _ClientProfile(
-        "ANDROID",
-        {
-            "clientName": "ANDROID",
-            "clientVersion": "19.44.38",
-            "androidSdkVersion": 30,
-            "hl": "en",
-            "gl": "US",
-        },
-        {
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "com.google.android.youtube/19.44.38"
-                " (Linux; U; Android 11) gzip"
+                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
             ),
         },
     ),
@@ -96,17 +77,81 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         },
     ),
     _ClientProfile(
-        "TVHTML5",
+        "ANDROID",
         {
-            "clientName": "TVHTML5",
-            "clientVersion": "7.20250312.16.00",
+            "clientName": "ANDROID",
+            "clientVersion": "19.44.38",
+            "androidSdkVersion": 30,
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+                "com.google.android.youtube/19.44.38"
+                " (Linux; U; Android 11) gzip"
+            ),
+        },
+    ),
+    _ClientProfile(
+        "ANDROID_VR",
+        {
+            "clientName": "ANDROID_VR",
+            "clientVersion": "1.60.19",
+            "deviceMake": "Oculus",
+            "deviceModel": "Quest 3",
+            "osName": "Android",
+            "osVersion": "12L",
+            "androidSdkVersion": 32,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "com.google.android.apps.youtube.vr.oculus/1.60.19"
+                " (Linux; U; Android 12L) gzip"
+            ),
+        },
+    ),
+    _ClientProfile(
+        "ANDROID_VR",
+        {
+            "clientName": "ANDROID_VR",
+            "clientVersion": "1.60.19",
+            "deviceMake": "Oculus",
+            "deviceModel": "Quest 3",
+            "osName": "Android",
+            "osVersion": "12L",
+            "androidSdkVersion": 32,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "com.google.android.apps.youtube.vr.oculus/1.60.19"
+                " (Linux; U; Android 12L) gzip"
+            ),
+        },
+    ),
+    _ClientProfile(
+        "IOS",
+        {
+            "clientName": "IOS",
+            "clientVersion": "20.03.02",
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iOS",
+            "osVersion": "17.5.1.21F90",
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "com.google.ios.youtube/20.03.02"
+                " (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"
             ),
         },
     ),
@@ -128,6 +173,8 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         },
     ),
 )
+
+_PROFILE_BY_NAME = {p.name: p for p in _CLIENT_PROFILES}
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -187,6 +234,204 @@ def _parse_hls_variants(master_text: str, master_url: str) -> list[dict[str, Any
     return formats
 
 
+def _is_sabr_stream_url(url: str) -> bool:
+    """YouTube SABR (serverAbrStreamingUrl) returns vnd.yt-ump protobuf — not MP4/HLS."""
+    return bool(url) and "sabr" in url.lower()
+
+
+def _formats_from_streaming_progressive(streaming: dict[str, Any]) -> list[dict[str, Any]]:
+    """Muxed progressive URLs from streamingData.formats (e.g. ANDROID_VR itag 18)."""
+    formats: list[dict[str, Any]] = []
+    for fmt in streaming.get("formats") or []:
+        url = (fmt.get("url") or "").strip()
+        if not url or _is_sabr_stream_url(url):
+            continue
+        mime = (fmt.get("mimeType") or "").lower()
+        if "video" not in mime:
+            continue
+        if not any(c in mime for c in ("mp4a", "opus", "audio")):
+            continue
+        itag = fmt.get("itag")
+        height = int(fmt.get("height") or 0)
+        width = int(fmt.get("width") or 0)
+        bitrate = fmt.get("bitrate") or fmt.get("averageBitrate") or 0
+        formats.append({
+            "format_id": f"progressive-{itag or len(formats)}",
+            "url": url,
+            "protocol": "https",
+            "ext": "mp4",
+            "height": height,
+            "width": width,
+            "tbr": (int(bitrate) / 1000.0) if bitrate else None,
+            "vcodec": "avc1",
+            "acodec": "mp4a",
+            "http_headers": dict(_STREAM_HEADERS),
+        })
+    formats.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    return formats
+
+
+def _codecs_from_mime(mime: str) -> tuple[str, str]:
+    """Infer vcodec/acodec from YouTube mimeType string."""
+    m = (mime or "").lower()
+    vcodec = "none"
+    acodec = "none"
+    if "video" in m:
+        vcodec = "avc1"
+    if "mp4a" in m or "opus" in m:
+        acodec = "mp4a" if "mp4a" in m else "opus"
+    elif "audio" in m and "video" not in m:
+        acodec = "mp4a"
+    return vcodec, acodec
+
+
+def _format_from_raw_adaptive(raw: dict, *, audio_only: bool = False) -> dict[str, Any]:
+    url = (raw.get("url") or "").strip()
+    mime = raw.get("mimeType") or ""
+    vcodec, acodec = _codecs_from_mime(mime)
+    if audio_only:
+        vcodec = "none"
+    itag = raw.get("itag")
+    height = int(raw.get("height") or 0)
+    width = int(raw.get("width") or 0)
+    bitrate = raw.get("bitrate") or raw.get("averageBitrate") or 0
+    fid = f"audio-{itag}" if audio_only else f"adaptive-{itag or len(url)}"
+    return {
+        "format_id": fid,
+        "url": url,
+        "protocol": "https",
+        "ext": "m4a" if audio_only else "mp4",
+        "height": height,
+        "width": width,
+        "tbr": (int(bitrate) / 1000.0) if bitrate else None,
+        "vcodec": vcodec,
+        "acodec": acodec,
+        "http_headers": dict(_STREAM_HEADERS),
+    }
+
+
+def _pick_best_audio_format(streaming: dict[str, Any]) -> Optional[dict[str, Any]]:
+    best: Optional[dict[str, Any]] = None
+    best_br = -1
+    for raw in streaming.get("adaptiveFormats") or []:
+        mime = (raw.get("mimeType") or "").lower()
+        if "audio" not in mime or "video" in mime:
+            continue
+        url = (raw.get("url") or "").strip()
+        if not url or _is_sabr_stream_url(url):
+            continue
+        br = int(raw.get("bitrate") or raw.get("averageBitrate") or 0)
+        if br > best_br:
+            best_br = br
+            best = _format_from_raw_adaptive(raw, audio_only=True)
+    return best
+
+
+def _formats_from_player_streaming(data: dict) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
+    """Extract all usable formats + best audio + hls master URL from player response."""
+    streaming = data.get("streamingData") or {}
+    out: list[dict[str, Any]] = []
+    out.extend(_formats_from_streaming_progressive(streaming))
+    out.extend(_streaming_url_formats(streaming))
+    adaptive = _formats_from_adaptive(streaming)
+    out.extend(adaptive)
+    audio = _pick_best_audio_format(streaming)
+    hls = (streaming.get("hlsManifestUrl") or "").strip() or None
+    return out, audio, hls
+
+
+def _dedupe_youtube_formats(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per height — prefer muxed/HLS over video-only DASH."""
+    by_height: dict[int, dict[str, Any]] = {}
+    extras: list[dict[str, Any]] = []
+
+    def _score(fmt: dict) -> tuple[int, int]:
+        muxed = fmt.get("acodec") not in ("none", None)
+        proto = (fmt.get("protocol") or "").lower()
+        hls = proto in ("m3u8", "m3u8_native", "m3u8_ffmpeg") or fmt.get("format_id") == "hls-master"
+        return (2 if hls else 1 if muxed else 0, int(fmt.get("tbr") or 0))
+
+    for fmt in formats:
+        url = (fmt.get("url") or "").strip()
+        if not url or _is_sabr_stream_url(url):
+            continue
+        height = int(fmt.get("height") or 0)
+        if height <= 0:
+            if (fmt.get("format_id") or "") == "hls-master":
+                extras.append(fmt)
+            continue
+        prev = by_height.get(height)
+        if prev is None or _score(fmt) > _score(prev):
+            by_height[height] = fmt
+    merged = sorted(by_height.values(), key=lambda f: int(f.get("height") or 0), reverse=True)
+    return extras + merged
+
+
+def _formats_from_adaptive(streaming: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build yt-dlp-shaped formats from streamingData.adaptiveFormats (DASH/mp4)."""
+    formats: list[dict[str, Any]] = []
+    for fmt in streaming.get("adaptiveFormats") or []:
+        url = fmt.get("url") or ""
+        if not url:
+            continue
+        mime = (fmt.get("mimeType") or "").lower()
+        if "video" not in mime and "mpegurl" not in mime:
+            continue
+        height = int(fmt.get("height") or 0)
+        width = int(fmt.get("width") or 0)
+        vcodec, acodec = _codecs_from_mime(fmt.get("mimeType") or "")
+        if "mpegurl" in mime or ".m3u8" in url:
+            protocol = "m3u8_native"
+            ext = "mp4"
+        else:
+            protocol = "https"
+            ext = "mp4"
+        bitrate = fmt.get("bitrate") or fmt.get("averageBitrate") or 0
+        formats.append({
+            "format_id": f"adaptive-{fmt.get('itag') or len(formats)}",
+            "url": url,
+            "protocol": protocol,
+            "ext": ext,
+            "height": height,
+            "width": width,
+            "tbr": (int(bitrate) / 1000.0) if bitrate else None,
+            "vcodec": vcodec,
+            "acodec": acodec,
+            "http_headers": dict(_STREAM_HEADERS),
+        })
+    formats.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    return formats
+
+
+def _format_from_streaming_url(url: str, format_id: str, *, height: int = 0) -> dict[str, Any]:
+    """Single HLS master or muxed ABR URL from streamingData."""
+    lower = url.lower()
+    if ".m3u8" in lower or "/api/manifest/hls" in lower or "mpegurl" in lower:
+        protocol = "m3u8_native"
+    else:
+        protocol = "https"
+    return {
+        "format_id": format_id,
+        "url": url,
+        "protocol": protocol,
+        "ext": "mp4",
+        "height": height,
+        "width": 0,
+        "vcodec": "avc1",
+        "acodec": "mp4a",
+        "http_headers": dict(_STREAM_HEADERS),
+    }
+
+
+def _streaming_url_formats(streaming: dict[str, Any]) -> list[dict[str, Any]]:
+    """HLS master only — serverAbrStreamingUrl is SABR (not proxyable as MP4)."""
+    out: list[dict[str, Any]] = []
+    hls = (streaming.get("hlsManifestUrl") or "").strip()
+    if hls:
+        out.append(_format_from_streaming_url(hls, "hls-master"))
+    return out
+
+
 def _classify_http(status_code: int) -> FailureKind:
     if status_code in (403, 429, 500, 502, 503, 504):
         return "retry"
@@ -199,17 +444,26 @@ def _classify_playability(status: Optional[str], reason: Optional[str]) -> Failu
     if not status or status == "OK":
         return "ok"
     reason_l = (reason or "").lower()
+    if status == "LOGIN_REQUIRED" and ("age" in reason_l or "confirm your age" in reason_l):
+        return "fatal"
     if status in ("ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"):
         return "retry"
     if status == "LIVE_STREAM_OFFLINE":
         return "fatal"
     if "private" in reason_l or "removed" in reason_l or "deleted" in reason_l:
         return "fatal"
+    if status == "UNPLAYABLE" and any(
+        k in reason_l for k in ("token", "visitor", "integrity", "bot")
+    ):
+        return "retry"
     return "retry"
 
 
 def _merge_headers(profile: _ClientProfile, session: Optional["YouTubeSession"]) -> dict[str, str]:
-    headers = dict(profile.headers)
+    headers = dict(_STREAM_HEADERS)
+    headers.update(profile.headers)
+    headers["X-Youtube-Client-Name"] = str(profile.context.get("clientName", ""))
+    headers["X-Youtube-Client-Version"] = str(profile.context.get("clientVersion", ""))
     if session and session.cookie_header:
         headers["Cookie"] = session.cookie_header
     return headers
@@ -220,17 +474,14 @@ def _enrich_client_context(client: dict[str, Any], profile_name: str) -> dict[st
     out.setdefault("hl", "en")
     out.setdefault("gl", "US")
     out["clientScreen"] = "WATCH"
-    # ponytail: fixed BRT offset — upgrade path: read from settings or tzlocal
     out["utcOffsetMinutes"] = -180
     return out
 
 
 def _profiles_for_session(session: Optional["YouTubeSession"]) -> tuple[_ClientProfile, ...]:
-    """Without po_token, WEB/MWEB are slow misses — try TV before mobile web."""
-    if session and session.po_token:
-        return _CLIENT_PROFILES
-    order = ("IOS", "ANDROID", "TVHTML5", "MWEB", "WEB")
-    return tuple(sorted(_CLIENT_PROFILES, key=lambda p: order.index(p.name)))
+    """TV → MWEB → ANDROID → IOS → WEB; po_token unlocks full ladder."""
+    order = ("TVHTML5", "MWEB", "ANDROID", "IOS", "WEB")
+    return tuple(_PROFILE_BY_NAME[n] for n in order if n in _PROFILE_BY_NAME)
 
 
 def _player_body(
@@ -246,22 +497,37 @@ def _player_body(
         "videoId": video_id,
         "contentCheckOk": True,
         "racyCheckOk": True,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "signatureTimestamp": 0,
+            },
+        },
     }
     if session and session.po_token:
         body["serviceIntegrityDimensions"] = {"poToken": session.po_token}
     return body
 
 
+def _http_for(session: Optional["YouTubeSession"]) -> requests.Session:
+    from services.youtube_session import http_session_for
+
+    return http_session_for(session)
+
+
 def _player_request(
     video_id: str,
     profile: _ClientProfile,
-    timeout: float,
+    read_timeout: float,
     session: Optional["YouTubeSession"] = None,
+    http: Optional[requests.Session] = None,
 ) -> tuple[Optional[dict], int, FailureKind]:
     body = _player_body(video_id, profile, session)
     headers = _merge_headers(profile, session)
+    client = http or _http_for(session)
+    timeout = (_CONNECT_TIMEOUT_SEC, read_timeout)
     try:
-        resp = requests.post(
+        resp = client.post(
             _INNERTUBE_PLAYER_URL,
             json=body,
             headers=headers,
@@ -294,15 +560,31 @@ def _player_request(
         return data, resp.status_code, pb_kind
 
     streaming = data.get("streamingData") or {}
-    if not streaming.get("hlsManifestUrl") and not streaming.get("adaptiveFormats"):
+    if (
+        not streaming.get("hlsManifestUrl")
+        and not streaming.get("adaptiveFormats")
+        and not streaming.get("formats")
+    ):
         logger.debug("InnerTube %s missing streamingData for %s", profile.name, video_id)
         return data, resp.status_code, "retry"
 
     return data, resp.status_code, "ok"
 
 
-def _info_from_player_data(data: dict, video_id: str, master_text: str, master_url: str) -> Optional[dict]:
-    formats = _parse_hls_variants(master_text, master_url)
+def _info_from_player_data(
+    data: dict,
+    video_id: str,
+    master_text: Optional[str],
+    master_url: Optional[str],
+    adaptive_formats: Optional[list[dict[str, Any]]] = None,
+) -> Optional[dict]:
+    formats: list[dict[str, Any]] = []
+    if master_text and master_url:
+        formats = _parse_hls_variants(master_text, master_url)
+    elif master_url and not master_text:
+        formats = [_format_from_streaming_url(master_url, "hls-master")]
+    if not formats and adaptive_formats:
+        formats = _dedupe_youtube_formats(adaptive_formats)
     if not formats:
         return None
 
@@ -336,74 +618,244 @@ def _info_from_player_data(data: dict, video_id: str, master_text: str, master_u
     }
 
 
-def innertube_extract_info(
-    url: str,
-    timeout: Optional[float] = None,
-    session: Optional["YouTubeSession"] = None,
+def _resolve_profile(
+    video_id: str,
+    profile: _ClientProfile,
+    session: Optional["YouTubeSession"],
+    read_timeout: float,
 ) -> Optional[dict[str, Any]]:
-    """Resolve YouTube metadata + HLS via InnerTube, trying clients in order."""
-    video_id = extract_video_id(url)
-    if session is None:
-        from services.youtube_session import youtube_session_from_settings
-        session = youtube_session_from_settings(video_id=video_id)
-
-    player_timeout = timeout if timeout is not None else _PLAYER_TIMEOUT_SEC
-    manifest_timeout = timeout if timeout is not None else _MANIFEST_TIMEOUT_SEC
-    if not video_id:
+    http = _http_for(session)
+    data, _status, kind = _player_request(
+        video_id, profile, read_timeout, session=session, http=http,
+    )
+    if kind == "fatal" or kind != "ok" or not data:
         return None
 
-    manifest_headers = dict(_STREAM_HEADERS)
-    if session.cookie_header:
-        manifest_headers["Cookie"] = session.cookie_header
+    streaming = data.get("streamingData") or {}
+    master_url = streaming.get("hlsManifestUrl")
+    progressive = _formats_from_streaming_progressive(streaming)
+    adaptive = _formats_from_adaptive(streaming)
+    url_formats = _streaming_url_formats(streaming)
 
-    saw_fatal = False
-    for profile in _profiles_for_session(session):
-        data, _status, kind = _player_request(
-            video_id, profile, player_timeout, session=session,
-        )
-        if kind == "fatal":
-            saw_fatal = True
-            continue
-        if kind != "ok" or not data:
-            time.sleep(0.15)
-            continue
-
-        streaming = data.get("streamingData") or {}
-        master_url = streaming.get("hlsManifestUrl")
-        if not master_url:
-            logger.debug("InnerTube %s no hlsManifestUrl for %s", profile.name, video_id)
-            continue
-
+    if master_url:
+        manifest_headers = _merge_headers(profile, session)
         try:
-            manifest = requests.get(
+            manifest = http.get(
                 master_url,
                 headers=manifest_headers,
-                timeout=manifest_timeout,
+                timeout=(_CONNECT_TIMEOUT_SEC, _READ_TIMEOUT_MANIFEST_SEC),
             )
             if manifest.status_code in (403, 429):
                 logger.debug(
                     "InnerTube %s manifest HTTP %s for %s",
                     profile.name, manifest.status_code, video_id,
                 )
-                continue
-            manifest.raise_for_status()
-            master_text = manifest.text
+            else:
+                manifest.raise_for_status()
+                info = _info_from_player_data(
+                    data, video_id, manifest.text, master_url, adaptive_formats=adaptive,
+                )
+                if info:
+                    logger.debug("InnerTube %s HLS succeeded for %s", profile.name, video_id)
+                    return info
         except requests.RequestException as exc:
             logger.debug(
                 "InnerTube %s manifest fetch failed %s: %s", profile.name, video_id, exc,
             )
-            continue
-
-        info = _info_from_player_data(data, video_id, master_text, master_url)
+        # Manifest text fetch failed — still expose master URL for HLS preview (muxed + seekable).
+        info = _info_from_player_data(
+            data,
+            video_id,
+            None,
+            master_url,
+            adaptive_formats=url_formats or adaptive,
+        )
         if info:
-            logger.debug("InnerTube %s succeeded for %s", profile.name, video_id)
+            logger.debug("InnerTube %s HLS master URL (unparsed) for %s", profile.name, video_id)
             return info
-        logger.debug("InnerTube %s empty HLS ladder for %s", profile.name, video_id)
 
-    if saw_fatal:
-        logger.debug("InnerTube all clients failed (fatal) for %s", video_id)
-    else:
-        logger.debug("InnerTube all clients exhausted for %s", video_id)
+    if progressive:
+        info = _info_from_player_data(
+            data, video_id, None, None, adaptive_formats=progressive,
+        )
+        if info:
+            logger.debug("InnerTube %s progressive formats for %s", profile.name, video_id)
+            return info
+
+    if url_formats:
+        info = _info_from_player_data(
+            data, video_id, None, None, adaptive_formats=url_formats + adaptive,
+        )
+        if info:
+            logger.debug("InnerTube %s streaming URL formats for %s", profile.name, video_id)
+            return info
+
+    if adaptive:
+        info = _info_from_player_data(data, video_id, None, None, adaptive_formats=adaptive)
+        if info:
+            logger.debug("InnerTube %s adaptiveFormats succeeded for %s", profile.name, video_id)
+            return info
+
+    return None
+
+
+def _race_profiles(
+    profiles: tuple[_ClientProfile, ...],
+    video_id: str,
+    session: Optional["YouTubeSession"],
+    read_timeout: float,
+    wall_timeout: float,
+) -> Optional[dict[str, Any]]:
+    if not profiles:
+        return None
+    if len(profiles) == 1:
+        return _resolve_profile(video_id, profiles[0], session, read_timeout)
+
+    winner: Optional[dict[str, Any]] = None
+    with ThreadPoolExecutor(max_workers=len(profiles), thread_name_prefix="innertube") as pool:
+        futures = {
+            pool.submit(_resolve_profile, video_id, profile, session, read_timeout): profile
+            for profile in profiles
+        }
+        try:
+            for fut in as_completed(futures, timeout=wall_timeout):
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    profile = futures[fut]
+                    logger.debug("InnerTube race %s error %s: %s", profile.name, video_id, exc)
+                    continue
+                if result:
+                    winner = result
+                    break
+        except TimeoutError:
+            pass
+        for fut in futures:
+            fut.cancel()
+    return winner
+
+
+def _collect_merged_innertube_info(
+    video_id: str,
+    session: Optional["YouTubeSession"],
+    read_timeout: float,
+) -> Optional[dict[str, Any]]:
+    """Merge formats from all InnerTube clients — ANDROID_VR muxed + IOS heights."""
+    http = _http_for(session)
+    profile_order = ("TVHTML5", "MWEB", "ANDROID", "ANDROID_VR", "IOS", "WEB")
+    all_formats: list[dict[str, Any]] = []
+    audio_fmt: Optional[dict[str, Any]] = None
+    hls_url: Optional[str] = None
+    meta_data: Optional[dict] = None
+
+    for name in profile_order:
+        profile = _PROFILE_BY_NAME.get(name)
+        if not profile:
+            continue
+        timeout = min(read_timeout, _TV_TIMEOUT_SEC) if name == "TVHTML5" else read_timeout
+        data, _status, kind = _player_request(
+            video_id, profile, timeout, session=session, http=http,
+        )
+        if kind != "ok" or not data:
+            continue
+        if meta_data is None:
+            meta_data = data
+        partial, audio, hls = _formats_from_player_streaming(data)
+        all_formats.extend(partial)
+        if audio and audio_fmt is None:
+            audio_fmt = audio
+        if hls and hls_url is None:
+            hls_url = hls
+
+    if not meta_data:
+        return None
+
+    merged = _dedupe_youtube_formats(all_formats)
+    video_heights = [f for f in merged if int(f.get("height") or 0) > 0]
+
+    # Multiple DASH heights — synthetic HLS preview; skip TV/MWEB HLS (needs PO token).
+    if len(video_heights) >= 2:
+        info = _info_from_player_data(
+            meta_data, video_id, None, None, adaptive_formats=merged,
+        )
+        if info:
+            if audio_fmt:
+                info["_preview_audio_format"] = audio_fmt
+            return info
+
+    if hls_url:
+        headers = dict(_STREAM_HEADERS)
+        if session and session.cookie_header:
+            headers["Cookie"] = session.cookie_header
+        try:
+            manifest = http.get(
+                hls_url,
+                headers=headers,
+                timeout=(_CONNECT_TIMEOUT_SEC, _READ_TIMEOUT_MANIFEST_SEC),
+            )
+            if manifest.status_code == 200:
+                info = _info_from_player_data(
+                    meta_data, video_id, manifest.text, hls_url,
+                    adaptive_formats=merged,
+                )
+                if info:
+                    if audio_fmt:
+                        info["_preview_audio_format"] = audio_fmt
+                    return info
+        except requests.RequestException as exc:
+            logger.debug("merged HLS manifest fetch failed %s: %s", video_id, exc)
+        info = _info_from_player_data(
+            meta_data, video_id, None, hls_url, adaptive_formats=merged,
+        )
+        if info:
+            if audio_fmt:
+                info["_preview_audio_format"] = audio_fmt
+            return info
+
+    if not merged:
+        return None
+    info = _info_from_player_data(meta_data, video_id, None, None, adaptive_formats=merged)
+    if info and audio_fmt:
+        info["_preview_audio_format"] = audio_fmt
+    return info
+
+
+def innertube_extract_info(
+    url: str,
+    timeout: Optional[float] = None,
+    session: Optional["YouTubeSession"] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve YouTube metadata + streams via merged InnerTube clients."""
+    video_id = extract_video_id(url)
+    if session is None:
+        from services.youtube_session import youtube_session_from_settings
+        session = youtube_session_from_settings(video_id=video_id)
+
+    if not video_id:
+        return None
+
+    read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
+    info = _collect_merged_innertube_info(video_id, session, read_timeout)
+    if info:
+        return info
+
+    try:
+        from deps import settings_mgr
+        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+    except Exception:
+        auto_auth = True
+    if auto_auth:
+        from services.youtube_auth import strengthen_youtube_session
+
+        strong = strengthen_youtube_session(
+            session, video_id, auto_auth=auto_auth, fetch_pot=False,
+        )
+        if strong is not session:
+            info = _collect_merged_innertube_info(video_id, strong, read_timeout)
+            if info:
+                return info
+
+    logger.debug("InnerTube all clients exhausted for %s", video_id)
     return None
 
 
@@ -415,5 +867,17 @@ _sample_master = (
 )
 _parsed = _parse_hls_variants(_sample_master, "https://example.com/master.m3u8")
 assert len(_parsed) == 1 and _parsed[0]["height"] == 720
+_prog = _formats_from_streaming_progressive({
+    "formats": [{
+        "url": "https://cdn.example/v.mp4",
+        "mimeType": 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+        "itag": 18,
+        "height": 360,
+    }],
+})
+assert len(_prog) == 1 and _prog[0]["format_id"] == "progressive-18"
+assert _is_sabr_stream_url("https://x.googlevideo.com/videoplayback?sabr=1")
 assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
+assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "fatal"
 assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
+assert _profiles_for_session(None)[0].name == "TVHTML5"
