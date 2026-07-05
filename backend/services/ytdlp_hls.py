@@ -1341,9 +1341,19 @@ def _download_progressive_clip(
     del prefer_height
     duration = max(0.1, end_sec - start_sec)
     resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
+    media_rng = _googlevideo_byte_range(media_url, start_sec, end_sec)
+    tmpdir: Optional[str] = None
+    media_input = media_url
+    ss = start_sec
+    if media_rng:
+        tmpdir = tempfile.mkdtemp(prefix="prog_clip_")
+        media_input = os.path.join(tmpdir, "in.mp4")
+        _fetch_googlevideo_range(media_url, media_rng, headers, media_input)
+        ss = max(0.0, start_sec - _range_lead_sec(media_url, media_rng[0]))
     cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
-    cmd += _ffmpeg_input_headers(headers or {})
-    cmd += ["-ss", str(start_sec), "-i", media_url, "-t", str(duration)]
+    if not media_rng:
+        cmd += _ffmpeg_input_headers(headers or {})
+    cmd += ["-ss", str(ss), "-i", media_input, "-t", str(duration)]
     if audio_only:
         cmd += ["-vn", "-acodec", "libmp3lame", "-b:a", "192k", output_path]
     else:
@@ -1362,30 +1372,107 @@ def _download_progressive_clip(
             "phase": "Downloading",
             "phase_id": _phase_id("Downloading"),
         })
-    _run_ffmpeg(
-        cmd,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-        register_abort=register_abort,
-        progress_hook=progress_hook,
-        encode_duration=duration,
-        progress_from=10.0,
-        progress_to=92.0,
-        phase="Remuxing" if (video_encoder or "copy") == "copy" else "Encoding",
-    )
-    _verify_output_file(output_path)
-    if progress_hook:
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 99,
-            "phase": "Finalising",
-            "phase_id": _phase_id("Finalising"),
-        })
-        progress_hook({"status": "finished"})
+    try:
+        _run_ffmpeg(
+            cmd,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            progress_hook=progress_hook,
+            encode_duration=duration,
+            progress_from=10.0,
+            progress_to=92.0,
+            phase="Remuxing" if (video_encoder or "copy") == "copy" else "Encoding",
+        )
+        _verify_output_file(output_path)
+        if progress_hook:
+            progress_hook({
+                "status": "postprocessing",
+                "percent": 99,
+                "phase": "Finalising",
+                "phase_id": _phase_id("Finalising"),
+            })
+            progress_hook({"status": "finished"})
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _dash_video_needs_transcode(video_url: str) -> bool:
+def _dur_sec_from_googlevideo_url(url: str) -> Optional[float]:
+    m = re.search(r"[?&]dur=([\d.]+)", url or "", re.I)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _googlevideo_byte_range(
+    url: str, start_sec: float, end_sec: float,
+) -> Optional[tuple[int, int]]:
+    """Byte range covering [start_sec, end_sec] with keyframe lead-in."""
+    from services.size_estimate import _clen_bytes_from_url
+
+    clen = _clen_bytes_from_url(url)
+    dur = _dur_sec_from_googlevideo_url(url)
+    if not clen or not dur:
+        return None
+    clip = max(0.1, end_sec - start_sec)
+    lead = min(start_sec, 3.0)
+    t0 = max(0.0, start_sec - lead)
+    t1 = min(dur, end_sec + clip * 0.08)
+    b0 = int(clen * (t0 / dur))
+    b1 = min(clen - 1, int(clen * (t1 / dur)))
+    if b1 <= b0:
+        return None
+    return b0, b1
+
+
+def _range_lead_sec(url: str, byte_start: int) -> float:
+    from services.size_estimate import _clen_bytes_from_url
+
+    clen = _clen_bytes_from_url(url)
+    dur = _dur_sec_from_googlevideo_url(url)
+    if not clen or not dur:
+        return 0.0
+    return max(0.0, byte_start / clen * dur)
+
+
+def _fetch_googlevideo_range(
+    url: str,
+    byte_range: tuple[int, int],
+    headers: Optional[dict],
+    dest: str,
+) -> None:
+    """HTTP Range fetch of a googlevideo slice to a local file."""
+    b0, b1 = byte_range
+    hdrs = dict(headers or {})
+    hdrs["Range"] = f"bytes={b0}-{b1}"
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(
+            url, headers=hdrs, impersonate="chrome", stream=True,
+            timeout=(10, 180),
+        )
+    except ImportError:
+        resp = requests.get(url, headers=hdrs, stream=True, timeout=180)
+    resp.raise_for_status()
+    with open(dest, "wb") as out:
+        for chunk in resp.iter_content(256 * 1024):
+            if chunk:
+                out.write(chunk)
+
+
+def _dash_video_needs_transcode(video_url: str, video_fmt: Optional[dict] = None) -> bool:
     """VP9/AV1/webm cannot be copied into MP4."""
+    if video_fmt:
+        ext = (video_fmt.get("ext") or "").lower()
+        vc = (video_fmt.get("vcodec") or "").lower()
+        if ext == "webm" or vc.startswith(("vp9", "av01")):
+            return True
     u = (video_url or "").lower()
     if "mime=video%2fwebm" in u or "mime=video/webm" in u:
         return True
@@ -1412,54 +1499,84 @@ def _download_muxed_dash_clip(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
+    video_fmt: Optional[dict] = None,
 ) -> None:
     """Trim separate video+audio googlevideo URLs and mux to MP4."""
     duration = max(0.1, end_sec - start_sec)
     resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
     hdr = _ffmpeg_input_headers(headers or {})
     reconnect = _ffmpeg_reconnect_args()
-    probe = ["-probesize", "32M", "-analyzeduration", "5M"]
+    probe = ["-probesize", "8M", "-analyzeduration", "2M"]
+
+    v_range = _googlevideo_byte_range(video_url, start_sec, end_sec)
+    a_range = _googlevideo_byte_range(audio_url, start_sec, end_sec)
+    tmpdir: Optional[str] = None
+    v_input, a_input = video_url, audio_url
+    v_ss, a_ss = start_sec, start_sec
+
+    if v_range and a_range:
+        tmpdir = tempfile.mkdtemp(prefix="dash_clip_")
+        v_input = os.path.join(tmpdir, "v.mp4")
+        a_input = os.path.join(tmpdir, "a.m4a")
+        if progress_hook:
+            progress_hook({
+                "status": "downloading",
+                "percent": 8,
+                "phase": "Downloading",
+                "phase_id": _phase_id("Downloading"),
+            })
+        _fetch_googlevideo_range(video_url, v_range, headers, v_input)
+        _fetch_googlevideo_range(audio_url, a_range, headers, a_input)
+        v_ss = max(0.0, start_sec - _range_lead_sec(video_url, v_range[0]))
+        a_ss = max(0.0, start_sec - _range_lead_sec(audio_url, a_range[0]))
+
     cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
-    cmd += probe + hdr + reconnect + ["-ss", str(start_sec), "-i", video_url]
-    cmd += probe + hdr + reconnect + ["-ss", str(start_sec), "-i", audio_url]
+    remote = not (v_range and a_range)
+    inp_hdr = (hdr + reconnect) if remote else []
+    cmd += probe + inp_hdr + ["-ss", str(v_ss), "-i", v_input]
+    cmd += probe + inp_hdr + ["-ss", str(a_ss), "-i", a_input]
     cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
     enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
     if enc_args:
         cmd += enc_args
-    elif _dash_video_needs_transcode(video_url) and output_path.lower().endswith(".mp4"):
+    elif _dash_video_needs_transcode(video_url, video_fmt) and output_path.lower().endswith(".mp4"):
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
     else:
         cmd += ["-c", "copy"]
     if mp4_faststart:
         cmd += ["-movflags", "+faststart"]
     cmd.append(output_path)
-    if progress_hook:
-        progress_hook({
-            "status": "downloading",
-            "percent": 5,
-            "phase": "Downloading",
-            "phase_id": _phase_id("Downloading"),
-        })
-    _run_ffmpeg(
-        cmd,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-        register_abort=register_abort,
-        progress_hook=progress_hook,
-        encode_duration=duration,
-        progress_from=10.0,
-        progress_to=92.0,
-        phase="Muxing",
-    )
-    _verify_output_file(output_path)
-    if progress_hook:
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 99,
-            "phase": "Finalising",
-            "phase_id": _phase_id("Finalising"),
-        })
-        progress_hook({"status": "finished"})
+    try:
+        if progress_hook and not (v_range and a_range):
+            progress_hook({
+                "status": "downloading",
+                "percent": 5,
+                "phase": "Downloading",
+                "phase_id": _phase_id("Downloading"),
+            })
+        _run_ffmpeg(
+            cmd,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            progress_hook=progress_hook,
+            encode_duration=duration,
+            progress_from=10.0,
+            progress_to=92.0,
+            phase="Muxing",
+        )
+        _verify_output_file(output_path)
+        if progress_hook:
+            progress_hook({
+                "status": "postprocessing",
+                "percent": 99,
+                "phase": "Finalising",
+                "phase_id": _phase_id("Finalising"),
+            })
+            progress_hook({"status": "finished"})
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _download_hls_clip(
@@ -1532,6 +1649,7 @@ def _download_hls_clip(
                     register_abort=register_abort,
                     video_encoder=video_encoder,
                     mp4_faststart=mp4_faststart,
+                    video_fmt=video_fmt,
                 )
                 return
 
