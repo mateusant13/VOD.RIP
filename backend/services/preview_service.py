@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 # ponytail: _sessions module-level dict + _lock is a global mutable singleton.
@@ -35,6 +35,8 @@ PLAYLIST_REWRITE_TTL_SEC = 20 * 60
 PREWARM_SEGMENT_COUNT = 3
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
+_UPSTREAM_CHUNK_BYTES = 64 * 1024
+_UPSTREAM_CONNECT_TIMEOUT_SEC = 15
 _PREVIEW_ROOT = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -172,27 +174,6 @@ class PreviewManager:
                     session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
                     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
 
-                    with self._lock:
-                            self._sessions[session_id] = session
-
-                    # Warm master + default variant playlists so the first hls.js fetches are instant.
-                    try:
-                            proxy_playlist(session_id, session.master_url)
-                            if session.entry_url != session.master_url:
-                                    proxy_playlist(session_id, session.entry_url)
-                    # ponytail: survival guarantee for playlist warm — best-effort; session works without it
-                    except Exception as exc:
-                    # ponytail: best-effort — proxy_playlist(session_id, session.entry_url)
-                            logger.warning("Playlist warm failed: %s", exc)
-
-                    threading.Thread(
-                            target=_prewarm_session,
-                            args=(session_id, crop_start),
-                            daemon=True,
-                            name=f"kd-prewarm-{session_id[:8]}",
-                    ).start()
-                    return session
-
             with self._lock:
                     self._sessions[session_id] = session
                     if len(self._sessions) > self._max_sessions:
@@ -209,6 +190,31 @@ class PreviewManager:
                                             ),
                                             daemon=True,
                                     ).start()
+
+            if kind == "progressive":
+                    return session
+
+            if session.platform == "YouTube" and session.entry_url:
+                    for attempt in range(2):
+                            try:
+                                    proxy_playlist(session_id, session.entry_url)
+                                    break
+                            except Exception as exc:
+                                    if attempt == 0:
+                                            time.sleep(0.2)
+                                    else:
+                                            logger.debug(
+                                                    "YouTube sync playlist warm skipped session=%s: %s",
+                                                    session_id[:8],
+                                                    exc,
+                                            )
+
+            threading.Thread(
+                    target=_warm_and_prewarm_session,
+                    args=(session_id, crop_start),
+                    daemon=True,
+                    name=f"kd-prewarm-{session_id[:8]}",
+            ).start()
             return session
 
 
@@ -270,7 +276,9 @@ def _request_headers(session: PreviewSession, range_header: Optional[str] = None
 
 
 def _is_playlist_url(url: str) -> bool:
-    return ".m3u8" in urlparse(url).path.lower()
+    # ponytail: endswith only — YouTube videoplayback segments embed index.m3u8 in path
+    path = urlparse(url).path.lower().rstrip("/")
+    return path.endswith(".m3u8")
 
 
 def _guess_content_type(url: str, header_ct: str = "") -> str:
@@ -295,6 +303,149 @@ def _is_rangeable_cdn_media(url: str) -> bool:
     return "googlevideo.com" in host or "videoplayback" in lower
 
 
+def _open_upstream_stream(
+    session: PreviewSession,
+    url: str,
+    range_header: Optional[str] = None,
+):
+    """Open a streaming HTTP GET to *url*; caller must close the response."""
+    host = urlparse(url).hostname or ""
+    if not _host_allowed(host, session):
+        raise PermissionError(f"URL host not allowed for preview: {host}")
+    headers = _request_headers(session, range_header)
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(
+            url,
+            headers=headers,
+            impersonate="chrome",
+            stream=True,
+            timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 3600),
+        )
+    except ImportError:
+        import requests
+
+        resp = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=_UPSTREAM_CONNECT_TIMEOUT_SEC,
+        )
+    resp.raise_for_status()
+    session.touch()
+    return resp
+
+
+def _upstream_response_meta(
+    resp,
+    url: str,
+    range_header: Optional[str] = None,
+) -> Tuple[str, dict, int]:
+    ctype = _guess_content_type(url, resp.headers.get("Content-Type", ""))
+    out_headers: dict = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
+    for key in ("Content-Range", "Content-Length", "Accept-Ranges"):
+        val = resp.headers.get(key)
+        if val:
+            out_headers[key] = val
+    status = resp.status_code
+    if range_header and status == 200 and out_headers.get("Accept-Ranges"):
+        status = 206
+    return ctype, out_headers, status
+
+
+def preview_session_kind(session_id: str) -> Optional[str]:
+    session = get_session(session_id)
+    return session.kind if session else None
+
+
+def open_progressive_proxy(
+    session_id: str,
+    range_header: Optional[str] = None,
+) -> Tuple[Callable[[], object], str, dict, int, Callable[[], None]]:
+    """Return (chunk_generator, content_type, response_headers, status, cleanup)."""
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if session.kind != "progressive":
+        raise ValueError("Preview session is not progressive")
+    upstream = session.entry_url
+    resp = _open_upstream_stream(session, upstream, range_header)
+    ctype, hdrs, status = _upstream_response_meta(resp, upstream, range_header)
+
+    def _close_upstream() -> None:
+        try:
+            resp.close()
+        except OSError:
+            pass
+
+    def _generate():
+        try:
+            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                if chunk:
+                    yield chunk
+        finally:
+            _close_upstream()
+
+    return _generate, ctype, hdrs, status, _close_upstream
+
+
+def open_segment_proxy(
+    session_id: str,
+    upstream_url: str,
+    range_header: Optional[str] = None,
+) -> Tuple[Callable[[], object], str, dict, int, Callable[[], None]]:
+    """Stream a segment/init/key through the preview proxy (Range-aware)."""
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+
+    if range_header is None:
+        cached = _read_cache(session, upstream_url)
+        if cached is not None:
+            ctype = _guess_content_type(upstream_url)
+
+            def _cached_once() -> object:
+                yield cached
+
+            return (
+                _cached_once,
+                ctype,
+                {
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(cached)),
+                    "Cache-Control": "public, max-age=3600",
+                },
+                200,
+                lambda: None,
+            )
+
+    resp = _open_upstream_stream(session, upstream_url, range_header)
+    ctype, hdrs, status = _upstream_response_meta(resp, upstream_url, range_header)
+
+    def _close_upstream() -> None:
+        try:
+            resp.close()
+        except OSError:
+            pass
+
+    def _generate() -> object:
+        buf = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if range_header is None and len(buf) + len(chunk) <= MAX_SEGMENT_BYTES:
+                    buf.extend(chunk)
+                yield chunk
+        finally:
+            _close_upstream()
+            if range_header is None and buf and not _is_playlist_url(upstream_url):
+                _write_cache(session, upstream_url, bytes(buf))
+
+    return _generate, ctype, hdrs, status, _close_upstream
+
+
 def _http_get_bytes(
     session: PreviewSession,
     url: str,
@@ -305,10 +456,6 @@ def _http_get_bytes(
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
 
-    if range_header is None and _is_rangeable_cdn_media(url):
-        # ponytail: YouTube googlevideo URLs are 100MB+ — browsers range-request; never pull whole file
-        range_header = "bytes=0-2097151"
-
     headers = _request_headers(session, range_header)
     try:
         from curl_cffi import requests as cffi_requests
@@ -318,7 +465,7 @@ def _http_get_bytes(
             headers=headers,
             impersonate="chrome",
             stream=False,
-            timeout=60,
+            timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 90),
         )
     except ImportError:
         import requests
@@ -339,6 +486,18 @@ def _http_get_bytes(
     if range_header and status == 200:
         status = 206
     return data, ctype, out_headers, status
+
+
+def _extract_youtube_preview_info(full_url: str, oauth: Optional[str]) -> dict:
+    """Cached YouTube resolve — InnerTube multi-client, then yt-dlp fallback."""
+    from deps import settings_mgr
+    from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
+
+    cookies = settings_mgr.get().youtube_cookies_file or None
+    return cached_extract_info(
+        full_url,
+        youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies),
+    )
 
 
 def _deduped_hls_variants(info: dict) -> List[dict]:
@@ -522,47 +681,25 @@ def resolve_stream_info(
         return chosen_url, headers, platform, variants, "progressive"
 
     if platform == "YouTube":
-        opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
-        info = _extract_hls_info(full_url, opts)
+        info = _extract_youtube_preview_info(full_url, oauth)
         headers = info.get("http_headers") or {
             "Referer": "https://www.youtube.com/",
             "Origin": "https://www.youtube.com",
         }
-        progressive = _deduped_progressive_variants(info)
-        if not progressive:
-            # ponytail: YouTube DASH — pick any https video format with a direct URL
-            for fmt in sorted(
-                info.get("formats") or [],
-                key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
-                reverse=True,
-            ):
-                if (fmt.get("vcodec") or "none") == "none":
-                    continue
+        hls_variants = _deduped_hls_variants(info)
+        with_height = [f for f in hls_variants if int(f.get("height") or 0) > 0]
+        if with_height:
+            for fmt in hls_variants:
                 stream_url = fmt.get("url") or ""
-                if not stream_url:
-                    continue
-                proto = (fmt.get("protocol") or "").lower()
-                if "m3u8" in proto or "dash" in proto:
-                    continue
-                progressive = [fmt]
-                break
-        if progressive:
+                if stream_url and _url_looks_like_master(stream_url):
+                    return stream_url, headers, platform, with_height, "hls"
             chosen_url = _pick_variant_by_height(
-                [(int(v.get("height") or 0), v.get("url") or "") for v in progressive],
+                [(int(v.get("height") or 0), v.get("url") or "") for v in with_height],
                 prefer_height=prefer_height,
             )
             if chosen_url:
-                return chosen_url, headers, platform, progressive, "progressive"
-        hls_variants = _deduped_hls_variants(info)
-        if hls_variants:
-            first = hls_variants[0]
-            stream_url = first.get("url") or ""
-            if stream_url:
-                return stream_url, headers, platform, hls_variants, "hls"
-        direct = info.get("url") or ""
-        if direct:
-            return direct, headers, platform, [], "progressive"
-        raise RuntimeError("YouTube video has no playable stream URL")
+                return chosen_url, headers, platform, with_height, "hls"
+        raise RuntimeError("YouTube video has no playable HLS stream URL")
 
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)
@@ -785,6 +922,26 @@ def _write_cache(session: PreviewSession, url: str, data: bytes) -> None:
         pass
 
 
+def _warm_and_prewarm_session(session_id: str, crop_start: float) -> None:
+    """Background: cache playlists + segments near trim start (off session-create hot path)."""
+    try:
+        session = get_session(session_id)
+        if not session:
+            return
+        try:
+            if session.custom_master:
+                proxy_playlist(session_id, session.entry_url)
+            else:
+                proxy_playlist(session_id, session.master_url)
+                if session.entry_url != session.master_url:
+                    proxy_playlist(session_id, session.entry_url)
+        except Exception as exc:
+            logger.debug("Playlist warm skipped session=%s: %s", session_id[:8], exc)
+        _prewarm_session(session_id, crop_start)
+    except Exception as exc:
+        logger.warning("Warm/prewarm failed session=%s: %s", session_id[:8], exc)
+
+
 def _prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache rewritten playlist + segments near trim start."""
     try:
@@ -942,9 +1099,7 @@ def proxy_master(
     if not session:
         raise ValueError("Preview session not found or expired")
     if session.kind == "progressive":
-        upstream = session.entry_url
-        data, ctype, headers, status = _http_get_bytes(session, upstream, range_header=range_header)
-        return data, ctype, headers, status
+        raise ValueError("Use open_progressive_proxy for progressive streams")
     if session.custom_master:
         data = session.custom_master.encode("utf-8")
         return data, "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, 200
@@ -1017,3 +1172,10 @@ _cleanup_stale_sessions = _manager._cleanup_stale_sessions
 delete_session = _manager.delete_session
 get_session = _manager.get_session
 create_session = _manager.create_session
+
+# ponytail: self-check — YouTube segments must not be classified as playlists
+assert not _is_playlist_url(
+    "https://rr1---sn.example.googlevideo.com/videoplayback/id/x/itag/231"
+    "/source/youtube/playlist/index.m3u8/seg.ts"
+)
+assert _is_playlist_url("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/master.m3u8")

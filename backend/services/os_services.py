@@ -137,6 +137,63 @@ def _find_linux_opener() -> Optional[str]:
     return None
 
 
+def _wsl_windows_path(abspath: str) -> Optional[str]:
+    """Map ``/mnt/c/Users/...`` to ``C:\\Users\\...`` for explorer.exe on WSL."""
+    normalized = abspath.replace("\\", "/")
+    if not normalized.startswith("/mnt/"):
+        return None
+    parts = [p for p in normalized.split("/") if p]
+    if len(parts) < 2:
+        return None
+    drive = parts[1].upper()
+    if len(drive) != 1 or not drive.isalpha():
+        return None
+    rest = parts[2:]
+    if not rest:
+        return f"{drive}:\\"
+    return f"{drive}:\\" + "\\".join(rest)
+
+
+def _wsl_explorer_exe() -> Optional[str]:
+    for candidate in (
+        shutil.which("explorer.exe"),
+        "/mnt/c/Windows/explorer.exe",
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _open_via_wsl_explorer(abspath: str, *, reveal: bool, is_file: bool) -> bool:
+    explorer = _wsl_explorer_exe()
+    win_path = _wsl_windows_path(abspath)
+    if not explorer or not win_path:
+        return False
+    try:
+        if reveal or is_file:
+            escaped = win_path.replace('"', '\\"')
+            subprocess.Popen([explorer, f'/select,"{escaped}"'])
+        else:
+            subprocess.Popen([explorer, win_path])
+        return True
+    except OSError as exc:
+        logger.debug("WSL explorer open failed: %s", exc)
+        return False
+
+
+def _run_opener(cmd: list[str]) -> bool:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=15)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or b"").decode(errors="replace").strip()
+            logger.warning("Opener failed (%s): %s", " ".join(cmd[:2]), err[:200])
+            return False
+        return True
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Opener failed (%s): %s", cmd[0], exc)
+        return False
+
+
 def open_file_or_folder(
     path: str,
     *,
@@ -171,14 +228,28 @@ def open_file_or_folder(
             cmd = ["open", "-R", abspath]
         else:
             cmd = ["open", abspath]
-        subprocess.Popen(cmd)
+        if not _run_opener(cmd):
+            logger.warning("Could not open path in Finder: %s", abspath)
+    elif is_wsl():
+        if not _open_via_wsl_explorer(abspath, reveal=reveal, is_file=is_file):
+            opener = _find_linux_opener()
+            if opener is None:
+                logger.warning(
+                    "No file opener on WSL (tried explorer.exe and %s)",
+                    ", ".join(_LINUX_OPENERS),
+                )
+                return
+            target = str(p.parent) if (is_file and not reveal) else abspath
+            if not _run_opener([opener, target]):
+                logger.warning("Could not open path on WSL: %s", abspath)
     else:
         opener = _find_linux_opener()
         if opener is None:
             logger.warning("No file opener found on Linux (tried: %s)", ", ".join(_LINUX_OPENERS))
             return
         target = str(p.parent) if (is_file and not reveal) else abspath
-        subprocess.Popen([opener, target])
+        if not _run_opener([opener, target]):
+            logger.warning("Could not open path on Linux: %s", abspath)
 # ===================================================================
 # Platform detection helpers
 # ===================================================================
@@ -312,8 +383,25 @@ def unregister_child_pid(pid: int) -> None:
         _CHILD_PIDS.discard(pid)
 
 
+def _pid_looks_like_ffmpeg(pid: int) -> bool:
+    """Best-effort guard against PID reuse killing the wrong process."""
+    if pid <= 0:
+        return False
+    if is_windows():
+        out = _run_text(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"])
+        return "ffmpeg" in out.lower()
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+        return "ffmpeg" in cmdline.lower()
+    except OSError:
+        return False
+
+
 def _kill_pid(pid: int) -> None:
     """Kill a single process by PID (cross-platform)."""
+    if not _pid_looks_like_ffmpeg(pid):
+        logger.warning("Skipping kill pid=%d — process is not ffmpeg", pid)
+        return
     try:
         if is_windows():
             subprocess.run(
@@ -475,3 +563,6 @@ def _pick_folder_linux_fallback() -> Optional[str]:
         except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
             logger.debug("kdialog folder picker failed: %s", exc)
     return None
+
+
+assert _wsl_windows_path("/mnt/c/Users/test/file.mp4") == "C:\\Users\\test\\file.mp4"

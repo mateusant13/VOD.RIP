@@ -7,6 +7,7 @@ the dev ``__main__`` entry point.
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -44,6 +45,22 @@ app.include_router(channels.router)
 app.include_router(info.router)
 app.include_router(downloads.router)
 app.include_router(system.router)
+
+
+def _warm_youtube_session() -> None:
+    try:
+        from services.youtube_session import warm_youtube_session
+        warm_youtube_session()
+        logger.info("YouTube anonymous session pre-warmed")
+    except Exception:
+        logger.debug("YouTube session pre-warm failed", exc_info=True)
+
+
+threading.Thread(
+    target=_warm_youtube_session,
+    daemon=True,
+    name="youtube-warm",
+).start()
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -20,6 +20,7 @@ import {
   attachProgressivePreview,
   inferLevelHeight,
   initialPreviewPreferHeight,
+  resolveInitialHlsPreviewHeight,
   levelIndexForHeight,
   playbackHeightFromRequest,
   mergeVariantHeights,
@@ -59,6 +60,7 @@ interface PreviewPlayerOptions {
   playback: PlaybackInfo | null;
   sessionId: string | null;
   isClipPreview: boolean;
+  isYoutubePreview?: boolean;
   trimStart?: number;
   /**
    * Container element used to measure the player viewport cap.
@@ -83,6 +85,7 @@ export function usePreviewPlayer({
   playback,
   sessionId,
   isClipPreview,
+  isYoutubePreview = false,
   trimStart = 0,
   containerRef,
   onPreviewError,
@@ -141,8 +144,8 @@ export function usePreviewPlayer({
     playbackHeight: number,
     opts?: boolean | { userInitiated?: boolean },
   ) => {
-    if (!playbackHeight || playbackHeight === appliedHeightRef.current) return;
-    appliedHeightRef.current = playbackHeight;
+    if (!playbackHeight) return;
+    if (playbackHeight === appliedHeightRef.current && !opts) return;
 
     const userInitiated = typeof opts === 'boolean' ? opts : (opts?.userInitiated ?? false);
     const levels = previewLevelsRef.current;
@@ -163,6 +166,7 @@ export function usePreviewPlayer({
     // ── Progressive (direct MP4) path ──
     if (playback?.kind === 'progressive' && sid) {
       if (!video || !playback.url) return;
+      appliedHeightRef.current = playbackHeight;
       try {
         const targetUrl = userInitiated
           ? previewUrlWithPreferHeight(playback.url, playbackHeight)
@@ -192,29 +196,41 @@ export function usePreviewPlayer({
     const playbackUrl = playback?.url ?? '';
 
     if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
+      appliedHeightRef.current = playbackHeight;
       applyHlsQualityLevel(hls, hlsIndex, true);
+      if (!wasPaused) void video?.play().catch(() => {});
       return;
     }
 
     if (needsApiSwitch && sid && playbackUrl) {
+      appliedHeightRef.current = playbackHeight;
       try {
-        if (userInitiated) {
-          hls.loadSource(previewUrlWithPreferHeight(playbackUrl, playbackHeight));
-          hls.startLoad(savedTime);
-          void syncSessionQuality().catch(() => {});
-        } else {
-          await syncSessionQuality();
-          hls.loadSource(playbackUrl);
-          hls.startLoad();
-        }
+        const targetUrl = previewUrlWithPreferHeight(playbackUrl, playbackHeight);
+        const onManifest = () => {
+          hls.off?.(Hls.Events.MANIFEST_PARSED, onManifest);
+          if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+            applyHlsQualityLevel(hls, hlsIndex, true);
+          }
+          hls.startLoad?.(Math.max(0, savedTime));
+          if (video) {
+            video.currentTime = savedTime;
+            if (!wasPaused) void video.play().catch(() => {});
+          }
+        };
+        hls.stopLoad?.();
+        hls.on?.(Hls.Events.MANIFEST_PARSED, onManifest);
+        hls.loadSource?.(targetUrl);
+        void syncSessionQuality().catch(() => {});
       } catch (err: unknown) {
         appliedHeightRef.current = 0;
         onPreviewError?.(err instanceof Error ? err.message : 'Could not change preview quality');
       }
     } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
+      appliedHeightRef.current = playbackHeight;
       applyHlsQualityLevel(hls, hlsIndex, userInitiated);
+      if (userInitiated && !wasPaused) void video?.play().catch(() => {});
     }
-  }, [apiPost, playback, sessionId, trimStart, videoRef]);
+  }, [apiPost, playback, sessionId, trimStart, videoRef, onPreviewError]);
 
   const syncPlaybackToViewport = useCallback(async (fullscreenOverride?: boolean) => {
     const levels = previewLevelsRef.current;
@@ -295,12 +311,13 @@ export function usePreviewPlayer({
     playerCap: number,
     fallbackHeights?: number[],
   ) => {
-    const preferHeight = initialPreviewPreferHeight(isClipPreview, playerCap);
     return resolveHlsPreviewLevels(hls.levels, {
-      initialHeight: Math.min(preferHeight, playerCap),
+      initialHeight: resolveInitialHlsPreviewHeight(isClipPreview, playerCap, {
+        youtube: isYoutubePreview,
+      }),
       fallbackHeights: mergeVariantHeights(fallbackHeights),
     });
-  }, [isClipPreview]);
+  }, [isClipPreview, isYoutubePreview]);
 
   return {
     previewLevels,

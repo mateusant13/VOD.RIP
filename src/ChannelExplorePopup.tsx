@@ -13,6 +13,7 @@ import {
   detachProgressivePreview,
   inferLevelHeight,
   initialPreviewPreferHeight,
+  resolveInitialHlsPreviewHeight,
   measurePlayerHeightCap,
   mergeVariantHeights,
   resolveHlsPreviewLevels,
@@ -40,7 +41,7 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
-import { platformCardShadow, type PlatformStyleKey } from './platformStyles';
+import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
 
 function explorePlatformKey(raw: string): PlatformStyleKey {
@@ -149,6 +150,7 @@ export default function ChannelExplorePopup({
   const videoWrapRef = useRef<HTMLDivElement>(null);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const suppressPlayRef = useRef(false);
+  const platform = explorePlatformKey(vod.platform);
   const {
     previewLevels,
     qualityLevel,
@@ -163,12 +165,11 @@ export default function ChannelExplorePopup({
     playback,
     sessionId: sessionIdRef.current,
     isClipPreview: vod.isClip,
+    isYoutubePreview: platform === 'youtube',
     containerRef,
     onPreviewError: (msg) => setError(msg),
   });
 
-
-  const platform = explorePlatformKey(vod.platform);
 
   useEffect(() => {
     const pause = () => {
@@ -204,7 +205,9 @@ export default function ChannelExplorePopup({
     (async () => {
       try {
         const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
-        const preferHeight = initialPreviewPreferHeight(vod.isClip, playerCap);
+        const preferHeight = initialPreviewPreferHeight(vod.isClip, playerCap, {
+          youtube: platform === 'youtube',
+        });
         const clipInfoPromise = vod.isClip
           ? apiGet<{ qualities?: string[] }>(
             `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
@@ -256,8 +259,15 @@ export default function ChannelExplorePopup({
 
     return () => {
       cancelled = true;
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
+      const hls = hlsRef.current;
+      if (hls) {
+        try {
+          hls.stopLoad();
+          hls.detachMedia();
+          hls.destroy();
+        } catch {
+          /* ignore */
+        }
         hlsRef.current = null;
       }
       const video = videoRef.current;
@@ -560,7 +570,7 @@ export default function ChannelExplorePopup({
         maxBufferLength: 20,
         maxMaxBufferLength: 40,
         startFragPrefetch: true,
-        capLevelToPlayerSize: true,
+        capLevelToPlayerSize: platform !== 'youtube',
         fragLoadingTimeOut: 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
@@ -572,12 +582,16 @@ export default function ChannelExplorePopup({
       hls.attachMedia(video);
       let levelsInitialized = false;
       const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
-      const preferHeight = initialPreviewPreferHeight(vod.isClip, playerCap);
+      const meta = sessionMetaRef.current;
       const fallbackHeights = mergeVariantHeights(playback.variantHeights);
+      const initialHlsHeight = resolveInitialHlsPreviewHeight(vod.isClip, playerCap, {
+        youtube: platform === 'youtube',
+        variantHeights: fallbackHeights,
+        activeHeight: meta?.activeHeight ?? playback.activeHeight,
+      });
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
-        const cappedDefault = Math.min(preferHeight, playerCap);
         const { mapped, defaultIndex } = resolveHlsPreviewLevels(levels, {
-          initialHeight: cappedDefault,
+          initialHeight: initialHlsHeight,
           fallbackHeights,
         });
         if (!mapped.length) return;
@@ -662,11 +676,9 @@ export default function ChannelExplorePopup({
     return () => window.clearTimeout(t);
   }, [ready, focusPlayer]);
 
-  const ctrlBtn = (fs: boolean) => fs
-    ? 'border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]'
-    : 'border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white p-2 disabled:opacity-40';
+  const ctrlBtn = (fs: boolean) => platformPreviewCtrlBtn(platform, fs);
 
-  const fsCtrlBtn = 'border border-white/20 bg-black/25 text-zinc-100 p-2 disabled:opacity-30 backdrop-blur-[1px]';
+  const fsCtrlBtn = platformPreviewCtrlBtn(platform, true);
 
   const timelineUi = (
     <div className="flex items-center gap-1.5 w-full shrink-0">
@@ -912,7 +924,7 @@ export default function ChannelExplorePopup({
                     type="button"
                     onClick={() => void toggleFullscreen()}
                     disabled={!ready}
-                    className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
+                    className={platformPreviewCtrlBtn(platform, false, true)}
                     title="Exit fullscreen"
                   >
                     <Minimize2 size={18} />
@@ -955,7 +967,7 @@ export default function ChannelExplorePopup({
                   type="button"
                   onClick={() => void toggleFullscreen()}
                   disabled={!ready}
-                  className="border-2 border-white bg-black text-white hover:bg-white hover:text-black p-2 disabled:opacity-40 shadow-[2px_2px_0px_0px_#53fc18]"
+                  className={platformPreviewCtrlBtn(platform, false, true)}
                   title="Fullscreen"
                 >
                   <Maximize2 size={18} />

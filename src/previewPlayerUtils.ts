@@ -1,6 +1,12 @@
 export const PREVIEW_MAIN_DEFAULT_HEIGHT = 480;
 export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 360;
 export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
+/** Session prefer_height for YouTube before variant list is known — backend snaps to max ≤ this. */
+export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
+
+export function isYouTubePreviewPlatform(platform: string | null | undefined): boolean {
+  return (platform || '').toLowerCase() === 'youtube';
+}
 
 /** Validate URL protocol — only https, http, blob:, and relative proxy paths are allowed. */
 export function isValidPreviewUrl(u: string): boolean {
@@ -128,10 +134,50 @@ export function measurePlayerHeightCap(element: HTMLElement | null, aspect = 16 
   return snapPreviewHeight(h);
 }
 
-/** First preview load: fast default (360p clips / 480p VOD), never above player cap. */
-export function initialPreviewPreferHeight(isClip: boolean, playerCap: number): number {
+export type PreviewPreferHeightOpts = {
+  youtube?: boolean;
+  variantHeights?: number[];
+  qualityLabels?: string[];
+  activeHeight?: number;
+};
+
+/** Highest tier from API hints, else 1080p request for the preview session. */
+export function maxAvailablePreviewHeight(
+  variantHeights?: number[] | null,
+  qualityLabels?: string[] | null,
+): number {
+  const heights = mergeVariantHeights(
+    variantHeights ?? undefined,
+    parseQualityHeights(qualityLabels ?? []),
+  );
+  return heights.length ? heights[heights.length - 1] : PREVIEW_YOUTUBE_PREFER_HEIGHT;
+}
+
+/** First preview load: YouTube → max tier; Kick/Twitch → 360p/480p capped to player. */
+export function initialPreviewPreferHeight(
+  isClip: boolean,
+  playerCap: number,
+  opts?: PreviewPreferHeightOpts,
+): number {
+  if (opts?.youtube) {
+    if (opts.activeHeight && opts.activeHeight > 0) return opts.activeHeight;
+    return maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+  }
   const desired = isClip ? PREVIEW_CLIP_DEFAULT_HEIGHT : PREVIEW_MAIN_DEFAULT_HEIGHT;
   return Math.min(desired, playerCap);
+}
+
+/** HLS manifest default tier — YouTube starts at highest; others cap to viewport. */
+export function resolveInitialHlsPreviewHeight(
+  isClip: boolean,
+  playerCap: number,
+  opts?: PreviewPreferHeightOpts,
+): number {
+  if (opts?.youtube) {
+    if (opts.activeHeight && opts.activeHeight > 0) return opts.activeHeight;
+    return maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+  }
+  return Math.min(initialPreviewPreferHeight(isClip, playerCap), playerCap);
 }
 
 /** Stream height to fetch: full request in fullscreen, capped to player size otherwise. */
@@ -471,20 +517,39 @@ export interface HlsLevelController {
   loadLevel: number;
   autoLevelCapping?: number;
   config?: { capLevelToPlayerSize?: boolean };
+  stopLoad?: () => void;
+  loadSource?: (url: string) => void;
+  startLoad?: (startPosition?: number) => void;
+  on?: (event: string, cb: () => void) => void;
+  off?: (event: string, cb: () => void) => void;
 }
 
-/** Switch HLS quality — immediate uses currentLevel (same fragment), else next segment. */
+/** Switch HLS quality — immediate reloads current fragment at new level. */
 export function applyHlsQualityLevel(
   hls: HlsLevelController,
   levelIndex: number,
   immediate = false,
 ): void {
   if (levelIndex < 0 || levelIndex >= hls.levels.length) return;
+  if (hls.config) hls.config.capLevelToPlayerSize = false;
+  if (typeof hls.autoLevelCapping === 'number') hls.autoLevelCapping = -1;
   if (immediate) {
-    if (hls.config) hls.config.capLevelToPlayerSize = false;
-    if (typeof hls.autoLevelCapping === 'number') hls.autoLevelCapping = -1;
     hls.currentLevel = levelIndex;
+    hls.nextLevel = levelIndex;
+    hls.loadLevel = levelIndex;
     return;
   }
   hls.nextLevel = levelIndex;
 }
+
+void (() => {
+  const cap = 360;
+  console.assert(
+    initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) === 1080,
+    'YouTube preview should default to max tier',
+  );
+  console.assert(
+    initialPreviewPreferHeight(false, cap) === cap,
+    'Kick/Twitch preview should cap to player',
+  );
+})();

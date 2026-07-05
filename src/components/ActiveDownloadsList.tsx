@@ -1,6 +1,7 @@
 import { memo, type ReactNode } from 'react';
 import { FolderOpen, Pause, Play, StopCircle, Trash2 } from 'lucide-react';
-import { platformAccentColor } from '../platformColors';
+import { platformAccentColor, vodCheckboxStyle } from '../platformColors';
+import DownloadThumb from './DownloadThumb';
 
 export type ActiveDownloadRow = {
   download_id: string;
@@ -10,6 +11,7 @@ export type ActiveDownloadRow = {
   progress: number;
   output_file: string;
   title?: string | null;
+  thumbnail?: string | null;
   error?: string | null;
 };
 
@@ -82,6 +84,13 @@ function ActiveDownloadsListInner({
         const checked = showCheckbox && selectedIds?.has(dl.download_id);
         return (
           <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
+            <div className="flex gap-2 min-w-0">
+              <DownloadThumb
+                thumbnail={dl.thumbnail}
+                url={dl.url}
+                platform={dl.platform}
+              />
+              <div className="flex flex-col gap-2 min-w-0 flex-1">
             <div className="flex justify-between items-center gap-2">
               <div className="flex items-center gap-2 min-w-0">
                 {showCheckbox ? (
@@ -97,7 +106,8 @@ function ActiveDownloadsListInner({
                       checked={!!checked}
                       readOnly
                       tabIndex={-1}
-                      className="accent-[#53fc18] shrink-0 pointer-events-none"
+                      className="shrink-0 pointer-events-none"
+                      style={vodCheckboxStyle(platformAccentColor(dl.platform))}
                     />
                     {platformIcon(dl.platform, 'w-4 h-4')}
                   </label>
@@ -199,6 +209,8 @@ function ActiveDownloadsListInner({
             {dl.error && (
               <span className="text-[10px] text-red-400 font-mono">{dl.error}</span>
             )}
+              </div>
+            </div>
           </div>
         );
       })}

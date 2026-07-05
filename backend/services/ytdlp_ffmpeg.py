@@ -13,13 +13,56 @@ import tempfile
 import threading
 import time
 import uuid
+import contextvars
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
-from services.os_services import _NO_WINDOW, register_child_pid, unregister_child_pid
+from services.os_services import _NO_WINDOW, _kill_pid, register_child_pid, unregister_child_pid
 
 logger = logging.getLogger(__name__)
+
+_download_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "vodrip_download_id", default=None,
+)
+_download_ffmpeg_pids: dict[str, set[int]] = {}
+_download_pids_lock = threading.Lock()
+
+
+def set_download_context(download_id: Optional[str]) -> Optional[contextvars.Token]:
+    if download_id is None:
+        return None
+    return _download_id_ctx.set(download_id)
+
+
+def reset_download_context(token: Optional[contextvars.Token]) -> None:
+    if token is not None:
+        _download_id_ctx.reset(token)
+
+
+def kill_download_ffmpeg_pids(download_id: str) -> None:
+    """Kill ffmpeg children registered for one download (cancel/remove)."""
+    with _download_pids_lock:
+        pids = list(_download_ffmpeg_pids.pop(download_id, set()))
+    for pid in pids:
+        _kill_pid(pid)
+
+
+def _ytdlp_engine_opts() -> dict:
+    """YouTube needs a JS runtime (2026+). Prefer Node when Deno is absent."""
+    deno = shutil.which("deno")
+    if deno:
+        return {}
+    node = shutil.which("node")
+    if node:
+        return {"js_runtimes": {"node": {"path": node}}}
+    logger.warning(
+        "No JS runtime (deno/node) on PATH — YouTube extract may fail; see yt-dlp EJS wiki"
+    )
+    return {}
+
+
+assert isinstance(_ytdlp_engine_opts(), dict)
 
 
 def _check_pause_cancel(
@@ -41,12 +84,25 @@ def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
 MIN_VALID_OUTPUT_BYTES = 50_000
 
 def _track_ffmpeg_proc(proc: sp.Popen) -> None:
-    if proc.pid:
-        register_child_pid(proc.pid)
+    if not proc.pid:
+        return
+    register_child_pid(proc.pid)
+    download_id = _download_id_ctx.get()
+    if download_id:
+        with _download_pids_lock:
+            _download_ffmpeg_pids.setdefault(download_id, set()).add(proc.pid)
+
 
 def _untrack_ffmpeg_proc(proc: sp.Popen) -> None:
-    if proc.pid:
-        unregister_child_pid(proc.pid)
+    if not proc.pid:
+        return
+    unregister_child_pid(proc.pid)
+    download_id = _download_id_ctx.get()
+    if download_id:
+        with _download_pids_lock:
+            pids = _download_ffmpeg_pids.get(download_id)
+            if pids is not None:
+                pids.discard(proc.pid)
 
 VIDEO_ENCODER_OPTIONS: dict[str, str] = {
     "auto": "Auto (detect GPU)",

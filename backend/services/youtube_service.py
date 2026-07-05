@@ -48,15 +48,32 @@ def list_channel_videos_sync(
 ) -> list[dict[str, Any]]:
     import yt_dlp
 
+    from services.youtube_session import (
+        resolve_ytdlp_cookiefile,
+        youtube_session_from_settings,
+        ytdlp_youtube_extractor_args,
+    )
+
     url = channel_playlist_url(channel_ref, playlist)
-    opts = {
+    session = youtube_session_from_settings()
+    opts: dict[str, Any] = {
         "extract_flat": "in_playlist",
         "playlistend": max(1, min(int(limit), 100)),
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "ignoreerrors": True,
+        "socket_timeout": 12,
+        "extractor_args": {
+            "youtube": {
+                **ytdlp_youtube_extractor_args(session),
+                "player_client": ["ios", "mweb", "web"],
+            },
+        },
     }
+    cookie_path = resolve_ytdlp_cookiefile(session, None)
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries") or []

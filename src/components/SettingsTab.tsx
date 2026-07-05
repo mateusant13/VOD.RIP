@@ -73,6 +73,54 @@ export default function SettingsTab({
         </div>
       </div>
 
+      <div className="flex flex-col gap-1.5">
+        <FieldCaption>YouTube Cookies (optional — logged-in export)</FieldCaption>
+        <input
+          type="text"
+          value={settings.youtube_cookies_file ?? ''}
+          onChange={(e) => setSettings({ ...settings, youtube_cookies_file: e.target.value })}
+          placeholder="Only if bot-blocked — export while signed in to Google"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
+        />
+        <p className="text-[9px] font-mono text-zinc-600 leading-snug">
+          Anonymous session cookies are fetched automatically (no login). Use this field only for hard blocks.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption>Cookies From Browser</FieldCaption>
+          <input
+            type="text"
+            value={settings.youtube_cookies_browser ?? ''}
+            onChange={(e) => setSettings({ ...settings, youtube_cookies_browser: e.target.value })}
+            placeholder="chrome, firefox, edge…"
+            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs focus:outline-none focus:border-white"
+          />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption>Tokens JSON</FieldCaption>
+          <input
+            type="text"
+            value={settings.youtube_tokens_file ?? ''}
+            onChange={(e) => setSettings({ ...settings, youtube_tokens_file: e.target.value })}
+            placeholder="visitorData + po_token JSON"
+            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
+          />
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <FieldCaption>YouTube PO Token (optional)</FieldCaption>
+        <input
+          type="text"
+          value={settings.youtube_po_token ?? ''}
+          onChange={(e) => setSettings({ ...settings, youtube_po_token: e.target.value })}
+          placeholder="web.player poToken from DevTools"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
+        />
+      </div>
+
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
         <span>v{appVersion ?? '…'}</span>
         <span aria-hidden>·</span>

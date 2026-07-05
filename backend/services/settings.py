@@ -41,14 +41,29 @@ class SettingsManager:
                     )
                 if "video_encoder" not in data:
                     data["video_encoder"] = "auto"
-                return AppSettings(**data)
+                settings = AppSettings(**data)
+                return settings
         except Exception:
         # ponytail: best-effort — return AppSettings(**data)
             pass
-        return AppSettings()
+        settings = AppSettings()
+        return settings
+
+    def _autofill_ffmpeg_if_needed(self) -> None:
+        """Detect ffmpeg once under lock; persist via atomic save."""
+        if (self._settings.ffmpeg_path or "").strip():
+            return
+        from services.ytdlp_ffmpeg import _find_ffmpeg
+
+        found = _find_ffmpeg()
+        if not found:
+            return
+        updated = self._settings.model_copy(update={"ffmpeg_path": found})
+        self.save(updated)
 
     def get(self) -> AppSettings:
         with self._lock:
+            self._autofill_ffmpeg_if_needed()
             return self._settings.model_copy()
 
     def save(self, settings: AppSettings):

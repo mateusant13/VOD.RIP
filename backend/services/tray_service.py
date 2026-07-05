@@ -170,7 +170,10 @@ class TrayService:
         """Start the tray icon (blocking). Call from the main thread."""
         # Wayland + GNOME: tray is unreliable, skip with a warning
         if self._wayland_no_tray():
-            logger.warning("System tray unavailable under GNOME Wayland — running headless")
+            logger.warning(
+                "System tray unavailable under GNOME Wayland — opening WebUI in browser",
+            )
+            webbrowser.open(f"http://127.0.0.1:{self.port}")
             self._running.wait()
             return
 

@@ -63,6 +63,16 @@ async def update_settings(update: SettingsUpdate):
         current.temp_folder = update.temp_folder
     if update.oauth is not None:
         current.oauth = update.oauth
+    if update.youtube_cookies_file is not None:
+        current.youtube_cookies_file = update.youtube_cookies_file.strip()
+    if update.youtube_cookies_browser is not None:
+        current.youtube_cookies_browser = update.youtube_cookies_browser.strip()
+    if update.youtube_visitor_data is not None:
+        current.youtube_visitor_data = update.youtube_visitor_data.strip()
+    if update.youtube_po_token is not None:
+        current.youtube_po_token = update.youtube_po_token.strip()
+    if update.youtube_tokens_file is not None:
+        current.youtube_tokens_file = update.youtube_tokens_file.strip()
     if update.quality is not None:
         current.quality = update.quality
     if update.panel_layout is not None:

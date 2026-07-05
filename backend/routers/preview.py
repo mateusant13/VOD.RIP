@@ -7,12 +7,16 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse
 
 from deps import INFO_EXECUTOR
 from services.preview_service import (
     create_session,
     delete_session,
+    open_progressive_proxy,
+    preview_session_kind,
     proxy_master,
     proxy_playlist,
     proxy_segment,
@@ -119,17 +123,39 @@ async def _preview_master_response(
     session_id: str,
     range_header: Optional[str],
     prefer_height: Optional[int] = None,
+    *,
+    force_streaming: bool = False,
 ) -> Response:
     if prefer_height:
         await _preview_apply_prefer_height(session_id, prefer_height)
+    loop = asyncio.get_running_loop()
+    if force_streaming:
+        try:
+            generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
+                INFO_EXECUTOR,
+                lambda: open_progressive_proxy(session_id, range_header),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        response_headers = dict(extra_headers or {})
+        if ctype and ctype != "application/octet-stream":
+            response_headers.setdefault("Content-Type", ctype)
+        return StreamingResponse(
+            generate(),
+            media_type=ctype or "application/octet-stream",
+            status_code=status,
+            headers=response_headers,
+            background=BackgroundTask(cleanup),
+        )
     try:
-        data, ctype, extra_headers, status = await asyncio.get_running_loop().run_in_executor(
+        data, ctype, extra_headers, status = await loop.run_in_executor(
             INFO_EXECUTOR, proxy_master, session_id, range_header
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-    # ponytail: best-effort — network errors only
         raise HTTPException(status_code=500, detail=str(e))
     body: any = data
     response_headers = dict(extra_headers or {})
@@ -146,20 +172,24 @@ async def _preview_master_response(
 
 @router.get("/api/preview/hls/{session_id}/master.m3u8")
 async def preview_hls_master(session_id: str, request: Request):
+    loop = asyncio.get_running_loop()
+    kind = await loop.run_in_executor(INFO_EXECUTOR, preview_session_kind, session_id)
     return await _preview_master_response(
         session_id,
         request.headers.get("range"),
         _parse_prefer_height_query(request),
+        force_streaming=(kind == "progressive"),
     )
 
 
 @router.get("/api/preview/hls/{session_id}/stream.mp4")
 async def preview_stream_mp4(session_id: str, request: Request):
-    """Progressive MP4 proxy (Twitch clips) — same bytes as master, .mp4 URL for video."""
+    """Progressive MP4 proxy — streams googlevideo/CDN with forwarded Range headers."""
     return await _preview_master_response(
         session_id,
         request.headers.get("range"),
         _parse_prefer_height_query(request),
+        force_streaming=True,
     )
 
 
@@ -178,13 +208,23 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     try:
         if _is_playlist_url(upstream):
             data, ctype, extra_headers, status = await loop.run_in_executor(
-                None, lambda: proxy_playlist(session_id, upstream),
+                INFO_EXECUTOR,
+                lambda: proxy_playlist(session_id, upstream),
             )
             return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
         data, ctype, extra_headers, status = await loop.run_in_executor(
-            None, lambda: proxy_segment(session_id, upstream, range_header=range_header),
+            INFO_EXECUTOR,
+            lambda: proxy_segment(session_id, upstream, range_header),
         )
-        return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
+        response_headers = dict(extra_headers or {})
+        if ctype and ctype != "application/octet-stream":
+            response_headers.setdefault("Content-Type", ctype)
+        return Response(
+            content=data,
+            media_type=ctype or "application/octet-stream",
+            status_code=status,
+            headers=response_headers,
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:

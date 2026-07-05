@@ -2,13 +2,15 @@
 Main download entry point — yt-dlp wrapper, InstrumentedFFmpegPP, URL helpers, and video info.
 Depends on `ytdlp_ffmpeg`, `ytdlp_hls`, and `ytdlp_cache`.
 """
+import itertools
 import json
 import logging
 import os
 import re
 import threading
+import contextvars
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import subprocess
 import time
@@ -24,7 +26,7 @@ from services.ytdlp_ffmpeg import (
     MIN_VALID_OUTPUT_BYTES,
     _check_pause_cancel, _check_cancelled,
     resolve_video_encoder, resolve_concat_encoder,
-    normalize_video_encoder,
+    normalize_video_encoder, normalize_video_encoder_setting,
     _resolve_ffmpeg_exe,
     _parse_speed_multiplier,
     _phase_id,
@@ -134,24 +136,39 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     """Extract video metadata without downloading."""
     import asyncio
     full_url = build_url(url)
+    platform = detect_platform(full_url)
 
     cache_dir = _get_cache_dir()
     max_cache_mb = 200
+    oauth = None
+    cookies_file = None
     if settings_mgr is not None:
         max_cache_mb = settings_mgr.get().max_cache_mb
+        oauth = settings_mgr.get().oauth or None
+        cookies_file = settings_mgr.get().youtube_cookies_file or None
     max_bytes = max_cache_mb * 1024 * 1024
     cache_dir.mkdir(parents=True, exist_ok=True)
     _prune_cache_dir(cache_dir, max_bytes)
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "cachedir": str(cache_dir),
-    }
-
     def _extract():
+        if platform == "YouTube":
+            from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
+
+            opts = youtube_preview_ytdl_opts(
+                full_url, oauth=oauth, cachedir=cache_dir,
+                cookies_file=cookies_file,
+            )
+            return cached_extract_info(full_url, opts)
+        from services.ytdlp_ffmpeg import _ytdlp_engine_opts
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "cachedir": str(cache_dir),
+            **_ytdlp_engine_opts(),
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(full_url, download=False)
 
@@ -198,6 +215,9 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     return VideoInfo(**payload)
 
 _PP_PROGRESS_STATE_ATTR = "_vodrip_progress_state"
+_pp_state_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "vodrip_pp_state", default=None,
+)
 
 def _set_pp_progress_state(pp: FFmpegPostProcessor, state: dict) -> None:
     """Attach a thread-safe progress-state dict to a postprocessor instance.
@@ -230,6 +250,201 @@ def kill_pp_state_procs(pp_state: Optional[dict]) -> None:
 
 _ORIGINAL_REAL_RUN_FFMPEG = FFmpegPostProcessor.real_run_ffmpeg
 
+def _ytdlp_stock_ffmpeg_cmd(
+    pp: FFmpegPostProcessor,
+    input_path_opts: Sequence[Tuple[str, Sequence]],
+    output_path_opts: Sequence[Tuple[str, Sequence]],
+) -> list:
+    """Mirror yt-dlp's ``real_run_ffmpeg`` argv (merge-safe, no progress flags)."""
+    from yt_dlp.utils import encodeArgument
+
+    cmd = [pp.executable, encodeArgument("-y")]
+    if pp.basename == "ffmpeg":
+        cmd += [encodeArgument("-loglevel"), encodeArgument("repeat+info")]
+
+    def make_args(file, args, name, number):
+        keys = [f"_{name}{number}", f"_{name}"]
+        arg_list = list(args)
+        if name == "o":
+            arg_list += ["-movflags", "+faststart"]
+            if number == 1:
+                keys.append("")
+        arg_list += pp._configuration_args(pp.basename, keys)
+        if name == "i":
+            arg_list.append("-i")
+        return (
+            [encodeArgument(arg) for arg in arg_list]
+            + [pp._ffmpeg_filename_argument(file)]
+        )
+
+    for arg_type, path_opts in (("i", input_path_opts), ("o", output_path_opts)):
+        cmd += itertools.chain.from_iterable(
+            make_args(path, list(opts), arg_type, i + 1)
+            for i, (path, opts) in enumerate(path_opts) if path
+        )
+    return cmd
+
+def _ytdlp_stock_ffmpeg_cmd_with_progress(
+    pp: FFmpegPostProcessor,
+    input_path_opts,
+    output_path_opts,
+) -> list:
+    """Stock yt-dlp argv + ``-progress pipe:1`` (stdout) for live mux percent."""
+    from yt_dlp.utils import encodeArgument
+
+    cmd = _ytdlp_stock_ffmpeg_cmd(pp, input_path_opts, output_path_opts)
+    for i, arg in enumerate(cmd):
+        if str(arg) == "-i":
+            cmd[i:i] = [
+                encodeArgument("-nostats"),
+                encodeArgument("-progress"),
+                encodeArgument("pipe:1"),
+            ]
+            break
+    return cmd
+
+def _run_tracked_stock_ffmpeg(
+    pp: FFmpegPostProcessor,
+    input_path_opts,
+    output_path_opts,
+    *,
+    state: dict,
+    expected_retcodes=(0,),
+) -> str:
+    """Stock yt-dlp ffmpeg argv with a tracked, killable ``Popen`` (merge path)."""
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessorError
+    from yt_dlp.utils import shell_quote
+
+    pp.check_version()
+    oldest_mtime = min(
+        os.stat(path).st_mtime for path, _ in input_path_opts if path
+    )
+    cmd = _ytdlp_stock_ffmpeg_cmd_with_progress(pp, input_path_opts, output_path_opts)
+    pp.write_debug(f"ffmpeg command line: {shell_quote(cmd)}")
+
+    cancel_event = state.get("cancel_event")
+    pause_event = state.get("pause_event")
+    register_abort = state.get("register_abort")
+    state_lock = state.get("lock") or state.get("pp_lock")
+    duration_us = int(state.get("duration_us") or 0)
+    _check_pause_cancel(cancel_event, pause_event)
+
+    def _emit_progress_us(out_us: int) -> None:
+        if not state_lock or duration_us <= 0 or out_us <= 0:
+            return
+        pct = min(0.99, out_us / duration_us)
+        with state_lock:
+            state["last_percent"] = pct
+            state["last_emit_wall"] = time.monotonic()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            creationflags=_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return _ORIGINAL_REAL_RUN_FFMPEG(
+            pp, input_path_opts, output_path_opts,
+            expected_retcodes=expected_retcodes,
+        )
+
+    def _kill_proc() -> None:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    _track_ffmpeg_proc(proc)
+    state.setdefault("active_procs", []).append(proc)
+    if callable(register_abort):
+        register_abort(_kill_proc)
+
+    stderr_lines: list[str] = []
+    last_progress_us = 0
+
+    def _drain_stdout() -> None:
+        nonlocal last_progress_us
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    last_progress_us = int(line.split("=", 1)[1])
+                    _emit_progress_us(last_progress_us)
+                except ValueError:
+                    pass
+            elif line.startswith("progress=") and line.endswith("end"):
+                if duration_us > 0:
+                    _emit_progress_us(duration_us)
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    t_out = threading.Thread(target=_drain_stdout, daemon=True)
+    t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+    retcode = 0
+    try:
+        while proc.poll() is None:
+            try:
+                _check_pause_cancel(cancel_event, pause_event)
+            except PausedError:
+                _kill_proc()
+                raise
+            except CancelledError:
+                _kill_proc()
+                raise
+            time.sleep(0.15)
+        retcode = proc.returncode or 0
+    except KeyboardInterrupt:
+        _kill_proc()
+        raise
+    finally:
+        if proc.poll() is None:
+            _kill_proc()
+        _untrack_ffmpeg_proc(proc)
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+    stderr = "".join(stderr_lines)
+    if retcode not in tuple(expected_retcodes):
+        pp.write_debug(stderr)
+        last = stderr.strip().splitlines()
+        raise FFmpegPostProcessorError(last[-1] if last else f"ffmpeg failed (rc={retcode})")
+    for out_path, _ in output_path_opts:
+        if out_path:
+            pp.try_utime(out_path, oldest_mtime, oldest_mtime)
+    return stderr
+
+def _selfcheck_ytdlp_stock_cmd() -> None:
+    class _StubPP:
+        executable = "ffmpeg"
+        basename = "ffmpeg"
+
+        def _configuration_args(self, *_a, **_k):
+            return []
+
+        def _ffmpeg_filename_argument(self, path):
+            return path
+
+    cmd = _ytdlp_stock_ffmpeg_cmd(
+        _StubPP(),
+        [("a.mp4", [])],
+        [("out.mp4", ["-c", "copy"])],
+    )
+    assert any("movflags" in str(x) for x in cmd)
+
+_selfcheck_ytdlp_stock_cmd()
+
 def _build_ffmpeg_progress_cmd(
     executable: str,
     input_path_opts,
@@ -261,7 +476,7 @@ def _instrumented_real_run_ffmpeg(
     """Patch all ffmpeg postprocessors (merge, convert, extract) for progress."""
     import shlex
 
-    state = getattr(self, _PP_PROGRESS_STATE_ATTR, None)
+    state = getattr(self, _PP_PROGRESS_STATE_ATTR, None) or _pp_state_ctx.get()
     if state is None:
         return _ORIGINAL_REAL_RUN_FFMPEG(
             self, input_path_opts, output_path_opts,
@@ -278,26 +493,20 @@ def _instrumented_real_run_ffmpeg(
     pause_event = state.get("pause_event")
     register_abort = state.get("register_abort")
 
-    # ponytail: yt-dlp merge graphs — custom argv rebuild can hang; use stock ffmpeg for multi-input
+    # ponytail: yt-dlp merge — stock argv (not progress cmd); tracked Popen so delete can kill ffmpeg
     input_count = sum(1 for path, _ in input_path_opts if path)
     if input_count > 1:
-        def _run_merge_original():
-            _check_pause_cancel(cancel_event, pause_event)
-            return _ORIGINAL_REAL_RUN_FFMPEG(
-                self, input_path_opts, output_path_opts,
-                expected_retcodes=expected_retcodes,
-            )
         try:
-            result = _run_merge_original()
-        except Exception:
-            raise
+            return _run_tracked_stock_ffmpeg(
+                self, input_path_opts, output_path_opts,
+                state=state, expected_retcodes=expected_retcodes,
+            )
         finally:
             with state_lock:
                 state["last_percent"] = 1.0
                 state["last_speed"] = ""
                 state["last_eta_seconds"] = 0
                 state["last_emit_wall"] = time.monotonic()
-        return result
 
     cmd = _build_ffmpeg_progress_cmd(self.executable, input_path_opts, output_path_opts)
     self.write_debug(f"instrumented ffmpeg command line: {shlex.join(cmd)}")
@@ -315,9 +524,9 @@ def _instrumented_real_run_ffmpeg(
             creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
-        return _ORIGINAL_REAL_RUN_FFMPEG(
+        return _run_tracked_stock_ffmpeg(
             self, input_path_opts, output_path_opts,
-            expected_retcodes=expected_retcodes,
+            state=state, expected_retcodes=expected_retcodes,
         )
 
     def _kill_proc() -> None:
@@ -417,6 +626,7 @@ def _youtube_remux_by_default(encoder: Optional[str]) -> bool:
     return (encoder or "auto").strip().lower() in ("auto", "copy", "")
 
 assert _youtube_remux_by_default("auto") and not _youtube_remux_by_default("libx264")
+assert _youtube_remux_by_default("copy") and not _youtube_remux_by_default("h264_nvenc")
 
 def _build_ydl_opts(
     url: str,
@@ -433,12 +643,15 @@ def _build_ydl_opts(
     expected_duration: Optional[float] = None,
     audio_only: bool = False,
 ) -> dict:
+    from services.ytdlp_ffmpeg import _ytdlp_engine_opts
+
     opts = {
         "outtmpl": output_path,
         "noplaylist": True,
         "no_warnings": True,
         "quiet": True,
         "concurrent_fragment_downloads": 8,
+        **_ytdlp_engine_opts(),
     }
     if not audio_only:
         opts["merge_output_format"] = "mp4"
@@ -548,6 +761,10 @@ def _build_ydl_opts(
 
     return opts
 
+assert not _build_ydl_opts(
+    "https://www.youtube.com/watch?v=x", "/tmp/out.mp4", video_encoder="auto",
+).get("postprocessors")
+
 def _wrap_progress_hook(
     progress_hook: Optional[Callable],
     cancel_event: Optional[threading.Event],
@@ -563,6 +780,21 @@ def _wrap_progress_hook(
 
     return hook
 
+def sanitize_download_error(exc: BaseException) -> str:
+    """Strip yt-dlp ANSI noise; return a short user-facing message."""
+    msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+    msg = re.sub(r"^ERROR:\s*", "", msg, flags=re.IGNORECASE).strip()
+    low = msg.lower()
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "YouTube blocked this video — set cookies file, browser cookies, "
+            "or po_token in Settings"
+        )
+    if msg.lower().startswith("error:"):
+        msg = msg[6:].strip()
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
 def _ydl_download(
     url: str,
     opts: dict,
@@ -570,13 +802,20 @@ def _ydl_download(
     pause_event: Optional[threading.Event] = None,
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
-    ydl = yt_dlp.YoutubeDL(opts)
-    if register_abort:
-        register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
-    try:
-        ydl.download([url])
-    finally:
-        _check_pause_cancel(cancel_event, pause_event)
+    from services.ytdlp_hls import _YtdlpQuietLogger, _silence_stderr
+
+    quiet_opts = dict(opts)
+    quiet_opts.setdefault("quiet", True)
+    quiet_opts.setdefault("no_warnings", True)
+    quiet_opts["logger"] = _YtdlpQuietLogger()
+    with _silence_stderr():
+        ydl = yt_dlp.YoutubeDL(quiet_opts)
+        if register_abort:
+            register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
+        try:
+            ydl.download([url])
+        finally:
+            _check_pause_cancel(cancel_event, pause_event)
 
 def download_video_sync(
     url: str,
@@ -597,15 +836,21 @@ def download_video_sync(
 ) -> str:
     """Download a video or clip. Called from the download manager's worker thread."""
     full_url = build_url(url)
+    platform = detect_platform(full_url)
     progress_hook = _wrap_progress_hook(progress_hook, cancel_event, pause_event)
-    resolved_encoder = resolve_video_encoder(
-        video_encoder or (settings_mgr.get().video_encoder if settings_mgr else None)
+    encoder_setting = normalize_video_encoder_setting(
+        video_encoder or (settings_mgr.get().video_encoder if settings_mgr else None),
     )
+    resolved_encoder = resolve_video_encoder(encoder_setting)
 
     cache_dir = _get_cache_dir()
     max_cache_mb = 200
+    cookies_file = None
     if settings_mgr is not None:
         max_cache_mb = settings_mgr.get().max_cache_mb
+        cookies_file = settings_mgr.get().youtube_cookies_file or None
+        if not oauth:
+            oauth = settings_mgr.get().oauth or None
     max_bytes = max_cache_mb * 1024 * 1024
     cache_dir.mkdir(parents=True, exist_ok=True)
     _prune_cache_dir(cache_dir, max_bytes)
@@ -629,17 +874,35 @@ def download_video_sync(
     # before the download, so it's a free call from our perspective).
     expected_duration: Optional[float] = None
     try:
-        with yt_dlp.YoutubeDL({
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "cachedir": str(cache_dir),
-        }) as ydl:
-            info = ydl.extract_info(full_url, download=False)
-        if info:
-            expected_duration = info.get("duration")
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        if platform == "YouTube":
+            from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
+
+            info = cached_extract_info(
+                full_url,
+                youtube_preview_ytdl_opts(
+                    full_url, oauth=oauth, cachedir=cache_dir,
+                    cookies_file=cookies_file,
+                ),
+            )
+            if info:
+                expected_duration = info.get("duration")
+        else:
+            from services.ytdlp_ffmpeg import _ytdlp_engine_opts
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "cachedir": str(cache_dir),
+                **_ytdlp_engine_opts(),
+            }) as ydl:
+                info = ydl.extract_info(full_url, download=False)
+            if info:
+                expected_duration = info.get("duration")
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, RuntimeError):
+        expected_duration = None
+    except yt_dlp.utils.DownloadError as exc:
+        logger.debug("YouTube duration probe failed: %s", exc)
         expected_duration = None
 
     trim = _normalize_crop_range(crop_start, crop_end)
@@ -648,24 +911,36 @@ def download_video_sync(
 
     opts = _build_ydl_opts(
         full_url, output_path, quality, oauth, progress_hook, cachedir=str(cache_dir),
-        throttle_kib=settings_mgr.get().throttle_kib if settings_mgr is not None else None,
         temp_folder=settings_mgr.get().temp_folder if settings_mgr is not None else None,
         ffmpeg_path=settings_mgr.get().ffmpeg_path if settings_mgr is not None else None,
-        video_encoder=resolved_encoder,
+        video_encoder=encoder_setting,
         pp_state=pp_state,
         expected_duration=expected_duration,
         audio_only=audio_only,
     )
+    from services.youtube_session import (
+        youtube_session_from_settings,
+        ytdlp_youtube_extractor_args,
+        resolve_ytdlp_cookiefile,
+    )
+    from services.youtube_innertube import extract_video_id
 
-    platform = detect_platform(full_url)
-    if (
-        platform == "YouTube"
-        and not audio_only
-        and _youtube_remux_by_default(resolved_encoder)
-        and not opts.get("format")
-    ):
-        # ponytail: remux-only download path — merge with -c copy when codecs allow
-        opts["format"] = "bv*+ba/b"
+    yt_session = youtube_session_from_settings(settings_mgr, video_id=extract_video_id(full_url))
+    opts["_youtube_session"] = yt_session
+    if yt_session.cookies_from_browser and not opts.get("cookiefile"):
+        opts["cookiesfrombrowser"] = (yt_session.cookies_from_browser,)
+    cookie_path = resolve_ytdlp_cookiefile(yt_session, cookies_file)
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    if platform == "YouTube":
+        yt_args = opts.get("extractor_args") or {}
+        opts["extractor_args"] = {
+            **yt_args,
+            "youtube": {
+                **(yt_args.get("youtube") or {}),
+                **ytdlp_youtube_extractor_args(yt_session),
+            },
+        }
 
     if register_abort is not None:
         register_abort(lambda: kill_pp_state_procs(pp_state))
@@ -676,7 +951,14 @@ def download_video_sync(
     # to know about yt_dlp's internal state.
     opts["_vodrip_pp_state"] = pp_state
 
-    is_hls = platform in ("Twitch", "Kick") and not is_clip_url(full_url) and not audio_only
+    is_hls = (
+        platform == "YouTube"
+        or (
+            not audio_only
+            and platform in ("Twitch", "Kick")
+            and not is_clip_url(full_url)
+        )
+    )
 
     # HLS downloads report their own 0→90% progress while segments are
     # fetched and muxed. The yt-dlp postprocessor poller only applies to
@@ -713,6 +995,7 @@ def download_video_sync(
             video_encoder=resolved_encoder,
             register_temp_dir=register_temp_dir,
             mp4_faststart=mp4_faststart,
+            audio_only=audio_only,
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)
@@ -724,7 +1007,11 @@ def download_video_sync(
             start = _format_ts(crop[0])
             end = _format_ts(crop[1])
             opts["download_sections"] = [f"*{start}-{end}"]
-        _ydl_download(full_url, opts, cancel_event, pause_event, register_abort)
+        _pp_token = _pp_state_ctx.set(pp_state)
+        try:
+            _ydl_download(full_url, opts, cancel_event, pause_event, register_abort)
+        finally:
+            _pp_state_ctx.reset(_pp_token)
 
     _verify_output_file(output_path)
     return output_path

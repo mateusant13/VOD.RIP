@@ -150,3 +150,23 @@ def test_cancel_all_idempotent():
     count2 = mgr.cancel_all()
     assert count1 >= 0
     assert count2 == 0  # second call should have nothing to cancel
+
+
+def test_kill_pp_state_procs_terminates_child():
+    """kill_pp_state_procs must stop tracked ffmpeg children (mux cancel path)."""
+    import subprocess
+    import sys
+    import time
+
+    from services.ytdlp_download import kill_pp_state_procs
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pp_state = {"active_procs": [proc]}
+    kill_pp_state_procs(pp_state)
+    time.sleep(0.1)
+    assert proc.poll() is not None
+    assert not pp_state.get("active_procs")

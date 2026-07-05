@@ -1,5 +1,5 @@
 """
-System routes — focus, exit, info, version, update, ytdlp status.
+System routes — focus, exit, info, version, update, ytdlp status, local media.
 """
 
 import asyncio
@@ -8,11 +8,35 @@ import os
 import platform
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
-from deps import settings_mgr
+from deps import OS_EXECUTOR, settings_mgr
+from utils import media_type_for_path, validate_local_media_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["system"])
+
+
+@router.get("/api/local/media")
+async def local_media(path: str):
+    """Stream a completed download from disk (Range-aware)."""
+    try:
+        loop = asyncio.get_running_loop()
+        file_path = await loop.run_in_executor(
+            OS_EXECUTOR,
+            lambda: validate_local_media_path(path, settings_mgr),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return FileResponse(
+        str(file_path),
+        media_type=media_type_for_path(file_path),
+        filename=file_path.name,
+    )
 
 
 @router.post("/api/focus")

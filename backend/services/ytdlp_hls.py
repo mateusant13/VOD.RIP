@@ -2,11 +2,14 @@
 HLS playlist parsing, segment downloading, and clip assembly — the segment-level
 HLS downloader that avoids yt-dlp for Twitch/Kick VODs.
 """
+import contextlib
 import errno
+import io
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -53,8 +56,48 @@ _SEGMENT_STALL_SECONDS = 90
 
 _HLS_FORWARD_KEYS = frozenset({
     "format", "username", "password",
-    "cachedir", "quiet", "no_warnings",
+    "cachedir", "quiet", "no_warnings", "cookiefile",
 })
+
+
+class _YtdlpQuietLogger:
+    """Capture yt-dlp chatter; surface only at DEBUG."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def debug(self, msg: object) -> None:
+        pass
+
+    def info(self, msg: object) -> None:
+        pass
+
+    def warning(self, msg: object) -> None:
+        self.lines.append(str(msg))
+
+    def error(self, msg: object) -> None:
+        self.lines.append(str(msg))
+
+
+@contextlib.contextmanager
+def _silence_stderr():
+    """Redirect fd 2 — yt-dlp writes ERROR lines past logging hooks."""
+    buf = io.StringIO()
+    saved_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        with contextlib.redirect_stderr(buf):
+            old_sys = sys.stderr
+            sys.stderr = buf
+            try:
+                yield buf
+            finally:
+                sys.stderr = old_sys
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        os.close(devnull)
 
 
 SEGMENT_DOWNLOAD_WORKERS = 8
@@ -65,19 +108,318 @@ HLS_MUX_STALL_SECONDS = 120
 
 HLS_DOWNLOAD_PROGRESS_CAP = 90.0
 
+_EXTRACT_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_EXTRACT_INFLIGHT: dict[str, tuple[threading.Event, dict]] = {}
+_EXTRACT_CACHE_LOCK = threading.Lock()
+_EXTRACT_CACHE_TTL_SEC = 10 * 60
+_EXTRACT_CACHE_MAX = 32
+_EXTRACT_WAIT_SEC = 120
+
+
+def _extract_cache_key(url: str, opts: dict) -> str:
+    clients = (
+        (opts.get("extractor_args") or {})
+        .get("youtube", {})
+        .get("player_client")
+    )
+    oauth = opts.get("password") or opts.get("username") or ""
+    cookie = opts.get("cookiefile") or ""
+    browser = opts.get("cookiesfrombrowser") or ""
+    session = opts.get("_youtube_session")
+    sess_key = ""
+    if session is not None:
+        sess_key = f"{bool(session.visitor_data)}|{bool(session.po_token)}|{bool(session.cookie_header)}"
+    return f"{url}|{clients}|{bool(oauth)}|{cookie}|{browser}|{sess_key}"
+
+
+def _youtube_url_from_opts(url: str, opts: dict) -> bool:
+    from services.youtube_innertube import extract_video_id
+
+    return extract_video_id(url) is not None
+
+
+def _youtube_cookie_path(opts: dict) -> Optional[str]:
+    path = (opts.get("cookiefile") or "").strip()
+    if path and Path(path).is_file():
+        return path
+    return None
+
+
+def _try_innertube_info(url: str, session=None) -> Optional[dict]:
+    from services.youtube_innertube import innertube_extract_info
+
+    return innertube_extract_info(url, session=session)
+
+
+def youtube_preview_ytdl_opts(
+    full_url: str,
+    oauth: Optional[str] = None,
+    cachedir: Optional[Path] = None,
+    cookies_file: Optional[str] = None,
+    session=None,
+) -> dict:
+    """Fast YouTube extract profile for preview (HLS ladder, disk cache)."""
+    from services.ytdlp_cache import _get_cache_dir
+    from services.ytdlp_ffmpeg import _find_ffmpeg
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_session import (
+        resolve_ytdlp_cookiefile,
+        youtube_session_from_settings,
+        youtube_session_from_values,
+        ytdlp_youtube_extractor_args,
+    )
+
+    vid = extract_video_id(full_url)
+    if session is None:
+        try:
+            from deps import settings_mgr
+            s = settings_mgr.get()
+            session = youtube_session_from_values(
+                visitor_data=getattr(s, "youtube_visitor_data", "") or None,
+                po_token=getattr(s, "youtube_po_token", "") or None,
+                cookies_file=cookies_file or getattr(s, "youtube_cookies_file", "") or None,
+                tokens_file=getattr(s, "youtube_tokens_file", "") or None,
+                cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
+                video_id=vid,
+            )
+        except Exception:
+            session = youtube_session_from_settings(video_id=vid)
+
+    opts: dict = {
+        "extractor_args": {"youtube": ytdlp_youtube_extractor_args(session)},
+        "cachedir": str(cachedir or _get_cache_dir()),
+        "_youtube_session": session,
+        "socket_timeout": 10,
+    }
+    if oauth:
+        opts["username"] = "oauth_token"
+        opts["password"] = oauth
+    cookie_path = resolve_ytdlp_cookiefile(session, cookies_file)
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    if session.cookies_from_browser:
+        opts["cookiesfrombrowser"] = (session.cookies_from_browser,)
+    found = _find_ffmpeg()
+    if found:
+        opts["ffmpeg_location"] = found
+    return opts
+
+
+def _youtube_info_has_hls(info: dict) -> bool:
+    """Preview needs m3u8 ladder — progressive-only yt-dlp hits must not be cached."""
+    for fmt in info.get("formats") or []:
+        if fmt.get("url") and fmt.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg"):
+            return True
+    return False
+
+
+def _youtube_cache_ok(url: str, opts: dict, info: dict) -> bool:
+    if not _youtube_url_from_opts(url, opts):
+        return True
+    return _youtube_info_has_hls(info)
+
+
+def _try_innertube_info_retry(url: str, attempts: int = 3, session=None) -> Optional[dict]:
+    """InnerTube multi-client chain (IOS → ANDROID → MWEB → TVHTML5 → WEB)."""
+    for i in range(attempts):
+        info = _try_innertube_info(url, session=session)
+        if info and _youtube_info_has_hls(info):
+            return info
+        if i + 1 < attempts:
+            time.sleep(0.12 * (i + 1))
+    return None
+
+
+def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
+    """Rebuild opts with a fresh anonymous session (after a failed pass)."""
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_session import (
+        invalidate_anonymous_session,
+        resolve_ytdlp_cookiefile,
+        youtube_session_from_settings,
+        ytdlp_youtube_extractor_args,
+    )
+
+    invalidate_anonymous_session()
+    fresh = youtube_session_from_settings(video_id=extract_video_id(url))
+    merged = dict(opts)
+    merged["_youtube_session"] = fresh
+    merged["extractor_args"] = {"youtube": ytdlp_youtube_extractor_args(fresh)}
+    cookie_path = resolve_ytdlp_cookiefile(fresh, merged.get("cookiefile"))
+    if cookie_path:
+        merged["cookiefile"] = cookie_path
+    elif "cookiefile" in merged and not fresh.cookie_file:
+        merged.pop("cookiefile", None)
+    if fresh.cookies_from_browser:
+        merged["cookiesfrombrowser"] = (fresh.cookies_from_browser,)
+    return merged
+
+
+def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
+    yt_session = opts.get("_youtube_session")
+    info = _try_innertube_info_retry(url, session=yt_session)
+    if info:
+        return info
+    no_cookie = {k: v for k, v in opts.items() if k != "cookiefile"}
+    info = _extract_hls_info_quiet(url, no_cookie)
+    if info:
+        return info
+    if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
+        return _extract_hls_info_quiet(url, opts)
+    return None
+
+
+def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 4) -> dict:
+    working = dict(opts)
+    last_err: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            info = _youtube_extract_pass(url, working)
+            if info and _youtube_info_has_hls(info):
+                return info
+        except Exception as exc:
+            last_err = exc
+        if i + 1 < attempts:
+            if i % 2 == 1:
+                working = _merge_fresh_youtube_session(working, url)
+            time.sleep(0.2 * (i + 1))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(
+        "YouTube blocked this video — add cookies, browser cookies, or po_token in Settings"
+    )
+
+
+assert _try_innertube_info_retry.__name__ == "_try_innertube_info_retry"
+
+
+def _cache_extract_result(key: str, info: dict) -> None:
+    now = time.time()
+    with _EXTRACT_CACHE_LOCK:
+        if len(_EXTRACT_INFO_CACHE) >= _EXTRACT_CACHE_MAX:
+            oldest = min(_EXTRACT_INFO_CACHE.items(), key=lambda item: item[1][0])
+            _EXTRACT_INFO_CACHE.pop(oldest[0], None)
+        _EXTRACT_INFO_CACHE[key] = (now, info)
+
+
+def cached_extract_info(url: str, opts: dict) -> dict:
+    """yt-dlp extract_info with in-memory TTL cache (preview + /api/info share hits)."""
+    key = _extract_cache_key(url, opts)
+    now = time.time()
+    with _EXTRACT_CACHE_LOCK:
+        hit = _EXTRACT_INFO_CACHE.get(key)
+        if hit and (now - hit[0]) < _EXTRACT_CACHE_TTL_SEC and _youtube_cache_ok(url, opts, hit[1]):
+            return hit[1]
+        if hit and not _youtube_cache_ok(url, opts, hit[1]):
+            _EXTRACT_INFO_CACHE.pop(key, None)
+        inflight = _EXTRACT_INFLIGHT.get(key)
+        if inflight is not None:
+            leader = False
+        else:
+            box: dict = {"result": None, "error": None}
+            inflight = (threading.Event(), box)
+            _EXTRACT_INFLIGHT[key] = inflight
+            leader = True
+
+    if not leader:
+        event, box = inflight
+        if not event.wait(timeout=_EXTRACT_WAIT_SEC):
+            raise TimeoutError("YouTube metadata extract timed out")
+        with _EXTRACT_CACHE_LOCK:
+            hit = _EXTRACT_INFO_CACHE.get(key)
+            if hit and _youtube_cache_ok(url, opts, hit[1]):
+                return hit[1]
+        err = box.get("error")
+        if err is not None:
+            raise err
+        result = box.get("result")
+        if result is not None:
+            return result
+        return cached_extract_info(url, opts)
+
+    event, box = inflight
+    try:
+        info = None
+        if _youtube_url_from_opts(url, opts):
+            info = _youtube_extract_with_retries(url, opts)
+        else:
+            info = _extract_hls_info(url, opts)
+        if info is None:
+            raise RuntimeError(
+                "YouTube blocked this video — add cookies, browser cookies, or po_token in Settings"
+            )
+        if _youtube_url_from_opts(url, opts) and not _youtube_info_has_hls(info):
+            raise RuntimeError("YouTube extract returned no HLS formats")
+        box["result"] = info
+        if _youtube_cache_ok(url, opts, info):
+            _cache_extract_result(key, info)
+        return info
+    except BaseException as exc:
+        box["error"] = exc
+        raise
+    finally:
+        with _EXTRACT_CACHE_LOCK:
+            _EXTRACT_INFLIGHT.pop(key, None)
+        event.set()
+
+
+assert cached_extract_info.__name__ == "cached_extract_info"
+assert _youtube_info_has_hls({"formats": [{"url": "https://x/a.m3u8", "protocol": "m3u8_native"}]})
+assert not _youtube_info_has_hls({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "ext": "mp4"}]})
+
+
+def _extract_hls_info_quiet(url: str, opts: dict) -> Optional[dict]:
+    """yt-dlp extract without raising; stderr suppressed unless DEBUG."""
+    try:
+        return _extract_hls_info(url, opts)
+    except Exception as exc:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("yt-dlp fallback failed for %s: %s", url, exc)
+        return None
+
+
 def _extract_hls_info(url: str, opts: dict) -> dict:
     """Use yt-dlp to get HLS info without downloading, passing auth etc."""
+    from services.ytdlp_ffmpeg import _ytdlp_engine_opts
+
+    ydl_log = _YtdlpQuietLogger()
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "logger": ydl_log,
+        "socket_timeout": 10,
+        **_ytdlp_engine_opts(),
     }
+    ffmpeg_loc = opts.get("ffmpeg_location")
+    if not ffmpeg_loc:
+        from services.ytdlp_ffmpeg import _find_ffmpeg
+
+        ffmpeg_loc = _find_ffmpeg()
+    if ffmpeg_loc:
+        ydl_opts["ffmpeg_location"] = ffmpeg_loc
     for key in _HLS_FORWARD_KEYS:
         if key in opts:
             ydl_opts[key] = opts[key]
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    for key in ("js_runtimes", "extractor_args"):
+        if key in opts:
+            ydl_opts[key] = opts[key]
+    ytdlp_logger = logging.getLogger("yt_dlp")
+    prev_level = ytdlp_logger.level
+    if not logger.isEnabledFor(logging.DEBUG):
+        ytdlp_logger.setLevel(logging.CRITICAL)
+    try:
+        quiet = not logger.isEnabledFor(logging.DEBUG)
+        ctx = _silence_stderr() if quiet else contextlib.nullcontext()
+        with ctx:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+    finally:
+        if not logger.isEnabledFor(logging.DEBUG):
+            ytdlp_logger.setLevel(prev_level)
+        if ydl_log.lines and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("yt-dlp: %s", "\n".join(ydl_log.lines))
 
 def _find_hls_format(info: dict) -> dict:
     """Pick the best HLS (m3u8) format matching the user's quality preference.
@@ -813,6 +1155,22 @@ def download_hls_media_clip(
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+def _extract_hls_audio(video_path: str, output_path: str, ffmpeg_exe: Optional[str] = None) -> None:
+    """Strip video track from an HLS clip mux to mp3."""
+    resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
+    _run_ffmpeg(
+        [
+            resolved, "-y", "-i", video_path,
+            "-vn", "-acodec", "libmp3lame", "-b:a", "192k",
+            output_path,
+        ],
+        cancel_event=None,
+        pause_event=None,
+        register_abort=None,
+    )
+    _verify_output_file(output_path)
+
+
 def _download_hls_clip(
     url: str,
     output_path: str,
@@ -827,26 +1185,52 @@ def _download_hls_clip(
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
+    audio_only: bool = False,
 ) -> None:
     """Download only the HLS segments covering *start_sec*–*end_sec*."""
-    info = _extract_hls_info(url, opts)
+    from services.youtube_innertube import extract_video_id
+
+    extract_opts = dict(opts)
+    if extract_video_id(url):
+        if not extract_opts.get("_youtube_session"):
+            extract_opts = youtube_preview_ytdl_opts(
+                url,
+                oauth=opts.get("password"),
+                cachedir=opts.get("cachedir"),
+                cookies_file=opts.get("cookiefile"),
+            )
+        info = cached_extract_info(url, extract_opts)
+    else:
+        info = _extract_hls_info(url, opts)
     fmt = _find_hls_format(info)
     media_url = fmt["url"]
     headers = fmt.get("http_headers") or info.get("http_headers") or {}
     ffmpeg_exe = _resolve_ffmpeg_exe(opts.get("ffmpeg_location"))
 
-    download_hls_media_clip(
-        media_url, start_sec, end_sec, output_path, headers=headers,
-        ffmpeg_exe=ffmpeg_exe,
-        progress_hook=progress_hook,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-        register_abort=register_abort,
-        register_temp_dir=register_temp_dir,
-        prefer_height=prefer_height,
-        video_encoder=video_encoder,
-        mp4_faststart=mp4_faststart,
-    )
+    clip_target = output_path
+    temp_video: Optional[str] = None
+    if audio_only:
+        temp_video = tempfile.mktemp(suffix=".mp4", prefix="hls_audio_")
+        clip_target = temp_video
+
+    try:
+        download_hls_media_clip(
+            media_url, start_sec, end_sec, clip_target, headers=headers,
+            ffmpeg_exe=ffmpeg_exe,
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            register_temp_dir=register_temp_dir,
+            prefer_height=prefer_height,
+            video_encoder=video_encoder,
+            mp4_faststart=mp4_faststart,
+        )
+        if audio_only and temp_video:
+            _extract_hls_audio(temp_video, output_path, ffmpeg_exe)
+    finally:
+        if temp_video and os.path.isfile(temp_video):
+            os.unlink(temp_video)
 
 
 if __name__ == "__main__":

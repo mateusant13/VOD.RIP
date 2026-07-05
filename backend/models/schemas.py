@@ -28,6 +28,11 @@ class DownloadRequest(BaseModel):
     crop_start: Optional[float] = None
     crop_end: Optional[float] = None
     audio_only: bool = False
+    # ponytail: client already fetched info — skip slow re-extract before queue insert
+    title: Optional[str] = None
+    channel: Optional[str] = None
+    thumbnail: Optional[str] = None
+    duration: Optional[float] = None
 
 
 class DownloadState(BaseModel):
@@ -69,6 +74,11 @@ class AppSettings(BaseModel):
     ffmpeg_path: str = ""
     temp_folder: str = ""
     oauth: str = ""
+    youtube_cookies_file: str = ""
+    youtube_cookies_browser: str = ""
+    youtube_visitor_data: str = ""
+    youtube_po_token: str = ""
+    youtube_tokens_file: str = ""
     mp4_faststart: bool = False
     quality: str = "1080p"
     panel_layout: Optional[Dict[str, Any]] = None
@@ -90,6 +100,11 @@ class SettingsUpdate(BaseModel):
     ffmpeg_path: Optional[str] = None
     temp_folder: Optional[str] = None
     oauth: Optional[str] = None
+    youtube_cookies_file: Optional[str] = None
+    youtube_cookies_browser: Optional[str] = None
+    youtube_visitor_data: Optional[str] = None
+    youtube_po_token: Optional[str] = None
+    youtube_tokens_file: Optional[str] = None
     quality: Optional[str] = None
     panel_layout: Optional[Dict[str, Any]] = None
     window_geometry: Optional[Dict[str, Any]] = None

@@ -194,15 +194,93 @@ input[type="range"].url-trim-range::-moz-range-thumb {
   border: 1px solid rgba(113, 113, 122, 0.5);
 }
 
+/* Scrollbars — thin zinc thumb (matches zinc-800 panel borders) */
+.vod-app-shell *,
+#explore-portal *,
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+
+.vod-app-shell *::-webkit-scrollbar,
+#explore-portal *::-webkit-scrollbar,
 .custom-scrollbar::-webkit-scrollbar {
   width: calc(4px * var(--ui-scale));
+  height: calc(4px * var(--ui-scale));
 }
+
+.vod-app-shell *::-webkit-scrollbar-track,
+#explore-portal *::-webkit-scrollbar-track,
 .custom-scrollbar::-webkit-scrollbar-track {
   background: transparent;
 }
+
+.vod-app-shell *::-webkit-scrollbar-thumb,
+#explore-portal *::-webkit-scrollbar-thumb,
 .custom-scrollbar::-webkit-scrollbar-thumb {
   background: #3f3f46;
-  border-radius: 4px;
+  border-radius: 2px;
+}
+
+.vod-app-shell *::-webkit-scrollbar-thumb:hover,
+#explore-portal *::-webkit-scrollbar-thumb:hover,
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Checkboxes — square zinc border, accent fill (--vod-cb-accent), dark tick */
+.vod-app-shell input[type="checkbox"],
+#explore-portal input[type="checkbox"] {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  width: calc(14px * var(--ui-scale));
+  height: calc(14px * var(--ui-scale));
+  margin: 0;
+  flex-shrink: 0;
+  border: 1px solid #52525b;
+  background-color: #09090b;
+  border-radius: 0;
+  cursor: pointer;
+  position: relative;
+  vertical-align: middle;
+}
+
+.vod-app-shell input[type="checkbox"].vod-cb-sm,
+#explore-portal input[type="checkbox"].vod-cb-sm {
+  width: calc(12px * var(--ui-scale));
+  height: calc(12px * var(--ui-scale));
+}
+
+.vod-app-shell input[type="checkbox"]:checked,
+#explore-portal input[type="checkbox"]:checked {
+  background-color: var(--vod-cb-accent, #fafafa);
+  border-color: var(--vod-cb-accent, #fafafa);
+}
+
+.vod-app-shell input[type="checkbox"]:checked::after,
+#explore-portal input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 44%;
+  width: calc(3px * var(--ui-scale));
+  height: calc(7px * var(--ui-scale));
+  border: solid #09090b;
+  border-width: 0 calc(2px * var(--ui-scale)) calc(2px * var(--ui-scale)) 0;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.vod-app-shell input[type="checkbox"]:focus-visible,
+#explore-portal input[type="checkbox"]:focus-visible {
+  outline: 1px solid #fafafa;
+  outline-offset: 1px;
+}
+
+.vod-app-shell input[type="checkbox"]:disabled,
+#explore-portal input[type="checkbox"]:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ── Composable enter/exit animations via CSS custom properties ──

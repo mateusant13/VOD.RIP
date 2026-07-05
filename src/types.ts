@@ -34,6 +34,7 @@ export interface DownloadState {
   started_at: string;
   title?: string | null;
   channel?: string | null;
+  thumbnail?: string | null;
 }
 
 export interface DownloadsResponse {
@@ -79,6 +80,11 @@ export interface AppSettings {
   ffmpeg_path: string;
   temp_folder: string;
   oauth: string;
+  youtube_cookies_file?: string;
+  youtube_cookies_browser?: string;
+  youtube_visitor_data?: string;
+  youtube_po_token?: string;
+  youtube_tokens_file?: string;
   quality: string;
   panel_layout?: PersistedPanelLayout | null;
   window_geometry?: Record<string, number | boolean> | null;

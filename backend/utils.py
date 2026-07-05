@@ -216,45 +216,223 @@ def allow_foreground() -> None:
         pass
 
 
-def _explorer_title_matches(title: str, needles: set[str]) -> bool:
-    """Match Explorer window titles (localized suffixes, file/folder names)."""
-    tv = (title or "").lower()
-    if not tv:
-        return False
-    for n in needles:
-        if not n:
-            continue
-        if tv == n or tv.startswith(f"{n} -") or tv.startswith(n) or n in tv:
-            return True
+def _normalize_folder_path(path: str) -> str:
+    """Canonical folder path for Explorer HWND matching (custom drives, long paths)."""
+    p = (path or "").strip().strip('"')
+    if p.startswith("\\\\?\\UNC\\"):
+        p = "\\\\" + p[8:]
+    elif p.startswith("\\\\?\\"):
+        p = p[4:]
+    p = os.path.expanduser(p)
+    p = os.path.normpath(p)
+    try:
+        if os.path.exists(p):
+            p = os.path.realpath(p)
+    except OSError:
+        pass
+    p = p.rstrip("\\/")
+    if len(p) == 2 and p[1] == ":":
+        p += "\\"
+    return os.path.normcase(p)
+
+
+def _folders_equivalent(shell_path: str, target: str) -> bool:
+    a = _normalize_folder_path(shell_path)
+    b = _normalize_folder_path(target)
+    if a == b:
+        return True
+    # Explorer sometimes reports D: while we have D:\
+    if a.rstrip("\\") == b.rstrip("\\"):
+        return True
     return False
 
 
-assert _explorer_title_matches("Downloads - File Explorer", {"downloads"})
-assert _explorer_title_matches("clip.mp4 - Explorador de Arquivos", {"clip.mp4"})
-assert not _explorer_title_matches("File Explorer", {"missing"})
+def _explorer_hwnds_for_folder(folder_path: str) -> list[int]:
+    """Return HWNDs of Explorer windows showing folder_path (path match, not title)."""
+    folder_norm = _normalize_folder_path(folder_path)
+    hwnds: list[int] = []
+    try:
+        import win32com.client
+        for window in win32com.client.Dispatch("Shell.Application").Windows():
+            try:
+                path = window.Document.Folder.Self.Path
+                if path and _folders_equivalent(path, folder_norm):
+                    hwnd = int(window.HWND)
+                    if hwnd:
+                        hwnds.append(hwnd)
+            except Exception:
+                continue
+    except ImportError:
+        hwnds = _explorer_hwnds_jscript(folder_norm)
+    if not hwnds:
+        hwnds = _explorer_hwnds_enum_cabinets(folder_norm)
+    return hwnds
 
 
-def _topmost_explorer_hwnd(user32, ctypes, wintypes) -> int:
-    """First visible top-level Explorer folder window (EnumWindows z-order)."""
+def _explorer_hwnds_enum_cabinets(folder_norm: str) -> list[int]:
+    """Enum CabinetWClass top-level windows and match by Shell folder path."""
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        matched: list[int] = []
+
+        def _path_for_hwnd(hwnd: int) -> Optional[str]:
+            try:
+                import win32com.client
+                for window in win32com.client.Dispatch("Shell.Application").Windows():
+                    if int(window.HWND) == hwnd:
+                        return window.Document.Folder.Self.Path
+            except Exception:
+                return None
+            return None
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            buf = ctypes.create_unicode_buffer(256)
+            if not user32.GetClassNameW(hwnd, buf, 256):
+                return True
+            cls = buf.value
+            if cls not in ("CabinetWClass", "ExploreWClass"):
+                return True
+            root = user32.GetAncestor(hwnd, 2) or hwnd
+            path = _path_for_hwnd(int(root))
+            if path and _folders_equivalent(path, folder_norm):
+                matched.append(int(root))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        return matched
+    except Exception:
+        logger.debug("Cabinet HWND enum failed", exc_info=True)
+        return []
+
+
+def _explorer_hwnds_jscript(folder_norm: str) -> list[int]:
+    """Shell.Application path lookup without pywin32 (cscript + JScript)."""
+    import tempfile
+    escaped = folder_norm.replace("\\", "\\\\").replace('"', '\\"')
+    js = f"""
+var shell = new ActiveXObject("Shell.Application");
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var target = "{escaped}".toLowerCase().replace(/[\\\\/]+$/, "");
+function norm(p) {{
+  try {{
+    p = fso.GetAbsolutePathName(p);
+  }} catch (ex) {{}}
+  return p.toLowerCase().replace(/[\\\\/]+$/, "");
+}}
+var out = [];
+var e = new Enumerator(shell.Windows());
+for (; !e.atEnd(); e.moveNext()) {{
+  try {{
+    var p = e.item().Document.Folder.Self.Path;
+    if (p && norm(p) === target) out.push(e.item().HWND);
+  }} catch (ex) {{}}
+}}
+WScript.Echo(out.join("\\n"));
+"""
+    script_path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(js)
+            script_path = f.name
+        proc = subprocess.run(
+            ["cscript", "//nologo", script_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return []
+        return [int(line) for line in proc.stdout.splitlines() if line.strip().isdigit()]
+    except Exception:
+        logger.debug("JScript Explorer HWND lookup failed", exc_info=True)
+        return []
+    finally:
+        if script_path:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+
+if os.name == "nt":
+    assert os.path.normcase(os.path.abspath("C:\\foo")) == os.path.normcase("c:/foo")
+    assert _normalize_folder_path("D:\\VODs\\") == _normalize_folder_path("D:/VODs")
+    assert _folders_equivalent("D:\\VODs", "d:/vods/")
+
+
+def _pick_topmost_hwnd(user32, ctypes, wintypes, hwnds: list[int]) -> int:
+    """Among hwnds, return the one highest in desktop z-order."""
+    if not hwnds:
+        return 0
+    want = set(hwnds)
+    picked = 0
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-    GW_OWNER = 4
-    found: list[int] = []
 
     def _cb(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        cls = ctypes.create_unicode_buffer(256)
-        if user32.GetClassNameW(hwnd, cls, 256) == 0:
-            return True
-        if cls.value not in ("CabinetWClass", "ExploreWClass"):
-            return True
-        if user32.GetWindow(hwnd, GW_OWNER):
-            return True
-        found.append(hwnd)
-        return False
+        nonlocal picked
+        if hwnd in want:
+            picked = hwnd
+            return False
+        return True
 
     user32.EnumWindows(WNDENUMPROC(_cb), 0)
-    return found[0] if found else 0
+    return picked or hwnds[-1]
+
+
+def _raise_hwnd_foreground(root: int, user32, kernel32, ctypes, wintypes) -> None:
+    """Best-effort foreground activation for a top-level HWND."""
+    SW_RESTORE = 9
+    SW_SHOW = 5
+    ASFW_ANY = 0xFFFFFFFF
+    VK_MENU = 0x12
+    KEYEVENTF_KEYUP = 0x0002
+    try:
+        user32.AllowSetForegroundWindow(ASFW_ANY)
+        explorer_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(root, ctypes.byref(explorer_pid))
+        if explorer_pid.value:
+            user32.AllowSetForegroundWindow(explorer_pid.value)
+    except Exception:
+        pass  # ponytail: best-effort foreground unlock
+    try:
+        fg = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(fg, 0)
+        my_thread = kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_thread and fg_thread != my_thread:
+            user32.AttachThreadInput(my_thread, fg_thread, True)
+            attached = True
+        try:
+            user32.keybd_event(VK_MENU, 0, 0, 0)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            user32.ShowWindow(root, SW_RESTORE)
+            user32.ShowWindow(root, SW_SHOW)
+            user32.BringWindowToTop(root)
+            if hasattr(user32, "SwitchToThisWindow"):
+                user32.SwitchToThisWindow(root, True)
+            user32.SetForegroundWindow(root)
+        finally:
+            if attached:
+                user32.AttachThreadInput(my_thread, fg_thread, False)
+    except Exception:
+        pass
+    try:
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        user32.SetWindowPos(root, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetWindowPos(root, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+    except Exception:
+        pass
 
 
 def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> bool:
@@ -266,97 +444,15 @@ def focus_explorer_window(folder_path: str, item_name: Optional[str] = None) -> 
         from ctypes import wintypes
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        SW_RESTORE = 9
-        SW_SHOW = 5
-        GW_OWNER = 4
         GA_ROOT = 2
-        ASFW_ANY = 0xFFFFFFFF
-        VK_MENU = 0x12
-        KEYEVENTF_KEYUP = 0x0002
-        folder_norm = os.path.normcase(os.path.abspath(folder_path))
-        folder_base = (os.path.basename(folder_norm.rstrip("\\/")) or folder_norm).lower()
-        needles: set[str] = {folder_base}
-        if item_name:
-            needles.add(os.path.normcase(item_name).lower())
-        captured: list[int] = []
-        def _cb(hwnd, _lparam):
-            if captured:
-                return False
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            cls = ctypes.create_unicode_buffer(256)
-            if user32.GetClassNameW(hwnd, cls, 256) == 0:
-                return True
-            if cls.value not in ("CabinetWClass", "ExploreWClass"):
-                return True
-            if user32.GetWindow(hwnd, GW_OWNER):
-                return True
-            title = ctypes.create_unicode_buffer(512)
-            n = user32.GetWindowTextW(hwnd, title, 512)
-            if n <= 0:
-                return True
-            if _explorer_title_matches(title.value, needles):
-                captured.append(hwnd)
-                return False
-            return True
-        user32.EnumWindows(WNDENUMPROC(_cb), 0)
-        hwnd = captured[0] if captured else _topmost_explorer_hwnd(user32, ctypes, wintypes)
+        hwnds = _explorer_hwnds_for_folder(folder_path)
+        hwnd = _pick_topmost_hwnd(user32, ctypes, wintypes, hwnds)
         if not hwnd:
             return False
         root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
-        try:
-            user32.AllowSetForegroundWindow(ASFW_ANY)
-            explorer_pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(root, ctypes.byref(explorer_pid))
-            if explorer_pid.value:
-                user32.AllowSetForegroundWindow(explorer_pid.value)
-        except Exception:
-        # ponytail: ctypes/Win32 API errors only — best-effort foreground focus
-            pass
-        try:
-            fg = user32.GetForegroundWindow()
-            fg_thread = user32.GetWindowThreadProcessId(fg, 0)
-            my_thread = kernel32.GetCurrentThreadId()
-            attached = False
-            # ponytail: AttachThreadInput(idAttach, idAttachTo, fAttach)
-            # idAttach = OUR thread, idAttachTo = foreground thread.
-            # Previous code had these swapped, which silently fails.
-            if fg_thread and fg_thread != my_thread:
-                user32.AttachThreadInput(my_thread, fg_thread, True)
-                attached = True
-            try:
-                # ALT key trick: simulating an Alt press/release satisfies
-                # the Windows foreground activation prerequisite.
-                user32.keybd_event(VK_MENU, 0, 0, 0)
-                user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-                user32.ShowWindow(root, SW_RESTORE)
-                user32.ShowWindow(root, SW_SHOW)
-                user32.BringWindowToTop(root)
-                if hasattr(user32, "SwitchToThisWindow"):
-                    user32.SwitchToThisWindow(root, True)
-                user32.SetForegroundWindow(root)
-            finally:
-                if attached:
-                    user32.AttachThreadInput(my_thread, fg_thread, False)
-        except Exception:
-            pass
-        # SetWindowPos TOPMOST trick: force window on top as a fallback.
-        # This doesn't give keyboard focus but at least makes the window
-        # visible on top of other windows.
-        try:
-            HWND_TOPMOST = -1
-            HWND_NOTOPMOST = -2
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_SHOWWINDOW = 0x0040
-            user32.SetWindowPos(root, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-            user32.SetWindowPos(root, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-        except Exception:
-            pass  # ponytail: SetWindowPos already failed, nothing more to try
+        _raise_hwnd_foreground(root, user32, kernel32, ctypes, wintypes)
         return True
     except Exception:
-    # ponytail: best-effort — return True
         logger.debug("Could not focus Explorer window", exc_info=True)
         return False
 
@@ -382,18 +478,16 @@ def nudge_explorer_foreground(
 
 
 def _schedule_explorer_foreground(folder_path: str, item_name: Optional[str] = None) -> None:
-    """Focus Explorer now and again after the WebView steals focus back."""
-    nudge_explorer_foreground(folder_path, item_name, attempts=20, delay=0.1)
+    """Focus the Explorer window once it exists (pywebview steals focus on click)."""
 
-    def _delayed() -> None:
-        # ponytail: pywebview refocuses after the click handler — retry focus
-        for wait in (0.35, 0.55):
+    def _work() -> None:
+        for wait in (0.05, 0.15, 0.3, 0.5, 0.75, 1.0, 1.4, 1.9, 2.5, 3.2, 4.0, 5.0):
             time.sleep(wait)
             if focus_explorer_window(folder_path, item_name):
                 return
-            nudge_explorer_foreground(folder_path, item_name, attempts=8, delay=0.08)
+        nudge_explorer_foreground(folder_path, item_name, attempts=20, delay=0.15)
 
-    threading.Thread(target=_delayed, daemon=True, name="explorer-focus").start()
+    threading.Thread(target=_work, daemon=True, name="explorer-focus").start()
 
 
 def ensure_shell_com() -> bool:
@@ -534,6 +628,43 @@ def validate_open_folder_path(path: str, settings_mgr) -> str:
     if parent.is_dir():
         return str(p.resolve())
     raise FileNotFoundError(f"Folder does not exist: {parent}")
+
+
+_PLAYABLE_MEDIA_EXTS = frozenset({
+    ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".m4a", ".mp3",
+})
+_MEDIA_MIME = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+}
+
+
+def validate_local_media_path(path: str, settings_mgr) -> Path:
+    """Resolved file under the configured download folder."""
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("path is required")
+    p = Path(raw).expanduser()
+    if not p.is_absolute() and not (len(raw) > 1 and raw[1] == ":"):
+        p = download_dir(settings_mgr.get()) / p
+    p = p.resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"File not found: {p}")
+    if p.suffix.lower() not in _PLAYABLE_MEDIA_EXTS:
+        raise ValueError(f"Unsupported media type: {p.suffix}")
+    dl_root = download_dir(settings_mgr.get()).resolve()
+    if not p.is_relative_to(dl_root):
+        raise PermissionError("Media must be inside the download folder")
+    return p
+
+
+def media_type_for_path(path: Path) -> str:
+    return _MEDIA_MIME.get(path.suffix.lower(), "application/octet-stream")
 
 
 # ==================== Channel-browsing helpers ====================

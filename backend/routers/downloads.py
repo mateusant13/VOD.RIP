@@ -31,6 +31,28 @@ from utils import (
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["downloads"])
 
+_QUEUE_META_TIMEOUT_SEC = 2.5
+
+
+async def _resolve_queue_meta(req: DownloadRequest, platform: str) -> dict:
+    """Use client-provided metadata when available; else short best-effort fetch."""
+    if req.title or req.thumbnail or req.channel or req.duration:
+        return {
+            "title": req.title,
+            "channel": req.channel,
+            "thumbnail": req.thumbnail,
+            "duration": req.duration,
+            "duration_string": None,
+        }
+    try:
+        return await asyncio.wait_for(
+            fetch_queue_meta(req.url, platform),
+            timeout=_QUEUE_META_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.debug("Queue meta fetch timed out for %s", req.url[:80])
+        return {}
+
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 
 
@@ -118,7 +140,7 @@ async def download_video(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = _validate_download_url(req.url)
     require_hls_crop(req, platform)
-    meta = await fetch_queue_meta(req.url, platform)
+    meta = await _resolve_queue_meta(req, platform)
     output = build_output_path(req, opts, meta)
     safe_makedirs(Path(output).parent)
     download_func = None
@@ -160,7 +182,7 @@ async def download_video(req: DownloadRequest):
 async def download_clip(req: DownloadRequest):
     opts = settings_mgr.get()
     platform = _validate_download_url(req.url)
-    meta = await fetch_queue_meta(req.url, platform)
+    meta = await _resolve_queue_meta(req, platform)
     output = build_clip_output_path(req, opts, meta)
     safe_makedirs(Path(output).parent)
     crop_start = req.crop_start

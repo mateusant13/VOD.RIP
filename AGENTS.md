@@ -54,8 +54,17 @@ Before writing any code, stop at the first rung that holds:
 | `/ponytail-audit` | Audit whole repo for over-engineering |
 | `/ponytail-debt` | Harvest `ponytail:` shortcuts into a ledger |
 
+## Scope: simple ≠ incomplete
+
+**Simple** means shortest correct diff — not "do half the obvious surface."
+
+When you touch themed UI, platform logic, or a bug in one control:
+- Fix **siblings on the same surface** (same toolbar, same panel, same proxy path) if they'd look or behave wrong left half-done.
+- **Don't** expand into unrelated tabs, refactors, or new abstractions.
+- **Don't** end with "skipped: X, add when Y" for work that clearly belongs in the same pass. Either do it or leave a `ponytail:` comment in code with a real upgrade path.
+
+Autonomous is fine. Scope creep isn't.
+
 ## Output
 
-Code first. Then at most three short lines: what was skipped, when to add it. No essays, no feature tours, no design notes.
-
-Pattern: `[code] → skipped: [X], add when [Y].`
+Code first. **Do not** end with `→ skipped: X, add when Y` for work that belongs in the same task — ship it or leave a `ponytail:` comment in code with a real upgrade path. One deferral line at the end only when something is genuinely out of scope.

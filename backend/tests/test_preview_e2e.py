@@ -14,7 +14,70 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 
 from app import app
-from services.preview_service import _manager, PreviewSession, get_session, create_session, proxy_master
+from services.preview_service import _manager, PreviewSession, get_session, create_session, proxy_master, _is_playlist_url
+
+
+class TestIsPlaylistUrl:
+    def test_youtube_videoplayback_segment_not_playlist(self):
+        seg = (
+            "https://rr1---sn-x.googlevideo.com/videoplayback/id/abc/itag/231"
+            "/source/youtube/playlist/index.m3u8/seg"
+        )
+        assert not _is_playlist_url(seg)
+
+    def test_manifest_url_is_playlist(self):
+        assert _is_playlist_url("https://manifest.googlevideo.com/api/manifest/hls_playlist/x.m3u8")
+
+
+class TestYouTubePreviewResolve:
+    """YouTube preview must stay on HLS — progressive googlevideo URLs 403 in-browser."""
+
+    def test_progressive_only_metadata_rejected(self):
+        from unittest.mock import patch
+
+        from services.preview_service import resolve_stream_info
+
+        prog_only = {
+            "formats": [{
+                "url": "https://rr1---sn.example.googlevideo.com/videoplayback",
+                "protocol": "https",
+                "ext": "mp4",
+                "height": 720,
+                "vcodec": "avc1",
+                "acodec": "mp4a",
+            }],
+            "http_headers": {},
+        }
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        with patch(
+            "services.preview_service._extract_youtube_preview_info",
+            return_value=prog_only,
+        ):
+            with pytest.raises(RuntimeError, match="HLS"):
+                resolve_stream_info(url)
+
+    def test_hls_metadata_used(self):
+        from unittest.mock import patch
+
+        from services.preview_service import resolve_stream_info
+
+        hls_info = {
+            "formats": [{
+                "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/x/720.m3u8",
+                "protocol": "m3u8_native",
+                "height": 720,
+            }],
+            "http_headers": {"Referer": "https://www.youtube.com/"},
+        }
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        with patch(
+            "services.preview_service._extract_youtube_preview_info",
+            return_value=hls_info,
+        ):
+            entry, _hdrs, platform, _variants, kind = resolve_stream_info(url)
+        assert platform == "YouTube"
+        assert kind == "hls"
+        assert ".m3u8" in entry
 
 
 class TestPreviewManagerDirect:

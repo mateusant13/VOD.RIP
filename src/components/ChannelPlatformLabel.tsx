@@ -1,9 +1,12 @@
 /** Channel row label: per-platform logo + slug, hover to unlink one platform. */
 
+import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import PlatformVodIcon from './PlatformVodIcon';
 
 type Platform = 'Kick' | 'Twitch' | 'YouTube';
+
+const PLATFORM_REMOVE_DELAY_MS = 700;
 
 function PlatformChip({
   platform,
@@ -14,21 +17,58 @@ function PlatformChip({
   slug: string;
   onRemove?: () => void;
 }) {
+  const [removeReady, setRemoveReady] = useState(false);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (hoverTimerRef.current != null) {
+      window.clearTimeout(hoverTimerRef.current);
+    }
+  }, []);
+
   if (!slug.trim()) return null;
+
+  const onChipEnter = () => {
+    if (!onRemove) return;
+    if (hoverTimerRef.current != null) window.clearTimeout(hoverTimerRef.current);
+    hoverTimerRef.current = window.setTimeout(() => {
+      setRemoveReady(true);
+      hoverTimerRef.current = null;
+    }, PLATFORM_REMOVE_DELAY_MS);
+  };
+
+  const onChipLeave = () => {
+    if (hoverTimerRef.current != null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    setRemoveReady(false);
+  };
+
   return (
-    <span className="group/chip relative inline-flex items-center gap-0 shrink-0">
+    <span
+      className="group/chip relative inline-flex items-center gap-0 shrink-0"
+      onMouseEnter={onChipEnter}
+      onMouseLeave={onChipLeave}
+    >
       <PlatformVodIcon platform={platform} />
       <span className="whitespace-nowrap relative">
         {slug}
         {onRemove && (
           <button
             type="button"
-            title={`Remove ${platform} from channel`}
+            title={removeReady ? `Remove ${platform} from channel` : undefined}
+            disabled={!removeReady}
             onClick={(e) => {
               e.stopPropagation();
+              if (!removeReady) return;
               onRemove();
             }}
-            className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 group-hover/chip:opacity-100 p-0.5 bg-zinc-950/90 border border-zinc-600 rounded-sm text-zinc-400 hover:text-red-400 hover:border-red-500/60 transition-opacity z-10"
+            className={`absolute right-0 top-1/2 -translate-y-1/2 p-0.5 bg-zinc-950/90 border border-zinc-600 rounded-sm text-zinc-400 transition-opacity z-10 ${
+              removeReady
+                ? 'opacity-100 pointer-events-auto hover:text-red-400 hover:border-red-500/60 cursor-pointer'
+                : 'opacity-0 group-hover/chip:opacity-100 pointer-events-none cursor-default'
+            }`}
           >
             <X size={8} />
           </button>

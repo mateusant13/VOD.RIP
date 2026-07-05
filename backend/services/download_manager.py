@@ -34,7 +34,12 @@ from services.download_utils import (
     _download_timeout_seconds,
     _hook_progress_percent,
 )
-from services.ytdlp_download import kill_pp_state_procs
+from services.ytdlp_download import kill_pp_state_procs, sanitize_download_error
+from services.ytdlp_ffmpeg import (
+    kill_download_ffmpeg_pids,
+    reset_download_context,
+    set_download_context,
+)
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
@@ -349,6 +354,18 @@ class DownloadManager:
             _start_poller()
 
         def _download_worker():
+            ctx_token = set_download_context(download_id)
+            try:
+                _download_worker_body()
+            finally:
+                reset_download_context(ctx_token)
+                cleanup_snapshot = None
+                with self._lock:
+                    cleanup_snapshot = dict(self._cleanup_info.get(download_id) or {})
+                kill_pp_state_procs(cleanup_snapshot.get("pp_state"))
+                kill_download_ffmpeg_pids(download_id)
+
+        def _download_worker_body():
             try:
                 _enforce_deadline()
                 if cancel_event.is_set():
@@ -446,7 +463,7 @@ class DownloadManager:
                 )
                 with self._lock:
                     state.status = "Failed"
-                    state.error = f"{type(e).__name__}: {e}"
+                    state.error = sanitize_download_error(e)
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             # ponytail: bare except for catastrophic shutdown
@@ -458,7 +475,7 @@ class DownloadManager:
                 )
                 with self._lock:
                     state.status = "Failed"
-                    state.error = f"{type(_exc_val).__name__}: {_exc_val}" if _exc_val else "Unknown fatal error"
+                    state.error = sanitize_download_error(_exc_val) if _exc_val else "Unknown fatal error"
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             finally:
@@ -797,15 +814,19 @@ class DownloadManager:
             if raw_cleanup:
                 cleanup = dict(raw_cleanup)
                 pp_state = cleanup.get("pp_state")
-        for fn in abort_fns:
-            try:
-                fn()
-            # ponytail: survival guarantee for arbitrary abort callbacks
-            except Exception:
-                pass
-        kill_pp_state_procs(pp_state)
+        for _pass in range(2):
+            for fn in abort_fns:
+                try:
+                    fn()
+                # ponytail: survival guarantee for arbitrary abort callbacks
+                except Exception:
+                    pass
+            kill_pp_state_procs(pp_state)
+            kill_download_ffmpeg_pids(download_id)
+            if abort_fns or pp_state:
+                time.sleep(0.25)
         if abort_fns or pp_state:
-            time.sleep(0.35)
+            time.sleep(0.15)
         return cleanup
 
     def _purge_download_runtime(self, download_id: str) -> None:

@@ -1,9 +1,14 @@
 
 import { FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
+import { vodCheckboxStyle, platformAccentColor } from '../platformColors';
 import { ActiveDownloadsList } from './ActiveDownloadsList';
+import DownloadThumb from './DownloadThumb';
 import PlatformVodIcon from './PlatformVodIcon';
 import type { DownloadState } from '../types';
 
+function isPlayableLocalFile(path: string): boolean {
+  return /\.(mp4|mkv|webm|mov|m4v)$/i.test(path);
+}
 type Props = {
   queueDownloads: DownloadState[];
   recentDownloads?: DownloadState[];
@@ -25,6 +30,7 @@ type Props = {
   selectedRecentIds?: Set<string>;
   onToggleRecentSelection?: (id: string) => void;
   onBulkDeleteRecent?: () => void;
+  onWatchLocal?: (dl: DownloadState) => void;
 };
 
 export default function QueueTab({
@@ -48,6 +54,7 @@ export default function QueueTab({
   selectedRecentIds,
   onToggleRecentSelection,
   onBulkDeleteRecent,
+  onWatchLocal,
 }: Props) {
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
@@ -89,7 +96,8 @@ export default function QueueTab({
                   });
                 }
               }}
-              className="accent-[#53fc18]"
+              className="shrink-0"
+              style={vodCheckboxStyle('#fafafa')}
             />
             Select all
           </label>
@@ -145,7 +153,8 @@ export default function QueueTab({
                       });
                     }
                   }}
-                  className="accent-[#53fc18]"
+                  className="shrink-0"
+              style={vodCheckboxStyle('#fafafa')}
                 />
                 Select all
               </label>
@@ -201,21 +210,31 @@ export default function QueueTab({
                     });
                   }
                 }}
-                className="accent-[#53fc18]"
+                className="shrink-0"
+              style={vodCheckboxStyle('#fafafa')}
               />
               Select all
             </label>
           </div>
         )}
-        <div className="flex flex-col gap-2 max-h-[160px] overflow-y-auto pr-1 custom-scrollbar">
+        <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto pr-1 custom-scrollbar">
           {historyDownloads.length === 0 ? (
             <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
               NO COMPLETED DOWNLOADS YET.
             </div>
           ) : historyDownloads.map((dl) => {
             const checked = selectedHistoryIds?.has(dl.download_id);
+            const canWatch = Boolean(onWatchLocal && dl.output_file && isPlayableLocalFile(dl.output_file));
             return (
-              <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1.5">
+              <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex gap-2">
+                <DownloadThumb
+                  thumbnail={dl.thumbnail}
+                  url={dl.url}
+                  platform={dl.platform}
+                  watchable={canWatch}
+                  onWatch={canWatch ? () => onWatchLocal!(dl) : undefined}
+                />
+                <div className="flex flex-col gap-1.5 min-w-0 flex-1">
                 <div className="flex justify-between items-center gap-2">
                   <div className="flex items-center gap-2 min-w-0">
                     {onToggleHistorySelection ? (
@@ -231,7 +250,8 @@ export default function QueueTab({
                           checked={!!checked}
                           readOnly
                           tabIndex={-1}
-                          className="accent-[#53fc18] shrink-0 pointer-events-none"
+                          className="shrink-0 pointer-events-none"
+                          style={vodCheckboxStyle(platformAccentColor(dl.platform))}
                         />
                         <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                       </label>
@@ -268,6 +288,7 @@ export default function QueueTab({
                   </div>
                 </div>
                 {dl.error && <span className="text-[10px] text-red-400 font-mono">{dl.error}</span>}
+                </div>
               </div>
             );
           })}
