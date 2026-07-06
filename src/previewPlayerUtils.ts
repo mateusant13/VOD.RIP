@@ -126,14 +126,23 @@ export function progressivePlaybackUrlKey(playbackUrl: string): string {
 }
 
 /** Load proxied MP4 into a <video> — use <source type="video/mp4"> so .m3u8 paths still play. */
-export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: string, startTime?: number): void {
+export function attachProgressivePreview(
+  video: HTMLVideoElement,
+  playbackUrl: string,
+  startTime?: number,
+  cacheBust = false,
+): void {
   if (!isValidPreviewUrl(playbackUrl)) {
     throw new Error(`Blocked playback URL with disallowed protocol: ${playbackUrl.slice(0, 80)}`);
   }
+  const src = cacheBust
+    ? `${playbackUrl}${playbackUrl.includes('?') ? '&' : '?'}_=${Date.now()}`
+    : playbackUrl;
   const existingSource = video.querySelector('source');
   const existingUrl = existingSource?.getAttribute('src') ?? video.currentSrc;
   if (
-    existingUrl
+    !cacheBust
+    && existingUrl
     && progressivePlaybackUrlKey(existingUrl) === progressivePlaybackUrlKey(playbackUrl)
     && video.readyState >= HTMLMediaElement.HAVE_METADATA
   ) {
@@ -145,7 +154,7 @@ export function attachProgressivePreview(video: HTMLVideoElement, playbackUrl: s
   video.innerHTML = '';
   video.removeAttribute('src');
   const source = document.createElement('source');
-  source.src = playbackUrl;
+  source.src = src;
   source.type = 'video/mp4';
   video.appendChild(source);
   if (startTime != null && Number.isFinite(startTime) && video.readyState > HTMLMediaElement.HAVE_NOTHING) {
@@ -172,6 +181,75 @@ export function isClipRelativePreviewDuration(
   if (videoDurationSec >= vodDurationSec * 0.98) return false;
   if (!Number.isFinite(clipLengthSec) || clipLengthSec <= 0) return false;
   return Math.abs(videoDurationSec - clipLengthSec) <= Math.max(3, clipLengthSec * 0.08);
+}
+
+/** Prefer <video> duration when API metadata is off (common on YouTube progressive). */
+export function resolvePreviewDurationSec(
+  mediaDurationSec: number,
+  vodDurationSec: number,
+): number {
+  if (mediaDurationSec > 0 && vodDurationSec > 0) {
+    if (Math.abs(mediaDurationSec - vodDurationSec) > 3) return mediaDurationSec;
+  }
+  return mediaDurationSec > 0 ? mediaDurationSec : vodDurationSec;
+}
+
+export type ProgressivePreviewRecoveryOpts = {
+  video: HTMLVideoElement;
+  playbackUrl: string;
+  sessionId: string | null;
+  youtube: boolean;
+  extractSource?: string;
+  getResumeSec: () => number;
+  apiPost: <T>(path: string, body: unknown) => Promise<T>;
+  onRefreshing?: () => void;
+  onFatal?: () => void;
+  maxRetries?: number;
+};
+
+/** Retry progressive preview on CDN 416/expiry — logs extract_source for debugging. */
+export function bindProgressivePreviewRecovery(
+  opts: ProgressivePreviewRecoveryOpts,
+): () => void {
+  let retries = 0;
+  const max = opts.maxRetries ?? 4;
+
+  const onError = () => {
+    const code = opts.video.error?.code;
+    console.warn('[VOD.RIP preview] progressive error', {
+      code,
+      extractSource: opts.extractSource ?? 'unknown',
+      retries,
+    });
+    if (opts.youtube && opts.sessionId && retries < max) {
+      retries += 1;
+      opts.onRefreshing?.();
+      const resume = opts.getResumeSec();
+      void opts.apiPost<{ extract_source?: string }>(
+        `/api/preview/session/${opts.sessionId}/refresh`,
+        {},
+      ).then((res) => {
+        const src = res?.extract_source ?? opts.extractSource;
+        if (src) console.info('[VOD.RIP preview] refresh extract_source=', src);
+        attachProgressivePreview(opts.video, opts.playbackUrl, resume, true);
+        void opts.video.play().catch(() => {});
+      }).catch((err: unknown) => {
+        console.warn('[VOD.RIP preview] refresh failed', err);
+        if (retries < max) {
+          const resume = opts.getResumeSec();
+          attachProgressivePreview(opts.video, opts.playbackUrl, resume, true);
+          void opts.video.play().catch(() => {});
+        } else {
+          opts.onFatal?.();
+        }
+      });
+      return;
+    }
+    opts.onFatal?.();
+  };
+
+  opts.video.addEventListener('error', onError);
+  return () => opts.video.removeEventListener('error', onError);
 }
 
 export function channelSlugFromMediaUrl(u: string): string | null {

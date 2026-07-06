@@ -10,7 +10,10 @@ import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
   attachProgressivePreview,
+  bindProgressivePreviewRecovery,
   detachProgressivePreview,
+  isClipRelativePreviewDuration,
+  resolvePreviewDurationSec,
   inferLevelHeight,
   initialPreviewPreferHeight,
   resolveInitialHlsPreviewHeight,
@@ -138,6 +141,8 @@ export default function ChannelExplorePopup({
   const requestedHeightRef = useRef(0);
   const appliedHeightRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const extractSourceRef = useRef('');
+  const clipRelativeRef = useRef(false);
   const sessionMetaRef = useRef<{
     variantHeights: number[];
     qualityLabels?: string[];
@@ -225,6 +230,7 @@ export default function ChannelExplorePopup({
           variant_heights?: number[];
           quality_labels?: string[];
           active_height?: number;
+          extract_source?: string;
         }>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
@@ -246,6 +252,10 @@ export default function ChannelExplorePopup({
           activeHeight,
         };
         sessionIdRef.current = res.session_id;
+        extractSourceRef.current = res.extract_source ?? '';
+        if (extractSourceRef.current) {
+          console.info('[VOD.RIP preview] extract_source=', extractSourceRef.current);
+        }
         const resolved = resolvePreviewPlayback(vod.url, res);
         setPlayback({
           ...resolved,
@@ -326,7 +336,7 @@ export default function ChannelExplorePopup({
     }
   }, []);
 
-  const effectiveDurationSec = mediaDurationSec > 0 ? mediaDurationSec : vod.durationSec;
+  const effectiveDurationSec = resolvePreviewDurationSec(mediaDurationSec, vod.durationSec);
 
   const seekVideo = useCallback((sec: number) => {
     const video = videoRef.current;
@@ -553,16 +563,38 @@ export default function ChannelExplorePopup({
         }
       }).catch(() => { /* keep immediate levels */ });
       const onVideoError = () => {
-        setError('Clip preview failed — try again');
+        setError('Preview interrupted — try again');
         setLoading(false);
       };
+      const cleanupRecovery = bindProgressivePreviewRecovery({
+        video,
+        playbackUrl,
+        sessionId: sessionIdRef.current,
+        youtube: platform === 'youtube',
+        extractSource: extractSourceRef.current,
+        getResumeSec: () => video.currentTime,
+        apiPost,
+        onRefreshing: () => setLoading(true),
+        onFatal: onVideoError,
+      });
       appliedHeightRef.current = activeH;
+      const onLoadedMeta = () => {
+        if (Number.isFinite(video.duration) && video.duration > 0) {
+          setMediaDurationSec(Math.round(video.duration));
+          clipRelativeRef.current = isClipRelativePreviewDuration(
+            video.duration,
+            vod.durationSec,
+            vod.durationSec,
+          );
+        }
+      };
       attachProgressivePreview(video, playbackUrl);
+      video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
       video.addEventListener('canplay', onCanPlay, { once: true });
-      video.addEventListener('error', onVideoError, { once: true });
       cleanup = () => {
+        video.removeEventListener('loadedmetadata', onLoadedMeta);
         video.removeEventListener('canplay', onCanPlay);
-        video.removeEventListener('error', onVideoError);
+        cleanupRecovery();
         detachProgressivePreview(video);
       };
       return;
@@ -757,7 +789,7 @@ export default function ChannelExplorePopup({
       popoverClassName={fs
         ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
         : 'border-2 border-zinc-600 bg-zinc-950'}
-      popoverPlacement={fs ? 'down' : 'up'}
+      popoverPlacement="up"
     />
   );
 
@@ -867,7 +899,8 @@ export default function ChannelExplorePopup({
             }}
             onTimeUpdate={() => {
               const video = videoRef.current;
-              if (video) setCurrentTime(video.currentTime);
+              if (!video) return;
+              setCurrentTime(video.currentTime);
             }}
             onPlay={() => {
               if (suppressPlayRef.current) {

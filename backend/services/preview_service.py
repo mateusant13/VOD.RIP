@@ -402,6 +402,27 @@ def _youtube_refresh_and_remap(
     return _remap_youtube_url_after_refresh(failed_url, old_entry, old_variants, session)
 
 
+def _total_from_content_range(header: str) -> Optional[int]:
+    if not header:
+        return None
+    m = re.search(r"/(\d+)\s*$", header.strip())
+    return int(m.group(1)) if m else None
+
+
+def _clamp_range_header(range_header: str, total: int) -> Optional[str]:
+    m = re.match(r"bytes=(\d+)-(\d*)", (range_header or "").strip())
+    if not m or total <= 0:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else total - 1
+    if start >= total:
+        start = max(0, total - min(256 * 1024, total))
+    end = min(end, total - 1)
+    if end < start:
+        return None
+    return f"bytes={start}-{end}"
+
+
 def _open_upstream_stream(
     session: PreviewSession,
     url: str,
@@ -445,7 +466,27 @@ def _open_upstream_stream(
                     session, new_url, range_header, _retried=True,
                 )
         raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
-    resp.raise_for_status()
+    if resp.status_code == 416 and range_header and not _retried:
+        total = _total_from_content_range(resp.headers.get("Content-Range", ""))
+        try:
+            resp.close()
+        except OSError:
+            pass
+        if total is None:
+            try:
+                probe = _open_upstream_stream(session, url, "bytes=0-0", _retried=True)
+                total = _total_from_content_range(probe.headers.get("Content-Range", ""))
+                try:
+                    probe.close()
+                except OSError:
+                    pass
+            except Exception:
+                total = None
+        clamped = _clamp_range_header(range_header, total) if total else None
+        if clamped:
+            return _open_upstream_stream(session, url, clamped, _retried=True)
+    if resp.status_code >= 400:
+        resp.raise_for_status()
     session.touch()
     return resp
 
@@ -1718,4 +1759,5 @@ assert not _is_playlist_url(
     "/source/youtube/playlist/index.m3u8/seg.ts"
 )
 assert _is_playlist_url("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/master.m3u8")
+assert _clamp_range_header("bytes=8388608-8454143", 3697756) == "bytes=3435612-3697755"
 assert issubclass(StalePreviewUrls, RuntimeError)

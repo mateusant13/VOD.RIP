@@ -49,7 +49,7 @@ export default function PreviewQualityMenu({
         <Settings size={15} />
       </button>
       {menuOpen && (
-        <div className={`${popoverPos} z-50 min-w-[7rem] shadow-lg py-1 ${popoverClassName}`}>
+        <div className={`${popoverPos} z-[100] min-w-[7rem] shadow-lg py-1 ${popoverClassName}`}>
           {levels.map((l) => (
             <button
               key={l.index}

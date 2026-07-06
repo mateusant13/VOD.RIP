@@ -145,6 +145,7 @@ class PreviewSessionResponse(BaseModel):
     variant_heights: List[int] = []
     quality_labels: List[str] = []
     active_height: int = 0
+    extract_source: str = ""
 
 
 class PreviewQualityUpdateRequest(BaseModel):

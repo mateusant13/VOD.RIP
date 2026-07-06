@@ -42,6 +42,16 @@ def _preview_user_message(exc: BaseException) -> str:
     return youtube_user_message(exc, preview=True)
 
 
+def _session_extract_source(session) -> str:
+    if getattr(session, "platform", "") != "YouTube":
+        return ""
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_diag import last_extract_source
+
+    vid = extract_video_id(session.vod_url) or ""
+    return last_extract_source(vid)
+
+
 def _preview_session_response(session) -> PreviewSessionResponse:
     master = f"/api/preview/hls/{session.session_id}/master.m3u8"
     if session.kind == "progressive":
@@ -56,6 +66,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         variant_heights=session_variant_heights(session),
         quality_labels=session_quality_labels(session),
         active_height=session_active_height(session),
+        extract_source=_session_extract_source(session),
     )
 
 

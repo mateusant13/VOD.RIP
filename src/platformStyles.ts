@@ -41,7 +41,7 @@ export function platformButtonPressHover(platform: PlatformStyleKey): string {
 
 /** Press-in hover for the main download CTA (3px shadow stack). */
 export function platformDownloadBtn(platform: PlatformStyleKey): string {
-  const base = 'w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
+  const base = 'w-full shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
   if (platform === 'kick') {
     return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-px hover:translate-y-px`;
   }

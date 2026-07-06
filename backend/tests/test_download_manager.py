@@ -16,17 +16,29 @@ _VALID_TWITCH_VOD = "https://twitch.tv/videos/1000001"
 
 
 @pytest.fixture(autouse=True)
-def _purge_download_manager_after_test():
-    created: list[DownloadManager] = []
+def _purge_download_manager_every_ten():
+    """Purge queued/history test downloads every 10 start_download calls."""
+    count = {"n": 0}
+    created: list = []
     original_init = DownloadManager.__init__
+    original_start = DownloadManager.start_download
 
     def _track_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         created.append(self)
 
+    def _counting_start(self, *args, **kwargs):
+        dl_id = original_start(self, *args, **kwargs)
+        count["n"] += 1
+        if count["n"] % 10 == 0:
+            purge_download_manager(self)
+        return dl_id
+
     DownloadManager.__init__ = _track_init
+    DownloadManager.start_download = _counting_start
     yield
     DownloadManager.__init__ = original_init
+    DownloadManager.start_download = original_start
     for mgr in created:
         purge_download_manager(mgr)
 

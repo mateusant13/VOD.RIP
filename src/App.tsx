@@ -16,7 +16,7 @@ import {
 
 
   attachProgressivePreview,
-
+  bindProgressivePreviewRecovery,
   detachProgressivePreview,
   isClipRelativePreviewDuration,
   initialPreviewPreferHeight,
@@ -222,6 +222,7 @@ export default function App() {
   /** Menu selection — may exceed on-screen playback height until fullscreen. */
   const previewRequestedHeightRef = useRef(0);
   const previewAppliedHeightRef = useRef(0);
+  const previewExtractSourceRef = useRef('');
   // ── Shared preview hook (quality state machine) ──────────────────────────
   const {
     previewLevels,
@@ -711,6 +712,7 @@ export default function App() {
         variant_heights?: number[];
         quality_labels?: string[];
         active_height?: number;
+        extract_source?: string;
       }>('/api/preview/session', {
         url: trimmedUrl,
         crop_start: start,
@@ -719,6 +721,10 @@ export default function App() {
       });
       const res = await sessionPromise;
       if (gen !== previewGenRef.current) return;
+      previewExtractSourceRef.current = res.extract_source ?? '';
+      if (previewExtractSourceRef.current) {
+        console.info('[VOD.RIP preview] extract_source=', previewExtractSourceRef.current);
+      }
       const clipInfo = clipPreview && !qualityLabels?.length
         ? await apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
         : null;
@@ -883,24 +889,20 @@ export default function App() {
           syncProgressiveLevels(mapped, defaultIndex);
         }
       }).catch(() => { /* keep immediate levels */ });
-      const onVideoError = () => {
-        const sid = previewSessionId;
-        if (youtubePreview && sid) {
-          void apiPost(`/api/preview/session/${sid}/refresh`, {})
-            .then(() => {
-              if (cancelled) return;
-              attachProgressivePreview(video, playbackUrl);
-              void video.play().catch(() => {});
-            })
-            .catch(() => {
-              setError('Clip preview failed — try again');
-              setPreviewVideoLoading(false);
-            });
-          return;
-        }
-        setError('Clip preview failed — try again');
-        setPreviewVideoLoading(false);
-      };
+      const cleanupRecovery = bindProgressivePreviewRecovery({
+        video,
+        playbackUrl,
+        sessionId: previewSessionId,
+        youtube: youtubePreview,
+        extractSource: previewExtractSourceRef.current,
+        getResumeSec: () => video.currentTime,
+        apiPost,
+        onRefreshing: () => setPreviewVideoLoading(true),
+        onFatal: () => {
+          setError('Preview interrupted — try again');
+          setPreviewVideoLoading(false);
+        },
+      });
       previewAppliedHeightRef.current = activeH;
       const syncClipRelative = () => {
         const start = previewTrimStartRef.current;
@@ -921,10 +923,9 @@ export default function App() {
         syncClipRelative();
         onCanPlay();
       }, { once: true });
-      video.addEventListener('error', onVideoError, { once: true });
       cleanup = () => {
         video.removeEventListener('loadedmetadata', onLoadedMeta);
-        video.removeEventListener('error', onVideoError);
+        cleanupRecovery();
         detachProgressivePreview(video);
       };
       return;
@@ -1686,15 +1687,6 @@ export default function App() {
   const applyLayoutPanelClamps = useCallback(() => {
     const layout = layoutBoundsInput();
     const clamped = clampAllLayoutPanels(layout);
-    if (layout.urlPanelAside && videoInfo) {
-      const minTrimH = Math.min(
-        layoutMaxPanelHeight(),
-        Math.round(URL_ASIDE_TRIM_MIN_H * readUiScale()),
-      );
-      if (clamped.urlAside.h < minTrimH) {
-        clamped.urlAside = { ...clamped.urlAside, h: minTrimH };
-      }
-    }
     const nextLayout: LayoutPanelBoundsInput = {
       ...layout,
       preview: clamped.preview,
@@ -3185,7 +3177,7 @@ export default function App() {
       </div>
 
       {videoInfo && (
-        <div className="flex flex-col gap-2 min-h-0 flex-1 pb-px">
+        <div className="flex flex-col gap-2 shrink-0">
           <div className="border border-zinc-800 p-2 flex gap-2 bg-zinc-900/80 relative overflow-hidden shrink-0">
             <div className={`absolute top-0 right-0 w-10 h-10 opacity-15 blur-xl ${
               videoInfo.platform?.toLowerCase() === 'kick'
@@ -3461,55 +3453,58 @@ export default function App() {
                 finishUrlTrimDrag();
               }}
               className="url-trim-range w-full accent-zinc-400" />
-            <button
-              type="button"
-              onClick={() => {
-                const trimmed = url.trim();
-                if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
-              }}
-              disabled={!url.trim()}
-              className={`${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
-            >
-              <ExternalLink size={12} className="shrink-0" />
-              Open URL
-            </button>
-            <button
-              type="button"
-              onMouseEnter={() => {
-                const trimmed = url.trim();
-                if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
-                  warmYoutubePreview(trimmed);
-                }
-              }}
-              onClick={openPreview}
-              disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
-              className={`${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
-            >
-              {previewVideoLoading ? (
-                <Loader2 size={12} className="animate-spin shrink-0" />
-              ) : (
-                <Play size={12} fill="currentColor" className="shrink-0" />
-              )}
-              Watch preview
-            </button>
-
           </div>
-
-          <button
-            onClick={promptStartDownload}
-            disabled={loading || !videoInfo}
-            className={platformDownloadBtn(urlActionPlatform)}
-          >
-            <Download size={16} strokeWidth={3} />
-            <span className="inline-flex items-center">
-              <span className="tracking-widest">{currentIsClip ? 'Clip rip it' : 'VOD rip it'}</span>
-              <span className="rip-btn-bang" aria-hidden="true">!</span>
-            </span>
-          </button>
         </div>
       )}
     </div>
   );
+
+  const urlAsideActionBar = videoInfo ? (
+    <div className="flex flex-col gap-2 shrink-0 pt-2 border-t border-zinc-800">
+      <button
+        type="button"
+        onClick={() => {
+          const trimmed = url.trim();
+          if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
+        }}
+        disabled={!url.trim()}
+        className={`${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
+      >
+        <ExternalLink size={12} className="shrink-0" />
+        Open URL
+      </button>
+      <button
+        type="button"
+        onMouseEnter={() => {
+          const trimmed = url.trim();
+          if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
+            warmYoutubePreview(trimmed);
+          }
+        }}
+        onClick={openPreview}
+        disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
+        className={`${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
+      >
+        {previewVideoLoading ? (
+          <Loader2 size={12} className="animate-spin shrink-0" />
+        ) : (
+          <Play size={12} fill="currentColor" className="shrink-0" />
+        )}
+        Watch preview
+      </button>
+      <button
+        onClick={promptStartDownload}
+        disabled={loading || !videoInfo}
+        className={platformDownloadBtn(urlActionPlatform)}
+      >
+        <Download size={16} strokeWidth={3} />
+        <span className="inline-flex items-center">
+          <span className="tracking-widest">{currentIsClip ? 'Clip rip it' : 'VOD rip it'}</span>
+          <span className="rip-btn-bang" aria-hidden="true">!</span>
+        </span>
+      </button>
+    </div>
+  ) : null;
 
   const previewCtrlBtn = (fsOverlay: boolean, large = false) =>
     platformPreviewCtrlBtn(layoutPlatform, fsOverlay, large);
@@ -3726,7 +3721,7 @@ export default function App() {
           onMenuOpen: () => setPreviewQualityMenuOpen(false),
         })}
       </div>
-      <div className="flex items-center gap-1.5 ml-auto">
+      <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
         <PreviewQualityMenu
           levels={previewLevels}
           currentLevel={previewQualityLevel}
@@ -3736,7 +3731,7 @@ export default function App() {
           disabled={!previewVideoReady}
           buttonClassName={previewCtrlBtn(previewFullscreen)}
           onMenuOpen={() => setPreviewVolumeMenuOpen(false)}
-          popoverPlacement={previewFullscreen ? 'down' : 'up'}
+          popoverPlacement="up"
           popoverClassName={previewFullscreen
             ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
             : 'border-2 border-zinc-600 bg-zinc-950'}
@@ -3942,6 +3937,7 @@ export default function App() {
           <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden flex flex-col pr-1 custom-scrollbar overscroll-y-contain">
             {urlTabContent}
           </div>
+          {urlAsideActionBar}
           <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
         </div>
       )}

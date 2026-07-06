@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 log = logging.getLogger("VOD.RIP.youtube")
 
+_LAST_EXTRACT_SOURCE: dict[str, str] = {}
+
 
 def auth_hint(session: Any = None) -> str:
     if session is None:
@@ -44,7 +46,12 @@ def format_summary(info: Optional[dict]) -> str:
     )
 
 
+def last_extract_source(video_id: str) -> str:
+    return _LAST_EXTRACT_SOURCE.get(video_id, "")
+
+
 def log_extract_ok(video_id: str, source: str, info: dict, session: Any = None) -> None:
+    _LAST_EXTRACT_SOURCE[video_id] = source
     log.info(
         "extract ok video=%s source=%s auth=%s %s",
         video_id,
