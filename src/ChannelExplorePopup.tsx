@@ -121,6 +121,7 @@ export default function ChannelExplorePopup({
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [mediaDurationSec, setMediaDurationSec] = useState(0);
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [pos, setPos] = useState<PanelPos | null>(null);
@@ -197,6 +198,7 @@ export default function ChannelExplorePopup({
     setLoading(true);
     setReady(false);
     setError(null);
+    setMediaDurationSec(0);
     setPreviewLevels([]);
     setQualityLevel(0);
     setQualityMenuOpen(false);
@@ -324,15 +326,17 @@ export default function ChannelExplorePopup({
     }
   }, []);
 
+  const effectiveDurationSec = mediaDurationSec > 0 ? mediaDurationSec : vod.durationSec;
+
   const seekVideo = useCallback((sec: number) => {
     const video = videoRef.current;
     if (!video || !ready) return;
-    const t = Math.max(0, Math.min(sec, vod.durationSec));
+    const t = Math.max(0, Math.min(sec, effectiveDurationSec));
     if (Math.abs(video.currentTime - t) > 0.2) {
       video.currentTime = t;
     }
     setCurrentTime(t);
-  }, [ready, vod.durationSec]);
+  }, [ready, effectiveDurationSec]);
 
   const skip = useCallback((deltaSec: number) => {
     const video = videoRef.current;
@@ -690,15 +694,15 @@ export default function ChannelExplorePopup({
       <input
         type="range"
         min={0}
-        max={vod.durationSec}
+        max={effectiveDurationSec}
         step={0.25}
-        value={Math.min(currentTime, vod.durationSec)}
+        value={Math.min(currentTime, effectiveDurationSec)}
         disabled={!ready}
         onChange={(e) => seekVideo(parseFloat(e.target.value))}
         className="flex-1 accent-white disabled:opacity-40 h-1"
       />
       <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${fullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
-        {formatHmsFull(vod.durationSec)}
+        {formatHmsFull(effectiveDurationSec)}
       </span>
     </div>
   );
@@ -753,6 +757,7 @@ export default function ChannelExplorePopup({
       popoverClassName={fs
         ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
         : 'border-2 border-zinc-600 bg-zinc-950'}
+      popoverPlacement={fs ? 'down' : 'up'}
     />
   );
 
@@ -847,6 +852,9 @@ export default function ChannelExplorePopup({
               const video = videoRef.current;
               if (!video?.videoWidth || !video?.videoHeight) return;
               const aspect = video.videoWidth / video.videoHeight;
+              if (Number.isFinite(video.duration) && video.duration > 0) {
+                setMediaDurationSec(Math.round(video.duration));
+              }
               videoAspectRef.current = aspect;
               setVideoAspect(aspect);
               const clampedW = clampExplorePanelWidth(

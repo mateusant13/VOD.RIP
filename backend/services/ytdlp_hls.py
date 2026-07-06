@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin
@@ -28,7 +28,7 @@ import yt_dlp
 from services.ytdlp_ffmpeg import (
     CancelledError, PausedError,
     MIN_VALID_OUTPUT_BYTES,
-    _track_ffmpeg_proc, _untrack_ffmpeg_proc,
+    _track_ffmpeg_proc, _untrack_ffmpeg_proc, _terminate_ffmpeg_proc,
     resolve_video_encoder, resolve_concat_encoder,
     _check_pause_cancel,
     ffmpeg_h264_encode_args,
@@ -114,6 +114,25 @@ _EXTRACT_CACHE_LOCK = threading.Lock()
 _EXTRACT_CACHE_TTL_SEC = 10 * 60
 _EXTRACT_CACHE_MAX = 32
 _EXTRACT_WAIT_SEC = 120
+_YOUTUBE_EXTRACT_PARALLEL_SEC = 6.0
+
+
+def _youtube_manual_auth_configured() -> bool:
+    """True when user set cookies file, browser, po_token, or tokens file in Settings."""
+    try:
+        from deps import settings_mgr
+        s = settings_mgr.get()
+        if (getattr(s, "youtube_cookies_file", "") or "").strip():
+            return True
+        if (getattr(s, "youtube_cookies_browser", "") or "").strip():
+            return True
+        if (getattr(s, "youtube_po_token", "") or "").strip():
+            return True
+        if (getattr(s, "youtube_tokens_file", "") or "").strip():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _extract_cache_key(url: str, opts: dict) -> str:
@@ -198,11 +217,9 @@ def youtube_preview_ytdl_opts(
     if oauth:
         opts["username"] = "oauth_token"
         opts["password"] = oauth
-    cookie_path = resolve_ytdlp_cookiefile(session, cookies_file)
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
-    if session.cookies_from_browser:
-        opts["cookiesfrombrowser"] = (session.cookies_from_browser,)
+    from services.youtube_session import apply_ytdlp_cookie_opts
+
+    apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth, cookies_file=cookies_file)
     found = _find_ffmpeg()
     if found:
         opts["ffmpeg_location"] = found
@@ -318,46 +335,115 @@ def _try_innertube_info_retry(url: str, attempts: int = 1, session=None) -> Opti
 
 
 def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
-    """Rebuild opts with a fresh anonymous session (after a failed pass)."""
+    """Soft anonymous refresh — bootstrap new visitor cookies, no browser auth path."""
     from services.youtube_innertube import extract_video_id
     from services.youtube_session import (
-        invalidate_anonymous_session,
-        resolve_ytdlp_cookiefile,
+        bootstrap_anonymous_session,
         youtube_session_from_settings,
         ytdlp_extractor_args,
     )
 
-    invalidate_anonymous_session()
-    fresh = youtube_session_from_settings(video_id=extract_video_id(url))
+    vid = extract_video_id(url)
+    bootstrap_anonymous_session(video_id=vid, force=True)
+    fresh = youtube_session_from_settings(video_id=vid)
     merged = dict(opts)
     merged["_youtube_session"] = fresh
-    try:
-        from deps import settings_mgr
-        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
-    except Exception:
-        auto_auth = True
-    merged["extractor_args"] = ytdlp_extractor_args(fresh, auto_auth=auto_auth)
-    cookie_path = resolve_ytdlp_cookiefile(fresh, merged.get("cookiefile"))
-    if cookie_path:
-        merged["cookiefile"] = cookie_path
-    elif "cookiefile" in merged and not fresh.cookie_file:
-        merged.pop("cookiefile", None)
-    if fresh.cookies_from_browser:
-        merged["cookiesfrombrowser"] = (fresh.cookies_from_browser,)
+    merged["extractor_args"] = ytdlp_extractor_args(fresh, auto_auth=False)
+    merged.pop("cookiefile", None)
+    merged.pop("cookiesfrombrowser", None)
     return merged
 
 
+def _youtube_extract_parallel(
+    url: str,
+    opts: dict,
+    yt_session,
+    vid: str,
+) -> Optional[dict]:
+    """Race InnerTube vs yt-dlp anonymous — first playable result wins."""
+    from services.youtube_diag import log_extract_ok
+
+    bare_opts = {
+        k: v for k, v in opts.items()
+        if k not in ("cookiefile", "cookiesfrombrowser")
+    }
+    bare_opts["socket_timeout"] = min(int(bare_opts.get("socket_timeout") or 10), 6)
+
+    def _inn() -> Optional[dict]:
+        return _try_innertube_info_retry(url, session=yt_session)
+
+    def _ydl() -> Optional[dict]:
+        return _extract_hls_info_quiet(url, bare_opts)
+
+    winner: Optional[dict] = None
+    source = ""
+    # ponytail: shutdown(wait=False) — `with ThreadPoolExecutor` waits for slow yt-dlp (~5s)
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-extract")
+    try:
+        futures = {
+            pool.submit(_inn): "innertube_pass",
+            pool.submit(_ydl): "ytdlp_bare",
+        }
+        deadline = time.monotonic() + _YOUTUBE_EXTRACT_PARALLEL_SEC
+        pending = set(futures.keys())
+        while pending and time.monotonic() < deadline:
+            done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    info = fut.result()
+                except Exception as exc:
+                    logger.debug("parallel extract task failed %s: %s", vid, exc)
+                    continue
+                if info and _youtube_info_playable(info):
+                    winner = info
+                    source = futures[fut]
+                    break
+            if winner:
+                break
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if winner:
+        log_extract_ok(vid, source, winner, yt_session)
+    return winner
+
+
 def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_diag import log_extract_ok
+
     yt_session = opts.get("_youtube_session")
-    info = _try_innertube_info_retry(url, session=yt_session)
+    vid = extract_video_id(url) or url[:32]
+    has_auth = (
+        _youtube_cookie_path(opts)
+        or opts.get("cookiesfrombrowser")
+        or _youtube_manual_auth_configured()
+    )
+    if has_auth:
+        if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
+            info = _extract_hls_info_quiet(url, opts)
+            if info:
+                log_extract_ok(vid, "ytdlp_cookies", info, yt_session)
+                return info
+        info = _try_innertube_info_retry(url, session=yt_session)
+        if info:
+            log_extract_ok(vid, "innertube_pass", info, yt_session)
+            return info
+        info = _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
+        if info:
+            log_extract_ok(vid, "ytdlp_bare", info, yt_session)
+        return info
+
+    info = _youtube_extract_parallel(url, opts, yt_session, vid)
     if info:
         return info
-    # Cookie jar (anonymous or exported) is usually the fast yt-dlp path — try before bare.
-    if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
-        info = _extract_hls_info_quiet(url, opts)
-        if info:
-            return info
-    return _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
+    info = _try_innertube_info_retry(url, session=yt_session)
+    if info:
+        log_extract_ok(vid, "innertube_pass", info, yt_session)
+        return info
+    info = _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
+    if info:
+        log_extract_ok(vid, "ytdlp_bare", info, yt_session)
+    return info
 
 
 def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> dict:
@@ -376,9 +462,7 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> di
             time.sleep(0.12 * (i + 1))
     if last_err is not None:
         raise last_err
-    raise RuntimeError(
-        "YouTube blocked this video — add cookies, browser cookies, or po_token in Settings"
-    )
+    raise RuntimeError("YouTube preview unavailable for this video")
 
 
 assert _youtube_format_playable({"format_id": "hls-master", "url": "https://x/master.m3u8", "protocol": "m3u8_native"}) is True
@@ -436,16 +520,41 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         else:
             info = _extract_hls_info(url, opts)
         if info is None:
+            from services.youtube_innertube import extract_video_id
+            from services.youtube_diag import log_extract_fail
+            log_extract_fail(
+                extract_video_id(url) or "?",
+                "extract_returned_none",
+                opts.get("_youtube_session"),
+            )
             raise RuntimeError(
                 "YouTube blocked this video — add cookies, browser cookies, or po_token in Settings"
             )
         if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
+            from services.youtube_innertube import extract_video_id
+            from services.youtube_diag import format_summary, log_extract_fail
+            log_extract_fail(
+                extract_video_id(url) or "?",
+                "not_playable",
+                opts.get("_youtube_session"),
+                detail=format_summary(info),
+            )
             raise RuntimeError("YouTube extract returned no playable formats")
         box["result"] = info
         if _youtube_cache_ok(url, opts, info):
             _cache_extract_result(key, info)
         return info
     except BaseException as exc:
+        if _youtube_url_from_opts(url, opts):
+            from services.youtube_innertube import extract_video_id
+            from services.youtube_diag import log_extract_fail
+            log_extract_fail(
+                extract_video_id(url) or "?",
+                "extract_exception",
+                opts.get("_youtube_session"),
+                exc=exc if isinstance(exc, Exception) else None,
+                detail=str(exc)[:200],
+            )
         box["error"] = exc
         raise
     finally:
@@ -471,6 +580,9 @@ def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Op
         cached_extract_info(url, opts)
         return True
     except Exception as exc:
+        from services.youtube_diag import log_extract_fail
+        from services.youtube_innertube import extract_video_id
+        log_extract_fail(extract_video_id(url) or "?", "warm_skipped", exc=exc)
         logger.debug("YouTube warm extract skipped for %s: %s", url[:80], exc)
         return False
 
@@ -902,7 +1014,7 @@ def _progressive_hls_copy_to_mp4(
         ) from exc
     _track_ffmpeg_proc(proc)
     if register_abort:
-        register_abort(lambda: proc.poll() is None and proc.kill())
+        register_abort(lambda: _terminate_ffmpeg_proc(proc))
 
     seg_paths: list[Optional[str]] = [None] * total
     ready = [threading.Event() for _ in range(total)]
@@ -1039,6 +1151,7 @@ def _progressive_hls_copy_to_mp4(
                     err_tail = stderr.decode(errors="ignore")[-800:]
                     raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
     finally:
+        _terminate_ffmpeg_proc(proc)
         _untrack_ffmpeg_proc(proc)
 
     _verify_output_file(tmp_mp4)
@@ -1445,6 +1558,7 @@ def _fetch_googlevideo_range(
     byte_range: tuple[int, int],
     headers: Optional[dict],
     dest: str,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     """HTTP Range fetch of a googlevideo slice to a local file."""
     b0, b1 = byte_range
@@ -1462,6 +1576,8 @@ def _fetch_googlevideo_range(
     resp.raise_for_status()
     with open(dest, "wb") as out:
         for chunk in resp.iter_content(256 * 1024):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Download cancelled by user")
             if chunk:
                 out.write(chunk)
 
@@ -1485,6 +1601,23 @@ def _ffmpeg_reconnect_args() -> list[str]:
     return ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
 
 
+def _local_dash_slice_valid(path: str, *, audio: bool = False) -> bool:
+    """Range-fetched googlevideo slice must look like a readable media file."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 256:
+            return False
+        with open(path, "rb") as handle:
+            head = handle.read(32)
+        if b"ftyp" in head:
+            return True
+        # YouTube DASH audio is often webm-wrapped (EBML) even when muxed to m4a.
+        if audio and head[:4] == b"\x1aE\xdf\xa3":
+            return True
+        return False
+    except OSError:
+        return False
+
+
 def _download_muxed_dash_clip(
     video_url: str,
     audio_url: str,
@@ -1500,6 +1633,7 @@ def _download_muxed_dash_clip(
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
     video_fmt: Optional[dict] = None,
+    allow_remote_retry: bool = True,
 ) -> None:
     """Trim separate video+audio googlevideo URLs and mux to MP4."""
     duration = max(0.1, end_sec - start_sec)
@@ -1513,11 +1647,12 @@ def _download_muxed_dash_clip(
     tmpdir: Optional[str] = None
     v_input, a_input = video_url, audio_url
     v_ss, a_ss = start_sec, start_sec
+    used_local = False
 
     if v_range and a_range:
         tmpdir = tempfile.mkdtemp(prefix="dash_clip_")
-        v_input = os.path.join(tmpdir, "v.mp4")
-        a_input = os.path.join(tmpdir, "a.m4a")
+        v_local = os.path.join(tmpdir, "v.mp4")
+        a_local = os.path.join(tmpdir, "a.m4a")
         if progress_hook:
             progress_hook({
                 "status": "downloading",
@@ -1525,13 +1660,19 @@ def _download_muxed_dash_clip(
                 "phase": "Downloading",
                 "phase_id": _phase_id("Downloading"),
             })
-        _fetch_googlevideo_range(video_url, v_range, headers, v_input)
-        _fetch_googlevideo_range(audio_url, a_range, headers, a_input)
-        v_ss = max(0.0, start_sec - _range_lead_sec(video_url, v_range[0]))
-        a_ss = max(0.0, start_sec - _range_lead_sec(audio_url, a_range[0]))
+        _fetch_googlevideo_range(video_url, v_range, headers, v_local, cancel_event)
+        _fetch_googlevideo_range(audio_url, a_range, headers, a_local, cancel_event)
+        if _local_dash_slice_valid(v_local) and _local_dash_slice_valid(a_local, audio=True):
+            used_local = True
+            v_input, a_input = v_local, a_local
+            v_ss = max(0.0, start_sec - _range_lead_sec(video_url, v_range[0]))
+            a_ss = max(0.0, start_sec - _range_lead_sec(audio_url, a_range[0]))
+        else:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            tmpdir = None
 
     cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
-    remote = not (v_range and a_range)
+    remote = not used_local
     inp_hdr = (hdr + reconnect) if remote else []
     cmd += probe + inp_hdr + ["-ss", str(v_ss), "-i", v_input]
     cmd += probe + inp_hdr + ["-ss", str(a_ss), "-i", a_input]
@@ -1547,7 +1688,7 @@ def _download_muxed_dash_clip(
         cmd += ["-movflags", "+faststart"]
     cmd.append(output_path)
     try:
-        if progress_hook and not (v_range and a_range):
+        if progress_hook and remote:
             progress_hook({
                 "status": "downloading",
                 "percent": 5,
@@ -1574,6 +1715,45 @@ def _download_muxed_dash_clip(
                 "phase_id": _phase_id("Finalising"),
             })
             progress_hook({"status": "finished"})
+    except RuntimeError:
+        if used_local and allow_remote_retry:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            tmpdir = None
+            used_local = False
+            v_input, a_input = video_url, audio_url
+            v_ss, a_ss = start_sec, start_sec
+            remote = True
+            cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
+            inp_hdr = hdr + reconnect
+            cmd += probe + inp_hdr + ["-ss", str(v_ss), "-i", v_input]
+            cmd += probe + inp_hdr + ["-ss", str(a_ss), "-i", a_input]
+            cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
+            enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
+            if enc_args:
+                cmd += enc_args
+            elif _dash_video_needs_transcode(video_url, video_fmt) and output_path.lower().endswith(".mp4"):
+                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
+            else:
+                cmd += ["-c", "copy"]
+            if mp4_faststart:
+                cmd += ["-movflags", "+faststart"]
+            cmd.append(output_path)
+            _run_ffmpeg(
+                cmd,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                register_abort=register_abort,
+                progress_hook=progress_hook,
+                encode_duration=duration,
+                progress_from=10.0,
+                progress_to=92.0,
+                phase="Muxing",
+            )
+            _verify_output_file(output_path)
+            if progress_hook:
+                progress_hook({"status": "finished"})
+        else:
+            raise
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1708,6 +1888,8 @@ assert _find_media_format({
         "acodec": "mp4a",
     }],
 }).get("height") == 720
+assert _local_dash_slice_valid(__file__) is False
+assert _local_dash_slice_valid(__file__, audio=True) is False
 if __name__ == "__main__":
     assert _is_broken_pipe_error(BrokenPipeError())
     assert _is_broken_pipe_error(OSError(errno.EINVAL, "Invalid argument"))

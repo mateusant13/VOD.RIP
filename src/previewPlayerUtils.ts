@@ -161,6 +161,19 @@ export function detachProgressivePreview(video: HTMLVideoElement): void {
   video.load();
 }
 
+/** Muxed trim-window MP4 uses a 0-based timeline; full VOD progressive URLs do not. */
+export function isClipRelativePreviewDuration(
+  videoDurationSec: number,
+  vodDurationSec: number,
+  clipLengthSec: number,
+): boolean {
+  if (!Number.isFinite(videoDurationSec) || videoDurationSec <= 0) return false;
+  if (!Number.isFinite(vodDurationSec) || vodDurationSec <= 0) return false;
+  if (videoDurationSec >= vodDurationSec * 0.98) return false;
+  if (!Number.isFinite(clipLengthSec) || clipLengthSec <= 0) return false;
+  return Math.abs(videoDurationSec - clipLengthSec) <= Math.max(3, clipLengthSec * 0.08);
+}
+
 export function channelSlugFromMediaUrl(u: string): string | null {
   const host = hostnameFromUrl(u);
   if (host === 'kick.com' || host === 'www.kick.com') {

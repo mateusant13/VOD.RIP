@@ -1,5 +1,7 @@
 """Launch script for the Python Kick & Twitch Downloader"""
+import atexit
 import faulthandler
+import logging
 import subprocess
 import sys
 import os
@@ -16,8 +18,33 @@ def _install_fatal_hooks() -> None:
     sys.excepthook = _excepthook
 
 
+def _install_logging() -> None:
+    """Console INFO logs for dev (frozen EXE configures logging in __main_launcher__)."""
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("VOD.RIP.youtube").setLevel(logging.INFO)
+
+
+def _install_shutdown_hook() -> None:
+    def _atexit_shutdown() -> None:
+        try:
+            from services.shutdown_util import shutdown_downloads_and_children
+
+            shutdown_downloads_and_children()
+        except Exception:
+            pass
+
+    atexit.register(_atexit_shutdown)
+
+
 def main():
     _install_fatal_hooks()
+    _install_logging()
+    _install_shutdown_hook()
     # Debug mode removed — the `--debug` flag pointed to a missing `debug_cli.py`.
     # ponytail: Restore when a real debug CLI is built. For now, ignore --debug.
     if "--debug" in sys.argv:

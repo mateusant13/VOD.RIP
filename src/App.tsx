@@ -18,6 +18,7 @@ import {
   attachProgressivePreview,
 
   detachProgressivePreview,
+  isClipRelativePreviewDuration,
   initialPreviewPreferHeight,
   resolveInitialHlsPreviewHeight,
 
@@ -203,7 +204,7 @@ export default function App() {
   const previewInitialPlayDoneRef = useRef(false);
   const previewSuppressPlayRef = useRef(false);
   /** Monotonic generation counter — increment to cancel in-flight openPreview. */
-  const previewGenRef = useRef(0);
+  const previewClipRelativeRef = useRef(false);
   /** Cancels debounced YouTube metadata prefetch when URL changes. */
   const youtubePrefetchGenRef = useRef(0);
   const channelsScrollRef = useRef<HTMLDivElement>(null);
@@ -588,6 +589,7 @@ export default function App() {
     if (video) {
       detachProgressivePreview(video);
     }
+    previewClipRelativeRef.current = false;
   }, [setHlsRef]);
 
   const resetPreview = useCallback(async () => {
@@ -626,9 +628,11 @@ export default function App() {
     if (!video || !previewVideoReady) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
+    const clipRel = previewClipRelativeRef.current;
     const t = Math.max(start, Math.min(sec, end));
-    if (force || Math.abs(video.currentTime - t) > 0.05) {
-      video.currentTime = t;
+    const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+    if (force || Math.abs(video.currentTime - videoTime) > 0.05) {
+      video.currentTime = videoTime;
       syncPreviewTimeUi(t, true);
     }
   }, [previewVideoReady, syncPreviewTimeUi]);
@@ -752,7 +756,7 @@ export default function App() {
   useEffect(() => {
     const trimmed = url.trim();
     if (!trimmed || videoInfo?.title || loading) return;
-    if (detectUrlPlatform(trimmed) !== 'youtube' || isClipUrl(trimmed)) return;
+    if (detectUrlPlatform(trimmed) !== 'youtube') return;
     const gen = ++youtubePrefetchGenRef.current;
     const timer = window.setTimeout(() => {
       if (gen !== youtubePrefetchGenRef.current) return;
@@ -807,12 +811,13 @@ export default function App() {
       previewInitialSeekDoneRef.current = true;
       const start = previewTrimStartRef.current;
       const end = previewTrimEndRef.current;
-      if (Number.isFinite(start) && Math.abs(video.currentTime - start) > 0.25) {
-        video.currentTime = start;
+      const clipRel = previewClipRelativeRef.current;
+      const target = clipRel ? 0 : start;
+      if (Number.isFinite(target) && Math.abs(video.currentTime - target) > 0.25) {
+        video.currentTime = target;
       }
-      const t = Math.max(start, Math.min(video.currentTime, end));
-      if (Math.abs(video.currentTime - t) > 0.05) video.currentTime = t;
-      syncPreviewTimeUi(t, true);
+      const vodT = clipRel ? start + video.currentTime : Math.max(start, Math.min(video.currentTime, end));
+      syncPreviewTimeUi(vodT, true);
     };
 
     const onCanPlay = () => {
@@ -884,7 +889,7 @@ export default function App() {
           void apiPost(`/api/preview/session/${sid}/refresh`, {})
             .then(() => {
               if (cancelled) return;
-              attachProgressivePreview(video, playbackUrl, previewTrimStartRef.current);
+              attachProgressivePreview(video, playbackUrl);
               void video.play().catch(() => {});
             })
             .catch(() => {
@@ -897,11 +902,28 @@ export default function App() {
         setPreviewVideoLoading(false);
       };
       previewAppliedHeightRef.current = activeH;
-      attachProgressivePreview(video, playbackUrl, previewTrimStartRef.current);
-      video.addEventListener('canplay', onCanPlay, { once: true });
+      const syncClipRelative = () => {
+        const start = previewTrimStartRef.current;
+        const end = previewTrimEndRef.current;
+        previewClipRelativeRef.current = isClipRelativePreviewDuration(
+          video.duration,
+          vodDurationSecRef.current,
+          end - start,
+        );
+      };
+      const onLoadedMeta = () => {
+        syncClipRelative();
+        handlePreviewLoadedMetadata();
+      };
+      attachProgressivePreview(video, playbackUrl);
+      video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
+      video.addEventListener('canplay', () => {
+        syncClipRelative();
+        onCanPlay();
+      }, { once: true });
       video.addEventListener('error', onVideoError, { once: true });
       cleanup = () => {
-        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('loadedmetadata', onLoadedMeta);
         video.removeEventListener('error', onVideoError);
         detachProgressivePreview(video);
       };
@@ -1070,6 +1092,22 @@ export default function App() {
     if (!video) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
+    const clipRel = previewClipRelativeRef.current;
+    const clipLen = Math.max(0, end - start);
+    if (clipRel) {
+      const rel = video.currentTime;
+      const vodT = start + rel;
+      syncPreviewTimeUi(vodT);
+      if (rel >= clipLen - 0.05) {
+        video.pause();
+        if (Math.abs(video.currentTime - clipLen) > 0.05) {
+          video.currentTime = clipLen;
+        }
+        syncPreviewTimeUi(end, true);
+        setPreviewPlaying(false);
+      }
+      return;
+    }
     let t = video.currentTime;
     if (t < start - 0.05) {
       video.currentTime = start;
@@ -1092,7 +1130,14 @@ export default function App() {
     if (video.paused) {
       const start = previewTrimStartRef.current;
       const end = previewTrimEndRef.current;
-      if (video.currentTime >= end - 0.1 || video.currentTime < start) {
+      const clipRel = previewClipRelativeRef.current;
+      const clipLen = Math.max(0, end - start);
+      if (clipRel) {
+        if (video.currentTime >= clipLen - 0.1) {
+          video.currentTime = 0;
+          syncPreviewTimeUi(start, true);
+        }
+      } else if (video.currentTime >= end - 0.1 || video.currentTime < start) {
         video.currentTime = start;
         syncPreviewTimeUi(start, true);
       }
@@ -1102,7 +1147,7 @@ export default function App() {
       video.pause();
       setPreviewPlaying(false);
     }
-  }, [previewVideoReady]);
+  }, [previewVideoReady, syncPreviewTimeUi]);
 ;
 
 
@@ -3418,6 +3463,18 @@ export default function App() {
               className="url-trim-range w-full accent-zinc-400" />
             <button
               type="button"
+              onClick={() => {
+                const trimmed = url.trim();
+                if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
+              }}
+              disabled={!url.trim()}
+              className={`${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
+            >
+              <ExternalLink size={12} className="shrink-0" />
+              Open URL
+            </button>
+            <button
+              type="button"
               onMouseEnter={() => {
                 const trimmed = url.trim();
                 if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
@@ -3426,7 +3483,7 @@ export default function App() {
               }}
               onClick={openPreview}
               disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
-              className={`w-full font-mono uppercase font-bold py-[clamp(0.3rem,1.5vh,0.625rem)] text-[clamp(9px,calc(10px*var(--ui-scale)),12px)] flex items-center justify-center gap-1.5 disabled:opacity-40 ${platformWatchPreviewBtn(urlActionPlatform, previewOpen)}`}
+              className={`${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
             >
               {previewVideoLoading ? (
                 <Loader2 size={12} className="animate-spin shrink-0" />
@@ -3679,6 +3736,7 @@ export default function App() {
           disabled={!previewVideoReady}
           buttonClassName={previewCtrlBtn(previewFullscreen)}
           onMenuOpen={() => setPreviewVolumeMenuOpen(false)}
+          popoverPlacement={previewFullscreen ? 'down' : 'up'}
           popoverClassName={previewFullscreen
             ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
             : 'border-2 border-zinc-600 bg-zinc-950'}
@@ -3825,7 +3883,7 @@ export default function App() {
 
                 className={
                   previewFullscreen
-                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 max-h-[50vh] overflow-hidden bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
+                    ? `absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1 px-2 pb-2 pt-2 max-h-[50vh] overflow-x-hidden overflow-y-visible bg-gradient-to-t from-black/90 to-black/75 transition-opacity duration-150 ${
                       previewFsControlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                     }`
                     : 'absolute bottom-0 left-0 right-0 z-10 flex flex-col gap-1.5 px-2 pb-2 pt-2 bg-gradient-to-t from-black/80 to-black/50'

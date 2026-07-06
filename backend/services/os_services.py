@@ -397,15 +397,21 @@ def _pid_looks_like_ffmpeg(pid: int) -> bool:
         return False
 
 
-def _kill_pid(pid: int) -> None:
-    """Kill a single process by PID (cross-platform)."""
-    if not _pid_looks_like_ffmpeg(pid):
+def _kill_pid(pid: int, *, trusted: bool = False) -> None:
+    """Kill a single process by PID (cross-platform).
+
+    *trusted* skips the tasklist/cmdline guard — use only for PIDs registered via
+    ``register_child_pid`` at spawn time.
+    """
+    if pid <= 0:
+        return
+    if not trusted and not _pid_looks_like_ffmpeg(pid):
         logger.warning("Skipping kill pid=%d — process is not ffmpeg", pid)
         return
     try:
         if is_windows():
             subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
                 capture_output=True,
                 timeout=5,
             )
@@ -436,7 +442,7 @@ def kill_child_processes() -> None:
         _CHILD_PIDS.clear()
     for pid in pids:
         logger.info("Killing tracked ffmpeg child pid=%d", pid)
-        _kill_pid(pid)
+        _kill_pid(pid, trusted=True)
 
 
 # ===================================================================

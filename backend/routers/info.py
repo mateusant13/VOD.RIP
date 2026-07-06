@@ -9,6 +9,7 @@ import re
 from fastapi import APIRouter, HTTPException
 
 from deps import INFO_EXECUTOR
+from services.youtube_diag import youtube_user_message
 from services.kick_api_service import (
     get_clip_info_sync as kick_get_clip_info_sync,
     get_video_info_sync as kick_get_video_info_sync,
@@ -22,6 +23,17 @@ from utils import explain_oserror
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["info"])
+
+
+def _is_youtube_url(url: str) -> bool:
+    low = url.lower()
+    return "youtube.com" in low or "youtu.be" in low
+
+
+def _info_error_detail(url: str, exc: Exception) -> str:
+    if _is_youtube_url(url):
+        return youtube_user_message(exc, preview=False)
+    return str(exc)
 
 
 @router.get("/api/info/video")
@@ -43,8 +55,7 @@ async def info_video(id: str):
     except OSError as e:
         raise HTTPException(status_code=400, detail=explain_oserror(e))
     except Exception as e:
-    # ponytail: best-effort — network errors only
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=_info_error_detail(id, e))
 
 
 @router.get("/api/info/clip")
@@ -59,5 +70,4 @@ async def info_clip(id: str):
         info = await get_video_info(id)
         return info
     except Exception as e:
-    # ponytail: best-effort — return info
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=_info_error_detail(id, e))

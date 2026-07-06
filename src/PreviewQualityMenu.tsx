@@ -11,6 +11,8 @@ interface PreviewQualityMenuProps {
   buttonClassName: string;
   onMenuOpen?: () => void;
   popoverClassName?: string;
+  /** Fullscreen controls sit above a trim rail — open downward to avoid clipping. */
+  popoverPlacement?: 'up' | 'down';
 }
 
 export default function PreviewQualityMenu({
@@ -23,8 +25,13 @@ export default function PreviewQualityMenu({
   buttonClassName,
   onMenuOpen,
   popoverClassName = 'border-2 border-zinc-600 bg-zinc-950',
+  popoverPlacement = 'up',
 }: PreviewQualityMenuProps) {
   if (!levels.length) return null;
+
+  const popoverPos = popoverPlacement === 'down'
+    ? 'absolute top-full left-0 mt-1'
+    : 'absolute bottom-full left-0 mb-1';
 
   return (
     <div className="relative" data-player-menu>
@@ -42,7 +49,7 @@ export default function PreviewQualityMenu({
         <Settings size={15} />
       </button>
       {menuOpen && (
-        <div className={`absolute bottom-full left-0 mb-1 z-30 min-w-[7rem] shadow-lg py-1 ${popoverClassName}`}>
+        <div className={`${popoverPos} z-50 min-w-[7rem] shadow-lg py-1 ${popoverClassName}`}>
           {levels.map((l) => (
             <button
               key={l.index}

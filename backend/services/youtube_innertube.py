@@ -10,17 +10,17 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
+from services.youtube_fingerprint import youtube_http_headers
+
 logger = logging.getLogger(__name__)
 
 _INNERTUBE_PLAYER_URL = (
     "https://www.youtube.com/youtubei/v1/player"
     "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 )
-_STREAM_HEADERS = {
-    "Referer": "https://www.youtube.com/",
-    "Origin": "https://www.youtube.com",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+_STREAM_HEADERS = youtube_http_headers(
+    extra={"Referer": "https://www.youtube.com/", "Origin": "https://www.youtube.com"},
+)
 _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 _VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
@@ -718,7 +718,8 @@ def _race_profiles(
         return _resolve_profile(video_id, profiles[0], session, read_timeout)
 
     winner: Optional[dict[str, Any]] = None
-    with ThreadPoolExecutor(max_workers=len(profiles), thread_name_prefix="innertube") as pool:
+    pool = ThreadPoolExecutor(max_workers=len(profiles), thread_name_prefix="innertube")
+    try:
         futures = {
             pool.submit(_resolve_profile, video_id, profile, session, read_timeout): profile
             for profile in profiles
@@ -736,8 +737,8 @@ def _race_profiles(
                     break
         except TimeoutError:
             pass
-        for fut in futures:
-            fut.cancel()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return winner
 
 
@@ -774,6 +775,8 @@ def _collect_merged_innertube_info(
             hls_url = hls
 
     if not meta_data:
+        from services.youtube_diag import log_extract_fail
+        log_extract_fail(video_id, "innertube_no_playable_client", session)
         return None
 
     merged = _dedupe_youtube_formats(all_formats)
@@ -843,6 +846,8 @@ def innertube_extract_info(
     read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
     info = _collect_merged_innertube_info(video_id, session, read_timeout)
     if info:
+        from services.youtube_diag import log_extract_ok
+        log_extract_ok(video_id, "innertube", info, session)
         return info
 
     try:
@@ -850,7 +855,7 @@ def innertube_extract_info(
         auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
     except Exception:
         auto_auth = True
-    if auto_auth:
+    if auto_auth and not getattr(session, "anonymous", True):
         from services.youtube_auth import strengthen_youtube_session
 
         strong = strengthen_youtube_session(
@@ -859,8 +864,12 @@ def innertube_extract_info(
         if strong is not session:
             info = _collect_merged_innertube_info(video_id, strong, read_timeout)
             if info:
+                from services.youtube_diag import log_extract_ok
+                log_extract_ok(video_id, "innertube_strengthened", info, strong)
                 return info
 
+    from services.youtube_diag import log_extract_fail
+    log_extract_fail(video_id, "innertube_exhausted", session)
     logger.debug("InnerTube all clients exhausted for %s", video_id)
     return None
 

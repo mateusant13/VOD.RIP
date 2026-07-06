@@ -78,11 +78,9 @@ def list_channel_videos_sync(
             **{k: v for k, v in ext_args.items() if k != "youtube"},
         },
     }
-    cookie_path = resolve_ytdlp_cookiefile(session, None)
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
-    if session.cookies_from_browser:
-        opts["cookiesfrombrowser"] = (session.cookies_from_browser,)
+    from services.youtube_session import apply_ytdlp_cookie_opts
+
+    apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries") or []

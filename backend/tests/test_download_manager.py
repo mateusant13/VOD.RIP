@@ -4,13 +4,31 @@ Tests the state-machine and concurrency primitives without
 spawning real yt-dlp workers (no network).
 """
 
+import pytest
 from datetime import datetime, timezone
 
 from models.schemas import DownloadState
 from services.download_manager import DownloadManager
+from download_test_utils import purge_download_manager
 
 _VALID_KICK_VOD = "https://kick.com/realchannel/videos/100000"
 _VALID_TWITCH_VOD = "https://twitch.tv/videos/1000001"
+
+
+@pytest.fixture(autouse=True)
+def _purge_download_manager_after_test():
+    created: list[DownloadManager] = []
+    original_init = DownloadManager.__init__
+
+    def _track_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created.append(self)
+
+    DownloadManager.__init__ = _track_init
+    yield
+    DownloadManager.__init__ = original_init
+    for mgr in created:
+        purge_download_manager(mgr)
 
 
 def test_download_manager_initial_state():
@@ -94,11 +112,11 @@ def test_discard_from_queue():
     assert dl_id not in all_ids
 
 
-def test_concurrent_start_and_cancel():
+def test_concurrent_start_and_cancel(download_test_counter):
     """Starting and cancelling downloads concurrently doesn't deadlock."""
     from concurrent.futures import ThreadPoolExecutor
     mgr = DownloadManager(max_workers=4)
-    urls = [f"https://kick.com/realchannel/videos/{100000 + i}" for i in range(10)]
+    urls = [f"https://twitch.tv/videos/{1_000_000 + i}" for i in range(10)]
     ids = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
@@ -119,6 +137,7 @@ def test_concurrent_start_and_cancel():
     count = sum(1 for r in results if r is True)
     assert count >= 0
     assert mgr.cancel_all() >= 0
+    download_test_counter(mgr)
 
 
 def test_remove_history_deletes_output_file(tmp_path):

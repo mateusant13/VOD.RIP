@@ -145,6 +145,17 @@ class DownloadManager:
             self._worker_params[download_id] = worker_params
 
         self._db.upsert_queue_entry(state, worker_params)
+        from services.youtube_diag import log_download
+        trim = ""
+        if crop_start is not None or crop_end is not None:
+            trim = f"trim={crop_start}-{crop_end}"
+        log_download(
+            download_id,
+            "queued",
+            url=url,
+            platform=platform,
+            detail=f"type={download_type} quality={quality or 'default'} {trim}".strip(),
+        )
         self._spawn_worker(download_id)
         return download_id
 
@@ -430,6 +441,14 @@ class DownloadManager:
                         raise RuntimeError(
                             f"Output file too small ({size} bytes); download incomplete"
                         )
+                    from services.youtube_diag import log_download
+                    log_download(
+                        download_id,
+                        "completed",
+                        url=params.get("url", ""),
+                        platform=state.platform,
+                        detail=f"bytes={size}",
+                    )
                     with self._lock:
                         state.status = "Completed"
                         state.progress = 100
@@ -437,6 +456,8 @@ class DownloadManager:
                 else:
                     raise RuntimeError("Download finished but output file is missing")
             except ytdlp_service.DownloadTimeoutError as e:
+                from services.youtube_diag import log_download
+                log_download(download_id, "timeout", url=params.get("url", ""), platform=state.platform, detail=str(e))
                 with self._lock:
                     state.status = "Failed"
                     state.error = str(e)
@@ -465,6 +486,14 @@ class DownloadManager:
                     return
                 logger.exception(
                     "Download worker failure for %s", download_id, exc_info=e
+                )
+                from services.youtube_diag import log_download
+                log_download(
+                    download_id,
+                    "failed",
+                    url=params.get("url", ""),
+                    platform=state.platform,
+                    detail=sanitize_download_error(e),
                 )
                 with self._lock:
                     state.status = "Failed"
@@ -804,22 +833,23 @@ class DownloadManager:
 
     def _force_stop_download(self, download_id: str) -> Optional[dict]:
         """Cancel worker, run abort hooks, kill tracked ffmpeg. Returns cleanup info."""
-        abort_fns: List[Callable[[], None]] = []
         cleanup: Optional[dict] = None
         pp_state = None
-        with self._lock:
-            pause_event = self._pause_events.get(download_id)
-            event = self._cancel_events.get(download_id)
-            if pause_event:
-                pause_event.clear()
-            if event:
-                event.set()
-            abort_fns = list(self._abort_fns.get(download_id, []))
-            raw_cleanup = self._cleanup_info.get(download_id)
-            if raw_cleanup:
-                cleanup = dict(raw_cleanup)
-                pp_state = cleanup.get("pp_state")
-        for _pass in range(2):
+        deadline = time.monotonic() + 2.5
+        while True:
+            abort_fns: List[Callable[[], None]] = []
+            with self._lock:
+                pause_event = self._pause_events.get(download_id)
+                event = self._cancel_events.get(download_id)
+                if pause_event:
+                    pause_event.clear()
+                if event:
+                    event.set()
+                abort_fns = list(self._abort_fns.get(download_id, []))
+                raw_cleanup = self._cleanup_info.get(download_id)
+                if raw_cleanup:
+                    cleanup = dict(raw_cleanup)
+                    pp_state = cleanup.get("pp_state")
             for fn in abort_fns:
                 try:
                     fn()
@@ -827,11 +857,11 @@ class DownloadManager:
                 except Exception:
                     pass
             kill_pp_state_procs(pp_state)
-            kill_download_ffmpeg_pids(download_id)
-            if abort_fns or pp_state:
-                time.sleep(0.25)
-        if abort_fns or pp_state:
+            kill_download_ffmpeg_pids(download_id, remove=False)
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.15)
+        kill_download_ffmpeg_pids(download_id, remove=True)
         return cleanup
 
     def _purge_download_runtime(self, download_id: str) -> None:
@@ -839,8 +869,8 @@ class DownloadManager:
             self._downloads.pop(download_id, None)
             self._cancel_events.pop(download_id, None)
             self._pause_events.pop(download_id, None)
-            self._abort_fns.pop(download_id, None)
-            self._cleanup_info.pop(download_id, None)
+            # abort_fns + cleanup_info: worker thread finally-block still needs these
+            # while ffmpeg winds down after cancel/remove.
             self._worker_params.pop(download_id, None)
             self._sse_queues.pop(download_id, None)
 

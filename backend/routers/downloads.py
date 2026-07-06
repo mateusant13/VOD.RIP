@@ -31,6 +31,16 @@ from utils import (
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["downloads"])
 
+
+def _log_download_api_ok(download_id: str, platform: str, url: str, *, kind: str) -> None:
+    logger.info(
+        "download API 200 started id=%s platform=%s kind=%s url=%s",
+        download_id[:12],
+        platform,
+        kind,
+        url[:100],
+    )
+
 _QUEUE_META_TIMEOUT_SEC = 2.5
 
 
@@ -175,6 +185,7 @@ async def download_video(req: DownloadRequest):
         duration_string=meta.get("duration_string"),
         estimated_bytes=est,
     )
+    _log_download_api_ok(download_id, platform, req.url, kind="video")
     return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
 
 
@@ -222,6 +233,7 @@ async def download_clip(req: DownloadRequest):
         duration_string=meta.get("duration_string"),
         estimated_bytes=est,
     )
+    _log_download_api_ok(download_id, platform, req.url, kind="clip")
     return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
 
 

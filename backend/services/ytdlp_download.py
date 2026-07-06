@@ -921,21 +921,19 @@ def download_video_sync(
     from services.youtube_session import (
         youtube_session_from_settings,
         ytdlp_extractor_args,
-        resolve_ytdlp_cookiefile,
+        apply_ytdlp_cookie_opts,
     )
     from services.youtube_innertube import extract_video_id
 
     yt_session = youtube_session_from_settings(settings_mgr, video_id=extract_video_id(full_url))
     opts["_youtube_session"] = yt_session
-    if yt_session.cookies_from_browser and not opts.get("cookiefile"):
-        opts["cookiesfrombrowser"] = (yt_session.cookies_from_browser,)
-    cookie_path = resolve_ytdlp_cookiefile(yt_session, cookies_file)
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
     try:
         auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
     except Exception:
         auto_auth = True
+    apply_ytdlp_cookie_opts(
+        opts, yt_session, auto_auth=auto_auth, cookies_file=cookies_file,
+    )
     if platform == "YouTube":
         ext_args = ytdlp_extractor_args(yt_session, auto_auth=auto_auth)
         yt_args = opts.get("extractor_args") or {}
@@ -1000,6 +998,14 @@ def download_video_sync(
             start_sec = 0.0
             end_sec = expected_duration if expected_duration and expected_duration > 0 else 1e18
         mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
+        from services.youtube_diag import log as yt_log
+        yt_log.info(
+            "download path=hls_clip url=%s trim=%s-%s quality=%s",
+            full_url[:100],
+            start_sec,
+            end_sec,
+            quality,
+        )
         _download_hls_clip(
             full_url, output_path, start_sec, end_sec, opts,
             progress_hook=progress_hook,
@@ -1014,6 +1020,13 @@ def download_video_sync(
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)
+        from services.youtube_diag import log as yt_log
+        yt_log.info(
+            "download path=ytdlp url=%s trim=%s platform=%s",
+            full_url[:100],
+            crop,
+            platform,
+        )
         if crop_start is not None or crop_end is not None:
             if crop is None:
                 raise ValueError(

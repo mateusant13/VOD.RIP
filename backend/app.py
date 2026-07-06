@@ -8,6 +8,7 @@ the dev ``__main__`` entry point.
 import logging
 import os
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -31,7 +32,41 @@ try:
 except ImportError:
     __version__ = "0.0.0"
 
-app = FastAPI(title="Kick & Twitch Downloader", version=__version__)
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    def _warm_youtube() -> None:
+        try:
+            from services.youtube_session import warm_youtube_session
+
+            warm_youtube_session()
+            s = settings_mgr.get()
+            manual = bool(
+                (getattr(s, "youtube_cookies_file", "") or "").strip()
+                or (getattr(s, "youtube_cookies_browser", "") or "").strip()
+            )
+            if manual:
+                from services.youtube_auth import refresh_youtube_cookie_cache
+
+                refresh_youtube_cookie_cache(
+                    auto_auth=False,
+                    cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
+                )
+        except Exception:
+            logger.debug("YouTube warm-up skipped", exc_info=True)
+
+    threading.Thread(target=_warm_youtube, daemon=True, name="yt-warm").start()
+    yield
+    try:
+        from services.shutdown_util import shutdown_downloads_and_children
+
+        logger.info("API shutdown — cancelling downloads and killing ffmpeg children")
+        shutdown_downloads_and_children()
+    except Exception:
+        logger.exception("shutdown during API lifespan")
+
+
+app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"

@@ -236,7 +236,7 @@ class TestDownloadManagerRaceConditions:
         ids = []
         for i in range(5):
             dl_id = mgr.start_download(
-                url=f"https://kick.com/realchannel/videos/{100000 + i}",
+                url=f"https://twitch.tv/videos/{1_000_000 + i}",
                 output_file=rf"C:\tmp\{i}.mp4",
             )
             ids.append(dl_id)
@@ -246,7 +246,7 @@ class TestDownloadManagerRaceConditions:
         # Verify each download has the correct URL
         for dl_id, expected_url in zip(
             ids,
-            [f"https://kick.com/realchannel/videos/{100000 + i}" for i in range(5)],
+            [f"https://twitch.tv/videos/{1_000_000 + i}" for i in range(5)],
         ):
             found = [d for d in queue if d.download_id == dl_id]
             assert len(found) == 1
@@ -256,11 +256,11 @@ class TestDownloadManagerRaceConditions:
         """Test that cancelling one download doesn't affect others."""
         mgr = DownloadManager(max_workers=2)
         id1 = mgr.start_download(
-            url="https://kick.com/realchannel/videos/100001",
+            url="https://twitch.tv/videos/1_000_001",
             output_file=r"C:\tmp\1.mp4",
         )
         id2 = mgr.start_download(
-            url="https://kick.com/realchannel/videos/100002",
+            url="https://twitch.tv/videos/1_000_002",
             output_file=r"C:\tmp\2.mp4",
         )
 
@@ -278,13 +278,13 @@ class TestDownloadManagerRaceConditions:
         """Test that each download's state is isolated."""
         mgr = DownloadManager(max_workers=2)
         id1 = mgr.start_download(
-            url="https://kick.com/realchannel/videos/100001",
+            url="https://twitch.tv/videos/1_000_001",
             output_file=r"C:\tmp\1.mp4",
             title="Video 1",
             channel="Channel 1",
         )
         id2 = mgr.start_download(
-            url="https://kick.com/realchannel/videos/100002",
+            url="https://twitch.tv/videos/1_000_002",
             output_file=r"C:\tmp\2.mp4",
             title="Video 2",
             channel="Channel 2",

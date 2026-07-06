@@ -15,14 +15,13 @@ from typing import Any, Optional
 
 import requests
 
+from services.youtube_fingerprint import YT_USER_AGENT, youtube_http_headers
+
 logger = logging.getLogger(__name__)
 
 _INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 _VISITOR_ID_URL = f"https://www.youtube.com/youtubei/v1/visitor_id?key={_INNERTUBE_KEY}"
-_YT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+_YT_UA = YT_USER_AGENT
 _CONNECT_TIMEOUT_SEC = 0.9
 _READ_TIMEOUT_SEC = 6.0
 _ANON_LOCK = threading.Lock()
@@ -58,10 +57,7 @@ def http_session_for(session: Optional[YouTubeSession]) -> requests.Session:
         if isinstance(cached, requests.Session):
             return cached
     http = requests.Session()
-    http.headers.update({
-        "User-Agent": _YT_UA,
-        "Accept-Language": "en-US,en;q=0.9",
-    })
+    http.headers.update(youtube_http_headers())
     return http
 
 
@@ -134,10 +130,7 @@ def _bootstrap_network(
     timeout: float,
 ) -> tuple[Optional[str], Optional[str], Optional[str], requests.Session]:
     http = requests.Session()
-    http.headers.update({
-        "User-Agent": _YT_UA,
-        "Accept-Language": "en-US,en;q=0.9",
-    })
+    http.headers.update(youtube_http_headers())
     req_timeout = (_CONNECT_TIMEOUT_SEC, timeout)
     http.get("https://www.youtube.com/", timeout=req_timeout)
     if video_id:
@@ -335,7 +328,7 @@ def youtube_session_from_values(
         vd = vd or file_vd
         pt = pt or file_pt
 
-    browser_for_ytdlp = (cookies_from_browser or "").strip().lower() or None
+    explicit_browser = (cookies_from_browser or "").strip().lower() or None
 
     cookie_header: Optional[str] = None
     cookie_file: Optional[str] = None
@@ -348,10 +341,10 @@ def youtube_session_from_values(
         http_session = http_session_for(None)
         if cookie_header:
             http_session.headers["Cookie"] = cookie_header
-    elif browser_for_ytdlp:
+    elif explicit_browser:
         from services.youtube_auth import load_best_browser_session
 
-        _loaded, cookie_header, http_session = load_best_browser_session(browser_for_ytdlp, False)
+        loaded, cookie_header, http_session = load_best_browser_session(explicit_browser, False)
 
     if not cookie_header:
         anon_vd, anon_cookie, anon_file, anon_http = bootstrap_anonymous_session(
@@ -374,9 +367,9 @@ def youtube_session_from_values(
         visitor_data=vd,
         po_token=pt,
         cookie_header=cookie_header,
-        cookies_from_browser=browser_for_ytdlp,
+        cookies_from_browser=explicit_browser,
         anonymous=anonymous,
-        cookie_file=cookie_file if not browser_for_ytdlp else None,
+        cookie_file=cookie_file if not explicit_browser else None,
         http_session=http_session,
     )
 
@@ -441,6 +434,28 @@ def resolve_ytdlp_cookiefile(session: YouTubeSession, explicit: Optional[str] = 
     if session.cookie_file and Path(session.cookie_file).is_file():
         return session.cookie_file
     return None
+
+
+def apply_ytdlp_cookie_opts(
+    opts: dict,
+    session: YouTubeSession,
+    *,
+    auto_auth: bool = True,
+    cookies_file: Optional[str] = None,
+) -> None:
+    """Wire cookiefile / cookiesfrombrowser — manual Settings only (no auto browser on hot path)."""
+    cookie_path = resolve_ytdlp_cookiefile(session, cookies_file)
+    if not cookie_path:
+        from services.youtube_auth import find_fresh_cookie_cache
+
+        cookie_path = find_fresh_cookie_cache()
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+        opts.pop("cookiesfrombrowser", None)
+        return
+    browser = (session.cookies_from_browser or "").strip().lower() or None
+    if browser:
+        opts["cookiesfrombrowser"] = (browser,)
 
 
 assert youtube_session_from_values(visitor_data="abc", auto_auth=False).visitor_data == "abc"

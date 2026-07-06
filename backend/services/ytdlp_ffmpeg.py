@@ -40,24 +40,81 @@ def reset_download_context(token: Optional[contextvars.Token]) -> None:
         _download_id_ctx.reset(token)
 
 
-def kill_download_ffmpeg_pids(download_id: str) -> None:
+def kill_download_ffmpeg_pids(download_id: str, *, remove: bool = True) -> None:
     """Kill ffmpeg children registered for one download (cancel/remove)."""
     with _download_pids_lock:
-        pids = list(_download_ffmpeg_pids.pop(download_id, set()))
+        pids = list(_download_ffmpeg_pids.get(download_id) or ())
+        if remove:
+            _download_ffmpeg_pids.pop(download_id, None)
     for pid in pids:
-        _kill_pid(pid)
+        _kill_pid(pid, trusted=True)
+
+
+def _terminate_ffmpeg_proc(proc: sp.Popen) -> None:
+    """Best-effort kill + wait for a tracked ffmpeg ``Popen``."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except (OSError, sp.TimeoutExpired):
+        pass
+
+
+class _FakeProcForTerminate:
+    killed = False
+
+    def poll(self):
+        return None if not self.killed else 0
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+_fp = _FakeProcForTerminate()
+_terminate_ffmpeg_proc(_fp)  # type: ignore[arg-type]
+assert _fp.killed
+
+
+def _find_js_runtime(name: str) -> Optional[str]:
+    """PATH first, then common Windows install dirs (npm/deno installers skip PATH)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform != "win32":
+        return None
+    local = os.environ.get("LOCALAPPDATA", "")
+    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
+    home = os.environ.get("USERPROFILE", "")
+    candidates: list[Path] = []
+    if name == "deno":
+        candidates = [
+            Path(home) / ".deno" / "bin" / "deno.exe",
+            Path(local) / "deno" / "deno.exe",
+        ]
+    elif name == "node":
+        candidates = [
+            Path(prog) / "nodejs" / "node.exe",
+            Path(local) / "Programs" / "node" / "node.exe",
+        ]
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return None
 
 
 def _ytdlp_engine_opts() -> dict:
-    """YouTube needs a JS runtime (2026+). Prefer Node when Deno is absent."""
-    deno = shutil.which("deno")
-    if deno:
+    """YouTube needs a JS runtime (2026+). Prefer Deno (yt-dlp default), then Node."""
+    if _find_js_runtime("deno"):
         return {}
-    node = shutil.which("node")
+    node = _find_js_runtime("node")
     if node:
         return {"js_runtimes": {"node": {"path": node}}}
     logger.warning(
-        "No JS runtime (deno/node) on PATH — YouTube extract may fail; see yt-dlp EJS wiki"
+        "No JS runtime (deno/node) found — YouTube extract may fail; see yt-dlp EJS wiki"
     )
     return {}
 
@@ -354,7 +411,7 @@ def _run_ffmpeg(
         ) from exc
     _track_ffmpeg_proc(proc)
     if register_abort:
-        register_abort(lambda: proc.poll() is None and proc.kill())
+        register_abort(lambda: _terminate_ffmpeg_proc(proc))
 
     stderr_chunks: deque[bytes] = deque(maxlen=32)
     _stop_stderr = threading.Event()
@@ -500,9 +557,7 @@ def _run_ffmpeg(
             )
     finally:
         _stop_stderr.set()
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
+        _terminate_ffmpeg_proc(proc)
         _untrack_ffmpeg_proc(proc)
 
 def _normalize_crop_range(

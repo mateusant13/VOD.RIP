@@ -41,7 +41,7 @@ export function platformButtonPressHover(platform: PlatformStyleKey): string {
 
 /** Press-in hover for the main download CTA (3px shadow stack). */
 export function platformDownloadBtn(platform: PlatformStyleKey): string {
-  const base = 'w-full mt-auto shrink-0 border-2 border-white bg-black py-[clamp(0.4rem,2vh,0.5rem)] flex items-center justify-center gap-2 text-[clamp(10px,calc(12px*var(--ui-scale)),14px)] font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
+  const base = 'w-full mt-auto shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
   if (platform === 'kick') {
     return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-px hover:translate-y-px`;
   }
@@ -58,7 +58,7 @@ export function platformWatchPreviewBtn(platform: PlatformStyleKey, active: bool
   if (active) {
     return 'border-2 border-white bg-zinc-900 text-white shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)]';
   }
-  const base = 'border-2 font-mono uppercase font-bold transition-[transform,box-shadow,background-color,color,border-color] duration-150';
+  const base = 'w-full border-2 font-mono uppercase font-bold py-2 text-[10px] flex items-center justify-center gap-1.5 transition-[transform,box-shadow,background-color,color,border-color] duration-150';
   if (platform === 'kick') {
     return `${base} border-[#53fc18]/70 text-[#53fc18] bg-[#53fc18]/5 hover:border-[#53fc18] hover:bg-[#53fc18]/15 ${platformButtonPressHover('kick')}`;
   }

@@ -32,8 +32,14 @@ from services.preview_service import (
     _is_rangeable_cdn_media,
 )
 
+from services.youtube_diag import youtube_user_message
+
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
+
+
+def _preview_user_message(exc: BaseException) -> str:
+    return youtube_user_message(exc, preview=True)
 
 
 def _preview_session_response(session) -> PreviewSessionResponse:
@@ -112,12 +118,20 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 prefer_height=req.prefer_height,
             ),
         )
+        logger.info(
+            "preview session created id=%s kind=%s url=%s",
+            session.session_id[:8],
+            session.kind,
+            preview_url[:100],
+        )
         return _preview_session_response(session)
     except ValueError as e:
+        logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
     # ponytail: best-effort — network errors only
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("preview session failed url=%s", preview_url[:100])
+        raise HTTPException(status_code=500, detail=_preview_user_message(e))
 
 
 @router.post("/api/preview/session/{session_id}/refresh")
@@ -133,7 +147,7 @@ async def preview_refresh_session(session_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_preview_user_message(e))
 
 
 @router.post("/api/preview/session/{session_id}/quality")
@@ -200,7 +214,7 @@ async def _preview_master_response(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_preview_user_message(e))
     body: any = data
     response_headers = dict(extra_headers or {})
     response_headers.setdefault("Cache-Control", "no-cache")
