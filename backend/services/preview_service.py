@@ -735,7 +735,6 @@ def _best_muxed_variant_url(session: PreviewSession) -> Optional[str]:
 def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -> Path:
     """Mux DASH video+audio for the trim window into a local MP4 (preview only)."""
     from services.ytdlp_hls import (
-        _PREVIEW_MUX_FAST_SEC,
         _PREVIEW_MUX_MAX_SEC,
         _download_muxed_dash_clip,
     )
@@ -750,8 +749,8 @@ def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -
             return out
         start = max(0.0, float(session.crop_start))
         end = max(start + 0.5, float(session.crop_end))
-        mux_cap = _PREVIEW_MUX_FAST_SEC if fast else _PREVIEW_MUX_MAX_SEC
-        end = min(end, start + mux_cap)
+        # ponytail: fast only caps height (480p); duration is full preview window (≤30s)
+        end = min(end, start + _PREVIEW_MUX_MAX_SEC)
         video_url = _variant_url_for_height(session, height) or session.entry_url
         _download_muxed_dash_clip(
             video_url,
@@ -762,6 +761,12 @@ def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -
             headers=_merge_youtube_session_cookies(session.http_headers, session.vod_url),
             allow_remote_retry=True,
         )
+        yt_log = logging.getLogger("VOD.RIP.youtube")
+        if yt_log.isEnabledFor(logging.DEBUG):
+            yt_log.debug(
+                "preview mux session=%s height=%s dur=%.1fs fast_height=%s",
+                session.session_id[:8], height, end - start, fast,
+            )
     if not out.is_file() or out.stat().st_size < MIN_VALID_OUTPUT_BYTES:
         raise RuntimeError("YouTube preview mux produced no output")
     return out
@@ -2021,6 +2026,7 @@ assert preview_mux_ready(PreviewSession(
     session_id="x", vod_url="", master_url="", entry_url="", platform="Kick",
 ))
 assert issubclass(PreviewMuxPending, RuntimeError)
+assert min(907.0, 0.0 + 30.0) == 30.0  # preview mux window cap, not 10s teaser
 _dash_only = {
     "formats": [
         {"height": 720, "protocol": "https", "url": "https://x/v.mp4", "acodec": "none"},
