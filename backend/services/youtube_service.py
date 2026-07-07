@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,64 @@ def _content_kind_for_playlist(kind: PlaylistKind) -> str:
     if kind == "streams":
         return "stream"
     return "vod"
+
+
+def _created_at_from_entry(e: dict) -> Optional[str]:
+    upload_date = e.get("upload_date")
+    if upload_date and len(str(upload_date)) == 8:
+        try:
+            return datetime.strptime(
+                str(upload_date), "%Y%m%d",
+            ).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            pass
+    for key in ("timestamp", "release_timestamp"):
+        ts = e.get(key)
+        if ts is None:
+            continue
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+    return None
+
+
+def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
+    """Fill missing date/views via lightweight InnerTube (flat playlist is spotty)."""
+    need = [r for r in rows if not r.get("created_at") or r.get("views") is None]
+    if not need:
+        return
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from services.youtube_innertube import innertube_video_row_metadata
+    from services.youtube_session import youtube_session_from_settings
+
+    session = youtube_session_from_settings()
+    by_id = {r["id"]: r for r in need if r.get("id")}
+    workers = min(6, len(by_id))
+
+    def _fetch(vid: str) -> tuple[str, Optional[dict[str, Any]]]:
+        return vid, innertube_video_row_metadata(vid, session=session)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_fetch, vid) for vid in list(by_id)[:50]]
+        for fut in as_completed(futs):
+            try:
+                vid, meta = fut.result()
+            except Exception as exc:
+                logger.debug("youtube row enrich failed: %s", exc)
+                continue
+            if not meta:
+                continue
+            row = by_id.get(vid)
+            if not row:
+                continue
+            if not row.get("created_at") and meta.get("created_at"):
+                row["created_at"] = meta["created_at"]
+            if row.get("views") is None and meta.get("views") is not None:
+                row["views"] = meta["views"]
+            if not row.get("duration") and meta.get("duration"):
+                row["duration"] = meta["duration"]
 
 
 def list_channel_videos_sync(
@@ -98,15 +156,7 @@ def list_channel_videos_sync(
             webpage = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
         if not str(webpage).startswith("http"):
             webpage = f"https://www.youtube.com/watch?v={vid}"
-        upload_date = e.get("upload_date")
-        created_at = None
-        if upload_date and len(str(upload_date)) == 8:
-            try:
-                created_at = datetime.strptime(
-                    str(upload_date), "%Y%m%d",
-                ).replace(tzinfo=timezone.utc).isoformat()
-            except ValueError:
-                pass
+        created_at = _created_at_from_entry(e)
         thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
         dur = e.get("duration")
         dur_str = None
@@ -131,9 +181,12 @@ def list_channel_videos_sync(
             "channel": e.get("channel") or e.get("uploader") or channel_ref,
             "content_kind": content_kind,
         })
+    _enrich_youtube_channel_rows(out)
     return out
 
 
 assert channel_playlist_url("cellbit", "videos").endswith("/videos")
 assert channel_playlist_url("@cellbit", "shorts").endswith("/shorts")
 assert channel_playlist_url("UCxyz1234567890abcdefghijk", "streams").endswith("/streams")
+assert _created_at_from_entry({"upload_date": "20240511"}) is not None
+assert _created_at_from_entry({"timestamp": 1_700_000_000}) is not None

@@ -37,10 +37,27 @@ export function channelVideoDurationSec(v: ChannelVideo): number | null {
 /** Full VOD length for trim sliders — never derived from the current trim end. */
 
 export function videoInfoDurationSec(info: VideoInfo | null | undefined): number {
-  if (!info) return 3600;
+  if (!info) return 0;
   if (info.duration != null && info.duration > 0) return Math.floor(info.duration);
   const parsed = info.duration_string ? parseHmsDurationString(info.duration_string) : null;
-  return parsed != null && parsed > 0 ? parsed : 3600;
+  return parsed != null && parsed > 0 ? parsed : 0;
+}
+
+/** Apply backend-extracted VOD length to trim UI (fixes 3600/7200 placeholders). */
+export function syncDurationFromPreviewSession(
+  durationSec: number | undefined,
+  cropStart: number,
+  cropEnd: number,
+): { start: number; end: number; duration: number } | null {
+  if (!durationSec || durationSec <= 0) return null;
+  const dur = Math.floor(durationSec);
+  let end = cropEnd;
+  let start = cropStart;
+  if (end > dur || (start === 0 && (end === 3600 || end === 7200))) {
+    end = dur;
+  }
+  if (start >= end) start = 0;
+  return { start, end, duration: dur };
 }
 
 export function isLikelyClip(v: ChannelVideo): boolean {
@@ -76,16 +93,30 @@ export function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null 
   };
 }
 
+function mergeChannelVideoFields(prev: ChannelVideo | undefined, incoming: ChannelVideo): ChannelVideo {
+  const v = mapApiChannelItem(incoming);
+  if (!prev) return v;
+  return {
+    ...prev,
+    ...v,
+    created_at: v.created_at ?? prev.created_at ?? null,
+    views: v.views ?? prev.views ?? null,
+    duration: v.duration ?? prev.duration ?? null,
+    duration_string: v.duration_string ?? prev.duration_string ?? null,
+    thumbnail_url: v.thumbnail_url ?? prev.thumbnail_url ?? null,
+  };
+}
+
 /** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
 
 export function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
-  for (const v of incoming.map(mapApiChannelItem)) {
+  for (const v of existing) {
     map.set(channelVideoKey(v), v);
   }
-  for (const v of existing) {
+  for (const v of incoming.map(mapApiChannelItem)) {
     const k = channelVideoKey(v);
-    if (!map.has(k)) map.set(k, v);
+    map.set(k, mergeChannelVideoFields(map.get(k), v));
   }
   return Array.from(map.values()).sort(
     (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
@@ -96,12 +127,12 @@ export function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]
 
 export function mergeClipLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
-  for (const v of incoming.map(mapApiChannelItem).filter(isLikelyClip)) {
+  for (const v of existing.filter(isLikelyClip)) {
     map.set(channelVideoKey(v), v);
   }
-  for (const v of existing.filter(isLikelyClip)) {
+  for (const v of incoming.map(mapApiChannelItem).filter(isLikelyClip)) {
     const k = channelVideoKey(v);
-    if (!map.has(k)) map.set(k, v);
+    map.set(k, mergeChannelVideoFields(map.get(k), v));
   }
   return Array.from(map.values()).sort(
     (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0),
@@ -354,38 +385,20 @@ export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips' |
   return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {});
 }
 
-/** Hide cookie/auth jargon from channel list banners. */
-export function isHiddenChannelPlatformError(msg: string): boolean {
-  const low = (msg || '').toLowerCase();
-  return low.includes('cookie') || low.includes('dpapi') || low.includes('po_token')
-    || low.includes('sign in to');
+/** Channel fetch errors are logged server-side only — never show red banners. */
+export function isHiddenChannelPlatformError(_msg: string): boolean {
+  return true;
 }
 
+/** ponytail: re-enable selective banners when we have actionable user fixes */
 export function formatChannelErrorMessage(
-  ch: SavedChannel,
-  mode: 'vods' | 'clips' | 'streams',
-  kickEnabled: boolean,
-  twitchEnabled: boolean,
-  youtubeEnabled = false,
+  _ch: SavedChannel,
+  _mode: 'vods' | 'clips' | 'streams',
+  _kickEnabled: boolean,
+  _twitchEnabled: boolean,
+  _youtubeEnabled = false,
 ): string | null {
-  const errs = channelPlatformErrors(ch, mode);
-  const errKeys = Object.keys(errs).filter((k) => {
-    if (!errs[k]) return false;
-    if (isHiddenChannelPlatformError(errs[k])) return false;
-    if (k === 'Kick' && !kickEnabled) return false;
-    if (k === 'Twitch' && !twitchEnabled) return false;
-    if (k === 'YouTube' && !youtubeEnabled) return false;
-    return true;
-  });
-  if (errKeys.length === 0) return null;
-  const hasItems = mode === 'clips'
-    ? (ch.clipVideos?.length ?? 0) > 0
-    : mode === 'streams'
-      ? (ch.vodVideos ?? []).some((v) => v.content_kind === 'stream')
-      : (ch.vodVideos ?? []).some((v) => v.content_kind !== 'stream');
-  return hasItems
-    ? `Partial results — ${errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ')}`
-    : errKeys.map((k) => `${k}: ${errs[k]}`).join(' | ');
+  return null;
 }
 
 export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {

@@ -48,7 +48,7 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
@@ -163,6 +163,7 @@ export default function App() {
   const [downloadAsAudio, setDownloadAsAudio] = useState(false);
   const urlPlatform = detectUrlPlatform(url);
   const [trimStartSec, setTrimStartSec] = useState(0);
+  const [previewMetaDurationSec, setPreviewMetaDurationSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(3600);
   const [trimPanelHeight, setTrimPanelHeight] = useState(0);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -208,6 +209,8 @@ export default function App() {
   /** Monotonic generation counter — increment to cancel in-flight openPreview. */
   const previewGenRef = useRef(0);
   const previewClipRelativeRef = useRef(false);
+  /** YouTube DASH segment playlist — timeline 0 = crop_start, not VOD 0. */
+  const previewTrimTimelineRef = useRef(false);
   /** Cancels debounced YouTube metadata prefetch when URL changes. */
   const youtubePrefetchGenRef = useRef(0);
   const channelsScrollRef = useRef<HTMLDivElement>(null);
@@ -547,10 +550,10 @@ export default function App() {
     }
   }, []);
 
-  const vodDurationSec = useMemo(
-    () => Math.max(1, videoInfoDurationSec(videoInfo)),
-    [videoInfo],
-  );
+  const vodDurationSec = useMemo(() => {
+    if (previewMetaDurationSec > 0) return previewMetaDurationSec;
+    return videoInfoDurationSec(videoInfo);
+  }, [videoInfo, previewMetaDurationSec]);
 
   useEffect(() => {
     vodDurationSecRef.current = vodDurationSec;
@@ -595,6 +598,8 @@ export default function App() {
       detachProgressivePreview(video);
     }
     previewClipRelativeRef.current = false;
+    previewTrimTimelineRef.current = false;
+    setPreviewMetaDurationSec(0);
   }, [setHlsRef]);
 
   const resetPreview = useCallback(async () => {
@@ -659,10 +664,26 @@ export default function App() {
 
     // Cancel any previously in-flight openPreview
     const gen = ++previewGenRef.current;
-    const start = trimStartSecRef.current;
+    let start = trimStartSecRef.current;
     let end = trimEndSecRef.current;
     const clipPreview = isClipUrl(trimmedUrl);
     const youtubePreview = detectUrlPlatform(trimmedUrl) === 'youtube';
+    if (youtubePreview && videoInfoDurationSec(videoInfo) <= 0) {
+      try {
+        const info = await apiGet<VideoInfo>(
+          `/api/info/video?id=${encodeURIComponent(trimmedUrl)}`,
+        );
+        if (gen !== previewGenRef.current) return;
+        const dur = videoInfoDurationSec(info);
+        if (dur > 0) {
+          setVideoInfo(info);
+          start = 0;
+          end = dur;
+        }
+      } catch {
+        /* session create will still clamp via backend extract */
+      }
+    }
     // Preview window follows trim range (full VOD when sliders span entire duration).
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
@@ -739,6 +760,21 @@ export default function App() {
       };
       previewSessionIdRef.current = res.session_id;
       setPreviewSessionId(res.session_id);
+      previewTrimTimelineRef.current = res.trim_timeline === true;
+      const synced = syncDurationFromPreviewSession(res.duration_sec, start, end);
+      if (synced) {
+        start = synced.start;
+        end = synced.end;
+        previewTrimStartRef.current = start;
+        previewTrimEndRef.current = end;
+        setPreviewTrimStart(start);
+        setPreviewTrimEnd(end);
+        trimStartSecRef.current = start;
+        trimEndSecRef.current = end;
+        setTrimStartSec(start);
+        setTrimEndSec(end);
+        setPreviewMetaDurationSec(synced.duration);
+      }
       const playback = resolvePreviewPlayback(url.trim(), res);
       if (youtubePreview && playback.kind === 'progressive' && res.mux_ready === false) {
         const muxReady = await waitForPreviewMuxReady(
@@ -940,18 +976,19 @@ export default function App() {
     }
 
     if (Hls.isSupported()) {
+      const dashSegTimeline = previewTrimTimelineRef.current;
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 30,
-        maxBufferLength: 20,
-        maxMaxBufferLength: 40,
+        maxBufferLength: dashSegTimeline ? 40 : 20,
+        maxMaxBufferLength: dashSegTimeline ? 120 : 40,
         startFragPrefetch: true,
         capLevelToPlayerSize: !youtubePreview,
-        fragLoadingTimeOut: 20000,
+        fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
-        startPosition: previewTrimStartRef.current,
+        startPosition: dashSegTimeline ? 0 : previewTrimStartRef.current,
       });
       previewHlsRef.current = hls;
       setHlsRef(hls);
@@ -1008,6 +1045,18 @@ export default function App() {
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         syncPreviewLevels(data.levels ?? hls.levels, true);
+        if (previewTrimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
+          setPreviewMetaDurationSec(Math.round(video.duration));
+        }
+        if (previewTrimTimelineRef.current) {
+          const start = previewTrimStartRef.current;
+          const end = previewTrimEndRef.current;
+          previewClipRelativeRef.current = isClipRelativePreviewDuration(
+            video.duration,
+            vodDurationSecRef.current,
+            end - start,
+          );
+        }
       });
       hls.on(Hls.Events.LEVELS_UPDATED, () => {
         syncPreviewLevels(hls.levels);
@@ -1636,7 +1685,7 @@ export default function App() {
       url: buildVodUrl(v),
       title: v.title || 'Untitled',
       platform: v.platform,
-      durationSec: v.duration ? Math.max(2, Math.floor(v.duration)) : 7200,
+      durationSec: channelVideoDurationSec(v) ?? 0,
       platformListIndex: v.platformListIndex,
       isClip: isClipItem,
     };
@@ -1675,6 +1724,9 @@ export default function App() {
   const handlePreviewLoadedMetadata = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video?.videoWidth || !video?.videoHeight) return;
+    if (previewTrimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
+      setPreviewMetaDurationSec(Math.round(video.duration));
+    }
     const aspect = video.videoWidth / video.videoHeight;
     previewVideoAspectRef.current = aspect;
     setPreviewVideoAspect(aspect);
@@ -1855,6 +1907,10 @@ export default function App() {
           setVideoInfo(info);
           setQuality(bestAvailableQuality(info));
           const end = Math.max(1, videoInfoDurationSec(info));
+          if (end <= 0) {
+            setError('Could not determine video length');
+            return;
+          }
           trimStartSecRef.current = 0;
           trimEndSecRef.current = end;
           setTrimStartSec(0);
@@ -4317,18 +4373,6 @@ export default function App() {
                       </div>
                       </div>
                         );
-                      })()}
-                      {(() => {
-                        const msg = formatChannelErrorMessage(
-                          ch,
-                          channelContentFilter,
-                          kickEnabled && Boolean(ch.kickSlug?.trim()),
-                          twitchEnabled && Boolean(ch.twitchSlug?.trim()),
-                          youtubeEnabled && Boolean(ch.youtubeSlug?.trim()),
-                        );
-                        return msg ? (
-                          <p className="text-red-400 text-[10px] font-mono">{msg}</p>
-                        ) : null;
                       })()}
                       {channelsLoading && visibleChannelVideos.length === 0 ? (
                         <div className="flex justify-center py-4 text-zinc-500">

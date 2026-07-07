@@ -137,6 +137,10 @@ export interface PreviewSessionResponse {
   extract_source?: string;
   /** False while async YouTube DASH mux is still running on the backend. */
   mux_ready?: boolean;
+  /** HLS playlist is 0-based from crop_start (YouTube on-demand DASH segments). */
+  trim_timeline?: boolean;
+  /** Real VOD length from backend extract (crop_end clamped to this). */
+  duration_sec?: number;
 }
 
 export interface PreviewSessionStatusResponse {

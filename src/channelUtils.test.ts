@@ -20,6 +20,8 @@ import {
   findCachedVideoThumbnail,
   formatChannelErrorMessage,
   isHiddenChannelPlatformError,
+  syncDurationFromPreviewSession,
+  videoInfoDurationSec,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel } from './types';
 
@@ -113,6 +115,24 @@ describe('mergeVodLists', () => {
     const incoming = [makeVod({ id: 'v2', title: 'VOD 2' })];
     const result = mergeVodLists(existing, incoming);
     expect(result).toHaveLength(2);
+  });
+
+  it('preserves created_at when incoming row is partial', () => {
+    const existing = [makeVod({
+      id: 'yt1',
+      platform: 'YouTube',
+      created_at: '2024-01-15T00:00:00Z',
+      views: 100,
+    })];
+    const incoming = [makeVod({
+      id: 'yt1',
+      platform: 'YouTube',
+      created_at: null,
+      views: 200,
+    })];
+    const merged = mergeVodLists(existing, incoming);
+    expect(merged[0].created_at).toBe('2024-01-15T00:00:00Z');
+    expect(merged[0].views).toBe(200);
   });
 
   it('sorts newest first by created_at', () => {
@@ -349,16 +369,35 @@ describe('channelStreamsMissing', () => {
 });
 
 describe('isHiddenChannelPlatformError', () => {
-  it('hides cookie errors', () => {
+  it('hides all channel platform errors from UI', () => {
     expect(isHiddenChannelPlatformError('failed to load cookies')).toBe(true);
+    expect(isHiddenChannelPlatformError('Stream VOD fetch timed out — try again')).toBe(true);
     expect(formatChannelErrorMessage(
       {
         id: '1', displayName: 'x', kickSlug: '', twitchSlug: '', youtubeSlug: 'yt',
         vodVideos: [{ id: 'a', platform: 'YouTube', title: 't', duration: 1, created_at: '', views: 0 }],
         clipVideos: [], updatedAt: '',
-        vodErrors: { YouTube: 'failed to load cookies' },
+        vodErrors: { YouTube: 'Stream VOD fetch timed out — try again' },
       },
-      'vods', false, false, true,
+      'streams', false, false, true,
     )).toBeNull();
+  });
+});
+
+describe('videoInfoDurationSec', () => {
+  it('returns 0 when duration unknown', () => {
+    expect(videoInfoDurationSec(null)).toBe(0);
+    expect(videoInfoDurationSec({ title: 'x' })).toBe(0);
+  });
+});
+
+describe('syncDurationFromPreviewSession', () => {
+  it('replaces 7200 placeholder with real duration', () => {
+    const out = syncDurationFromPreviewSession(212, 0, 7200);
+    expect(out).toEqual({ start: 0, end: 212, duration: 212 });
+  });
+  it('keeps client crop_end when session duration is higher', () => {
+    const out = syncDurationFromPreviewSession(50, 0, 50);
+    expect(out).toEqual({ start: 0, end: 50, duration: 50 });
   });
 });

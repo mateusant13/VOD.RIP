@@ -579,6 +579,37 @@ def _player_request(
     return data, resp.status_code, "ok"
 
 
+def _created_at_from_player_data(data: dict) -> Optional[str]:
+    """Publish/upload date from player microformat (not in videoDetails)."""
+    from datetime import datetime, timezone
+
+    micro = (data.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+    for key in ("publishDate", "uploadDate"):
+        raw = micro.get(key)
+        if not raw:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        if re.match(r"^\d{8}$", s):
+            try:
+                return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+            if "T" in s:
+                try:
+                    norm = s.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(norm)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.astimezone(timezone.utc).isoformat()
+                except ValueError:
+                    pass
+            return f"{s}T00:00:00+00:00"
+    return None
+
+
 def _info_from_player_data(
     data: dict,
     video_id: str,
@@ -611,6 +642,11 @@ def _info_from_player_data(
     except (TypeError, ValueError):
         view_count = None
 
+    created_at = _created_at_from_player_data(data)
+    upload_date = None
+    if created_at and len(created_at) >= 10 and created_at[4] == "-":
+        upload_date = created_at[:10].replace("-", "")
+
     return {
         "id": video_id,
         "title": details.get("title"),
@@ -618,6 +654,8 @@ def _info_from_player_data(
         "uploader": details.get("author"),
         "channel": details.get("author"),
         "view_count": view_count,
+        "created_at": created_at,
+        "upload_date": upload_date,
         "thumbnail": thumb,
         "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
         "extractor": "youtube",
@@ -849,6 +887,68 @@ def _collect_merged_innertube_info(
     return info
 
 
+def innertube_video_row_metadata(
+    video_id: str,
+    session: Optional["YouTubeSession"] = None,
+    read_timeout: float = 2.0,
+) -> Optional[dict[str, Any]]:
+    """Lightweight player call for channel list rows (date/views/duration only)."""
+    if session is None:
+        from services.youtube_session import youtube_session_from_settings
+        session = youtube_session_from_settings(video_id=video_id)
+    out: dict[str, Any] = {}
+    for name in ("WEB", "IOS", "ANDROID"):
+        profile = _PROFILE_BY_NAME.get(name)
+        if not profile:
+            continue
+        data, _status, kind = _player_request(
+            video_id, profile, read_timeout, session=session,
+        )
+        if kind == "fatal" or not data:
+            continue
+        details = data.get("videoDetails") or {}
+        if not out.get("created_at"):
+            created = _created_at_from_player_data(data)
+            if created:
+                out["created_at"] = created
+        if out.get("views") is None:
+            views = details.get("viewCount")
+            try:
+                if views is not None:
+                    out["views"] = int(views)
+            except (TypeError, ValueError):
+                pass
+        if not out.get("duration"):
+            length = details.get("lengthSeconds")
+            try:
+                if length is not None:
+                    out["duration"] = int(length)
+            except (TypeError, ValueError):
+                pass
+        if out.get("created_at") and out.get("views") is not None:
+            break
+    if not out:
+        return None
+    return out
+
+
+def _ensure_info_created_at(
+    info: Optional[dict[str, Any]],
+    video_id: str,
+    session: Optional["YouTubeSession"],
+) -> None:
+    """IOS race winners often lack publishDate — backfill from WEB microformat."""
+    if not info or info.get("created_at") or info.get("upload_date"):
+        return
+    meta = innertube_video_row_metadata(video_id, session=session, read_timeout=2.5)
+    if not meta or not meta.get("created_at"):
+        return
+    info["created_at"] = meta["created_at"]
+    ca = str(meta["created_at"])
+    if len(ca) >= 10 and ca[4] == "-":
+        info["upload_date"] = ca[:10].replace("-", "")
+
+
 def innertube_extract_info(
     url: str,
     timeout: Optional[float] = None,
@@ -869,12 +969,14 @@ def innertube_extract_info(
     profiles = _profiles_for_session(session)
     info = _race_profiles(profiles, video_id, session, read_timeout, _RACE_TIMEOUT_SEC)
     if info:
+        _ensure_info_created_at(info, video_id, session)
         from services.youtube_diag import log_extract_ok
         log_extract_ok(video_id, "innertube_race", info, session)
         return info
 
     info = _collect_merged_innertube_info(video_id, session, read_timeout)
     if info:
+        _ensure_info_created_at(info, video_id, session)
         from services.youtube_diag import log_extract_ok
         log_extract_ok(video_id, "innertube", info, session)
         return info
@@ -889,11 +991,13 @@ def innertube_extract_info(
             _profiles_for_session(fresh), video_id, fresh, read_timeout, _RACE_TIMEOUT_SEC,
         )
         if info:
+            _ensure_info_created_at(info, video_id, fresh)
             from services.youtube_diag import log_extract_ok
             log_extract_ok(video_id, "innertube_race_fresh", info, fresh)
             return info
         info = _collect_merged_innertube_info(video_id, fresh, read_timeout)
         if info:
+            _ensure_info_created_at(info, video_id, fresh)
             from services.youtube_diag import log_extract_ok
             log_extract_ok(video_id, "innertube_fresh", info, fresh)
             return info

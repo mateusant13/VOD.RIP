@@ -148,6 +148,8 @@ class PreviewSessionResponse(BaseModel):
     active_height: int = 0
     extract_source: str = ""
     mux_ready: bool = True
+    trim_timeline: bool = False  # playlist starts at crop_start (YouTube on-demand DASH segments)
+    duration_sec: float = 0.0  # real VOD length from extract (crop_end clamped to this)
 
 
 class PreviewSessionStatusResponse(BaseModel):

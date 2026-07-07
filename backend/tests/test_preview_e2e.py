@@ -81,6 +81,28 @@ class TestYouTubePreviewResolve:
         assert kind == "hls"
         assert ".m3u8" in entry
 
+    def test_dash_only_with_separate_audio_uses_hls(self):
+        from unittest.mock import patch
+
+        from services.preview_service import resolve_stream_info
+
+        dash_info = {
+            "formats": [
+                {"height": 720, "protocol": "https", "url": "https://x/v720.mp4", "acodec": "none"},
+                {"height": 480, "protocol": "https", "url": "https://x/v480.mp4", "acodec": "none"},
+            ],
+            "_preview_audio_format": {"url": "https://x/a.m4a"},
+            "http_headers": {},
+        }
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        with patch(
+            "services.preview_service._extract_youtube_preview_info",
+            return_value=dash_info,
+        ):
+            _entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
+        assert platform == "YouTube"
+        assert kind == "hls"
+
 
 class TestPreviewManagerDirect:
     """Tests PreviewManager directly (no HTTP)."""

@@ -47,7 +47,8 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
-import type { PreviewSessionResponse } from './types';
+import type { PreviewSessionResponse, VideoInfo } from './types';
+import { videoInfoDurationSec, syncDurationFromPreviewSession } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
 
@@ -128,6 +129,7 @@ export default function ChannelExplorePopup({
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
+  const [sessionDurationSec, setSessionDurationSec] = useState(0);
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [pos, setPos] = useState<PanelPos | null>(null);
@@ -146,6 +148,7 @@ export default function ChannelExplorePopup({
   const sessionIdRef = useRef<string | null>(null);
   const extractSourceRef = useRef('');
   const clipRelativeRef = useRef(false);
+  const trimTimelineRef = useRef(false);
   const sessionMetaRef = useRef<{
     variantHeights: number[];
     qualityLabels?: string[];
@@ -207,6 +210,8 @@ export default function ChannelExplorePopup({
     setReady(false);
     setError(null);
     setMediaDurationSec(0);
+    setSessionDurationSec(0);
+    trimTimelineRef.current = false;
     setPreviewLevels([]);
     setQualityLevel(0);
     setQualityMenuOpen(false);
@@ -225,10 +230,19 @@ export default function ChannelExplorePopup({
           ).catch(() => null)
           : Promise.resolve(null);
         if (platform === 'youtube') warmYoutubePreview(vod.url);
+        let cropEnd = vod.durationSec;
+        if (cropEnd <= 0) {
+          const infoPath = vod.isClip ? '/api/info/clip' : '/api/info/video';
+          const info = await apiGet<VideoInfo>(
+            `${infoPath}?id=${encodeURIComponent(vod.url)}`,
+          );
+          cropEnd = videoInfoDurationSec(info);
+          if (cropEnd <= 0) throw new Error('Could not determine video length');
+        }
         const sessionPromise = apiPost<PreviewSessionResponse>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
-          crop_end: vod.durationSec,
+          crop_end: cropEnd,
           prefer_height: preferHeight,
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
@@ -236,13 +250,21 @@ export default function ChannelExplorePopup({
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;
         }
+        const synced = syncDurationFromPreviewSession(res.duration_sec, 0, cropEnd);
+        if (synced && synced.duration > 0) {
+          cropEnd = synced.end;
+          setSessionDurationSec(synced.duration);
+        } else if (res.duration_sec && res.duration_sec > 0) {
+          setSessionDurationSec(Math.floor(res.duration_sec));
+        }
+        trimTimelineRef.current = res.trim_timeline === true;
         const resolved = resolvePreviewPlayback(vod.url, res);
         if (platform === 'youtube' && resolved.kind === 'progressive' && res.mux_ready === false) {
           const muxReady = await waitForPreviewMuxReady(
             res.session_id,
             apiGet,
             undefined,
-            previewMuxPollMaxMs(0, vod.durationSec),
+            previewMuxPollMaxMs(0, cropEnd),
           );
           if (cancelled) {
             try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
@@ -343,7 +365,10 @@ export default function ChannelExplorePopup({
     }
   }, []);
 
-  const effectiveDurationSec = resolvePreviewDurationSec(mediaDurationSec, vod.durationSec);
+  const effectiveDurationSec = resolvePreviewDurationSec(
+    mediaDurationSec,
+    sessionDurationSec > 0 ? sessionDurationSec : vod.durationSec,
+  );
 
   const seekVideo = useCallback((sec: number) => {
     const video = videoRef.current;
@@ -608,15 +633,16 @@ export default function ChannelExplorePopup({
     }
 
     if (Hls.isSupported()) {
+      const dashSegTimeline = trimTimelineRef.current;
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 30,
-        maxBufferLength: 20,
-        maxMaxBufferLength: 40,
+        maxBufferLength: dashSegTimeline ? 40 : 20,
+        maxMaxBufferLength: dashSegTimeline ? 120 : 40,
         startFragPrefetch: true,
         capLevelToPlayerSize: platform !== 'youtube',
-        fragLoadingTimeOut: 20000,
+        fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
         startPosition: 0,
@@ -657,6 +683,9 @@ export default function ChannelExplorePopup({
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         syncPreviewLevels(data.levels ?? hls.levels, true);
+        if (Number.isFinite(video.duration) && video.duration > 0) {
+          setMediaDurationSec(Math.round(video.duration));
+        }
       });
       hls.on(Hls.Events.LEVELS_UPDATED, () => {
         syncPreviewLevels(hls.levels);

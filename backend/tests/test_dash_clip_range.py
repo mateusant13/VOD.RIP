@@ -1,5 +1,12 @@
 """YouTube DASH clip byte-range helpers."""
-from services.ytdlp_hls import _googlevideo_byte_range, _dash_video_needs_transcode
+import os
+import tempfile
+
+from services.ytdlp_hls import (
+    _googlevideo_byte_range,
+    _dash_video_needs_transcode,
+    _local_dash_slice_valid,
+)
 
 
 def test_googlevideo_byte_range_trim_start():
@@ -7,6 +14,16 @@ def test_googlevideo_byte_range_trim_start():
     b0, b1 = _googlevideo_byte_range(url, 0.0, 30.0)
     assert b0 == 0
     assert 25000 < b1 < 400000
+
+
+def test_local_dash_slice_accepts_midfile_fragment():
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(b"\x00" * 70000)
+        path = tmp.name
+    try:
+        assert _local_dash_slice_valid(path) is True
+    finally:
+        os.unlink(path)
 
 
 def test_dash_transcode_from_format_not_url():

@@ -17,8 +17,10 @@ from services.preview_service import (
     StalePreviewUrls,
     create_session,
     delete_session,
+    is_youtube_dash_segment_resource,
     open_progressive_proxy,
     open_segment_proxy,
+    open_youtube_dash_segment_proxy,
     preview_mux_ready,
     preview_session_kind,
     preview_session_mux_status,
@@ -32,6 +34,7 @@ from services.preview_service import (
     session_variant_heights,
     set_session_prefer_height,
     get_session,
+    youtube_dash_segment_index,
     _is_playlist_url,
     _is_rangeable_cdn_media,
 )
@@ -72,6 +75,8 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         active_height=session_active_height(session),
         extract_source=_session_extract_source(session),
         mux_ready=preview_mux_ready(session),
+        trim_timeline=getattr(session, "dash_segment_hls", False),
+        duration_sec=float(getattr(session, "vod_duration", 0) or 0),
     )
 
 
@@ -295,6 +300,22 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     try:
+        if is_youtube_dash_segment_resource(upstream):
+            seg_idx = youtube_dash_segment_index(upstream)
+            generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
+                INFO_EXECUTOR,
+                lambda: open_youtube_dash_segment_proxy(session_id, seg_idx, range_header),
+            )
+            response_headers = dict(extra_headers or {})
+            if ctype and ctype != "application/octet-stream":
+                response_headers.setdefault("Content-Type", ctype)
+            return StreamingResponse(
+                generate(),
+                media_type=ctype or "application/octet-stream",
+                status_code=status,
+                headers=response_headers,
+                background=BackgroundTask(cleanup),
+            )
         if _is_playlist_url(upstream):
             data, ctype, extra_headers, status = await loop.run_in_executor(
                 INFO_EXECUTOR,
@@ -335,8 +356,23 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
         raise HTTPException(status_code=403, detail=str(e))
     except StalePreviewUrls as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except PreviewMuxPending as e:
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+            headers={"Retry-After": "1"},
+        )
     except RuntimeError as e:
-        raise HTTPException(status_code=413, detail=str(e))
+        msg = str(e)
+        if "exceeds size limit" in msg:
+            raise HTTPException(status_code=413, detail=msg)
+        if "googlevideo" in msg.lower() or "ffmpeg failed" in msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail=msg,
+                headers={"Retry-After": "1"},
+            )
+        raise HTTPException(status_code=502, detail=msg)
     except Exception as e:
     # ponytail: best-effort — network errors only
         raise HTTPException(status_code=502, detail=str(e))

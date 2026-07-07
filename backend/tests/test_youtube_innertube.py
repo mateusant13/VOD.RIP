@@ -5,6 +5,7 @@ from services.youtube_innertube import (
     _classify_http,
     _classify_playability,
     _CLIENT_PROFILES,
+    _created_at_from_player_data,
     _enrich_client_context,
     _is_auto_dubbed_audio,
     _pick_best_audio_format,
@@ -133,3 +134,16 @@ def test_innertube_falls_through_clients_on_403():
     assert info["title"] == "t"
     assert mock_http.post.call_count >= 2
     assert len(_CLIENT_PROFILES) >= 2
+
+
+def test_created_at_from_player_microformat():
+    iso = _created_at_from_player_data({
+        "microformat": {"playerMicroformatRenderer": {"publishDate": "2024-05-11"}},
+    })
+    assert iso and iso.startswith("2024-05-11")
+    tz = _created_at_from_player_data({
+        "microformat": {
+            "playerMicroformatRenderer": {"publishDate": "2005-04-23T20:31:52-07:00"},
+        },
+    })
+    assert tz and "2005-04-2" in tz

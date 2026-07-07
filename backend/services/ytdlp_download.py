@@ -182,7 +182,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     formats = info.get("formats", [])
     qualities = _qualities_from_formats(formats, is_clip_url(full_url))
 
-    created_at = info.get("upload_date")
+    created_at = info.get("created_at") or info.get("upload_date")
     if not created_at and info.get("timestamp"):
         try:
             from datetime import datetime, timezone
@@ -191,6 +191,14 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             ).isoformat()
         except (TypeError, ValueError, OSError):
             created_at = None
+    if created_at and re.match(r"^\d{8}$", str(created_at)):
+        try:
+            from datetime import datetime, timezone
+            created_at = datetime.strptime(
+                str(created_at), "%Y%m%d",
+            ).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            pass
 
     from services.size_estimate import enrich_info_dict
 
