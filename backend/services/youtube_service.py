@@ -48,6 +48,7 @@ def list_channel_videos_sync(
 ) -> list[dict[str, Any]]:
     import yt_dlp
 
+    from services.ytdlp_guard import guarded_youtube_dl
     from services.youtube_session import (
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
@@ -81,7 +82,7 @@ def list_channel_videos_sync(
     from services.youtube_session import apply_ytdlp_cookie_opts
 
     apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth)
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with guarded_youtube_dl(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries") or []
     content_kind = _content_kind_for_playlist(playlist)

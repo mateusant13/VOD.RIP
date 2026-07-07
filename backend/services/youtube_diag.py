@@ -88,14 +88,16 @@ def log_extract_fail(
     *,
     exc: Optional[BaseException] = None,
     detail: str = "",
+    final: bool = False,
 ) -> None:
     msg = f"extract fail video={video_id} reason={reason} auth={auth_hint(session)}"
     if detail:
         msg = f"{msg} {detail}"
+    sink = log.warning if final else log.debug
     if exc is not None:
-        log.warning("%s: %s", msg, exc)
+        sink("%s: %s", msg, exc)
     else:
-        log.warning(msg)
+        sink(msg)
 
 
 def log_preview_resolve(

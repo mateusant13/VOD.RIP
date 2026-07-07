@@ -354,6 +354,13 @@ export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips' |
   return mode === 'clips' ? (ch.clipErrors ?? {}) : (ch.vodErrors ?? (ch as SavedChannel & { errors?: Record<string, string> }).errors ?? {});
 }
 
+/** Hide cookie/auth jargon from channel list banners. */
+export function isHiddenChannelPlatformError(msg: string): boolean {
+  const low = (msg || '').toLowerCase();
+  return low.includes('cookie') || low.includes('dpapi') || low.includes('po_token')
+    || low.includes('sign in to');
+}
+
 export function formatChannelErrorMessage(
   ch: SavedChannel,
   mode: 'vods' | 'clips' | 'streams',
@@ -364,6 +371,7 @@ export function formatChannelErrorMessage(
   const errs = channelPlatformErrors(ch, mode);
   const errKeys = Object.keys(errs).filter((k) => {
     if (!errs[k]) return false;
+    if (isHiddenChannelPlatformError(errs[k])) return false;
     if (k === 'Kick' && !kickEnabled) return false;
     if (k === 'Twitch' && !twitchEnabled) return false;
     if (k === 'YouTube' && !youtubeEnabled) return false;

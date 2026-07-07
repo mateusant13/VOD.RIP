@@ -18,6 +18,8 @@ import {
   deriveChannelDisplayName,
   resolveVideoThumbnail,
   findCachedVideoThumbnail,
+  formatChannelErrorMessage,
+  isHiddenChannelPlatformError,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel } from './types';
 
@@ -343,5 +345,20 @@ describe('channelStreamsMissing', () => {
 
   it('requests fetch before streamsFetched', () => {
     expect(channelStreamsMissing({ ...base, streamsFetched: false }, true)).toBe(true);
+  });
+});
+
+describe('isHiddenChannelPlatformError', () => {
+  it('hides cookie errors', () => {
+    expect(isHiddenChannelPlatformError('failed to load cookies')).toBe(true);
+    expect(formatChannelErrorMessage(
+      {
+        id: '1', displayName: 'x', kickSlug: '', twitchSlug: '', youtubeSlug: 'yt',
+        vodVideos: [{ id: 'a', platform: 'YouTube', title: 't', duration: 1, created_at: '', views: 0 }],
+        clipVideos: [], updatedAt: '',
+        vodErrors: { YouTube: 'failed to load cookies' },
+      },
+      'vods', false, false, true,
+    )).toBeNull();
   });
 });

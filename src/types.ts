@@ -125,6 +125,23 @@ export interface SavedChannel {
   videos?: ChannelVideo[];
 }
 
+export interface PreviewSessionResponse {
+  session_id: string;
+  master_url: string;
+  playback_url?: string;
+  kind?: string;
+  variant_heights?: number[];
+  quality_labels?: string[];
+  active_height?: number;
+  extract_source?: string;
+  /** False while async YouTube DASH mux is still running on the backend. */
+  mux_ready?: boolean;
+}
+
+export interface PreviewSessionStatusResponse {
+  mux_ready: boolean;
+}
+
 export type Tab = 'url' | 'channels' | 'queue' | 'settings';
 
 export interface PersistedPanelLayout {

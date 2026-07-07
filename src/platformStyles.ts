@@ -39,36 +39,49 @@ export function platformButtonPressHover(platform: PlatformStyleKey): string {
   return 'shadow-[2px_2px_0px_0px_#52525b] hover:shadow-[1px_1px_0px_0px_#52525b] hover:translate-x-px hover:translate-y-px';
 }
 
-/** Press-in hover for the main download CTA (3px shadow stack). */
+/** Press-in hover for the main download CTA — shadow only (no translate: avoids scrollbar flicker). */
 export function platformDownloadBtn(platform: PlatformStyleKey): string {
-  const base = 'w-full shrink-0 border-2 border-white bg-black py-2 flex items-center justify-center gap-2 text-xs font-black uppercase transition-[transform,box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
+  const base = 'w-full h-full min-h-[2.25rem] border-2 border-white bg-black flex items-center justify-center gap-2 text-xs font-black uppercase transition-[box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed';
   if (platform === 'kick') {
-    return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-px hover:translate-y-px`;
+    return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18]`;
   }
   if (platform === 'twitch') {
-    return `${base} shadow-[3px_3px_0px_0px_#9146FF] hover:shadow-[2px_2px_0px_0px_#9146FF] hover:translate-x-px hover:translate-y-px`;
+    return `${base} shadow-[3px_3px_0px_0px_#9146FF] hover:shadow-[2px_2px_0px_0px_#9146FF]`;
   }
   if (platform === 'youtube') {
-    return `${base} shadow-[3px_3px_0px_0px_#F03030] hover:shadow-[2px_2px_0px_0px_#F03030] hover:translate-x-px hover:translate-y-px`;
+    return `${base} shadow-[3px_3px_0px_0px_#F03030] hover:shadow-[2px_2px_0px_0px_#F03030]`;
   }
-  return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18] hover:translate-x-px hover:translate-y-px`;
+  return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18]`;
+}
+
+/** Selected-VOD panel actions — same look as VOD rip; active = inverted. */
+export function platformVodPanelBtn(platform: PlatformStyleKey, active = false): string {
+  const base = platformDownloadBtn(platform);
+  if (!active) return base;
+  return `${base} !bg-white !text-black shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)] hover:!bg-black hover:!text-white`;
+}
+
+/** Open URL / Watch preview — platform colors from VOD rip, mono label typography. */
+export function platformVodPanelSecondaryBtn(platform: PlatformStyleKey, active = false): string {
+  const base =
+    'w-full h-full min-h-[2.25rem] border-2 font-mono uppercase font-bold text-[10px] flex items-center justify-center gap-1.5 transition-[box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed border-white bg-black';
+  if (active) {
+    return `${base} !bg-white !text-black shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)] hover:!bg-black hover:!text-white`;
+  }
+  if (platform === 'kick') {
+    return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18]`;
+  }
+  if (platform === 'twitch') {
+    return `${base} shadow-[3px_3px_0px_0px_#9146FF] hover:shadow-[2px_2px_0px_0px_#9146FF]`;
+  }
+  if (platform === 'youtube') {
+    return `${base} shadow-[3px_3px_0px_0px_#F03030] hover:shadow-[2px_2px_0px_0px_#F03030]`;
+  }
+  return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18]`;
 }
 
 export function platformWatchPreviewBtn(platform: PlatformStyleKey, active: boolean): string {
-  if (active) {
-    return 'border-2 border-white bg-zinc-900 text-white shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)]';
-  }
-  const base = 'w-full border-2 font-mono uppercase font-bold py-2 text-[10px] flex items-center justify-center gap-1.5 transition-[transform,box-shadow,background-color,color,border-color] duration-150';
-  if (platform === 'kick') {
-    return `${base} border-[#53fc18]/70 text-[#53fc18] bg-[#53fc18]/5 hover:border-[#53fc18] hover:bg-[#53fc18]/15 ${platformButtonPressHover('kick')}`;
-  }
-  if (platform === 'twitch') {
-    return `${base} border-[#9146FF]/70 text-[#9146FF] bg-[#9146FF]/5 hover:border-[#9146FF] hover:bg-[#9146FF]/15 ${platformButtonPressHover('twitch')}`;
-  }
-  if (platform === 'youtube') {
-    return `${base} border-[#F03030]/70 text-[#F03030] bg-[#F03030]/5 hover:border-[#F03030] hover:bg-[#F03030]/15 ${platformButtonPressHover('youtube')}`;
-  }
-  return `${base} border-zinc-500 text-zinc-200 bg-zinc-900/50 hover:border-white hover:text-white ${platformButtonPressHover(null)}`;
+  return platformVodPanelSecondaryBtn(platform, active);
 }
 
 /** Preview player transport buttons — platform accent when docked, glass when fullscreen overlay. */

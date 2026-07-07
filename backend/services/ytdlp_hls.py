@@ -23,6 +23,8 @@ import shutil
 import subprocess as sp
 import tempfile
 
+from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp import
+from services.ytdlp_guard import assert_ytdlp_safe, guarded_youtube_dl, YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK
 import yt_dlp
 
 from services.ytdlp_ffmpeg import (
@@ -111,10 +113,17 @@ HLS_DOWNLOAD_PROGRESS_CAP = 90.0
 _EXTRACT_INFO_CACHE: dict[str, tuple[float, dict]] = {}
 _EXTRACT_INFLIGHT: dict[str, tuple[threading.Event, dict]] = {}
 _EXTRACT_CACHE_LOCK = threading.Lock()
-_EXTRACT_CACHE_TTL_SEC = 10 * 60
+# yt-dlp getpot_wpc registers globally — guarded_youtube_dl serializes all YoutubeDL().
+_EXTRACT_CACHE_TTL_SEC = 6 * 3600
 _EXTRACT_CACHE_MAX = 32
 _EXTRACT_WAIT_SEC = 120
-_YOUTUBE_EXTRACT_PARALLEL_SEC = 6.0
+_YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
+_YOUTUBE_PREVIEW_SOCKET_SEC = 5
+_PREVIEW_EXTRACT_WAIT_SEC = 8.0
+_PREVIEW_EXTRACT_MAX_WALL_SEC = 6.0
+_PREVIEW_MUX_MAX_SEC = 30.0
+_PREVIEW_MUX_FAST_SEC = 10.0
+_PREVIEW_MUX_FAST_HEIGHT = 480
 
 
 def _youtube_manual_auth_configured() -> bool:
@@ -133,6 +142,30 @@ def _youtube_manual_auth_configured() -> bool:
     except Exception:
         pass
     return False
+
+
+def _youtube_has_user_auth(opts: dict) -> bool:
+    """True only for user-configured auth — anonymous bootstrap cookie jar is not manual auth."""
+    if _youtube_manual_auth_configured():
+        return True
+    if opts.get("cookiesfrombrowser"):
+        return True
+    session = opts.get("_youtube_session")
+    if session and getattr(session, "anonymous", False):
+        return False
+    return bool(_youtube_cookie_path(opts))
+
+
+def invalidate_youtube_extract_cache(url: str) -> None:
+    """Drop cached extract for *url* so the next resolve can try other clients."""
+    prefix = f"{url}|"
+    with _EXTRACT_CACHE_LOCK:
+        for key in list(_EXTRACT_INFO_CACHE):
+            if key.startswith(prefix):
+                _EXTRACT_INFO_CACHE.pop(key, None)
+
+
+assert invalidate_youtube_extract_cache.__name__ == "invalidate_youtube_extract_cache"
 
 
 def _extract_cache_key(url: str, opts: dict) -> str:
@@ -164,10 +197,16 @@ def _youtube_cookie_path(opts: dict) -> Optional[str]:
     return None
 
 
-def _try_innertube_info(url: str, session=None) -> Optional[dict]:
+def _try_innertube_info(url: str, session=None, *, allow_session_refresh: bool = True) -> Optional[dict]:
     from services.youtube_innertube import innertube_extract_info
 
-    return innertube_extract_info(url, session=session)
+    try:
+        return innertube_extract_info(
+            url, session=session, allow_session_refresh=allow_session_refresh,
+        )
+    except Exception as exc:
+        logger.debug("InnerTube extract error for %s: %s", url, exc)
+        return None
 
 
 def youtube_preview_ytdl_opts(
@@ -212,7 +251,8 @@ def youtube_preview_ytdl_opts(
         "extractor_args": ytdlp_extractor_args(session, auto_auth=auto_auth),
         "cachedir": str(cachedir or _get_cache_dir()),
         "_youtube_session": session,
-        "socket_timeout": 10,
+        "socket_timeout": _YOUTUBE_PREVIEW_SOCKET_SEC,
+        "_preview_fast": True,
     }
     if oauth:
         opts["username"] = "oauth_token"
@@ -323,10 +363,14 @@ def _youtube_cache_ok(url: str, opts: dict, info: dict) -> bool:
     return _youtube_info_playable(info)
 
 
-def _try_innertube_info_retry(url: str, attempts: int = 1, session=None) -> Optional[dict]:
+def _try_innertube_info_retry(
+    url: str, attempts: int = 1, session=None, *, allow_session_refresh: bool = True,
+) -> Optional[dict]:
     """InnerTube multi-client chain — one pass; outer extract loop handles retries."""
     for i in range(attempts):
-        info = _try_innertube_info(url, session=session)
+        info = _try_innertube_info(
+            url, session=session, allow_session_refresh=allow_session_refresh,
+        )
         if info and _youtube_info_playable(info):
             return info
         if i + 1 < attempts:
@@ -334,10 +378,19 @@ def _try_innertube_info_retry(url: str, attempts: int = 1, session=None) -> Opti
     return None
 
 
+def _bare_ytdlp_opts(opts: dict) -> dict:
+    """Strip all cookie/session auth — last-resort yt-dlp pass."""
+    return {
+        k: v for k, v in opts.items()
+        if k not in ("cookiefile", "cookiesfrombrowser", "_youtube_session")
+    }
+
+
 def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
     """Soft anonymous refresh — bootstrap new visitor cookies, no browser auth path."""
     from services.youtube_innertube import extract_video_id
     from services.youtube_session import (
+        apply_ytdlp_cookie_opts,
         bootstrap_anonymous_session,
         youtube_session_from_settings,
         ytdlp_extractor_args,
@@ -351,38 +404,39 @@ def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
     merged["extractor_args"] = ytdlp_extractor_args(fresh, auto_auth=False)
     merged.pop("cookiefile", None)
     merged.pop("cookiesfrombrowser", None)
+    apply_ytdlp_cookie_opts(merged, fresh, auto_auth=False)
     return merged
 
 
-def _youtube_extract_parallel(
+def _youtube_extract_parallel_fast(
     url: str,
     opts: dict,
     yt_session,
     vid: str,
 ) -> Optional[dict]:
-    """Race InnerTube vs yt-dlp anonymous — first playable result wins."""
+    """Race InnerTube vs yt-dlp+cookies — first playable within ~4.5s wins (preview SLA)."""
     from services.youtube_diag import log_extract_ok
 
-    bare_opts = {
-        k: v for k, v in opts.items()
-        if k not in ("cookiefile", "cookiesfrombrowser")
-    }
-    bare_opts["socket_timeout"] = min(int(bare_opts.get("socket_timeout") or 10), 6)
+    cookie_opts = dict(opts)
+    cookie_opts["socket_timeout"] = min(
+        int(cookie_opts.get("socket_timeout") or 10), _YOUTUBE_PREVIEW_SOCKET_SEC,
+    )
 
     def _inn() -> Optional[dict]:
-        return _try_innertube_info_retry(url, session=yt_session)
+        return _try_innertube_info_retry(
+            url, session=yt_session, allow_session_refresh=False,
+        )
 
     def _ydl() -> Optional[dict]:
-        return _extract_hls_info_quiet(url, bare_opts)
+        return _extract_hls_info_quiet(url, cookie_opts)
 
     winner: Optional[dict] = None
     source = ""
-    # ponytail: shutdown(wait=False) — `with ThreadPoolExecutor` waits for slow yt-dlp (~5s)
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-extract")
     try:
         futures = {
             pool.submit(_inn): "innertube_pass",
-            pool.submit(_ydl): "ytdlp_bare",
+            pool.submit(_ydl): "ytdlp_cookies",
         }
         deadline = time.monotonic() + _YOUTUBE_EXTRACT_PARALLEL_SEC
         pending = set(futures.keys())
@@ -392,7 +446,7 @@ def _youtube_extract_parallel(
                 try:
                     info = fut.result()
                 except Exception as exc:
-                    logger.debug("parallel extract task failed %s: %s", vid, exc)
+                    logger.debug("parallel extract %s failed %s: %s", vid, futures[fut], exc)
                     continue
                 if info and _youtube_info_playable(info):
                     winner = info
@@ -401,7 +455,8 @@ def _youtube_extract_parallel(
             if winner:
                 break
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        with contextlib.suppress(Exception):
+            pool.shutdown(wait=False, cancel_futures=True)
     if winner:
         log_extract_ok(vid, source, winner, yt_session)
     return winner
@@ -413,55 +468,88 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
 
     yt_session = opts.get("_youtube_session")
     vid = extract_video_id(url) or url[:32]
-    has_auth = (
-        _youtube_cookie_path(opts)
-        or opts.get("cookiesfrombrowser")
-        or _youtube_manual_auth_configured()
-    )
-    if has_auth:
-        if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
-            info = _extract_hls_info_quiet(url, opts)
-            if info:
-                log_extract_ok(vid, "ytdlp_cookies", info, yt_session)
-                return info
-        info = _try_innertube_info_retry(url, session=yt_session)
+    has_auth = _youtube_has_user_auth(opts)
+    bare_opts = _bare_ytdlp_opts(opts)
+
+    # Anonymous: race InnerTube vs yt-dlp+cookies (~4.5s), then bare last resort.
+    if not has_auth:
+        info = _youtube_extract_parallel_fast(url, opts, yt_session, vid)
         if info:
-            log_extract_ok(vid, "innertube_pass", info, yt_session)
             return info
-        info = _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
-        if info:
+        if opts.get("_preview_fast"):
+            return None
+        info = _extract_hls_info_quiet(url, bare_opts)
+        if info and _youtube_info_playable(info):
             log_extract_ok(vid, "ytdlp_bare", info, yt_session)
         return info
 
-    info = _youtube_extract_parallel(url, opts, yt_session, vid)
-    if info:
-        return info
+    if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
+        info = _extract_hls_info_quiet(url, opts)
+        if info:
+            log_extract_ok(vid, "ytdlp_cookies", info, yt_session)
+            return info
     info = _try_innertube_info_retry(url, session=yt_session)
     if info:
         log_extract_ok(vid, "innertube_pass", info, yt_session)
         return info
-    info = _extract_hls_info_quiet(url, {k: v for k, v in opts.items() if k != "cookiefile"})
-    if info:
+    info = _extract_hls_info_quiet(url, bare_opts)
+    if info and _youtube_info_playable(info):
         log_extract_ok(vid, "ytdlp_bare", info, yt_session)
     return info
 
 
 def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> dict:
     working = dict(opts)
+    has_auth = _youtube_has_user_auth(working)
+    max_attempts = attempts if has_auth else 2
     last_err: Optional[BaseException] = None
-    for i in range(attempts):
+    refreshed = False
+    for i in range(max_attempts):
         try:
             info = _youtube_extract_pass(url, working)
             if info and _youtube_info_playable(info):
                 return info
         except Exception as exc:
             last_err = exc
-        if i + 1 < attempts:
-            if i % 2 == 1:
+        if i + 1 < max_attempts:
+            if not has_auth and not refreshed:
+                from services.youtube_session import invalidate_anonymous_session
+
+                invalidate_anonymous_session()
                 working = _merge_fresh_youtube_session(working, url)
-            time.sleep(0.12 * (i + 1))
+                refreshed = True
+            else:
+                time.sleep(0.2 * (i + 1))
     if last_err is not None:
         raise last_err
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_diag import log_extract_fail
+
+    log_extract_fail(
+        extract_video_id(url) or "?",
+        "all_fallbacks_exhausted",
+        working.get("_youtube_session"),
+        final=True,
+    )
+    raise RuntimeError("YouTube preview unavailable for this video")
+
+
+def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
+    """Preview SLA: ~6s wall clock — parallel race + one refresh, no bare yt-dlp crawl."""
+    deadline = time.monotonic() + _PREVIEW_EXTRACT_MAX_WALL_SEC
+    info = _youtube_extract_pass(url, opts)
+    if info and _youtube_info_playable(info):
+        return info
+    if time.monotonic() >= deadline:
+        raise RuntimeError("YouTube preview unavailable for this video")
+    if not _youtube_has_user_auth(opts):
+        from services.youtube_session import invalidate_anonymous_session
+
+        invalidate_anonymous_session()
+        working = _merge_fresh_youtube_session(dict(opts), url)
+        info = _youtube_extract_pass(url, working)
+        if info and _youtube_info_playable(info):
+            return info
     raise RuntimeError("YouTube preview unavailable for this video")
 
 
@@ -498,7 +586,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
     if not leader:
         event, box = inflight
-        if not event.wait(timeout=_EXTRACT_WAIT_SEC):
+        wait_sec = _PREVIEW_EXTRACT_WAIT_SEC if opts.get("_preview_fast") else _EXTRACT_WAIT_SEC
+        if not event.wait(timeout=wait_sec):
             raise TimeoutError("YouTube metadata extract timed out")
         with _EXTRACT_CACHE_LOCK:
             hit = _EXTRACT_INFO_CACHE.get(key)
@@ -516,7 +605,10 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     try:
         info = None
         if _youtube_url_from_opts(url, opts):
-            info = _youtube_extract_with_retries(url, opts)
+            if opts.get("_preview_fast"):
+                info = _youtube_extract_preview_with_retries(url, opts)
+            else:
+                info = _youtube_extract_with_retries(url, opts)
         else:
             info = _extract_hls_info(url, opts)
         if info is None:
@@ -564,21 +656,30 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
 
 assert cached_extract_info.__name__ == "cached_extract_info"
+assert _youtube_has_user_auth({"_youtube_session": type("S", (), {"anonymous": True})(), "cookiefile": "/x"}) is False
+assert isinstance(_YTDLP_EXTRACT_LOCK, type(threading.Lock()))
 assert _youtube_info_has_hls({"formats": [{"url": "https://x/a.m3u8", "protocol": "m3u8_native"}]})
 assert _youtube_info_use_clip_path({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
 assert _youtube_info_playable({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
 
 
 def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None) -> bool:
-    """Populate shared extract cache (InnerTube first). Cheap — safe to call from hover/prefetch."""
+    """Prefetch extract cache on hover — InnerTube only (fast, no yt-dlp spawn)."""
     from services.youtube_innertube import extract_video_id
 
     if not extract_video_id(url):
         return False
     try:
         opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
-        cached_extract_info(url, opts)
-        return True
+        session = opts.get("_youtube_session")
+        info = _try_innertube_info_retry(
+            url, session=session, allow_session_refresh=False,
+        )
+        if info and _youtube_info_playable(info):
+            key = _extract_cache_key(url, opts)
+            _cache_extract_result(key, info)
+            return True
+        return False
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
         from services.youtube_innertube import extract_video_id
@@ -632,7 +733,7 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         quiet = not logger.isEnabledFor(logging.DEBUG)
         ctx = _silence_stderr() if quiet else contextlib.nullcontext()
         with ctx:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with guarded_youtube_dl(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
     finally:
         if not logger.isEnabledFor(logging.DEBUG):

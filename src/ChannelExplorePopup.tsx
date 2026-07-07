@@ -25,6 +25,7 @@ import {
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
   warmYoutubePreview,
+  waitForPreviewMuxReady,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
@@ -45,6 +46,7 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
+import type { PreviewSessionResponse } from './types';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
 
@@ -222,25 +224,28 @@ export default function ChannelExplorePopup({
           ).catch(() => null)
           : Promise.resolve(null);
         if (platform === 'youtube') warmYoutubePreview(vod.url);
-        const sessionPromise = apiPost<{
-          session_id: string;
-          master_url: string;
-          playback_url?: string;
-          kind?: string;
-          variant_heights?: number[];
-          quality_labels?: string[];
-          active_height?: number;
-          extract_source?: string;
-        }>('/api/preview/session', {
+        const previewCropEnd = platform === 'youtube'
+          ? Math.min(vod.durationSec, 30)
+          : vod.durationSec;
+        const sessionPromise = apiPost<PreviewSessionResponse>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
-          crop_end: vod.durationSec,
+          crop_end: previewCropEnd,
           prefer_height: preferHeight,
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
         if (cancelled) {
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;
+        }
+        const resolved = resolvePreviewPlayback(vod.url, res);
+        if (platform === 'youtube' && resolved.kind === 'progressive' && res.mux_ready === false) {
+          const muxReady = await waitForPreviewMuxReady(res.session_id, apiGet);
+          if (cancelled) {
+            try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
+            return;
+          }
+          if (!muxReady) throw new Error('Preview preparation timed out');
         }
         const mergedQualityLabels = clipInfo?.qualities?.length
           ? clipInfo.qualities
@@ -256,7 +261,6 @@ export default function ChannelExplorePopup({
         if (extractSourceRef.current) {
           console.info('[VOD.RIP preview] extract_source=', extractSourceRef.current);
         }
-        const resolved = resolvePreviewPlayback(vod.url, res);
         setPlayback({
           ...resolved,
           variantHeights: res.variant_heights ?? [],
@@ -566,17 +570,6 @@ export default function ChannelExplorePopup({
         setError('Preview interrupted — try again');
         setLoading(false);
       };
-      const cleanupRecovery = bindProgressivePreviewRecovery({
-        video,
-        playbackUrl,
-        sessionId: sessionIdRef.current,
-        youtube: platform === 'youtube',
-        extractSource: extractSourceRef.current,
-        getResumeSec: () => video.currentTime,
-        apiPost,
-        onRefreshing: () => setLoading(true),
-        onFatal: onVideoError,
-      });
       appliedHeightRef.current = activeH;
       const onLoadedMeta = () => {
         if (Number.isFinite(video.duration) && video.duration > 0) {
@@ -589,6 +582,17 @@ export default function ChannelExplorePopup({
         }
       };
       attachProgressivePreview(video, playbackUrl);
+      const cleanupRecovery = bindProgressivePreviewRecovery({
+        video,
+        playbackUrl,
+        getSessionId: () => sessionIdRef.current,
+        youtube: platform === 'youtube',
+        extractSource: extractSourceRef.current,
+        getResumeSec: () => video.currentTime,
+        apiPost,
+        onRefreshing: () => setLoading(true),
+        onFatal: onVideoError,
+      });
       video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
       video.addEventListener('canplay', onCanPlay, { once: true });
       cleanup = () => {
@@ -912,8 +916,11 @@ export default function ChannelExplorePopup({
             onPause={() => setPlaying(false)}
           />
           {loading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20">
               <Loader2 size={28} className="animate-spin text-zinc-300" />
+              {!playback && (
+                <span className="text-zinc-300 text-[10px] font-mono">Preparing preview...</span>
+              )}
             </div>
           )}
           {error && (

@@ -25,7 +25,7 @@ _YT_UA = YT_USER_AGENT
 _CONNECT_TIMEOUT_SEC = 0.9
 _READ_TIMEOUT_SEC = 6.0
 _ANON_LOCK = threading.Lock()
-_ANON_TTL_SEC = 25 * 60
+_ANON_TTL_SEC = 2 * 3600
 _ANON_BOOT_EVENT: Optional[threading.Event] = None
 _ANON_CACHE: dict[str, Any] = {
     "ts": 0.0,
@@ -66,32 +66,48 @@ def _attach_anon_http(http: requests.Session) -> None:
         _ANON_CACHE["http_session"] = http
 
 
-def _cookie_header_from_jar(jar: requests.cookies.RequestsCookieJar) -> str:
+def _cookie_header_from_jar(jar) -> str:
+    try:
+        as_dict = dict(jar)
+        if as_dict:
+            return "; ".join(f"{k}={v}" for k, v in as_dict.items())
+    except (TypeError, ValueError):
+        pass
     parts: list[str] = []
     for cookie in jar:
+        if isinstance(cookie, str):
+            val = jar.get(cookie)
+            if val:
+                parts.append(f"{cookie}={val}")
+            continue
         dom = (cookie.domain or "").lower()
         if "youtube" in dom or dom.endswith("google.com"):
             parts.append(f"{cookie.name}={cookie.value}")
     return "; ".join(parts)
 
 
-def _write_netscape_cookiefile(jar: requests.cookies.RequestsCookieJar) -> Optional[str]:
+def _write_netscape_cookiefile(jar) -> Optional[str]:
     if not jar:
         return None
     fd, path = tempfile.mkstemp(prefix="yt_anon_", suffix=".txt")
     os.close(fd)
     try:
         lines = ["# Netscape HTTP Cookie File\n", "# auto-generated anonymous YouTube session\n"]
-        for c in jar:
-            domain = c.domain or ".youtube.com"
+        try:
+            cookie_items = [
+                (name, val, ".youtube.com", "/")
+                for name, val in dict(jar).items()
+            ]
+        except (TypeError, ValueError):
+            cookie_items = []
+            for c in jar:
+                if isinstance(c, str):
+                    continue
+                cookie_items.append((c.name, c.value, c.domain or ".youtube.com", c.path or "/"))
+        for name, value, domain, cookie_path in cookie_items:
             if not domain.startswith("."):
                 domain = f".{domain}"
-            secure = "TRUE" if c.secure else "FALSE"
-            expires = str(int(c.expires)) if c.expires else "0"
-            path = c.path or "/"
-            lines.append(
-                f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{c.name}\t{c.value}\n"
-            )
+            lines.append(f"{domain}\tTRUE\t{cookie_path}\tTRUE\t0\t{name}\t{value}\n")
         Path(path).write_text("".join(lines), encoding="utf-8")
         return path
     except OSError:
@@ -125,12 +141,28 @@ def invalidate_anonymous_session() -> None:
             pass
 
 
+def _new_youtube_http_session():
+    """Chrome TLS fingerprint when curl_cffi is available — plain requests trips bot gates."""
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        return cffi_requests.Session(impersonate="chrome")
+    except ImportError:
+        logger.warning(
+            "curl_cffi unavailable — YouTube HTTP using plain requests (higher bot-gate risk)",
+        )
+        http = requests.Session()
+        http.headers.update(youtube_http_headers())
+        return http
+
+
 def _bootstrap_network(
     video_id: Optional[str],
     timeout: float,
-) -> tuple[Optional[str], Optional[str], Optional[str], requests.Session]:
-    http = requests.Session()
-    http.headers.update(youtube_http_headers())
+) -> tuple[Optional[str], Optional[str], Optional[str], Any]:
+    http = _new_youtube_http_session()
+    if not hasattr(http, "impersonate"):
+        http.headers.update(youtube_http_headers())
     req_timeout = (_CONNECT_TIMEOUT_SEC, timeout)
     http.get("https://www.youtube.com/", timeout=req_timeout)
     if video_id:
@@ -199,7 +231,7 @@ def bootstrap_anonymous_session(
     visitor_data: Optional[str] = None
     cookie_header: Optional[str] = None
     cookie_file: Optional[str] = None
-    http_session: Optional[requests.Session] = None
+    http_session: Optional[Any] = None
     try:
         for attempt in range(3):
             try:
@@ -332,7 +364,7 @@ def youtube_session_from_values(
 
     cookie_header: Optional[str] = None
     cookie_file: Optional[str] = None
-    http_session: Optional[requests.Session] = None
+    http_session: Optional[Any] = None
     anonymous = False
     manual_cookie = (cookies_file or "").strip()
     if manual_cookie and Path(manual_cookie).is_file():
@@ -396,9 +428,9 @@ def youtube_session_from_settings(
 
 def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = True) -> dict[str, list[str]]:
     """Map session into yt-dlp youtube extractor_args."""
-    # ponytail: yt-dlp must never spawn WPC/Chrome — fetch_pot is always never
+    # ponytail: fetch_pot off — getpot_wpc spawns headless Chrome; use manual po_token in Settings
     args: dict[str, list[str]] = {
-        "player_client": ["tv", "web_safari", "mweb", "ios"],
+        "player_client": ["ios", "android", "mweb", "web_safari"],
         "fetch_pot": ["never"],
     }
     if session.visitor_data:
@@ -410,7 +442,7 @@ def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = T
             f"web.gvs+{token}",
             f"mweb.gvs+{token}",
         ]
-        args["player_client"] = ["tv", "mweb", "web_safari", "ios"]
+        args["player_client"] = ["ios", "android", "mweb", "web_safari"]
     return args
 
 
@@ -459,5 +491,6 @@ def apply_ytdlp_cookie_opts(
 
 
 assert youtube_session_from_values(visitor_data="abc", auto_auth=False).visitor_data == "abc"
-_anon_vd, _anon_ch, _, _anon_http = bootstrap_anonymous_session()
+_anon_vd, _anon_ch, _anon_cf, _anon_http = bootstrap_anonymous_session(force=True)
 assert _anon_ch is None or "VISITOR" in _anon_ch or "YSC" in _anon_ch or len(_anon_ch) > 0
+assert _anon_cf is None or Path(_anon_cf).is_file(), "anonymous cookie file must be written for yt-dlp"

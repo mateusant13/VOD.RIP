@@ -1,6 +1,7 @@
 """Fast YouTube preview/info via InnerTube multi-client fallback (~400ms vs ~3s yt-dlp)."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,27 +91,6 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
             "User-Agent": (
                 "com.google.android.youtube/19.44.38"
                 " (Linux; U; Android 11) gzip"
-            ),
-        },
-    ),
-    _ClientProfile(
-        "ANDROID_VR",
-        {
-            "clientName": "ANDROID_VR",
-            "clientVersion": "1.60.19",
-            "deviceMake": "Oculus",
-            "deviceModel": "Quest 3",
-            "osName": "Android",
-            "osVersion": "12L",
-            "androidSdkVersion": 32,
-            "hl": "en",
-            "gl": "US",
-        },
-        {
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "com.google.android.apps.youtube.vr.oculus/1.60.19"
-                " (Linux; U; Android 12L) gzip"
             ),
         },
     ),
@@ -736,10 +716,22 @@ def _race_profiles(
                     winner = result
                     break
         except TimeoutError:
-            pass
+            logger.debug("InnerTube race timeout %s after %.1fs", video_id, wall_timeout)
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        with contextlib.suppress(Exception):
+            pool.shutdown(wait=False, cancel_futures=True)
     return winner
+
+
+def _is_bot_gate(data: Optional[dict]) -> bool:
+    """YouTube LOGIN_REQUIRED bot check — stop hammering all clients."""
+    if not data:
+        return False
+    play = data.get("playabilityStatus") or {}
+    if play.get("status") != "LOGIN_REQUIRED":
+        return False
+    reason = (play.get("reason") or "").lower()
+    return "bot" in reason or "confirm you're not" in reason or "confirm you" in reason
 
 
 def _collect_merged_innertube_info(
@@ -749,12 +741,13 @@ def _collect_merged_innertube_info(
 ) -> Optional[dict[str, Any]]:
     """Merge formats from all InnerTube clients — ANDROID_VR muxed + IOS heights."""
     http = _http_for(session)
-    profile_order = ("TVHTML5", "MWEB", "ANDROID", "ANDROID_VR", "IOS", "WEB")
+    profile_order = ("IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
     all_formats: list[dict[str, Any]] = []
     audio_fmt: Optional[dict[str, Any]] = None
     hls_url: Optional[str] = None
     meta_data: Optional[dict] = None
 
+    bot_hits = 0
     for name in profile_order:
         profile = _PROFILE_BY_NAME.get(name)
         if not profile:
@@ -764,6 +757,10 @@ def _collect_merged_innertube_info(
             video_id, profile, timeout, session=session, http=http,
         )
         if kind != "ok" or not data:
+            if _is_bot_gate(data):
+                bot_hits += 1
+                if bot_hits >= 2:
+                    break
             continue
         if meta_data is None:
             meta_data = data
@@ -782,16 +779,7 @@ def _collect_merged_innertube_info(
     merged = _dedupe_youtube_formats(all_formats)
     video_heights = [f for f in merged if int(f.get("height") or 0) > 0]
 
-    # Multiple DASH heights — synthetic HLS preview; skip TV/MWEB HLS (needs PO token).
-    if len(video_heights) >= 2:
-        info = _info_from_player_data(
-            meta_data, video_id, None, None, adaptive_formats=merged,
-        )
-        if info:
-            if audio_fmt:
-                info["_preview_audio_format"] = audio_fmt
-            return info
-
+    # Prefer HLS when any client returned a manifest — avoids DASH mux 403s in preview.
     if hls_url:
         headers = dict(_STREAM_HEADERS)
         if session and session.cookie_header:
@@ -821,6 +809,16 @@ def _collect_merged_innertube_info(
                 info["_preview_audio_format"] = audio_fmt
             return info
 
+    # Multiple DASH heights — progressive proxy + mux (no HLS manifest worked).
+    if len(video_heights) >= 2:
+        info = _info_from_player_data(
+            meta_data, video_id, None, None, adaptive_formats=merged,
+        )
+        if info:
+            if audio_fmt:
+                info["_preview_audio_format"] = audio_fmt
+            return info
+
     if not merged:
         return None
     info = _info_from_player_data(meta_data, video_id, None, None, adaptive_formats=merged)
@@ -833,6 +831,8 @@ def innertube_extract_info(
     url: str,
     timeout: Optional[float] = None,
     session: Optional["YouTubeSession"] = None,
+    *,
+    allow_session_refresh: bool = True,
 ) -> Optional[dict[str, Any]]:
     """Resolve YouTube metadata + streams via merged InnerTube clients."""
     video_id = extract_video_id(url)
@@ -844,18 +844,44 @@ def innertube_extract_info(
         return None
 
     read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
+    profiles = _profiles_for_session(session)
+    info = _race_profiles(profiles, video_id, session, read_timeout, _RACE_TIMEOUT_SEC)
+    if info:
+        from services.youtube_diag import log_extract_ok
+        log_extract_ok(video_id, "innertube_race", info, session)
+        return info
+
     info = _collect_merged_innertube_info(video_id, session, read_timeout)
     if info:
         from services.youtube_diag import log_extract_ok
         log_extract_ok(video_id, "innertube", info, session)
         return info
 
+    # ponytail: outer cached_extract_info retry already re-bootstraps — avoid double hammer
+    if allow_session_refresh and session and getattr(session, "anonymous", True):
+        from services.youtube_session import invalidate_anonymous_session, youtube_session_from_settings
+
+        invalidate_anonymous_session()
+        fresh = youtube_session_from_settings(video_id=video_id)
+        info = _race_profiles(
+            _profiles_for_session(fresh), video_id, fresh, read_timeout, _RACE_TIMEOUT_SEC,
+        )
+        if info:
+            from services.youtube_diag import log_extract_ok
+            log_extract_ok(video_id, "innertube_race_fresh", info, fresh)
+            return info
+        info = _collect_merged_innertube_info(video_id, fresh, read_timeout)
+        if info:
+            from services.youtube_diag import log_extract_ok
+            log_extract_ok(video_id, "innertube_fresh", info, fresh)
+            return info
+
     try:
         from deps import settings_mgr
         auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
     except Exception:
         auto_auth = True
-    if auto_auth and not getattr(session, "anonymous", True):
+    if auto_auth and session and not getattr(session, "anonymous", True):
         from services.youtube_auth import strengthen_youtube_session
 
         strong = strengthen_youtube_session(

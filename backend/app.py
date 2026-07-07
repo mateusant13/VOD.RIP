@@ -5,6 +5,9 @@ Assembles the app, mounts static files, includes all routers, and provides
 the dev ``__main__`` entry point.
 """
 
+from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp import
+from services.ytdlp_guard import assert_ytdlp_safe
+
 import logging
 import os
 import threading
@@ -35,6 +38,16 @@ except ImportError:
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
+    # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
+    try:
+        s = settings_mgr.get()
+        if getattr(s, "youtube_wpc_pot", False):
+            s.youtube_wpc_pot = False
+            settings_mgr.save(s)
+            logger.warning("youtube_wpc_pot forced off at startup (headless Chrome disabled)")
+    except Exception:
+        logger.debug("settings wpc clamp skipped", exc_info=True)
+
     def _warm_youtube() -> None:
         try:
             from services.youtube_session import warm_youtube_session
@@ -67,6 +80,8 @@ async def _app_lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
+
+assert_ytdlp_safe()
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"

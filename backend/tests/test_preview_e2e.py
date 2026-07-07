@@ -53,7 +53,7 @@ class TestYouTubePreviewResolve:
             "services.preview_service._extract_youtube_preview_info",
             return_value=prog_only,
         ):
-            entry, _hdrs, platform, _variants, kind = resolve_stream_info(url)
+            entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
         assert platform == "YouTube"
         assert kind == "progressive"
         assert "googlevideo.com" in entry
@@ -76,7 +76,7 @@ class TestYouTubePreviewResolve:
             "services.preview_service._extract_youtube_preview_info",
             return_value=hls_info,
         ):
-            entry, _hdrs, platform, _variants, kind = resolve_stream_info(url)
+            entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
         assert platform == "YouTube"
         assert kind == "hls"
         assert ".m3u8" in entry

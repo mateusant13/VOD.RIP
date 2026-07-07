@@ -36,6 +36,16 @@ def normalize_err(msg: str, limit: int = 200) -> str:
     return msg if len(msg) <= limit else msg[: limit - 3] + "..."
 
 
+def user_visible_platform_error(msg: str) -> str:
+    """Drop cookie/auth noise — never show in channel partial-results UI."""
+    if not msg:
+        return ""
+    low = msg.lower()
+    if any(x in low for x in ("cookie", "dpapi", "decrypt", "po_token", "sign in to")):
+        return ""
+    return normalize_err(msg)
+
+
 def format_platform_error(exc: BaseException) -> str:
     """Human-readable per-platform error (Playwright may raise empty NotImplementedError)."""
     msg = str(exc).strip()
@@ -48,6 +58,10 @@ def format_platform_error(exc: BaseException) -> str:
             "Restart the backend; if using dev mode, ensure Kick runs in a worker thread."
         )
     return name
+
+
+assert user_visible_platform_error("failed to load cookies") == ""
+assert user_visible_platform_error("timeout") == "timeout"
 
 
 def explain_oserror(e: OSError) -> str:

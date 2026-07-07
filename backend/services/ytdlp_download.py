@@ -16,6 +16,8 @@ import subprocess
 import time
 
 import requests
+from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp import
+from services.ytdlp_guard import guarded_youtube_dl
 import yt_dlp
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
@@ -169,7 +171,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             "cachedir": str(cache_dir),
             **_ytdlp_engine_opts(),
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with guarded_youtube_dl(ydl_opts) as ydl:
             return ydl.extract_info(full_url, download=False)
 
     loop = asyncio.get_running_loop()
@@ -809,13 +811,13 @@ def _ydl_download(
     quiet_opts.setdefault("no_warnings", True)
     quiet_opts["logger"] = _YtdlpQuietLogger()
     with _silence_stderr():
-        ydl = yt_dlp.YoutubeDL(quiet_opts)
-        if register_abort:
-            register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
-        try:
-            ydl.download([url])
-        finally:
-            _check_pause_cancel(cancel_event, pause_event)
+        with guarded_youtube_dl(quiet_opts) as ydl:
+            if register_abort:
+                register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
+            try:
+                ydl.download([url])
+            finally:
+                _check_pause_cancel(cancel_event, pause_event)
 
 def download_video_sync(
     url: str,
@@ -888,7 +890,7 @@ def download_video_sync(
                 expected_duration = info.get("duration")
         else:
             from services.ytdlp_ffmpeg import _ytdlp_engine_opts
-            with yt_dlp.YoutubeDL({
+            with guarded_youtube_dl({
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,

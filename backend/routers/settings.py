@@ -95,7 +95,12 @@ async def update_settings(update: SettingsUpdate):
     if update.youtube_pot_headless is not None:
         current.youtube_pot_headless = update.youtube_pot_headless
     if update.youtube_wpc_pot is not None:
-        current.youtube_wpc_pot = bool(update.youtube_wpc_pot)
+        if update.youtube_wpc_pot:
+            raise HTTPException(
+                status_code=400,
+                detail="WPC PO tokens are disabled — they spawn headless Chrome",
+            )
+        current.youtube_wpc_pot = False
     if update.quality is not None:
         current.quality = update.quality
     if update.panel_layout is not None:

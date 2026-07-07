@@ -23,6 +23,10 @@ async def test_youtube_preview_session_and_stream(url: str):
             "/api/preview/session",
             json={"url": url, "crop_start": 0, "crop_end": 60, "prefer_height": 720},
         )
+        if create.status_code == 500:
+            detail = (create.json().get("detail") or "").lower()
+            if "unavailable" in detail or "try again" in detail:
+                pytest.skip(f"YouTube extract blocked: {create.json().get('detail')}")
         assert create.status_code == 200, create.text
         body = create.json()
         sid = body["session_id"]

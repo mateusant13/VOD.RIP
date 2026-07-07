@@ -7,6 +7,10 @@ import sys
 import os
 import traceback
 
+# ponytail: YTDLP_NO_PLUGINS via ytdlp_env.py — blocks getpot_wpc Chrome spawning
+from services import ytdlp_env  # noqa: F401
+from services.ytdlp_guard import assert_ytdlp_safe
+
 
 def _install_fatal_hooks() -> None:
     faulthandler.enable(all_threads=True)
@@ -60,6 +64,7 @@ def main():
         release_api_port(port, skip_pid=os.getpid())
 
     # Install deps if needed
+    assert_ytdlp_safe()
     try:
         import fastapi  # noqa: F401
         import yt_dlp  # noqa: F401

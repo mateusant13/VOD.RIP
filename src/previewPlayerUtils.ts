@@ -101,6 +101,32 @@ export function resolvePreviewPlayback(
   return { url, kind: progressive ? 'progressive' : 'hls' };
 }
 
+export type PreviewMuxPollSignal = { gen: number; current: number };
+
+/** Poll async YouTube DASH mux until stream.mp4 is safe to attach. */
+export async function waitForPreviewMuxReady(
+  sessionId: string,
+  apiGet: <T>(path: string) => Promise<T>,
+  signal?: PreviewMuxPollSignal,
+  maxMs = 45000,
+): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  const pollMs = 400;
+  while (Date.now() < deadline) {
+    if (signal && signal.gen !== signal.current) return false;
+    try {
+      const st = await apiGet<{ mux_ready?: boolean }>(
+        `/api/preview/session/${sessionId}/status`,
+      );
+      if (st.mux_ready) return true;
+    } catch {
+      /* keep polling until timeout */
+    }
+    await new Promise<void>((resolve) => { window.setTimeout(resolve, pollMs); });
+  }
+  return false;
+}
+
 /** Append prefer_height (and cache-bust) so the proxy switches tier on the same request. */
 export function previewUrlWithPreferHeight(baseUrl: string, height: number): string {
   try {
@@ -197,7 +223,8 @@ export function resolvePreviewDurationSec(
 export type ProgressivePreviewRecoveryOpts = {
   video: HTMLVideoElement;
   playbackUrl: string;
-  sessionId: string | null;
+  /** ponytail: ref getter — React state is stale when the preview effect first runs. */
+  getSessionId: () => string | null;
   youtube: boolean;
   extractSource?: string;
   getResumeSec: () => number;
@@ -207,6 +234,15 @@ export type ProgressivePreviewRecoveryOpts = {
   maxRetries?: number;
 };
 
+/** Spurious errors while swapping <source> or calling video.load() — not user-visible failures. */
+export function isIgnorableProgressivePreviewError(video: HTMLVideoElement): boolean {
+  const code = video.error?.code;
+  if (code === MediaError.MEDIA_ERR_ABORTED) return true;
+  if (!video.currentSrc && video.readyState === HTMLMediaElement.HAVE_NOTHING) return true;
+  if (video.networkState === HTMLMediaElement.NETWORK_EMPTY) return true;
+  return false;
+}
+
 /** Retry progressive preview on CDN 416/expiry — logs extract_source for debugging. */
 export function bindProgressivePreviewRecovery(
   opts: ProgressivePreviewRecoveryOpts,
@@ -215,18 +251,21 @@ export function bindProgressivePreviewRecovery(
   const max = opts.maxRetries ?? 4;
 
   const onError = () => {
+    if (isIgnorableProgressivePreviewError(opts.video)) return;
     const code = opts.video.error?.code;
+    const sessionId = opts.getSessionId();
     console.warn('[VOD.RIP preview] progressive error', {
       code,
       extractSource: opts.extractSource ?? 'unknown',
       retries,
+      sessionId,
     });
-    if (opts.youtube && opts.sessionId && retries < max) {
+    if (opts.youtube && sessionId && retries < max) {
       retries += 1;
       opts.onRefreshing?.();
       const resume = opts.getResumeSec();
       void opts.apiPost<{ extract_source?: string }>(
-        `/api/preview/session/${opts.sessionId}/refresh`,
+        `/api/preview/session/${sessionId}/refresh`,
         {},
       ).then((res) => {
         const src = res?.extract_source ?? opts.extractSource;
@@ -692,6 +731,9 @@ export function applyHlsQualityLevel(
 }
 
 void (() => {
+  const stub = document.createElement('video');
+  Object.defineProperty(stub, 'error', { value: { code: MediaError.MEDIA_ERR_ABORTED } });
+  console.assert(isIgnorableProgressivePreviewError(stub), 'abort during load is ignorable');
   console.assert(
     warmYoutubePreviewBatch(['https://www.youtube.com/watch?v=dQw4w9WgXcQ'], 1) === undefined,
     'batch warm is fire-and-forget',
@@ -705,4 +747,5 @@ void (() => {
     initialPreviewPreferHeight(false, cap) === cap,
     'Kick/Twitch preview should cap to player',
   );
+  console.assert(typeof waitForPreviewMuxReady === 'function', 'mux poll helper exported');
 })();

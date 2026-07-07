@@ -9,16 +9,19 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewWarmRequest
+from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewWarmRequest
 
 from deps import INFO_EXECUTOR
 from services.preview_service import (
+    PreviewMuxPending,
     StalePreviewUrls,
     create_session,
     delete_session,
     open_progressive_proxy,
     open_segment_proxy,
+    preview_mux_ready,
     preview_session_kind,
+    preview_session_mux_status,
     proxy_master,
     proxy_playlist,
     proxy_segment,
@@ -28,6 +31,7 @@ from services.preview_service import (
     session_quality_labels,
     session_variant_heights,
     set_session_prefer_height,
+    get_session,
     _is_playlist_url,
     _is_rangeable_cdn_media,
 )
@@ -67,6 +71,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         quality_labels=session_quality_labels(session),
         active_height=session_active_height(session),
         extract_source=_session_extract_source(session),
+        mux_ready=preview_mux_ready(session),
     )
 
 
@@ -109,6 +114,12 @@ async def preview_warm(req: PreviewWarmRequest):
 async def preview_create_session(req: PreviewSessionCreateRequest):
     if req.crop_end <= req.crop_start:
         raise HTTPException(status_code=400, detail="End must be after start")
+    from services.ytdlp_download import detect_platform
+
+    if detect_platform((req.url or "").strip()) == "YouTube":
+        max_preview = req.crop_start + 30.0
+        if req.crop_end > max_preview:
+            req.crop_end = max_preview
     from deps import settings_mgr
     opts = settings_mgr.get()
     preview_url = (req.url or "").strip()
@@ -143,6 +154,19 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     # ponytail: best-effort — network errors only
         logger.exception("preview session failed url=%s", preview_url[:100])
         raise HTTPException(status_code=500, detail=_preview_user_message(e))
+
+
+@router.get("/api/preview/session/{session_id}/status")
+async def preview_session_status(session_id: str):
+    """Poll YouTube DASH mux readiness (background job started at session create)."""
+    try:
+        status = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR,
+            lambda: preview_session_mux_status(session_id),
+        )
+        return PreviewSessionStatusResponse(**status)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/api/preview/session/{session_id}/refresh")
@@ -206,6 +230,8 @@ async def _preview_master_response(
             )
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except PreviewMuxPending as e:
+            raise HTTPException(status_code=503, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         response_headers = dict(extra_headers or {})

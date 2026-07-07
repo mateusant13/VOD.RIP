@@ -1,8 +1,11 @@
-"""Anonymous parallel YouTube extract policy."""
-import time
-from unittest.mock import patch
+"""Anonymous YouTube extract fallback order."""
+from unittest.mock import MagicMock, patch
 
-from services.ytdlp_hls import _youtube_extract_parallel, _youtube_manual_auth_configured
+from services.ytdlp_hls import (
+    _youtube_extract_pass,
+    _youtube_has_user_auth,
+    _youtube_manual_auth_configured,
+)
 
 
 def test_manual_auth_false_by_default():
@@ -14,21 +17,31 @@ def test_manual_auth_false_by_default():
         assert _youtube_manual_auth_configured() is False
 
 
-def test_parallel_picks_first_playable():
+def test_anonymous_cookie_jar_is_not_user_auth():
+    session = MagicMock(anonymous=True)
+    opts = {"cookiefile": "/tmp/anon.txt", "_youtube_session": session}
+    with patch("services.ytdlp_hls._youtube_cookie_path", return_value=True):
+        with patch("services.ytdlp_hls._youtube_manual_auth_configured", return_value=False):
+            assert _youtube_has_user_auth(opts) is False
+
+
+def test_anonymous_parallel_races_innertube_and_ytdlp():
     good = {"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]}
+    calls: list[str] = []
 
-    def fast_inn(*_a, **_k):
+    def ydl(url, opts):
+        calls.append("ydl")
+        return None
+
+    def inn(*_a, **_k):
+        calls.append("inn")
         return good
 
-    def slow_ydl(*_a, **_k):
-        import time
-        time.sleep(2)
-        return good
-
-    with patch("services.ytdlp_hls._try_innertube_info_retry", side_effect=fast_inn):
-        with patch("services.ytdlp_hls._extract_hls_info_quiet", side_effect=slow_ydl):
-            t0 = time.monotonic()
-            info = _youtube_extract_parallel("https://www.youtube.com/watch?v=abc123def45", {}, None, "abc123def45")
-            elapsed = time.monotonic() - t0
+    session = MagicMock(anonymous=True)
+    opts = {"_youtube_session": session}
+    with patch("services.ytdlp_hls._youtube_has_user_auth", return_value=False):
+        with patch("services.ytdlp_hls._extract_hls_info_quiet", side_effect=ydl):
+            with patch("services.ytdlp_hls._try_innertube_info_retry", side_effect=inn):
+                info = _youtube_extract_pass("https://www.youtube.com/watch?v=abc123def45", opts)
     assert info is good
-    assert elapsed < 1.0, f"parallel should not wait for slow yt-dlp, took {elapsed:.2f}s"
+    assert "inn" in calls

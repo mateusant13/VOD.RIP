@@ -34,6 +34,7 @@ from utils import (
     format_platform_error,
     looks_like_clip_entry,
     normalize_err,
+    user_visible_platform_error,
     parse_video_date,
     parse_wanted_platforms,
     resolve_channel_slug,
@@ -160,7 +161,9 @@ async def _gather_channel_clips(
     all_clips = filter_clip_entries(all_clips)
     all_clips.sort(key=lambda v: -(v.get("views") or 0))
     for k, v in list(per_platform_errors.items()):
-        per_platform_errors[k] = normalize_err(v)
+        per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
+        if not per_platform_errors[k]:
+            del per_platform_errors[k]
     return all_clips, per_platform_errors
 
 
@@ -252,7 +255,9 @@ async def channel_videos(
             elif "YouTube" in wanted:
                 per_platform_errors["YouTube"] = "YouTube channel is required"
             for k, v in list(per_platform_errors.items()):
-                per_platform_errors[k] = normalize_err(v)
+                per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
+                if not per_platform_errors[k]:
+                    del per_platform_errors[k]
             payload = {
                 "videos": all_videos,
                 "channel": channel,
@@ -385,7 +390,9 @@ async def channel_videos(
 
         all_videos.sort(key=_sort_key)
         for k, v in list(per_platform_errors.items()):
-            per_platform_errors[k] = normalize_err(v)
+            per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
+            if not per_platform_errors[k]:
+                del per_platform_errors[k]
         payload = {
             "videos": all_videos,
             "channel": channel,

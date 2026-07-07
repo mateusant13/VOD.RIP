@@ -396,8 +396,9 @@ def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dic
     try:
         import yt_dlp
 
+        from services.ytdlp_guard import guarded_youtube_dl
         url = f"https://www.twitch.tv/videos/{video_id}"
-        with yt_dlp.YoutubeDL({
+        with guarded_youtube_dl({
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,

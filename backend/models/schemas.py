@@ -146,6 +146,13 @@ class PreviewSessionResponse(BaseModel):
     quality_labels: List[str] = []
     active_height: int = 0
     extract_source: str = ""
+    mux_ready: bool = True
+
+
+class PreviewSessionStatusResponse(BaseModel):
+    mux_ready: bool
+    mux_status: str = "unnecessary"
+    mux_error: str = ""
 
 
 class PreviewQualityUpdateRequest(BaseModel):

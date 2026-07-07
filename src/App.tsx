@@ -38,15 +38,16 @@ import {
   warmYoutubePreview,
   warmYoutubePreviewBatch,
   bindYoutubeChannelScrollWarm,
+  waitForPreviewMuxReady,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
-import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformWatchPreviewBtn, platformDownloadBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
+import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
-import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, formatChannelErrorMessage, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
 import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
@@ -204,6 +205,7 @@ export default function App() {
   const previewInitialPlayDoneRef = useRef(false);
   const previewSuppressPlayRef = useRef(false);
   /** Monotonic generation counter — increment to cancel in-flight openPreview. */
+  const previewGenRef = useRef(0);
   const previewClipRelativeRef = useRef(false);
   /** Cancels debounced YouTube metadata prefetch when URL changes. */
   const youtubePrefetchGenRef = useRef(0);
@@ -223,6 +225,7 @@ export default function App() {
   const previewRequestedHeightRef = useRef(0);
   const previewAppliedHeightRef = useRef(0);
   const previewExtractSourceRef = useRef('');
+  const previewSessionIdRef = useRef<string | null>(null);
   // ── Shared preview hook (quality state machine) ──────────────────────────
   const {
     previewLevels,
@@ -615,6 +618,7 @@ export default function App() {
     setPreviewQualityMenuOpen(false);
     setPreviewVolumeMenuOpen(false);
     previewSessionMetaRef.current = null;
+    previewSessionIdRef.current = null;
     previewRequestedHeightRef.current = 0;
     previewAppliedHeightRef.current = 0;
     previewInitialSeekDoneRef.current = false;
@@ -655,7 +659,13 @@ export default function App() {
     // Cancel any previously in-flight openPreview
     const gen = ++previewGenRef.current;
     const start = trimStartSecRef.current;
-    const end = trimEndSecRef.current;
+    let end = trimEndSecRef.current;
+    const clipPreview = isClipUrl(trimmedUrl);
+    const youtubePreview = detectUrlPlatform(trimmedUrl) === 'youtube';
+    // ponytail: preview only needs first ~30s — full VOD trim makes DASH mux time out
+    if (youtubePreview) {
+      end = Math.min(end, start + 30);
+    }
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
@@ -693,8 +703,6 @@ export default function App() {
       if (oldSid) {
         try { await apiDelete(`/api/preview/session/${oldSid}`); } catch { /* ignore */ }
       }
-      const clipPreview = isClipUrl(trimmedUrl);
-      const youtubePreview = detectUrlPlatform(trimmedUrl) === 'youtube';
       const playerCap = measurePlayerHeightCap(
         previewContainerRef.current ?? previewPanelRef.current,
         previewVideoAspectRef.current,
@@ -704,22 +712,12 @@ export default function App() {
       });
       let qualityLabels = videoInfo?.qualities;
       if (youtubePreview) warmYoutubePreview(trimmedUrl);
-      const sessionPromise = apiPost<{
-        session_id: string;
-        master_url: string;
-        playback_url?: string;
-        kind?: string;
-        variant_heights?: number[];
-        quality_labels?: string[];
-        active_height?: number;
-        extract_source?: string;
-      }>('/api/preview/session', {
+      const res = await apiPost<PreviewSessionResponse>('/api/preview/session', {
         url: trimmedUrl,
         crop_start: start,
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
-      const res = await sessionPromise;
       if (gen !== previewGenRef.current) return;
       previewExtractSourceRef.current = res.extract_source ?? '';
       if (previewExtractSourceRef.current) {
@@ -728,6 +726,7 @@ export default function App() {
       const clipInfo = clipPreview && !qualityLabels?.length
         ? await apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
         : null;
+      if (gen !== previewGenRef.current) return;
       if (clipInfo?.qualities?.length) {
         qualityLabels = clipInfo.qualities;
       }
@@ -740,8 +739,18 @@ export default function App() {
         qualityLabels: mergedQualityLabels,
         activeHeight,
       };
+      previewSessionIdRef.current = res.session_id;
       setPreviewSessionId(res.session_id);
       const playback = resolvePreviewPlayback(url.trim(), res);
+      if (youtubePreview && playback.kind === 'progressive' && res.mux_ready === false) {
+        const muxReady = await waitForPreviewMuxReady(
+          res.session_id,
+          apiGet,
+          { gen, current: previewGenRef.current },
+        );
+        if (gen !== previewGenRef.current) return;
+        if (!muxReady) throw new Error('Preview preparation timed out');
+      }
       setPreviewPlayback({
         ...playback,
         variantHeights: res.variant_heights ?? [],
@@ -889,20 +898,6 @@ export default function App() {
           syncProgressiveLevels(mapped, defaultIndex);
         }
       }).catch(() => { /* keep immediate levels */ });
-      const cleanupRecovery = bindProgressivePreviewRecovery({
-        video,
-        playbackUrl,
-        sessionId: previewSessionId,
-        youtube: youtubePreview,
-        extractSource: previewExtractSourceRef.current,
-        getResumeSec: () => video.currentTime,
-        apiPost,
-        onRefreshing: () => setPreviewVideoLoading(true),
-        onFatal: () => {
-          setError('Preview interrupted — try again');
-          setPreviewVideoLoading(false);
-        },
-      });
       previewAppliedHeightRef.current = activeH;
       const syncClipRelative = () => {
         const start = previewTrimStartRef.current;
@@ -918,6 +913,20 @@ export default function App() {
         handlePreviewLoadedMetadata();
       };
       attachProgressivePreview(video, playbackUrl);
+      const cleanupRecovery = bindProgressivePreviewRecovery({
+        video,
+        playbackUrl,
+        getSessionId: () => previewSessionIdRef.current,
+        youtube: youtubePreview,
+        extractSource: previewExtractSourceRef.current,
+        getResumeSec: () => video.currentTime,
+        apiPost,
+        onRefreshing: () => setPreviewVideoLoading(true),
+        onFatal: () => {
+          setError('Preview interrupted — try again');
+          setPreviewVideoLoading(false);
+        },
+      });
       video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
       video.addEventListener('canplay', () => {
         syncClipRelative();
@@ -2452,7 +2461,7 @@ export default function App() {
           } else {
             incoming.push(...(data.clips ?? (data as unknown as ChannelVodsResponse).videos ?? []).map(mapApiChannelItem));
             for (const [platform, pe] of Object.entries(data.per_platform_errors ?? {})) {
-              if (pe) errs[platform] = pe;
+              if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
             }
           }
         } catch (err: unknown) {
@@ -2487,7 +2496,7 @@ export default function App() {
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs.YouTube;
             const pe = data.per_platform_errors?.YouTube;
-            if (pe) errs.YouTube = pe;
+            if (pe && !isHiddenChannelPlatformError(pe)) errs.YouTube = pe;
           } catch (err: unknown) {
             errs.YouTube = err instanceof Error ? err.message : 'Failed to fetch YouTube stream VODs';
           }
@@ -2523,7 +2532,7 @@ export default function App() {
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
-            if (pe) errs[platform] = pe;
+            if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
           } catch (err: unknown) {
             errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} VODs`;
           }
@@ -3460,7 +3469,7 @@ export default function App() {
   );
 
   const urlAsideActionBar = videoInfo ? (
-    <div className="flex flex-col gap-2 shrink-0 pt-2 border-t border-zinc-800">
+    <div className={`${urlPanelAside ? 'flex-1' : 'shrink-0'} min-h-[6.5rem] flex flex-col gap-2 shrink-0 pt-2 border-t border-zinc-800 overflow-hidden`}>
       <button
         type="button"
         onClick={() => {
@@ -3468,7 +3477,7 @@ export default function App() {
           if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
         }}
         disabled={!url.trim()}
-        className={`${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
+        className={`flex-1 min-h-0 ${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
       >
         <ExternalLink size={12} className="shrink-0" />
         Open URL
@@ -3483,7 +3492,7 @@ export default function App() {
         }}
         onClick={openPreview}
         disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
-        className={`${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
+        className={`flex-1 min-h-0 ${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
       >
         {previewVideoLoading ? (
           <Loader2 size={12} className="animate-spin shrink-0" />
@@ -3495,7 +3504,7 @@ export default function App() {
       <button
         onClick={promptStartDownload}
         disabled={loading || !videoInfo}
-        className={platformDownloadBtn(urlActionPlatform)}
+        className={`flex-1 min-h-0 ${platformVodPanelBtn(urlActionPlatform)}`}
       >
         <Download size={16} strokeWidth={3} />
         <span className="inline-flex items-center">
@@ -3866,8 +3875,11 @@ export default function App() {
                   onPause={() => setPreviewPlaying(false)}
                 />
                 {previewVideoLoading && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20 pointer-events-none">
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20 pointer-events-none">
                     <Loader2 size={40} className="animate-spin text-zinc-300" />
+                    {!previewPlayback && (
+                      <span className="text-zinc-300 text-xs font-mono">Preparing preview...</span>
+                    )}
                   </div>
                 )}
               </div>
@@ -3908,7 +3920,7 @@ export default function App() {
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
         <div
           ref={urlAsidePanelRef}
-          className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
+          className={`group relative shrink-0 overflow-hidden bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
           style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
         >
           {showUrlInSidebar && (
@@ -3934,7 +3946,7 @@ export default function App() {
               <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">VOD · Trim</span>
             </div>
           )}
-          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden flex flex-col pr-1 custom-scrollbar overscroll-y-contain">
+          <div className="flex-[2] min-h-0 overflow-hidden flex flex-col">
             {urlTabContent}
           </div>
           {urlAsideActionBar}
@@ -4015,7 +4027,12 @@ export default function App() {
             : 'overflow-y-auto overflow-x-hidden custom-scrollbar pr-1 pb-2 overscroll-y-contain'
         }`}>
         {/* ════════════════════════════ URL TAB ════════════════════════════ */}
-        {showUrlInMainCard && urlTabContent}
+        {showUrlInMainCard && (
+          <>
+            {urlTabContent}
+            {urlAsideActionBar}
+          </>
+        )}
 
         {/* ════════════════════════════ CHANNELS TAB ════════════════════════════ */}
           {tab === 'channels' && (
