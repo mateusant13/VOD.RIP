@@ -26,6 +26,7 @@ import {
   resolveProgressivePreviewLevelsAsync,
   warmYoutubePreview,
   waitForPreviewMuxReady,
+  previewMuxPollMaxMs,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
@@ -224,13 +225,10 @@ export default function ChannelExplorePopup({
           ).catch(() => null)
           : Promise.resolve(null);
         if (platform === 'youtube') warmYoutubePreview(vod.url);
-        const previewCropEnd = platform === 'youtube'
-          ? Math.min(vod.durationSec, 30)
-          : vod.durationSec;
         const sessionPromise = apiPost<PreviewSessionResponse>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
-          crop_end: previewCropEnd,
+          crop_end: vod.durationSec,
           prefer_height: preferHeight,
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
@@ -240,7 +238,12 @@ export default function ChannelExplorePopup({
         }
         const resolved = resolvePreviewPlayback(vod.url, res);
         if (platform === 'youtube' && resolved.kind === 'progressive' && res.mux_ready === false) {
-          const muxReady = await waitForPreviewMuxReady(res.session_id, apiGet);
+          const muxReady = await waitForPreviewMuxReady(
+            res.session_id,
+            apiGet,
+            undefined,
+            previewMuxPollMaxMs(0, vod.durationSec),
+          );
           if (cancelled) {
             try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
             return;

@@ -288,7 +288,7 @@ class PreviewSession:
     variant_muxed: Dict[int, bool] = field(default_factory=dict)
     preview_audio_url: Optional[str] = None
     crop_start: float = 0.0
-    crop_end: float = 30.0
+    crop_end: float = 0.0
     cache_bytes: int = 0
     last_access: float = field(default_factory=time.time)
     cache_dir: Path = field(default_factory=Path)
@@ -734,10 +734,7 @@ def _best_muxed_variant_url(session: PreviewSession) -> Optional[str]:
 
 def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -> Path:
     """Mux DASH video+audio for the trim window into a local MP4 (preview only)."""
-    from services.ytdlp_hls import (
-        _PREVIEW_MUX_MAX_SEC,
-        _download_muxed_dash_clip,
-    )
+    from services.ytdlp_hls import _download_muxed_dash_clip
 
     height = _pick_mux_height(session, fast=fast)
     out = _mux_output_path(session, height)
@@ -749,8 +746,6 @@ def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -
             return out
         start = max(0.0, float(session.crop_start))
         end = max(start + 0.5, float(session.crop_end))
-        # ponytail: fast only caps height (720p); duration is full preview window (≤30s)
-        end = min(end, start + _PREVIEW_MUX_MAX_SEC)
         video_url = _variant_url_for_height(session, height) or session.entry_url
         _download_muxed_dash_clip(
             video_url,
@@ -2026,7 +2021,6 @@ assert preview_mux_ready(PreviewSession(
     session_id="x", vod_url="", master_url="", entry_url="", platform="Kick",
 ))
 assert issubclass(PreviewMuxPending, RuntimeError)
-assert min(907.0, 0.0 + 30.0) == 30.0  # preview mux window cap, not 10s teaser
 _dash_only = {
     "formats": [
         {"height": 720, "protocol": "https", "url": "https://x/v.mp4", "acodec": "none"},

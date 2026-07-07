@@ -121,8 +121,7 @@ _YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
 _YOUTUBE_PREVIEW_SOCKET_SEC = 5
 _PREVIEW_EXTRACT_WAIT_SEC = 8.0
 _PREVIEW_EXTRACT_MAX_WALL_SEC = 6.0
-_PREVIEW_MUX_MAX_SEC = 30.0
-_PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: teaser phase only — preview mux uses _PREVIEW_MUX_MAX_SEC
+_PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: unused teaser cap — mux uses session trim window
 _PREVIEW_MUX_FAST_HEIGHT = 720
 
 

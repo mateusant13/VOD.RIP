@@ -114,12 +114,6 @@ async def preview_warm(req: PreviewWarmRequest):
 async def preview_create_session(req: PreviewSessionCreateRequest):
     if req.crop_end <= req.crop_start:
         raise HTTPException(status_code=400, detail="End must be after start")
-    from services.ytdlp_download import detect_platform
-
-    if detect_platform((req.url or "").strip()) == "YouTube":
-        max_preview = req.crop_start + 30.0
-        if req.crop_end > max_preview:
-            req.crop_end = max_preview
     from deps import settings_mgr
     opts = settings_mgr.get()
     preview_url = (req.url or "").strip()

@@ -105,14 +105,20 @@ export function resolvePreviewPlayback(
 
 export type PreviewMuxPollSignal = { gen: number; current: number };
 
+/** Scale mux poll timeout with trim length (DASH mux is proportional to duration). */
+export function previewMuxPollMaxMs(cropStart: number, cropEnd: number): number {
+  const sec = Math.max(1, cropEnd - cropStart);
+  return Math.min(15 * 60 * 1000, Math.max(45_000, sec * 2000));
+}
+
 /** Poll async YouTube DASH mux until stream.mp4 is safe to attach. */
 export async function waitForPreviewMuxReady(
   sessionId: string,
   apiGet: <T>(path: string) => Promise<T>,
   signal?: PreviewMuxPollSignal,
-  maxMs = 45000,
+  maxMs?: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + maxMs;
+  const deadline = Date.now() + (maxMs ?? 120_000);
   const pollMs = 400;
   while (Date.now() < deadline) {
     if (signal && signal.gen !== signal.current) return false;
@@ -751,5 +757,6 @@ void (() => {
     initialPreviewPreferHeight(false, cap) === cap,
     'Kick/Twitch preview should cap to player',
   );
+  console.assert(previewMuxPollMaxMs(0, 900) === 15 * 60 * 1000, 'mux poll capped at 15min');
   console.assert(typeof waitForPreviewMuxReady === 'function', 'mux poll helper exported');
 })();

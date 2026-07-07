@@ -39,6 +39,7 @@ import {
   warmYoutubePreviewBatch,
   bindYoutubeChannelScrollWarm,
   waitForPreviewMuxReady,
+  previewMuxPollMaxMs,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
@@ -662,10 +663,7 @@ export default function App() {
     let end = trimEndSecRef.current;
     const clipPreview = isClipUrl(trimmedUrl);
     const youtubePreview = detectUrlPlatform(trimmedUrl) === 'youtube';
-    // ponytail: preview only needs first ~30s — full VOD trim makes DASH mux time out
-    if (youtubePreview) {
-      end = Math.min(end, start + 30);
-    }
+    // Preview window follows trim range (full VOD when sliders span entire duration).
     previewTrimStartRef.current = start;
     previewTrimEndRef.current = end;
     setPreviewTrimStart(start);
@@ -747,6 +745,7 @@ export default function App() {
           res.session_id,
           apiGet,
           { gen, current: previewGenRef.current },
+          previewMuxPollMaxMs(start, end),
         );
         if (gen !== previewGenRef.current) return;
         if (!muxReady) throw new Error('Preview preparation timed out');
