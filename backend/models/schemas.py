@@ -15,6 +15,7 @@ class VideoInfo(BaseModel):
     qualities: List[str] = []
     platform: Optional[str] = None
     created_at: Optional[str] = None
+    views: Optional[int] = None
     size_by_quality: Optional[Dict[str, int]] = None
     estimated_bytes: Optional[int] = None
     bitrate_kbps: Optional[float] = None
@@ -134,7 +135,7 @@ class PreviewSessionCreateRequest(BaseModel):
     url: str
     crop_start: float = 0.0
     crop_end: float = 0.0
-    prefer_height: int = 480
+    prefer_height: int = 720
 
 
 class PreviewSessionResponse(BaseModel):
@@ -156,4 +157,4 @@ class PreviewSessionStatusResponse(BaseModel):
 
 
 class PreviewQualityUpdateRequest(BaseModel):
-    prefer_height: int = 480
+    prefer_height: int = 720

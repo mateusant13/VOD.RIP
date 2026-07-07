@@ -61,12 +61,21 @@ export function platformVodPanelBtn(platform: PlatformStyleKey, active = false):
   return `${base} !bg-white !text-black shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)] hover:!bg-black hover:!text-white`;
 }
 
-/** Open URL / Watch preview — platform colors from VOD rip, mono label typography. */
+/** Open URL / Watch preview — platform accent; active = subtle tint, not full white fill. */
 export function platformVodPanelSecondaryBtn(platform: PlatformStyleKey, active = false): string {
   const base =
     'w-full h-full min-h-[2.25rem] border-2 font-mono uppercase font-bold text-[10px] flex items-center justify-center gap-1.5 transition-[box-shadow,background-color,color] duration-150 hover:bg-white hover:text-black disabled:opacity-40 disabled:cursor-not-allowed border-white bg-black';
   if (active) {
-    return `${base} !bg-white !text-black shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)] hover:!bg-black hover:!text-white`;
+    if (platform === 'kick') {
+      return `${base} !text-[#53fc18] !border-[#53fc18] !bg-[#53fc18]/10 shadow-[2px_2px_0px_0px_#53fc18] hover:!bg-[#53fc18]/20 hover:!text-[#53fc18]`;
+    }
+    if (platform === 'twitch') {
+      return `${base} !text-[#9146FF] !border-[#9146FF] !bg-[#9146FF]/10 shadow-[2px_2px_0px_0px_#9146FF] hover:!bg-[#9146FF]/20 hover:!text-[#9146FF]`;
+    }
+    if (platform === 'youtube') {
+      return `${base} !text-[#F03030] !border-[#F03030] !bg-[#F03030]/10 shadow-[2px_2px_0px_0px_#F03030] hover:!bg-[#F03030]/20 hover:!text-[#F03030]`;
+    }
+    return `${base} !bg-zinc-900 !text-white shadow-[2px_2px_0px_0px_rgba(255,255,255,0.35)]`;
   }
   if (platform === 'kick') {
     return `${base} shadow-[3px_3px_0px_0px_#53fc18] hover:shadow-[2px_2px_0px_0px_#53fc18]`;

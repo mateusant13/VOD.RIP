@@ -172,7 +172,7 @@ async def preview_session_status(session_id: str):
 @router.post("/api/preview/session/{session_id}/refresh")
 async def preview_refresh_session(session_id: str, request: Request):
     """Re-resolve expired YouTube googlevideo URLs for an active preview session."""
-    prefer_height = _parse_prefer_height_query(request) or 480
+    prefer_height = _parse_prefer_height_query(request) or 720
     try:
         session = await asyncio.get_running_loop().run_in_executor(
             INFO_EXECUTOR,

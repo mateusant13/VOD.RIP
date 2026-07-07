@@ -64,7 +64,6 @@ def list_channel_videos_sync(
         auto_auth = True
     ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
     opts: dict[str, Any] = {
-        "extract_flat": "in_playlist",
         "playlistend": max(1, min(int(limit), 100)),
         "quiet": True,
         "no_warnings": True,
@@ -109,12 +108,22 @@ def list_channel_videos_sync(
             except ValueError:
                 pass
         thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+        dur = e.get("duration")
+        dur_str = None
+        if dur is not None:
+            try:
+                sec = int(float(dur))
+                m, s = divmod(sec, 60)
+                h, m = divmod(m, 60)
+                dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+            except (TypeError, ValueError):
+                pass
         out.append({
             "id": vid,
             "platform": "YouTube",
             "title": e.get("title") or "Untitled",
-            "duration": e.get("duration"),
-            "duration_string": None,
+            "duration": dur,
+            "duration_string": dur_str,
             "created_at": created_at,
             "views": e.get("view_count"),
             "thumbnail_url": thumb,

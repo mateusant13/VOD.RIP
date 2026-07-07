@@ -131,7 +131,7 @@ class PreviewManager:
             crop_start: float = 0.0,
             crop_end: float = 0.0,
             oauth: Optional[str] = None,
-            prefer_height: int = 480,
+            prefer_height: int = 720,
     ) -> PreviewSession:
             self._cleanup_stale_sessions()
             raw_entry, headers, platform, variant_formats, kind, yt_info = resolve_stream_info(
@@ -401,7 +401,7 @@ def _remap_youtube_url_after_refresh(
 def _youtube_refresh_and_remap(
     session: PreviewSession,
     failed_url: str,
-    prefer_height: int = 480,
+    prefer_height: int = 720,
 ) -> Optional[str]:
     if session.platform != "YouTube":
         return None
@@ -522,7 +522,7 @@ def preview_session_kind(session_id: str) -> Optional[str]:
     return session.kind if session else None
 
 
-def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 480) -> None:
+def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 720) -> None:
     """Re-resolve googlevideo URLs — they expire; stale URLs cause preview 403/500."""
     if session.platform != "YouTube":
         return
@@ -589,7 +589,7 @@ def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 
 
 def refresh_youtube_preview_session(
     session_id: str,
-    prefer_height: int = 480,
+    prefer_height: int = 720,
 ) -> PreviewSession:
     """Refresh expired YouTube stream URLs for an active preview session."""
     session = get_session(session_id)
@@ -607,7 +607,7 @@ _PREVIEW_MUX_LOCKS: Dict[str, threading.Lock] = {}
 def _pick_mux_height(session: PreviewSession, *, fast: bool = True) -> int:
     from services.ytdlp_hls import _PREVIEW_MUX_FAST_HEIGHT
 
-    prefer = session_active_height(session) or 480
+    prefer = session_active_height(session) or 720
     if not fast:
         return prefer
     cap = _PREVIEW_MUX_FAST_HEIGHT
@@ -749,7 +749,7 @@ def _ensure_youtube_preview_mux(session: PreviewSession, *, fast: bool = True) -
             return out
         start = max(0.0, float(session.crop_start))
         end = max(start + 0.5, float(session.crop_end))
-        # ponytail: fast only caps height (480p); duration is full preview window (≤30s)
+        # ponytail: fast only caps height (720p); duration is full preview window (≤30s)
         end = min(end, start + _PREVIEW_MUX_MAX_SEC)
         video_url = _variant_url_for_height(session, height) or session.entry_url
         _download_muxed_dash_clip(
@@ -885,12 +885,12 @@ def open_progressive_proxy(
         if session.platform != "YouTube":
             raise
         logger.debug("progressive proxy refresh after error session=%s: %s", session_id[:8], first_exc)
-        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 480)
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 720)
         upstream = session.entry_url
         resp = _open_upstream_stream(session, upstream, range_header)
     if resp.status_code in (403, 404, 410) and session.platform == "YouTube":
         resp.close()
-        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 480)
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_h or 720)
         upstream = session.entry_url
         resp = _open_upstream_stream(session, upstream, range_header)
     ctype, hdrs, status = _upstream_response_meta(resp, upstream, range_header)
@@ -1355,7 +1355,7 @@ def _formats_are_dash_https(formats: List[dict]) -> bool:
 def resolve_stream_info(
     url: str,
     oauth: Optional[str] = None,
-    prefer_height: int = 480,
+    prefer_height: int = 720,
 ) -> Tuple[str, dict, str, List[dict], str, Optional[dict]]:
     """Return (master_url, headers, platform, variant_formats, kind, yt_info).
 
@@ -1550,8 +1550,8 @@ def resolve_stream_info(
     return stream_url, headers, platform, [], "hls", None
 
 
-def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int = 480) -> Optional[str]:
-    """Pick a preview variant (default ~480p) for faster startup and prewarm."""
+def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int = 720) -> Optional[str]:
+    """Pick a preview variant (default ~720p) for faster startup and prewarm."""
     lines = master_text.splitlines()
     variants: list[tuple[int, int, str]] = []
     i = 0
@@ -1591,7 +1591,7 @@ def _pick_preview_variant(master_text: str, master_url: str, prefer_height: int 
     return urljoin(master_url, variants[0][2])
 
 
-def _resolve_preview_entry(session: PreviewSession, entry_url: str, prefer_height: int = 480) -> str:
+def _resolve_preview_entry(session: PreviewSession, entry_url: str, prefer_height: int = 720) -> str:
     """Follow master playlist to a single media playlist for prewarm."""
     if session.variant_entries:
         picked = _pick_variant_by_height(session.variant_entries, prefer_height)

@@ -17,6 +17,7 @@ export interface VideoInfo {
   qualities: string[];
   platform: string | null;
   created_at?: string | null;
+  views?: number | null;
   size_by_quality?: Record<string, number>;
   estimated_bytes?: number;
   bitrate_kbps?: number;

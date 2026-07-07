@@ -208,6 +208,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         "qualities": qualities,
         "platform": detect_platform(full_url),
         "created_at": created_at,
+        "views": info.get("view_count"),
     }
     enrich_info_dict(
         payload,

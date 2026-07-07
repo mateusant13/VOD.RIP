@@ -5,11 +5,42 @@ from services.youtube_innertube import (
     _classify_http,
     _classify_playability,
     _CLIENT_PROFILES,
+    _enrich_client_context,
+    _is_auto_dubbed_audio,
+    _pick_best_audio_format,
     extract_video_id,
     innertube_extract_info,
     _parse_hls_variants,
 )
 from services.youtube_session import YouTubeSession
+
+
+def test_enrich_client_context_drops_forced_locale():
+    ctx = _enrich_client_context({"hl": "en", "gl": "US", "clientName": "WEB"}, "WEB")
+    assert "hl" not in ctx
+    assert "gl" not in ctx
+
+
+def test_pick_audio_prefers_original_over_auto_dub():
+    streaming = {
+        "adaptiveFormats": [
+            {
+                "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                "url": "https://cdn.example/dub.m4a",
+                "bitrate": 200000,
+                "audioTrack": {"isAutoDubbed": True},
+            },
+            {
+                "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                "url": "https://cdn.example/orig.m4a",
+                "bitrate": 128000,
+                "audioTrack": {"displayName": "Portuguese"},
+            },
+        ],
+    }
+    picked = _pick_best_audio_format(streaming)
+    assert picked is not None
+    assert "orig.m4a" in picked["url"]
 
 
 def test_extract_video_id_watch():

@@ -290,9 +290,25 @@ def _format_from_raw_adaptive(raw: dict, *, audio_only: bool = False) -> dict[st
     }
 
 
+def _is_auto_dubbed_audio(raw: dict) -> bool:
+    """YouTube serves English auto-dub tracks when client locale is en — skip them."""
+    if raw.get("isAutoDubbed") is True:
+        return True
+    track = raw.get("audioTrack")
+    if isinstance(track, dict):
+        if track.get("isAutoDubbed") is True:
+            return True
+        name = (track.get("displayName") or track.get("id") or "").lower()
+        if "auto" in name and "dub" in name:
+            return True
+    return False
+
+
 def _pick_best_audio_format(streaming: dict[str, Any]) -> Optional[dict[str, Any]]:
-    best: Optional[dict[str, Any]] = None
-    best_br = -1
+    best_orig: Optional[dict[str, Any]] = None
+    best_orig_br = -1
+    best_any: Optional[dict[str, Any]] = None
+    best_any_br = -1
     for raw in streaming.get("adaptiveFormats") or []:
         mime = (raw.get("mimeType") or "").lower()
         if "audio" not in mime or "video" in mime:
@@ -301,10 +317,15 @@ def _pick_best_audio_format(streaming: dict[str, Any]) -> Optional[dict[str, Any
         if not url or _is_sabr_stream_url(url):
             continue
         br = int(raw.get("bitrate") or raw.get("averageBitrate") or 0)
-        if br > best_br:
-            best_br = br
-            best = _format_from_raw_adaptive(raw, audio_only=True)
-    return best
+        fmt = _format_from_raw_adaptive(raw, audio_only=True)
+        if _is_auto_dubbed_audio(raw):
+            if br > best_any_br:
+                best_any_br = br
+                best_any = fmt
+        elif br > best_orig_br:
+            best_orig_br = br
+            best_orig = fmt
+    return best_orig or best_any
 
 
 def _formats_from_player_streaming(data: dict) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]], Optional[str]]:
@@ -457,8 +478,9 @@ def _merge_headers(profile: _ClientProfile, session: Optional["YouTubeSession"])
 
 def _enrich_client_context(client: dict[str, Any], profile_name: str) -> dict[str, Any]:
     out = dict(client)
-    out.setdefault("hl", "en")
-    out.setdefault("gl", "US")
+    # ponytail: omit hl/gl — forced en/US triggers translated titles and auto-dubbed audio
+    out.pop("hl", None)
+    out.pop("gl", None)
     out["clientScreen"] = "WATCH"
     out["utcOffsetMinutes"] = -180
     return out
@@ -902,6 +924,9 @@ def innertube_extract_info(
 
 assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+assert "hl" not in _enrich_client_context({"hl": "en", "gl": "US"}, "WEB")
+assert _is_auto_dubbed_audio({"audioTrack": {"isAutoDubbed": True}}) is True
+assert not _is_auto_dubbed_audio({"audioTrack": {"displayName": "Portuguese"}})
 _sample_master = (
     "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720\n"
     "https://example.com/720.m3u8\n"

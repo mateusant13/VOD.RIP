@@ -174,8 +174,6 @@ def _bootstrap_network(
                 "client": {
                     "clientName": "WEB",
                     "clientVersion": "2.20250224.01.00",
-                    "hl": "en",
-                    "gl": "US",
                 }
             }
         },

@@ -123,7 +123,7 @@ _PREVIEW_EXTRACT_WAIT_SEC = 8.0
 _PREVIEW_EXTRACT_MAX_WALL_SEC = 6.0
 _PREVIEW_MUX_MAX_SEC = 30.0
 _PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: teaser phase only — preview mux uses _PREVIEW_MUX_MAX_SEC
-_PREVIEW_MUX_FAST_HEIGHT = 480
+_PREVIEW_MUX_FAST_HEIGHT = 720
 
 
 def _youtube_manual_auth_configured() -> bool:

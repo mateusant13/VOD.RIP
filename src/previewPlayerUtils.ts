@@ -58,10 +58,12 @@ export function bindYoutubeChannelScrollWarm(
   return () => observer.disconnect();
 }
 
-export const PREVIEW_MAIN_DEFAULT_HEIGHT = 480;
-export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 360;
+export const PREVIEW_MAIN_DEFAULT_HEIGHT = 720;
+export const PREVIEW_EXPLORE_DEFAULT_HEIGHT = 720;
 export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
-/** Session prefer_height for YouTube before variant list is known — backend snaps to max ≤ this. */
+/** Default YouTube preview tier — user can raise in preview quality menu. */
+export const PREVIEW_YOUTUBE_DEFAULT_HEIGHT = 720;
+/** Max prefer_height when variant list unknown. */
 export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
 
 export function isYouTubePreviewPlatform(platform: string | null | undefined): boolean {
@@ -343,7 +345,7 @@ export function maxAvailablePreviewHeight(
   return heights.length ? heights[heights.length - 1] : PREVIEW_YOUTUBE_PREFER_HEIGHT;
 }
 
-/** First preview load: YouTube → max tier; Kick/Twitch → 360p/480p capped to player. */
+/** First preview load: YouTube → 720p default (raise in player); Kick/Twitch → capped to player. */
 export function initialPreviewPreferHeight(
   isClip: boolean,
   playerCap: number,
@@ -351,13 +353,14 @@ export function initialPreviewPreferHeight(
 ): number {
   if (opts?.youtube) {
     if (opts.activeHeight && opts.activeHeight > 0) return opts.activeHeight;
-    return maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+    const max = maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+    return Math.min(PREVIEW_YOUTUBE_DEFAULT_HEIGHT, max || PREVIEW_YOUTUBE_DEFAULT_HEIGHT);
   }
   const desired = isClip ? PREVIEW_CLIP_DEFAULT_HEIGHT : PREVIEW_MAIN_DEFAULT_HEIGHT;
   return Math.min(desired, playerCap);
 }
 
-/** HLS manifest default tier — YouTube starts at highest; others cap to viewport. */
+/** HLS manifest default tier — YouTube 720p default; others cap to viewport. */
 export function resolveInitialHlsPreviewHeight(
   isClip: boolean,
   playerCap: number,
@@ -365,7 +368,8 @@ export function resolveInitialHlsPreviewHeight(
 ): number {
   if (opts?.youtube) {
     if (opts.activeHeight && opts.activeHeight > 0) return opts.activeHeight;
-    return maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+    const max = maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
+    return Math.min(PREVIEW_YOUTUBE_DEFAULT_HEIGHT, max || PREVIEW_YOUTUBE_DEFAULT_HEIGHT);
   }
   return Math.min(initialPreviewPreferHeight(isClip, playerCap), playerCap);
 }
@@ -740,8 +744,8 @@ void (() => {
   );
   const cap = 360;
   console.assert(
-    initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) === 1080,
-    'YouTube preview should default to max tier',
+    initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) === 720,
+    'YouTube preview should default to 720p',
   );
   console.assert(
     initialPreviewPreferHeight(false, cap) === cap,
