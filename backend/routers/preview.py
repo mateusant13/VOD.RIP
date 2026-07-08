@@ -107,15 +107,13 @@ async def preview_warm(req: PreviewWarmRequest):
     from deps import settings_mgr
     opts = settings_mgr.get()
 
-    def _run() -> None:
-        from services.ytdlp_hls import warm_youtube_extract
-        warm_youtube_extract(
-            url,
-            oauth=opts.oauth or None,
-            cookies_file=opts.youtube_cookies_file or None,
-        )
+    from services.preview_service import kickoff_youtube_warm
 
-    asyncio.get_running_loop().run_in_executor(INFO_EXECUTOR, _run)
+    kickoff_youtube_warm(
+        url,
+        oauth=opts.oauth or None,
+        cookies_file=opts.youtube_cookies_file or None,
+    )
     return {"warmed": True}
 
 

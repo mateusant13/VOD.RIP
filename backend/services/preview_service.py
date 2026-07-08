@@ -48,6 +48,9 @@ _RESOLVED_STREAM_TTL_SEC = 15 * 60
 _RESOLVED_STREAM_MAX = 64
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
+# In-flight YouTube warm keyed by canonical URL — create_session awaits paste warm.
+_YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
+_YOUTUBE_WARM_LOCK = threading.Lock()
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
 _UPSTREAM_CHUNK_BYTES = 64 * 1024
@@ -147,6 +150,8 @@ class PreviewManager:
             prefer_height: int = 720,
     ) -> PreviewSession:
             self._cleanup_stale_sessions()
+            if detect_platform(url) == "YouTube":
+                await_youtube_warm_if_pending(url)
             raw_entry, headers, platform, variant_formats, kind, yt_info = resolve_stream_info(
                     url, oauth=oauth, prefer_height=prefer_height,
             )
@@ -2028,6 +2033,48 @@ def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
             oldest = min(_RESOLVED_STREAM_CACHE.items(), key=lambda item: item[1][0])
             _RESOLVED_STREAM_CACHE.pop(oldest[0], None)
         _RESOLVED_STREAM_CACHE[key] = (time.time(), value)
+
+
+def kickoff_youtube_warm(
+    url: str,
+    oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+) -> None:
+    """Fire-and-forget warm on URL paste — deduped per canonical URL."""
+    key = (url or "").strip()
+    if not key:
+        return
+    with _YOUTUBE_WARM_LOCK:
+        if key in _YOUTUBE_WARM_INFLIGHT:
+            return
+        done = threading.Event()
+        _YOUTUBE_WARM_INFLIGHT[key] = done
+
+    def _run() -> None:
+        try:
+            from services.ytdlp_hls import warm_youtube_extract
+
+            warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
+        finally:
+            with _YOUTUBE_WARM_LOCK:
+                ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+    from deps import INFO_EXECUTOR
+
+    INFO_EXECUTOR.submit(_run)
+
+
+def await_youtube_warm_if_pending(url: str, timeout_sec: float = 45.0) -> None:
+    """Block create_session until an in-flight paste warm finishes."""
+    key = (url or "").strip()
+    if not key:
+        return
+    with _YOUTUBE_WARM_LOCK:
+        ev = _YOUTUBE_WARM_INFLIGHT.get(key)
+    if ev is not None and not ev.wait(timeout_sec):
+        logger.debug("YouTube warm wait timed out for %s", key[:80])
 
 
 def warm_youtube_preview_resolve(
