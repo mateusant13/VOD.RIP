@@ -5,7 +5,7 @@ import type { PreviewSessionStatusResponse } from './types';
 const _warmInflight = new Set<string>();
 const _warmTimers = new Map<string, number>();
 
-/** YouTube watch URL → 11-char video id (explore iframe fast path). */
+/** YouTube watch URL → 11-char video id. */
 export function youtubeVideoIdFromUrl(url: string): string | null {
   const m = url.trim().match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/live\/|\/embed\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
@@ -139,6 +139,15 @@ export function previewPlaylistPollMaxMs(): number {
   return 15_000;
 }
 
+/** YouTube explore/main — never wait full trim-length mux (VOD crop_end can be hours). */
+export function youtubePreviewMuxPollMaxMs(
+  playbackKind: 'hls' | 'progressive',
+  trimTimeline: boolean,
+): number {
+  if (trimTimeline) return 0;
+  return previewPlaylistPollMaxMs();
+}
+
 /** ponytail: legacy dash-segment mux poll cap — backend no longer muxes per segment. */
 export function previewDashMuxPollMaxMs(): number {
   return 0;
@@ -259,6 +268,25 @@ export function shouldWaitForPreviewMux(
   // Window-HLS: still wait for playlist/seg0 (caller polls via waitForPreviewMuxReady).
   // Progressive: wait for full-file mux readiness.
   return playbackKind === 'hls' || playbackKind === 'progressive';
+}
+
+/** Skip mux poll when session already returned an attachable proxy URL (explore/main). */
+export function shouldPollPreviewMuxReady(
+  res: {
+    playlist_ready?: boolean;
+    segment_buffer_ready?: boolean;
+    trim_timeline?: boolean;
+    mux_ready?: boolean;
+  },
+  playbackKind: 'hls' | 'progressive',
+  playbackUrl?: string,
+): boolean {
+  if (!shouldWaitForPreviewMux(res, playbackKind)) return false;
+  if (!playbackUrl || !isValidPreviewUrl(playbackUrl)) return true;
+  // HLS master is attachable while seg0 buffers — don't block on mux status.
+  if (playbackKind === 'hls') return false;
+  if (res.mux_ready || res.playlist_ready || res.segment_buffer_ready) return false;
+  return true;
 }
 
 /** Append prefer_height (and cache-bust) so the proxy switches tier on the same request. */
@@ -841,7 +869,23 @@ export function resolveHlsPreviewLevels(
     }
 
     const fromHls = mapInferredHlsLevels(raw, initialHeight);
-    if (fromHls.mapped.length) return fromHls;
+    if (fromHls.mapped.length) {
+      const hlsHeights = fromHls.mapped.map((m) => m.height).filter((h) => h > 0);
+      const mergedHeights = mergeVariantHeights(hlsHeights, fallback);
+      const hlsMax = hlsHeights.length ? Math.max(...hlsHeights) : 0;
+      const mergedMax = mergedHeights.length ? Math.max(...mergedHeights) : 0;
+      if (mergedMax > hlsMax) {
+        const expanded = mapHeightsToPreviewLevels(mergedHeights);
+        if (hlsLevels.length === 1) {
+          expanded.forEach((m) => { m.index = 0; });
+        }
+        return {
+          mapped: expanded,
+          defaultIndex: levelIndexForHeight(expanded, initialHeight),
+        };
+      }
+      return fromHls;
+    }
   }
 
   if (fallback.length > 0) {
@@ -1019,6 +1063,10 @@ void (() => {
   console.assert(previewMuxPollMaxMs(0, 900) === 15 * 60 * 1000, 'mux poll capped at 15min');
   console.assert(previewDashMuxPollMaxMs() === 0, 'dash segment mux poll removed');
   console.assert(previewPlaylistPollMaxMs() === 15_000, 'window-HLS playlist poll capped');
+  console.assert(
+    youtubePreviewMuxPollMaxMs('progressive', false) === 15_000,
+    'YouTube progressive mux poll capped',
+  );
   console.assert(PREVIEW_SEEK_DEBOUNCE_MS === 200, 'seek debounce ms');
   console.assert(
     shouldWaitForPreviewMux({ playlist_ready: true, trim_timeline: true }, 'hls') === false,
@@ -1040,6 +1088,32 @@ void (() => {
     shouldWaitForPreviewMux({ playlist_ready: false, trim_timeline: false }, 'progressive') === true,
     'full-file mux still waits for progressive',
   );
+  console.assert(
+    shouldPollPreviewMuxReady(
+      { playlist_ready: false, trim_timeline: false },
+      'hls',
+      '/api/preview/session/sid/playlist.m3u8',
+    ) === false,
+    'attachable HLS URL skips mux poll',
+  );
+  console.assert(
+    shouldPollPreviewMuxReady(
+      { playlist_ready: false, trim_timeline: false },
+      'progressive',
+      '/api/preview/session/sid/file.mp4',
+    ) === true,
+    'progressive without mux_ready still polls',
+  );
+  {
+    const merged = resolveHlsPreviewLevels(
+      [{ height: 720, bitrate: 1_000_000 }],
+      { initialHeight: 720, fallbackHeights: [1080, 720, 480] },
+    );
+    console.assert(
+      merged.mapped.some((m) => m.height === 1080),
+      'HLS menu merges backend variant_heights (1080p)',
+    );
+  }
   // prewarmPreviewDashSeek is a no-op now (backend removed per-segment DASH mux).
   prewarmPreviewDashSeek('sid', 12.3, async () => ({ ok: true }));
   {

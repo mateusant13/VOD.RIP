@@ -3,10 +3,11 @@
 Real UX path: URL paste fires /api/preview/warm (async), user clicks preview;
 create_session awaits in-flight warm then serves cached resolve.
 
-Budgets (Kick/Twitch parity):
-  - post-warm session + first playable bytes: <= 3000ms
-  - post-seek first bytes: <= 2000ms
-  - paste-to-playable (sync warm + session + stream): <= 3500ms for YouTube shorts
+Budgets (kick/twitch parity):
+  - POST_WARM   : YouTube UX — post-warm session + first playable bytes <= 3000ms
+  - TWITCH_KICK : Twitch/Kick CI — same path <= 4000ms (HLS/CDN variance ponytail)
+  - PASTE_WARM  : cold YouTube extract on paste (background) <= 4000ms
+  - SEEK        : post-seek first playable bytes <= 2000ms
 """
 from __future__ import annotations
 
@@ -144,7 +145,7 @@ _PLATFORM_IDS = [f"{p[0]}:{p[1].split('/')[-1][:24]}" for p in PLATFORMS]
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("platform,url,position_sec,needs_warm", PLATFORMS, ids=_PLATFORM_IDS)
 def test_preview_speed_post_warm_real(platform: str, url: str, position_sec: float, needs_warm: bool):
-    """After paste warm completes, session + first bytes must be Kick-fast (<=3s)."""
+    """After paste warm completes, session + first bytes within platform budget (YouTube <=3s UX)."""
     _clear_caches()
     with TestClient(app) as c:
         if needs_warm:
@@ -235,5 +236,62 @@ def test_youtube_paste_to_playable_budget():
         assert warm_ms <= PASTE_WARM_BUDGET_MS, f"warm {warm_ms}ms > {PASTE_WARM_BUDGET_MS}ms"
         assert post_ms <= POST_WARM_BUDGET_MS, (
             f"post-warm {post_ms}ms > {POST_WARM_BUDGET_MS}ms (session={session_ms} stream={stream_ms})"
+        )
+        c.delete(f"/api/preview/session/{sid}")
+
+
+WARM_DEDUP_RACE_BUDGET_MS = 5000
+
+
+@pytest.mark.timeout(120)
+def test_youtube_warm_dedup_race_real():
+    """Warm + immediate create_session must share one extract (no double work).
+
+    Scenario: paste fires /api/preview/warm (background); user clicks preview
+    moments later, triggering /api/preview/session for the same URL. With dedup
+    the session awaits the in-flight warm and reuses the populated extract
+    cache. A double extract (warm + session) would take ~6-7s end-to-end on
+    a Short; with dedup it must finish in <= 5s.
+    """
+    url = "https://www.youtube.com/shorts/IbkQI11-NZk"
+    _clear_caches()
+    with TestClient(app) as c:
+        t0 = time.monotonic()
+        # Kick off warm — do NOT await; the session is the consumer.
+        warm_resp = c.post("/api/preview/warm", json={"url": url})
+        assert warm_resp.status_code == 200, warm_resp.text[:200]
+        assert warm_resp.json().get("warmed") is True
+
+        # Immediately create session for the same URL. create_session
+        # internally calls await_youtube_warm_if_pending(url), so it should
+        # join the in-flight warm rather than re-extract.
+        sid, kind, resp, session_ms = _create_session(c, url)
+        total_ms = int((time.monotonic() - t0) * 1000)
+
+        if sid is None:
+            if _is_platform_blocked(resp):
+                pytest.skip(f"YouTube blocked: {resp.text[:200]}")
+            pytest.fail(f"CREATE {url}: {resp.status_code} {resp.text[:200]}")
+
+        fstatus, stream_ms, nbytes, body, text = _fetch_first_bytes(c, sid, kind)
+        post_ms = session_ms + stream_ms
+
+        _RESULTS.append(
+            {
+                "platform": "YouTube",
+                "url": url,
+                "post_warm_ms": post_ms,
+                "session_ms": session_ms,
+                "stream_ms": stream_ms,
+            }
+        )
+
+        assert fstatus in (200, 206), f"stream={fstatus}"
+        assert nbytes > 0
+        assert _is_playable_body(kind, body, text)
+        assert total_ms <= WARM_DEDUP_RACE_BUDGET_MS, (
+            f"warm+session dedup race took {total_ms}ms "
+            f"(session={session_ms} stream={stream_ms}); double extract suspected "
+            f"(budget {WARM_DEDUP_RACE_BUDGET_MS}ms)"
         )
         c.delete(f"/api/preview/session/{sid}")

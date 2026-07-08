@@ -39,11 +39,12 @@ import {
   warmYoutubePreviewBatch,
   bindYoutubeChannelScrollWarm,
   waitForPreviewMuxReady,
-  shouldWaitForPreviewMux,
+  shouldPollPreviewMuxReady,
   clampPreviewTimeToVodTrim,
   PREVIEW_SEEK_DEBOUNCE_MS,
   previewMuxPollMaxMs,
   previewPlaylistPollMaxMs,
+  youtubePreviewMuxPollMaxMs,
   attachPreviewBufferingListeners,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
@@ -849,10 +850,11 @@ export default function App() {
         setPreviewMetaDurationSec(synced.duration);
       }
       const playback = resolvePreviewPlayback(url.trim(), res);
-      if (youtubePreview && shouldWaitForPreviewMux(res, playback.kind)) {
-        const pollMaxMs = !res.trim_timeline && playback.kind === 'hls'
-          ? previewPlaylistPollMaxMs()
-          : previewMuxPollMaxMs(start, end);
+      if (youtubePreview && shouldPollPreviewMuxReady(res, playback.kind, playback.url)) {
+        const pollMaxMs = youtubePreviewMuxPollMaxMs(
+          playback.kind,
+          res.trim_timeline === true,
+        );
         const muxReady = await waitForPreviewMuxReady(
           res.session_id,
           apiGet,
@@ -953,6 +955,7 @@ export default function App() {
 
     const onCanPlay = () => {
       setPreviewVideoReady(true);
+      setPreviewBuffering(false);
       setPreviewVideoLoading(false);
       video.volume = PREVIEW_DEFAULT_VOLUME;
       previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
@@ -969,6 +972,13 @@ export default function App() {
         });
       }
     };
+
+    const clearStallUi = () => {
+      if (cancelled) return;
+      setPreviewVideoLoading(false);
+      setPreviewBuffering(false);
+    };
+    video.addEventListener('playing', clearStallUi);
 
     if (playbackKind === 'progressive' || isClipPreviewUrl(previewPageUrl)) {
       const meta = previewSessionMetaRef.current;
@@ -1037,7 +1047,7 @@ export default function App() {
         extractSource: previewExtractSourceRef.current,
         getResumeSec: () => video.currentTime,
         apiPost,
-        onRefreshing: () => setPreviewVideoLoading(true),
+        onRefreshing: () => setPreviewBuffering(true),
         onFatal: () => {
           setError('Preview interrupted — try again');
           setPreviewVideoLoading(false);
@@ -1050,6 +1060,7 @@ export default function App() {
       }, { once: true });
       cleanup = () => {
         video.removeEventListener('loadedmetadata', onLoadedMeta);
+        video.removeEventListener('playing', clearStallUi);
         cleanupRecovery();
         detachProgressivePreview(video);
       };
@@ -1083,6 +1094,7 @@ export default function App() {
       };
       requestAnimationFrame(() => requestAnimationFrame(loadPlayback));
       let levelsInitialized = false;
+      let maxMenuHeight = 0;
       const playerCap = measurePlayerHeightCap(
         previewContainerRef.current ?? previewPanelRef.current,
         previewVideoAspectRef.current,
@@ -1107,8 +1119,11 @@ export default function App() {
           fallbackHeights,
         });
         if (!mapped.length) return;
+        const maxH = Math.max(0, ...mapped.map((m) => m.height));
+        const grew = maxH > maxMenuHeight;
+        if (grew) maxMenuHeight = maxH;
         setPreviewLevels(mapped);
-        if (!levelsInitialized || applyDefault) {
+        if (!levelsInitialized || applyDefault || grew) {
           levelsInitialized = true;
           const hlsIndex = mapped[defaultIndex]?.index ?? defaultIndex;
           if (hls.levels.length > 0 && hlsIndex >= 0 && hlsIndex < hls.levels.length) {
@@ -1188,6 +1203,7 @@ export default function App() {
       });
       cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', clearStallUi);
         try {
           hls.stopLoad();
           hls.detachMedia();
@@ -1205,6 +1221,7 @@ export default function App() {
       video.addEventListener('canplay', onCanPlay, { once: true });
       cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', clearStallUi);
         video.removeAttribute('src');
         video.load();
       };
@@ -4082,7 +4099,7 @@ export default function App() {
                   }}
                   onPause={() => setPreviewPlaying(false)}
                 />
-                {previewVideoLoading && (
+                {previewVideoLoading && !previewVideoReady && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20 pointer-events-none">
                     <Loader2 size={40} className="animate-spin text-zinc-300" />
                     {!previewPlayback && (

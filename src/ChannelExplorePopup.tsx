@@ -25,9 +25,11 @@ import {
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
   warmYoutubePreview,
-  youtubeVideoIdFromUrl,
   waitForPreviewMuxReady,
-  shouldWaitForPreviewMux,
+  shouldPollPreviewMuxReady,
+  shouldPollPreviewMuxReady,
+  youtubePreviewMuxPollMaxMs,
+  PREVIEW_SEEK_DEBOUNCE_MS,
   attachPreviewBufferingListeners,
   previewMuxPollMaxMs,
   previewPlaylistPollMaxMs,
@@ -36,16 +38,6 @@ import {
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
-import {
-  createYoutubeEmbedPlayer,
-  loadYoutubeIframeApi,
-  mapYoutubePlaybackQualities,
-  YT_PLAYER_STATE,
-  YOUTUBE_EMBED_CLIP,
-  YOUTUBE_EMBED_SCALE,
-  type YTPlayer,
-  type YoutubeEmbedQuality,
-} from './youtubeIframePlayer';
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
@@ -153,7 +145,6 @@ export default function ChannelExplorePopup({
   const [fullscreen, setFullscreen] = useState(false);
   const [fsControlsVisible, setFsControlsVisible] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [youtubeEmbedId, setYoutubeEmbedId] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -179,10 +170,8 @@ export default function ChannelExplorePopup({
   const posRef = useRef<PanelPos | null>(null);
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
   const videoWrapRef = useRef<HTMLDivElement>(null);
-  const ytHostRef = useRef<HTMLDivElement>(null);
-  const ytPlayerRef = useRef<YTPlayer | null>(null);
-  const ytQualitiesRef = useRef<YoutubeEmbedQuality[]>([]);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
+  const seekDebounceRef = useRef<number | null>(null);
   const suppressPlayRef = useRef(false);
   const platform = explorePlatformKey(vod.platform);
   const {
@@ -208,11 +197,6 @@ export default function ChannelExplorePopup({
 
   useEffect(() => {
     const pause = () => {
-      if (ytPlayerRef.current) {
-        ytPlayerRef.current.pauseVideo();
-        setPlaying(false);
-        return;
-      }
       videoRef.current?.pause();
       setPlaying(false);
     };
@@ -245,32 +229,6 @@ export default function ChannelExplorePopup({
     setQualityMenuOpen(false);
     requestedHeightRef.current = 0;
     appliedHeightRef.current = 0;
-
-    const ytEmbedId = platform === 'youtube' && !vod.isClip
-      ? youtubeVideoIdFromUrl(vod.url)
-      : null;
-    if (ytEmbedId) {
-      setYoutubeEmbedId(ytEmbedId);
-      setPlayback(null);
-      sessionIdRef.current = null;
-      trimTimelineRef.current = false;
-      const applyDuration = (dur: number) => {
-        if (cancelled || dur <= 0) return;
-        setSessionDurationSec(dur);
-        setMediaDurationSec(dur);
-      };
-      if (vod.durationSec > 0) applyDuration(vod.durationSec);
-      else {
-        void apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(vod.url)}`)
-          .then((info) => applyDuration(videoInfoDurationSec(info)))
-          .catch(() => {});
-      }
-      return () => {
-        cancelled = true;
-        setYoutubeEmbedId(null);
-      };
-    }
-    setYoutubeEmbedId(null);
 
     (async () => {
       try {
@@ -313,10 +271,11 @@ export default function ChannelExplorePopup({
         }
         trimTimelineRef.current = res.trim_timeline === true;
         const resolved = resolvePreviewPlayback(vod.url, res);
-        if (platform === 'youtube' && shouldWaitForPreviewMux(res, resolved.kind)) {
-          const pollMaxMs = !res.trim_timeline && resolved.kind === 'hls'
-            ? previewPlaylistPollMaxMs()
-            : previewMuxPollMaxMs(0, cropEnd);
+        if (platform === 'youtube' && shouldPollPreviewMuxReady(res, resolved.kind, resolved.url)) {
+          const pollMaxMs = youtubePreviewMuxPollMaxMs(
+            resolved.kind,
+            res.trim_timeline === true,
+          );
           const muxReady = await waitForPreviewMuxReady(
             res.session_id,
             apiGet,
@@ -359,6 +318,10 @@ export default function ChannelExplorePopup({
 
     return () => {
       cancelled = true;
+      if (seekDebounceRef.current != null) {
+        window.clearTimeout(seekDebounceRef.current);
+        seekDebounceRef.current = null;
+      }
       const hls = hlsRef.current;
       if (hls) {
         try {
@@ -386,98 +349,6 @@ export default function ChannelExplorePopup({
     };
   }, [vod.url, vod.durationSec]);
 
-  useEffect(() => {
-    if (!youtubeEmbedId) return;
-    let cancelled = false;
-    let tick: number | undefined;
-    const host = ytHostRef.current;
-    if (!host) return;
-
-    setLoading(true);
-    setReady(false);
-    setBuffering(false);
-    setCurrentTime(0);
-    setPlaying(false);
-    setError(null);
-
-    void loadYoutubeIframeApi().then(() => {
-      if (cancelled || !ytHostRef.current) return;
-      try {
-        ytPlayerRef.current?.destroy();
-      } catch {
-        /* ignore */
-      }
-      const player = createYoutubeEmbedPlayer(ytHostRef.current, youtubeEmbedId, {
-        onReady: (p) => {
-          if (cancelled) return;
-          ytPlayerRef.current = p;
-          const dur = p.getDuration();
-          if (dur > 0 && Number.isFinite(dur)) {
-            const rounded = Math.floor(dur);
-            setMediaDurationSec(rounded);
-            setSessionDurationSec((prev) => (prev > 0 ? prev : rounded));
-          }
-          setVideoAspect(16 / 9);
-          videoAspectRef.current = 16 / 9;
-          const levels = mapYoutubePlaybackQualities(p.getAvailableQualityLevels());
-          ytQualitiesRef.current = levels;
-          const mapped: PreviewLevelOption[] = levels.map((l, i) => ({
-            index: i,
-            height: l.height,
-            label: l.label,
-          }));
-          setPreviewLevels(mapped);
-          setQualityLevel(0);
-          p.setVolume(Math.round(volumeRef.current * 100));
-          if (volumeRef.current > 0) {
-            p.unMute();
-            setMuted(false);
-          } else {
-            p.mute();
-            setMuted(true);
-          }
-          setLoading(false);
-          setReady(true);
-          p.playVideo();
-          setPlaying(true);
-          tick = window.setInterval(() => {
-            const pl = ytPlayerRef.current;
-            if (!pl || cancelled) return;
-            const t = pl.getCurrentTime();
-            if (Number.isFinite(t)) setCurrentTime(t);
-          }, 250);
-        },
-        onStateChange: (state) => {
-          if (cancelled) return;
-          setPlaying(state === YT_PLAYER_STATE.PLAYING);
-          setBuffering(state === YT_PLAYER_STATE.BUFFERING);
-        },
-        onError: () => {
-          if (cancelled) return;
-          setError('YouTube playback failed');
-          setLoading(false);
-        },
-      });
-      ytPlayerRef.current = player;
-    }).catch(() => {
-      if (!cancelled) {
-        setError('Could not load YouTube player');
-        setLoading(false);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      if (tick != null) window.clearInterval(tick);
-      try {
-        ytPlayerRef.current?.destroy();
-      } catch {
-        /* ignore */
-      }
-      ytPlayerRef.current = null;
-      ytQualitiesRef.current = [];
-    };
-  }, [youtubeEmbedId, setPreviewLevels, setQualityLevel]);
 
 
 
@@ -488,20 +359,6 @@ export default function ChannelExplorePopup({
 
 
   const togglePlay = useCallback(() => {
-    const yt = ytPlayerRef.current;
-    if (yt && ready) {
-      if (playing) {
-        yt.pauseVideo();
-        setPlaying(false);
-      } else {
-        yt.unMute();
-        yt.setVolume(Math.round(volumeRef.current * 100));
-        yt.playVideo();
-        setMuted(false);
-        setPlaying(true);
-      }
-      return;
-    }
     const video = videoRef.current;
     if (!video || !ready) return;
     if (video.paused) {
@@ -517,20 +374,6 @@ export default function ChannelExplorePopup({
 
   const setVolumeLevel = useCallback((level: number) => {
     const v = Math.max(0, Math.min(1, level));
-    const yt = ytPlayerRef.current;
-    if (yt) {
-      yt.setVolume(Math.round(v * 100));
-      if (v > 0) {
-        yt.unMute();
-        volumeRef.current = v;
-        setMuted(false);
-      } else {
-        yt.mute();
-        setMuted(true);
-      }
-      setVolume(v);
-      return;
-    }
     const video = videoRef.current;
     if (!video) return;
     video.volume = v;
@@ -552,12 +395,6 @@ export default function ChannelExplorePopup({
 
   const seekVideo = useCallback((sec: number) => {
     const t = Math.max(0, Math.min(sec, effectiveDurationSec));
-    const yt = ytPlayerRef.current;
-    if (yt && ready) {
-      yt.seekTo(t, true);
-      setCurrentTime(t);
-      return;
-    }
     const video = videoRef.current;
     if (!video || !ready) return;
     if (Math.abs(video.currentTime - t) > 0.2) {
@@ -566,13 +403,19 @@ export default function ChannelExplorePopup({
     setCurrentTime(t);
   }, [ready, effectiveDurationSec]);
 
+  const seekVideoDebounced = useCallback((sec: number) => {
+    setCurrentTime(Math.max(0, Math.min(sec, effectiveDurationSec)));
+    if (seekDebounceRef.current != null) {
+      window.clearTimeout(seekDebounceRef.current);
+    }
+    seekDebounceRef.current = window.setTimeout(() => {
+      seekDebounceRef.current = null;
+      seekVideo(sec);
+    }, PREVIEW_SEEK_DEBOUNCE_MS);
+  }, [effectiveDurationSec, seekVideo]);
+
   const skip = useCallback((deltaSec: number) => {
     if (!ready) return;
-    const yt = ytPlayerRef.current;
-    if (yt) {
-      seekVideo(yt.getCurrentTime() + deltaSec);
-      return;
-    }
     const video = videoRef.current;
     if (!video) return;
     seekVideo(video.currentTime + deltaSec);
@@ -713,7 +556,7 @@ export default function ChannelExplorePopup({
   }, [fullscreen, panelWidth, videoAspect, ready]);
 
   useEffect(() => {
-    if (youtubeEmbedId || !playback?.url) return;
+    if (!playback?.url) return;
     let cancelled = false;
     let cleanup: (() => void) | undefined;
     let detachBuffering: (() => void) | undefined;
@@ -736,6 +579,7 @@ export default function ChannelExplorePopup({
 
     const onCanPlay = () => {
       setReady(true);
+      setBuffering(false);
       setLoading(false);
       video.volume = PREVIEW_DEFAULT_VOLUME;
       volumeRef.current = PREVIEW_DEFAULT_VOLUME;
@@ -747,6 +591,13 @@ export default function ChannelExplorePopup({
         });
       }
     };
+
+    const clearStallUi = () => {
+      if (cancelled) return;
+      setLoading(false);
+      setBuffering(false);
+    };
+    video.addEventListener('playing', clearStallUi);
 
     if (playbackKind === 'progressive' || isClipPreviewUrl(vod.url)) {
       const meta = sessionMetaRef.current;
@@ -811,7 +662,7 @@ export default function ChannelExplorePopup({
         extractSource: extractSourceRef.current,
         getResumeSec: () => video.currentTime,
         apiPost,
-        onRefreshing: () => setLoading(true),
+        onRefreshing: () => setBuffering(true),
         onFatal: onVideoError,
       });
       video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
@@ -819,6 +670,7 @@ export default function ChannelExplorePopup({
       cleanup = () => {
         video.removeEventListener('loadedmetadata', onLoadedMeta);
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', clearStallUi);
         cleanupRecovery();
         detachProgressivePreview(video);
       };
@@ -849,6 +701,7 @@ export default function ChannelExplorePopup({
       };
       requestAnimationFrame(() => requestAnimationFrame(loadPlayback));
       let levelsInitialized = false;
+      let maxMenuHeight = 0;
       const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
       const meta = sessionMetaRef.current;
       const fallbackHeights = mergeVariantHeights(playback.variantHeights);
@@ -863,7 +716,10 @@ export default function ChannelExplorePopup({
           fallbackHeights,
         });
         if (!mapped.length) return;
-        if (!levelsInitialized || applyDefault) {
+        const maxH = Math.max(0, ...mapped.map((m) => m.height));
+        const grew = maxH > maxMenuHeight;
+        if (grew) maxMenuHeight = maxH;
+        if (!levelsInitialized || applyDefault || grew) {
           levelsInitialized = true;
           const hlsIndex = mapped[defaultIndex]?.index ?? defaultIndex;
           if (hls.levels.length > 0 && hlsIndex >= 0 && hlsIndex < hls.levels.length) {
@@ -907,6 +763,7 @@ export default function ChannelExplorePopup({
       });
       cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', clearStallUi);
         hls.destroy();
         hlsRef.current = null;
         setHlsRef(null);
@@ -924,6 +781,7 @@ export default function ChannelExplorePopup({
       video.addEventListener('canplay', onCanPlay, { once: true });
       cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', clearStallUi);
         video.removeAttribute('src');
         video.load();
       };
@@ -964,7 +822,7 @@ export default function ChannelExplorePopup({
         step={0.25}
         value={Math.min(currentTime, effectiveDurationSec)}
         disabled={!ready}
-        onChange={(e) => seekVideo(parseFloat(e.target.value))}
+        onChange={(e) => seekVideoDebounced(parseFloat(e.target.value))}
         className="flex-1 accent-white disabled:opacity-40 h-1"
       />
       <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${fullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
@@ -1017,13 +875,6 @@ export default function ChannelExplorePopup({
       menuOpen={qualityMenuOpen}
       setMenuOpen={setQualityMenuOpen}
       onSelect={(idx: number) => {
-        const ytQ = ytQualitiesRef.current[idx];
-        if (ytPlayerRef.current && ytQ) {
-          ytPlayerRef.current.setPlaybackQuality(ytQ.ytQuality);
-          setQualityLevel(idx);
-          setQualityMenuOpen(false);
-          return;
-        }
         void applyQuality(idx);
         setQualityMenuOpen(false);
       }}
@@ -1117,32 +968,11 @@ export default function ChannelExplorePopup({
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
             if (!ready) return;
-            if (ytPlayerRef.current) {
-              togglePlay();
-              return;
-            }
             const video = videoRef.current;
             if (video) unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
             togglePlay();
           }}
         >
-          {youtubeEmbedId ? (
-            <div className="absolute inset-0 overflow-hidden bg-black">
-              <div
-                ref={ytHostRef}
-                className="w-full h-full origin-center [&_iframe]:pointer-events-none [&_iframe]:border-0"
-                style={{
-                  transform: `scale(${YOUTUBE_EMBED_SCALE})`,
-                  clipPath: YOUTUBE_EMBED_CLIP,
-                }}
-              />
-              {/* ponytail: blocks YT title/logo hit areas; iframe already pointer-events-none */}
-              <div className="absolute inset-0 z-10 pointer-events-none" aria-hidden>
-                <div className="absolute top-0 inset-x-0 h-[14%] bg-gradient-to-b from-black via-black/70 to-transparent" />
-                <div className="absolute bottom-0 inset-x-0 h-[16%] bg-gradient-to-t from-black via-black/70 to-transparent" />
-              </div>
-            </div>
-          ) : (
           <video
             ref={videoRef}
             className="w-full h-full object-contain pointer-events-none"
@@ -1179,15 +1009,12 @@ export default function ChannelExplorePopup({
             }}
             onPause={() => setPlaying(false)}
           />
-          )}
-          {loading && (
+          {loading && !ready && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20">
               <Loader2 size={28} className="animate-spin text-zinc-300" />
-              {youtubeEmbedId ? 'Loading YouTube…' : (
-                <span className="text-zinc-300 text-[10px] font-mono">
-                  {platform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
-                </span>
-              )}
+              <span className="text-zinc-300 text-[10px] font-mono">
+                {platform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
+              </span>
             </div>
           )}
           {buffering && ready && !loading && (

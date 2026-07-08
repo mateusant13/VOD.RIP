@@ -2179,7 +2179,7 @@ def resolve_stream_info(
         cache_key: Optional[str] = None
         vid = extract_video_id(full_url)
         if vid:
-            cache_key = f"{vid}:{prefer_height}"
+            cache_key = f"{vid}:{prefer_height}:v2"
             cached = _get_resolved_stream_cached(cache_key)
             if cached is not None:
                 return cached
@@ -2225,7 +2225,16 @@ def resolve_stream_info(
             return result
 
         # MP4 (muxed progressive) → muxed HLS → DASH window HLS (ffmpeg last resort).
+        muxed_hls = [f for f in hls_variants if _is_muxed_format(f)]
+        muxed_with_height = [f for f in muxed_hls if int(f.get("height") or 0) > 0]
+        video_heights_all = [f for f in merged if int(f.get("height") or 0) > 0]
+        max_video_h = max((int(f.get("height") or 0) for f in video_heights_all), default=0)
         muxed_progressive = _deduped_progressive_variants({"formats": merged})
+        # ponytail: one low progressive tier (e.g. 360p) hides 720p/1080p DASH/HLS ladder
+        if muxed_progressive and len(muxed_progressive) < 2:
+            max_prog_h = max(int(f.get("height") or 0) for f in muxed_progressive)
+            if max_video_h > max_prog_h:
+                muxed_progressive = []
         if muxed_progressive:
             prog_urls = [
                 (int(v.get("height") or 0), v.get("url") or "") for v in muxed_progressive
@@ -2241,8 +2250,6 @@ def resolve_stream_info(
                     headers = {**headers, **picked["http_headers"]}
                 return _yt_resolve("progressive", prog_url, muxed_progressive)
 
-        muxed_hls = [f for f in hls_variants if _is_muxed_format(f)]
-        muxed_with_height = [f for f in muxed_hls if int(f.get("height") or 0) > 0]
         if muxed_with_height:
             for fmt in muxed_hls:
                 stream_url = fmt.get("url") or ""
