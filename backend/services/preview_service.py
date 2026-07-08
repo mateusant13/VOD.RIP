@@ -2035,13 +2035,21 @@ def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
         _RESOLVED_STREAM_CACHE[key] = (time.time(), value)
 
 
+def _youtube_warm_inflight_key(url: str) -> str:
+    """Dedup paste warm + create_session await on video id, not shorts vs watch URL."""
+    from services.youtube_innertube import extract_video_id
+
+    raw = (url or "").strip()
+    return extract_video_id(raw) or raw
+
+
 def kickoff_youtube_warm(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
 ) -> None:
     """Fire-and-forget warm on URL paste — deduped per canonical URL."""
-    key = (url or "").strip()
+    key = _youtube_warm_inflight_key(url)
     if not key:
         return
     with _YOUTUBE_WARM_LOCK:
@@ -2051,11 +2059,19 @@ def kickoff_youtube_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        ok = False
         try:
             from services.ytdlp_hls import warm_youtube_extract
 
-            warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
+            ok = warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
         finally:
+            if not ok:
+                try:
+                    from services.youtube_session import invalidate_anonymous_session
+
+                    invalidate_anonymous_session()
+                except Exception:
+                    pass
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
             if ev is not None:
@@ -2068,7 +2084,7 @@ def kickoff_youtube_warm(
 
 def await_youtube_warm_if_pending(url: str, timeout_sec: float = 45.0) -> None:
     """Block create_session until an in-flight paste warm finishes."""
-    key = (url or "").strip()
+    key = _youtube_warm_inflight_key(url)
     if not key:
         return
     with _YOUTUBE_WARM_LOCK:
@@ -2123,6 +2139,10 @@ def resolve_stream_info(
         return info.m3u8_url, headers, platform, [], "hls", None
 
     full_url = build_url(url, platform)
+    if platform == "YouTube":
+        from services.youtube_innertube import canonical_youtube_watch_url
+
+        full_url = canonical_youtube_watch_url(full_url) or full_url
 
     # Twitch clips — prefer yt-dlp for progressive MP4 resolution.
     # yt-dlp uses OAuth tokens (when available) for authenticating CDN requests.
@@ -2988,4 +3008,6 @@ _placeholder = PreviewSession(
     platform="YouTube", cache_dir=Path("/tmp"), crop_start=0, crop_end=7200,
 )
 _clamp_session_crop_to_vod_duration(_placeholder, {"duration": 19})
-assert _placeholder.crop_end == 19, "placeholder clamp without boost stays at extract dur"
+assert _placeholder.crop_end == 19, "placeholder clamp without extract dur stays at extract dur"
+assert _youtube_warm_inflight_key("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+assert _youtube_warm_inflight_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"

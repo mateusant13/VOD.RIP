@@ -131,7 +131,8 @@ def _youtube_manual_auth_configured() -> bool:
     try:
         from deps import settings_mgr
         s = settings_mgr.get()
-        if (getattr(s, "youtube_cookies_file", "") or "").strip():
+        path = (getattr(s, "youtube_cookies_file", "") or "").strip()
+        if path and Path(path).is_file() and not Path(path).name.startswith("yt_anon_"):
             return True
         if (getattr(s, "youtube_cookies_browser", "") or "").strip():
             return True
@@ -145,23 +146,32 @@ def _youtube_manual_auth_configured() -> bool:
 
 
 def _youtube_has_user_auth(opts: dict) -> bool:
-    """True only for user-configured auth ÔÇö anonymous bootstrap cookie jar is not manual auth."""
-    if _youtube_manual_auth_configured():
-        return True
-    if opts.get("cookiesfrombrowser"):
-        return True
+    """True only for user-configured auth — anonymous bootstrap cookie jar is not manual auth."""
     session = opts.get("_youtube_session")
     if session and getattr(session, "anonymous", False):
         return False
-    return bool(_youtube_cookie_path(opts))
+    if opts.get("cookiesfrombrowser"):
+        return True
+    if _youtube_manual_auth_configured():
+        return True
+    cookie_path = _youtube_cookie_path(opts)
+    if cookie_path and not Path(cookie_path).name.startswith("yt_anon_"):
+        return True
+    return False
 
 
 def invalidate_youtube_extract_cache(url: str) -> None:
     """Drop cached extract for *url* so the next resolve can try other clients."""
-    prefix = f"{url}|"
+    from services.youtube_innertube import canonical_youtube_watch_url, extract_video_id
+
+    keys = {(canonical_youtube_watch_url(url) or url)}
+    vid = extract_video_id(url)
+    if vid:
+        keys.add(f"https://www.youtube.com/watch?v={vid}")
+    prefixes = tuple(f"{k}|" for k in keys)
     with _EXTRACT_CACHE_LOCK:
         for key in list(_EXTRACT_INFO_CACHE):
-            if key.startswith(prefix):
+            if key.startswith(prefixes):
                 _EXTRACT_INFO_CACHE.pop(key, None)
 
 
@@ -169,6 +179,9 @@ assert invalidate_youtube_extract_cache.__name__ == "invalidate_youtube_extract_
 
 
 def _extract_cache_key(url: str, opts: dict) -> str:
+    from services.youtube_innertube import canonical_youtube_watch_url
+
+    cache_url = canonical_youtube_watch_url(url) or url
     clients = (
         (opts.get("extractor_args") or {})
         .get("youtube", {})
@@ -181,7 +194,7 @@ def _extract_cache_key(url: str, opts: dict) -> str:
     sess_key = ""
     if session is not None:
         sess_key = f"{bool(session.visitor_data)}|{bool(session.po_token)}|{bool(session.cookie_header)}"
-    return f"{url}|{clients}|{bool(oauth)}|{cookie}|{browser}|{sess_key}"
+    return f"{cache_url}|{clients}|{bool(oauth)}|{cookie}|{browser}|{sess_key}"
 
 
 def _youtube_url_from_opts(url: str, opts: dict) -> bool:
@@ -387,24 +400,22 @@ def _bare_ytdlp_opts(opts: dict) -> dict:
 
 
 def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
-    """Soft anonymous refresh ÔÇö bootstrap new visitor cookies, no browser auth path."""
+    """Soft anonymous refresh — bootstrap new visitor cookies, no settings cookies_file."""
     from services.youtube_innertube import extract_video_id
     from services.youtube_session import (
         apply_ytdlp_cookie_opts,
-        bootstrap_anonymous_session,
-        youtube_session_from_settings,
+        youtube_session_bootstrap_only,
         ytdlp_extractor_args,
     )
 
     vid = extract_video_id(url)
-    bootstrap_anonymous_session(video_id=vid, force=True)
-    fresh = youtube_session_from_settings(video_id=vid)
+    fresh = youtube_session_bootstrap_only(video_id=vid, force=True)
     merged = dict(opts)
     merged["_youtube_session"] = fresh
     merged["extractor_args"] = ytdlp_extractor_args(fresh, auto_auth=False)
     merged.pop("cookiefile", None)
     merged.pop("cookiesfrombrowser", None)
-    apply_ytdlp_cookie_opts(merged, fresh, auto_auth=False)
+    apply_ytdlp_cookie_opts(merged, fresh, auto_auth=False, cookies_file=None)
     return merged
 
 
@@ -485,13 +496,23 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
 
     if _youtube_cookie_path(opts) or opts.get("cookiesfrombrowser"):
         info = _extract_hls_info_quiet(url, opts)
-        if info:
+        if info and _youtube_info_playable(info):
             log_extract_ok(vid, "ytdlp_cookies", info, yt_session)
             return info
     info = _try_innertube_info_retry(url, session=yt_session)
-    if info:
+    if info and _youtube_info_playable(info):
         log_extract_ok(vid, "innertube_pass", info, yt_session)
         return info
+    # ponytail: stale youtube_cookies_file blocks all clients — retry anon fast path once
+    if has_auth and _youtube_manual_auth_configured():
+        from services.youtube_diag import log_extract_fail
+
+        log_extract_fail(vid, "auth_fallback_anon", yt_session, detail="manual cookies exhausted")
+        anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
+        anon_session = anon_opts.get("_youtube_session")
+        info = _youtube_extract_parallel_fast(url, anon_opts, anon_session, vid)
+        if info:
+            return info
     info = _extract_hls_info_quiet(url, bare_opts)
     if info and _youtube_info_playable(info):
         log_extract_ok(vid, "ytdlp_bare", info, yt_session)
@@ -540,6 +561,11 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
     info = _youtube_extract_pass(url, opts)
     if info and _youtube_info_playable(info):
         return info
+    if _youtube_has_user_auth(opts) and _youtube_manual_auth_configured():
+        anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
+        info = _youtube_extract_pass(url, anon_opts)
+        if info and _youtube_info_playable(info):
+            return info
     if not _youtube_has_user_auth(opts):
         from services.youtube_session import invalidate_anonymous_session
 
@@ -551,7 +577,10 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
     # ponytail: channel VODs often miss the 8s fast path — allow full extract before 500
     if time.monotonic() - t0 < _PREVIEW_EXTRACT_FALLBACK_SEC:
         try:
-            return _youtube_extract_with_retries(url, opts, attempts=3)
+            retry_opts = opts
+            if _youtube_manual_auth_configured():
+                retry_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
+            return _youtube_extract_with_retries(url, retry_opts, attempts=3)
         except Exception as exc:
             logger.debug("preview extract fallback failed %s: %s", url[:60], exc)
     raise RuntimeError("YouTube preview unavailable for this video")

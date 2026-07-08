@@ -406,6 +406,27 @@ def youtube_session_from_values(
     )
 
 
+def youtube_session_bootstrap_only(
+    video_id: Optional[str] = None,
+    *,
+    force: bool = True,
+) -> YouTubeSession:
+    """Anonymous session from bootstrap only — never settings cookies_file."""
+    vd, cookie_header, cookie_file, http_session = bootstrap_anonymous_session(
+        video_id=video_id,
+        force=force,
+    )
+    if not vd:
+        vd = fetch_visitor_data()
+    return YouTubeSession(
+        visitor_data=vd,
+        cookie_header=cookie_header,
+        cookie_file=cookie_file,
+        http_session=http_session,
+        anonymous=bool(cookie_header),
+    )
+
+
 def youtube_session_from_settings(
     settings_mgr=None,
     video_id: Optional[str] = None,

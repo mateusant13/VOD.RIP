@@ -179,6 +179,14 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
+def canonical_youtube_watch_url(url: str) -> Optional[str]:
+    """One watch URL per video id — warm/cache/dedup must not split shorts vs watch."""
+    vid = extract_video_id(url)
+    if not vid:
+        return None
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
 def _parse_hls_variants(master_text: str, master_url: str) -> list[dict[str, Any]]:
     """Turn an HLS master playlist into yt-dlp-shaped format entries."""
     formats: list[dict[str, Any]] = []
@@ -1028,6 +1036,9 @@ def innertube_extract_info(
 
 assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+assert canonical_youtube_watch_url("https://www.youtube.com/shorts/dQw4w9WgXcQ") == (
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+)
 assert "hl" not in _enrich_client_context({"hl": "en", "gl": "US"}, "WEB")
 assert _is_auto_dubbed_audio({"audioTrack": {"isAutoDubbed": True}}) is True
 assert not _is_auto_dubbed_audio({"audioTrack": {"displayName": "Portuguese"}})
