@@ -15,8 +15,9 @@ import time
 import uuid
 import contextvars
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Union
 
 from services.os_services import _NO_WINDOW, _kill_pid, register_child_pid, unregister_child_pid
 
@@ -666,6 +667,141 @@ def probe_segment_codec(
             result["audio_codec"] = name
     return result
 
+
+SEGMENT_EXTINF_TOLERANCE_SEC = 0.15
+
+
+@dataclass(slots=True)
+class SegmentAudit:
+    declared_duration: float
+    actual_duration: float
+    delta: float
+    ok: bool
+    first_pts: Optional[float] = None
+    last_pts: Optional[float] = None
+    pts_monotonic: Optional[bool] = None
+
+
+class SegmentAuditError(RuntimeError):
+    """MPEG-TS segment failed EXTINF / timing audit after mux."""
+
+    def __init__(self, path: str, audit: SegmentAudit):
+        self.path = path
+        self.audit = audit
+        super().__init__(
+            f"segment audit failed path={path} declared={audit.declared_duration:.3f}s "
+            f"actual={audit.actual_duration:.3f}s delta={audit.delta:+.3f}s"
+        )
+
+
+def probe_ts_duration(
+    path: Union[str, Path],
+    ffmpeg_exe: Optional[str] = None,
+) -> float:
+    """Return MPEG-TS container duration in seconds (format=duration, not stream)."""
+    ffprobe = _resolve_ffprobe_exe(ffmpeg_exe)
+    target = Path(path)
+    if not ffprobe or not target.is_file():
+        raise RuntimeError(f"ffprobe unavailable or file missing: {path}")
+    out = sp.run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        creationflags=_NO_WINDOW,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe duration failed rc={out.returncode}: {(out.stderr or '').strip()}"
+        )
+    raw = (out.stdout or "").strip()
+    if not raw or raw.upper() == "N/A":
+        raise RuntimeError(f"ffprobe returned no duration for {path}")
+    duration = float(raw)
+    if duration <= 0:
+        raise RuntimeError(f"ffprobe duration invalid ({duration}) for {path}")
+    return duration
+
+
+def probe_ts_pts_bounds(
+    path: Union[str, Path],
+    ffmpeg_exe: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """First/last video packet pts_time — diagnostic only for ~10s preview segments."""
+    ffprobe = _resolve_ffprobe_exe(ffmpeg_exe)
+    target = Path(path)
+    if not ffprobe or not target.is_file():
+        return None, None
+    try:
+        out = sp.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=pts_time",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=_NO_WINDOW,
+        )
+    except (OSError, sp.TimeoutExpired):
+        return None, None
+    if out.returncode != 0:
+        return None, None
+    pts: list[float] = []
+    for line in (out.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.upper() == "N/A":
+            continue
+        try:
+            pts.append(float(stripped))
+        except ValueError:
+            continue
+    if not pts:
+        return None, None
+    return pts[0], pts[-1]
+
+
+def audit_segment_extinf(
+    path: Union[str, Path],
+    declared_sec: float,
+    tolerance: float = SEGMENT_EXTINF_TOLERANCE_SEC,
+    ffmpeg_exe: Optional[str] = None,
+    check_pts: bool = True,
+) -> SegmentAudit:
+    """Compare playlist EXTINF to ffprobe format duration; optional PTS sanity."""
+    actual = probe_ts_duration(path, ffmpeg_exe=ffmpeg_exe)
+    delta = actual - declared_sec
+    first_pts: Optional[float] = None
+    last_pts: Optional[float] = None
+    pts_monotonic: Optional[bool] = None
+    if check_pts:
+        first_pts, last_pts = probe_ts_pts_bounds(path, ffmpeg_exe=ffmpeg_exe)
+        if first_pts is not None and last_pts is not None:
+            pts_monotonic = last_pts >= first_pts
+    ok = abs(delta) <= tolerance
+    if pts_monotonic is False:
+        ok = False
+    return SegmentAudit(
+        declared_duration=declared_sec,
+        actual_duration=actual,
+        delta=delta,
+        ok=ok,
+        first_pts=first_pts,
+        last_pts=last_pts,
+        pts_monotonic=pts_monotonic,
+    )
+
+
 def _bundled_ffmpeg_dirs() -> list[Path]:
     """PyInstaller COLLECT / one-file extract dirs that ship ffmpeg next to the app."""
     dirs: list[Path] = []
@@ -900,3 +1036,8 @@ def _format_ts(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+assert abs(10.0 - 9.92) <= SEGMENT_EXTINF_TOLERANCE_SEC
+assert not (abs(10.0 - 9.5) <= SEGMENT_EXTINF_TOLERANCE_SEC)
+_audit = SegmentAudit(declared_duration=10.0, actual_duration=9.92, delta=-0.08, ok=True)
+assert _audit.ok and _audit.delta < 0

@@ -1,4 +1,4 @@
-"""Real-network: DASH segment mux must work when seeking (high segment indices)."""
+"""Real-network: window HLS serves mid-window segments after whole-window mux."""
 from __future__ import annotations
 
 import time
@@ -21,7 +21,7 @@ def _is_mpegts(body: bytes) -> bool:
     return hits >= 2
 
 
-def _fetch_segment(c, path: str, retries: int = 120) -> tuple[int, bytes]:
+def _fetch(c, path: str, retries: int = 240) -> tuple[int, bytes]:
     for _ in range(retries):
         resp = c.get(path)
         if resp.status_code == 503:
@@ -31,7 +31,7 @@ def _fetch_segment(c, path: str, retries: int = 120) -> tuple[int, bytes]:
     return 503, b""
 
 
-def test_youtube_dash_seek_segments_high_index():
+def test_youtube_window_hls_mid_segments():
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE
 
     _EXTRACT_INFO_CACHE.clear()
@@ -55,10 +55,29 @@ def test_youtube_dash_seek_segments_high_index():
 
             tested = True
             master = c.get(f"/api/preview/hls/{sid}/master.m3u8")
+            playlist_line = next(
+                (
+                    ln.strip()
+                    for ln in master.text.splitlines()
+                    if ln.strip().startswith("/api/") and "window-playlist" in ln
+                ),
+                "",
+            )
+            if not playlist_line:
+                failures.append(f"MASTER {url}: no window-playlist")
+                c.delete(f"/api/preview/session/{sid}")
+                continue
+
+            media_status, media = _fetch(c, playlist_line)
+            if media_status != 200:
+                failures.append(f"MEDIA {url}: HTTP {media_status}")
+                c.delete(f"/api/preview/session/{sid}")
+                continue
+            media_text = media.decode("utf-8", errors="replace")
             paths = [
                 ln.strip()
-                for ln in master.text.splitlines()
-                if ln.strip().startswith("/api/") and "ytseg-" in ln
+                for ln in media_text.splitlines()
+                if ln.strip().startswith("/api/") and "window-seg-" in ln
             ]
             if len(paths) < 6:
                 failures.append(f"PLAYLIST {url}: only {len(paths)} segments")
@@ -66,7 +85,10 @@ def test_youtube_dash_seek_segments_high_index():
                 continue
 
             for idx in (0, 5, 8, 9):
-                status, content = _fetch_segment(c, paths[idx], retries=180)
+                if idx >= len(paths):
+                    failures.append(f"seg{idx} {url}: playlist too short ({len(paths)})")
+                    continue
+                status, content = _fetch(c, paths[idx], retries=300)
                 if status not in (200, 206):
                     failures.append(f"seg{idx} {url}: HTTP {status} body={content[:120]!r}")
                     continue
@@ -80,5 +102,5 @@ def test_youtube_dash_seek_segments_high_index():
             break
 
     if not tested:
-        pytest.skip("no DASH-segment YouTube URL in candidates")
+        pytest.skip("no DASH window-HLS YouTube URL in candidates")
     assert not failures, "\n".join(failures)

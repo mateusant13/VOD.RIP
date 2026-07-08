@@ -59,10 +59,7 @@ async def test_youtube_preview_session_and_stream(url: str):
                 headers={"Range": "bytes=0-4095"},
             )
         else:
-            stream2 = await client.get(
-                f"/api/preview/hls/{sid}/master.m3u8",
-                params={"prefer_height": 480},
-            )
+            stream2 = await client.get(f"/api/preview/hls/{sid}/master.m3u8")
         assert stream2.status_code in (200, 206), (
             f"after quality {url} status={stream2.status_code} {stream2.text[:500]}"
         )

@@ -120,9 +120,10 @@ _EXTRACT_WAIT_SEC = 120
 _YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
 _YOUTUBE_PREVIEW_SOCKET_SEC = 5
 _PREVIEW_EXTRACT_WAIT_SEC = 8.0
-_PREVIEW_EXTRACT_MAX_WALL_SEC = 6.0
+_PREVIEW_EXTRACT_MAX_WALL_SEC = 8.0
+_PREVIEW_EXTRACT_FALLBACK_SEC = 22.0  # total wall incl. full yt-dlp retries on cache miss
 _PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: unused teaser cap ÔÇö mux uses session trim window
-_PREVIEW_MUX_FAST_HEIGHT = 720
+_PREVIEW_MUX_FAST_HEIGHT = 480
 
 
 def _youtube_manual_auth_configured() -> bool:
@@ -534,13 +535,11 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> di
 
 
 def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
-    """Preview SLA: ~6s wall clock ÔÇö parallel race + one refresh, no bare yt-dlp crawl."""
-    deadline = time.monotonic() + _PREVIEW_EXTRACT_MAX_WALL_SEC
+    """Preview SLA: fast InnerTube race, then full retries before giving up."""
+    t0 = time.monotonic()
     info = _youtube_extract_pass(url, opts)
     if info and _youtube_info_playable(info):
         return info
-    if time.monotonic() >= deadline:
-        raise RuntimeError("YouTube preview unavailable for this video")
     if not _youtube_has_user_auth(opts):
         from services.youtube_session import invalidate_anonymous_session
 
@@ -549,6 +548,12 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
         info = _youtube_extract_pass(url, working)
         if info and _youtube_info_playable(info):
             return info
+    # ponytail: channel VODs often miss the 8s fast path — allow full extract before 500
+    if time.monotonic() - t0 < _PREVIEW_EXTRACT_FALLBACK_SEC:
+        try:
+            return _youtube_extract_with_retries(url, opts, attempts=3)
+        except Exception as exc:
+            logger.debug("preview extract fallback failed %s: %s", url[:60], exc)
     raise RuntimeError("YouTube preview unavailable for this video")
 
 
@@ -619,7 +624,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 opts.get("_youtube_session"),
             )
             raise RuntimeError(
-                "YouTube blocked this video ÔÇö add cookies, browser cookies, or po_token in Settings"
+                "YouTube blocked this video — try again or add youtube_cookies_file in settings.json"
             )
         if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
             from services.youtube_innertube import extract_video_id
@@ -663,25 +668,17 @@ assert _youtube_info_playable({"formats": [{"url": "https://x/v.mp4", "protocol"
 
 
 def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None) -> bool:
-    """Prefetch extract cache on hover ÔÇö InnerTube only (fast, no yt-dlp spawn)."""
+    """Prefetch resolved-stream cache on hover — same path as create_session."""
     from services.youtube_innertube import extract_video_id
 
     if not extract_video_id(url):
         return False
     try:
-        opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
-        session = opts.get("_youtube_session")
-        info = _try_innertube_info_retry(
-            url, session=session, allow_session_refresh=False,
-        )
-        if info and _youtube_info_playable(info):
-            key = _extract_cache_key(url, opts)
-            _cache_extract_result(key, info)
-            return True
-        return False
+        from services.preview_service import warm_youtube_preview_resolve
+
+        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=720)
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
-        from services.youtube_innertube import extract_video_id
         log_extract_fail(extract_video_id(url) or "?", "warm_skipped", exc=exc)
         logger.debug("YouTube warm extract skipped for %s: %s", url[:80], exc)
         return False
@@ -1966,6 +1963,10 @@ def _download_muxed_dash_clip(
         cmd += enc_args
     elif _dash_video_needs_transcode(video_url, video_fmt) and not is_ts:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
+    elif is_ts:
+        # ponytail: m4a→mpegts needs AAC ADTS for browser MSE — plain -c copy is silent
+        # initial_discontinuity: each on-demand segment resets PTS; pairs with #EXT-X-DISCONTINUITY
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-mpegts_flags", "+initial_discontinuity"]
     else:
         cmd += ["-c", "copy"]
     if is_ts:
@@ -2046,6 +2047,143 @@ def _download_muxed_dash_clip(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _mux_dash_window_to_hls(
+    video_url: str,
+    audio_url: str,
+    output_dir: str,
+    start_sec: float,
+    end_sec: float,
+    headers: Optional[dict] = None,
+    video_prefix_cache: Optional[str] = None,
+    audio_prefix_cache: Optional[str] = None,
+) -> Path:
+    """Mux a DASH crop window into a local HLS playlist (window.m3u8 + seg_NNN.ts).
+
+    Reuses the ``_fetch_googlevideo_window_local`` Range-fetch path so we never
+    pull the full adaptive-format MP4 — just the byte window the trim needs.
+    Output is ``{output_dir}/window.m3u8`` (VOD playlist, independent segments,
+    4-second target duration) so the frontend MSE player can attach the instant
+    ``seg_000.ts`` lands and HLS.js finalises when ``#EXT-X-ENDLIST`` appears.
+    """
+    from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+
+    os.makedirs(output_dir, exist_ok=True)
+    duration = max(0.1, end_sec - start_sec)
+    ffmpeg_exe = _resolve_ffmpeg_exe()
+    v_local = os.path.join(output_dir, "_v.mp4")
+    a_local = os.path.join(output_dir, "_a.m4a")
+    v_ss = _fetch_googlevideo_window_local(
+        video_url, start_sec, end_sec, headers, v_local,
+        prefix_cache=video_prefix_cache,
+    )
+    a_ss = _fetch_googlevideo_window_local(
+        audio_url, start_sec, end_sec, headers, a_local,
+        prefix_cache=audio_prefix_cache,
+    )
+    playlist = os.path.join(output_dir, "window.m3u8")
+    seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
+    cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-probesize", "8M", "-analyzeduration", "2M",
+        "-ss", str(v_ss), "-i", v_local,
+        "-probesize", "8M", "-analyzeduration", "2M",
+        "-ss", str(a_ss), "-i", a_local,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-t", str(duration),
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "hls",
+        "-hls_time", "4",
+        "-hls_playlist_type", "vod",
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", seg_pattern,
+        playlist,
+    ]
+    _run_ffmpeg(
+        cmd,
+        encode_duration=duration,
+        progress_from=10.0,
+        progress_to=92.0,
+        phase="Muxing",
+    )
+    playlist_path = Path(playlist)
+    if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
+        raise RuntimeError("window HLS mux produced no playlist")
+    return playlist_path
+
+
+def _resolve_youtube_audio_format(info: dict) -> Optional[dict]:
+    """Best HTTPS audio-only stream from InnerTube info."""
+    tagged = info.get("_preview_audio_format")
+    if tagged and tagged.get("url"):
+        return tagged
+    candidates = [
+        f for f in info.get("formats") or []
+        if f.get("url")
+        and (f.get("protocol") or "").lower() in ("https", "http")
+        and f.get("acodec") not in (None, "none")
+        and f.get("vcodec") in (None, "none")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+
+
+def _ytdlp_audio_section_download(
+    url: str,
+    output_path: str,
+    start_sec: float,
+    end_sec: float,
+    opts: dict,
+    progress_hook: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
+    pause_event: Optional[threading.Event] = None,
+    register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
+) -> None:
+    """ponytail: yt-dlp section + extract when DASH audio URL unavailable."""
+    from yt_dlp import YoutubeDL
+    from yt_dlp.utils import download_range_func
+
+    tmpdir = tempfile.mkdtemp(prefix="ytdlp_aud_")
+    try:
+        out_tmpl = os.path.join(tmpdir, "clip.%(ext)s")
+        ydl_opts = dict(opts)
+        ydl_opts.update({
+            "outtmpl": out_tmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "bestaudio/best",
+            "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
+            "force_keyframes_at_cuts": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+        if progress_hook:
+            ydl_opts["progress_hooks"] = [progress_hook]
+        with guarded_youtube_dl(ydl_opts) as ydl:
+            if register_abort:
+                register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
+            _check_pause_cancel(cancel_event, pause_event)
+            ydl.download([url])
+        mp3s = sorted(Path(tmpdir).glob("clip.*"))
+        if not mp3s:
+            raise RuntimeError("yt-dlp audio section produced no output")
+        src = str(mp3s[0])
+        if src != output_path:
+            if os.path.isfile(output_path):
+                os.unlink(output_path)
+            shutil.move(src, output_path)
+        _verify_output_file(output_path)
+        if progress_hook:
+            progress_hook({"status": "finished"})
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _download_hls_clip(
     url: str,
     output_path: str,
@@ -2087,6 +2225,23 @@ def _download_hls_clip(
             and int(f.get("height") or 0) > 0
             and (f.get("protocol") or "").lower() in ("https", "http")
         ]
+        if audio_only:
+            audio_fmt = _resolve_youtube_audio_format(info)
+            if audio_fmt and audio_fmt.get("url"):
+                aheaders = audio_fmt.get("http_headers") or headers
+                _download_progressive_clip(
+                    audio_fmt["url"], output_path, start_sec, end_sec, headers=aheaders,
+                    ffmpeg_exe=ffmpeg_exe,
+                    progress_hook=progress_hook,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    register_abort=register_abort,
+                    prefer_height=prefer_height,
+                    video_encoder=video_encoder,
+                    mp4_faststart=mp4_faststart,
+                    audio_only=True,
+                )
+                return
         if https_formats:
             video_fmt = _pick_youtube_clip_video_format(https_formats, prefer_height)
             vheaders = video_fmt.get("http_headers") or headers
@@ -2119,6 +2274,15 @@ def _download_hls_clip(
                     video_fmt=video_fmt,
                 )
                 return
+        if audio_only:
+            _ytdlp_audio_section_download(
+                url, output_path, start_sec, end_sec, extract_opts,
+                progress_hook=progress_hook,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                register_abort=register_abort,
+            )
+            return
 
     fmt = _find_media_format(info)
     media_url = fmt["url"]
@@ -2208,6 +2372,12 @@ def ytdlp_section_mux_to_ts(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+assert _resolve_youtube_audio_format({
+    "formats": [
+        {"url": "https://x/v.mp4", "protocol": "https", "height": 720, "vcodec": "avc1", "acodec": "mp4a"},
+        {"url": "https://x/a.m4a", "protocol": "https", "vcodec": "none", "acodec": "mp4a", "abr": 128},
+    ],
+})["url"] == "https://x/a.m4a"
 assert _find_media_format({
     "formats": [{
         "url": "https://x/v.mp4",
@@ -2221,6 +2391,7 @@ assert _local_dash_slice_valid("nonexistent_dash_slice_abc123") is False
 assert _local_dash_slice_valid("nonexistent_dash_slice_abc123", audio=True) is False
 assert _GOOGLEVIDEO_RANGE_CHUNK_BYTES == 1 * 1024 * 1024
 assert _GOOGLEVIDEO_MAX_FROM_ZERO_BYTES == 16 * 1024 * 1024
+assert _mux_dash_window_to_hls.__name__ == "_mux_dash_window_to_hls"
 if __name__ == "__main__":
     assert _is_broken_pipe_error(BrokenPipeError())
     assert _is_broken_pipe_error(OSError(errno.EINVAL, "Invalid argument"))

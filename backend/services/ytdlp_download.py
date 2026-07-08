@@ -179,6 +179,25 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     if info is None:
         raise ValueError("Could not extract video info")
 
+    if platform == "YouTube":
+        try:
+            dur = float(info.get("duration") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if 0 < dur < 90:
+            from services.youtube_innertube import extract_video_id, innertube_video_row_metadata
+
+            vid = extract_video_id(full_url)
+            if vid:
+                meta = innertube_video_row_metadata(vid, read_timeout=5.0)
+                if meta:
+                    try:
+                        fallback = float(meta.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        fallback = 0.0
+                    if fallback > dur:
+                        info["duration"] = int(fallback)
+
     formats = info.get("formats", [])
     qualities = _qualities_from_formats(formats, is_clip_url(full_url))
 
@@ -798,8 +817,7 @@ def sanitize_download_error(exc: BaseException) -> str:
     low = msg.lower()
     if "sign in to confirm" in low or "not a bot" in low:
         return (
-            "YouTube blocked this video — set cookies file, browser cookies, "
-            "or po_token in Settings"
+            "YouTube blocked this video — try again or add youtube_cookies_file in settings.json"
         )
     if msg.lower().startswith("error:"):
         msg = msg[6:].strip()

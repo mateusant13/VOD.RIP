@@ -930,16 +930,6 @@ class DownloadManager:
                     output_file = entry.get("output_file") or None
                     status = status or entry.get("status")
                     break
-        if output_file:
-            if status in ("Failed", "Cancelled"):
-                output_existed = bool(cleanup and cleanup.get("output_existed"))
-                expected_duration = cleanup.get("expected_duration") if cleanup else None
-                delete_partial_output(
-                    output_file,
-                    output_existed,
-                    expected_duration=expected_duration,
-                )
-            delete_download_output(output_file)
         had_on_disk = any(e.get("download_id") == download_id for e in self._db.history)
         if had_on_disk:
             self._db.drop_history(download_id)
@@ -948,7 +938,36 @@ class DownloadManager:
         if had_queue:
             self._db.remove_queue_entry(download_id)
             removed = True
+        if output_file:
+            self._schedule_output_delete(output_file, status, cleanup)
         return removed
+
+    def _schedule_output_delete(
+        self,
+        output_file: str,
+        status: Optional[str],
+        cleanup: Optional[dict],
+    ) -> None:
+        """ponytail: drop DB first, delete files on executor so /remove returns fast."""
+
+        def _run() -> None:
+            try:
+                if status in ("Failed", "Cancelled"):
+                    output_existed = bool(cleanup and cleanup.get("output_existed"))
+                    expected_duration = cleanup.get("expected_duration") if cleanup else None
+                    delete_partial_output(
+                        output_file,
+                        output_existed,
+                        expected_duration=expected_duration,
+                    )
+                delete_download_output(output_file)
+            except Exception as exc:
+                logger.warning("background delete failed for %s: %s", output_file, exc)
+
+        try:
+            self._executor.submit(_run)
+        except RuntimeError:
+            _run()
 
     def unregister_sse(self, download_id: str, queue):
         with self._lock:

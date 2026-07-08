@@ -19,7 +19,7 @@ CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9e
 CHANNEL_VIDEOS_QUERY = """
 query ChannelVideos($login: String!, $first: Int!, $after: Cursor) {
   user(login: $login) {
-    videos(first: $first, after: $after, type: ARCHIVE, sort: TIME) {
+    videos(first: $first, after: $after, sort: TIME) {
       pageInfo { hasNextPage endCursor }
       edges {
         node {
@@ -273,7 +273,7 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
 
 
 def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Return recent archive VODs for a Twitch channel login."""
+    """Return recent VODs/highlights/uploads for a Twitch channel login."""
     login = (login or "").strip().lower()
     if not login:
         return []
@@ -321,14 +321,14 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
 
 
 CLIP_MAX_DURATION_SEC = 60
-# Twitch clips page uses ?range=7d — maps to LAST_WEEK in GQL.
-TWITCH_CLIPS_RANGE_FILTER = "LAST_WEEK"
+# Fetch all clips; UI applies 14-day preference then Show more for older.
+TWITCH_CLIPS_RANGE_FILTER = "ALL_TIME"
 
 
 def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Return the *limit* most recent clips (<=60s), ranked by view count (desc).
 
-    Equivalent to https://www.twitch.tv/{login}/clips?range=7d
+    Equivalent to https://www.twitch.tv/{login}/clips (all time; UI filters recent first).
     """
     login = (login or "").strip().lower()
     if not login:
@@ -480,3 +480,7 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
         is_clip=False,
     )
     return payload
+
+
+assert "type: ARCHIVE" not in CHANNEL_VIDEOS_QUERY
+assert TWITCH_CLIPS_RANGE_FILTER == "ALL_TIME"

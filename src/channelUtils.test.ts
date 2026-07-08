@@ -11,6 +11,14 @@ import {
   channelClipsMissing,
   channelVodsMissing,
   channelStreamsMissing,
+  mergeClipPlatformsFetched,
+  mergeVodPlatformsFetched,
+  channelHasCachedContent,
+  channelPlatformVisibleSlice,
+  channelPlatformCanExpand,
+  channelLinkDraftFromParsed,
+  channelLinkWillAddSummary,
+  parseChannelInput,
   buildVodUrl,
   slugFromVideoUrl,
   youtubeSlugFromChannelUrl,
@@ -162,6 +170,85 @@ describe('mergeClipLists', () => {
   });
 });
 
+describe('mergeVodPlatformsFetched', () => {
+  it('marks platform fetched after completed attempt even when empty', () => {
+    const out = mergeVodPlatformsFetched(
+      {},
+      { kickSlug: 'a', twitchSlug: 'b', youtubeSlug: '' },
+      [],
+      {},
+      { Kick: true, Twitch: true },
+    );
+    expect(out.Kick).toBe(true);
+    expect(out.Twitch).toBe(true);
+  });
+
+  it('marks platform fetched when rows or errors arrive', () => {
+    const v = makeVod({ platform: 'Twitch', id: '1' });
+    const out = mergeVodPlatformsFetched({}, { kickSlug: 'a', twitchSlug: 'b', youtubeSlug: '' }, [v], {});
+    expect(out.Twitch).toBe(true);
+    expect(out.Kick).toBeUndefined();
+  });
+});
+
+describe('channelLinkDraftFromParsed', () => {
+  it('prefills all platforms from bare handle', () => {
+    const draft = channelLinkDraftFromParsed(parseChannelInput('surtepi'));
+    expect(draft.kickSlug).toBe('surtepi');
+    expect(draft.twitchSlug).toBe('surtepi');
+    expect(draft.youtubeSlug).toBe('surtepi');
+    expect(draft.kickEnabled && draft.twitchEnabled && draft.youtubeEnabled).toBe(true);
+  });
+
+  it('detects youtube source and guesses kick/twitch', () => {
+    const draft = channelLinkDraftFromParsed(
+      parseChannelInput('https://youtube.com/@surtepi'),
+      'https://youtube.com/@surtepi',
+    );
+    expect(draft.detectedFrom).toBe('youtube');
+    expect(draft.kickSlug).toBeTruthy();
+    expect(draft.twitchSlug).toBeTruthy();
+  });
+
+  it('summarizes will-add line', () => {
+    const draft = channelLinkDraftFromParsed(parseChannelInput('surtepi'));
+    expect(channelLinkWillAddSummary(draft)).toContain('surtepi');
+  });
+});
+
+describe('channelPlatformVisibleSlice', () => {
+  const oldDate = new Date(Date.now() - 60 * 86_400_000).toISOString();
+  const newDate = new Date().toISOString();
+  const oldVod = (id: string): ChannelVideo => ({
+    id,
+    platform: 'Kick',
+    title: id,
+    created_at: oldDate,
+    url: `https://kick.com/x/videos/${id}`,
+    channel: 'x',
+  });
+  const newVod = (id: string): ChannelVideo => ({
+    ...oldVod(id),
+    created_at: newDate,
+  });
+
+  it('shows only recent items until beyondRecent', () => {
+    const videos = [newVod('n1'), oldVod('o1'), oldVod('o2')];
+    expect(channelPlatformVisibleSlice(videos, 5, false, false).map((v) => v.id)).toEqual(['n1']);
+    expect(channelPlatformVisibleSlice(videos, 5, true, false).map((v) => v.id)).toEqual(['n1', 'o1', 'o2']);
+  });
+
+  it('shows next items from full list when beyondRecent', () => {
+    const videos = [newVod('n1'), oldVod('o1'), oldVod('o2')];
+    expect(channelPlatformVisibleSlice(videos, 2, true, false).map((v) => v.id)).toEqual(['n1', 'o1']);
+  });
+
+  it('canExpand when older items exist beyond recent window', () => {
+    const videos = [newVod('n1'), oldVod('o1')];
+    expect(channelPlatformCanExpand(videos, 1, false, false)).toBe(true);
+  });
+});
+
 describe('channelClipsMissing', () => {
   const ch = (overrides: Partial<SavedChannel> = {}): SavedChannel => ({
     id: 'ch1',
@@ -193,9 +280,19 @@ describe('channelClipsMissing', () => {
   it('returns true when Kick clips missing but Kick enabled', () => {
     const state = ch({
       clipsFetched: true,
+      clipPlatformsFetched: { Twitch: true },
       clipVideos: [makeClip({ platform: 'Twitch', id: 'twitch_clip' })],
     });
     expect(channelClipsMissing(state, true, true)).toBe(true);
+  });
+
+  it('returns false when Kick was fetched but channel has no Kick clips', () => {
+    const state = ch({
+      clipsFetched: true,
+      clipPlatformsFetched: { Kick: true, Twitch: true },
+      clipVideos: [makeClip({ platform: 'Twitch', id: 'twitch_clip' })],
+    });
+    expect(channelClipsMissing(state, true, true)).toBe(false);
   });
 });
 

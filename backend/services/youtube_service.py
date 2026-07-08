@@ -60,9 +60,48 @@ def _created_at_from_entry(e: dict) -> Optional[str]:
     return None
 
 
+def _duration_string_from_sec(sec: int) -> str:
+    m, s = divmod(max(0, int(sec)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _youtube_row_needs_enrich(row: dict[str, Any]) -> bool:
+    if not row.get("created_at"):
+        return True
+    if row.get("views") is None:
+        return True
+    dur = row.get("duration")
+    if dur is None:
+        return True
+    try:
+        if int(float(dur)) <= 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _apply_youtube_row_metadata(row: dict[str, Any], meta: dict[str, Any]) -> None:
+    if not row.get("created_at") and meta.get("created_at"):
+        row["created_at"] = meta["created_at"]
+    if row.get("views") is None and meta.get("views") is not None:
+        row["views"] = meta["views"]
+    if not row.get("duration") and meta.get("duration"):
+        row["duration"] = meta["duration"]
+        if not row.get("duration_string"):
+            try:
+                row["duration_string"] = _duration_string_from_sec(int(meta["duration"]))
+            except (TypeError, ValueError):
+                pass
+
+
+_YOUTUBE_ENRICH_MAX = 24  # ponytail: cap — visible rows only; full list on scroll later
+
+
 def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
-    """Fill missing date/views via lightweight InnerTube (flat playlist is spotty)."""
-    need = [r for r in rows if not r.get("created_at") or r.get("views") is None]
+    """Fill missing date/views/duration via lightweight InnerTube (flat playlist is spotty)."""
+    need = [r for r in rows if _youtube_row_needs_enrich(r)][: _YOUTUBE_ENRICH_MAX]
     if not need:
         return
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,7 +117,7 @@ def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
         return vid, innertube_video_row_metadata(vid, session=session)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_fetch, vid) for vid in list(by_id)[:50]]
+        futs = [pool.submit(_fetch, vid) for vid in by_id]
         for fut in as_completed(futs):
             try:
                 vid, meta = fut.result()
@@ -90,12 +129,7 @@ def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
             row = by_id.get(vid)
             if not row:
                 continue
-            if not row.get("created_at") and meta.get("created_at"):
-                row["created_at"] = meta["created_at"]
-            if row.get("views") is None and meta.get("views") is not None:
-                row["views"] = meta["views"]
-            if not row.get("duration") and meta.get("duration"):
-                row["duration"] = meta["duration"]
+            _apply_youtube_row_metadata(row, meta)
 
 
 def list_channel_videos_sync(
@@ -103,10 +137,11 @@ def list_channel_videos_sync(
     limit: int = 50,
     *,
     playlist: PlaylistKind = "videos",
+    enrich: bool = True,
 ) -> list[dict[str, Any]]:
     import yt_dlp
 
-    from services.ytdlp_guard import guarded_youtube_dl
+    from services.ytdlp_guard import guarded_youtube_dl_channel
     from services.youtube_session import (
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
@@ -123,6 +158,7 @@ def list_channel_videos_sync(
     ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
     opts: dict[str, Any] = {
         "playlistend": max(1, min(int(limit), 100)),
+        "extract_flat": "in_playlist",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -139,7 +175,7 @@ def list_channel_videos_sync(
     from services.youtube_session import apply_ytdlp_cookie_opts
 
     apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth)
-    with guarded_youtube_dl(opts) as ydl:
+    with guarded_youtube_dl_channel(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries") or []
     content_kind = _content_kind_for_playlist(playlist)
@@ -163,9 +199,7 @@ def list_channel_videos_sync(
         if dur is not None:
             try:
                 sec = int(float(dur))
-                m, s = divmod(sec, 60)
-                h, m = divmod(m, 60)
-                dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+                dur_str = _duration_string_from_sec(sec)
             except (TypeError, ValueError):
                 pass
         out.append({
@@ -181,7 +215,8 @@ def list_channel_videos_sync(
             "channel": e.get("channel") or e.get("uploader") or channel_ref,
             "content_kind": content_kind,
         })
-    _enrich_youtube_channel_rows(out)
+    if enrich:
+        _enrich_youtube_channel_rows(out)
     return out
 
 
@@ -190,3 +225,6 @@ assert channel_playlist_url("@cellbit", "shorts").endswith("/shorts")
 assert channel_playlist_url("UCxyz1234567890abcdefghijk", "streams").endswith("/streams")
 assert _created_at_from_entry({"upload_date": "20240511"}) is not None
 assert _created_at_from_entry({"timestamp": 1_700_000_000}) is not None
+assert _youtube_row_needs_enrich({"id": "x", "views": 1, "created_at": "2024-01-01"}) is True
+assert _YOUTUBE_ENRICH_MAX == 24
+assert _duration_string_from_sec(125) == "2:05"

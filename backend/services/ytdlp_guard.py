@@ -15,6 +15,7 @@ os.environ["YTDLP_NO_PLUGINS"] = "1"
 import yt_dlp  # noqa: E402
 
 _YTDLP_LOCK = threading.Lock()
+_YTDLP_CHANNEL_LOCK = threading.Lock()  # flat playlist lists — don't queue behind preview/download
 _FORBIDDEN_YOUTUBE_KEYS = frozenset({"fetch_pot"})
 
 
@@ -50,8 +51,19 @@ def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeDL]:
             yield ydl
 
 
+@contextlib.contextmanager
+def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeDL]:
+    """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists."""
+    assert_ytdlp_safe()
+    safe = sanitize_ytdlp_opts(opts)
+    with _YTDLP_CHANNEL_LOCK:
+        with yt_dlp.YoutubeDL(safe) as ydl:
+            yield ydl
+
+
 # Back-compat alias used by ytdlp_hls tests / comments.
 YTDLP_EXTRACT_LOCK = _YTDLP_LOCK
+YTDLP_CHANNEL_LOCK = _YTDLP_CHANNEL_LOCK
 
 assert_ytdlp_safe()
 assert sanitize_ytdlp_opts({

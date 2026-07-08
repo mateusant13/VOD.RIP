@@ -39,7 +39,12 @@ import {
   warmYoutubePreviewBatch,
   bindYoutubeChannelScrollWarm,
   waitForPreviewMuxReady,
+  shouldWaitForPreviewMux,
+  clampPreviewTimeToVodTrim,
+  PREVIEW_SEEK_DEBOUNCE_MS,
   previewMuxPollMaxMs,
+  previewPlaylistPollMaxMs,
+  attachPreviewBufferingListeners,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
@@ -48,10 +53,11 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS , loadStoredChannelUi } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft } from './channelUtils';
+import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelWidthAtSiblingMins, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import { readUiScale } from './uiScale';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
@@ -176,6 +182,7 @@ export default function App() {
     activeHeight?: number;
   } | null>(null);
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
+  const [previewBuffering, setPreviewBuffering] = useState(false);
   const [previewVideoReady, setPreviewVideoReady] = useState(false);
   const previewVideoLoadingRef = useRef(false);
   const previewVideoReadyRef = useRef(false);
@@ -230,6 +237,7 @@ export default function App() {
   const previewAppliedHeightRef = useRef(0);
   const previewExtractSourceRef = useRef('');
   const previewSessionIdRef = useRef<string | null>(null);
+  const previewSeekDebounceRef = useRef<number | null>(null);
   // ── Shared preview hook (quality state machine) ──────────────────────────
   const {
     previewLevels,
@@ -240,6 +248,7 @@ export default function App() {
     setPreviewLevels,
     setQualityLevel: setPreviewQualityLevel,
     setHlsRef,
+    syncHlsLevels: syncPreviewHlsLevels,
   } = usePreviewPlayer({
     videoRef: previewVideoRef,
     playback: previewPlayback,
@@ -248,6 +257,7 @@ export default function App() {
     isYoutubePreview: urlPlatform === 'youtube',
     containerRef: previewContainerRef,
     trimStart: previewTrimStartRef.current,
+    trimTimelineRef: previewTrimTimelineRef,
     onPreviewError: (msg: string) => {
       if (msg) setError(msg);
     },
@@ -304,10 +314,13 @@ export default function App() {
   const restorePanelLayout = useCallback((pl: PersistedPanelLayout) => {
     const clampedUrl = clampStoredPanelSize(pl.urlAside, URL_ASIDE_PANEL_DEFAULT);
     const clampedMain = clampStoredPanelSize(pl.main, MAIN_PANEL_DEFAULT);
+    const layout = layoutBoundsInput();
     const clampedPreviewW = clampLayoutNumber(
       pl.previewPanelWidth,
       PREVIEW_PANEL_MIN_W,
-      panelMaxW(),
+      layout.previewOpen
+        ? layoutMaxPanelWidthAtSiblingMins('preview', layout)
+        : panelMaxW(),
       defaultPanelLayout().previewPanelWidth,
     );
     previewPanelWidthRef.current = clampedPreviewW;
@@ -395,30 +408,24 @@ export default function App() {
   const [selectedQueueIds, setSelectedQueueIds] = useState<Set<string>>(new Set());
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
   const [selectedRecentIds, setSelectedRecentIds] = useState<Set<string>>(new Set());
+  const pendingRemovalIdsRef = useRef<Set<string>>(new Set());
   const [selectedChannelVodUrls, setSelectedChannelVodUrls] = useState<Set<string>>(new Set());
   // Channels — persisted in localStorage (survives server restarts).
   const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => loadSavedChannels());
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [addChannelInput, setAddChannelInput] = useState('');
-  const [pendingYoutubeChannelAdd, setPendingYoutubeChannelAdd] = useState<{
-    kickSlug: string;
-    twitchSlug: string;
-  } | null>(null);
-  const [pendingYoutubeInput, setPendingYoutubeInput] = useState('');
+  const [pendingAddChannel, setPendingAddChannel] = useState<ChannelLinkDraft | null>(null);
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
   const [editingChannelName, setEditingChannelName] = useState('');
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' | 'YouTube' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
-  const [pendingAddChannel, setPendingAddChannel] = useState<{
-    kickSlug: string;
-    twitchSlug: string;
-    youtubeSlug: string;
-  } | null>(null);
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
+  const channelsSaveTimerRef = useRef<number | null>(null);
+  const channelUiSaveTimerRef = useRef<number | null>(null);
   /** True after saved channels were hydrated once (localStorage wins over API). */
   const channelsHydratedRef = useRef(false);
   const channelUiPersistReadyRef = useRef(false);
@@ -432,6 +439,9 @@ export default function App() {
   const [kickVisibleLimit, setKickVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
   const [twitchVisibleLimit, setTwitchVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
   const [youtubeVisibleLimit, setYoutubeVisibleLimit] = useState(CHANNEL_INITIAL_VISIBLE);
+  const [channelBeyondRecent, setChannelBeyondRecent] = useState<
+    Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>
+  >({});
   const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips' | 'streams'>(
     initialChannelUi.content,
   );
@@ -474,11 +484,33 @@ export default function App() {
   const channelHasYoutube = Boolean(selectedChannel?.youtubeSlug?.trim());
 
   const visibleChannelVideos = useMemo(() => {
+    const clips = channelContentFilter === 'clips';
     const items: ChannelVideo[] = [];
-    if (kickEnabled && channelHasKick) items.push(...kickChannelVideos.slice(0, kickVisibleLimit));
-    if (twitchEnabled && channelHasTwitch) items.push(...twitchChannelVideos.slice(0, twitchVisibleLimit));
-    if (youtubeEnabled && channelHasYoutube) items.push(...youtubeChannelVideos.slice(0, youtubeVisibleLimit));
-    const sorted = channelContentFilter === 'clips'
+    if (kickEnabled && channelHasKick) {
+      items.push(...channelPlatformVisibleSlice(
+        kickChannelVideos,
+        kickVisibleLimit,
+        channelBeyondRecent.Kick ?? false,
+        clips,
+      ));
+    }
+    if (twitchEnabled && channelHasTwitch) {
+      items.push(...channelPlatformVisibleSlice(
+        twitchChannelVideos,
+        twitchVisibleLimit,
+        channelBeyondRecent.Twitch ?? false,
+        clips,
+      ));
+    }
+    if (youtubeEnabled && channelHasYoutube) {
+      items.push(...channelPlatformVisibleSlice(
+        youtubeChannelVideos,
+        youtubeVisibleLimit,
+        channelBeyondRecent.YouTube ?? false,
+        clips,
+      ));
+    }
+    const sorted = clips
       ? items.sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0))
       : items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
     let kickN = 0;
@@ -506,6 +538,7 @@ export default function App() {
     channelHasKick,
     channelHasTwitch,
     channelHasYoutube,
+    channelBeyondRecent,
   ]);
 
   const bulkDownloadPlatforms = useMemo(() => {
@@ -523,10 +556,28 @@ export default function App() {
     return null;
   }, [bulkDownloadPlatforms]);
 
-  const canExpandKick = kickEnabled && channelHasKick && kickVisibleLimit < kickChannelVideos.length;
-  const canExpandTwitch = twitchEnabled && channelHasTwitch && twitchVisibleLimit < twitchChannelVideos.length;
-  const canExpandYoutube = youtubeEnabled && channelHasYoutube && youtubeVisibleLimit < youtubeChannelVideos.length;
+  const clipsMode = channelContentFilter === 'clips';
+  const canExpandKick = kickEnabled && channelHasKick && channelPlatformCanExpand(
+    kickChannelVideos, kickVisibleLimit, channelBeyondRecent.Kick ?? false, clipsMode,
+  );
+  const canExpandTwitch = twitchEnabled && channelHasTwitch && channelPlatformCanExpand(
+    twitchChannelVideos, twitchVisibleLimit, channelBeyondRecent.Twitch ?? false, clipsMode,
+  );
+  const canExpandYoutube = youtubeEnabled && channelHasYoutube && channelPlatformCanExpand(
+    youtubeChannelVideos, youtubeVisibleLimit, channelBeyondRecent.YouTube ?? false, clipsMode,
+  );
   const canExpandChannelList = canExpandKick || canExpandTwitch || canExpandYoutube;
+
+  const resetChannelListPaging = useCallback(() => {
+    setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+    setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+    setYoutubeVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+    setChannelBeyondRecent({});
+  }, []);
+
+  useEffect(() => {
+    resetChannelListPaging();
+  }, [selectedChannelId, channelContentFilter, resetChannelListPaging]);
 
   // Settings
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -581,6 +632,10 @@ export default function App() {
   }, [previewTrimStart, previewTrimEnd, needleGlance]);
 
   const destroyPreviewPlayer = useCallback(() => {
+    if (previewSeekDebounceRef.current != null) {
+      window.clearTimeout(previewSeekDebounceRef.current);
+      previewSeekDebounceRef.current = null;
+    }
     const hls = previewHlsRef.current;
     if (hls) {
       try {
@@ -634,7 +689,7 @@ export default function App() {
     }
   }, [previewSessionId, destroyPreviewPlayer]);
 
-  const seekPreviewVideo = useCallback((sec: number, force = false) => {
+  const seekPreviewVideoImmediate = useCallback((sec: number, force = false) => {
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
     const start = previewTrimStartRef.current;
@@ -647,6 +702,24 @@ export default function App() {
       syncPreviewTimeUi(t, true);
     }
   }, [previewVideoReady, syncPreviewTimeUi]);
+
+  const seekPreviewVideo = useCallback((sec: number, force = false) => {
+    if (force) {
+      if (previewSeekDebounceRef.current != null) {
+        window.clearTimeout(previewSeekDebounceRef.current);
+        previewSeekDebounceRef.current = null;
+      }
+      seekPreviewVideoImmediate(sec, true);
+      return;
+    }
+    if (previewSeekDebounceRef.current != null) {
+      window.clearTimeout(previewSeekDebounceRef.current);
+    }
+    previewSeekDebounceRef.current = window.setTimeout(() => {
+      previewSeekDebounceRef.current = null;
+      seekPreviewVideoImmediate(sec, false);
+    }, PREVIEW_SEEK_DEBOUNCE_MS);
+  }, [seekPreviewVideoImmediate]);
 
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
@@ -776,12 +849,15 @@ export default function App() {
         setPreviewMetaDurationSec(synced.duration);
       }
       const playback = resolvePreviewPlayback(url.trim(), res);
-      if (youtubePreview && playback.kind === 'progressive' && res.mux_ready === false) {
+      if (youtubePreview && shouldWaitForPreviewMux(res, playback.kind)) {
+        const pollMaxMs = !res.trim_timeline && playback.kind === 'hls'
+          ? previewPlaylistPollMaxMs()
+          : previewMuxPollMaxMs(start, end);
         const muxReady = await waitForPreviewMuxReady(
           res.session_id,
           apiGet,
           { gen, current: previewGenRef.current },
-          previewMuxPollMaxMs(start, end),
+          pollMaxMs,
         );
         if (gen !== previewGenRef.current) return;
         if (!muxReady) throw new Error('Preview preparation timed out');
@@ -843,6 +919,7 @@ export default function App() {
     const youtubePreview = detectUrlPlatform(previewPageUrl) === 'youtube';
     let cancelled = false;
     let cleanup: (() => void) | undefined;
+    let detachBuffering: (() => void) | undefined;
 
     const setup = () => {
       if (cancelled) return;
@@ -851,9 +928,13 @@ export default function App() {
         requestAnimationFrame(setup);
         return;
       }
+      detachBuffering = attachPreviewBufferingListeners(video, (stalling) => {
+        if (!cancelled) setPreviewBuffering(stalling);
+      });
       const { url: playbackUrl, kind: playbackKind } = previewPlayback;
 
     setPreviewVideoLoading(true);
+    setPreviewBuffering(false);
     setPreviewVideoReady(false);
 
     const performInitialSeek = () => {
@@ -981,8 +1062,8 @@ export default function App() {
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 30,
-        maxBufferLength: dashSegTimeline ? 40 : 20,
-        maxMaxBufferLength: dashSegTimeline ? 120 : 40,
+        maxBufferLength: dashSegTimeline ? 60 : 20,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 40,
         startFragPrefetch: true,
         capLevelToPlayerSize: !youtubePreview,
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
@@ -1031,15 +1112,11 @@ export default function App() {
           levelsInitialized = true;
           const hlsIndex = mapped[defaultIndex]?.index ?? defaultIndex;
           if (hls.levels.length > 0 && hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-            const levelHeight = inferLevelHeight(hls.levels[hlsIndex]);
-            if (levelHeight > 0) {
-              hls.loadLevel = hlsIndex;
-              previewAppliedHeightRef.current = levelHeight;
-            }
+            hls.loadLevel = hlsIndex;
           }
-          setPreviewQualityLevel(defaultIndex);
+          syncPreviewHlsLevels(mapped, defaultIndex);
           const picked = mapped[defaultIndex];
-          if (picked?.height) previewRequestedHeightRef.current = picked.height;
+          if (picked?.height) previewAppliedHeightRef.current = picked.height;
         }
       };
 
@@ -1141,6 +1218,7 @@ export default function App() {
     setup();
     return () => {
       cancelled = true;
+      detachBuffering?.();
       cleanup?.();
     };
   }, [previewOpen, previewPlayback, previewSessionId]);
@@ -1151,32 +1229,9 @@ export default function App() {
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
     const clipRel = previewClipRelativeRef.current;
-    const clipLen = Math.max(0, end - start);
-    if (clipRel) {
-      const rel = video.currentTime;
-      const vodT = start + rel;
-      syncPreviewTimeUi(vodT);
-      if (rel >= clipLen - 0.05) {
-        video.pause();
-        if (Math.abs(video.currentTime - clipLen) > 0.05) {
-          video.currentTime = clipLen;
-        }
-        syncPreviewTimeUi(end, true);
-        setPreviewPlaying(false);
-      }
-      return;
-    }
-    let t = video.currentTime;
-    if (t < start - 0.05) {
-      video.currentTime = start;
-      t = start;
-    }
-    syncPreviewTimeUi(t);
-    if (t >= end - 0.05) {
-      video.pause();
-      if (Math.abs(video.currentTime - end) > 0.05) {
-        video.currentTime = end;
-      }
+    const { paused, vodTime } = clampPreviewTimeToVodTrim(video, start, end, clipRel);
+    syncPreviewTimeUi(vodTime);
+    if (paused) {
       syncPreviewTimeUi(end, true);
       setPreviewPlaying(false);
     }
@@ -1215,7 +1270,7 @@ export default function App() {
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
     const t = Math.max(start, Math.min(end, video.currentTime + deltaSec));
-    seekPreviewVideo(t);
+    seekPreviewVideo(t, true);
   }, [previewVideoReady, seekPreviewVideo]);
 
   const seekPreviewPercent = useCallback((fraction: number) => {
@@ -1782,11 +1837,24 @@ export default function App() {
   }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen, videoInfo]);
 
   const layoutRowHasMultiplePanels = useCallback(() => {
+    return layoutHasMultiplePanels(layoutBoundsInput());
+  }, [layoutBoundsInput]);
+
+  const syncRowHeightsToPreview = useCallback(() => {
     const layout = layoutBoundsInput();
-    let count = 1;
-    if (layout.previewOpen) count += 1;
-    if (layout.urlPanelAside) count += 1;
-    return count > 1;
+    if (!layout.previewOpen || !previewPanelRef.current) return;
+    const maxH = layoutMaxPanelHeight();
+    const previewH = Math.min(maxH, previewPanelRef.current.offsetHeight);
+    if (previewH <= 0) return;
+    const nextUrlH = Math.min(maxH, Math.max(urlAsidePanelSizeRef.current.h, previewH));
+    const nextMainH = Math.min(maxH, Math.max(mainPanelSizeRef.current.h, previewH));
+    if (nextUrlH === urlAsidePanelSizeRef.current.h && nextMainH === mainPanelSizeRef.current.h) return;
+    urlAsidePanelSizeRef.current = { ...urlAsidePanelSizeRef.current, h: nextUrlH };
+    mainPanelSizeRef.current = { ...mainPanelSizeRef.current, h: nextMainH };
+    setUrlAsidePanelSize((prev) => ({ ...prev, h: nextUrlH }));
+    setMainPanelSize((prev) => ({ ...prev, h: nextMainH }));
+    if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, urlAsidePanelSizeRef.current);
+    if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, mainPanelSizeRef.current);
   }, [layoutBoundsInput]);
 
   const applyLayoutRowSizes = useCallback((fitted: {
@@ -1806,7 +1874,8 @@ export default function App() {
     mainPanelSizeRef.current = fitted.main;
     setMainPanelSize(fitted.main);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
-  }, [layoutBoundsInput]);
+    syncRowHeightsToPreview();
+  }, [layoutBoundsInput, syncRowHeightsToPreview]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const chromeH = previewChromeHRef.current;
@@ -1818,9 +1887,10 @@ export default function App() {
       aspect,
       clampWidth: (w) => {
         const layout = layoutBoundsInput();
-        const aspectW = clampPreviewPanelWidth(w, chromeH, aspect, layout);
-        if (!coupled) return aspectW;
-        return resizeLayoutGivingWidthTo(layout, 'preview', aspectW).preview.w;
+        if (coupled) {
+          return resizeLayoutGivingWidthTo(layout, 'preview', w).preview.w;
+        }
+        return clampPreviewPanelWidth(w, chromeH, aspect, layout);
       },
       onResizeMove: coupled
         ? (w) => {
@@ -1936,7 +2006,12 @@ export default function App() {
               (kickSlug || twitchSlug || youtubeSlug)
               && !isChannelAlreadySaved(kickSlug, twitchSlug, savedChannels, youtubeSlug)
             ) {
-              setPendingAddChannel({ kickSlug, twitchSlug, youtubeSlug });
+              setPendingAddChannel(channelLinkDraftFromParsed({
+                displayName: info.channel ?? info.uploader ?? '',
+                kickSlug,
+                twitchSlug,
+                youtubeSlug,
+              }, trimmed));
             }
           }
           return;
@@ -2050,11 +2125,55 @@ export default function App() {
   const refreshDownloads = useCallback(async () => {
     try {
       const data = await apiGet<DownloadsResponse>('/api/downloads');
-      setQueueDownloads(data.queue || []);
-      setRecentDownloads(data.recent || []);
-      setHistoryDownloads(data.history || []);
+      const pending = pendingRemovalIdsRef.current;
+      const withoutPending = (list: DownloadState[] | undefined) =>
+        (list || []).filter((d) => !pending.has(d.download_id));
+      setQueueDownloads(withoutPending(data.queue));
+      setRecentDownloads(withoutPending(data.recent));
+      setHistoryDownloads(withoutPending(data.history));
     } catch {}
   }, []);
+
+  const hideDownloadOptimistic = useCallback((id: string) => {
+    pendingRemovalIdsRef.current.add(id);
+    setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    setRecentDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
+    setSelectedHistoryIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setSelectedRecentIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setSelectedQueueIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const finishDownloadRemoval = useCallback((id: string, ok: boolean) => {
+    pendingRemovalIdsRef.current.delete(id);
+    if (!ok) void refreshDownloads();
+  }, [refreshDownloads]);
+
+  const requestDownloadRemoval = useCallback((id: string) => {
+    hideDownloadOptimistic(id);
+    void apiPost(`/api/download/${id}/remove`, {})
+      .then(() => finishDownloadRemoval(id, true))
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : 'Failed to remove download';
+        setError(msg);
+        finishDownloadRemoval(id, false);
+      });
+  }, [hideDownloadOptimistic, finishDownloadRemoval]);
 
   const activeDownloadIds = useMemo(
     () => queueDownloads
@@ -2237,29 +2356,15 @@ export default function App() {
     refreshDownloads();
   }, [refreshDownloads]);
 
-  const handleDeleteHistory = useCallback(async (id: string) => {
+  const handleDeleteHistory = useCallback((id: string) => {
     if (!window.confirm('Remove this download from history? The file on disk will also be deleted.')) return;
-    setHistoryDownloads((prev) => prev.filter((d) => d.download_id !== id));
-    try {
-      await apiPost(`/api/download/${id}/remove`, {});
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to remove from history';
-      setError(msg);
-      refreshDownloads();
-    }
-  }, [refreshDownloads]);
+    requestDownloadRemoval(id);
+  }, [requestDownloadRemoval]);
 
   const handleRemoveFromQueue = useCallback(async (id: string) => {
     if (!window.confirm('Remove this download from the queue? Any partial file on disk will also be deleted.')) return;
-    setQueueDownloads((prev) => prev.filter((d) => d.download_id !== id));
-    try {
-      await apiPost(`/api/download/${id}/remove`, {});
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to remove from queue';
-      setError(msg);
-      refreshDownloads();
-    }
-  }, [refreshDownloads]);
+    requestDownloadRemoval(id);
+  }, [requestDownloadRemoval]);
 
   const toggleQueueSelection = useCallback((id: string) => {
     setSelectedQueueIds((prev) => {
@@ -2285,38 +2390,29 @@ export default function App() {
     });
   }, []);
 
-  const handleBulkDeleteRecent = useCallback(async () => {
+  const handleBulkDeleteRecent = useCallback(() => {
     if (selectedRecentIds.size === 0) return;
     if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent? Files on disk will also be deleted.`)) return;
     const ids = [...selectedRecentIds];
     setSelectedRecentIds(new Set());
-    await Promise.allSettled(ids.map((id) =>
-      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
-    ));
-    refreshDownloads();
-  }, [selectedRecentIds, refreshDownloads]);
+    ids.forEach((id) => requestDownloadRemoval(id));
+  }, [selectedRecentIds, requestDownloadRemoval]);
 
-  const handleBulkDeleteQueue = useCallback(async () => {
+  const handleBulkDeleteQueue = useCallback(() => {
     if (selectedQueueIds.size === 0) return;
     if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue? Partial files on disk will also be deleted.`)) return;
     const ids = [...selectedQueueIds];
     setSelectedQueueIds(new Set());
-    await Promise.allSettled(ids.map((id) =>
-      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
-    ));
-    refreshDownloads();
-  }, [selectedQueueIds, refreshDownloads]);
+    ids.forEach((id) => requestDownloadRemoval(id));
+  }, [selectedQueueIds, requestDownloadRemoval]);
 
-  const handleBulkDeleteHistory = useCallback(async () => {
+  const handleBulkDeleteHistory = useCallback(() => {
     if (selectedHistoryIds.size === 0) return;
     if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history? Files on disk will also be deleted.`)) return;
     const ids = [...selectedHistoryIds];
     setSelectedHistoryIds(new Set());
-    await Promise.allSettled(ids.map((id) =>
-      apiPost(`/api/download/${id}/remove`, {}).catch(() => {}),
-    ));
-    refreshDownloads();
-  }, [selectedHistoryIds, refreshDownloads]);
+    ids.forEach((id) => requestDownloadRemoval(id));
+  }, [selectedHistoryIds, requestDownloadRemoval]);
 
   const handleBulkDownloadChannelVods = useCallback(async () => {
     if (selectedChannelVodUrls.size === 0) return;
@@ -2408,7 +2504,17 @@ export default function App() {
     persistChannels(savedChannels);
     if (!channelsPersistReadyRef.current) return;
     const payload = savedChannels.map(({ loading: _loading, ...ch }) => ch);
-    apiPost('/api/settings', { saved_channels: payload }).catch(() => {});
+    if (channelsSaveTimerRef.current) {
+      window.clearTimeout(channelsSaveTimerRef.current);
+    }
+    channelsSaveTimerRef.current = window.setTimeout(() => {
+      apiPost('/api/settings', { saved_channels: payload }).catch(() => {});
+    }, 2000);
+    return () => {
+      if (channelsSaveTimerRef.current) {
+        window.clearTimeout(channelsSaveTimerRef.current);
+      }
+    };
   }, [savedChannels]);
 
   useEffect(() => {
@@ -2426,12 +2532,17 @@ export default function App() {
       /* ignore */
     }
     if (!channelUiPersistReadyRef.current) return;
-    apiPost('/api/settings', {
-      channel_kick_enabled: kickEnabled,
-      channel_twitch_enabled: twitchEnabled,
-      channel_youtube_enabled: youtubeEnabled,
-      channel_content_filter: channelContentFilter,
-    }).catch(() => {});
+    if (channelUiSaveTimerRef.current) {
+      window.clearTimeout(channelUiSaveTimerRef.current);
+    }
+    channelUiSaveTimerRef.current = window.setTimeout(() => {
+      apiPost('/api/settings', {
+        channel_kick_enabled: kickEnabled,
+        channel_twitch_enabled: twitchEnabled,
+        channel_youtube_enabled: youtubeEnabled,
+        channel_content_filter: channelContentFilter,
+      }).catch(() => {});
+    }, 800);
     setSettings((prev) =>
       prev
         ? {
@@ -2443,6 +2554,11 @@ export default function App() {
           }
         : prev,
     );
+    return () => {
+      if (channelUiSaveTimerRef.current) {
+        window.clearTimeout(channelUiSaveTimerRef.current);
+      }
+    };
   }, [kickEnabled, twitchEnabled, youtubeEnabled, channelContentFilter]);
 
   const updateChannel = useCallback((id: string, patch: Partial<SavedChannel>) => {
@@ -2453,12 +2569,22 @@ export default function App() {
   savedChannelsRef.current = savedChannels;
 
   const channelRefreshInFlightRef = useRef<Set<string>>(new Set());
+  const channelRefreshPromisesRef = useRef<Map<string, Promise<void>>>(new Map());
+
+  const clearChannelRefreshFlight = useCallback((channelId: string, mode?: 'vods' | 'clips' | 'streams') => {
+    const modes = mode ? [mode] : (['vods', 'clips', 'streams'] as const);
+    for (const m of modes) {
+      const key = `${channelId}:${m}`;
+      channelRefreshInFlightRef.current.delete(key);
+      channelRefreshPromisesRef.current.delete(key);
+    }
+  }, []);
 
   const refreshChannel = useCallback(async (
     channelId: string,
     channelOverride?: SavedChannel,
     contentMode?: 'vods' | 'clips' | 'streams',
-    opts?: { incremental?: boolean; silent?: boolean },
+    opts?: { incremental?: boolean; silent?: boolean; force?: boolean },
   ) => {
     const ch = channelOverride ?? savedChannelsRef.current.find((c) => c.id === channelId);
     if (!ch) return;
@@ -2466,17 +2592,26 @@ export default function App() {
     const incremental = opts?.incremental ?? false;
     const silent = opts?.silent ?? false;
     const flightKey = `${channelId}:${mode}`;
-    if (!incremental && channelRefreshInFlightRef.current.has(flightKey)) return;
+
+    if (opts?.force) {
+      clearChannelRefreshFlight(channelId, mode);
+    }
+
+    if (!incremental) {
+      const pending = channelRefreshPromisesRef.current.get(flightKey);
+      if (pending) return pending;
+    }
+
+    const task = (async () => {
     if (!incremental) channelRefreshInFlightRef.current.add(flightKey);
 
     if (!incremental && !silent) {
       updateChannel(channelId, { loading: true });
-      setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
-      setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
-      setYoutubeVisibleLimit(CHANNEL_INITIAL_VISIBLE);
+      resetChannelListPaging();
     }
     const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
+    const attempted: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> = {};
 
     // Always fetch both platforms; Kick/Twitch toggles only filter the display.
     const wantKick = true;
@@ -2491,6 +2626,7 @@ export default function App() {
         const params = new URLSearchParams({
           platforms: clipPlatforms.join(','),
           limit: '10',
+          days: '0',
           kick_slug: ch.kickSlug,
           twitch_login: ch.twitchSlug,
           youtube_slug: ch.youtubeSlug,
@@ -2523,17 +2659,38 @@ export default function App() {
           const msg = err instanceof Error ? err.message : 'Failed to fetch clips';
           errs.Kick = msg;
           errs.Twitch = msg;
+          if (ch.kickSlug?.trim()) attempted.Kick = true;
+          if (ch.twitchSlug?.trim()) attempted.Twitch = true;
+          if (ch.youtubeSlug?.trim()) attempted.YouTube = true;
         }
+        if (ch.kickSlug?.trim() && !attempted.Kick) attempted.Kick = true;
+        if (ch.twitchSlug?.trim() && !attempted.Twitch) attempted.Twitch = true;
+        if (ch.youtubeSlug?.trim() && !attempted.YouTube) attempted.YouTube = true;
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
         const clipVideos = mergeClipLists(latest.clipVideos ?? [], incoming);
-        const prevClipErrors = latest.clipErrors ?? {};
-        updateChannel(channelId, {
-          clipVideos,
-          clipErrors: { ...prevClipErrors, ...errs },
-          clipsFetched: clipVideos.length > 0 || Object.keys(errs).length === 0,
-          loading: false,
-          updatedAt: new Date().toISOString(),
-        });
+        if (incremental) {
+          updateChannel(channelId, {
+            clipVideos,
+            updatedAt: new Date().toISOString(),
+          });
+        } else {
+          const prevClipErrors = latest.clipErrors ?? {};
+          const clipPlatformsFetched = mergeClipPlatformsFetched(
+            latest.clipPlatformsFetched ?? {},
+            ch,
+            incoming,
+            errs,
+            attempted,
+          );
+          updateChannel(channelId, {
+            clipVideos,
+            clipErrors: { ...prevClipErrors, ...errs },
+            clipsFetched: Object.values(clipPlatformsFetched).some(Boolean),
+            clipPlatformsFetched,
+            loading: false,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       } else if (mode === 'streams') {
         const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
         if (ch.youtubeSlug?.trim()) {
@@ -2543,16 +2700,19 @@ export default function App() {
             youtube_slug: ch.youtubeSlug,
             url: ch.youtubeSlug,
             limit: String(limit),
+            days: '0',
             kick_slug: ch.kickSlug,
             twitch_login: ch.twitchSlug,
           });
           try {
             const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}`);
+            attempted.YouTube = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs.YouTube;
             const pe = data.per_platform_errors?.YouTube;
             if (pe && !isHiddenChannelPlatformError(pe)) errs.YouTube = pe;
           } catch (err: unknown) {
+            attempted.YouTube = true;
             errs.YouTube = err instanceof Error ? err.message : 'Failed to fetch YouTube stream VODs';
           }
         } else if (wantYoutube) {
@@ -2560,14 +2720,22 @@ export default function App() {
         }
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
-        const streamFetchOk = !errs.YouTube;
-        updateChannel(channelId, {
-          vodVideos,
-          vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
-          streamsFetched: streamFetchOk,
-          loading: false,
-          updatedAt: new Date().toISOString(),
-        });
+        if (incremental) {
+          updateChannel(channelId, {
+            vodVideos,
+            updatedAt: new Date().toISOString(),
+          });
+        } else {
+          updateChannel(channelId, {
+            vodVideos,
+            vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
+            streamsFetched: !ch.youtubeSlug?.trim()
+              || incoming.some((v) => v.content_kind === 'stream')
+              || Boolean(errs.YouTube),
+            loading: false,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       } else {
         const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
         const fetchVods = async (platform: 'Kick' | 'Twitch' | 'YouTube', slug: string) => {
@@ -2575,7 +2743,7 @@ export default function App() {
           const params = new URLSearchParams({
             url: slug,
             limit: String(limit),
-            days: '14',
+            days: '0',
             platforms: platform,
             content: 'vods',
             kick_slug: ch.kickSlug,
@@ -2584,11 +2752,13 @@ export default function App() {
           });
           try {
             const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}`);
+            attempted[platform] = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
             const pe = data.per_platform_errors?.[platform];
             if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
           } catch (err: unknown) {
+            attempted[platform] = true;
             errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} VODs`;
           }
         };
@@ -2602,23 +2772,45 @@ export default function App() {
         await Promise.all(vodTasks);
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
-        updateChannel(channelId, {
-          vodVideos,
-          vodErrors: errs,
-          loading: false,
-          updatedAt: new Date().toISOString(),
-        });
+        if (incremental) {
+          updateChannel(channelId, {
+            vodVideos,
+            updatedAt: new Date().toISOString(),
+          });
+        } else {
+          const vodPlatformsFetched = mergeVodPlatformsFetched(
+            latest.vodPlatformsFetched ?? {},
+            ch,
+            incoming,
+            errs,
+            attempted,
+          );
+          updateChannel(channelId, {
+            vodVideos,
+            vodErrors: errs,
+            vodPlatformsFetched,
+            loading: false,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       }
 
     } finally {
       if (!incremental) {
         channelRefreshInFlightRef.current.delete(flightKey);
+        channelRefreshPromisesRef.current.delete(flightKey);
         if (!silent) {
           updateChannel(channelId, { loading: false });
         }
       }
     }
-  }, [updateChannel, channelContentFilter]);
+    })();
+
+    if (!incremental) {
+      channelRefreshPromisesRef.current.set(flightKey, task);
+    }
+    return task;
+  }, [updateChannel, channelContentFilter, resetChannelListPaging, clearChannelRefreshFlight]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
@@ -2665,16 +2857,11 @@ export default function App() {
           : channelVodsMissing(ch, kickEnabled, twitchEnabled, youtubeEnabled);
     if (!needsFetch) return;
 
-    // The in-flight Set inside `refreshChannel` is the only guard
-    // we keep: if a fetch for the same channel+mode is already
-    // running, it will pick up the latest filter state when it
-    // completes (the toggle only affects display filtering, and
-    // the underlying fetch always pulls both platforms). Letting
-    // an in-flight fetch finish is preferable to aborting and
-    // restarting it, because the response carries both Kick and
-    // Twitch entries — the next render will see the populated
-    // cache and skip the re-fetch.
-    void refreshChannelRef.current(selectedChannelId, undefined, mode, { silent: true });
+    const hasCache = channelHasCachedContent(ch, mode, kickEnabled, twitchEnabled, youtubeEnabled);
+    void refreshChannelRef.current(selectedChannelId, undefined, mode, {
+      silent: hasCache,
+      force: !hasCache,
+    });
   }, [channelContentFilter, kickEnabled, twitchEnabled, youtubeEnabled, selectedChannelId]);
 
   // ponytail: prefetch YouTube stream-tab VODs while user is on Videos/Shorts
@@ -2708,12 +2895,8 @@ export default function App() {
     incrementalSyncDoneRef.current = true;
     const channels = loadSavedChannels();
     channels.forEach((c) => {
-      // silent: true -> no loading spinner, cached data stays visible
-      // undefined contentMode -> uses current filter (VODs or clips)
-      void refreshChannelRef.current(c.id, c, undefined, { silent: true });
-      if (c.youtubeSlug?.trim()) {
-        void refreshChannelRef.current(c.id, c, 'streams', { silent: true });
-      }
+      void refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true });
+      void refreshChannelRef.current(c.id, c, 'clips', { silent: true, incremental: true });
     });
   }, []);
 
@@ -2750,7 +2933,10 @@ export default function App() {
     channelRefreshInFlightRef.current.delete(`${id}:vods`);
     channelRefreshInFlightRef.current.delete(`${id}:clips`);
     channelRefreshInFlightRef.current.delete(`${id}:streams`);
-    await refreshChannel(id, entry, 'vods');
+    channelRefreshPromisesRef.current.delete(`${id}:vods`);
+    channelRefreshPromisesRef.current.delete(`${id}:clips`);
+    channelRefreshPromisesRef.current.delete(`${id}:streams`);
+    await refreshChannel(id, entry, 'vods', { force: true });
     if (channelContentFilter === 'clips' && (kick || twitch || youtube)) {
       await refreshChannel(id, entry, 'clips');
     }
@@ -2759,38 +2945,37 @@ export default function App() {
     }
   }, [savedChannels.length, refreshChannel, channelContentFilter]);
 
-  const handleAddChannel = useCallback(async () => {
+  const channelLinkDuplicate = useMemo(() => {
+    if (!pendingAddChannel) return null;
+    const { kick, twitch, youtube } = channelLinkDraftSlugs(pendingAddChannel);
+    if (!kick && !twitch && !youtube) return null;
+    if (isChannelAlreadySaved(kick, twitch, savedChannels, youtube)) {
+      return 'This channel is already linked.';
+    }
+    return null;
+  }, [pendingAddChannel, savedChannels]);
+
+  const commitChannelLink = useCallback(async () => {
+    if (!pendingAddChannel) return;
+    const { kick, twitch, youtube } = channelLinkDraftSlugs(pendingAddChannel);
+    if (!kick && !twitch && !youtube) return;
+    setPendingAddChannel(null);
+    setAddChannelInput('');
+    await addChannelFromSlugs(kick, twitch, youtube);
+  }, [pendingAddChannel, addChannelFromSlugs]);
+
+  const handleAddChannel = useCallback(() => {
     const raw = addChannelInput.trim();
     if (!raw) return;
     const parsed = parseChannelInput(raw);
-    if (!parsed.kickSlug && !parsed.twitchSlug && !parsed.youtubeSlug) return;
-    if (!parsed.youtubeSlug && (parsed.kickSlug || parsed.twitchSlug)) {
-      setPendingYoutubeChannelAdd({ kickSlug: parsed.kickSlug, twitchSlug: parsed.twitchSlug });
-      setPendingYoutubeInput('');
-      return;
-    }
-    await addChannelFromSlugs(parsed.kickSlug, parsed.twitchSlug, parsed.youtubeSlug);
+    if (!parsed.kickSlug && !parsed.twitchSlug && !parsed.youtubeSlug && !parsed.displayName) return;
+    setPendingAddChannel(channelLinkDraftFromParsed(parsed, raw));
     setAddChannelInput('');
-  }, [addChannelInput, addChannelFromSlugs]);
-
-  const commitPendingYoutubeChannelAdd = useCallback(async (withYoutube: boolean) => {
-    if (!pendingYoutubeChannelAdd) return;
-    const { kickSlug, twitchSlug } = pendingYoutubeChannelAdd;
-    const youtube = withYoutube
-      ? (youtubeSlugFromChannelUrl(pendingYoutubeInput) || pendingYoutubeInput.trim())
-      : '';
-    setPendingYoutubeChannelAdd(null);
-    setPendingYoutubeInput('');
-    setAddChannelInput('');
-    await addChannelFromSlugs(kickSlug, twitchSlug, youtube);
-  }, [pendingYoutubeChannelAdd, pendingYoutubeInput, addChannelFromSlugs]);
+  }, [addChannelInput]);
 
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {
       if (prev === channelId) return null;
-      setKickVisibleLimit(CHANNEL_INITIAL_VISIBLE);
-      setTwitchVisibleLimit(CHANNEL_INITIAL_VISIBLE);
-      setYoutubeVisibleLimit(CHANNEL_INITIAL_VISIBLE);
       return channelId;
     });
     setEditingChannelId(null);
@@ -2838,6 +3023,8 @@ export default function App() {
       clipErrors: {} as Record<string, string>,
       clipsFetched: false,
       streamsFetched: false,
+      vodPlatformsFetched: {},
+      clipPlatformsFetched: {},
     };
     const updated: SavedChannel = {
       ...ch,
@@ -2888,6 +3075,8 @@ export default function App() {
       clipErrors: {} as Record<string, string>,
       clipsFetched: false,
       streamsFetched: false,
+      vodPlatformsFetched: {},
+      clipPlatformsFetched: {},
     };
     const slugPatch = editingSlug.platform === 'Kick'
       ? { kickSlug: slug }
@@ -2904,10 +3093,51 @@ export default function App() {
   }, [editingSlug, editingSlugValue, savedChannels, updateChannel, refreshChannel]);
 
   const handleExpandChannelList = useCallback(() => {
-    if (kickEnabled) setKickVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
-    if (twitchEnabled) setTwitchVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
-    if (youtubeEnabled) setYoutubeVisibleLimit((n) => n + CHANNEL_EXPAND_STEP);
-  }, [kickEnabled, twitchEnabled, youtubeEnabled]);
+    const markBeyond = (videos: ChannelVideo[], nextLimit: number, platform: 'Kick' | 'Twitch' | 'YouTube') => {
+      const sorted = sortChannelVideosByMode(videos, clipsMode);
+      const cutoff = Date.now() - CHANNEL_RECENT_DAYS * 86_400_000;
+      const recent = sorted.filter((v) => {
+        const ts = parseVideoTs(v.created_at);
+        return ts === 0 || ts >= cutoff;
+      });
+      const recentPool = recent.length > 0 ? recent : sorted;
+      if (nextLimit > recentPool.length && sorted.length > recentPool.length) {
+        setChannelBeyondRecent((prev) => ({ ...prev, [platform]: true }));
+      }
+    };
+    if (kickEnabled && channelHasKick) {
+      setKickVisibleLimit((n) => {
+        const next = n + CHANNEL_EXPAND_STEP;
+        markBeyond(kickChannelVideos, next, 'Kick');
+        return next;
+      });
+    }
+    if (twitchEnabled && channelHasTwitch) {
+      setTwitchVisibleLimit((n) => {
+        const next = n + CHANNEL_EXPAND_STEP;
+        markBeyond(twitchChannelVideos, next, 'Twitch');
+        return next;
+      });
+    }
+    if (youtubeEnabled && channelHasYoutube) {
+      setYoutubeVisibleLimit((n) => {
+        const next = n + CHANNEL_EXPAND_STEP;
+        markBeyond(youtubeChannelVideos, next, 'YouTube');
+        return next;
+      });
+    }
+  }, [
+    clipsMode,
+    kickEnabled,
+    twitchEnabled,
+    youtubeEnabled,
+    channelHasKick,
+    channelHasTwitch,
+    channelHasYoutube,
+    kickChannelVideos,
+    twitchChannelVideos,
+    youtubeChannelVideos,
+  ]);
   const removeChannel = useCallback((channelId: string) => {
     setSavedChannels((prev) => {
       const next = prev.filter((c) => c.id !== channelId);
@@ -2981,7 +3211,7 @@ export default function App() {
       if (typeof s.channel_youtube_enabled === 'boolean') {
         setYoutubeEnabled(s.channel_youtube_enabled);
       }
-      if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods') {
+      if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods' || s.channel_content_filter === 'streams') {
         setChannelContentFilter(s.channel_content_filter);
       }
       hydrateSavedChannelsOnce(
@@ -3203,8 +3433,13 @@ export default function App() {
             type="text"
             value={url}
             onChange={(e) => {
-              setUrl(e.target.value);
+              const v = e.target.value;
+              setUrl(v);
               setPreviewChannelBadge(null);
+              const trimmed = v.trim();
+              if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
+                warmYoutubePreview(trimmed);
+              }
             }}
             placeholder={urlFetched ? 'VOD or clip link' : 'PASTE VOD OR CLIP LINK...'}
             onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
@@ -3293,101 +3528,14 @@ export default function App() {
           </div>
 
           {pendingAddChannel && (
-            <div className="border border-zinc-700 bg-zinc-900/90 p-2 flex flex-col gap-2 shrink-0">
-              <p className="text-[10px] font-mono text-zinc-400">
-                Add channel to list?
-              </p>
-              <label className="flex flex-col gap-0.5">
-                <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600 flex items-center gap-1">
-                  <PlatformVodIcon platform="Kick" className="w-3 h-3" /> Kick name
-                </span>
-                <input
-                  type="text"
-                  value={pendingAddChannel.kickSlug}
-                  onChange={(e) => setPendingAddChannel((prev) => (
-                    prev ? { ...prev, kickSlug: e.target.value } : prev
-                  ))}
-                  placeholder="kick name"
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#53fc18] text-[10px]"
-                />
-              </label>
-              <label className="flex flex-col gap-0.5">
-                <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600 flex items-center gap-1">
-                  <PlatformVodIcon platform="Twitch" className="w-3 h-3" /> Twitch name
-                </span>
-                <input
-                  type="text"
-                  value={pendingAddChannel.twitchSlug}
-                  onChange={(e) => setPendingAddChannel((prev) => (
-                    prev ? { ...prev, twitchSlug: e.target.value } : prev
-                  ))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      void addChannelFromSlugs(
-                        pendingAddChannel.kickSlug,
-                        pendingAddChannel.twitchSlug,
-                        pendingAddChannel.youtubeSlug,
-                      );
-                      setPendingAddChannel(null);
-                    }
-                  }}
-                  placeholder="twitch name"
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#9146FF] text-[10px]"
-                />
-              </label>
-              <label className="flex flex-col gap-0.5">
-                <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600 flex items-center gap-1">
-                  <PlatformVodIcon platform="YouTube" className="w-3 h-3" /> YouTube name
-                </span>
-                <input
-                  type="text"
-                  value={pendingAddChannel.youtubeSlug}
-                  onChange={(e) => setPendingAddChannel((prev) => (
-                    prev ? { ...prev, youtubeSlug: e.target.value } : prev
-                  ))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      void addChannelFromSlugs(
-                        pendingAddChannel.kickSlug,
-                        pendingAddChannel.twitchSlug,
-                        pendingAddChannel.youtubeSlug,
-                      );
-                      setPendingAddChannel(null);
-                    }
-                  }}
-                  placeholder="@handle or UC… from channel URL"
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#F03030] text-[10px]"
-                />
-              </label>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    void addChannelFromSlugs(
-                      pendingAddChannel.kickSlug,
-                      pendingAddChannel.twitchSlug,
-                      pendingAddChannel.youtubeSlug,
-                    );
-                    setPendingAddChannel(null);
-                  }}
-                  disabled={
-                    !pendingAddChannel.kickSlug.trim()
-                    && !pendingAddChannel.twitchSlug.trim()
-                    && !pendingAddChannel.youtubeSlug.trim()
-                  }
-                  className="flex-1 bg-white text-black font-black uppercase py-1 text-[10px] border-2 border-white disabled:opacity-40"
-                >
-                  Add
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPendingAddChannel(null)}
-                  className="flex-1 bg-zinc-950 text-red-300 font-black uppercase py-1 text-[10px] border-2 border-red-500 hover:border-red-400 hover:bg-red-950/60 hover:text-red-200 transition-colors"
-                >
-                  Dismiss
-                </button>
-              </div>
-            </div>
+            <ChannelLinkCard
+              draft={pendingAddChannel}
+              onChange={setPendingAddChannel}
+              onConfirm={() => void commitChannelLink()}
+              onCancel={() => setPendingAddChannel(null)}
+              duplicateMessage={channelLinkDuplicate}
+              className="shrink-0"
+            />
           )}
 
           <div className="grid grid-cols-2 gap-2 shrink-0">
@@ -3938,8 +4086,15 @@ export default function App() {
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20 pointer-events-none">
                     <Loader2 size={40} className="animate-spin text-zinc-300" />
                     {!previewPlayback && (
-                      <span className="text-zinc-300 text-xs font-mono">Preparing preview...</span>
+                      <span className="text-zinc-300 text-xs font-mono">
+                        {urlPlatform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
+                      </span>
                     )}
+                  </div>
+                )}
+                {previewBuffering && previewVideoReady && !previewVideoLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/35 z-20 pointer-events-none">
+                    <Loader2 size={32} className="animate-spin text-zinc-200/90" />
                   </div>
                 )}
               </div>
@@ -4109,38 +4264,14 @@ export default function App() {
                 <Plus size={14} />
               </button>
             </div>
-            {pendingYoutubeChannelAdd && (
-              <div className="border border-zinc-700 bg-zinc-900/90 p-2 flex flex-col gap-2">
-                <p className="text-[10px] font-mono text-zinc-400">
-                  Add YouTube channel? Optional — paste @handle or channel id from the channel URL.
-                </p>
-                <input
-                  type="text"
-                  value={pendingYoutubeInput}
-                  onChange={(e) => setPendingYoutubeInput(e.target.value)}
-                  placeholder="@handle or UC…"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void commitPendingYoutubeChannelAdd(true);
-                  }}
-                  className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 focus:outline-none focus:border-[#F03030] text-[10px]"
-                />
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void commitPendingYoutubeChannelAdd(true)}
-                    className="flex-1 bg-white text-black font-black uppercase py-1 text-[10px] border-2 border-white"
-                  >
-                    Add
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void commitPendingYoutubeChannelAdd(false)}
-                    className="flex-1 border border-zinc-600 text-zinc-400 font-mono uppercase py-1 text-[10px] hover:text-white"
-                  >
-                    Skip
-                  </button>
-                </div>
-              </div>
+            {pendingAddChannel && tab === 'channels' && (
+              <ChannelLinkCard
+                draft={pendingAddChannel}
+                onChange={setPendingAddChannel}
+                onConfirm={() => void commitChannelLink()}
+                onCancel={() => setPendingAddChannel(null)}
+                duplicateMessage={channelLinkDuplicate}
+              />
             )}
             {addChannelNotice && (
               <p className="text-amber-400 text-[10px] font-mono">{addChannelNotice}</p>
@@ -4229,10 +4360,8 @@ export default function App() {
                     <button type="button" title="Refresh"
                       onClick={(e) => {
                         e.stopPropagation();
-                        channelRefreshInFlightRef.current.delete(`${ch.id}:vods`);
-                        channelRefreshInFlightRef.current.delete(`${ch.id}:clips`);
-                        channelRefreshInFlightRef.current.delete(`${ch.id}:streams`);
-                        void refreshChannel(ch.id, undefined, channelContentFilter);
+                        clearChannelRefreshFlight(ch.id);
+                        void refreshChannel(ch.id, undefined, channelContentFilter, { force: true });
                       }}
                       disabled={ch.loading}
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">

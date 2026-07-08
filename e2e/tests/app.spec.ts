@@ -30,7 +30,7 @@ test.describe('App loads correctly', () => {
     await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
 
     // The URL input should be present
-    const urlInput = page.getByPlaceholder(/kick\.com|twitch\.tv/i);
+    const urlInput = page.getByPlaceholder(/paste vod or clip link/i);
     await expect(urlInput).toBeVisible({ timeout: 10_000 });
 
     // Report any console errors

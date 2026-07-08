@@ -113,9 +113,11 @@ async def update_settings(update: SettingsUpdate):
         current.channel_kick_enabled = bool(update.channel_kick_enabled)
     if update.channel_twitch_enabled is not None:
         current.channel_twitch_enabled = bool(update.channel_twitch_enabled)
+    if update.channel_youtube_enabled is not None:
+        current.channel_youtube_enabled = bool(update.channel_youtube_enabled)
     if update.channel_content_filter is not None:
         filt = (update.channel_content_filter or "vods").strip().lower()
-        current.channel_content_filter = "clips" if filt == "clips" else "vods"
+        current.channel_content_filter = filt if filt in ("clips", "vods", "streams") else "vods"
     if update.mp4_faststart is not None:
         current.mp4_faststart = bool(update.mp4_faststart)
     settings_mgr.save(current)

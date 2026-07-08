@@ -371,10 +371,12 @@ def youtube_session_from_values(
         http_session = http_session_for(None)
         if cookie_header:
             http_session.headers["Cookie"] = cookie_header
-    elif explicit_browser:
+    elif explicit_browser or auto_auth:
         from services.youtube_auth import load_best_browser_session
 
-        loaded, cookie_header, http_session = load_best_browser_session(explicit_browser, False)
+        _browser, cookie_header, http_session = load_best_browser_session(
+            explicit_browser, auto_auth and not explicit_browser,
+        )
 
     if not cookie_header:
         anon_vd, anon_cookie, anon_file, anon_http = bootstrap_anonymous_session(

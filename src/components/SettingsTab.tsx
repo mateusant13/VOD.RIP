@@ -1,9 +1,9 @@
-import { type Dispatch, type SetStateAction, useEffect, useState } from 'react';
+import { type Dispatch, type SetStateAction } from 'react';
 import {
   CheckCircle2, FolderOpen, Loader2, StopCircle,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
-import { apiGet, apiPost } from '../hooks/useApiClient';
+import { apiPost } from '../hooks/useApiClient';
 import type { AppSettings, UpdateInfo } from '../types';
 
 type Props = {
@@ -39,24 +39,6 @@ export default function SettingsTab({
   onApplyUpdate,
   onFlushPanelLayout,
 }: Props) {
-  const [ytAuth, setYtAuth] = useState<{
-    auto_auth: boolean;
-    browser: string | null;
-    pot_providers: string[];
-    pot_auto_available: boolean;
-  } | null>(null);
-
-  useEffect(() => {
-    void apiGet<{
-      auto_auth: boolean;
-      browser: string | null;
-      pot_providers: string[];
-      pot_auto_available: boolean;
-    }>('/api/settings/youtube-auth')
-      .then(setYtAuth)
-      .catch(() => setYtAuth(null));
-  }, [settings.youtube_auto_auth, settings.youtube_cookies_browser]);
-
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1.5">
@@ -89,78 +71,6 @@ export default function SettingsTab({
             onChange={(e) => setSettings({ ...settings, max_cache_mb: parseInt(e.target.value) || 200 })}
             className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 focus:outline-none focus:border-white text-xs" />
         </div>
-      </div>
-
-      <div className="flex flex-col gap-2 border border-zinc-800 bg-zinc-950/50 p-2">
-        <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={settings.youtube_auto_auth !== false}
-            onChange={(e) => setSettings({ ...settings, youtube_auto_auth: e.target.checked })}
-            className="vod-cb-sm"
-          />
-          Auto YouTube auth (recommended)
-        </label>
-        <p className="text-[9px] text-zinc-600 font-mono leading-snug">
-          Preview and downloads use InnerTube over HTTP (no browser spawned).
-          {ytAuth?.browser ? (
-            <> Detected browser: <span className="text-zinc-400">{ytAuth.browser}</span>.</>
-          ) : null}
-          {settings.youtube_cookies_browser ? (
-            <> Reading cookies from <span className="text-zinc-400">{settings.youtube_cookies_browser}</span>.</>
-          ) : null}
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-1.5">
-        <FieldCaption>YouTube Cookies (optional — logged-in export)</FieldCaption>
-        <input
-          type="text"
-          value={settings.youtube_cookies_file ?? ''}
-          onChange={(e) => setSettings({ ...settings, youtube_cookies_file: e.target.value })}
-          placeholder="Only if bot-blocked — export while signed in to Google"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
-        />
-        <p className="text-[9px] font-mono text-zinc-600 leading-snug">
-          Anonymous session cookies are fetched automatically (no login). Use this field only for hard blocks.
-        </p>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div className="flex flex-col gap-1.5">
-          <FieldCaption>Cookies From Browser</FieldCaption>
-          <input
-            type="text"
-            value={settings.youtube_cookies_browser ?? ''}
-            onChange={(e) => setSettings({ ...settings, youtube_cookies_browser: e.target.value })}
-            placeholder="chrome / edge / firefox — only when set"
-            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs focus:outline-none focus:border-white"
-          />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <FieldCaption>Tokens JSON</FieldCaption>
-          <input
-            type="text"
-            value={settings.youtube_tokens_file ?? ''}
-            onChange={(e) => setSettings({ ...settings, youtube_tokens_file: e.target.value })}
-            placeholder="visitorData + po_token JSON"
-            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
-          />
-        </div>
-      </div>
-
-      <div className="flex flex-col gap-1.5">
-        <FieldCaption>YouTube PO Token (advanced override)</FieldCaption>
-        <input
-          type="text"
-          value={settings.youtube_po_token ?? ''}
-          onChange={(e) => setSettings({ ...settings, youtube_po_token: e.target.value })}
-          placeholder="Optional — paste po_token from tokens JSON export"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2 text-xs truncate focus:outline-none focus:border-white"
-        />
-        <p className="text-[9px] text-zinc-600 font-mono leading-snug">
-          Advanced override only. Preview does not use PO tokens; paste a manual token for yt-dlp downloads.
-        </p>
       </div>
 
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">

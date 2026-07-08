@@ -1,7 +1,9 @@
-"""Real-network YouTube DASH segment preview — segments 0/1/2 must mux."""
+"""Real-network YouTube DASH window HLS preview — seg0/1/2 must mux."""
 from __future__ import annotations
 
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -23,7 +25,7 @@ def _is_mpegts(body: bytes) -> bool:
     return hits >= 2
 
 
-def _fetch_segment(c, path: str, retries: int = 120) -> tuple[int, bytes]:
+def _fetch(c, path: str, retries: int = 180) -> tuple[int, bytes]:
     for _ in range(retries):
         resp = c.get(path)
         if resp.status_code == 503:
@@ -33,7 +35,36 @@ def _fetch_segment(c, path: str, retries: int = 120) -> tuple[int, bytes]:
     return 503, b""
 
 
-def test_youtube_dash_segments_zero_one_two():
+def _parse_extinf_durations(playlist_text: str) -> list[float]:
+    out: list[float] = []
+    for line in playlist_text.splitlines():
+        if line.startswith("#EXTINF:"):
+            out.append(float(line.split(":", 1)[1].split(",")[0]))
+    return out
+
+
+def _audit_segment_body(content: bytes, declared_sec: float) -> str | None:
+    from services.ytdlp_ffmpeg import _resolve_ffprobe_exe, audit_segment_extinf
+
+    if not _resolve_ffprobe_exe():
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    try:
+        audit = audit_segment_extinf(tmp_path, declared_sec)
+        if audit.ok:
+            return None
+        return (
+            f"EXTINF audit declared={declared_sec:.3f} actual={audit.actual_duration:.3f} "
+            f"delta={audit.delta:+.3f} pts={audit.first_pts}..{audit.last_pts}"
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+
+def test_youtube_window_hls_segments_zero_one_two():
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE
 
     _EXTRACT_INFO_CACHE.clear()
@@ -57,23 +88,38 @@ def test_youtube_dash_segments_zero_one_two():
 
             tested = True
             master = c.get(f"/api/preview/hls/{sid}/master.m3u8")
-            if master.status_code != 200 or "ytseg-" not in master.text:
+            if master.status_code != 200 or "window-playlist" not in master.text:
                 failures.append(f"MASTER {url}: {master.status_code}")
                 c.delete(f"/api/preview/session/{sid}")
                 continue
 
+            playlist_line = next(
+                (
+                    ln.strip()
+                    for ln in master.text.splitlines()
+                    if ln.strip().startswith("/api/") and "window-playlist" in ln
+                ),
+                "",
+            )
+            media_status, media = _fetch(c, playlist_line, retries=180)
+            if media_status != 200:
+                failures.append(f"MEDIA {url}: HTTP {media_status}")
+                c.delete(f"/api/preview/session/{sid}")
+                continue
+            media_text = media.decode("utf-8", errors="replace")
             seg_paths = [
                 ln.strip()
-                for ln in master.text.splitlines()
-                if ln.strip().startswith("/api/") and "ytseg-" in ln
+                for ln in media_text.splitlines()
+                if ln.strip().startswith("/api/") and "window-seg-" in ln
             ]
+            extinf = _parse_extinf_durations(media_text)
             if len(seg_paths) < 3:
                 failures.append(f"PLAYLIST {url}: only {len(seg_paths)} segments")
                 c.delete(f"/api/preview/session/{sid}")
                 continue
 
             for idx, path in enumerate(seg_paths[:3]):
-                status, content = _fetch_segment(c, path)
+                status, content = _fetch(c, path)
                 if status not in (200, 206):
                     failures.append(f"seg{idx} {url}: HTTP {status}")
                     continue
@@ -82,9 +128,14 @@ def test_youtube_dash_segments_zero_one_two():
                     continue
                 if not _is_mpegts(content):
                     failures.append(f"seg{idx} {url}: not MPEG-TS head={content[:20]!r}")
+                    continue
+                if idx < len(extinf):
+                    audit_err = _audit_segment_body(content, extinf[idx])
+                    if audit_err:
+                        failures.append(f"seg{idx} {url}: {audit_err}")
 
             if len(seg_paths) >= 6:
-                status, content = _fetch_segment(c, seg_paths[5])
+                status, content = _fetch(c, seg_paths[5], retries=240)
                 if status not in (200, 206) or not _is_mpegts(content):
                     failures.append(f"seg5 {url}: seek-mid failed status={status}")
 
@@ -92,5 +143,5 @@ def test_youtube_dash_segments_zero_one_two():
             break
 
     if not tested:
-        pytest.skip("no DASH-segment YouTube URL in candidates")
+        pytest.skip("no DASH window-HLS YouTube URL in candidates")
     assert not failures, "\n".join(failures)

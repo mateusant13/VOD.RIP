@@ -18,6 +18,8 @@ import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
   applyHlsQualityLevel,
   attachProgressivePreview,
+  effectiveHlsLevelIndex,
+  hlsNeedsApiQualitySwitch,
   inferLevelHeight,
   resolveInitialHlsPreviewHeight,
   levelIndexForHeight,
@@ -26,7 +28,9 @@ import {
   resolveHlsPreviewLevels,
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
-  previewUrlWithPreferHeight,
+  resumePreviewAtTime,
+  VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS,
+  VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS,
   type PreviewLevelOption,
 } from '../previewPlayerUtils';
 
@@ -72,6 +76,8 @@ interface PreviewPlayerOptions {
    * If not provided, errors are silently swallowed.
    */
   onPreviewError?: (message: string) => void;
+  /** Legacy clip-relative HLS timeline (trim_timeline=true); window-HLS uses absolute VOD time. */
+  trimTimelineRef?: React.RefObject<boolean>;
 }
 
 /**
@@ -88,6 +94,7 @@ export function usePreviewPlayer({
   trimStart = 0,
   containerRef,
   onPreviewError,
+  trimTimelineRef,
 }: PreviewPlayerOptions): PreviewPlayerState & PreviewPlayerActions & {
   setHlsRef: (hls: Hls | null) => void;
   syncProgressiveLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
@@ -102,6 +109,16 @@ export function usePreviewPlayer({
   const requestedHeightRef = useRef(0);
   const appliedHeightRef = useRef(0);
   const previewLevelsRef = useRef<PreviewLevelOption[]>([]);
+  const viewportSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingViewportHeightRef = useRef(0);
+
+  const cancelViewportSync = useCallback(() => {
+    if (viewportSyncTimerRef.current != null) {
+      clearTimeout(viewportSyncTimerRef.current);
+      viewportSyncTimerRef.current = null;
+    }
+    pendingViewportHeightRef.current = 0;
+  }, []);
 
   // Keep a ref in sync for closures
   const setLevels = useCallback((levels: PreviewLevelOption[]) => {
@@ -167,16 +184,10 @@ export function usePreviewPlayer({
       if (!video || !playback.url) return;
       appliedHeightRef.current = playbackHeight;
       try {
-        const targetUrl = userInitiated
-          ? previewUrlWithPreferHeight(playback.url, playbackHeight)
-          : `${playback.url}${playback.url.includes('?') ? '&' : '?'}t=${Date.now()}`;
-        attachProgressivePreview(video, targetUrl, savedTime);
-        if (!wasPaused) void video.play().catch(() => {});
-        if (userInitiated) {
-          void syncSessionQuality().catch(() => {});
-        } else {
-          await syncSessionQuality();
-        }
+        await syncSessionQuality();
+        const sep = playback.url.includes('?') ? '&' : '?';
+        attachProgressivePreview(video, `${playback.url}${sep}t=${Date.now()}`, savedTime);
+        resumePreviewAtTime(video, savedTime, wasPaused);
       } catch (err: unknown) {
         appliedHeightRef.current = 0;
         onPreviewError?.(err instanceof Error ? err.message : 'Could not change preview quality');
@@ -191,35 +202,47 @@ export function usePreviewPlayer({
     const hlsIndex = level.index;
     const hlsLevel = hls.levels[hlsIndex] as { height?: number } | undefined;
     const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
-    const needsApiSwitch = !hlsHeight || hlsHeight !== playbackHeight;
+    const trimTimeline = trimTimelineRef?.current === true;
+    const needsApiSwitch = hlsNeedsApiQualitySwitch(
+      playbackHeight,
+      appliedHeightRef.current,
+      hlsHeight,
+      trimTimeline,
+    );
     const playbackUrl = playback?.url ?? '';
 
     if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
       appliedHeightRef.current = playbackHeight;
       applyHlsQualityLevel(hls, hlsIndex, true);
-      if (!wasPaused) void video?.play().catch(() => {});
+      if (video) resumePreviewAtTime(video, savedTime, wasPaused);
       return;
     }
 
     if (needsApiSwitch && sid && playbackUrl) {
       appliedHeightRef.current = playbackHeight;
       try {
-        const targetUrl = previewUrlWithPreferHeight(playbackUrl, playbackHeight);
+        // Apply tier server-side first — avoid master?prefer_height racing POST /quality
+        // and clearing ytseg cache while HLS.js fetches segments.
+        await syncSessionQuality();
+        const sep = playbackUrl.includes('?') ? '&' : '?';
+        const targetUrl = `${playbackUrl}${sep}t=${Date.now()}`;
         const onManifest = () => {
           hls.off?.(Hls.Events.MANIFEST_PARSED, onManifest);
-          if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
-            applyHlsQualityLevel(hls, hlsIndex, true);
+          const effectiveIndex = effectiveHlsLevelIndex(hlsIndex, hls.levels.length);
+          if (effectiveIndex >= 0) {
+            applyHlsQualityLevel(hls, effectiveIndex, true);
           }
-          hls.startLoad?.(Math.max(0, savedTime));
           if (video) {
-            video.currentTime = savedTime;
-            if (!wasPaused) void video.play().catch(() => {});
+            resumePreviewAtTime(video, savedTime, wasPaused);
+          } else {
+            hls.startLoad?.(Math.max(0, savedTime));
           }
         };
         hls.stopLoad?.();
         hls.on?.(Hls.Events.MANIFEST_PARSED, onManifest);
-        hls.loadSource?.(targetUrl);
-        void syncSessionQuality().catch(() => {});
+        requestAnimationFrame(() => {
+          hls.loadSource?.(targetUrl);
+        });
       } catch (err: unknown) {
         appliedHeightRef.current = 0;
         onPreviewError?.(err instanceof Error ? err.message : 'Could not change preview quality');
@@ -227,28 +250,52 @@ export function usePreviewPlayer({
     } else if (hlsIndex >= 0 && hlsIndex < hls.levels.length) {
       appliedHeightRef.current = playbackHeight;
       applyHlsQualityLevel(hls, hlsIndex, userInitiated);
-      if (userInitiated && !wasPaused) void video?.play().catch(() => {});
+      if (userInitiated && video) resumePreviewAtTime(video, savedTime, wasPaused);
     }
-  }, [apiPost, playback, sessionId, trimStart, videoRef, onPreviewError]);
+  }, [apiPost, playback, sessionId, trimStart, trimTimelineRef, videoRef, onPreviewError]);
 
-  const syncPlaybackToViewport = useCallback(async (fullscreenOverride?: boolean) => {
+  const syncPlaybackToViewport = useCallback((fullscreenOverride?: boolean) => {
+    if (trimTimelineRef?.current) return Promise.resolve();
     const levels = previewLevelsRef.current;
-    if (!levels.length) return;
+    if (!levels.length) return Promise.resolve();
     const fullscreen = fullscreenOverride ?? false;
     const requested = requestedHeightRef.current || levels[qualityLevel]?.height || PREVIEW_CLIP_DEFAULT_HEIGHT;
     const cap = measurePlayerCap();
     const available = levels.map((l) => l.height);
     const playbackHeight = playbackHeightFromRequest(requested, available, cap, fullscreen);
-    await applyPlaybackHeight(playbackHeight);
-  }, [applyPlaybackHeight, measurePlayerCap, qualityLevel]);
+    if (!playbackHeight || playbackHeight === appliedHeightRef.current) {
+      cancelViewportSync();
+      return Promise.resolve();
+    }
+    pendingViewportHeightRef.current = playbackHeight;
+    if (viewportSyncTimerRef.current != null) {
+      clearTimeout(viewportSyncTimerRef.current);
+    }
+    const delay = fullscreenOverride === undefined
+      ? VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS
+      : VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS;
+    return new Promise<void>((resolve) => {
+      viewportSyncTimerRef.current = setTimeout(() => {
+        viewportSyncTimerRef.current = null;
+        const h = pendingViewportHeightRef.current;
+        pendingViewportHeightRef.current = 0;
+        if (!h || h === appliedHeightRef.current) {
+          resolve();
+          return;
+        }
+        void applyPlaybackHeight(h).finally(resolve);
+      }, delay);
+    });
+  }, [applyPlaybackHeight, cancelViewportSync, measurePlayerCap, qualityLevel, trimTimelineRef]);
 
   const applyQuality = useCallback(async (levelIndex: number) => {
+    cancelViewportSync();
     const level = previewLevelsRef.current[levelIndex];
     if (!level) return;
     requestedHeightRef.current = level.height;
     setQualityLevel(levelIndex);
     await applyPlaybackHeight(level.height, { userInitiated: true });
-  }, [applyPlaybackHeight]);
+  }, [applyPlaybackHeight, cancelViewportSync]);
 
   const syncProgressiveLevels = useCallback((
     mapped: PreviewLevelOption[],

@@ -148,12 +148,20 @@ class PreviewSessionResponse(BaseModel):
     active_height: int = 0
     extract_source: str = ""
     mux_ready: bool = True
+    playlist_ready: bool = True  # full VOD playlist exists — player can attach immediately
+    segment_buffer_ready: bool = True  # first segment(s) on disk (optional warm)
     trim_timeline: bool = False  # playlist starts at crop_start (YouTube on-demand DASH segments)
     duration_sec: float = 0.0  # real VOD length from extract (crop_end clamped to this)
 
 
+class PreviewSeekRequest(BaseModel):
+    position_sec: float = 0.0
+
+
 class PreviewSessionStatusResponse(BaseModel):
     mux_ready: bool
+    playlist_ready: bool = True
+    segment_buffer_ready: bool = True
     mux_status: str = "unnecessary"
     mux_error: str = ""
 

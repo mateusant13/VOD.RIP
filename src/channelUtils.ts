@@ -139,6 +139,52 @@ export function mergeClipLists(existing: ChannelVideo[], incoming: ChannelVideo[
   );
 }
 
+export function sortChannelVideosByMode(videos: ChannelVideo[], clips: boolean): ChannelVideo[] {
+  return [...videos].sort(
+    clips
+      ? (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)
+      : (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
+  );
+}
+
+function recentChannelVideos(sorted: ChannelVideo[]): ChannelVideo[] {
+  const cutoff = Date.now() - CHANNEL_RECENT_DAYS * 86_400_000;
+  const recent = sorted.filter((v) => {
+    const ts = parseVideoTs(v.created_at);
+    return ts === 0 || ts >= cutoff;
+  });
+  return recent.length > 0 ? recent : sorted;
+}
+
+/** Slice a platform list for display — 14-day window first, full cache after Show more. */
+export function channelPlatformVisibleSlice(
+  videos: ChannelVideo[],
+  visibleLimit: number,
+  beyondRecent: boolean,
+  clips: boolean,
+): ChannelVideo[] {
+  const sorted = sortChannelVideosByMode(videos, clips);
+  if (!beyondRecent && sorted.length > 0) {
+    return recentChannelVideos(sorted).slice(0, visibleLimit);
+  }
+  return sorted.slice(0, visibleLimit);
+}
+
+export function channelPlatformCanExpand(
+  videos: ChannelVideo[],
+  visibleLimit: number,
+  beyondRecent: boolean,
+  clips: boolean,
+): boolean {
+  const sorted = sortChannelVideosByMode(videos, clips);
+  if (visibleLimit < sorted.length) return true;
+  if (!beyondRecent) {
+    const recent = recentChannelVideos(sorted);
+    if (recent.length > 0 && recent.length < sorted.length) return true;
+  }
+  return false;
+}
+
 export function channelClipsMissing(
   ch: SavedChannel,
   kickOn: boolean,
@@ -146,12 +192,17 @@ export function channelClipsMissing(
   youtubeOn = false,
 ): boolean {
   const clips = ch.clipVideos ?? [];
+  const fetched = ch.clipPlatformsFetched ?? {};
   if (!ch.clipsFetched && clips.length === 0) return true;
-  if (kickOn && ch.kickSlug?.trim() && !clips.some((v) => v.platform === 'Kick')) return true;
-  if (twitchOn && ch.twitchSlug?.trim() && !clips.some((v) => v.platform === 'Twitch')) {
+  if (kickOn && ch.kickSlug?.trim() && !clips.some((v) => v.platform === 'Kick') && !fetched.Kick) {
     return true;
   }
-  if (youtubeOn && ch.youtubeSlug?.trim() && !clips.some((v) => v.platform === 'YouTube')) return true;
+  if (twitchOn && ch.twitchSlug?.trim() && !clips.some((v) => v.platform === 'Twitch') && !fetched.Twitch) {
+    return true;
+  }
+  if (youtubeOn && ch.youtubeSlug?.trim() && !clips.some((v) => v.platform === 'YouTube') && !fetched.YouTube) {
+    return true;
+  }
   return false;
 }
 
@@ -173,14 +224,86 @@ export function channelVodsMissing(
   twitchOn: boolean,
   youtubeOn = false,
 ): boolean {
-  if (!ch.updatedAt && (ch.vodVideos?.length ?? 0) === 0) return true;
-  if (kickOn && ch.kickSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Kick')) return true;
-  if (twitchOn && ch.twitchSlug?.trim() && !ch.vodVideos?.some((v) => v.platform === 'Twitch')) return true;
+  const vods = ch.vodVideos ?? [];
+  const fetched = ch.vodPlatformsFetched ?? {};
+  if (!ch.updatedAt && vods.length === 0) return true;
+  if (kickOn && ch.kickSlug?.trim() && !vods.some((v) => v.platform === 'Kick') && !fetched.Kick) {
+    return true;
+  }
+  if (twitchOn && ch.twitchSlug?.trim() && !vods.some((v) => v.platform === 'Twitch') && !fetched.Twitch) {
+    return true;
+  }
   if (youtubeOn && ch.youtubeSlug?.trim()
-    && !ch.vodVideos?.some((v) => v.platform === 'YouTube' && v.content_kind !== 'stream')) {
+    && !vods.some((v) => v.platform === 'YouTube' && v.content_kind !== 'stream')
+    && !fetched.YouTube) {
     return true;
   }
   return false;
+}
+
+/** True when the UI can show cached rows for the current platform toggles. */
+export function channelHasCachedContent(
+  ch: SavedChannel,
+  mode: 'vods' | 'clips' | 'streams',
+  kickOn: boolean,
+  twitchOn: boolean,
+  youtubeOn: boolean,
+): boolean {
+  if (mode === 'clips') {
+    const clips = ch.clipVideos ?? [];
+    if (kickOn && ch.kickSlug?.trim() && clips.some((v) => v.platform === 'Kick')) return true;
+    if (twitchOn && ch.twitchSlug?.trim() && clips.some((v) => v.platform === 'Twitch')) return true;
+    if (youtubeOn && ch.youtubeSlug?.trim() && clips.some((v) => v.platform === 'YouTube')) return true;
+    return false;
+  }
+  if (mode === 'streams') {
+    return (ch.vodVideos ?? []).some((v) => v.content_kind === 'stream');
+  }
+  const vods = (ch.vodVideos ?? []).filter(
+    (v) => v.content_kind !== 'stream' && v.content_kind !== 'clip',
+  );
+  if (kickOn && ch.kickSlug?.trim() && vods.some((v) => v.platform === 'Kick')) return true;
+  if (twitchOn && ch.twitchSlug?.trim() && vods.some((v) => v.platform === 'Twitch')) return true;
+  if (youtubeOn && ch.youtubeSlug?.trim() && vods.some((v) => v.platform === 'YouTube')) return true;
+  return false;
+}
+
+function clipPlatformFetchDone(
+  platform: 'Kick' | 'Twitch' | 'YouTube',
+  incoming: ChannelVideo[],
+  errs: Record<string, string>,
+  attempted?: boolean,
+): boolean {
+  return attempted || incoming.some((v) => v.platform === platform) || Boolean(errs[platform]);
+}
+
+/** Mark platforms fetched after a completed API attempt (empty OK; errors count too). */
+export function mergeClipPlatformsFetched(
+  prev: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>,
+  ch: Pick<SavedChannel, 'kickSlug' | 'twitchSlug' | 'youtubeSlug'>,
+  incoming: ChannelVideo[],
+  errs: Record<string, string>,
+  attempted: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> = {},
+): Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> {
+  const out = { ...prev };
+  if (ch.kickSlug?.trim() && clipPlatformFetchDone('Kick', incoming, errs, attempted.Kick)) out.Kick = true;
+  if (ch.twitchSlug?.trim() && clipPlatformFetchDone('Twitch', incoming, errs, attempted.Twitch)) out.Twitch = true;
+  if (ch.youtubeSlug?.trim() && clipPlatformFetchDone('YouTube', incoming, errs, attempted.YouTube)) out.YouTube = true;
+  return out;
+}
+
+export function mergeVodPlatformsFetched(
+  prev: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>,
+  ch: Pick<SavedChannel, 'kickSlug' | 'twitchSlug' | 'youtubeSlug'>,
+  incoming: ChannelVideo[],
+  errs: Record<string, string>,
+  attempted: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> = {},
+): Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> {
+  const out = { ...prev };
+  if (ch.kickSlug?.trim() && clipPlatformFetchDone('Kick', incoming, errs, attempted.Kick)) out.Kick = true;
+  if (ch.twitchSlug?.trim() && clipPlatformFetchDone('Twitch', incoming, errs, attempted.Twitch)) out.Twitch = true;
+  if (ch.youtubeSlug?.trim() && clipPlatformFetchDone('YouTube', incoming, errs, attempted.YouTube)) out.YouTube = true;
+  return out;
 }
 
 /** Resolve Twitch/Kick thumbnail templates with width/height placeholders. */
@@ -379,6 +502,89 @@ export function parseChannelInput(raw: string): {
   return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: '' };
 }
 
+export type ChannelLinkPlatform = 'kick' | 'twitch' | 'youtube';
+
+export type ChannelLinkDraft = {
+  kickSlug: string;
+  twitchSlug: string;
+  youtubeSlug: string;
+  kickEnabled: boolean;
+  twitchEnabled: boolean;
+  youtubeEnabled: boolean;
+  detectedFrom: ChannelLinkPlatform | null;
+};
+
+export function detectChannelLinkSource(raw: string): ChannelLinkPlatform | null {
+  const lower = raw.trim().toLowerCase();
+  if (lower.includes('kick.com')) return 'kick';
+  if (lower.includes('twitch.tv')) return 'twitch';
+  if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'youtube';
+  return null;
+}
+
+/** Prefill all three platform rows; cross-fill guesses when only one URL was pasted. */
+export function channelLinkDraftFromParsed(
+  parsed: ReturnType<typeof parseChannelInput>,
+  raw = '',
+): ChannelLinkDraft {
+  const detectedFrom = detectChannelLinkSource(raw);
+  const guess = parsed.displayName || parsed.kickSlug || parsed.twitchSlug || parsed.youtubeSlug;
+  return {
+    kickSlug: parsed.kickSlug || guess,
+    twitchSlug: parsed.twitchSlug || guess,
+    youtubeSlug: parsed.youtubeSlug || guess,
+    kickEnabled: true,
+    twitchEnabled: true,
+    youtubeEnabled: true,
+    detectedFrom,
+  };
+}
+
+export function normalizeChannelLinkSlug(platform: ChannelLinkPlatform, value: string): string {
+  let s = value.trim();
+  if (platform === 'youtube') {
+    return youtubeSlugFromChannelUrl(s) || s.replace(/^@+/, '');
+  }
+  return s.replace(/^@+/, '').toLowerCase();
+}
+
+export function channelLinkWillAddSummary(draft: ChannelLinkDraft): string | null {
+  const rows: { platform: string; slug: string }[] = [];
+  if (draft.kickEnabled && draft.kickSlug.trim()) {
+    rows.push({ platform: 'Kick', slug: draft.kickSlug.trim() });
+  }
+  if (draft.twitchEnabled && draft.twitchSlug.trim()) {
+    rows.push({ platform: 'Twitch', slug: draft.twitchSlug.trim() });
+  }
+  if (draft.youtubeEnabled && draft.youtubeSlug.trim()) {
+    rows.push({ platform: 'YouTube', slug: draft.youtubeSlug.trim() });
+  }
+  if (!rows.length) return null;
+  const slugs = rows.map((r) => r.slug.toLowerCase());
+  const allSame = slugs.every((s) => s === slugs[0]);
+  if (allSame) {
+    return `${rows[0].slug} · ${rows.map((r) => r.platform).join(' · ')}`;
+  }
+  return rows.map((r) => `${r.platform}: ${r.slug}`).join(' · ');
+}
+
+export function channelLinkDraftSlugs(draft: ChannelLinkDraft): {
+  kick: string;
+  twitch: string;
+  youtube: string;
+} {
+  return {
+    kick: draft.kickEnabled ? normalizeChannelLinkSlug('kick', draft.kickSlug) : '',
+    twitch: draft.twitchEnabled ? normalizeChannelLinkSlug('twitch', draft.twitchSlug) : '',
+    youtube: draft.youtubeEnabled ? normalizeChannelLinkSlug('youtube', draft.youtubeSlug) : '',
+  };
+}
+
+export function channelLinkDraftValid(draft: ChannelLinkDraft): boolean {
+  const { kick, twitch, youtube } = channelLinkDraftSlugs(draft);
+  return Boolean(kick || twitch || youtube);
+}
+
 /** Settings/section captions — not <label> so clicks never focus nearby inputs. */
 
 export function channelPlatformErrors(ch: SavedChannel, mode: 'vods' | 'clips' | 'streams'): Record<string, string> {
@@ -419,6 +625,8 @@ export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
     clipErrors: ch.clipErrors ?? {},
     clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,
     streamsFetched: ch.streamsFetched ?? (vodVideos?.some((v) => v.content_kind === 'stream') ?? false),
+    vodPlatformsFetched: ch.vodPlatformsFetched ?? {},
+    clipPlatformsFetched: ch.clipPlatformsFetched ?? {},
     loading: false,
   };
 }
@@ -626,6 +834,9 @@ export function loadStoredChannelUi(): {
 export const CHANNEL_INITIAL_VISIBLE = 5;
 
 export const CHANNEL_EXPAND_STEP = 10;
+
+/** Prefer this window for the first page; Show more pierces into older cached items. */
+export const CHANNEL_RECENT_DAYS = 14;
 
 export const CHANNEL_FETCH_LIMIT = 100;
 /** Cheap head fetch on page load — merge only ids not already cached. */

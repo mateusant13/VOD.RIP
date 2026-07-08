@@ -4,7 +4,6 @@ Channel browsing routes — VODs and clips for saved Kick/Twitch channels.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from urllib.parse import unquote
 
@@ -18,6 +17,7 @@ from deps import (
     CHANNEL_LIMIT_MAX,
     CHANNEL_VOD_FETCH_TIMEOUT_SEC,
     CLIP_FETCH_TIMEOUT_SEC,
+    YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
 )
 from services.channel_cache import get_cached, make_channel_cache_key, set_cached
 from services.kick_api_service import (
@@ -31,6 +31,7 @@ from services.twitch_gql_service import (
 from services.youtube_service import list_channel_videos_sync as youtube_list_channel_videos_sync
 from utils import (
     filter_clip_entries,
+    filter_videos_recent_or_all_by_platform,
     format_platform_error,
     looks_like_clip_entry,
     normalize_err,
@@ -44,6 +45,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["channels"])
 
 
+def _cache_channel_payload(key: str, payload: dict) -> dict:
+    """Skip caching empty error-only responses so retries aren't blocked 90s."""
+    errs = payload.get("per_platform_errors") or {}
+    rows = payload.get("videos") or payload.get("clips") or []
+    if errs and not rows:
+        return payload
+    set_cached(key, payload)
+    return payload
+
+
 async def _gather_channel_clips(
     *,
     wanted: List[str],
@@ -51,7 +62,8 @@ async def _gather_channel_clips(
     twitch_login: str,
     youtube_slug: str = "",
     limit: int,
-) -> tuple[List[dict], Dict[str, str]]:
+    days: int = CHANNEL_DAYS_DEFAULT,
+) -> tuple[List[dict], Dict[str, str], int]:
     """Fetch clips per platform using platform-specific logins."""
     per_platform_errors: Dict[str, str] = {}
     all_clips: List[dict] = []
@@ -68,9 +80,15 @@ async def _gather_channel_clips(
             vids = await asyncio.wait_for(
                 loop.run_in_executor(
                     CHANNEL_EXECUTOR,
-                    partial(youtube_list_channel_videos_sync, youtube_ref, limit, playlist="shorts"),
+                    partial(
+                        youtube_list_channel_videos_sync,
+                        youtube_ref,
+                        limit,
+                        playlist="shorts",
+                        enrich=False,
+                    ),
                 ),
-                timeout=CLIP_FETCH_TIMEOUT_SEC,
+                timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
             per_platform_errors["YouTube"] = "Shorts fetch timed out — try again"
@@ -159,12 +177,13 @@ async def _gather_channel_clips(
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     all_clips = filter_clip_entries(all_clips)
+    all_clips, effective_days = filter_videos_recent_or_all_by_platform(all_clips, days)
     all_clips.sort(key=lambda v: -(v.get("views") or 0))
     for k, v in list(per_platform_errors.items()):
         per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
         if not per_platform_errors[k]:
             del per_platform_errors[k]
-    return all_clips, per_platform_errors
+    return all_clips, per_platform_errors, effective_days
 
 
 @router.get("/api/channel/videos")
@@ -208,15 +227,16 @@ async def channel_videos(
                 "days": days,
                 "per_platform_errors": {},
             }
-            set_cached(cache_key, payload)
+            _cache_channel_payload(cache_key, payload)
             return payload
         if content_norm == "clips":
-            all_clips, per_platform_errors = await _gather_channel_clips(
+            all_clips, per_platform_errors, days_eff = await _gather_channel_clips(
                 wanted=wanted,
                 kick_slug=kick_ch,
                 twitch_login=twitch_ch,
                 youtube_slug=youtube_ch,
                 limit=limit_norm,
+                days=days_norm,
             )
             payload = {
                 "clips": all_clips,
@@ -224,9 +244,10 @@ async def channel_videos(
                 "channel": channel,
                 "platforms": wanted,
                 "content": "clips",
+                "days": days_eff,
                 "per_platform_errors": per_platform_errors,
             }
-            set_cached(cache_key, payload)
+            _cache_channel_payload(cache_key, payload)
             return payload
         if content_norm == "streams":
             per_platform_errors: Dict[str, str] = {}
@@ -243,9 +264,10 @@ async def channel_videos(
                                 youtube_ch,
                                 limit_norm,
                                 playlist="streams",
+                                enrich=False,
                             ),
                         ),
-                        timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                        timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                     )
                     all_videos.extend(vids)
                 except asyncio.TimeoutError:
@@ -258,18 +280,18 @@ async def channel_videos(
                 per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
                 if not per_platform_errors[k]:
                     del per_platform_errors[k]
+            all_videos, days_eff = filter_videos_recent_or_all_by_platform(all_videos, days_norm)
             payload = {
                 "videos": all_videos,
                 "channel": channel,
                 "platforms": wanted,
                 "content": "streams",
+                "days": days_eff,
                 "per_platform_errors": per_platform_errors,
             }
-            set_cached(cache_key, payload)
+            _cache_channel_payload(cache_key, payload)
             return payload
         limit = limit_norm
-        days = days_norm
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
         per_platform_errors: Dict[str, str] = {}
         all_videos: List[dict] = []
         loop = asyncio.get_running_loop()
@@ -348,9 +370,15 @@ async def channel_videos(
                 vids = await asyncio.wait_for(
                     loop.run_in_executor(
                         CHANNEL_EXECUTOR,
-                        partial(youtube_list_channel_videos_sync, ref, limit, playlist="videos"),
+                        partial(
+                            youtube_list_channel_videos_sync,
+                            ref,
+                            limit,
+                            playlist="videos",
+                            enrich=False,
+                        ),
                     ),
-                    timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                    timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
                 per_platform_errors["YouTube"] = "VOD fetch timed out — try again"
@@ -375,13 +403,7 @@ async def channel_videos(
                 elif isinstance(result, BaseException):
                     logger.debug("Channel fetch task failed: %s", result)
 
-        if cutoff is not None:
-            filtered: List[dict] = []
-            for v in all_videos:
-                dt = parse_video_date(v.get("created_at"))
-                if dt is None or dt >= cutoff:
-                    filtered.append(v)
-            all_videos = filtered
+        all_videos, days_eff = filter_videos_recent_or_all_by_platform(all_videos, days_norm)
 
         def _sort_key(v: dict) -> tuple:
             dt = parse_video_date(v.get("created_at"))
@@ -398,10 +420,10 @@ async def channel_videos(
             "channel": channel,
             "platforms": wanted,
             "content": "vods",
-            "days": days,
+            "days": days_eff,
             "per_platform_errors": per_platform_errors,
         }
-        set_cached(cache_key, payload)
+        _cache_channel_payload(cache_key, payload)
         return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -415,6 +437,7 @@ async def channel_clips(
     url: str = "",
     platforms: str = "Kick,Twitch",
     limit: int = CHANNEL_CLIP_LIMIT,
+    days: int = CHANNEL_DAYS_DEFAULT,
     kick_slug: Optional[str] = None,
     twitch_login: Optional[str] = None,
     youtube_slug: Optional[str] = None,
@@ -430,8 +453,9 @@ async def channel_clips(
         channel = kick_ch or twitch_ch or youtube_ch
         wanted = parse_wanted_platforms(platforms)
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+        days_norm = max(0, min(int(days), 365))
         cache_key = make_channel_cache_key(
-            "clips", kick_ch, twitch_ch, platforms, limit_norm,
+            "clips", kick_ch, twitch_ch, platforms, limit_norm, days_norm,
             ",".join(sorted(wanted)), youtube_ch,
         )
         cached = get_cached(cache_key)
@@ -445,23 +469,25 @@ async def channel_clips(
                 "content": "clips",
                 "per_platform_errors": {},
             }
-            set_cached(cache_key, payload)
+            _cache_channel_payload(cache_key, payload)
             return payload
-        all_clips, per_platform_errors = await _gather_channel_clips(
+        all_clips, per_platform_errors, days_eff = await _gather_channel_clips(
             wanted=wanted,
             kick_slug=kick_ch,
             twitch_login=twitch_ch,
             youtube_slug=youtube_ch,
             limit=limit_norm,
+            days=days_norm,
         )
         payload = {
             "clips": all_clips,
             "channel": channel,
             "platforms": wanted,
             "content": "clips",
+            "days": days_eff,
             "per_platform_errors": per_platform_errors,
         }
-        set_cached(cache_key, payload)
+        _cache_channel_payload(cache_key, payload)
         return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

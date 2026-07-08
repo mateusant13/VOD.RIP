@@ -5,6 +5,7 @@ spawning real yt-dlp workers (no network).
 """
 
 import pytest
+import time
 from datetime import datetime, timezone
 
 from models.schemas import DownloadState
@@ -170,6 +171,10 @@ def test_remove_history_deletes_output_file(tmp_path):
     mgr._db.record_history(state)
 
     assert mgr.remove_history(dl_id) is True
+    for _ in range(30):
+        if not output.is_file():
+            break
+        time.sleep(0.05)
     assert not output.is_file()
 
 

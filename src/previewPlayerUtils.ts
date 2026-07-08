@@ -1,8 +1,28 @@
 import { apiPost } from './hooks/useApiClient';
 import { detectUrlPlatform, isClipUrl } from './channelUtils';
+import type { PreviewSessionStatusResponse } from './types';
 
 const _warmInflight = new Set<string>();
 const _warmTimers = new Map<string, number>();
+
+/** YouTube watch URL → 11-char video id (explore iframe fast path). */
+export function youtubeVideoIdFromUrl(url: string): string | null {
+  const m = url.trim().match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/live\/|\/embed\/)([a-zA-Z0-9_-]{11})/);
+  return m?.[1] ?? null;
+}
+
+/** ponytail: channel explore YouTube — iframe beats DASH segment mux for startup SLA */
+export function youtubeEmbedSrc(videoId: string, startSec = 0): string {
+  const q = new URLSearchParams({
+    autoplay: '1',
+    mute: '1',
+    start: String(Math.max(0, Math.floor(startSec))),
+    rel: '0',
+    modestbranding: '1',
+    playsinline: '1',
+  });
+  return `https://www.youtube-nocookie.com/embed/${videoId}?${q}`;
+}
 
 /** Debounced fire-and-forget InnerTube cache warm (hover, URL paste, preview intent). */
 export function warmYoutubePreview(url: string, delayMs = 0): void {
@@ -65,6 +85,9 @@ export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
 export const PREVIEW_YOUTUBE_DEFAULT_HEIGHT = 720;
 /** Max prefer_height when variant list unknown. */
 export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
+/** Debounce resize-driven POST /api/preview/session/.../quality (viewport cap changes). */
+export const VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS = 450;
+export const VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS = 120;
 
 export function isYouTubePreviewPlatform(platform: string | null | undefined): boolean {
   return (platform || '').toLowerCase() === 'youtube';
@@ -105,27 +128,97 @@ export function resolvePreviewPlayback(
 
 export type PreviewMuxPollSignal = { gen: number; current: number };
 
-/** Scale mux poll timeout with trim length (DASH mux is proportional to duration). */
+/** Scale mux poll timeout with trim length (full-file mux is proportional to duration). */
 export function previewMuxPollMaxMs(cropStart: number, cropEnd: number): number {
   const sec = Math.max(1, cropEnd - cropStart);
   return Math.min(15 * 60 * 1000, Math.max(45_000, sec * 2000));
 }
 
-/** Poll async YouTube DASH mux until stream.mp4 is safe to attach. */
+/** Window-HLS: playlist becomes safe to attach within a few seconds — cap wait short. */
+export function previewPlaylistPollMaxMs(): number {
+  return 15_000;
+}
+
+/** ponytail: legacy dash-segment mux poll cap — backend no longer muxes per segment. */
+export function previewDashMuxPollMaxMs(): number {
+  return 0;
+}
+
+/** Debounce trim-slider / scrub seeks so HLS fragment requests are not stamped on every mousemove. */
+export const PREVIEW_SEEK_DEBOUNCE_MS = 200;
+
+/**
+ * ponytail: deprecated — backend no longer muxes per-segment DASH segments.
+ * Kept as a no-op so legacy callers compile but no network call is dispatched.
+ * Use absolute VOD seek + client-side clamp on window-HLS instead.
+ */
+export function prewarmPreviewDashSeek(
+  _sessionId: string,
+  _positionSec: number,
+  _apiPost: <T>(path: string, body?: unknown) => Promise<T>,
+): void {
+  /* no-op: backend removed per-segment DASH mux */
+}
+
+/** Stagger explore-popup YouTube sessions so ffmpeg mux does not stampede. */
+export const YOUTUBE_EXPLORE_SESSION_STAGGER_MS = 0;
+
+export function youtubeExploreSessionStaggerMs(stackIndex: number): number {
+  return Math.max(0, stackIndex) * YOUTUBE_EXPLORE_SESSION_STAGGER_MS;
+}
+
+/** Debounced waiting/playing hooks — avoids spinner flicker on sub-200ms gaps. */
+export function attachPreviewBufferingListeners(
+  video: HTMLVideoElement,
+  onBuffering: (buffering: boolean) => void,
+): () => void {
+  let stallTimer: number | undefined;
+  const clearStallTimer = () => {
+    if (stallTimer !== undefined) {
+      window.clearTimeout(stallTimer);
+      stallTimer = undefined;
+    }
+  };
+  const onWaiting = () => {
+    clearStallTimer();
+    stallTimer = window.setTimeout(() => onBuffering(true), 180);
+  };
+  const onResume = () => {
+    clearStallTimer();
+    onBuffering(false);
+  };
+  video.addEventListener('waiting', onWaiting);
+  video.addEventListener('playing', onResume);
+  video.addEventListener('canplay', onResume);
+  return () => {
+    clearStallTimer();
+    video.removeEventListener('waiting', onWaiting);
+    video.removeEventListener('playing', onResume);
+    video.removeEventListener('canplay', onResume);
+  };
+}
+
+/**
+ * Poll the preview session until playlist/seg0 is ready (window-HLS path) or
+ * the full file is muxed (progressive / very-long-window fallback).
+ * Backend removed per-segment DASH mux — we never wait on individual segments.
+ */
 export async function waitForPreviewMuxReady(
   sessionId: string,
   apiGet: <T>(path: string) => Promise<T>,
   signal?: PreviewMuxPollSignal,
   maxMs?: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + (maxMs ?? 120_000);
-  const pollMs = 400;
+  const deadline = Date.now() + (maxMs ?? previewPlaylistPollMaxMs());
+  const pollMs = 150;
   while (Date.now() < deadline) {
     if (signal && signal.gen !== signal.current) return false;
     try {
-      const st = await apiGet<{ mux_ready?: boolean }>(
+      const st = await apiGet<PreviewSessionStatusResponse>(
         `/api/preview/session/${sessionId}/status`,
       );
+      // Short-circuit on playlist / first-segment cache — never wait for full mux.
+      if (st.playlist_ready === true || st.segment_buffer_ready === true) return true;
       if (st.mux_ready) return true;
     } catch {
       /* keep polling until timeout */
@@ -133,6 +226,39 @@ export async function waitForPreviewMuxReady(
     await new Promise<void>((resolve) => { window.setTimeout(resolve, pollMs); });
   }
   return false;
+}
+
+/**
+ * Decide whether to block session create on a readiness poll.
+ *
+ * - Already attachable (playlist_ready / segment_buffer_ready / mux_ready) → no wait.
+ * - Window-HLS (trim_timeline=true): playlist attaches immediately; poll seg0 only.
+ * - Muxed CDN HLS (trim_timeline=false): poll playlist/seg0, not full-window mux.
+ * - Progressive: wait for the underlying full-file mux.
+ *
+ * Backend removed per-segment DASH mux, so the old "wait for full mux on HLS"
+ * path is intentionally gone — we only wait for playlist/seg0.
+ */
+export function shouldWaitForPreviewMux(
+  res: {
+    playlist_ready?: boolean;
+    segment_buffer_ready?: boolean;
+    trim_timeline?: boolean;
+    mux_ready?: boolean;
+  },
+  playbackKind: 'hls' | 'progressive',
+): boolean {
+  if (
+    res.playlist_ready === true
+    || res.segment_buffer_ready === true
+    || res.mux_ready === true
+  ) {
+    return false;
+  }
+  if (res.trim_timeline) return false;
+  // Window-HLS: still wait for playlist/seg0 (caller polls via waitForPreviewMuxReady).
+  // Progressive: wait for full-file mux readiness.
+  return playbackKind === 'hls' || playbackKind === 'progressive';
 }
 
 /** Append prefer_height (and cache-bust) so the proxy switches tier on the same request. */
@@ -157,6 +283,36 @@ export function progressivePlaybackUrlKey(playbackUrl: string): string {
   } catch {
     return playbackUrl.replace(/([?&])t=\d+(&?)/, (_m, lead, tail) => (tail ? lead : ''));
   }
+}
+
+/** Unmute + play; falls back to muted autoplay when the browser blocks sound. */
+export async function playPreviewWithAudio(
+  video: HTMLVideoElement,
+  setMuted: (muted: boolean) => void,
+  volume = 0.1,
+): Promise<void> {
+  video.muted = false;
+  video.volume = volume;
+  setMuted(false);
+  try {
+    await video.play();
+    if (video.muted) setMuted(true);
+  } catch {
+    video.muted = true;
+    setMuted(true);
+    await video.play().catch(() => {});
+  }
+}
+
+/** Call on click/key — unlocks audio after muted autoplay (explore popup loads async). */
+export function unlockPreviewAudioFromGesture(
+  video: HTMLVideoElement,
+  setMuted: (muted: boolean) => void,
+  volume = 0.1,
+): void {
+  video.muted = false;
+  video.volume = Math.max(volume, 0.05);
+  setMuted(false);
 }
 
 /** Load proxied MP4 into a <video> — use <source type="video/mp4"> so .m3u8 paths still play. */
@@ -191,10 +347,16 @@ export function attachProgressivePreview(
   source.src = src;
   source.type = 'video/mp4';
   video.appendChild(source);
-  if (startTime != null && Number.isFinite(startTime) && video.readyState > HTMLMediaElement.HAVE_NOTHING) {
-    video.currentTime = startTime;
-  }
   video.load();
+  if (startTime != null && Number.isFinite(startTime)) {
+    const seek = () => {
+      video.currentTime = startTime;
+    };
+    video.addEventListener('loadedmetadata', seek, { once: true });
+    requestAnimationFrame(() => {
+      if (video.readyState >= HTMLMediaElement.HAVE_METADATA) seek();
+    });
+  }
 }
 
 export function detachProgressivePreview(video: HTMLVideoElement): void {
@@ -226,6 +388,56 @@ export function resolvePreviewDurationSec(
     if (Math.abs(mediaDurationSec - vodDurationSec) > 3) return mediaDurationSec;
   }
   return mediaDurationSec > 0 ? mediaDurationSec : vodDurationSec;
+}
+
+/**
+ * Client-side trim clamp for the window-HLS path (trim_timeline=false).
+ *
+ * Window-HLS exposes the full VOD timeline — trim is enforced by seeking into
+ * [start, end] and clamping the player back if it drifts. This is a no-op when
+ * the HLS path uses clip-relative timing (trim_timeline=true / muxed clip MP4),
+ * where the timeline itself is already 0-based from crop_start.
+ */
+export function clampPreviewTimeToVodTrim(
+  video: HTMLVideoElement,
+  trimStartSec: number,
+  trimEndSec: number,
+  clipRelative: boolean,
+): { applied: boolean; paused: boolean; vodTime: number } {
+  if (!Number.isFinite(trimStartSec) || !Number.isFinite(trimEndSec)) {
+    return { applied: false, paused: false, vodTime: video.currentTime };
+  }
+  if (trimEndSec <= trimStartSec) {
+    return { applied: false, paused: false, vodTime: video.currentTime };
+  }
+  const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  if (clipRelative) {
+    const clipLen = Math.max(0, trimEndSec - trimStartSec);
+    let t = cur;
+    if (t < 0) t = 0;
+    else if (t > clipLen) t = clipLen;
+    const vodTime = trimStartSec + t;
+    const applied = Math.abs(video.currentTime - t) > 0.05;
+    if (applied) video.currentTime = t;
+    let paused = false;
+    if (t >= clipLen - 0.05) {
+      video.pause();
+      paused = true;
+    }
+    return { applied, paused, vodTime };
+  }
+  // Window-HLS: currentTime is absolute VOD time.
+  let t = cur;
+  if (t < trimStartSec) t = trimStartSec;
+  else if (t > trimEndSec) t = trimEndSec;
+  const applied = Math.abs(video.currentTime - t) > 0.05;
+  if (applied) video.currentTime = t;
+  let paused = false;
+  if (t >= trimEndSec - 0.05) {
+    video.pause();
+    paused = true;
+  }
+  return { applied, paused, vodTime: t };
 }
 
 export type ProgressivePreviewRecoveryOpts = {
@@ -611,6 +823,7 @@ export function resolveHlsPreviewLevels(
         raw.forEach((l, i) => { l.height = fallback[i]; });
       } else if (hlsLevels.length === 1 && fallback.length > 1) {
         const mapped = mapHeightsToPreviewLevels(fallback);
+        mapped.forEach((m) => { m.index = 0; });
         return {
           mapped,
           defaultIndex: levelIndexForHeight(mapped, initialHeight),
@@ -717,27 +930,73 @@ export interface HlsLevelController {
   loadLevel: number;
   autoLevelCapping?: number;
   config?: { capLevelToPlayerSize?: boolean };
+  media?: HTMLMediaElement | null;
   stopLoad?: () => void;
   loadSource?: (url: string) => void;
   startLoad?: (startPosition?: number) => void;
 }
 
-/** Switch HLS quality — immediate reloads current fragment at new level. */
+/** Clamp menu level index to manifest level count (YouTube DASH mux exposes one HLS level). */
+export function effectiveHlsLevelIndex(hlsIndex: number, levelCount: number): number {
+  if (levelCount <= 0) return -1;
+  return Math.min(Math.max(0, hlsIndex), levelCount - 1);
+}
+
+/**
+ * Whether POST /quality + manifest reload is needed.
+ * YouTube DASH segment playlists expose one HLS level with height=0 — compare applied tier instead.
+ */
+export function hlsNeedsApiQualitySwitch(
+  playbackHeight: number,
+  appliedHeight: number,
+  hlsLevelHeight: number,
+  trimTimeline: boolean,
+): boolean {
+  if (trimTimeline) return playbackHeight !== appliedHeight;
+  return !hlsLevelHeight || hlsLevelHeight !== playbackHeight;
+}
+
+/** Re-seek on the next frame so MSE fetches the current fragment at the new tier. */
+export function resumePreviewAtTime(
+  video: HTMLVideoElement,
+  time: number,
+  wasPaused: boolean,
+): void {
+  const t = Math.max(0, time);
+  const apply = () => {
+    const end = video.seekable.length > 0
+      ? video.seekable.end(video.seekable.length - 1)
+      : Number.POSITIVE_INFINITY;
+    const target = Number.isFinite(end) ? Math.min(t, Math.max(0, end - 0.05)) : t;
+    if (Math.abs(video.currentTime - target) > 0.02) {
+      video.currentTime = target;
+    }
+    if (!wasPaused) void video.play().catch(() => {});
+  };
+  requestAnimationFrame(() => requestAnimationFrame(apply));
+}
+
+/** Switch HLS quality — reloads the current fragment at the chosen level. */
 export function applyHlsQualityLevel(
   hls: HlsLevelController,
   levelIndex: number,
   immediate = false,
 ): void {
-  if (levelIndex < 0 || levelIndex >= hls.levels.length) return;
+  const idx = effectiveHlsLevelIndex(levelIndex, hls.levels.length);
+  if (idx < 0) return;
   if (hls.config) hls.config.capLevelToPlayerSize = false;
   if (typeof hls.autoLevelCapping === 'number') hls.autoLevelCapping = -1;
   if (immediate) {
-    hls.currentLevel = levelIndex;
-    hls.nextLevel = levelIndex;
-    hls.loadLevel = levelIndex;
+    hls.currentLevel = idx;
+    hls.nextLevel = idx;
+    hls.loadLevel = idx;
+    const media = hls.media;
+    if (media && hls.startLoad) {
+      hls.startLoad(Math.max(0, media.currentTime || 0));
+    }
     return;
   }
-  hls.nextLevel = levelIndex;
+  hls.nextLevel = idx;
 }
 
 void (() => {
@@ -758,5 +1017,52 @@ void (() => {
     'Kick/Twitch preview should cap to player',
   );
   console.assert(previewMuxPollMaxMs(0, 900) === 15 * 60 * 1000, 'mux poll capped at 15min');
+  console.assert(previewDashMuxPollMaxMs() === 0, 'dash segment mux poll removed');
+  console.assert(previewPlaylistPollMaxMs() === 15_000, 'window-HLS playlist poll capped');
+  console.assert(PREVIEW_SEEK_DEBOUNCE_MS === 200, 'seek debounce ms');
+  console.assert(
+    shouldWaitForPreviewMux({ playlist_ready: true, trim_timeline: true }, 'hls') === false,
+    'playlist_ready skips mux wait',
+  );
+  console.assert(
+    shouldWaitForPreviewMux({ segment_buffer_ready: true }, 'hls') === false,
+    'segment_buffer_ready (seg0) skips mux wait',
+  );
+  console.assert(
+    shouldWaitForPreviewMux({ playlist_ready: false, trim_timeline: true }, 'hls') === false,
+    'trim_timeline skips mux wait (segments built on demand)',
+  );
+  console.assert(
+    shouldWaitForPreviewMux({ playlist_ready: false, trim_timeline: false }, 'hls') === true,
+    'window-HLS still waits for playlist/seg0',
+  );
+  console.assert(
+    shouldWaitForPreviewMux({ playlist_ready: false, trim_timeline: false }, 'progressive') === true,
+    'full-file mux still waits for progressive',
+  );
+  // prewarmPreviewDashSeek is a no-op now (backend removed per-segment DASH mux).
+  prewarmPreviewDashSeek('sid', 12.3, async () => ({ ok: true }));
+  {
+    const v = document.createElement('video');
+    Object.defineProperty(v, 'currentTime', { writable: true, value: 5 });
+    const r = clampPreviewTimeToVodTrim(v, 10, 20, false);
+    console.assert(r.vodTime === 10 && r.applied, 'window-HLS clamps below trim start');
+    Object.defineProperty(v, 'currentTime', { writable: true, value: 25 });
+    const r2 = clampPreviewTimeToVodTrim(v, 10, 20, false);
+    console.assert(r2.paused && r2.vodTime === 20, 'window-HLS clamps and pauses at trim end');
+  }
+  console.assert(youtubeExploreSessionStaggerMs(2) === 0, 'explore stagger disabled');
+  console.assert(youtubeVideoIdFromUrl('https://youtu.be/dQw4w9WgXcQ') === 'dQw4w9WgXcQ');
+  console.assert(youtubeEmbedSrc('abc123def45', 30).includes('start=30'));
   console.assert(typeof waitForPreviewMuxReady === 'function', 'mux poll helper exported');
+  console.assert(VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS >= VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS);
+  console.assert(effectiveHlsLevelIndex(3, 1) === 0, 'single-level manifest clamps menu index');
+  console.assert(
+    hlsNeedsApiQualitySwitch(720, 720, 0, true) === false,
+    'trim timeline: same tier skips API reload',
+  );
+  console.assert(
+    hlsNeedsApiQualitySwitch(720, 0, 0, false) === true,
+    'normal HLS: unknown level height needs API',
+  );
 })();

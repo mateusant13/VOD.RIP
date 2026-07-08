@@ -25,11 +25,27 @@ import {
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
   warmYoutubePreview,
+  youtubeVideoIdFromUrl,
   waitForPreviewMuxReady,
+  shouldWaitForPreviewMux,
+  attachPreviewBufferingListeners,
   previewMuxPollMaxMs,
+  previewPlaylistPollMaxMs,
+  playPreviewWithAudio,
+  unlockPreviewAudioFromGesture,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
+import {
+  createYoutubeEmbedPlayer,
+  loadYoutubeIframeApi,
+  mapYoutubePlaybackQualities,
+  YT_PLAYER_STATE,
+  YOUTUBE_EMBED_CLIP,
+  YOUTUBE_EMBED_SCALE,
+  type YTPlayer,
+  type YoutubeEmbedQuality,
+} from './youtubeIframePlayer';
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
@@ -121,6 +137,7 @@ export default function ChannelExplorePopup({
     activeHeight?: number;
   } | null>(null);
   const [loading, setLoading] = useState(true);
+  const [buffering, setBuffering] = useState(false);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -136,6 +153,7 @@ export default function ChannelExplorePopup({
   const [fullscreen, setFullscreen] = useState(false);
   const [fsControlsVisible, setFsControlsVisible] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [youtubeEmbedId, setYoutubeEmbedId] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -161,6 +179,9 @@ export default function ChannelExplorePopup({
   const posRef = useRef<PanelPos | null>(null);
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
   const videoWrapRef = useRef<HTMLDivElement>(null);
+  const ytHostRef = useRef<HTMLDivElement>(null);
+  const ytPlayerRef = useRef<YTPlayer | null>(null);
+  const ytQualitiesRef = useRef<YoutubeEmbedQuality[]>([]);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const suppressPlayRef = useRef(false);
   const platform = explorePlatformKey(vod.platform);
@@ -180,12 +201,18 @@ export default function ChannelExplorePopup({
     isClipPreview: vod.isClip,
     isYoutubePreview: platform === 'youtube',
     containerRef,
+    trimTimelineRef: trimTimelineRef,
     onPreviewError: (msg) => setError(msg),
   });
 
 
   useEffect(() => {
     const pause = () => {
+      if (ytPlayerRef.current) {
+        ytPlayerRef.current.pauseVideo();
+        setPlaying(false);
+        return;
+      }
       videoRef.current?.pause();
       setPlaying(false);
     };
@@ -207,6 +234,7 @@ export default function ChannelExplorePopup({
     initialPlayDoneRef.current = false;
     setPlayback(null);
     setLoading(true);
+    setBuffering(false);
     setReady(false);
     setError(null);
     setMediaDurationSec(0);
@@ -217,6 +245,32 @@ export default function ChannelExplorePopup({
     setQualityMenuOpen(false);
     requestedHeightRef.current = 0;
     appliedHeightRef.current = 0;
+
+    const ytEmbedId = platform === 'youtube' && !vod.isClip
+      ? youtubeVideoIdFromUrl(vod.url)
+      : null;
+    if (ytEmbedId) {
+      setYoutubeEmbedId(ytEmbedId);
+      setPlayback(null);
+      sessionIdRef.current = null;
+      trimTimelineRef.current = false;
+      const applyDuration = (dur: number) => {
+        if (cancelled || dur <= 0) return;
+        setSessionDurationSec(dur);
+        setMediaDurationSec(dur);
+      };
+      if (vod.durationSec > 0) applyDuration(vod.durationSec);
+      else {
+        void apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(vod.url)}`)
+          .then((info) => applyDuration(videoInfoDurationSec(info)))
+          .catch(() => {});
+      }
+      return () => {
+        cancelled = true;
+        setYoutubeEmbedId(null);
+      };
+    }
+    setYoutubeEmbedId(null);
 
     (async () => {
       try {
@@ -259,12 +313,15 @@ export default function ChannelExplorePopup({
         }
         trimTimelineRef.current = res.trim_timeline === true;
         const resolved = resolvePreviewPlayback(vod.url, res);
-        if (platform === 'youtube' && resolved.kind === 'progressive' && res.mux_ready === false) {
+        if (platform === 'youtube' && shouldWaitForPreviewMux(res, resolved.kind)) {
+          const pollMaxMs = !res.trim_timeline && resolved.kind === 'hls'
+            ? previewPlaylistPollMaxMs()
+            : previewMuxPollMaxMs(0, cropEnd);
           const muxReady = await waitForPreviewMuxReady(
             res.session_id,
             apiGet,
             undefined,
-            previewMuxPollMaxMs(0, cropEnd),
+            pollMaxMs,
           );
           if (cancelled) {
             try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
@@ -329,6 +386,99 @@ export default function ChannelExplorePopup({
     };
   }, [vod.url, vod.durationSec]);
 
+  useEffect(() => {
+    if (!youtubeEmbedId) return;
+    let cancelled = false;
+    let tick: number | undefined;
+    const host = ytHostRef.current;
+    if (!host) return;
+
+    setLoading(true);
+    setReady(false);
+    setBuffering(false);
+    setCurrentTime(0);
+    setPlaying(false);
+    setError(null);
+
+    void loadYoutubeIframeApi().then(() => {
+      if (cancelled || !ytHostRef.current) return;
+      try {
+        ytPlayerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
+      const player = createYoutubeEmbedPlayer(ytHostRef.current, youtubeEmbedId, {
+        onReady: (p) => {
+          if (cancelled) return;
+          ytPlayerRef.current = p;
+          const dur = p.getDuration();
+          if (dur > 0 && Number.isFinite(dur)) {
+            const rounded = Math.floor(dur);
+            setMediaDurationSec(rounded);
+            setSessionDurationSec((prev) => (prev > 0 ? prev : rounded));
+          }
+          setVideoAspect(16 / 9);
+          videoAspectRef.current = 16 / 9;
+          const levels = mapYoutubePlaybackQualities(p.getAvailableQualityLevels());
+          ytQualitiesRef.current = levels;
+          const mapped: PreviewLevelOption[] = levels.map((l, i) => ({
+            index: i,
+            height: l.height,
+            label: l.label,
+          }));
+          setPreviewLevels(mapped);
+          setQualityLevel(0);
+          p.setVolume(Math.round(volumeRef.current * 100));
+          if (volumeRef.current > 0) {
+            p.unMute();
+            setMuted(false);
+          } else {
+            p.mute();
+            setMuted(true);
+          }
+          setLoading(false);
+          setReady(true);
+          p.playVideo();
+          setPlaying(true);
+          tick = window.setInterval(() => {
+            const pl = ytPlayerRef.current;
+            if (!pl || cancelled) return;
+            const t = pl.getCurrentTime();
+            if (Number.isFinite(t)) setCurrentTime(t);
+          }, 250);
+        },
+        onStateChange: (state) => {
+          if (cancelled) return;
+          setPlaying(state === YT_PLAYER_STATE.PLAYING);
+          setBuffering(state === YT_PLAYER_STATE.BUFFERING);
+        },
+        onError: () => {
+          if (cancelled) return;
+          setError('YouTube playback failed');
+          setLoading(false);
+        },
+      });
+      ytPlayerRef.current = player;
+    }).catch(() => {
+      if (!cancelled) {
+        setError('Could not load YouTube player');
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      if (tick != null) window.clearInterval(tick);
+      try {
+        ytPlayerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
+      ytPlayerRef.current = null;
+      ytQualitiesRef.current = [];
+    };
+  }, [youtubeEmbedId, setPreviewLevels, setQualityLevel]);
+
 
 
 
@@ -338,21 +488,51 @@ export default function ChannelExplorePopup({
 
 
   const togglePlay = useCallback(() => {
+    const yt = ytPlayerRef.current;
+    if (yt && ready) {
+      if (playing) {
+        yt.pauseVideo();
+        setPlaying(false);
+      } else {
+        yt.unMute();
+        yt.setVolume(Math.round(volumeRef.current * 100));
+        yt.playVideo();
+        setMuted(false);
+        setPlaying(true);
+      }
+      return;
+    }
     const video = videoRef.current;
     if (!video || !ready) return;
     if (video.paused) {
-      void video.play().catch(() => {});
-      setPlaying(true);
+      unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
+      void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
+        setPlaying(!video.paused);
+      });
     } else {
       video.pause();
       setPlaying(false);
     }
-  }, [ready]);
+  }, [ready, playing]);
 
   const setVolumeLevel = useCallback((level: number) => {
+    const v = Math.max(0, Math.min(1, level));
+    const yt = ytPlayerRef.current;
+    if (yt) {
+      yt.setVolume(Math.round(v * 100));
+      if (v > 0) {
+        yt.unMute();
+        volumeRef.current = v;
+        setMuted(false);
+      } else {
+        yt.mute();
+        setMuted(true);
+      }
+      setVolume(v);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
-    const v = Math.max(0, Math.min(1, level));
     video.volume = v;
     if (v > 0) volumeRef.current = v;
     setVolume(v);
@@ -371,9 +551,15 @@ export default function ChannelExplorePopup({
   );
 
   const seekVideo = useCallback((sec: number) => {
+    const t = Math.max(0, Math.min(sec, effectiveDurationSec));
+    const yt = ytPlayerRef.current;
+    if (yt && ready) {
+      yt.seekTo(t, true);
+      setCurrentTime(t);
+      return;
+    }
     const video = videoRef.current;
     if (!video || !ready) return;
-    const t = Math.max(0, Math.min(sec, effectiveDurationSec));
     if (Math.abs(video.currentTime - t) > 0.2) {
       video.currentTime = t;
     }
@@ -381,8 +567,14 @@ export default function ChannelExplorePopup({
   }, [ready, effectiveDurationSec]);
 
   const skip = useCallback((deltaSec: number) => {
+    if (!ready) return;
+    const yt = ytPlayerRef.current;
+    if (yt) {
+      seekVideo(yt.getCurrentTime() + deltaSec);
+      return;
+    }
     const video = videoRef.current;
-    if (!video || !ready) return;
+    if (!video) return;
     seekVideo(video.currentTime + deltaSec);
   }, [ready, seekVideo]);
 
@@ -521,9 +713,10 @@ export default function ChannelExplorePopup({
   }, [fullscreen, panelWidth, videoAspect, ready]);
 
   useEffect(() => {
-    if (!playback?.url) return;
+    if (youtubeEmbedId || !playback?.url) return;
     let cancelled = false;
     let cleanup: (() => void) | undefined;
+    let detachBuffering: (() => void) | undefined;
 
     const setup = () => {
       if (cancelled) return;
@@ -532,9 +725,13 @@ export default function ChannelExplorePopup({
         requestAnimationFrame(setup);
         return;
       }
+      detachBuffering = attachPreviewBufferingListeners(video, (stalling) => {
+        if (!cancelled) setBuffering(stalling);
+      });
       const { url: playbackUrl, kind: playbackKind } = playback;
 
     setLoading(true);
+    setBuffering(false);
     setReady(false);
 
     const onCanPlay = () => {
@@ -543,14 +740,10 @@ export default function ChannelExplorePopup({
       video.volume = PREVIEW_DEFAULT_VOLUME;
       volumeRef.current = PREVIEW_DEFAULT_VOLUME;
       setVolume(PREVIEW_DEFAULT_VOLUME);
-      video.muted = false;
-      setMuted(false);
       if (!initialPlayDoneRef.current && video.paused) {
         initialPlayDoneRef.current = true;
-        void video.play().catch(() => {
-          video.muted = true;
-          setMuted(true);
-          void video.play().catch(() => {});
+        void playPreviewWithAudio(video, setMuted, PREVIEW_DEFAULT_VOLUME).then(() => {
+          setPlaying(!video.paused);
         });
       }
     };
@@ -638,8 +831,8 @@ export default function ChannelExplorePopup({
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 30,
-        maxBufferLength: dashSegTimeline ? 40 : 20,
-        maxMaxBufferLength: dashSegTimeline ? 120 : 40,
+        maxBufferLength: dashSegTimeline ? 60 : 20,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 40,
         startFragPrefetch: true,
         capLevelToPlayerSize: platform !== 'youtube',
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
@@ -649,8 +842,12 @@ export default function ChannelExplorePopup({
       });
       hlsRef.current = hls;
       setHlsRef(hls);
-      hls.loadSource(playbackUrl);
       hls.attachMedia(video);
+      const loadPlayback = () => {
+        if (cancelled) return;
+        hls.loadSource(playbackUrl);
+      };
+      requestAnimationFrame(() => requestAnimationFrame(loadPlayback));
       let levelsInitialized = false;
       const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
       const meta = sessionMetaRef.current;
@@ -740,6 +937,7 @@ export default function ChannelExplorePopup({
     setup();
     return () => {
       cancelled = true;
+      detachBuffering?.();
       cleanup?.();
     };
   }, [playback, vod.isClip]);
@@ -818,7 +1016,17 @@ export default function ChannelExplorePopup({
       currentLevel={qualityLevel}
       menuOpen={qualityMenuOpen}
       setMenuOpen={setQualityMenuOpen}
-      onSelect={(idx: number) => { void applyQuality(idx); setQualityMenuOpen(false); }}
+      onSelect={(idx: number) => {
+        const ytQ = ytQualitiesRef.current[idx];
+        if (ytPlayerRef.current && ytQ) {
+          ytPlayerRef.current.setPlaybackQuality(ytQ.ytQuality);
+          setQualityLevel(idx);
+          setQualityMenuOpen(false);
+          return;
+        }
+        void applyQuality(idx);
+        setQualityMenuOpen(false);
+      }}
       disabled={!ready}
       buttonClassName={fs ? fsCtrlBtn : ctrlBtn(false)}
       onMenuOpen={() => setVolumeMenuOpen(false)}
@@ -908,9 +1116,33 @@ export default function ChannelExplorePopup({
           style={fullscreen ? undefined : { aspectRatio: videoAspect }}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
-            if (ready) togglePlay();
+            if (!ready) return;
+            if (ytPlayerRef.current) {
+              togglePlay();
+              return;
+            }
+            const video = videoRef.current;
+            if (video) unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
+            togglePlay();
           }}
         >
+          {youtubeEmbedId ? (
+            <div className="absolute inset-0 overflow-hidden bg-black">
+              <div
+                ref={ytHostRef}
+                className="w-full h-full origin-center [&_iframe]:pointer-events-none [&_iframe]:border-0"
+                style={{
+                  transform: `scale(${YOUTUBE_EMBED_SCALE})`,
+                  clipPath: YOUTUBE_EMBED_CLIP,
+                }}
+              />
+              {/* ponytail: blocks YT title/logo hit areas; iframe already pointer-events-none */}
+              <div className="absolute inset-0 z-10 pointer-events-none" aria-hidden>
+                <div className="absolute top-0 inset-x-0 h-[14%] bg-gradient-to-b from-black via-black/70 to-transparent" />
+                <div className="absolute bottom-0 inset-x-0 h-[16%] bg-gradient-to-t from-black via-black/70 to-transparent" />
+              </div>
+            </div>
+          ) : (
           <video
             ref={videoRef}
             className="w-full h-full object-contain pointer-events-none"
@@ -947,12 +1179,20 @@ export default function ChannelExplorePopup({
             }}
             onPause={() => setPlaying(false)}
           />
+          )}
           {loading && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20">
               <Loader2 size={28} className="animate-spin text-zinc-300" />
-              {!playback && (
-                <span className="text-zinc-300 text-[10px] font-mono">Preparing preview...</span>
+              {youtubeEmbedId ? 'Loading YouTube…' : (
+                <span className="text-zinc-300 text-[10px] font-mono">
+                  {platform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
+                </span>
               )}
+            </div>
+          )}
+          {buffering && ready && !loading && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/35 z-20 pointer-events-none">
+              <Loader2 size={24} className="animate-spin text-zinc-200/90" />
             </div>
           )}
           {error && (

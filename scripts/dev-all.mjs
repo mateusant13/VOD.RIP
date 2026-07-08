@@ -18,9 +18,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isPortListening(port) {
+function isPortListeningOn(host, port) {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ port, host: "127.0.0.1" });
+    const socket = net.createConnection({ port, host });
     const done = (listening) => {
       socket.removeAllListeners();
       try { socket.destroy(); } catch { /* ignore */ }
@@ -31,6 +31,14 @@ function isPortListening(port) {
     socket.once("timeout", () => done(false));
     socket.once("error", () => done(false));
   });
+}
+
+async function isPortListening(port) {
+  // Vite may bind [::1] only on Windows while API checks used 127.0.0.1
+  for (const host of ["127.0.0.1", "::1"]) {
+    if (await isPortListeningOn(host, port)) return true;
+  }
+  return false;
 }
 
 async function waitPortFree(port, timeoutMs = 12000) {
@@ -115,6 +123,20 @@ function apiHealthy(port) {
   });
 }
 
+function viteHealthy(port) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/`, (res) => {
+      resolve(res.statusCode >= 200 && res.statusCode < 500);
+      res.resume();
+    });
+    req.on("error", () => resolve(false));
+    req.setTimeout(2500, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
 function start(label, command, args, cwd, extraEnv = {}) {
   const child = spawn(command, args, {
     cwd,
@@ -170,9 +192,14 @@ async function main() {
     }
   }
 
-  await ensurePortFree(vitePort, "Vite");
-
   console.log(`Open UI at    -> http://localhost:${vitePort}`);
+  if (await viteHealthy(vitePort)) {
+    console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
+    console.log("(Ctrl+C stops API only; existing Vite keeps running)\n");
+    return;
+  }
+
+  await ensurePortFree(vitePort, "Vite");
   console.log("(Ctrl+C stops both)\n");
 
   const viteBin = path.join(root, "node_modules", "vite", "bin", "vite.js");

@@ -5,15 +5,13 @@ from services.youtube_session import apply_ytdlp_cookie_opts, youtube_session_fr
 from services.youtube_session import YouTubeSession
 
 
-def test_auto_auth_resolves_browser_without_eager_cookie_read():
-    with patch("services.youtube_auth.load_best_browser_session") as load:
-        with patch(
-            "services.youtube_auth.resolve_youtube_browser",
-            return_value="chrome",
-        ):
-            s = youtube_session_from_values(auto_auth=True)
-    load.assert_not_called()
-    assert s.cookies_from_browser is None
+def test_auto_auth_tries_browser_before_anonymous():
+    with patch(
+        "services.youtube_auth.load_best_browser_session",
+        return_value=(None, None, None),
+    ) as load:
+        s = youtube_session_from_values(auto_auth=True)
+    load.assert_called_once_with(None, True)
     assert s.anonymous is True
 
 

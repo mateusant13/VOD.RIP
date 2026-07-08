@@ -14,7 +14,14 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 
 from app import app
-from services.preview_service import _manager, PreviewSession, get_session, create_session, proxy_master, _is_playlist_url
+from services.preview_service import _manager, PreviewSession, get_session, create_session, proxy_master, _is_playlist_url, _RESOLVED_STREAM_CACHE
+
+
+@pytest.fixture(autouse=True)
+def _clear_youtube_resolve_cache():
+    _RESOLVED_STREAM_CACHE.clear()
+    yield
+    _RESOLVED_STREAM_CACHE.clear()
 
 
 class TestIsPlaylistUrl:

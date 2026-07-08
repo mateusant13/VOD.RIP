@@ -35,6 +35,25 @@ export function layoutRowGap(previewOpen: boolean, urlPanelAside: boolean): numb
   if (count <= 1) return 0;
   return previewOpen && urlPanelAside ? LAYOUT_ROW_GAP_TRIPLE : LAYOUT_ROW_GAP_SPLIT;
 }
+export function layoutRowHasMultiplePanels(layout: LayoutPanelBoundsInput): boolean {
+  let count = 1;
+  if (layout.previewOpen) count += 1;
+  if (layout.urlPanelAside) count += 1;
+  return count > 1;
+}
+/** Max width for one panel when every sibling is at its minimum width. */
+export function layoutMaxPanelWidthAtSiblingMins(
+  target: LayoutPanelKey,
+  layout: LayoutPanelBoundsInput,
+): number {
+  const budget = layoutRowWidthBudget(layout);
+  let minOthers = 0;
+  if (layout.previewOpen && target !== 'preview') minOthers += PREVIEW_PANEL_MIN_W;
+  if (layout.urlPanelAside && target !== 'urlAside') minOthers += PANEL_MIN.w;
+  if (target !== 'main') minOthers += PANEL_MIN.w;
+  const minTarget = target === 'preview' ? PREVIEW_PANEL_MIN_W : PANEL_MIN.w;
+  return Math.max(minTarget, budget - minOthers);
+}
 export function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsInput): number {
   const { maxW } = viewportContentBox();
   const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
@@ -45,7 +64,10 @@ export function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelB
   if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
   if (target !== 'main') othersW += layout.main.w;
 
-  return Math.max(PANEL_MIN.w, Math.min(panelMaxW(), maxW - othersW - gapTotal));
+  return Math.max(
+    PANEL_MIN.w,
+    Math.min(layoutMaxPanelWidthAtSiblingMins(target, layout), maxW - othersW - gapTotal),
+  );
 }
 export function layoutMaxPanelHeight(): number {
   return Math.min(panelMaxHeight(), viewportContentBox().maxH);
@@ -62,7 +84,7 @@ export function clampPanelSizeForLayout(
     h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
   };
 }
-function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
+export function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
   const { usableWidth } = layoutRowEdgeInsets();
   const count = (layout.previewOpen ? 1 : 0) + (layout.urlPanelAside ? 1 : 0) + 1;
   const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
@@ -94,9 +116,8 @@ export function resizeLayoutGivingWidthTo(
     else main = { ...main, w };
   };
 
-  const snap = (): LayoutPanelBoundsInput => ({ ...layout, preview, urlAside, main });
-  const maxTarget = layoutMaxPanelWidth(target, snap());
-  setW(target, Math.min(maxTarget, Math.max(minWFor(target), desiredW)));
+  const maxAtMins = layoutMaxPanelWidthAtSiblingMins(target, layout);
+  setW(target, Math.min(maxAtMins, Math.max(minWFor(target), desiredW)));
 
   type Slot = { get: () => number; set: (w: number) => void; minW: number };
   const siblingSlots: Slot[] = [];
@@ -259,13 +280,15 @@ export function maxPreviewPanelWidth(
   aspect: number,
   layout: LayoutPanelBoundsInput,
 ): number {
+  const rowMax = layoutMaxPanelWidthAtSiblingMins('preview', layout);
+  if (layoutRowHasMultiplePanels(layout)) return rowMax;
   const shadowPad = panelResizeHandleInset(true);
   const { maxH } = viewportContentBox(shadowPad);
-  const capW = Math.min(panelMaxW(), layoutMaxPanelWidth('preview', layout));
+  const capW = layoutMaxPanelWidth('preview', layout);
   const videoMaxW = capW - PREVIEW_PANEL_PAD_H;
   const videoMaxH = Math.max(100, maxH - chromeH - PREVIEW_PANEL_PAD_H);
   const videoMaxWFromH = videoMaxH * aspect;
-  return Math.floor(Math.min(videoMaxW, videoMaxWFromH) + PREVIEW_PANEL_PAD_H);
+  return Math.floor(Math.min(rowMax, Math.min(videoMaxW, videoMaxWFromH) + PREVIEW_PANEL_PAD_H));
 }
 export function clampPreviewPanelWidth(
   width: number,
@@ -548,7 +571,13 @@ export function loadPanelLayout(): PersistedPanelLayout {
       previewPanelWidth: clampLayoutNumber(
         parsed.previewPanelWidth,
         PREVIEW_PANEL_MIN_W,
-        panelMaxW(),
+        layoutMaxPanelWidthAtSiblingMins('preview', {
+          previewOpen: true,
+          urlPanelAside: true,
+          preview: { w: fallback.previewPanelWidth, h: 0 },
+          urlAside: fallback.urlAside,
+          main: fallback.main,
+        }),
         fallback.previewPanelWidth,
       ),
       urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
@@ -574,8 +603,9 @@ export function clampStoredPanelSize(value: unknown, fallback: PanelSize): Panel
   if (!value || typeof value !== 'object') return fallback;
   const o = value as { w?: unknown; h?: unknown };
   const maxH = typeof window !== 'undefined' ? panelMaxHeight() : fallback.h;
+  const maxW = typeof window !== 'undefined' ? viewportContentBox().maxW : fallback.w;
   return {
-    w: clampLayoutNumber(o.w, PANEL_MIN.w, panelMaxW(), fallback.w),
+    w: clampLayoutNumber(o.w, PANEL_MIN.w, maxW, fallback.w),
     h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
   };
 }

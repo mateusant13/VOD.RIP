@@ -18,8 +18,9 @@ def test_sanitize_strips_fetch_pot_auto():
     assert out["extractor_args"]["youtube"]["fetch_pot"] == ["never"]
 
 
-def test_guarded_youtube_dl_is_singleton_lock():
-    from services.ytdlp_guard import YTDLP_EXTRACT_LOCK
+def test_guarded_youtube_dl_channel_has_separate_lock():
+    from services.ytdlp_guard import YTDLP_CHANNEL_LOCK, YTDLP_EXTRACT_LOCK
     import threading
 
-    assert isinstance(YTDLP_EXTRACT_LOCK, type(threading.Lock()))
+    assert isinstance(YTDLP_CHANNEL_LOCK, type(threading.Lock()))
+    assert YTDLP_CHANNEL_LOCK is not YTDLP_EXTRACT_LOCK

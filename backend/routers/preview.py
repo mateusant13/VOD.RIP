@@ -9,19 +9,21 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import PreviewQualityUpdateRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewWarmRequest
+from models.schemas import PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewWarmRequest
 
 from deps import INFO_EXECUTOR
 from services.preview_service import (
     PreviewMuxPending,
     StalePreviewUrls,
+    WINDOW_HLS_MARKER,
     create_session,
     delete_session,
-    is_youtube_dash_segment_resource,
     open_progressive_proxy,
     open_segment_proxy,
-    open_youtube_dash_segment_proxy,
+    open_youtube_window_hls_proxy,
     preview_mux_ready,
+    preview_playlist_ready,
+    preview_segment_buffer_ready,
     preview_session_kind,
     preview_session_mux_status,
     proxy_master,
@@ -34,7 +36,7 @@ from services.preview_service import (
     session_variant_heights,
     set_session_prefer_height,
     get_session,
-    youtube_dash_segment_index,
+    schedule_youtube_window_hls_mux,
     _is_playlist_url,
     _is_rangeable_cdn_media,
 )
@@ -75,7 +77,9 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         active_height=session_active_height(session),
         extract_source=_session_extract_source(session),
         mux_ready=preview_mux_ready(session),
-        trim_timeline=getattr(session, "dash_segment_hls", False),
+        playlist_ready=preview_playlist_ready(session),
+        segment_buffer_ready=preview_segment_buffer_ready(session),
+        trim_timeline=getattr(session, "dash_window_hls", False),
         duration_sec=float(getattr(session, "vod_duration", 0) or 0),
     )
 
@@ -168,6 +172,22 @@ async def preview_session_status(session_id: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.post("/api/preview/session/{session_id}/seek")
+async def preview_session_seek(session_id: str, req: PreviewSeekRequest):
+    """Prewarm kick — window HLS muxes the whole window upfront, so just verify mux running."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Preview session not found or expired")
+    if not getattr(session, "dash_window_hls", False):
+        return {"ok": True, "prewarmed": False}
+    # window HLS = whole-window mux; nudge the background job if not started yet
+    await asyncio.get_running_loop().run_in_executor(
+        INFO_EXECUTOR,
+        lambda: schedule_youtube_window_hls_mux(session_id),
+    )
+    return {"ok": True, "prewarmed": True}
+
+
 @router.post("/api/preview/session/{session_id}/refresh")
 async def preview_refresh_session(session_id: str, request: Request):
     """Re-resolve expired YouTube googlevideo URLs for an active preview session."""
@@ -218,8 +238,9 @@ async def _preview_master_response(
     *,
     force_streaming: bool = False,
 ) -> Response:
-    if prefer_height:
-        await _preview_apply_prefer_height(session_id, prefer_height)
+    # ponytail: tier changes via POST /quality only — master?prefer_height raced POST /quality
+    # and cleared ytseg cache while HLS.js fetched segments (black screen / 404).
+    _ = prefer_height
     loop = asyncio.get_running_loop()
     if force_streaming:
         try:
@@ -300,11 +321,11 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     try:
-        if is_youtube_dash_segment_resource(upstream):
-            seg_idx = youtube_dash_segment_index(upstream)
+        if upstream.startswith(WINDOW_HLS_MARKER):
+            # window-playlist → dynamic media playlist, window-seg-NNN → local .ts
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
                 INFO_EXECUTOR,
-                lambda: open_youtube_dash_segment_proxy(session_id, seg_idx, range_header),
+                lambda: open_youtube_window_hls_proxy(session_id, id, range_header),
             )
             response_headers = dict(extra_headers or {})
             if ctype and ctype != "application/octet-stream":

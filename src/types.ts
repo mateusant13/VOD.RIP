@@ -122,6 +122,10 @@ export interface SavedChannel {
   clipsFetched?: boolean;
   /** True after at least one YouTube /streams fetch completed. */
   streamsFetched?: boolean;
+  /** Per-platform VOD list fetch completed (empty list counts). */
+  vodPlatformsFetched?: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>;
+  /** Per-platform clips/shorts fetch completed (empty list counts). */
+  clipPlatformsFetched?: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>;
   /** Legacy — migrated to vodVideos / clipVideos on load */
   videos?: ChannelVideo[];
 }
@@ -137,6 +141,10 @@ export interface PreviewSessionResponse {
   extract_source?: string;
   /** False while async YouTube DASH mux is still running on the backend. */
   mux_ready?: boolean;
+  /** True when master/media playlist exists — attach player without waiting for segment mux. */
+  playlist_ready?: boolean;
+  /** True when first segment(s) are cached on disk (warm path). */
+  segment_buffer_ready?: boolean;
   /** HLS playlist is 0-based from crop_start (YouTube on-demand DASH segments). */
   trim_timeline?: boolean;
   /** Real VOD length from backend extract (crop_end clamped to this). */
@@ -145,6 +153,8 @@ export interface PreviewSessionResponse {
 
 export interface PreviewSessionStatusResponse {
   mux_ready: boolean;
+  playlist_ready?: boolean;
+  segment_buffer_ready?: boolean;
 }
 
 export type Tab = 'url' | 'channels' | 'queue' | 'settings';

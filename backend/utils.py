@@ -815,6 +815,45 @@ def parse_video_date(value) -> Optional[datetime]:
         return None
 
 
+def filter_videos_recent_or_all(videos: List[dict], days: int) -> tuple[List[dict], int]:
+    """Keep items from the last `days`; if none qualify, return the full list (effective days=0)."""
+    if days <= 0 or not videos:
+        return videos, max(0, days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    recent: List[dict] = []
+    for v in videos:
+        dt = parse_video_date(v.get("created_at"))
+        if dt is None or dt >= cutoff:
+            recent.append(v)
+    if recent:
+        return recent, days
+    # ponytail: 14-day window empty — show older uploads from the same fetch
+    return videos, 0
+
+
+def filter_videos_recent_or_all_by_platform(videos: List[dict], days: int) -> tuple[List[dict], int]:
+    """Per-platform 14-day filter with unlimited fallback when a platform has no recent items."""
+    if days <= 0 or not videos:
+        return videos, max(0, days)
+    by_plat: Dict[str, List[dict]] = {}
+    for v in videos:
+        by_plat.setdefault(str(v.get("platform") or ""), []).append(v)
+    out: List[dict] = []
+    effective = days
+    for plat_vids in by_plat.values():
+        chunk, eff = filter_videos_recent_or_all(plat_vids, days)
+        out.extend(chunk)
+        if eff == 0:
+            effective = 0
+    return out, effective
+
+
+_old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+_new = datetime.now(timezone.utc).isoformat()
+assert len(filter_videos_recent_or_all([{"created_at": _old}], 14)[0]) == 1
+assert len(filter_videos_recent_or_all([{"created_at": _new}, {"created_at": _old}], 14)[0]) == 1
+
+
 # ==================== Download helpers ====================
 
 

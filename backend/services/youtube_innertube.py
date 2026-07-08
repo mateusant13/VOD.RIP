@@ -925,7 +925,7 @@ def innertube_video_row_metadata(
                     out["duration"] = int(length)
             except (TypeError, ValueError):
                 pass
-        if out.get("created_at") and out.get("views") is not None:
+        if out.get("created_at") and out.get("views") is not None and out.get("duration"):
             break
     if not out:
         return None
