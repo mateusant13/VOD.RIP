@@ -67,26 +67,32 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   let lastErr: unknown;
-  // Retry both network failures and timeout aborts so users never see a one-off
-  // "restart dev" message; the final attempt surfaces a friendly hint instead.
+  // Retry network failures and our own timeout, but never retry a caller's
+  // intentional cancellation. AbortSignal.timeout() throws a distinct
+  // TimeoutError, and AbortSignal.any() lets us honour a caller-supplied
+  // signal without losing that distinction.
   for (let i = 0; i <= API_RETRY_ATTEMPTS; i++) {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const timeoutSignal = AbortSignal.timeout(API_TIMEOUT_MS);
+    const signal = init?.signal
+      ? AbortSignal.any([init.signal, timeoutSignal])
+      : timeoutSignal;
     try {
-      return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+      return await fetch(`${API_BASE}${path}`, { ...init, signal });
     } catch (err: unknown) {
       lastErr = err;
+      // Caller-initiated aborts are not retries; surface them immediately.
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
       if (i >= API_RETRY_ATTEMPTS) break;
       await new Promise((resolve) =>
         window.setTimeout(resolve, API_RETRY_BACKOFF_MS * (i + 1))
       );
-    } finally {
-      window.clearTimeout(timer);
     }
   }
-  const isAbort =
-    lastErr instanceof DOMException && (lastErr as DOMException).name === 'AbortError';
-  throw new Error(isAbort ? TIMEOUT_HINT : BACKEND_HINT);
+  const isTimeout =
+    lastErr instanceof DOMException && (lastErr as DOMException).name === 'TimeoutError';
+  throw new Error(isTimeout ? TIMEOUT_HINT : BACKEND_HINT);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {

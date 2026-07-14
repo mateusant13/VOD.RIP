@@ -209,6 +209,58 @@ class TestYouTubePreviewResolve:
             _manager._sessions.pop(sid, None)
         shutil.rmtree(cache_dir, ignore_errors=True)
 
+    def test_refresh_falls_back_to_existing_progressive_when_no_muxed_available(self):
+        """If re-extract is DASH-only and no muxed fallback exists, stay progressive."""
+        from unittest.mock import patch
+
+        from services.preview_service import (
+            PreviewSession,
+            _manager,
+            refresh_youtube_preview_session,
+        )
+
+        sid = secrets.token_hex(8)
+        cache_dir = Path(tempfile.gettempdir()) / "kd_test" / sid
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        session = PreviewSession(
+            session_id=sid,
+            vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            master_url=f"/api/preview/hls/{sid}/master.m3u8",
+            entry_url="https://x/p360.mp4",
+            platform="YouTube",
+            cache_dir=cache_dir,
+            kind="progressive",
+            dash_window_hls=False,
+        )
+        with _manager._lock:
+            _manager._sessions[sid] = session
+
+        dash_only = {
+            "formats": [
+                {"height": 720, "protocol": "https", "url": "https://x/v720.mp4", "acodec": "none"},
+            ],
+            "_preview_audio_format": {"url": "https://x/a.m4a"},
+            "http_headers": {},
+        }
+
+        with patch(
+            "services.preview_service.resolve_stream_info",
+            return_value=("https://x/v720.mp4", {}, "YouTube", dash_only["formats"], "hls", dash_only),
+        ):
+            with patch(
+                "services.preview_service._reextract_youtube_for_preview",
+                return_value=dash_only,
+            ):
+                refreshed = refresh_youtube_preview_session(sid)
+
+        assert refreshed.kind == "progressive", refreshed.kind
+        assert refreshed.dash_window_hls is False
+        assert refreshed.entry_url == "https://x/p360.mp4"
+
+        with _manager._lock:
+            _manager._sessions.pop(sid, None)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
 
 class TestPreviewManagerDirect:
     """Tests PreviewManager directly (no HTTP)."""

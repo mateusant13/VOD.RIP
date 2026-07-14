@@ -790,6 +790,16 @@ def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 
                 session, prog_url, prog_formats, prog_info, prefer_height,
             )
             return
+        # ponytail: never make a progressive session switch to window-HLS on a
+        # far seek. If YouTube returns only DASH formats, keep the existing
+        # progressive URL and fresh cookies rather than forcing a multi-second
+        # seg0 remux. The URL is usually still valid for the duration of a
+        # preview session; if it expired, the player surfaces a network error
+        # and the user can reopen the preview.
+        session.http_headers = _merge_youtube_session_cookies(headers, session.vod_url)
+        session.touch()
+        _clear_preview_url_caches(session)
+        return
     proxy_master_url: Optional[str] = None
     if kind == "progressive":
         proxy_master_url = f"/api/preview/hls/{session.session_id}/master.m3u8"
