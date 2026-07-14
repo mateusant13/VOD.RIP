@@ -110,6 +110,105 @@ class TestYouTubePreviewResolve:
         assert platform == "YouTube"
         assert kind == "hls"
 
+    def test_dash_only_does_not_fall_back_to_lone_360p_progressive(self):
+        """A lone 360p muxed tier must not hide higher DASH video heights."""
+        from unittest.mock import patch
+
+        from services.preview_service import resolve_stream_info
+
+        dash_with_low_muxed = {
+            "formats": [
+                {"height": 720, "protocol": "https", "url": "https://x/v720.mp4", "acodec": "none"},
+                {
+                    "height": 360,
+                    "protocol": "https",
+                    "url": "https://x/p360.mp4",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "avc1.4d401e",
+                    "ext": "mp4",
+                },
+            ],
+            "_preview_audio_format": {"url": "https://x/a.m4a"},
+            "http_headers": {},
+        }
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        with patch(
+            "services.preview_service._extract_youtube_preview_info",
+            return_value=dash_with_low_muxed,
+        ):
+            _entry, _hdrs, platform, variants, kind, _yt = resolve_stream_info(url)
+        assert platform == "YouTube"
+        assert kind == "hls"
+        assert 720 in {int(f.get("height") or 0) for f in variants}
+
+    def test_refresh_keeps_progressive_session_progressive(self):
+        """A progressive session refresh must not switch to window-HLS on a far seek."""
+        from unittest.mock import patch, MagicMock
+
+        from services.preview_service import (
+            PreviewSession,
+            _manager,
+            refresh_youtube_preview_session,
+        )
+
+        sid = secrets.token_hex(8)
+        cache_dir = Path(tempfile.gettempdir()) / "kd_test" / sid
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        session = PreviewSession(
+            session_id=sid,
+            vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            master_url=f"/api/preview/hls/{sid}/master.m3u8",
+            entry_url="https://x/p360.mp4",
+            platform="YouTube",
+            cache_dir=cache_dir,
+            kind="progressive",
+            dash_window_hls=False,
+        )
+        with _manager._lock:
+            _manager._sessions[sid] = session
+
+        dash_info = {
+            "formats": [
+                {"height": 720, "protocol": "https", "url": "https://x/v720.mp4", "acodec": "none"},
+            ],
+            "_preview_audio_format": {"url": "https://x/a.m4a"},
+            "http_headers": {},
+        }
+        muxed_info = {
+            "formats": [
+                {
+                    "height": 360,
+                    "protocol": "https",
+                    "url": "https://x/p360.mp4",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "avc1.4d401e",
+                    "ext": "mp4",
+                },
+            ],
+            "http_headers": {},
+        }
+
+        def _fake_extract(_url, oauth=None, cachedir=None, cookies_file=None):
+            return muxed_info
+
+        with patch(
+            "services.preview_service._extract_youtube_preview_info",
+            side_effect=_fake_extract,
+        ):
+            with patch(
+                "services.preview_service._reextract_youtube_for_preview",
+                return_value=muxed_info,
+            ):
+                refreshed = refresh_youtube_preview_session(sid)
+
+        assert refreshed.kind == "progressive", refreshed.kind
+        assert refreshed.dash_window_hls is False
+        assert refreshed.entry_url == "https://x/p360.mp4"
+
+        with _manager._lock:
+            _manager._sessions.pop(sid, None)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
 
 class TestPreviewManagerDirect:
     """Tests PreviewManager directly (no HTTP)."""

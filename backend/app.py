@@ -5,7 +5,7 @@ Assembles the app, mounts static files, includes all routers, and provides
 the dev ``__main__`` entry point.
 """
 
-from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp import
+from services import ytdlp_env  # noqa: F401 — import order before yt-dlp
 from services.ytdlp_guard import assert_ytdlp_safe
 
 import logging
@@ -49,7 +49,17 @@ async def _app_lifespan(_app: FastAPI):
         logger.debug("settings wpc clamp skipped", exc_info=True)
 
     def _warm_youtube() -> None:
+        from services.ytdlp_hls import preview_fast_only_mode
+
+        if preview_fast_only_mode():
+            logger.info("YouTube warm-up skipped (VODRIP_PREVIEW_FAST_ONLY)")
+            return
         try:
+            from services.youtube_pot_service import schedule_pot_service_warm
+            from services.youtube_ytdlp_update import schedule_ytdlp_update_check
+
+            schedule_pot_service_warm()
+            schedule_ytdlp_update_check()
             from services.youtube_session import warm_youtube_session
 
             warm_youtube_session()
@@ -98,6 +108,11 @@ app.include_router(system.router)
 
 
 def _warm_youtube_session() -> None:
+    from services.ytdlp_hls import preview_fast_only_mode
+
+    if preview_fast_only_mode():
+        logger.info("YouTube session pre-warm skipped (VODRIP_PREVIEW_FAST_ONLY)")
+        return
     try:
         from services.youtube_session import warm_youtube_session
 

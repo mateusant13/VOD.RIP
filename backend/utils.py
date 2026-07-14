@@ -156,13 +156,18 @@ def resolve_output_file_override(req, opts, default_path: str) -> str:
     if os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":"):
         return raw
     base = download_dir(opts)
-    stem = sanitize_filename_component(Path(raw).stem, fallback="clip")
-    return str(base / f"{stem}.mp4")
+    p = Path(raw)
+    stem = sanitize_filename_component(p.stem, fallback="clip")
+    ext = p.suffix.lower()
+    if ext not in (".mp4", ".mp3", ".m4a"):
+        ext = ".mp3" if getattr(req, "audio_only", False) else ".mp4"
+    return str(base / f"{stem}{ext}")
 
 
 def build_output_path(req, opts, meta: dict) -> str:
-    if req.output_file:
-        return req.output_file
+    raw = (req.output_file or "").strip()
+    if raw and (os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":")):
+        return raw
     base = download_dir(opts)
     title = meta.get("title") or detect_platform(req.url).lower()
     platform = detect_platform(req.url).lower()
@@ -182,7 +187,8 @@ def build_output_path(req, opts, meta: dict) -> str:
             stem = f"{stem} [{tag}]"
     stem = sanitize_filename_component(stem, fallback="video")
     ext = "mp3" if getattr(req, "audio_only", False) else "mp4"
-    return str(base / f"{stem}.{ext}")
+    default_path = str(base / f"{stem}.{ext}")
+    return resolve_output_file_override(req, opts, default_path)
 
 
 def build_clip_output_path(req, opts, meta: dict) -> str:
@@ -206,7 +212,8 @@ def build_clip_output_path(req, opts, meta: dict) -> str:
             parts.append(f"[{tag}]")
     stem = " - ".join(parts)
     stem = sanitize_filename_component(stem, fallback="clip")
-    default_path = str(base / f"{stem}.mp4")
+    ext = "mp3" if getattr(req, "audio_only", False) else "mp4"
+    default_path = str(base / f"{stem}.{ext}")
     return resolve_output_file_override(req, opts, default_path)
 
 
@@ -931,6 +938,8 @@ async def fetch_queue_meta(url: str, platform: str) -> dict:
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
             "duration_string": info.get("duration_string"),
+            "estimated_bytes": info.get("estimated_bytes"),
+            "size_by_quality": info.get("size_by_quality"),
         }
     except Exception:
     # ponytail: network/metadata errors only — returns empty dict on failure

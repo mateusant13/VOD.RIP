@@ -132,6 +132,10 @@ def size_by_quality_from_formats(
         return {}
     dur = float(duration_sec)
     by_label: Dict[str, float] = {}
+    # Labels whose value came from a muxed-progressive format with a concrete
+    # byte count (clen, filesize, or filesize_approx). These should not be lifted
+    # by the fallback bitrate floor, which is tuned for video-only DASH estimates.
+    muxed_progressive_labels: set[str] = set()
 
     for fmt in formats or []:
         if not isinstance(fmt, dict):
@@ -156,12 +160,15 @@ def size_by_quality_from_formats(
             fmt.get("acodec") in ("none", None)
             and fmt.get("vcodec") not in ("none", None)
         )
+        is_muxed_progressive = not is_video_only and not is_clip
 
         clen = _clen_bytes_from_url(url)
         if clen and clen > 0:
             total = clen
             if is_video_only:
                 total += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
+            elif is_muxed_progressive:
+                muxed_progressive_labels.add(label)
             by_label[label] = max(by_label.get(label, 0), total)
             continue
 
@@ -172,6 +179,8 @@ def size_by_quality_from_formats(
                 if fs > 0:
                     if is_video_only:
                         fs += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
+                    elif is_muxed_progressive:
+                        muxed_progressive_labels.add(label)
                     by_label[label] = max(by_label.get(label, 0), fs)
                     continue
             except (TypeError, ValueError):
@@ -187,7 +196,74 @@ def size_by_quality_from_formats(
             est = bytes_from_bitrate_kbps(total_kbps * scale, dur)
             by_label[label] = max(by_label.get(label, 0), est)
 
+    # Don't let YouTube fast-preview muxed streams understate the real download.
+    # Skip the floor for labels where we already have a concrete muxed-progressive
+    # byte count (clen/filesize/filesize_approx); the floor protects video-only
+    # DASH estimates that rely on bitrate scaling.
+    if not is_clip:
+        for label, size in list(by_label.items()):
+            if label in muxed_progressive_labels:
+                continue
+            floor = bytes_from_bitrate_kbps(_fallback_mbps(label) * 1000.0, dur)
+            if size < floor:
+                by_label[label] = floor
+
     return {k: int(v) for k, v in by_label.items() if v > 0}
+
+
+def audio_size_bytes_from_formats(
+    formats: List[dict],
+    duration_sec: float,
+) -> Optional[int]:
+    """Best audio-only format size (filesize → abr → tbr) in bytes."""
+    if not duration_sec or duration_sec <= 0:
+        return None
+    best = 0
+    for fmt in formats or []:
+        if not isinstance(fmt, dict):
+            continue
+        vcodec = (fmt.get("vcodec") or "none").lower()
+        acodec = (fmt.get("acodec") or "none").lower()
+        if vcodec != "none" or acodec == "none":
+            continue
+        filesize = fmt.get("filesize") or fmt.get("filesize_approx")
+        if filesize:
+            try:
+                fs = float(filesize)
+                if fs > best:
+                    best = int(fs)
+                continue
+            except (TypeError, ValueError):
+                pass
+        abr = fmt.get("abr")
+        if abr is not None:
+            try:
+                val = float(abr)
+                if val > 0:
+                    est = bytes_from_bitrate_kbps(val, duration_sec)
+                    if est > best:
+                        best = est
+                continue
+            except (TypeError, ValueError):
+                pass
+        tbr = fmt.get("tbr")
+        if tbr is not None:
+            try:
+                val = float(tbr)
+                if val > 0:
+                    est = bytes_from_bitrate_kbps(val, duration_sec)
+                    if est > best:
+                        best = est
+            except (TypeError, ValueError):
+                pass
+    return best if best > 0 else None
+
+
+def audio_size_bytes_default(duration_sec: float) -> int:
+    """Fallback audio-only size using the default audio bitrate."""
+    if duration_sec <= 0:
+        return 0
+    return bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, duration_sec)
 
 
 def hls_bandwidth_by_height(
@@ -240,7 +316,7 @@ def _parse_media_playlist_segments(
     headers: Optional[dict] = None,
     timeout: float = 12.0,
 ) -> list[dict]:
-    """Return [{duration, url}, ...] from an HLS media playlist."""
+    """Return [{duration, url, byte_range_len?, byte_range_offset?}, ...] from an HLS media playlist."""
     headers = headers or {}
     try:
         r = requests.get(playlist_url, headers=headers, timeout=timeout)
@@ -254,6 +330,8 @@ def _parse_media_playlist_segments(
         return []
     segments: list[dict] = []
     current_duration: Optional[float] = None
+    pending_range: Optional[tuple[int, Optional[int]]] = None
+    range_re = re.compile(r"^#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?$")
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#EXTINF:"):
@@ -261,12 +339,27 @@ def _parse_media_playlist_segments(
                 current_duration = float(line.split(":")[1].split(",")[0])
             except (IndexError, ValueError):
                 current_duration = None
-        elif line and not line.startswith("#") and current_duration is not None:
-            segments.append({
+            continue
+        range_m = range_re.match(line)
+        if range_m:
+            try:
+                length = int(range_m.group(1))
+                offset = int(range_m.group(2)) if range_m.group(2) is not None else None
+                pending_range = (length, offset)
+            except (TypeError, ValueError):
+                pending_range = None
+            continue
+        if line and not line.startswith("#") and current_duration is not None:
+            seg: dict = {
                 "duration": current_duration,
                 "url": urljoin(playlist_url, line),
-            })
+            }
+            if pending_range:
+                seg["byte_range_len"] = pending_range[0]
+                seg["byte_range_offset"] = pending_range[1]
+            segments.append(seg)
             current_duration = None
+            pending_range = None
     return segments
 
 
@@ -289,7 +382,9 @@ def _bytes_per_second_from_media_playlist(
     total_dur = 0.0
     for i in indices:
         seg = segments[i]
-        nbytes = _probe_segment_size(seg["url"], headers)
+        nbytes = seg.get("byte_range_len")
+        if nbytes is None:
+            nbytes = _probe_segment_size(seg["url"], headers)
         if not nbytes or nbytes <= 0:
             continue
         total_bytes += nbytes
@@ -303,8 +398,8 @@ def _resolve_hls_master_to_media(
     playlist_url: str,
     headers: Optional[dict] = None,
     prefer_height: int = 1080,
-) -> tuple[Optional[str], int]:
-    """Follow a master playlist to the best media playlist URL + height."""
+) -> tuple[Optional[str], int, int]:
+    """Follow a master playlist to the best media playlist URL + height + bandwidth."""
     headers = headers or {}
     try:
         r = requests.get(playlist_url, headers=headers, timeout=12.0)
@@ -313,11 +408,11 @@ def _resolve_hls_master_to_media(
     # ponytail: request errors only
     except (requests.RequestException, OSError, ValueError) as exc:
         logger.debug("HLS playlist fetch failed %s: %s", playlist_url, exc)
-        return None, 0
+        return None, 0, 0
     if "#EXTINF:" in text:
-        return playlist_url, prefer_height
+        return playlist_url, prefer_height, 0
     if "#EXT-X-STREAM-INF" not in text:
-        return None, 0
+        return None, 0, 0
     variants: list[tuple[int, int, str]] = []
     pending_bw = 0
     pending_h = 0
@@ -340,7 +435,7 @@ def _resolve_hls_master_to_media(
             pending_bw = 0
             pending_h = 0
     if not variants:
-        return None, 0
+        return None, 0, 0
     with_h = [v for v in variants if v[0] > 0]
     if with_h:
         exact = [v for v in with_h if v[0] == prefer_height]
@@ -351,10 +446,10 @@ def _resolve_hls_master_to_media(
             chosen = max(at_or_below, key=lambda item: item[0]) if at_or_below else min(with_h, key=lambda item: item[0])
     else:
         chosen = max(variants, key=lambda item: item[1])
-    child_url, child_h = _resolve_hls_master_to_media(chosen[2], headers, prefer_height)
+    child_url, child_h, child_bw = _resolve_hls_master_to_media(chosen[2], headers, prefer_height)
     if child_url:
-        return child_url, child_h or chosen[0]
-    return None, 0
+        return child_url, child_h or chosen[0], child_bw or chosen[1]
+    return None, 0, 0
 
 
 def size_by_quality_from_hls_master(
@@ -369,7 +464,7 @@ def size_by_quality_from_hls_master(
     out: Dict[str, int] = {}
 
     # Measured segment throughput is the most accurate path for remux/copy.
-    media_url, height = _resolve_hls_master_to_media(master_url, headers)
+    media_url, height, chosen_bw = _resolve_hls_master_to_media(master_url, headers)
     if media_url:
         bps = _bytes_per_second_from_media_playlist(media_url, headers)
         if bps and bps > 0:
@@ -377,12 +472,27 @@ def size_by_quality_from_hls_master(
             if sampled > 0:
                 label = _label_from_height(height) if height > 0 else "source"
                 out[label] = sampled
-                out["source"] = sampled
+                out["source"] = max(out.get("source", 0), sampled)
+                # Scale the measured variant to other declared bandwidths so
+                # 720p/480p selections get realistic estimates too.
+                if chosen_bw > 0:
+                    bw_map = hls_bandwidth_by_height(master_url, headers=headers)
+                    for other_h, other_bw in bw_map.items():
+                        if other_h <= 0 or other_bw <= 0:
+                            continue
+                        other_label = _label_from_height(other_h)
+                        scaled = int(sampled * (other_bw / float(chosen_bw)))
+                        if scaled > 0:
+                            out[other_label] = max(out.get(other_label, 0), scaled)
                 if height >= 1080:
-                    out["1080p"] = sampled
-                    out.setdefault("1080p60", sampled)
+                    out.setdefault("1080p60", out.get("1080p", sampled))
                 if height >= 720:
-                    out["720p"] = sampled
+                    out.setdefault("720p60", out.get("720p", sampled))
+                # Media playlist with a single variant: the stream is the same
+                # regardless of which quality label the UI requests.
+                if chosen_bw <= 0:
+                    for q in ("source", "1080p", "1080p60", "720p", "720p60", "480p", "360p", "240p"):
+                        out[q] = max(out.get(q, 0), sampled)
                 return out
 
     bw_map = hls_bandwidth_by_height(master_url, headers=headers)
@@ -493,7 +603,14 @@ def estimate_bytes_for_selection(
     def _scale(full_bytes: int) -> int:
         if full_dur <= 0:
             return full_bytes
-        return int(full_bytes * min(1.0, duration_sec / full_dur))
+        ratio = min(1.0, duration_sec / full_dur)
+        if ratio < 1.0 and (full_dur <= 120 or ratio < 0.25):
+            # Short clips (and very short trims of longer clips) carry container
+            # + audio lead-in overhead when stream-copied; scale only the media
+            # payload and keep a flat overhead floor.
+            overhead = min(max(512 * 1024, int(full_bytes * 0.05)), 1 * 1024 * 1024)
+            return int(overhead + (full_bytes - overhead) * ratio)
+        return int(full_bytes * ratio)
 
     if q in sizes and sizes[q] > 0:
         return _scale(sizes[q])
@@ -554,6 +671,13 @@ def enrich_info_dict(
             size_map[str(label)] = bytes_from_bitrate_kbps(
                 mbps * 1000.0 * _MANIFEST_TO_REMUX_SCALE, dur,
             )
+
+    # Audio-only estimate so /api/download/video audio_only=True can size the queue.
+    audio_bytes = audio_size_bytes_from_formats(formats, dur)
+    if not audio_bytes and dur > 0:
+        audio_bytes = audio_size_bytes_default(dur)
+    if audio_bytes and audio_bytes > 0:
+        size_map["audio"] = audio_bytes
 
     if size_map:
         info["size_by_quality"] = size_map

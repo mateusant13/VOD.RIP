@@ -129,6 +129,10 @@ class OpenFolderRequest(BaseModel):
 
 class PreviewWarmRequest(BaseModel):
     url: str
+    # ponytail: hint that the user is likely to open preview soon (hover/pre-mux).
+    # Triggers a background full-VOD mux so first open is instant from cache.
+    full_mux: bool = False
+    prefer_height: int = 720
 
 
 class PreviewSessionCreateRequest(BaseModel):
@@ -150,12 +154,27 @@ class PreviewSessionResponse(BaseModel):
     mux_ready: bool = True
     playlist_ready: bool = True  # full VOD playlist exists — player can attach immediately
     segment_buffer_ready: bool = True  # first segment(s) on disk (optional warm)
-    trim_timeline: bool = False  # playlist starts at crop_start (YouTube on-demand DASH segments)
+    trim_timeline: bool = False  # window-HLS: playlist is 0-based from window_hls_mux_start
     duration_sec: float = 0.0  # real VOD length from extract (crop_end clamped to this)
+    window_hls_mux_start: float = 0.0
+    window_hls_mux_end: float = 0.0
+    # ponytail: when the backend is serving a local cached MP4, the browser can
+    # do native byte-range seeks without a refresh/mux round-trip.
+    cached_progressive: bool = False
 
 
 class PreviewSeekRequest(BaseModel):
     position_sec: float = 0.0
+
+
+class PreviewTimingRequest(BaseModel):
+    platform: str = ""
+    surface: str = "main"
+    event: str = ""
+    session_id: str = ""
+    open_ms: float = 0.0
+    seek_ms: float = 0.0
+    detail: str = ""
 
 
 class PreviewSessionStatusResponse(BaseModel):
@@ -164,6 +183,8 @@ class PreviewSessionStatusResponse(BaseModel):
     segment_buffer_ready: bool = True
     mux_status: str = "unnecessary"
     mux_error: str = ""
+    window_hls_mux_start: float = 0.0
+    window_hls_mux_end: float = 0.0
 
 
 class PreviewQualityUpdateRequest(BaseModel):

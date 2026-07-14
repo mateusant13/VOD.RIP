@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,8 @@ TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 
 CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9eba8f91d88"
+CLIP_ACCESS_TOKEN_HASH = "993d9a5131f15a37bd16f32342c44ed1e0b1a9b968c6afdb662d2cddd595f6c5"
+VOD_PLAYBACK_TOKEN_HASH = "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
 
 CHANNEL_VIDEOS_QUERY = """
 query ChannelVideos($login: String!, $first: Int!, $after: Cursor) {
@@ -186,9 +190,15 @@ def get_clip_info_sync(url_or_slug: str) -> Dict[str, Any]:
         "created_at": node.get("createdAt"),
         "content_kind": "clip",
     }
+    # Probe signed CloudFront URLs for accurate size estimates. Unsigned sourceURL
+    # values redirect/403 from CloudFront, so the HEAD probe must use sig/token.
+    try:
+        signed_variants = get_clip_signed_variants_sync(slug or url_or_slug)
+    except Exception:
+        signed_variants = []
     enrich_info_dict(
         payload,
-        progressive_variants=node.get("videoQualities") or [],
+        progressive_variants=signed_variants or (node.get("videoQualities") or []),
         is_clip=True,
     )
     return payload
@@ -198,6 +208,158 @@ def get_clip_progressive_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]
     """Progressive MP4 variants for Twitch clip preview (~0.3-1s)."""
     node = _fetch_clip_node(url_or_slug)
     return _clip_progressive_formats(node.get("videoQualities") or [])
+
+
+def _signed_clip_progressive_formats(
+    video_qualities: List[dict],
+    sig: str,
+    token: str,
+) -> List[Dict[str, Any]]:
+    """Same as _clip_progressive_formats but appends playback-access query params."""
+    out: List[Dict[str, Any]] = []
+    for q in video_qualities or []:
+        try:
+            height = int(q.get("quality") or 0)
+        except (TypeError, ValueError):
+            continue
+        url = (q.get("sourceURL") or "").strip()
+        if not height or not url:
+            continue
+        signed_url = f"{url}?{urlencode({'sig': sig, 'token': token})}"
+        out.append({
+            "height": height,
+            "url": signed_url,
+            "ext": "mp4",
+            "protocol": "https",
+            "tbr": float(height),
+        })
+    out.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    return out
+
+
+def get_clip_signed_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]:
+    """Fast, signed progressive MP4 variants for a Twitch clip.
+
+    Uses the public ``VideoAccessToken_Clip`` persisted query so the returned
+    URLs include the ``sig``/``token`` query params required by CloudFront.
+    """
+    slug = _extract_clip_slug(url_or_slug)
+    if not slug:
+        raise ValueError(f"Not a Twitch clip URL or slug: {url_or_slug}")
+    data = _gql_persisted(
+        "VideoAccessToken_Clip",
+        CLIP_ACCESS_TOKEN_HASH,
+        {"slug": slug, "platform": "web"},
+    )
+    clip = data.get("clip")
+    if not clip:
+        raise RuntimeError(f"Twitch clip not found: {slug}")
+    token_data = clip.get("playbackAccessToken") or {}
+    sig = token_data.get("signature")
+    token = token_data.get("value")
+    if not sig or not token:
+        raise RuntimeError(f"Twitch clip access token missing: {slug}")
+    return _signed_clip_progressive_formats(
+        clip.get("videoQualities") or [], sig, token
+    )
+
+
+_HLS_STREAM_INF_RE = re.compile(r"#EXT-X-STREAM-INF[\s\S]*?\n([^#\n].*)", re.IGNORECASE)
+_HLS_RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)", re.IGNORECASE)
+
+
+def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[str, Any]]:
+    """Parse variant URLs and heights from a Twitch HLS master playlist."""
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for block in master_text.split("#EXT-X-STREAM-INF")[1:]:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        info_line = lines[0]
+        url_line = ""
+        for line in lines[1:]:
+            stripped = line.strip()
+            if stripped:
+                url_line = stripped
+                break
+        if not url_line:
+            continue
+        variant_url = url_line if url_line.startswith("http") else urljoin(master_url, url_line)
+        if variant_url in seen:
+            continue
+        seen.add(variant_url)
+        m = _HLS_RESOLUTION_RE.search(info_line)
+        height = int(m.group(2)) if m else 0
+        out.append({
+            "height": height,
+            "url": variant_url,
+            "ext": "mp4",
+            "protocol": "m3u8_native",
+        })
+    out.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    return out
+
+
+def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any]]]:
+    """Fast Twitch VOD playback URL via GQL + Usher (no yt-dlp).
+
+    Returns (master_m3u8_url, headers, variant_formats).
+    """
+    vid = _extract_video_id(url_or_id)
+    if not vid:
+        raise ValueError(f"Not a Twitch VOD URL or id: {url_or_id}")
+
+    data = _gql_persisted(
+        "PlaybackAccessToken",
+        VOD_PLAYBACK_TOKEN_HASH,
+        {
+            "isLive": False,
+            "login": "",
+            "isVod": True,
+            "vodID": vid,
+            "playerType": "embed",
+            "platform": "site",
+        },
+    )
+    token_node = data.get("videoPlaybackAccessToken") or data.get("playbackAccessToken") or {}
+    sig = token_node.get("signature")
+    token = token_node.get("value")
+    if not sig or not token:
+        raise RuntimeError(f"Twitch VOD access token missing: {vid}")
+
+    query = urlencode({
+        "allow_source": "true",
+        "allow_audio_only": "true",
+        "playlist_include_framerate": "true",
+        "supported_codecs": "h264",
+        "platform": "web",
+        "p": str(random.randint(1_000_000, 9_999_999)),
+        "nauth": token,
+        "nauthsig": sig,
+    })
+    master_url = f"https://usher.ttvnw.net/vod/v2/{vid}.m3u8?{query}"
+
+    headers: dict = {
+        "Referer": "https://www.twitch.tv/",
+        "Origin": "https://www.twitch.tv",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+    }
+    req = urllib.request.Request(master_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            master_text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:200]
+        raise RuntimeError(f"Twitch VOD master fetch failed: HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Twitch VOD master fetch failed: {e}") from e
+
+    variants = _parse_hls_master_variants(master_url, master_text)
+    return master_url, headers, variants
 
 
 def _extract_video_id(url_or_id: str) -> Optional[str]:

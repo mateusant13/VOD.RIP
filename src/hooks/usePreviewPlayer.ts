@@ -292,10 +292,12 @@ export function usePreviewPlayer({
     cancelViewportSync();
     const level = previewLevelsRef.current[levelIndex];
     if (!level) return;
+    // ponytail: skip if the same level is already applied (or in flight).
+    if (levelIndex === qualityLevel && level.height === appliedHeightRef.current) return;
     requestedHeightRef.current = level.height;
     setQualityLevel(levelIndex);
     await applyPlaybackHeight(level.height, { userInitiated: true });
-  }, [applyPlaybackHeight, cancelViewportSync]);
+  }, [applyPlaybackHeight, cancelViewportSync, qualityLevel]);
 
   const syncProgressiveLevels = useCallback((
     mapped: PreviewLevelOption[],

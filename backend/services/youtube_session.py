@@ -395,6 +395,9 @@ def youtube_session_from_values(
     if not vd:
         vd = fetch_visitor_data()
 
+    if not pt and video_id:
+        pt = resolve_video_po_token(video_id, po_token)
+
     return YouTubeSession(
         visitor_data=vd,
         po_token=pt,
@@ -447,13 +450,38 @@ def youtube_session_from_settings(
     )
 
 
+def resolve_video_po_token(
+    video_id: Optional[str],
+    settings_po: Optional[str] = None,
+) -> Optional[str]:
+    """Manual settings token wins; else mint via bgutil when the POT server is up."""
+    manual = (settings_po or "").strip()
+    if manual:
+        return manual
+    vid = (video_id or "").strip()
+    if not vid:
+        return None
+    try:
+        from services.youtube_pot_service import fetch_video_po_token, pot_service_ping
+
+        if not pot_service_ping():
+            return None
+        return fetch_video_po_token(vid)
+    except Exception:
+        return None
+
+
 def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = True) -> dict[str, list[str]]:
     """Map session into yt-dlp youtube extractor_args."""
-    # ponytail: fetch_pot off — getpot_wpc spawns headless Chrome; use manual po_token in Settings
     args: dict[str, list[str]] = {
-        "player_client": ["ios", "android", "mweb", "web_safari"],
-        "fetch_pot": ["never"],
+        "player_client": ["web_safari", "ios", "android", "mweb", "tv"],
     }
+    try:
+        from services.youtube_pot_service import pot_service_ping
+
+        args["fetch_pot"] = ["auto"] if pot_service_ping() else ["never"]
+    except Exception:
+        args["fetch_pot"] = ["never"]
     if session.visitor_data:
         args["visitor_data"] = [session.visitor_data]
     if session.po_token:
@@ -461,9 +489,9 @@ def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = T
         args["po_token"] = [
             f"web.player+{token}",
             f"web.gvs+{token}",
+            f"web_safari.gvs+{token}",
             f"mweb.gvs+{token}",
         ]
-        args["player_client"] = ["ios", "android", "mweb", "web_safari"]
     return args
 
 

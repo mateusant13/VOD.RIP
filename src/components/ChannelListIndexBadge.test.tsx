@@ -7,14 +7,14 @@ describe("ChannelListIndexBadge", () => {
     render(<ChannelListIndexBadge platform="Kick" index={3} />);
     const badge = screen.getByText("3");
     expect(badge).toBeInTheDocument();
-    expect(badge.className).toContain("text-[#53fc18]");
+    expect((badge as HTMLElement).style.color).toBe("rgb(83, 252, 24)");
   });
 
   it("renders index number for Twitch", () => {
     render(<ChannelListIndexBadge platform="Twitch" index={1} />);
     const badge = screen.getByText("1");
     expect(badge).toBeInTheDocument();
-    expect(badge.className).toContain("text-[#9146FF]");
+    expect((badge as HTMLElement).style.color).toBe("rgb(145, 70, 255)");
   });
 
   it("shows platform title", () => {

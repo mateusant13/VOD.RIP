@@ -39,6 +39,41 @@ def _ffmpeg_binaries():
     return result
 
 
+def _bundled_node_binaries():
+    """Bundle the private Node 20 runtime from build/external/node.exe.
+
+    Ships under ``<exe-dir>/runtime/node.exe`` so the YouTube PO Token
+    (bgutil) subprocess can spawn without requiring Node on PATH.
+    Produced by ``scripts/download-node.ps1``. Skips silently when the
+    artefact is absent — dev installs and CI without Node continue fine.
+    """
+    if sys.platform != "win32":
+        return []
+    node_exe = _EXTERNAL_DIR / "node.exe"
+    if not node_exe.is_file():
+        return []
+    return [(str(node_exe), "runtime")]
+
+
+def _bundled_bgutil_datas():
+    """Bundle the bgutil-ytdlp-pot-provider server under ``runtime/bgutil-pot/``.
+
+    Layout matches ``youtube_pot_service.frozen_runtime_paths``:
+
+        <exe-dir>/runtime/bgutil-pot/server/build/main.js
+        <exe-dir>/runtime/bgutil-pot/server/node_modules/...
+
+    The server subtree is self-contained (``npm ci`` + ``npm run build``
+    already executed by ``scripts/build-bgutil-bundle.ps1``). We bundle
+    only the ``server/`` subtree — the repo root and ``docs/`` are not
+    needed at runtime and just bloat the installer.
+    """
+    server_dir = _EXTERNAL_DIR / "bgutil-pot" / "server"
+    if not server_dir.is_dir():
+        return []
+    return [(str(server_dir), "runtime/bgutil-pot/server")]
+
+
 def _hidden_imports():
     imports = [
         "uvicorn",
@@ -74,6 +109,7 @@ def _hidden_imports():
         "services.updater",
         "services.crash_handler",
         "services._version",
+        "services.youtube_pot_service",
         "models.schemas",
         "webview",
         "PIL",
@@ -110,13 +146,14 @@ a = Analysis(
         str(_BACKEND_DIR / "main.py"),
     ],
     pathex=[str(_BACKEND_DIR)],
-    binaries=_ffmpeg_binaries(),
+    binaries=_ffmpeg_binaries() + _bundled_node_binaries(),
     datas=[
         (str(_STATIC_DIR / "index.html"), "static"),
         (str(_ICON_ICO), "."),
     ] + ([(
         str(_ICON_ICNS), ".",
-    )] if _IS_MAC and _ICON_ICNS.is_file() else []),
+    )] if _IS_MAC and _ICON_ICNS.is_file() else [])
+      + _bundled_bgutil_datas(),
     hiddenimports=_hidden_imports(),
     hookspath=[str(_hooks)] if _hooks.is_dir() else [],
     runtime_hooks=[],

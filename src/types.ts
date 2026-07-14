@@ -145,16 +145,24 @@ export interface PreviewSessionResponse {
   playlist_ready?: boolean;
   /** True when first segment(s) are cached on disk (warm path). */
   segment_buffer_ready?: boolean;
-  /** HLS playlist is 0-based from crop_start (YouTube on-demand DASH segments). */
+  /** HLS playlist is 0-based from window_hls_mux_start (YouTube window-HLS). */
   trim_timeline?: boolean;
   /** Real VOD length from backend extract (crop_end clamped to this). */
   duration_sec?: number;
+  window_hls_mux_start?: number;
+  window_hls_mux_end?: number;
+  /** True when the backend is serving a local cached MP4 (instant byte-range seeks). */
+  cached_progressive?: boolean;
 }
 
 export interface PreviewSessionStatusResponse {
   mux_ready: boolean;
   playlist_ready?: boolean;
   segment_buffer_ready?: boolean;
+  mux_status?: string;
+  mux_error?: string;
+  window_hls_mux_start?: number;
+  window_hls_mux_end?: number;
 }
 
 export type Tab = 'url' | 'channels' | 'queue' | 'settings';

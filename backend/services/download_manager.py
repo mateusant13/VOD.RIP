@@ -409,6 +409,7 @@ class DownloadManager:
                         "register_abort": _register_abort,
                         "register_temp_dir": _register_temp_dir,
                         "settings_mgr": params.get("settings_mgr"),
+                        "audio_only": params.get("audio_only"),
                     }
                     kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
                     output_file_result = download_func(**kwargs)

@@ -11,6 +11,15 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pyDir = path.join(root, "backend");
 const apiPort = Number(process.env.PORT || "7897");
 const vitePort = Number(process.env.VITE_PORT || "5173");
+/** Windows: prefer py -3.11 so a stale 3.10 on PATH does not run the API. */
+const pyCmd = process.env.VODRIP_PYTHON || (process.platform === "win32" ? "py" : "python");
+const pyArgsPrefix = process.env.VODRIP_PYTHON ? [] : process.platform === "win32" ? ["-3.11"] : [];
+
+const fastPreview =
+  process.argv.includes("--fast-preview") ||
+  process.argv.includes("2") ||
+  process.env.VODRIP_PREVIEW_FAST_ONLY === "1";
+const previewFastEnv = fastPreview ? { VODRIP_PREVIEW_FAST_ONLY: "1" } : {};
 
 const children = [];
 
@@ -81,8 +90,9 @@ function releasePort(port) {
       killWinPid(pid);
     }
   }
+  const pyInline = [pyCmd, ...pyArgsPrefix, "-c"].join(" ");
   execSync(
-    `python -c "from services.server_lifecycle import release_api_port; release_api_port(${port}, timeout=12)"`,
+    `${pyInline} "from services.server_lifecycle import release_api_port; release_api_port(${port}, timeout=12)"`,
     { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(apiPort) } },
   );
 }
@@ -179,8 +189,18 @@ process.on("SIGTERM", () => shutdown(0));
 async function main() {
   await ensurePortFree(apiPort, "API");
 
+  if (fastPreview) {
+    console.log(
+      "[dev:2] VODRIP_PREVIEW_FAST_ONLY=1 — innertube race only (~8s), no cookies/POT/browser/slow fallback",
+    );
+    console.log("        Best for shorts/simple VODs; 6h titiltei streams need npm run dev\n");
+  }
+
   console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
-  start("api", "python", ["run.py"], pyDir, { VODRIP_SKIP_PORT_RELEASE: "1" });
+  start("api", pyCmd, [...pyArgsPrefix, "run.py"], pyDir, {
+    VODRIP_SKIP_PORT_RELEASE: "1",
+    ...previewFastEnv,
+  });
 
   for (let i = 0; i < 30; i++) {
     await sleep(500);

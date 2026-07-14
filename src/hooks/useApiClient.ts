@@ -8,11 +8,13 @@
 
 const API_BASE = '';
 const API_TIMEOUT_MS = 60_000;
+const API_RETRY_ATTEMPTS = 2;
+const API_RETRY_BACKOFF_MS = 900;
 
 const IS_DEV_UI = import.meta.env.DEV;
 const TIMEOUT_HINT = IS_DEV_UI
-  ? 'Request timed out — the API may be hung. Stop and restart: npm run dev'
-  : 'Request timed out — try again or quit VOD.RIP from the tray and reopen.';
+  ? 'The backend is taking too long. Please wait a moment and try again.'
+  : 'The app is taking too long. Please wait a moment and try again.';
 const BACKEND_HINT = IS_DEV_UI
   ? 'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).'
   : 'API not reachable. Quit VOD.RIP from the tray and reopen the app.';
@@ -36,6 +38,11 @@ function formatApiDetail(detail: unknown): string {
 }
 
 function apiErrorMessage(res: Response, fallback: string, path?: string): string {
+  const p = path ?? '';
+  // Preview extract failures are 500 with a real message — not a dead backend.
+  if ((res.status === 500 || res.status === 503) && p.includes('/api/preview/')) {
+    return fallback || 'Preview failed — try again.';
+  }
   if (res.status === 500 || res.status === 502 || res.status === 503) {
     return IS_DEV_UI
       ? 'Backend not running. Start the app with: npm run dev  (API on http://localhost:7897 + UI on :5173).'
@@ -59,31 +66,27 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
 }
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const attempt = async (): Promise<Response> => {
+  let lastErr: unknown;
+  // Retry both network failures and timeout aborts so users never see a one-off
+  // "restart dev" message; the final attempt surfaces a friendly hint instead.
+  for (let i = 0; i <= API_RETRY_ATTEMPTS; i++) {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     try {
       return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    } catch (err: unknown) {
+      lastErr = err;
+      if (i >= API_RETRY_ATTEMPTS) break;
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, API_RETRY_BACKOFF_MS * (i + 1))
+      );
     } finally {
       window.clearTimeout(timer);
     }
-  };
-  try {
-    return await attempt();
-  } catch (err: unknown) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error(TIMEOUT_HINT);
-    }
-    try {
-      await new Promise((resolve) => window.setTimeout(resolve, 400));
-      return await attempt();
-    } catch (retryErr: unknown) {
-      if (retryErr instanceof DOMException && retryErr.name === 'AbortError') {
-        throw new Error(TIMEOUT_HINT);
-      }
-      throw new Error(BACKEND_HINT);
-    }
   }
+  const isAbort =
+    lastErr instanceof DOMException && (lastErr as DOMException).name === 'AbortError';
+  throw new Error(isAbort ? TIMEOUT_HINT : BACKEND_HINT);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {

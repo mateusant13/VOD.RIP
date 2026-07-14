@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-all.mjs",
+    "dev:2": "node scripts/dev-all.mjs --fast-preview",
     "dev:vite": "vite",
     "dev:api": "cd backend && python run.py",
     "dev:all": "node scripts/dev-all.mjs",

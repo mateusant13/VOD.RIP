@@ -30,11 +30,10 @@ def _window_sess() -> PreviewSession:
     return s
 
 
-def test_window_hls_playlist_ready_before_segments():
-    """dash_window_hls session: playlist is ready as soon as custom_master exists."""
+def test_window_hls_playlist_ready_requires_seg0():
+    """dash_window_hls: playlist_ready only when seg0 is on disk (playable)."""
     s = _window_sess()
-    assert preview_playlist_ready(s)
-    # mux has not run, no seg0, no ENDLIST → not segment / not mux ready
+    assert not preview_playlist_ready(s)
     assert not preview_mux_ready(s)
     assert not preview_segment_buffer_ready(s)
     assert "window-playlist" in (s.custom_master or "")

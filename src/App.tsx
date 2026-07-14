@@ -30,36 +30,40 @@ import {
   resolveHlsPreviewLevels,
   isClipPreviewUrl,
   resolvePreviewPlayback,
+  previewSessionRefreshHandoff,
+  previewSeekOptimisticUi,
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
-  inferLevelHeight,
   suggestClipDownloadName,
   suggestVideoDownloadName,
   warmYoutubePreview,
   warmYoutubePreviewBatch,
+  warmYoutubePreviewFull,
+  cancelWarmYoutubePreviewFull,
   bindYoutubeChannelScrollWarm,
-  waitForPreviewMuxReady,
-  shouldPollPreviewMuxReady,
   clampPreviewTimeToVodTrim,
   PREVIEW_SEEK_DEBOUNCE_MS,
-  previewMuxPollMaxMs,
-  previewPlaylistPollMaxMs,
-  youtubePreviewMuxPollMaxMs,
+  seekYoutubeWindowHls,
+  windowHlsVideoTimeSec,
+  isPositionInWindowHlsMux,
   attachPreviewBufferingListeners,
+  applyVideoLocalSeek,
+  reloadWindowHlsAtPosition,
+  shieldPreviewBuffering,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
+import { PreviewTiming, waitVideoPlayable } from './previewTiming';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, youtubeSlugFromChannelUrl, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelWidthAtSiblingMins, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, URL_ASIDE_TRIM_MIN_H, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
-import { readUiScale } from './uiScale';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelWidthAtSiblingMins, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -73,6 +77,7 @@ import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
+import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 
 // ─── TYPES (migrated to src/types.ts) ───────────────
 const IS_DEV_UI = import.meta.env.DEV;
@@ -185,6 +190,8 @@ export default function App() {
   const [previewVideoLoading, setPreviewVideoLoading] = useState(false);
   const [previewBuffering, setPreviewBuffering] = useState(false);
   const [previewVideoReady, setPreviewVideoReady] = useState(false);
+  const [previewYoutubeEmbedUrl, setPreviewYoutubeEmbedUrl] = useState<string | null>(null);
+  const previewYoutubeIframeRef = useRef<HTMLIFrameElement>(null);
   const previewVideoLoadingRef = useRef(false);
   const previewVideoReadyRef = useRef(false);
   const [previewTimeUi, setPreviewTimeUi] = useState(0);
@@ -217,10 +224,25 @@ export default function App() {
   /** Monotonic generation counter — increment to cancel in-flight openPreview. */
   const previewGenRef = useRef(0);
   const previewClipRelativeRef = useRef(false);
-  /** YouTube DASH segment playlist — timeline 0 = crop_start, not VOD 0. */
+  /** YouTube window-HLS — HLS timeline is chunk-relative (see previewWindowHlsMuxStartRef). */
   const previewTrimTimelineRef = useRef(false);
+  /** YouTube window-HLS chunk offset — local timeline 0 = mux_start on VOD. */
+  const previewWindowHlsMuxStartRef = useRef(0);
+  const previewWindowHlsMuxEndRef = useRef(0);
+  const previewSeekInflightRef = useRef(0);
+  const previewSeekLockedRef = useRef(false);
+  const previewRecoveryTimerRef = useRef<number | null>(null);
+  const previewBufferingClearRef = useRef<(() => void) | null>(null);
+  const fetchVideoInfoGenRef = useRef(0);
+  /** URL that current videoInfo / trim sliders belong to — gates Watch Preview. */
+  const [videoInfoUrl, setVideoInfoUrl] = useState<string | null>(null);
+  /** ponytail: in-memory VideoInfo cache. Avoids re-fetching the same URL when
+   *  the user pastes/types it again. Bounded to 32 entries (LRU-ish). */
+  const videoInfoCacheRef = useRef<Map<string, VideoInfo>>(new Map());
   /** Cancels debounced YouTube metadata prefetch when URL changes. */
   const youtubePrefetchGenRef = useRef(0);
+  /** ponytail: debounce URL warm so every keystroke doesn't fire a network call. */
+  const urlWarmTimerRef = useRef<number | null>(null);
   const channelsScrollRef = useRef<HTMLDivElement>(null);
   /** True while a preview is active (loaded or loading) — blocks re-clicks. */
   const previewStartedRef = useRef(false);
@@ -238,7 +260,17 @@ export default function App() {
   const previewAppliedHeightRef = useRef(0);
   const previewExtractSourceRef = useRef('');
   const previewSessionIdRef = useRef<string | null>(null);
+  /** YouTube Extract Info — session created in parallel so Watch Preview attaches instantly. */
+  const previewSessionPrefetchRef = useRef<{
+    url: string;
+    session: PreviewSessionResponse;
+  } | null>(null);
+  const previewTimingRef = useRef<PreviewTiming | null>(null);
   const previewSeekDebounceRef = useRef<number | null>(null);
+  const previewPlaybackKindRef = useRef<'hls' | 'progressive'>('progressive');
+  const previewPendingSeekSecRef = useRef<number | null>(null);
+  const previewSeekTargetRef = useRef<number | null>(null);
+  const previewCachedProgressiveRef = useRef(false);
   // ── Shared preview hook (quality state machine) ──────────────────────────
   const {
     previewLevels,
@@ -263,6 +295,30 @@ export default function App() {
       if (msg) setError(msg);
     },
   });
+
+  useEffect(() => {
+    previewPlaybackKindRef.current = previewPlayback?.kind ?? 'progressive';
+  }, [previewPlayback?.kind]);
+
+  const previewSessionHandoffRefs = {
+    trimTimelineRef: previewTrimTimelineRef,
+    windowHlsMuxStartRef: previewWindowHlsMuxStartRef,
+    windowHlsMuxEndRef: previewWindowHlsMuxEndRef,
+    extractSourceRef: previewExtractSourceRef,
+    pendingSeekSecRef: previewPendingSeekSecRef,
+    cachedProgressiveRef: previewCachedProgressiveRef,
+    sessionMetaRef: previewSessionMetaRef,
+  };
+
+  const applyPreviewSessionRefresh = useCallback((res: PreviewSessionResponse) => (
+    previewSessionRefreshHandoff(
+      previewLoadedUrlRef.current ?? url.trim(),
+      res,
+      previewSessionHandoffRefs,
+      setPreviewPlayback,
+      () => previewVideoRef.current?.currentTime ?? 0,
+    )
+  ), [url]);
 
   const previewNeedleRailRef = useRef<HTMLDivElement>(null);
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
@@ -632,11 +688,26 @@ export default function App() {
     return Math.max(0, previewTrimEnd - previewTrimStart);
   }, [previewTrimStart, previewTrimEnd, needleGlance]);
 
+  const postYoutubePreviewCommand = useCallback((func: string, args: unknown[] = []) => {
+    youtubeIframeCommand(previewYoutubeIframeRef.current, func, args);
+  }, []);
+
   const destroyPreviewPlayer = useCallback(() => {
+    setPreviewYoutubeEmbedUrl(null);
     if (previewSeekDebounceRef.current != null) {
       window.clearTimeout(previewSeekDebounceRef.current);
       previewSeekDebounceRef.current = null;
     }
+    if (previewRecoveryTimerRef.current != null) {
+      window.clearTimeout(previewRecoveryTimerRef.current);
+      previewRecoveryTimerRef.current = null;
+    }
+    // Invalidate any in-flight seek so its async callbacks become no-ops.
+    previewSeekInflightRef.current += 1;
+    previewSeekTargetRef.current = null;
+    previewSeekLockedRef.current = false;
+    previewPendingSeekSecRef.current = null;
+    previewBufferingClearRef.current = null;
     const hls = previewHlsRef.current;
     if (hls) {
       try {
@@ -655,6 +726,8 @@ export default function App() {
     }
     previewClipRelativeRef.current = false;
     previewTrimTimelineRef.current = false;
+    previewWindowHlsMuxStartRef.current = 0;
+    previewWindowHlsMuxEndRef.current = 0;
     setPreviewMetaDurationSec(0);
   }, [setHlsRef]);
 
@@ -667,6 +740,7 @@ export default function App() {
     setPreviewOpen(false);
     setPreviewSessionId(null);
     setPreviewPlayback(null);
+    setPreviewYoutubeEmbedUrl(null);
     setPreviewVideoLoading(false);
     setPreviewVideoReady(false);
     previewCurrentTimeRef.current = 0;
@@ -691,20 +765,198 @@ export default function App() {
   }, [previewSessionId, destroyPreviewPlayer]);
 
   const seekPreviewVideoImmediate = useCallback((sec: number, force = false) => {
-    const video = previewVideoRef.current;
-    if (!video || !previewVideoReady) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
-    const clipRel = previewClipRelativeRef.current;
     const t = Math.max(start, Math.min(sec, end));
-    const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
-    if (force || Math.abs(video.currentTime - videoTime) > 0.05) {
-      video.currentTime = videoTime;
+    if (previewYoutubeEmbedUrl) {
+      if (!previewVideoReady) return;
+      // Keep this target until YouTube reports the new position. The iframe
+      // emits its old time briefly after seekTo; accepting it makes the
+      // controlled scrubber jump backwards.
+      previewSeekTargetRef.current = t;
+      previewTimingRef.current?.markSeekStart(t);
       syncPreviewTimeUi(t, true);
+      postYoutubePreviewCommand('seekTo', [t, true]);
+      return;
     }
-  }, [previewVideoReady, syncPreviewTimeUi]);
+    const video = previewVideoRef.current;
+    if (!video || !previewVideoReady) return;
+    previewSeekTargetRef.current = t;
+    previewTimingRef.current?.markSeekStart(t);
+    const pageUrl = previewLoadedUrlRef.current ?? url.trim();
+    const youtube = detectUrlPlatform(pageUrl) === 'youtube';
+    const optimistic = previewSeekOptimisticUi(
+      youtube,
+      previewTrimTimelineRef.current,
+      previewPlaybackKindRef.current,
+    );
+    const finishSeek = () => {
+      previewSeekTargetRef.current = null;
+      syncPreviewTimeUi(t, true);
+    };
+    const applyLocalTime = (videoTime: number) => {
+      if (force || Math.abs(video.currentTime - videoTime) > 0.05) {
+        video.currentTime = videoTime;
+      }
+      if (optimistic) syncPreviewTimeUi(t, true);
+    };
+
+    const sid = previewSessionIdRef.current;
+    if (
+      previewTrimTimelineRef.current
+      && sid
+      && youtube
+    ) {
+      // Invalidate any previous seek before starting the next one so callbacks
+      // for the old one become no-ops and cannot leak the timeline lock.
+      const seekId = ++previewSeekInflightRef.current;
+      const clearLockIfCurrent = () => {
+        if (seekId === previewSeekInflightRef.current) {
+          previewSeekLockedRef.current = false;
+          setPreviewBuffering(false);
+        }
+      };
+      const muxStart = previewWindowHlsMuxStartRef.current;
+      const muxEnd = previewWindowHlsMuxEndRef.current;
+      const resumePlay = !video.paused;
+      if (isPositionInWindowHlsMux(t, muxStart, muxEnd)) {
+        previewSeekLockedRef.current = true;
+        // The slider already jumped optimistically in seekPreviewVideo.
+        // applyVideoLocalSeek pauses during the seek so the decoder does not
+        // play forward from the previous keyframe to the target.
+        void applyVideoLocalSeek(video, windowHlsVideoTimeSec(t, muxStart))
+          .then(() => {
+            if (seekId !== previewSeekInflightRef.current) return;
+            previewSeekLockedRef.current = false;
+            finishSeek();
+            previewBufferingClearRef.current?.();
+            setPreviewBuffering(false);
+            if (resumePlay) void video.play().then(() => setPreviewPlaying(true)).catch(() => {});
+          })
+          .catch(() => {
+            if (seekId !== previewSeekInflightRef.current) return;
+            previewSeekTargetRef.current = null;
+            clearLockIfCurrent();
+          });
+        return;
+      }
+      // Out-of-window seek: keep the slider at the target (already set
+      // optimistically) and wait for the backend remux. Do not touch
+      // video.currentTime until the new chunk is ready — the old window does
+      // not contain the target, so any local seek would snap to the wrong frame.
+      previewSeekLockedRef.current = true;
+      video.pause();
+      setPreviewPlaying(false);
+      shieldPreviewBuffering(120_000);
+      // Show loading immediately so the user knows the requested frame is being
+      // prepared while the backend remuxes.
+      setPreviewBuffering(true);
+      let slowSpinner: number | undefined;
+      void (async () => {
+        try {
+          slowSpinner = window.setTimeout(() => setPreviewBuffering(true), 800);
+          const { muxStart: newStart, muxEnd: newEnd, remuxed } = await seekYoutubeWindowHls(sid, t, apiPost, apiGet, 12_000);
+          if (seekId !== previewSeekInflightRef.current) return;
+          previewWindowHlsMuxStartRef.current = newStart;
+          previewWindowHlsMuxEndRef.current = newEnd;
+          const videoTime = windowHlsVideoTimeSec(t, newStart);
+          if (remuxed && previewHlsRef.current) {
+            await reloadWindowHlsAtPosition(
+              previewHlsRef.current,
+              sid,
+              video,
+              videoTime,
+            );
+          } else {
+            await applyVideoLocalSeek(video, videoTime);
+          }
+          if (seekId !== previewSeekInflightRef.current) return;
+          previewSeekLockedRef.current = false;
+          finishSeek();
+          previewBufferingClearRef.current?.();
+          waitVideoPlayable(video, previewTimingRef.current ?? new PreviewTiming('youtube', 'main'));
+          if (resumePlay) void video.play().then(() => setPreviewPlaying(true)).catch(() => {});
+        } catch (err: unknown) {
+          if (seekId === previewSeekInflightRef.current) {
+            setError(err instanceof Error ? err.message : 'Seek failed');
+            previewSeekTargetRef.current = null;
+          }
+        } finally {
+          if (slowSpinner !== undefined) window.clearTimeout(slowSpinner);
+          clearLockIfCurrent();
+        }
+      })();
+      return;
+    }
+
+    if (
+      youtube
+      && !previewTrimTimelineRef.current
+      && previewPlaybackKindRef.current === 'progressive'
+      && !previewCachedProgressiveRef.current
+      && sid
+      && t > start + 60
+    ) {
+      const clipRel = previewClipRelativeRef.current;
+      const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+      // Show a teaser frame at the target immediately while /refresh resolves
+      // the full-window progressive URL in the background.
+      applyLocalTime(videoTime);
+      previewPendingSeekSecRef.current = t;
+      setPreviewBuffering(true);
+      void apiPost<PreviewSessionResponse>(`/api/preview/session/${sid}/refresh`, {})
+        .then((res) => {
+          if (applyPreviewSessionRefresh(res)) {
+            setPreviewBuffering(false);
+            return;
+          }
+          const clipRel = previewClipRelativeRef.current;
+          const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+          applyLocalTime(videoTime);
+          waitVideoPlayable(
+            video,
+            previewTimingRef.current ?? new PreviewTiming(youtube ? 'youtube' : 'unknown', 'main'),
+          );
+          finishSeek();
+        })
+        .catch(() => {
+          const clipRel = previewClipRelativeRef.current;
+          const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+          applyLocalTime(videoTime);
+          waitVideoPlayable(
+            video,
+            previewTimingRef.current ?? new PreviewTiming(youtube ? 'youtube' : 'unknown', 'main'),
+          );
+          finishSeek();
+        })
+        .finally(() => setPreviewBuffering(false));
+      return;
+    }
+
+    const clipRel = previewClipRelativeRef.current;
+    const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+    applyLocalTime(videoTime);
+    const plat = detectUrlPlatform(pageUrl) ?? 'unknown';
+    waitVideoPlayable(
+      video,
+      previewTimingRef.current ?? new PreviewTiming(plat, 'main'),
+    );
+    finishSeek();
+  }, [previewYoutubeEmbedUrl, previewVideoReady, syncPreviewTimeUi, url, applyPreviewSessionRefresh, postYoutubePreviewCommand]);
 
   const seekPreviewVideo = useCallback((sec: number, force = false) => {
+    const start = previewTrimStartRef.current;
+    const end = previewTrimEndRef.current;
+    const clamped = Math.max(start, Math.min(sec, end));
+    previewSeekTargetRef.current = clamped;
+    const pageUrl = previewLoadedUrlRef.current ?? url.trim();
+    if (previewSeekOptimisticUi(
+      detectUrlPlatform(pageUrl) === 'youtube',
+      previewTrimTimelineRef.current,
+      previewPlaybackKindRef.current,
+    )) {
+      syncPreviewTimeUi(clamped, true);
+    }
     if (force) {
       if (previewSeekDebounceRef.current != null) {
         window.clearTimeout(previewSeekDebounceRef.current);
@@ -735,28 +987,45 @@ export default function App() {
     ) return;
     previewStartedRef.current = true;
     youtubePrefetchGenRef.current += 1;
+    const pagePlatform = detectUrlPlatform(trimmedUrl) ?? 'unknown';
+    const timing = new PreviewTiming(pagePlatform, 'main');
+    previewTimingRef.current = timing;
+    timing.markOpen(trimmedUrl.slice(0, 80));
 
     // Cancel any previously in-flight openPreview
     const gen = ++previewGenRef.current;
+    const bailIfSuperseded = () => {
+      if (gen !== previewGenRef.current) {
+        if (!previewOpenRef.current) setPreviewVideoLoading(false);
+        return true;
+      }
+      return false;
+    };
     let start = trimStartSecRef.current;
     let end = trimEndSecRef.current;
     const clipPreview = isClipUrl(trimmedUrl);
     const youtubePreview = detectUrlPlatform(trimmedUrl) === 'youtube';
     if (youtubePreview && videoInfoDurationSec(videoInfo) <= 0) {
-      try {
-        const info = await apiGet<VideoInfo>(
-          `/api/info/video?id=${encodeURIComponent(trimmedUrl)}`,
-        );
-        if (gen !== previewGenRef.current) return;
-        const dur = videoInfoDurationSec(info);
-        if (dur > 0) {
-          setVideoInfo(info);
-          start = 0;
-          end = dur;
-        }
-      } catch {
-        /* session create will still clamp via backend extract */
-      }
+      void apiGet<VideoInfo>(`/api/info/video?id=${encodeURIComponent(trimmedUrl)}`)
+        .then((info) => {
+          if (gen !== previewGenRef.current) return;
+          const dur = videoInfoDurationSec(info);
+          if (dur > 0) {
+            setVideoInfo(info);
+            setPreviewMetaDurationSec(dur);
+            if (trimEndSecRef.current === 3600) {
+              trimStartSecRef.current = 0;
+              trimEndSecRef.current = dur;
+              previewTrimStartRef.current = 0;
+              previewTrimEndRef.current = dur;
+              setTrimStartSec(0);
+              setTrimEndSec(dur);
+              setPreviewTrimStart(0);
+              setPreviewTrimEnd(dur);
+            }
+          }
+        })
+        .catch(() => {});
     }
     // Preview window follows trim range (full VOD when sliders span entire duration).
     previewTrimStartRef.current = start;
@@ -768,12 +1037,13 @@ export default function App() {
     previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
     setPreviewVolume(PREVIEW_DEFAULT_VOLUME);
     setPreviewMuted(false);
-    previewVideoAspectRef.current = PREVIEW_VIDEO_ASPECT_DEFAULT;
-    setPreviewVideoAspect(PREVIEW_VIDEO_ASPECT_DEFAULT);
+    const initialAspect = clipPreview ? 9 / 16 : PREVIEW_VIDEO_ASPECT_DEFAULT;
+    previewVideoAspectRef.current = initialAspect;
+    setPreviewVideoAspect(initialAspect);
     const clampedPreviewW = clampPreviewPanelWidth(
       previewPanelWidthRef.current,
       previewChromeHRef.current,
-      PREVIEW_VIDEO_ASPECT_DEFAULT,
+      initialAspect,
       {
         previewOpen: true,
         urlPanelAside: true,
@@ -790,6 +1060,9 @@ export default function App() {
     setPreviewVideoReady(false);
     syncPreviewTimeUi(start, true);
     setError(null);
+    // YouTube deliberately uses the app's proxied <video>/HLS pipeline too.
+    // An iframe can display native YouTube overlays regardless of controls=0 and
+    // has unreliable desktop fullscreen, so it must never be the preview surface.
     try {
       const oldSid = previewSessionId;
       destroyPreviewPlayer();
@@ -802,16 +1075,25 @@ export default function App() {
       );
       const previewPreferHeight = initialPreviewPreferHeight(clipPreview, playerCap, {
         youtube: youtubePreview,
+        variantHeights: videoInfo?.qualities
+          ? parseQualityHeights(videoInfo.qualities)
+          : undefined,
       });
       let qualityLabels = videoInfo?.qualities;
-      if (youtubePreview) warmYoutubePreview(trimmedUrl);
-      const res = await apiPost<PreviewSessionResponse>('/api/preview/session', {
+      const prefetched =
+        previewSessionPrefetchRef.current?.url === trimmedUrl
+          ? previewSessionPrefetchRef.current.session
+          : null;
+      if (prefetched) previewSessionPrefetchRef.current = null;
+      const res = prefetched ?? await apiPost<PreviewSessionResponse>('/api/preview/session', {
         url: trimmedUrl,
         crop_start: start,
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
-      if (gen !== previewGenRef.current) return;
+      if (bailIfSuperseded()) return;
+      timing.setSessionId(res.session_id);
+      timing.mark('session_ready', `kind=${res.kind} trim=${res.trim_timeline === true}`);
       previewExtractSourceRef.current = res.extract_source ?? '';
       if (previewExtractSourceRef.current) {
         console.info('[VOD.RIP preview] extract_source=', previewExtractSourceRef.current);
@@ -819,7 +1101,7 @@ export default function App() {
       const clipInfo = clipPreview && !qualityLabels?.length
         ? await apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
         : null;
-      if (gen !== previewGenRef.current) return;
+      if (bailIfSuperseded()) return;
       if (clipInfo?.qualities?.length) {
         qualityLabels = clipInfo.qualities;
       }
@@ -835,6 +1117,9 @@ export default function App() {
       previewSessionIdRef.current = res.session_id;
       setPreviewSessionId(res.session_id);
       previewTrimTimelineRef.current = res.trim_timeline === true;
+      previewWindowHlsMuxStartRef.current = res.window_hls_mux_start ?? 0;
+      previewWindowHlsMuxEndRef.current = res.window_hls_mux_end ?? 0;
+      previewCachedProgressiveRef.current = res.cached_progressive === true;
       const synced = syncDurationFromPreviewSession(res.duration_sec, start, end);
       if (synced) {
         start = synced.start;
@@ -850,19 +1135,8 @@ export default function App() {
         setPreviewMetaDurationSec(synced.duration);
       }
       const playback = resolvePreviewPlayback(url.trim(), res);
-      if (youtubePreview && shouldPollPreviewMuxReady(res, playback.kind, playback.url)) {
-        const pollMaxMs = youtubePreviewMuxPollMaxMs(
-          playback.kind,
-          res.trim_timeline === true,
-        );
-        const muxReady = await waitForPreviewMuxReady(
-          res.session_id,
-          apiGet,
-          { gen, current: previewGenRef.current },
-          pollMaxMs,
-        );
-        if (gen !== previewGenRef.current) return;
-        if (!muxReady) throw new Error('Preview preparation timed out');
+      if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
+        timing.mark('attach_before_segments');
       }
       setPreviewPlayback({
         ...playback,
@@ -878,7 +1152,7 @@ export default function App() {
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
     }
-  }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo?.qualities, videoInfo?.title]);
+  }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo, videoInfo?.qualities, videoInfo?.title]);
 
   // Warm YouTube extract cache while user reads the page (no UI update until Extract Info).
   useEffect(() => {
@@ -896,13 +1170,15 @@ export default function App() {
   // Channel list: warm first YouTube rows + IntersectionObserver on scroll.
   useEffect(() => {
     if (tab !== 'channels' || !selectedChannelId || !youtubeEnabled) return;
+    // ponytail: defer batch warm while user is on a Twitch URL — frees INFO_EXECUTOR for Twitch info/preview.
+    if (detectUrlPlatform(url.trim()) === 'twitch') return;
     const root = channelsScrollRef.current;
     if (!root) return;
 
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube')
       .map((v) => buildVodUrl(v));
-    warmYoutubePreviewBatch(youtubeUrls, 6, 90);
+    warmYoutubePreviewBatch(youtubeUrls, 3, 120);
 
     let cleanup: (() => void) | undefined;
     const raf = requestAnimationFrame(() => {
@@ -913,7 +1189,7 @@ export default function App() {
       cancelAnimationFrame(raf);
       cleanup?.();
     };
-  }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos]);
+  }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -930,9 +1206,11 @@ export default function App() {
         requestAnimationFrame(setup);
         return;
       }
-      detachBuffering = attachPreviewBufferingListeners(video, (stalling) => {
+      const bufferingHandle = attachPreviewBufferingListeners(video, (stalling) => {
         if (!cancelled) setPreviewBuffering(stalling);
       });
+      previewBufferingClearRef.current = bufferingHandle.clearStall;
+      detachBuffering = bufferingHandle.detach;
       const { url: playbackUrl, kind: playbackKind } = previewPlayback;
 
     setPreviewVideoLoading(true);
@@ -945,11 +1223,19 @@ export default function App() {
       const start = previewTrimStartRef.current;
       const end = previewTrimEndRef.current;
       const clipRel = previewClipRelativeRef.current;
-      const target = clipRel ? 0 : start;
+      const dashSegTimeline = previewTrimTimelineRef.current;
+      let target = clipRel ? 0 : start;
+      if (dashSegTimeline) {
+        target = windowHlsVideoTimeSec(start, previewWindowHlsMuxStartRef.current);
+      }
       if (Number.isFinite(target) && Math.abs(video.currentTime - target) > 0.25) {
         video.currentTime = target;
       }
-      const vodT = clipRel ? start + video.currentTime : Math.max(start, Math.min(video.currentTime, end));
+      const vodT = dashSegTimeline
+        ? previewWindowHlsMuxStartRef.current + video.currentTime
+        : clipRel
+          ? start + video.currentTime
+          : Math.max(start, Math.min(video.currentTime, end));
       syncPreviewTimeUi(vodT, true);
     };
 
@@ -957,6 +1243,7 @@ export default function App() {
       setPreviewVideoReady(true);
       setPreviewBuffering(false);
       setPreviewVideoLoading(false);
+      previewTimingRef.current?.mark('canplay');
       video.volume = PREVIEW_DEFAULT_VOLUME;
       previewVolumeRef.current = PREVIEW_DEFAULT_VOLUME;
       setPreviewVolume(PREVIEW_DEFAULT_VOLUME);
@@ -971,6 +1258,9 @@ export default function App() {
           void video.play().catch(() => {});
         });
       }
+      if (video.readyState >= 3 && !video.paused && video.currentTime > 0.02) {
+        previewTimingRef.current?.markFirstPlayable('canplay_already_playing');
+      }
     };
 
     const clearStallUi = () => {
@@ -979,6 +1269,10 @@ export default function App() {
       setPreviewBuffering(false);
     };
     video.addEventListener('playing', clearStallUi);
+    const onFirstPlaying = () => {
+      previewTimingRef.current?.markFirstPlayable();
+    };
+    video.addEventListener('playing', onFirstPlaying, { once: true });
 
     if (playbackKind === 'progressive' || isClipPreviewUrl(previewPageUrl)) {
       const meta = previewSessionMetaRef.current;
@@ -1045,12 +1339,18 @@ export default function App() {
         getSessionId: () => previewSessionIdRef.current,
         youtube: youtubePreview,
         extractSource: previewExtractSourceRef.current,
-        getResumeSec: () => video.currentTime,
+        getResumeSec: () => previewSeekTargetRef.current ?? video.currentTime,
         apiPost,
         onRefreshing: () => setPreviewBuffering(true),
         onFatal: () => {
           setError('Preview interrupted — try again');
           setPreviewVideoLoading(false);
+        },
+        onSessionRefresh: (res) => {
+          previewPendingSeekSecRef.current = previewSeekTargetRef.current ?? video.currentTime;
+          const ok = applyPreviewSessionRefresh(res as PreviewSessionResponse);
+          if (ok) setPreviewBuffering(false);
+          return ok;
         },
       });
       video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
@@ -1072,15 +1372,19 @@ export default function App() {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
-        backBufferLength: 30,
-        maxBufferLength: dashSegTimeline ? 60 : 20,
-        maxMaxBufferLength: dashSegTimeline ? 180 : 40,
+        backBufferLength: 12,
+        // Play-first: start playback once ~6 s are buffered instead of waiting
+        // for 20 s. Window-HLS keeps a larger buffer because the chunk is muxed.
+        maxBufferLength: dashSegTimeline ? 60 : 6,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 12,
         startFragPrefetch: true,
         capLevelToPlayerSize: !youtubePreview,
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
-        startPosition: dashSegTimeline ? 0 : previewTrimStartRef.current,
+        startPosition: dashSegTimeline
+          ? 0
+          : (previewPendingSeekSecRef.current ?? previewTrimStartRef.current),
       });
       previewHlsRef.current = hls;
       setHlsRef(hls);
@@ -1137,14 +1441,18 @@ export default function App() {
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         syncPreviewLevels(data.levels ?? hls.levels, true);
-        if (previewTrimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
-          setPreviewMetaDurationSec(Math.round(video.duration));
+        const pending = previewPendingSeekSecRef.current;
+        if (pending != null && pending > 0 && !previewTrimTimelineRef.current) {
+          previewPendingSeekSecRef.current = null;
+          previewSeekTargetRef.current = null;
+          syncPreviewTimeUi(pending, true);
+          hls.startLoad(pending);
         }
         if (previewTrimTimelineRef.current) {
           const start = previewTrimStartRef.current;
           const end = previewTrimEndRef.current;
           previewClipRelativeRef.current = isClipRelativePreviewDuration(
-            video.duration,
+            vodDurationSecRef.current,
             vodDurationSecRef.current,
             end - start,
           );
@@ -1235,16 +1543,90 @@ export default function App() {
     setup();
     return () => {
       cancelled = true;
+      previewBufferingClearRef.current = null;
       detachBuffering?.();
       cleanup?.();
     };
   }, [previewOpen, previewPlayback, previewSessionId]);
 
-  const handlePreviewTimeUpdate = useCallback(() => {
+  useEffect(() => {
+    if (!previewYoutubeEmbedUrl) return;
+    const onMessage = (event: MessageEvent) => {
+      // YouTube's IFrame API delivers `infoDelivery` events with `currentTime`
+      // via postMessage. The safe way to filter them is by comparing
+      // `event.source` against the iframe's contentWindow — checking origin
+      // alone is unreliable because YouTube occasionally proxies through
+      // related origins.
+      const iframe = previewYoutubeIframeRef.current;
+      if (!iframe || event.source !== iframe.contentWindow) {
+        // Fall back: also accept messages whose origin is the embed origin.
+        if (event.origin !== 'https://www.youtube.com') return;
+      }
+      let data: any;
+      try { data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data; } catch { return; }
+      if (!data || data.event !== 'infoDelivery') return;
+      const state = Number(data?.info?.playerState);
+      if (state === 1) setPreviewPlaying(true);
+      else if (state === 2 || state === 0) setPreviewPlaying(false);
+      const t = Number(data?.info?.currentTime);
+      if (!Number.isFinite(t)) return;
+      const target = previewSeekTargetRef.current;
+      if (target != null) {
+        if (Math.abs(t - target) > 1.5) return;
+        previewSeekTargetRef.current = null;
+      }
+      const start = previewTrimStartRef.current;
+      const end = previewTrimEndRef.current;
+      if (t < start - 0.5) {
+        postYoutubePreviewCommand('seekTo', [start, true]);
+        syncPreviewTimeUi(start, true);
+        return;
+      }
+      if (t >= end - 0.05) {
+        postYoutubePreviewCommand('pauseVideo');
+        syncPreviewTimeUi(end, true);
+        setPreviewPlaying(false);
+      } else {
+        syncPreviewTimeUi(Math.max(start, t));
+      }
+    };
+    youtubeIframeListen(previewYoutubeIframeRef.current);
+    const poll = window.setInterval(() => {
+      youtubeIframeListen(previewYoutubeIframeRef.current);
+      postYoutubePreviewCommand('getCurrentTime');
+      postYoutubePreviewCommand('getPlayerState');
+    }, 250);
+    window.addEventListener('message', onMessage);
+    return () => {
+      window.clearInterval(poll);
+      window.removeEventListener('message', onMessage);
+    };
+  }, [previewYoutubeEmbedUrl, postYoutubePreviewCommand, syncPreviewTimeUi]);
+
+    const handlePreviewTimeUpdate = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video) return;
+    // During an out-of-chunk remux the HLS loader briefly reports positions
+    // near the new chunk's mux start while we wait for FRAG_BUFFERED to land
+    // the explicit seek. Ignore those reports so the slider doesn't bounce.
+    if (previewSeekLockedRef.current) return;
+    // While a user seek is in flight (optimistic UI already shows the target),
+    // ignore timeupdate reports at the old position. Otherwise the controlled
+    // slider snaps back before the debounced seek fires on the first drag.
+    if (previewSeekTargetRef.current != null) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
+    if (previewTrimTimelineRef.current) {
+      const vodTime = previewWindowHlsMuxStartRef.current + video.currentTime;
+      if (vodTime > end - 0.05) {
+        video.pause();
+        syncPreviewTimeUi(end, true);
+        setPreviewPlaying(false);
+        return;
+      }
+      syncPreviewTimeUi(Math.max(start, vodTime));
+      return;
+    }
     const clipRel = previewClipRelativeRef.current;
     const { paused, vodTime } = clampPreviewTimeToVodTrim(video, start, end, clipRel);
     syncPreviewTimeUi(vodTime);
@@ -1255,6 +1637,25 @@ export default function App() {
   }, [syncPreviewTimeUi]);
 
   const togglePreviewPlay = useCallback(() => {
+    if (previewYoutubeEmbedUrl) {
+      if (!previewVideoReady) return;
+      const start = previewTrimStartRef.current;
+      const outOfTrim = previewTimeUiRef.current >= previewTrimEndRef.current - 0.1 || previewTimeUiRef.current < start - 0.1;
+      if (!previewPlaying) {
+        if (outOfTrim) {
+          postYoutubePreviewCommand('seekTo', [start, true]);
+          syncPreviewTimeUi(start, true);
+        }
+        postYoutubePreviewCommand('setVolume', [Math.round(previewVolumeRef.current * 100)]);
+        postYoutubePreviewCommand(previewMuted ? 'mute' : 'unMute');
+        postYoutubePreviewCommand('playVideo');
+        setPreviewPlaying(true);
+      } else {
+        postYoutubePreviewCommand('pauseVideo');
+        setPreviewPlaying(false);
+      }
+      return;
+    }
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
     if (video.paused) {
@@ -1277,18 +1678,24 @@ export default function App() {
       video.pause();
       setPreviewPlaying(false);
     }
-  }, [previewVideoReady, syncPreviewTimeUi]);
+  }, [previewYoutubeEmbedUrl, previewVideoReady, previewPlaying, postYoutubePreviewCommand, syncPreviewTimeUi]);
 ;
 
 
   const skipPreview = useCallback((deltaSec: number) => {
+    if (!previewVideoReady) return;
     const video = previewVideoRef.current;
-    if (!video || !previewVideoReady) return;
+    if (!video && !previewYoutubeEmbedUrl) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
-    const t = Math.max(start, Math.min(end, video.currentTime + deltaSec));
+    const base = previewYoutubeEmbedUrl
+      ? previewTimeUiRef.current
+      : (previewTrimTimelineRef.current
+        ? previewTimeUiRef.current
+        : video!.currentTime);
+    const t = Math.max(start, Math.min(end, base + deltaSec));
     seekPreviewVideo(t, true);
-  }, [previewVideoReady, seekPreviewVideo]);
+  }, [previewVideoReady, previewYoutubeEmbedUrl, seekPreviewVideo]);
 
   const seekPreviewPercent = useCallback((fraction: number) => {
     const start = previewTrimStartRef.current;
@@ -1328,10 +1735,19 @@ export default function App() {
   }, [vodDurationSec]);
 
   const clampPreviewPlaybackToTrim = useCallback(() => {
-    const video = previewVideoRef.current;
-    if (!video || !previewVideoReady) return;
+    if (!previewVideoReady) return;
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
+    if (previewYoutubeEmbedUrl) {
+      const t = Math.max(start, Math.min(previewTimeUiRef.current, end));
+      if (Math.abs(previewTimeUiRef.current - t) > 0.05) {
+        postYoutubePreviewCommand('seekTo', [t, true]);
+        syncPreviewTimeUi(t, true);
+      }
+      return;
+    }
+    const video = previewVideoRef.current;
+    if (!video) return;
     let t = video.currentTime;
     if (t < start) t = start;
     else if (t > end) t = end;
@@ -1339,7 +1755,7 @@ export default function App() {
       video.currentTime = t;
       syncPreviewTimeUi(t, true);
     }
-  }, [previewVideoReady, syncPreviewTimeUi]);
+  }, [previewVideoReady, previewYoutubeEmbedUrl, postYoutubePreviewCommand, syncPreviewTimeUi]);
 
   const commitPreviewTrimRange = useCallback((
     rawStart: number,
@@ -1548,9 +1964,17 @@ export default function App() {
   }, [commitUrlTrimRange, markUrlTrimEndpoint]);
 
   const setPreviewVolumeLevel = useCallback((level: number) => {
+    const v = Math.max(0, Math.min(1, level));
+    if (previewYoutubeEmbedUrl) {
+      postYoutubePreviewCommand('setVolume', [Math.round(v * 100)]);
+      previewVolumeRef.current = v;
+      setPreviewVolume(v);
+      postYoutubePreviewCommand(v <= 0 ? 'mute' : 'unMute');
+      setPreviewMuted(v <= 0);
+      return;
+    }
     const video = previewVideoRef.current;
     if (!video) return;
-    const v = Math.max(0, Math.min(1, level));
     video.volume = v;
     previewVolumeRef.current = v;
     setPreviewVolume(v);
@@ -1561,7 +1985,7 @@ export default function App() {
       video.muted = false;
       setPreviewMuted(false);
     }
-  }, []);
+  }, [previewYoutubeEmbedUrl, postYoutubePreviewCommand]);
 
   const bumpPreviewFsControls = useCallback(() => {
     setPreviewFsControlsVisible(true);
@@ -1655,6 +2079,8 @@ export default function App() {
 
   useEffect(() => {
     const onFullscreenChange = () => {
+      // Always derive state from the browser. The old YouTube-only "fake"
+      // fullscreen left the controls locked after Escape.
       const fs = document.fullscreenElement === previewContainerRef.current;
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
@@ -1664,7 +2090,7 @@ export default function App() {
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, [syncPreviewPlaybackToViewport]);
+  }, [syncPreviewPlaybackToViewport, previewYoutubeEmbedUrl]);
 
   useEffect(() => {
     if (!previewOpen || !previewVideoReady || previewFullscreen) return;
@@ -1751,7 +2177,10 @@ export default function App() {
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
     pauseAllExplorePopups();
     const vodUrl = buildVodUrl(v);
-    if (v.platform === 'youtube') warmYoutubePreview(vodUrl);
+    if (v.platform === 'youtube') {
+      warmYoutubePreview(vodUrl);
+      warmYoutubePreviewFull(vodUrl, 500, 720);
+    }
     const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips' || isLikelyClip(v);
     const vod: ExplorePopupVod = {
       url: buildVodUrl(v),
@@ -1760,6 +2189,7 @@ export default function App() {
       durationSec: channelVideoDurationSec(v) ?? 0,
       platformListIndex: v.platformListIndex,
       isClip: isClipItem,
+      thumbnailUrl: resolveVideoThumbnail(v.thumbnail_url ?? null, 640, 360),
     };
     const id = crypto.randomUUID();
     assignExplorePopupZ(id);
@@ -1796,9 +2226,6 @@ export default function App() {
   const handlePreviewLoadedMetadata = useCallback(() => {
     const video = previewVideoRef.current;
     if (!video?.videoWidth || !video?.videoHeight) return;
-    if (previewTrimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
-      setPreviewMetaDurationSec(Math.round(video.duration));
-    }
     const aspect = video.videoWidth / video.videoHeight;
     previewVideoAspectRef.current = aspect;
     setPreviewVideoAspect(aspect);
@@ -1977,12 +2404,83 @@ export default function App() {
 
   // ── Fetch video info ──
 
-  const fetchVideoInfo = useCallback(async (videoUrl: string) => {
+  type FetchVideoInfoHint = {
+    durationSec?: number;
+    title?: string;
+    thumbnailUrl?: string | null;
+    /** Skip the /api/info/video round-trip when the caller already has enough metadata
+     *  (e.g. from the channel list). The VOD · Trim panel renders immediately from the
+     *  hint; explicit Extract Info can still refresh later. */
+    skipNetwork?: boolean;
+  };
+
+  const applyVideoInfoTrim = useCallback((trimmed: string, end: number) => {
+    trimStartSecRef.current = 0;
+    trimEndSecRef.current = end;
+    setTrimStartSec(0);
+    setTrimEndSec(end);
+    previewTrimStartRef.current = 0;
+    previewTrimEndRef.current = end;
+    setPreviewTrimStart(0);
+    setPreviewTrimEnd(end);
+    setVideoInfoUrl(trimmed);
+  }, []);
+
+  const fetchVideoInfo = useCallback(async (videoUrl: string, hint?: FetchVideoInfoHint) => {
     const trimmed = videoUrl.trim();
     if (!trimmed) return;
+    const gen = ++fetchVideoInfoGenRef.current;
+    if (previewSessionPrefetchRef.current?.url !== trimmed) {
+      previewSessionPrefetchRef.current = null;
+    }
     setLoading(true);
     setError(null);
     setPendingAddChannel(null);
+
+    // ponytail: cache hit — user has pasted/typed this URL before. Apply it
+    // immediately so the UI populates while we skip the network call.
+    const cached = videoInfoCacheRef.current.get(trimmed);
+    if (cached && gen === fetchVideoInfoGenRef.current) {
+      setUrl(trimmed);
+      setVideoInfo(cached);
+      setQuality(bestAvailableQuality(cached));
+      const end = Math.max(1, videoInfoDurationSec(cached));
+      if (end > 0) applyVideoInfoTrim(trimmed, end);
+      setLoading(false);
+      return;
+    }
+    const hintDuration = hint?.durationSec;
+    const hintTitle = hint?.title;
+    if (hintDuration && hintDuration > 0 && hintTitle) {
+      const end = Math.max(1, Math.floor(hintDuration));
+      applyVideoInfoTrim(trimmed, end);
+      const platform = detectUrlPlatform(trimmed);
+      const synthetic: VideoInfo = {
+        id: trimmed,
+        title: hintTitle,
+        duration: end,
+        duration_string: fmtDuration(end),
+        uploader: null,
+        thumbnail: hint.thumbnailUrl || findCachedVideoThumbnail(trimmed, savedChannels),
+        webpage_url: trimmed,
+        extractor: platform,
+        is_live: null,
+        qualities: ['source'],
+        platform: platform === 'youtube' ? 'YouTube' : platform === 'twitch' ? 'Twitch' : platform === 'kick' ? 'Kick' : null,
+      };
+      setUrl(trimmed);
+      setVideoInfo(synthetic);
+      setQuality(bestAvailableQuality(synthetic));
+      if (hint.skipNetwork) {
+        if (!previewOpen) {
+          void resetPreview();
+        }
+        setLoading(false);
+        return;
+      }
+    } else if (trimmed !== videoInfoUrl) {
+      setVideoInfoUrl(null);
+    }
     const infoPath = isClipUrl(trimmed) ? '/api/info/clip' : '/api/info/video';
     const encoded = encodeURIComponent(trimmed);
     let lastErr: Error | null = null;
@@ -1990,7 +2488,15 @@ export default function App() {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const info = await apiGet<VideoInfo>(`${infoPath}?id=${encoded}`);
+          if (gen !== fetchVideoInfoGenRef.current) return;
           setUrl(trimmed);
+          // ponytail: store in cache so re-pasting the same URL is instant.
+          const cache = videoInfoCacheRef.current;
+          cache.set(trimmed, info);
+          if (cache.size > 32) {
+            const firstKey = cache.keys().next().value;
+            if (firstKey !== undefined) cache.delete(firstKey);
+          }
           setVideoInfo(info);
           setQuality(bestAvailableQuality(info));
           const end = Math.max(1, videoInfoDurationSec(info));
@@ -1998,14 +2504,7 @@ export default function App() {
             setError('Could not determine video length');
             return;
           }
-          trimStartSecRef.current = 0;
-          trimEndSecRef.current = end;
-          setTrimStartSec(0);
-          setTrimEndSec(end);
-          previewTrimStartRef.current = 0;
-          previewTrimEndRef.current = end;
-          setPreviewTrimStart(0);
-          setPreviewTrimEnd(end);
+          applyVideoInfoTrim(trimmed, end);
           if (!previewOpen) {
             void resetPreview();
           }
@@ -2043,7 +2542,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [previewOpen, resetPreview, savedChannels]);
+  }, [previewOpen, resetPreview, savedChannels, applyVideoInfoTrim, videoInfoUrl]);
 
   const handleGetInfo = useCallback(() => {
     previewStartedRef.current = false;
@@ -3347,12 +3846,16 @@ export default function App() {
   ]);
 
   // ── Fill VOD from channel ──
-  const selectVod = useCallback((vodUrl: string, badge?: ChannelPreviewBadge) => {
+  const selectVod = useCallback((
+    vodUrl: string,
+    badge?: ChannelPreviewBadge,
+    hint?: FetchVideoInfoHint,
+  ) => {
     setUrl(vodUrl);
     setChannelVodPanelOpen(true);
     setUrlTabBarHidden(true);
     setPreviewChannelBadge(badge ?? null);
-    void fetchVideoInfo(vodUrl);
+    void fetchVideoInfo(vodUrl, hint);
   }, [fetchVideoInfo]);
 
   const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
@@ -3360,6 +3863,11 @@ export default function App() {
       platform: vod.platform,
       platformListIndex: vod.platformListIndex,
       isClip: vod.isClip,
+    }, {
+      durationSec: vod.durationSec > 0 ? vod.durationSec : undefined,
+      title: vod.title,
+      thumbnailUrl: vod.thumbnailUrl ?? undefined,
+      skipNetwork: true,
     });
   }, [selectVod]);
 
@@ -3435,6 +3943,13 @@ export default function App() {
     return resolveVideoThumbnail(cached, 48, 36);
   }, [videoInfo?.thumbnail, url, savedChannels]);
 
+  const previewPosterSrc = useMemo(() => {
+    const fromInfo = resolveVideoThumbnail(videoInfo?.thumbnail, 640, 360);
+    if (fromInfo) return fromInfo;
+    const cached = findCachedVideoThumbnail(url, savedChannels);
+    return resolveVideoThumbnail(cached, 640, 360);
+  }, [videoInfo?.thumbnail, url, savedChannels]);
+
   useEffect(() => {
     setVideoInfoThumbFailed(false);
   }, [videoInfoThumbSrc]);
@@ -3454,8 +3969,18 @@ export default function App() {
               setUrl(v);
               setPreviewChannelBadge(null);
               const trimmed = v.trim();
-              if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed)) {
-                warmYoutubePreview(trimmed);
+              // ponytail: debounce warm calls so a paste/typing doesn't fire on every keystroke.
+              if (urlWarmTimerRef.current != null) {
+                window.clearTimeout(urlWarmTimerRef.current);
+                urlWarmTimerRef.current = null;
+              }
+              if (detectUrlPlatform(trimmed) === 'youtube' && !isClipUrl(trimmed) && trimmed.length >= 12) {
+                urlWarmTimerRef.current = window.setTimeout(() => {
+                  urlWarmTimerRef.current = null;
+                  warmYoutubePreview(trimmed);
+                  // ponytail: also queue a full-VOD mux so first preview open is instant.
+                  warmYoutubePreviewFull(trimmed, 1500, 720);
+                }, 300);
               }
             }}
             placeholder={urlFetched ? 'VOD or clip link' : 'PASTE VOD OR CLIP LINK...'}
@@ -3716,7 +4241,13 @@ export default function App() {
           }
         }}
         onClick={openPreview}
-        disabled={previewVideoLoading || vodDurationSec <= 0 || trimEndSec <= trimStartSec}
+        disabled={
+          previewVideoLoading
+          || loading
+          || vodDurationSec <= 0
+          || trimEndSec <= trimStartSec
+          || (url.trim() !== '' && videoInfoUrl !== url.trim())
+        }
         className={`flex-1 min-h-0 ${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
       >
         {previewVideoLoading ? (
@@ -4074,37 +4605,55 @@ export default function App() {
               style={!previewFullscreen ? { aspectRatio: previewVideoAspect } : undefined}
             >
               <div
-                className={`relative bg-black overflow-hidden cursor-pointer ${
-                  'absolute inset-0 z-0'
-                }`}
-
+                className="relative bg-black overflow-hidden cursor-pointer absolute inset-0 z-0"
                 onClick={() => {
                   focusPreviewPlayer();
                   togglePreviewPlay();
                 }}
               >
-                <video
-                  ref={previewVideoRef}
-                  className="w-full h-full object-contain pointer-events-none"
-                  muted={previewMuted}
-                  playsInline
-                  onLoadedMetadata={handlePreviewLoadedMetadata}
-                  onTimeUpdate={handlePreviewTimeUpdate}
-                  onPlay={() => {
-                    if (previewSuppressPlayRef.current) {
-                      previewVideoRef.current?.pause();
-                      return;
-                    }
-                    setPreviewPlaying(true);
-                  }}
-                  onPause={() => setPreviewPlaying(false)}
-                />
+                {previewYoutubeEmbedUrl ? (
+                  <>
+                    <iframe
+                      ref={previewYoutubeIframeRef}
+                      className="youtube-embed-frame pointer-events-none"
+                      src={previewYoutubeEmbedUrl}
+                      title="YouTube trim preview"
+                      allow="autoplay; encrypted-media; picture-in-picture"
+                      tabIndex={-1}
+                      onLoad={() => {
+                        setPreviewVideoReady(true);
+                        setPreviewVideoLoading(false);
+                        youtubeIframeListen(previewYoutubeIframeRef.current);
+                        postYoutubePreviewCommand('setVolume', [Math.round(previewVolumeRef.current * 100)]);
+                      }}
+                    />
+                    <div className="absolute inset-0 z-[1]" aria-hidden="true" />
+                  </>
+                ) : (
+                  <video
+                    ref={previewVideoRef}
+                    className="w-full h-full object-contain pointer-events-none"
+                    muted={previewMuted}
+                    playsInline
+                    poster={previewPosterSrc || videoInfoThumbSrc || undefined}
+                    onLoadedMetadata={handlePreviewLoadedMetadata}
+                    onTimeUpdate={handlePreviewTimeUpdate}
+                    onPlay={() => {
+                      if (previewSuppressPlayRef.current) {
+                        previewVideoRef.current?.pause();
+                        return;
+                      }
+                      setPreviewPlaying(true);
+                    }}
+                    onPause={() => setPreviewPlaying(false)}
+                  />
+                )}
                 {previewVideoLoading && !previewVideoReady && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20 pointer-events-none">
                     <Loader2 size={40} className="animate-spin text-zinc-300" />
                     {!previewPlayback && (
                       <span className="text-zinc-300 text-xs font-mono">
-                        {urlPlatform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
+                        {urlPlatform === 'youtube' ? 'Starting YouTube preview…' : 'Preparing preview…'}
                       </span>
                     )}
                   </div>
@@ -4580,9 +5129,25 @@ export default function App() {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,
                                   isClip: isClipItem,
+                                }, {
+                                  durationSec: durSec ?? undefined,
+                                  title: v.title || undefined,
+                                  thumbnailUrl: v.thumbnail_url ?? undefined,
+                                  skipNetwork: true,
                                 })}
                                 onMouseEnter={() => {
-                                  if (v.platform === 'youtube') warmYoutubePreview(fullUrl);
+                                  if (v.platform === 'youtube') {
+                                    warmYoutubePreview(fullUrl);
+                                    // ponytail: longer-delay full-VOD mux on hover.
+                                    // Fires after ~1s of mouse rest so it only runs
+                                    // when the user is genuinely browsing rather than
+                                    // sweeping the list. Cache hit makes the next
+                                    // click ~instant from local MP4.
+                                    warmYoutubePreviewFull(fullUrl, 1000, 720);
+                                  }
+                                }}
+                                onMouseLeave={() => {
+                                  if (v.platform === 'youtube') cancelWarmYoutubePreviewFull(fullUrl);
                                 }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Enter' || e.key === ' ') {
@@ -4591,6 +5156,11 @@ export default function App() {
                                       platform: v.platform,
                                       platformListIndex: v.platformListIndex,
                                       isClip: isClipItem,
+                                    }, {
+                                      durationSec: durSec ?? undefined,
+                                      title: v.title || undefined,
+                                      thumbnailUrl: v.thumbnail_url ?? undefined,
+                                      skipNetwork: true,
                                     });
                                   }
                                 }}
@@ -4639,7 +5209,10 @@ export default function App() {
                                   type="button"
                                   title={isClipItem ? 'Preview clip' : 'Preview VOD'}
                                   onMouseEnter={() => {
-                                    if (v.platform === 'youtube') warmYoutubePreview(fullUrl);
+                                    if (v.platform === 'youtube') {
+                                      warmYoutubePreview(fullUrl);
+                                      warmYoutubePreviewFull(fullUrl, 1000, 720);
+                                    }
                                   }}
                                   onClick={(e) => {
                                     e.stopPropagation();

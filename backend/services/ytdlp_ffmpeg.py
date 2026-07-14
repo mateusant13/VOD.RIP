@@ -81,7 +81,19 @@ assert _fp.killed
 
 
 def _find_js_runtime(name: str) -> Optional[str]:
-    """PATH first, then common Windows install dirs (npm/deno installers skip PATH)."""
+    """PATH first, then common Windows install dirs (npm/deno installers skip PATH).
+
+    Under a frozen install (``vod-rip.spec``), the bundled Node runtime
+    lives at ``<exe-dir>/runtime/node.exe``. We check that first so
+    yt-dlp always uses the same private runtime the bgutil POT server
+    spawns from — keeping the JS engine version pinned across the whole
+    app instead of silently falling through to whatever the user
+    happens to have on PATH.
+    """
+    if name == "node" and getattr(sys, "frozen", False):
+        bundled = _bundled_node_exe()
+        if bundled is not None:
+            return bundled
     found = shutil.which(name)
     if found:
         return found
@@ -105,6 +117,21 @@ def _find_js_runtime(name: str) -> Optional[str]:
         if path.is_file():
             return str(path)
     return None
+
+
+def _bundled_node_exe() -> Optional[str]:
+    """Path to the frozen installer's bundled ``node.exe``, or None.
+
+    Mirrors ``youtube_pot_service._frozen_runtime_paths``: looks at
+    ``<exe-dir>/runtime/node.exe`` where vod-rip.spec drops the private
+    Node 20 runtime produced by ``scripts/download-node.ps1``.
+    Returned as a string so the caller can hand it straight to yt-dlp
+    via ``js_runtimes``.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    candidate = Path(sys.executable).resolve().parent / "runtime" / "node.exe"
+    return str(candidate) if candidate.is_file() else None
 
 
 def _ytdlp_engine_opts() -> dict:

@@ -5,6 +5,7 @@ Download routes — start, cancel, pause, resume, SSE streaming.
 import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from models.schemas import DownloadRequest
 
 from deps import download_mgr, settings_mgr, INFO_EXECUTOR
+from services.size_estimate import estimate_bytes_for_selection
 from services.url_validation import is_sensible_vod_url
 from services.ytdlp_service import detect_platform
 from utils import (
@@ -25,7 +27,6 @@ from utils import (
     remove_download_history,
     require_hls_crop,
     safe_makedirs,
-    trim_estimated_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ async def _resolve_queue_meta(req: DownloadRequest, platform: str) -> dict:
         logger.debug("Queue meta fetch timed out for %s", req.url[:80])
         return {}
 
-MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = int(os.environ.get("VODRIP_MAX_DOWNLOAD_BYTES", "1073741824"))
 
 
 # Ponytail: validate URL is a supported Kick/Twitch URL before starting download
@@ -97,6 +98,27 @@ def _cap_estimated_bytes(
     return (
         capped, crop_start, new_crop_end,
         f"Download capped at 1 GB (was {gb:.1f} GB). Trim adjusted to {new_clip_sec:.0f}s.",
+    )
+
+
+def _estimate_raw_bytes(
+    meta: dict,
+    quality: str | None,
+    audio_only: bool,
+) -> int | None:
+    """Full-length byte estimate for the requested quality / audio-only mode."""
+    sizes = meta.get("size_by_quality") or {}
+    full_dur = meta.get("duration") or 0.0
+    if not sizes or full_dur <= 0:
+        return meta.get("estimated_bytes")
+    q = (quality or "source").strip().lower()
+    if audio_only and "audio" in sizes:
+        q = "audio"
+    return estimate_bytes_for_selection(
+        duration_sec=full_dur,
+        quality=q,
+        size_by_quality=sizes,
+        full_duration_sec=full_dur,
     )
 
 
@@ -158,7 +180,7 @@ async def download_video(req: DownloadRequest):
         from services.kick_api_service import download_vod_sync as kick_download_vod
         download_func = kick_download_vod
     # 1GB download cap: auto-adjust trim if estimated size exceeds limit
-    raw_estimated = trim_estimated_bytes(meta, req.crop_start, req.crop_end)
+    raw_estimated = _estimate_raw_bytes(meta, req.quality or opts.quality, req.audio_only)
     capped_bytes, adj_start, adj_end, cap_warning = _cap_estimated_bytes(
         raw_estimated, meta.get("duration"), req.crop_start, req.crop_end,
     )
@@ -201,7 +223,7 @@ async def download_clip(req: DownloadRequest):
     if crop_start is not None and crop_end is not None and crop_end <= crop_start:
         raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
     # 1GB download cap for clips
-    raw_estimated = trim_estimated_bytes(meta, crop_start, crop_end)
+    raw_estimated = _estimate_raw_bytes(meta, req.quality or opts.quality, req.audio_only)
     capped_bytes, adj_start, adj_end, cap_warning = _cap_estimated_bytes(
         raw_estimated, meta.get("duration"), crop_start, crop_end,
     )
@@ -224,7 +246,8 @@ async def download_clip(req: DownloadRequest):
         crop_start=crop_start,
         crop_end=crop_end,
         download_func=download_func,
-        download_type="clip",
+        download_type="audio" if req.audio_only else "clip",
+        audio_only=req.audio_only,
         settings_mgr=settings_mgr,
         title=meta.get("title"),
         channel=meta.get("channel"),

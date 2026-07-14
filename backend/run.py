@@ -7,7 +7,7 @@ import sys
 import os
 import traceback
 
-# ponytail: YTDLP_NO_PLUGINS via ytdlp_env.py — blocks getpot_wpc Chrome spawning
+# ponytail: YTDLP_NO_PLUGINS removed — getpot_wpc blocked in ytdlp_guard; bgutil allowed
 from services import ytdlp_env  # noqa: F401
 from services.ytdlp_guard import assert_ytdlp_safe
 
@@ -31,6 +31,7 @@ def _install_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("VOD.RIP.youtube").setLevel(logging.INFO)
+    logging.getLogger("VOD.RIP.preview_timing").setLevel(logging.INFO)
 
 
 def _install_shutdown_hook() -> None:

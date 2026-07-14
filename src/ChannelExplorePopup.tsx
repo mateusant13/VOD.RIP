@@ -22,22 +22,27 @@ import {
   resolveHlsPreviewLevels,
   isClipPreviewUrl,
   resolvePreviewPlayback,
+  previewSessionRefreshHandoff,
+  previewSeekOptimisticUi,
   resolveProgressivePreviewLevels,
   resolveProgressivePreviewLevelsAsync,
-  warmYoutubePreview,
-  waitForPreviewMuxReady,
-  shouldPollPreviewMuxReady,
-  shouldPollPreviewMuxReady,
-  youtubePreviewMuxPollMaxMs,
+  seekYoutubeWindowHls,
+  windowHlsVideoTimeSec,
+  windowHlsVodTimeSec,
+  isYoutubeWindowHlsPreview,
+  isPositionInWindowHlsMux,
   PREVIEW_SEEK_DEBOUNCE_MS,
   attachPreviewBufferingListeners,
-  previewMuxPollMaxMs,
-  previewPlaylistPollMaxMs,
+  applyVideoLocalSeek,
+  reloadWindowHlsAtPosition,
+  shieldPreviewBuffering,
   playPreviewWithAudio,
   unlockPreviewAudioFromGesture,
   type PreviewLevelOption,
   isValidPreviewUrl,
 } from './previewPlayerUtils';
+import { PreviewTiming, waitVideoPlayable } from './previewTiming';
+import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
@@ -56,6 +61,7 @@ import {
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
 import type { PreviewSessionResponse, VideoInfo } from './types';
+import { resolveVideoThumbnail } from './channelUtils';
 import { videoInfoDurationSec, syncDurationFromPreviewSession } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
@@ -78,6 +84,7 @@ export interface ExplorePopupVod {
   durationSec: number;
   platformListIndex: number;
   isClip: boolean;
+  thumbnailUrl?: string | null;
 }
 
 interface ChannelExplorePopupProps {
@@ -131,6 +138,8 @@ export default function ChannelExplorePopup({
   const [loading, setLoading] = useState(true);
   const [buffering, setBuffering] = useState(false);
   const [ready, setReady] = useState(false);
+  const [youtubeEmbed, setYoutubeEmbed] = useState<string | null>(null);
+  const youtubeIframeRef = useRef<HTMLIFrameElement>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(PREVIEW_DEFAULT_VOLUME);
@@ -139,6 +148,7 @@ export default function ChannelExplorePopup({
   const [currentTime, setCurrentTime] = useState(0);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
   const [sessionDurationSec, setSessionDurationSec] = useState(0);
+  const [windowHlsMuxEndSec, setWindowHlsMuxEndSec] = useState(0);
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [pos, setPos] = useState<PanelPos | null>(null);
@@ -158,6 +168,11 @@ export default function ChannelExplorePopup({
   const extractSourceRef = useRef('');
   const clipRelativeRef = useRef(false);
   const trimTimelineRef = useRef(false);
+  const windowHlsMuxStartRef = useRef(0);
+  const windowHlsMuxEndRef = useRef(0);
+  const seekInflightRef = useRef(0);
+  const seekLockedRef = useRef(false);
+  const bufferingClearRef = useRef<(() => void) | null>(null);
   const sessionMetaRef = useRef<{
     variantHeights: number[];
     qualityLabels?: string[];
@@ -172,8 +187,37 @@ export default function ChannelExplorePopup({
   const videoWrapRef = useRef<HTMLDivElement>(null);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const seekDebounceRef = useRef<number | null>(null);
+  const playbackKindRef = useRef<'hls' | 'progressive'>('progressive');
+  const pendingSeekSecRef = useRef<number | null>(null);
+  const seekTargetRef = useRef<number | null>(null);
+  const cachedProgressiveRef = useRef(false);
+  const previewTimingRef = useRef<PreviewTiming | null>(null);
   const suppressPlayRef = useRef(false);
   const platform = explorePlatformKey(vod.platform);
+  useEffect(() => {
+    playbackKindRef.current = playback?.kind ?? 'progressive';
+  }, [playback?.kind]);
+
+  const sessionHandoffRefs = {
+    trimTimelineRef,
+    windowHlsMuxStartRef,
+    windowHlsMuxEndRef,
+    extractSourceRef,
+    pendingSeekSecRef,
+    cachedProgressiveRef,
+    sessionMetaRef,
+  };
+
+  const applySessionRefresh = useCallback((res: PreviewSessionResponse) => (
+    previewSessionRefreshHandoff(
+      vod.url,
+      res,
+      sessionHandoffRefs,
+      setPlayback,
+      () => videoRef.current?.currentTime ?? 0,
+    )
+  ), [vod.url]);
+
   const {
     previewLevels,
     qualityLevel,
@@ -194,6 +238,10 @@ export default function ChannelExplorePopup({
     onPreviewError: (msg) => setError(msg),
   });
 
+
+  const postYoutubeCommand = useCallback((func: string, args: unknown[] = []) => {
+    youtubeIframeCommand(youtubeIframeRef.current, func, args);
+  }, []);
 
   useEffect(() => {
     const pause = () => {
@@ -217,19 +265,31 @@ export default function ChannelExplorePopup({
     let cancelled = false;
     initialPlayDoneRef.current = false;
     setPlayback(null);
+    setYoutubeEmbed(null);
     setLoading(true);
     setBuffering(false);
     setReady(false);
     setError(null);
     setMediaDurationSec(0);
     setSessionDurationSec(0);
+    setWindowHlsMuxEndSec(0);
+    if (vod.durationSec > 0) {
+      setSessionDurationSec(Math.floor(vod.durationSec));
+      setMediaDurationSec(vod.durationSec);
+    }
     trimTimelineRef.current = false;
     setPreviewLevels([]);
     setQualityLevel(0);
     setQualityMenuOpen(false);
     requestedHeightRef.current = 0;
     appliedHeightRef.current = 0;
+    const timing = new PreviewTiming(platform ?? 'unknown', 'explore');
+    previewTimingRef.current = timing;
+    timing.markOpen(vod.url.slice(0, 80));
 
+    // Never embed youtube.com: controls=0 cannot suppress every native overlay.
+    // Use the same proxied media pipeline as every other platform so only the
+    // application's controls receive pointer/keyboard input.
     (async () => {
       try {
         const playerCap = measurePlayerHeightCap(videoWrapRef.current, videoAspectRef.current);
@@ -241,7 +301,6 @@ export default function ChannelExplorePopup({
             `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
           ).catch(() => null)
           : Promise.resolve(null);
-        if (platform === 'youtube') warmYoutubePreview(vod.url);
         let cropEnd = vod.durationSec;
         if (cropEnd <= 0) {
           const infoPath = vod.isClip ? '/api/info/clip' : '/api/info/video';
@@ -270,24 +329,11 @@ export default function ChannelExplorePopup({
           setSessionDurationSec(Math.floor(res.duration_sec));
         }
         trimTimelineRef.current = res.trim_timeline === true;
+        windowHlsMuxStartRef.current = res.window_hls_mux_start ?? 0;
+        windowHlsMuxEndRef.current = res.window_hls_mux_end ?? 0;
+        cachedProgressiveRef.current = res.cached_progressive === true;
+        setWindowHlsMuxEndSec(res.window_hls_mux_end ?? 0);
         const resolved = resolvePreviewPlayback(vod.url, res);
-        if (platform === 'youtube' && shouldPollPreviewMuxReady(res, resolved.kind, resolved.url)) {
-          const pollMaxMs = youtubePreviewMuxPollMaxMs(
-            resolved.kind,
-            res.trim_timeline === true,
-          );
-          const muxReady = await waitForPreviewMuxReady(
-            res.session_id,
-            apiGet,
-            undefined,
-            pollMaxMs,
-          );
-          if (cancelled) {
-            try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
-            return;
-          }
-          if (!muxReady) throw new Error('Preview preparation timed out');
-        }
         const mergedQualityLabels = clipInfo?.qualities?.length
           ? clipInfo.qualities
           : (res.quality_labels?.length ? res.quality_labels : undefined);
@@ -298,6 +344,8 @@ export default function ChannelExplorePopup({
           activeHeight,
         };
         sessionIdRef.current = res.session_id;
+        timing.setSessionId(res.session_id);
+        timing.mark('session_ready', `kind=${res.kind} trim=${res.trim_timeline === true}`);
         extractSourceRef.current = res.extract_source ?? '';
         if (extractSourceRef.current) {
           console.info('[VOD.RIP preview] extract_source=', extractSourceRef.current);
@@ -318,6 +366,12 @@ export default function ChannelExplorePopup({
 
     return () => {
       cancelled = true;
+      // Invalidate any in-flight seek so its async callbacks become no-ops.
+      seekInflightRef.current += 1;
+      seekTargetRef.current = null;
+      seekLockedRef.current = false;
+      pendingSeekSecRef.current = null;
+      bufferingClearRef.current = null;
       if (seekDebounceRef.current != null) {
         window.clearTimeout(seekDebounceRef.current);
         seekDebounceRef.current = null;
@@ -340,6 +394,7 @@ export default function ChannelExplorePopup({
       if (document.fullscreenElement === containerRef.current) {
         void document.exitFullscreen().catch(() => {});
       }
+      setYoutubeEmbed(null);
       const sid = sessionIdRef.current;
       sessionIdRef.current = null;
       sessionMetaRef.current = null;
@@ -359,6 +414,19 @@ export default function ChannelExplorePopup({
 
 
   const togglePlay = useCallback(() => {
+    if (youtubeEmbed) {
+      if (!ready) return;
+      if (playing) {
+        postYoutubeCommand('pauseVideo');
+        setPlaying(false);
+      } else {
+        postYoutubeCommand('setVolume', [Math.round(volumeRef.current * 100)]);
+        postYoutubeCommand(muted ? 'mute' : 'unMute');
+        postYoutubeCommand('playVideo');
+        setPlaying(true);
+      }
+      return;
+    }
     const video = videoRef.current;
     if (!video || !ready) return;
     if (video.paused) {
@@ -370,10 +438,18 @@ export default function ChannelExplorePopup({
       video.pause();
       setPlaying(false);
     }
-  }, [ready, playing]);
+  }, [ready, playing, youtubeEmbed, postYoutubeCommand]);
 
   const setVolumeLevel = useCallback((level: number) => {
     const v = Math.max(0, Math.min(1, level));
+    if (youtubeEmbed) {
+      postYoutubeCommand('setVolume', [Math.round(v * 100)]);
+      if (v > 0) volumeRef.current = v;
+      setVolume(v);
+      postYoutubeCommand(v <= 0 ? 'mute' : 'unMute');
+      setMuted(v <= 0);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     video.volume = v;
@@ -386,25 +462,244 @@ export default function ChannelExplorePopup({
       video.muted = false;
       setMuted(false);
     }
-  }, []);
+  }, [youtubeEmbed, postYoutubeCommand]);
+
+  useEffect(() => {
+    if (!youtubeEmbed) return;
+    const onMessage = (event: MessageEvent) => {
+      // YouTube's IFrame API delivers `infoDelivery` events with `currentTime`
+      // via postMessage. Match by `event.source` against the iframe's
+      // contentWindow — origin alone is unreliable for YT embeds.
+      const iframe = youtubeIframeRef.current;
+      if (!iframe || event.source !== iframe.contentWindow) {
+        if (event.origin !== 'https://www.youtube.com') return;
+      }
+      let data: any;
+      try { data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data; } catch { return; }
+      if (!data || data.event !== 'infoDelivery') return;
+      const state = Number(data?.info?.playerState);
+      if (state === 1) setPlaying(true);
+      else if (state === 2 || state === 0) setPlaying(false);
+      const t = Number(data?.info?.currentTime);
+      if (Number.isFinite(t)) {
+        const target = seekTargetRef.current;
+        if (target != null) {
+          if (Math.abs(t - target) > 1.5) return;
+          seekTargetRef.current = null;
+        }
+        setCurrentTime(t);
+      }
+    };
+    youtubeIframeListen(youtubeIframeRef.current);
+    const poll = window.setInterval(() => {
+      youtubeIframeListen(youtubeIframeRef.current);
+      postYoutubeCommand('getCurrentTime');
+    }, 250);
+    window.addEventListener('message', onMessage);
+    return () => {
+      window.clearInterval(poll);
+      window.removeEventListener('message', onMessage);
+    };
+  }, [youtubeEmbed, postYoutubeCommand]);
 
   const effectiveDurationSec = resolvePreviewDurationSec(
     mediaDurationSec,
     sessionDurationSec > 0 ? sessionDurationSec : vod.durationSec,
+    isYoutubeWindowHlsPreview(
+      platform === 'youtube',
+      playback?.kind ?? 'progressive',
+      windowHlsMuxEndSec,
+    ),
   );
+
+  const windowHlsTimeline = trimTimelineRef.current
+    || isYoutubeWindowHlsPreview(
+      platform === 'youtube',
+      playback?.kind ?? 'progressive',
+      windowHlsMuxEndSec,
+    );
 
   const seekVideo = useCallback((sec: number) => {
     const t = Math.max(0, Math.min(sec, effectiveDurationSec));
+    if (youtubeEmbed) {
+      if (!ready) return;
+      // Ignore delayed pre-seek infoDelivery events until the iframe reaches
+      // this position; otherwise the controlled timeline visibly rewinds.
+      seekTargetRef.current = t;
+      setCurrentTime(t);
+      previewTimingRef.current?.markSeekStart(t);
+      postYoutubeCommand('seekTo', [t, true]);
+      return;
+    }
     const video = videoRef.current;
     if (!video || !ready) return;
-    if (Math.abs(video.currentTime - t) > 0.2) {
-      video.currentTime = t;
+    const windowHlsSeek = trimTimelineRef.current
+      || isYoutubeWindowHlsPreview(
+        platform === 'youtube',
+        playbackKindRef.current,
+        windowHlsMuxEndRef.current,
+      );
+    seekTargetRef.current = t;
+    const optimistic = previewSeekOptimisticUi(
+      platform === 'youtube',
+      trimTimelineRef.current,
+      playbackKindRef.current,
+    );
+    if (optimistic) setCurrentTime(t);
+    previewTimingRef.current?.markSeekStart(t);
+
+    const applyLocal = (videoTime: number) => {
+      if (Math.abs(video.currentTime - videoTime) > 0.2) {
+        video.currentTime = videoTime;
+      }
+    };
+
+    const finishSeek = () => {
+      seekTargetRef.current = null;
+      setCurrentTime(t);
+    };
+
+    const sid = sessionIdRef.current;
+    if (windowHlsSeek && sid && platform === 'youtube') {
+      // Invalidate any previous seek before starting the next one so callbacks
+      // for the old one become no-ops and cannot leak the timeline lock.
+      const seekId = ++seekInflightRef.current;
+      const clearLockIfCurrent = () => {
+        if (seekId === seekInflightRef.current) {
+          seekLockedRef.current = false;
+          setBuffering(false);
+        }
+      };
+      const muxStart = windowHlsMuxStartRef.current;
+      const muxEnd = windowHlsMuxEndRef.current;
+      const resumePlay = !video.paused;
+      if (isPositionInWindowHlsMux(t, muxStart, muxEnd)) {
+        seekLockedRef.current = true;
+        // The slider already jumped optimistically in seekVideoDebounced.
+        // applyVideoLocalSeek pauses during the seek so the decoder does not
+        // play forward from the previous keyframe to the target.
+        void applyVideoLocalSeek(video, windowHlsVideoTimeSec(t, muxStart))
+          .then(() => {
+            if (seekId !== seekInflightRef.current) return;
+            seekLockedRef.current = false;
+            finishSeek();
+            bufferingClearRef.current?.();
+            setBuffering(false);
+            if (resumePlay) void video.play().then(() => setPlaying(true)).catch(() => {});
+          })
+          .catch(() => {
+            if (seekId !== seekInflightRef.current) return;
+            seekTargetRef.current = null;
+            clearLockIfCurrent();
+          });
+        return;
+      }
+      // Out-of-window seek: keep the slider at the target (already set
+      // optimistically) and wait for the backend remux. Do not touch
+      // video.currentTime until the new chunk is ready — the old window does
+      // not contain the target, so any local seek would snap to the wrong frame.
+      seekLockedRef.current = true;
+      video.pause();
+      setPlaying(false);
+      shieldPreviewBuffering(120_000);
+      // Show loading immediately so the user knows the requested frame is being
+      // prepared while the backend remuxes.
+      setBuffering(true);
+      let slowSpinner: number | undefined;
+      void (async () => {
+        try {
+          slowSpinner = window.setTimeout(() => setBuffering(true), 800);
+          const { muxStart: newStart, muxEnd: newEnd, remuxed } = await seekYoutubeWindowHls(sid, t, apiPost, apiGet, 12_000);
+          if (seekId !== seekInflightRef.current) return;
+          windowHlsMuxStartRef.current = newStart;
+          windowHlsMuxEndRef.current = newEnd;
+          setWindowHlsMuxEndSec(newEnd);
+          const videoTime = windowHlsVideoTimeSec(t, newStart);
+          if (remuxed && hlsRef.current) {
+            await reloadWindowHlsAtPosition(
+              hlsRef.current,
+              sid,
+              video,
+              videoTime,
+            );
+          } else {
+            await applyVideoLocalSeek(video, videoTime);
+          }
+          if (seekId !== seekInflightRef.current) return;
+          seekLockedRef.current = false;
+          finishSeek();
+          bufferingClearRef.current?.();
+          waitVideoPlayable(video, previewTimingRef.current ?? new PreviewTiming(platform, 'explore'));
+          if (resumePlay) void video.play().then(() => setPlaying(true)).catch(() => {});
+        } catch (err: unknown) {
+          if (seekId === seekInflightRef.current) {
+            setError(err instanceof Error ? err.message : 'Seek failed');
+            seekTargetRef.current = null;
+          }
+        } finally {
+          if (slowSpinner !== undefined) window.clearTimeout(slowSpinner);
+          clearLockIfCurrent();
+        }
+      })();
+      return;
     }
-    setCurrentTime(t);
-  }, [ready, effectiveDurationSec]);
+
+    if (
+      platform === 'youtube'
+      && !trimTimelineRef.current
+      && playbackKindRef.current === 'progressive'
+      && !cachedProgressiveRef.current
+      && sid
+      && t > 60
+    ) {
+      // Show a teaser frame at the target immediately while /refresh resolves
+      // the full-window progressive URL in the background.
+      applyLocal(t);
+      pendingSeekSecRef.current = t;
+      setBuffering(true);
+      void apiPost<PreviewSessionResponse>(`/api/preview/session/${sid}/refresh`, {})
+        .then((res) => {
+          if (applySessionRefresh(res)) {
+            setBuffering(false);
+            return;
+          }
+          applyLocal(t);
+          waitVideoPlayable(
+            video,
+            previewTimingRef.current ?? new PreviewTiming(platform ?? 'unknown', 'explore'),
+          );
+          finishSeek();
+        })
+        .catch(() => {
+          applyLocal(t);
+          waitVideoPlayable(
+            video,
+            previewTimingRef.current ?? new PreviewTiming(platform ?? 'unknown', 'explore'),
+          );
+          finishSeek();
+        })
+        .finally(() => setBuffering(false));
+      return;
+    }
+
+    applyLocal(t);
+    waitVideoPlayable(
+      video,
+      previewTimingRef.current ?? new PreviewTiming(platform ?? 'unknown', 'explore'),
+    );
+    finishSeek();
+  }, [ready, effectiveDurationSec, platform, applySessionRefresh, youtubeEmbed, postYoutubeCommand]);
 
   const seekVideoDebounced = useCallback((sec: number) => {
-    setCurrentTime(Math.max(0, Math.min(sec, effectiveDurationSec)));
+    const clamped = Math.max(0, Math.min(sec, effectiveDurationSec));
+    seekTargetRef.current = clamped;
+    if (previewSeekOptimisticUi(
+      platform === 'youtube',
+      trimTimelineRef.current,
+      playbackKindRef.current,
+    )) {
+      setCurrentTime(clamped);
+    }
     if (seekDebounceRef.current != null) {
       window.clearTimeout(seekDebounceRef.current);
     }
@@ -418,7 +713,16 @@ export default function ChannelExplorePopup({
     if (!ready) return;
     const video = videoRef.current;
     if (!video) return;
-    seekVideo(video.currentTime + deltaSec);
+    const windowHlsSeek = trimTimelineRef.current
+      || isYoutubeWindowHlsPreview(
+        platform === 'youtube',
+        playbackKindRef.current,
+        windowHlsMuxEndRef.current,
+      );
+    const base = windowHlsSeek
+      ? windowHlsMuxStartRef.current + video.currentTime
+      : video.currentTime;
+    seekVideo(base + deltaSec);
   }, [ready, seekVideo]);
 
   const focusPlayer = useCallback(() => {
@@ -568,9 +872,11 @@ export default function ChannelExplorePopup({
         requestAnimationFrame(setup);
         return;
       }
-      detachBuffering = attachPreviewBufferingListeners(video, (stalling) => {
+      const bufferingHandle = attachPreviewBufferingListeners(video, (stalling) => {
         if (!cancelled) setBuffering(stalling);
       });
+      bufferingClearRef.current = bufferingHandle.clearStall;
+      detachBuffering = bufferingHandle.detach;
       const { url: playbackUrl, kind: playbackKind } = playback;
 
     setLoading(true);
@@ -581,6 +887,7 @@ export default function ChannelExplorePopup({
       setReady(true);
       setBuffering(false);
       setLoading(false);
+      previewTimingRef.current?.mark('canplay');
       video.volume = PREVIEW_DEFAULT_VOLUME;
       volumeRef.current = PREVIEW_DEFAULT_VOLUME;
       setVolume(PREVIEW_DEFAULT_VOLUME);
@@ -588,6 +895,9 @@ export default function ChannelExplorePopup({
         initialPlayDoneRef.current = true;
         void playPreviewWithAudio(video, setMuted, PREVIEW_DEFAULT_VOLUME).then(() => {
           setPlaying(!video.paused);
+          if (video.readyState >= 3 && !video.paused && video.currentTime > 0.02) {
+            previewTimingRef.current?.markFirstPlayable('canplay_already_playing');
+          }
         });
       }
     };
@@ -598,6 +908,9 @@ export default function ChannelExplorePopup({
       setBuffering(false);
     };
     video.addEventListener('playing', clearStallUi);
+    video.addEventListener('playing', () => {
+      previewTimingRef.current?.markFirstPlayable();
+    }, { once: true });
 
     if (playbackKind === 'progressive' || isClipPreviewUrl(vod.url)) {
       const meta = sessionMetaRef.current;
@@ -660,10 +973,16 @@ export default function ChannelExplorePopup({
         getSessionId: () => sessionIdRef.current,
         youtube: platform === 'youtube',
         extractSource: extractSourceRef.current,
-        getResumeSec: () => video.currentTime,
+        getResumeSec: () => seekTargetRef.current ?? video.currentTime,
         apiPost,
         onRefreshing: () => setBuffering(true),
         onFatal: onVideoError,
+        onSessionRefresh: (res) => {
+          pendingSeekSecRef.current = seekTargetRef.current ?? video.currentTime;
+          const ok = applySessionRefresh(res as PreviewSessionResponse);
+          if (ok) setBuffering(false);
+          return ok;
+        },
       });
       video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
       video.addEventListener('canplay', onCanPlay, { once: true });
@@ -682,15 +1001,17 @@ export default function ChannelExplorePopup({
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
-        backBufferLength: 30,
-        maxBufferLength: dashSegTimeline ? 60 : 20,
-        maxMaxBufferLength: dashSegTimeline ? 180 : 40,
+        backBufferLength: 12,
+        // Play-first: start playback once ~6 s are buffered instead of waiting
+        // for 20 s. Window-HLS keeps a larger buffer because the chunk is muxed.
+        maxBufferLength: dashSegTimeline ? 60 : 6,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 12,
         startFragPrefetch: true,
         capLevelToPlayerSize: platform !== 'youtube',
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
-        startPosition: 0,
+        startPosition: trimTimelineRef.current ? 0 : (pendingSeekSecRef.current ?? 0),
       });
       hlsRef.current = hls;
       setHlsRef(hls);
@@ -736,7 +1057,14 @@ export default function ChannelExplorePopup({
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         syncPreviewLevels(data.levels ?? hls.levels, true);
-        if (Number.isFinite(video.duration) && video.duration > 0) {
+        const pending = pendingSeekSecRef.current;
+        if (pending != null && pending > 0 && !trimTimelineRef.current) {
+          pendingSeekSecRef.current = null;
+          seekTargetRef.current = null;
+          setCurrentTime(pending);
+          hls.startLoad(pending);
+        }
+        if (!trimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
           setMediaDurationSec(Math.round(video.duration));
         }
       });
@@ -795,6 +1123,7 @@ export default function ChannelExplorePopup({
     setup();
     return () => {
       cancelled = true;
+      bufferingClearRef.current = null;
       detachBuffering?.();
       cleanup?.();
     };
@@ -973,16 +1302,40 @@ export default function ChannelExplorePopup({
             togglePlay();
           }}
         >
+          {youtubeEmbed ? (
+            <>
+              <iframe
+                ref={youtubeIframeRef}
+                className="youtube-embed-frame pointer-events-none"
+                src={youtubeEmbed}
+                title="YouTube mini preview"
+                allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+                allowFullScreen
+                onLoad={() => {
+                  setReady(true);
+                  setLoading(false);
+                  youtubeIframeListen(youtubeIframeRef.current);
+                  postYoutubeCommand('setVolume', [Math.round(volumeRef.current * 100)]);
+                }}
+              />
+              <div className="absolute inset-0 z-[1]" aria-hidden="true" />
+            </>
+          ) : (
           <video
             ref={videoRef}
             className="w-full h-full object-contain pointer-events-none"
             muted={muted}
             playsInline
+            poster={resolveVideoThumbnail(vod.thumbnailUrl ?? null, 640, 360) || undefined}
             onLoadedMetadata={() => {
               const video = videoRef.current;
               if (!video?.videoWidth || !video?.videoHeight) return;
               const aspect = video.videoWidth / video.videoHeight;
-              if (Number.isFinite(video.duration) && video.duration > 0) {
+              if (
+                !trimTimelineRef.current
+                && Number.isFinite(video.duration)
+                && video.duration > 0
+              ) {
                 setMediaDurationSec(Math.round(video.duration));
               }
               videoAspectRef.current = aspect;
@@ -998,7 +1351,20 @@ export default function ChannelExplorePopup({
             onTimeUpdate={() => {
               const video = videoRef.current;
               if (!video) return;
-              setCurrentTime(video.currentTime);
+              // During an out-of-chunk remux the HLS loader briefly reports
+              // positions near the new chunk's mux start while we wait for
+              // FRAG_BUFFERED to land the explicit seek. Ignore those reports
+              // so the slider doesn't bounce.
+              if (seekLockedRef.current) return;
+              // While a user seek is in flight (optimistic UI already shows the
+              // target), ignore timeupdate reports at the old position so the
+              // controlled slider doesn't snap back before the seek lands.
+              if (seekTargetRef.current != null) return;
+              if (windowHlsTimeline) {
+                setCurrentTime(windowHlsVodTimeSec(video.currentTime, windowHlsMuxStartRef.current));
+              } else {
+                setCurrentTime(video.currentTime);
+              }
             }}
             onPlay={() => {
               if (suppressPlayRef.current) {
@@ -1009,11 +1375,12 @@ export default function ChannelExplorePopup({
             }}
             onPause={() => setPlaying(false)}
           />
+          )}
           {loading && !ready && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 z-20">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40 z-20">
               <Loader2 size={28} className="animate-spin text-zinc-300" />
               <span className="text-zinc-300 text-[10px] font-mono">
-                {platform === 'youtube' ? 'Preparing segments…' : 'Preparing preview…'}
+                {platform === 'youtube' ? 'Starting YouTube preview…' : 'Preparing preview…'}
               </span>
             </div>
           )}

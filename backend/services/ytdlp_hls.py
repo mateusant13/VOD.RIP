@@ -49,6 +49,10 @@ from services.os_services import _NO_WINDOW, register_child_pid, unregister_chil
 
 logger = logging.getLogger(__name__)
 
+
+class StaleGooglevideoUrl(RuntimeError):
+    """Signed googlevideo URL expired (403/404/410) — re-resolve before retry."""
+
 # These constants are also used by ytdlp_ffmpeg and will be kept there
 # while re-exported via the shim.
 
@@ -118,16 +122,26 @@ _EXTRACT_CACHE_TTL_SEC = 6 * 3600
 _EXTRACT_CACHE_MAX = 32
 _EXTRACT_WAIT_SEC = 120
 _YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
-_YOUTUBE_PREVIEW_SOCKET_SEC = 5
-_PREVIEW_EXTRACT_WAIT_SEC = 8.0
+_PREVIEW_EXTRACT_RACE_SEC = 5.5  # wall clock — innertube + yt-dlp paths race together
+_YOUTUBE_PREVIEW_SOCKET_SEC = 3
+_PREVIEW_EXTRACT_WAIT_SEC = 24.0
 _PREVIEW_EXTRACT_MAX_WALL_SEC = 8.0
-_PREVIEW_EXTRACT_FALLBACK_SEC = 22.0  # total wall incl. full yt-dlp retries on cache miss
+_PREVIEW_EXTRACT_FALLBACK_SEC = 24.0  # total wall incl. full yt-dlp retries on cache miss
 _PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: unused teaser cap ÔÇö mux uses session trim window
 _PREVIEW_MUX_FAST_HEIGHT = 480
 
 
+def preview_fast_only_mode() -> bool:
+    """dev:2 — innertube race only; no cookies, POT, browser, or slow extract fallback."""
+    return os.environ.get("VODRIP_PREVIEW_FAST_ONLY", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _youtube_manual_auth_configured() -> bool:
     """True when user set cookies file, browser, po_token, or tokens file in Settings."""
+    if preview_fast_only_mode():
+        return False
     try:
         from deps import settings_mgr
         s = settings_mgr.get()
@@ -210,12 +224,21 @@ def _youtube_cookie_path(opts: dict) -> Optional[str]:
     return None
 
 
-def _try_innertube_info(url: str, session=None, *, allow_session_refresh: bool = True) -> Optional[dict]:
+def _try_innertube_info(
+    url: str,
+    session=None,
+    *,
+    allow_session_refresh: bool = True,
+    preview_fast: bool = False,
+) -> Optional[dict]:
     from services.youtube_innertube import innertube_extract_info
 
     try:
         return innertube_extract_info(
-            url, session=session, allow_session_refresh=allow_session_refresh,
+            url,
+            session=session,
+            allow_session_refresh=allow_session_refresh,
+            preview_fast=preview_fast,
         )
     except Exception as exc:
         logger.debug("InnerTube extract error for %s: %s", url, exc)
@@ -235,39 +258,53 @@ def youtube_preview_ytdl_opts(
     from services.youtube_innertube import extract_video_id
     from services.youtube_session import (
         resolve_ytdlp_cookiefile,
+        youtube_session_bootstrap_only,
         youtube_session_from_settings,
         youtube_session_from_values,
         ytdlp_extractor_args,
     )
 
     vid = extract_video_id(full_url)
-    auto_auth = True
+    fast_only = preview_fast_only_mode()
+    auto_auth = not fast_only
     if session is None:
-        try:
-            from deps import settings_mgr
-            s = settings_mgr.get()
-            auto_auth = getattr(s, "youtube_auto_auth", True)
-            session = youtube_session_from_values(
-                visitor_data=getattr(s, "youtube_visitor_data", "") or None,
-                po_token=getattr(s, "youtube_po_token", "") or None,
-                cookies_file=cookies_file or getattr(s, "youtube_cookies_file", "") or None,
-                tokens_file=getattr(s, "youtube_tokens_file", "") or None,
-                cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
-                video_id=vid,
-                auto_auth=auto_auth,
-            )
-        except Exception:
-            session = youtube_session_from_settings(video_id=vid)
-            auto_auth = True
+        if fast_only:
+            session = youtube_session_bootstrap_only(video_id=vid, force=False)
+        else:
+            try:
+                from deps import settings_mgr
+                s = settings_mgr.get()
+                auto_auth = getattr(s, "youtube_auto_auth", True)
+                session = youtube_session_from_values(
+                    visitor_data=getattr(s, "youtube_visitor_data", "") or None,
+                    po_token=getattr(s, "youtube_po_token", "") or None,
+                    cookies_file=cookies_file or getattr(s, "youtube_cookies_file", "") or None,
+                    tokens_file=getattr(s, "youtube_tokens_file", "") or None,
+                    cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
+                    video_id=vid,
+                    auto_auth=auto_auth,
+                )
+            except Exception:
+                session = youtube_session_from_settings(video_id=vid)
+                auto_auth = True
+
+    extractor_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
+    if fast_only:
+        extractor_args = dict(extractor_args)
+        yt_args = dict(extractor_args.get("youtube") or {})
+        yt_args["fetch_pot"] = ["never"]
+        extractor_args["youtube"] = yt_args
 
     opts: dict = {
-        "extractor_args": ytdlp_extractor_args(session, auto_auth=auto_auth),
+        "extractor_args": extractor_args,
         "cachedir": str(cachedir or _get_cache_dir()),
         "_youtube_session": session,
         "socket_timeout": _YOUTUBE_PREVIEW_SOCKET_SEC,
         "_preview_fast": True,
     }
-    if oauth:
+    if fast_only:
+        opts["_preview_fast_only"] = True
+    if oauth and not fast_only:
         opts["username"] = "oauth_token"
         opts["password"] = oauth
     from services.youtube_session import apply_ytdlp_cookie_opts
@@ -419,6 +456,86 @@ def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
     return merged
 
 
+def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
+    """Preview SLA: race InnerTube + yt-dlp (cookies + bare) — first playable wins."""
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_diag import log_extract_ok
+
+    vid = extract_video_id(url) or url[:32]
+    yt_session = opts.get("_youtube_session")
+    sock = min(int(opts.get("socket_timeout") or 10), _YOUTUBE_PREVIEW_SOCKET_SEC)
+    cookie_opts = {**opts, "socket_timeout": sock}
+    bare_opts = {**_bare_ytdlp_opts(opts), "socket_timeout": sock}
+
+    def _inn() -> Optional[dict]:
+        return _try_innertube_info(
+            url,
+            session=yt_session,
+            allow_session_refresh=False,
+            preview_fast=True,
+        )
+
+    def _ydl(ytdl_opts: dict) -> Optional[dict]:
+        return _extract_hls_info_quiet(url, ytdl_opts)
+
+    tasks: list[tuple[object, str]] = [
+        (_inn, "innertube_race"),
+        (lambda: _ydl(cookie_opts), "ytdlp_cookies"),
+        (lambda: _ydl(bare_opts), "ytdlp_bare"),
+    ]
+
+    winner: Optional[dict] = None
+    source = ""
+    pool = ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="yt-preview")
+    pending: set = set()
+    try:
+        futures = {pool.submit(fn): src for fn, src in tasks}
+        deadline = time.monotonic() + _PREVIEW_EXTRACT_RACE_SEC
+        pending = set(futures.keys())
+        while pending and time.monotonic() < deadline:
+            done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    info = fut.result()
+                except Exception as exc:
+                    logger.debug("preview race %s %s: %s", vid, futures[fut], exc)
+                    continue
+                if info and _youtube_info_playable(info):
+                    winner = info
+                    source = futures[fut]
+                    pending.clear()
+                    break
+            if winner:
+                break
+        # ponytail: long VOD yt-dlp often lands just after race deadline — brief grace
+        if not winner and pending:
+            grace_deadline = time.monotonic() + min(
+                6.0,
+                max(0.0, _PREVIEW_EXTRACT_MAX_WALL_SEC - _PREVIEW_EXTRACT_RACE_SEC) + 2.0,
+            )
+            while pending and time.monotonic() < grace_deadline:
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        info = fut.result()
+                    except Exception as exc:
+                        logger.debug("preview race grace %s %s: %s", vid, futures[fut], exc)
+                        continue
+                    if info and _youtube_info_playable(info):
+                        winner = info
+                        source = futures[fut]
+                        pending.clear()
+                        break
+                if winner:
+                    break
+    finally:
+        with contextlib.suppress(Exception):
+            pool.shutdown(wait=False, cancel_futures=True)
+    if winner:
+        log_extract_ok(vid, source, winner, yt_session)
+    return winner
+
+
 def _youtube_extract_parallel_fast(
     url: str,
     opts: dict,
@@ -477,8 +594,19 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
     from services.youtube_innertube import extract_video_id
     from services.youtube_diag import log_extract_ok
 
-    yt_session = opts.get("_youtube_session")
     vid = extract_video_id(url) or url[:32]
+    if opts.get("_preview_fast"):
+        info = _youtube_extract_preview_race(url, opts)
+        if info:
+            return info
+        if _youtube_manual_auth_configured():
+            anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
+            info = _youtube_extract_preview_race(url, anon_opts)
+            if info:
+                return info
+        return None
+
+    yt_session = opts.get("_youtube_session")
     has_auth = _youtube_has_user_auth(opts)
     bare_opts = _bare_ytdlp_opts(opts)
 
@@ -556,37 +684,102 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> di
 
 
 def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
-    """Preview SLA: fast InnerTube race, then full retries before giving up."""
+    """Preview SLA: parallel race, one fresh-session retry, then full extract fallback."""
     t0 = time.monotonic()
-    info = _youtube_extract_pass(url, opts)
-    if info and _youtube_info_playable(info):
-        return info
-    if _youtube_has_user_auth(opts) and _youtube_manual_auth_configured():
-        anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
-        info = _youtube_extract_pass(url, anon_opts)
-        if info and _youtube_info_playable(info):
-            return info
-    if not _youtube_has_user_auth(opts):
+    attempts: list[dict] = [opts]
+    if _youtube_manual_auth_configured():
+        attempts.append(_merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url))
+    elif not _youtube_has_user_auth(opts):
         from services.youtube_session import invalidate_anonymous_session
 
         invalidate_anonymous_session()
-        working = _merge_fresh_youtube_session(dict(opts), url)
-        info = _youtube_extract_pass(url, working)
+        attempts.append(_merge_fresh_youtube_session(dict(opts), url))
+
+    for i, attempt_opts in enumerate(attempts):
+        if time.monotonic() - t0 > _PREVIEW_EXTRACT_MAX_WALL_SEC:
+            break
+        info = _youtube_extract_pass(url, attempt_opts)
         if info and _youtube_info_playable(info):
             return info
-    # ponytail: channel VODs often miss the 8s fast path — allow full extract before 500
-    if time.monotonic() - t0 < _PREVIEW_EXTRACT_FALLBACK_SEC:
-        try:
-            retry_opts = opts
-            if _youtube_manual_auth_configured():
-                retry_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
-            return _youtube_extract_with_retries(url, retry_opts, attempts=3)
-        except Exception as exc:
-            logger.debug("preview extract fallback failed %s: %s", url[:60], exc)
+        if i + 1 < len(attempts):
+            remaining = _PREVIEW_EXTRACT_MAX_WALL_SEC - (time.monotonic() - t0)
+            if remaining < 1.0:
+                break
+
+    # ponytail: long VODs miss the 8s fast race — fall back to full InnerTube merge + yt-dlp
+    if not preview_fast_only_mode():
+        deadline = t0 + _PREVIEW_EXTRACT_FALLBACK_SEC
+        if time.monotonic() < deadline:
+            slow_opts = dict(opts)
+            slow_opts.pop("_preview_fast", None)
+            slow_opts["socket_timeout"] = max(
+                int(slow_opts.get("socket_timeout") or _YOUTUBE_PREVIEW_SOCKET_SEC),
+                10,
+            )
+            yt_session = slow_opts.get("_youtube_session")
+            from services.youtube_innertube import extract_video_id
+
+            vid = extract_video_id(url)
+            if vid and yt_session is not None and not getattr(yt_session, "po_token", None):
+                from services.youtube_session import resolve_video_po_token
+
+                auto_po = resolve_video_po_token(vid)
+                if auto_po:
+                    from services.youtube_session import YouTubeSession
+
+                    yt_session = YouTubeSession(
+                        visitor_data=yt_session.visitor_data,
+                        po_token=auto_po,
+                        cookie_header=yt_session.cookie_header,
+                        cookies_from_browser=yt_session.cookies_from_browser,
+                        anonymous=yt_session.anonymous,
+                        cookie_file=yt_session.cookie_file,
+                        http_session=yt_session.http_session,
+                    )
+                    slow_opts["_youtube_session"] = yt_session
+            if not _youtube_cookie_path(slow_opts) and not slow_opts.get("cookiesfrombrowser"):
+                from services.youtube_auth import find_fresh_cookie_cache
+
+                cached_cookie = find_fresh_cookie_cache()
+                if cached_cookie:
+                    slow_opts["cookiefile"] = cached_cookie
+            try:
+                info = _try_innertube_info(
+                    url,
+                    session=yt_session,
+                    allow_session_refresh=True,
+                    preview_fast=False,
+                )
+                if info and _youtube_info_playable(info):
+                    return info
+            except Exception as exc:
+                logger.debug("preview slow innertube %s: %s", url[:60], exc)
+            if time.monotonic() < deadline:
+                try:
+                    info = _youtube_extract_with_retries(url, slow_opts, attempts=2)
+                    if info and _youtube_info_playable(info):
+                        return info
+                except Exception as exc:
+                    logger.debug("preview slow ytdlp %s: %s", url[:60], exc)
+
+    from services.youtube_innertube import extract_video_id
+    from services.youtube_diag import log_extract_fail
+
+    log_extract_fail(
+        extract_video_id(url) or "?",
+        "preview_race_exhausted",
+        opts.get("_youtube_session"),
+        final=True,
+        detail=f"wall_ms={int((time.monotonic() - t0) * 1000)}",
+    )
     raise RuntimeError("YouTube preview unavailable for this video")
 
 
 assert _youtube_format_playable({"format_id": "hls-master", "url": "https://x/master.m3u8", "protocol": "m3u8_native"}) is True
+assert _PREVIEW_EXTRACT_RACE_SEC <= _PREVIEW_EXTRACT_MAX_WALL_SEC
+assert _PREVIEW_EXTRACT_FALLBACK_SEC >= _PREVIEW_EXTRACT_WAIT_SEC
+assert preview_fast_only_mode.__name__ == "preview_fast_only_mode"
+assert _youtube_extract_preview_race.__name__ == "_youtube_extract_preview_race"
 
 
 def _cache_extract_result(key: str, info: dict) -> None:
@@ -620,6 +813,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     if not leader:
         event, box = inflight
         wait_sec = _PREVIEW_EXTRACT_WAIT_SEC if opts.get("_preview_fast") else _EXTRACT_WAIT_SEC
+        if preview_fast_only_mode():
+            wait_sec = min(wait_sec, _PREVIEW_EXTRACT_MAX_WALL_SEC + 2.0)
         if not event.wait(timeout=wait_sec):
             raise TimeoutError("YouTube metadata extract timed out")
         with _EXTRACT_CACHE_LOCK:
@@ -705,7 +900,7 @@ def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Op
     try:
         from services.preview_service import warm_youtube_preview_resolve
 
-        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=720)
+        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=360)
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
         log_extract_fail(extract_video_id(url) or "?", "warm_skipped", exc=exc)
@@ -1575,6 +1770,7 @@ def _download_progressive_clip(
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
     audio_only: bool = False,
+    force_copy: bool = False,
 ) -> None:
     """Trim a direct MP4 URL (YouTube adaptiveFormats) via ffmpeg."""
     del prefer_height
@@ -1595,6 +1791,10 @@ def _download_progressive_clip(
     cmd += ["-ss", str(ss), "-i", media_input, "-t", str(duration)]
     if audio_only:
         cmd += ["-vn", "-acodec", "libmp3lame", "-b:a", "192k", output_path]
+    elif force_copy:
+        # Muxed progressive MP4 (e.g. YouTube itag 18) is already H.264/AAC;
+        # stream-copy avoids a 3× re-encode size penalty.
+        cmd += ["-c", "copy", "-movflags", "+faststart", output_path]
     else:
         enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
         if enc_args:
@@ -1648,14 +1848,97 @@ def _dur_sec_from_googlevideo_url(url: str) -> Optional[float]:
     return v if v > 0 else None
 
 
-def _googlevideo_byte_range(
-    url: str, start_sec: float, end_sec: float,
-) -> Optional[tuple[int, int]]:
-    """Byte range covering [start_sec, end_sec] with keyframe lead-in."""
+def _clen_dur_from_googlevideo_url(url: str) -> tuple[Optional[int], Optional[float]]:
+    """Parse clen/dur from query params or embedded sgovp blob."""
     from services.size_estimate import _clen_bytes_from_url
+    from urllib.parse import unquote
 
     clen = _clen_bytes_from_url(url)
     dur = _dur_sec_from_googlevideo_url(url)
+    if clen and dur:
+        return clen, dur
+    m = re.search(r"[?&]sgovp=([^&]+)", url or "", re.I)
+    if m:
+        blob = unquote(m.group(1))
+        if not clen:
+            cm = re.search(r"clen=(\d+)", blob, re.I)
+            if cm:
+                try:
+                    clen = int(cm.group(1))
+                except ValueError:
+                    pass
+        if not dur:
+            dm = re.search(r"dur=([\d.]+)", blob, re.I)
+            if dm:
+                try:
+                    dur = float(dm.group(1))
+                except ValueError:
+                    pass
+    return clen, dur
+
+
+def _resolve_googlevideo_clen(
+    url: str,
+    fmt: Optional[dict] = None,
+    vod_duration: float = 0.0,
+) -> Optional[int]:
+    """clen: URL/sgovp → format filesize → tbr×duration estimate."""
+    clen, _dur = _clen_dur_from_googlevideo_url(url)
+    if clen:
+        return clen
+    if fmt:
+        fs = fmt.get("filesize") or fmt.get("filesize_approx")
+        if fs:
+            try:
+                return int(fs)
+            except (TypeError, ValueError):
+                pass
+        tbr = fmt.get("tbr")
+        dur = fmt.get("duration") or vod_duration
+        if tbr and dur:
+            try:
+                return int(float(tbr) * 1000.0 / 8.0 * float(dur))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _resolve_googlevideo_dur(
+    url: str,
+    fmt: Optional[dict] = None,
+    vod_duration: float = 0.0,
+) -> Optional[float]:
+    """duration: URL/sgovp → format duration → session vod_duration."""
+    _clen, dur = _clen_dur_from_googlevideo_url(url)
+    if dur:
+        return dur
+    if fmt:
+        raw = fmt.get("duration")
+        if raw:
+            try:
+                v = float(raw)
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+    if vod_duration and vod_duration > 0:
+        return float(vod_duration)
+    return None
+
+
+def _googlevideo_byte_range(
+    url: str,
+    start_sec: float,
+    end_sec: float,
+    *,
+    clen_bytes: Optional[int] = None,
+    duration_sec: Optional[float] = None,
+    fmt: Optional[dict] = None,
+    vod_duration: float = 0.0,
+) -> Optional[tuple[int, int]]:
+    """Byte range covering [start_sec, end_sec] with keyframe lead-in."""
+    clen = clen_bytes or _resolve_googlevideo_clen(url, fmt, vod_duration)
+    dur = duration_sec or _resolve_googlevideo_dur(url, fmt, vod_duration)
     if not clen or not dur:
         return None
     clip = max(0.1, end_sec - start_sec)
@@ -1675,6 +1958,9 @@ _INIT_BOX_BYTES = 2_097_152
 _GOOGLEVIDEO_RANGE_CHUNK_BYTES = 1 * 1024 * 1024
 # ponytail: ~16MB cap on contiguous Range from byte 0 — use init+media concat beyond this
 _GOOGLEVIDEO_MAX_FROM_ZERO_BYTES = 16 * 1024 * 1024
+# Multi-connection fetch for large background jobs (full-VOD warm) — bounded to avoid CDN 403s.
+_GOOGLEVIDEO_PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+_GOOGLEVIDEO_PARALLEL_MAX_WORKERS = 4
 
 
 def _range_lead_sec(url: str, byte_start: int) -> float:
@@ -1707,6 +1993,10 @@ def _fetch_googlevideo_range_once(
         )
     except ImportError:
         resp = requests.get(url, headers=hdrs, stream=True, timeout=180)
+    if resp.status_code in (403, 404, 410):
+        raise StaleGooglevideoUrl(
+            f"googlevideo URL expired HTTP {resp.status_code} for {url[:80]}",
+        )
     resp.raise_for_status()
     with open(dest, "wb") as out:
         for chunk in resp.iter_content(256 * 1024):
@@ -1716,6 +2006,13 @@ def _fetch_googlevideo_range_once(
                 out.write(chunk)
 
 
+def _is_stale_googlevideo_error(exc: Exception) -> bool:
+    if isinstance(exc, StaleGooglevideoUrl):
+        return True
+    resp = getattr(exc, "response", None)
+    return bool(resp is not None and getattr(resp, "status_code", 0) in (403, 404, 410))
+
+
 def _fetch_googlevideo_span_resilient(
     url: str,
     byte_range: tuple[int, int],
@@ -1723,12 +2020,14 @@ def _fetch_googlevideo_span_resilient(
     dest: str,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    """Fetch a byte span; bisect on 403 and tolerate missing tail bytes."""
+    """Fetch a byte span; bisect on transport errors, fail fast on expired URLs."""
     b0, b1 = byte_range
     try:
         _fetch_googlevideo_range_once(url, byte_range, headers, dest, cancel_event)
         return
     except Exception as exc:
+        if _is_stale_googlevideo_error(exc):
+            raise StaleGooglevideoUrl(str(exc)) from exc
         if b1 - b0 < 256 * 1024:
             if b0 > 0 and os.path.isfile(dest) and os.path.getsize(dest) >= 65536:
                 logger.debug("googlevideo span tail dropped %d-%d: %s", b0, b1, exc)
@@ -1756,12 +2055,50 @@ def _fetch_googlevideo_range(
     headers: Optional[dict],
     dest: str,
     cancel_event: Optional[threading.Event] = None,
+    max_workers: int = 1,
 ) -> None:
     """HTTP Range fetch of a googlevideo slice to a local file."""
     b0, b1 = byte_range
     if b1 - b0 <= _GOOGLEVIDEO_RANGE_CHUNK_BYTES:
         _fetch_googlevideo_span_resilient(url, byte_range, headers, dest, cancel_event)
         return
+
+    total = b1 - b0 + 1
+    workers = min(
+        max(1, max_workers),
+        max(1, total // _GOOGLEVIDEO_RANGE_CHUNK_BYTES),
+    )
+    if workers > 1 and total >= _GOOGLEVIDEO_PARALLEL_MIN_BYTES:
+        # ponytail: parallel chunk fetch uses more of the user's bandwidth/CPU for
+        # large background jobs (full-VOD warm). Each worker still does resilient
+        # 1MB sub-chunks so transient CDN errors are handled inside the slice.
+        tmpdir = tempfile.mkdtemp(prefix="gv_par_")
+        try:
+            per_worker = total // workers
+            part_files = [os.path.join(tmpdir, f"part_{i}") for i in range(workers)]
+            part_ranges: list[tuple[int, int]] = []
+            for i in range(workers):
+                start = b0 + i * per_worker
+                end = b1 if i == workers - 1 else start + per_worker - 1
+                part_ranges.append((start, end))
+
+            def _download_part(idx: int) -> None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Download cancelled by user")
+                _fetch_googlevideo_range(
+                    url, part_ranges[idx], headers, part_files[idx], cancel_event, max_workers=1,
+                )
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_download_part, range(workers)))
+            with open(dest, "wb") as out:
+                for pf in part_files:
+                    with open(pf, "rb") as src:
+                        shutil.copyfileobj(src, out)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
     with open(dest, "wb") as out:
         pos = b0
         while pos <= b1:
@@ -1854,9 +2191,15 @@ def _fetch_googlevideo_window_local(
     dest: str,
     cancel_event: Optional[threading.Event] = None,
     prefix_cache: Optional[str] = None,
+    *,
+    fmt: Optional[dict] = None,
+    vod_duration: float = 0.0,
+    max_workers: int = 4,
 ) -> float:
     """Fetch a seekable local googlevideo window; return ffmpeg -ss for the clip start."""
-    media = _googlevideo_byte_range(url, start_sec, end_sec)
+    media = _googlevideo_byte_range(
+        url, start_sec, end_sec, fmt=fmt, vod_duration=vod_duration,
+    )
     if not media:
         raise RuntimeError("no googlevideo byte range for clip window")
     _mb0, mb1 = media
@@ -1867,7 +2210,7 @@ def _fetch_googlevideo_window_local(
         _grow_googlevideo_prefix_cache(url, headers, prefix_cache, mb1, cancel_event)
         shutil.copyfile(prefix_cache, dest)
         return start_sec
-    _fetch_googlevideo_range(url, (0, mb1), headers, dest, cancel_event)
+    _fetch_googlevideo_range(url, (0, mb1), headers, dest, cancel_event, max_workers=max_workers)
     return start_sec
 
 
@@ -1938,10 +2281,16 @@ def _download_muxed_dash_clip(
     is_ts = output_path.lower().endswith(".ts")
 
     v_range = (
-        _googlevideo_byte_range(video_url, start_sec, end_sec) if use_byte_range else None
+        _googlevideo_byte_range(
+            video_url, start_sec, end_sec,
+            fmt=video_fmt, vod_duration=0.0,
+        ) if use_byte_range else None
     )
     a_range = (
-        _googlevideo_byte_range(audio_url, start_sec, end_sec) if use_byte_range else None
+        _googlevideo_byte_range(
+            audio_url, start_sec, end_sec,
+            fmt=None, vod_duration=0.0,
+        ) if use_byte_range else None
     )
     tmpdir: Optional[str] = None
     v_input, a_input = video_url, audio_url
@@ -2085,6 +2434,10 @@ def _mux_dash_window_to_hls(
     headers: Optional[dict] = None,
     video_prefix_cache: Optional[str] = None,
     audio_prefix_cache: Optional[str] = None,
+    *,
+    video_fmt: Optional[dict] = None,
+    audio_fmt: Optional[dict] = None,
+    vod_duration: float = 0.0,
 ) -> Path:
     """Mux a DASH crop window into a local HLS playlist (window.m3u8 + seg_NNN.ts).
 
@@ -2101,22 +2454,79 @@ def _mux_dash_window_to_hls(
     ffmpeg_exe = _resolve_ffmpeg_exe()
     v_local = os.path.join(output_dir, "_v.mp4")
     a_local = os.path.join(output_dir, "_a.m4a")
-    v_ss = _fetch_googlevideo_window_local(
-        video_url, start_sec, end_sec, headers, v_local,
-        prefix_cache=video_prefix_cache,
-    )
-    a_ss = _fetch_googlevideo_window_local(
-        audio_url, start_sec, end_sec, headers, a_local,
-        prefix_cache=audio_prefix_cache,
-    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            v_future = pool.submit(
+                _fetch_googlevideo_window_local,
+                video_url,
+                start_sec,
+                end_sec,
+                headers,
+                v_local,
+                None,
+                video_prefix_cache,
+                fmt=video_fmt,
+                vod_duration=vod_duration,
+            )
+            a_future = pool.submit(
+                _fetch_googlevideo_window_local,
+                audio_url,
+                start_sec,
+                end_sec,
+                headers,
+                a_local,
+                None,
+                audio_prefix_cache,
+                fmt=audio_fmt,
+                vod_duration=vod_duration,
+            )
+            v_ss = v_future.result()
+            a_ss = a_future.result()
+        v_input, a_input = v_local, a_local
+    except Exception as exc:
+        err = str(exc).lower()
+        if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
+            # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
+            playlist = os.path.join(output_dir, "window.m3u8")
+            seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
+            hdr = _ffmpeg_input_headers(headers or {})
+            reconnect = _ffmpeg_reconnect_args()
+            probe = ["-probesize", "8M", "-analyzeduration", "2M"]
+            cmd = [
+                ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
+                *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-t", str(duration),
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-f", "hls",
+                "-hls_time", "4",
+                "-hls_playlist_type", "vod",
+                "-hls_flags", "independent_segments",
+                "-hls_segment_filename", seg_pattern,
+                playlist,
+            ]
+            _run_ffmpeg(
+                cmd,
+                encode_duration=duration,
+                progress_from=10.0,
+                progress_to=92.0,
+                phase="Muxing",
+            )
+            playlist_path = Path(playlist)
+            if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
+                raise RuntimeError("remote window HLS mux produced no playlist") from exc
+            return playlist_path
+        raise
     playlist = os.path.join(output_dir, "window.m3u8")
     seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
     cmd = [
         ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
         "-probesize", "8M", "-analyzeduration", "2M",
-        "-ss", str(v_ss), "-i", v_local,
+        "-ss", str(v_ss), "-i", v_input,
         "-probesize", "8M", "-analyzeduration", "2M",
-        "-ss", str(a_ss), "-i", a_local,
+        "-ss", str(a_ss), "-i", a_input,
         "-map", "0:v:0", "-map", "1:a:0",
         "-t", str(duration),
         "-c:v", "copy",
@@ -2286,6 +2696,7 @@ def _download_hls_clip(
                     video_encoder=video_encoder,
                     mp4_faststart=mp4_faststart,
                     audio_only=audio_only,
+                    force_copy=True,
                 )
                 return
             audio_fmt = info.get("_preview_audio_format")
@@ -2330,6 +2741,7 @@ def _download_hls_clip(
             video_encoder=video_encoder,
             mp4_faststart=mp4_faststart,
             audio_only=audio_only,
+            force_copy=True,
         )
         return
 

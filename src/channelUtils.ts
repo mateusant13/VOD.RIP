@@ -25,6 +25,7 @@ export function isClipUrl(u: string): boolean {
   if (l.includes('clips.twitch.tv')) return true;
   if (l.includes('twitch.tv') && l.includes('/clip/')) return true;
   if (l.includes('kick.com') && l.includes('/clips/')) return true;
+  if (l.includes('youtube.com/shorts/') || l.includes('youtu.be/shorts/')) return true;
   return false;
 }
 

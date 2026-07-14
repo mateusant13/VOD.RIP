@@ -30,6 +30,8 @@ _READ_TIMEOUT_PLAYER_SEC = 2.0
 _READ_TIMEOUT_MANIFEST_SEC = 8.0
 _TV_TIMEOUT_SEC = 1.1
 _RACE_TIMEOUT_SEC = 2.5
+_PREVIEW_INNERTUBE_READ_SEC = 1.5
+_PREVIEW_INNERTUBE_RACE_SEC = 2.0
 
 if TYPE_CHECKING:
     from services.youtube_session import YouTubeSession
@@ -149,6 +151,23 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                 " AppleWebKit/537.36 (KHTML, like Gecko)"
                 " Chrome/131.0.0.0 Safari/537.36"
+            ),
+        },
+    ),
+    _ClientProfile(
+        "WEB_SAFARI",
+        {
+            "clientName": "WEB",
+            "clientVersion": "2.20250224.01.00",
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+                " AppleWebKit/605.1.15 (KHTML, like Gecko)"
+                " Version/17.4 Safari/605.1.15"
             ),
         },
     ),
@@ -495,8 +514,8 @@ def _enrich_client_context(client: dict[str, Any], profile_name: str) -> dict[st
 
 
 def _profiles_for_session(session: Optional["YouTubeSession"]) -> tuple[_ClientProfile, ...]:
-    """TV → MWEB → ANDROID → IOS → WEB; po_token unlocks full ladder."""
-    order = ("TVHTML5", "MWEB", "ANDROID", "IOS", "WEB")
+    """WEB_SAFARI HLS first, then mobile/TV fallbacks."""
+    order = ("WEB_SAFARI", "IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
     return tuple(_PROFILE_BY_NAME[n] for n in order if n in _PROFILE_BY_NAME)
 
 
@@ -809,7 +828,7 @@ def _collect_merged_innertube_info(
 ) -> Optional[dict[str, Any]]:
     """Merge formats from all InnerTube clients — ANDROID_VR muxed + IOS heights."""
     http = _http_for(session)
-    profile_order = ("IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
+    profile_order = ("WEB_SAFARI", "IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
     all_formats: list[dict[str, Any]] = []
     audio_fmt: Optional[dict[str, Any]] = None
     hls_url: Optional[str] = None
@@ -963,6 +982,7 @@ def innertube_extract_info(
     session: Optional["YouTubeSession"] = None,
     *,
     allow_session_refresh: bool = True,
+    preview_fast: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Resolve YouTube metadata + streams via merged InnerTube clients."""
     video_id = extract_video_id(url)
@@ -970,17 +990,41 @@ def innertube_extract_info(
         from services.youtube_session import youtube_session_from_settings
         session = youtube_session_from_settings(video_id=video_id)
 
+    if session and video_id and not session.po_token:
+        from services.youtube_session import resolve_video_po_token, YouTubeSession
+        auto_po = resolve_video_po_token(video_id)
+        if auto_po:
+            session = YouTubeSession(
+                visitor_data=session.visitor_data,
+                po_token=auto_po,
+                cookie_header=session.cookie_header,
+                cookies_from_browser=session.cookies_from_browser,
+                anonymous=session.anonymous,
+                cookie_file=session.cookie_file,
+                http_session=session.http_session,
+            )
+
     if not video_id:
         return None
 
-    read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
+    if preview_fast:
+        read_timeout = _PREVIEW_INNERTUBE_READ_SEC
+        wall_timeout = _PREVIEW_INNERTUBE_RACE_SEC
+    else:
+        read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
+        wall_timeout = _RACE_TIMEOUT_SEC
     profiles = _profiles_for_session(session)
-    info = _race_profiles(profiles, video_id, session, read_timeout, _RACE_TIMEOUT_SEC)
+    info = _race_profiles(profiles, video_id, session, read_timeout, wall_timeout)
     if info:
         _ensure_info_created_at(info, video_id, session)
         from services.youtube_diag import log_extract_ok
         log_extract_ok(video_id, "innertube_race", info, session)
         return info
+
+    if preview_fast:
+        from services.youtube_diag import log_extract_fail
+        log_extract_fail(video_id, "innertube_preview_race_miss", session)
+        return None
 
     info = _collect_merged_innertube_info(video_id, session, read_timeout)
     if info:
@@ -1061,4 +1105,5 @@ assert _is_sabr_stream_url("https://x.googlevideo.com/videoplayback?sabr=1")
 assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
 assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "fatal"
 assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
-assert _profiles_for_session(None)[0].name == "TVHTML5"
+assert _profiles_for_session(None)[0].name == "WEB_SAFARI"
+assert "WEB_SAFARI" in _PROFILE_BY_NAME

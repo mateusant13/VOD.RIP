@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -34,32 +35,62 @@ logger = logging.getLogger(__name__)
 
 SESSION_TTL_SEC = 30 * 60
 PLAYLIST_REWRITE_TTL_SEC = 20 * 60
-_MAX_PLAYLIST_FETCH_BYTES = 512 * 1024
+_MAX_PLAYLIST_FETCH_BYTES = 512 * 1024  # ponytail: non-streaming fetches only (keys/init)
+_MAX_REWRITTEN_PLAYLIST_BYTES = 32 * 1024 * 1024  # long YouTube VOD media playlists
 PREWARM_SEGMENT_COUNT = 5
-# ponytail: window HLS mux — single background job muxes entire crop window to local HLS
+# ponytail: window HLS mux — chunk at a time; full crop_end stays for trim UI/download
 WINDOW_HLS_SEGMENT_SEC = 4.0  # HLS segment target duration — short for fast first segment
+# ponytail: smaller seek remux window = faster out-of-chunk seeks. 20 s is enough
+# for a preview scrub and remuxes far quicker than the old 90/180 s windows.
+WINDOW_HLS_MUX_CHUNK_SEC = 20.0  # seek remux byte-window cap (VODs under 30 min)
+WINDOW_HLS_MUX_CHUNK_LONG_SEC = 40.0  # seek remux for long VODs — fewer remuxes
+WINDOW_HLS_LONG_VOD_MIN_SEC = 1800.0  # 30 min — use long seek window above this
+WINDOW_HLS_INITIAL_CHUNK_SEC = 2.0  # first-play chunk — smaller = faster seg0
+WINDOW_HLS_SHORT_VOD_MAX_SEC = 60.0  # mux entire crop on first play when trim ≤ this
+WINDOW_HLS_CACHE_MB = 500  # total disk budget for window-HLS segment cache
 WINDOW_HLS_MARKER = "youtube-window-hls:"  # resource_map marker for window HLS resources
 # ponytail: alias exposed for new code paths while old imports keep working
 YOUTUBE_WINDOW_HLS_MARKER = WINDOW_HLS_MARKER
 # resource IDs registered in session.resource_map for window HLS access
 WINDOW_HLS_PLAYLIST_RESOURCE = "window-playlist"
 WINDOW_HLS_SEGMENT_RESOURCE_PREFIX = "window-seg-"
-_RESOLVED_STREAM_TTL_SEC = 15 * 60
+# Signed googlevideo URLs expire in minutes — long cache recycles stale 403s.
+_RESOLVED_STREAM_TTL_SEC = 60
 _RESOLVED_STREAM_MAX = 64
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
 # In-flight YouTube warm keyed by canonical URL — create_session awaits paste warm.
 _YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
 _YOUTUBE_WARM_LOCK = threading.Lock()
+# ponytail: latest URL the user is actively previewing. Warm jobs check this
+# before doing heavy work and bail out cheaply if they're no longer relevant.
+# Without this, parallel warm jobs from the channel list steal INFO_EXECUTOR
+# workers away from the preview the user actually clicked.
+# Module-level + lock so it works across asyncio threads and executor threads.
+_ACTIVE_YOUTUBE_PREVIEW_KEY: Optional[str] = None
+_ACTIVE_YOUTUBE_PREVIEW_LOCK = threading.Lock()
+# Preflight window-HLS mux on URL paste — adopted by create_session when ready.
+_PREFLIGHT_MUX_INFLIGHT: Dict[str, threading.Event] = {}
+_PREFLIGHT_MUX_LOCK = threading.Lock()
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
 _UPSTREAM_CHUNK_BYTES = 64 * 1024
 _UPSTREAM_CONNECT_TIMEOUT_SEC = 15
 _PREVIEW_ROOT = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
+# ponytail: full-VOD mux cache persisted by video_id+quality
+_FULL_MUX_CACHE_DIR = _PREVIEW_ROOT / "full_mux_cache"
+FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
+
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+_DEFAULT_TWITCH_HEADERS: dict = {
+    "Referer": "https://www.twitch.tv/",
+    "Origin": "https://www.twitch.tv",
+    "User-Agent": _DEFAULT_UA,
+}
 
 _ALLOWED_HOST_SUFFIXES = (
     "kick.com",
@@ -142,7 +173,7 @@ class PreviewManager:
 
 
 
-    def create_session(self, 
+    def create_session(self,
             url: str,
             crop_start: float = 0.0,
             crop_end: float = 0.0,
@@ -201,9 +232,38 @@ class PreviewManager:
                             if int(fmt.get("height") or 0) > 0 and fmt.get("url")
                     ]
                     if kind == "hls":
-                            _apply_youtube_custom_master(session, variant_formats, yt_info)
+                            from services.ytdlp_hls import preview_fast_only_mode
+
+                            # YouTube-specific DASH/window-HLS master logic must not be
+                            # applied to Twitch/Kick HLS — it produces an invalid custom
+                            # master and the player never reaches canplay.
+                            if platform == "YouTube":
+                                    _apply_youtube_custom_master(session, variant_formats, yt_info)
+                            elif len(session.variant_entries) >= 2:
+                                    session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
                             for _height, upstream in session.variant_entries:
                                     session.allowed_hosts.update(_hosts_for_url(upstream))
+                            if (
+                                session.dash_window_hls
+                                and not preview_fast_only_mode()
+                            ):
+                                muxed = _youtube_muxed_progressive_for_long_explore(
+                                    session.vod_url, oauth, prefer_height,
+                                    yt_info=yt_info,
+                                )
+                                if muxed:
+                                    prog_url, prog_formats, prog_info = muxed
+                                    _apply_muxed_progressive_session(
+                                        session,
+                                        prog_url,
+                                        prog_formats,
+                                        prog_info,
+                                        prefer_height,
+                                    )
+                                    kind = "progressive"
+                                    variant_formats = prog_formats
+                                    yt_info = prog_info
+                                    proxy_master_url = session.master_url
             if kind == "progressive":
                     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
             elif session.custom_master:
@@ -216,8 +276,14 @@ class PreviewManager:
                     session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
                     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
 
+            if platform == "YouTube" and variant_formats:
+                _stash_youtube_preview_formats(
+                    session, variant_formats, yt_info, prefer_height, session.entry_url,
+                )
+
             with self._lock:
                     self._sessions[session_id] = session
+                    session.timing_created_mono = time.monotonic()
                     if len(self._sessions) > self._max_sessions:
                             stale = sorted(
                                     self._sessions.items(),
@@ -234,7 +300,20 @@ class PreviewManager:
                                     ).start()
 
             if _youtube_entry_needs_mux(session):
-                schedule_youtube_preview_mux(session_id)
+                cached_full = _try_use_full_mux_cache(session)
+                if cached_full:
+                    # Cached full-VOD mux is available. Mark the session as
+                    # progressive and remember the cached file path — the
+                    # proxy checks `cached_progressive_path` and serves the
+                    # local MP4 directly with HTTP Range support. Original
+                    # state (variant_entries, audio_url, etc.) is left
+                    # intact for diagnostics.
+                    session.kind = "progressive"
+                    session.dash_window_hls = False
+                    session.cached_progressive_path = str(cached_full)
+                    session.mux_status = "ready"
+                else:
+                    schedule_youtube_preview_mux(session_id)
 
             if kind == "progressive":
                     from services.youtube_diag import log_preview_session
@@ -270,8 +349,11 @@ class PreviewManager:
                                             )
 
             if session.dash_window_hls:
+                    _init_window_hls_mux_bounds(session)
                     schedule_youtube_window_hls_mux(session_id)
 
+            _enforce_full_mux_cache_budget()
+            _schedule_background_full_mux(session_id)
             threading.Thread(
                     target=_warm_and_prewarm_session,
                     args=(session_id, crop_start),
@@ -305,9 +387,16 @@ class PreviewSession:
     rewritten_playlists: Dict[str, Tuple[bytes, float]] = field(default_factory=dict)
     custom_master: Optional[str] = None
     kind: str = "hls"
+    # ponytail: when set, the proxy serves this local MP4 directly instead of
+    # the upstream stream. Original session state (variant_entries, audio_url,
+    # etc.) is preserved for diagnostics so we don't have to mutate multiple
+    # fields to flip a session to progressive.
+    cached_progressive_path: Optional[str] = None
     variant_entries: List[Tuple[int, str]] = field(default_factory=list)
     variant_muxed: Dict[int, bool] = field(default_factory=dict)
     preview_audio_url: Optional[str] = None
+    preview_audio_fmt: Optional[dict] = None
+    preview_video_fmt: Optional[dict] = None
     crop_start: float = 0.0
     crop_end: float = 0.0
     vod_duration: float = 0.0  # seconds from extract — clamps crop_end
@@ -317,7 +406,13 @@ class PreviewSession:
     mux_status: str = "unnecessary"  # unnecessary | pending | ready | error
     mux_error: Optional[str] = None
     dash_window_hls: bool = False  # YouTube DASH: crop window muxed to local HLS
+    window_hls_mux_start: float = 0.0  # active mux byte window (subset of crop)
+    window_hls_mux_end: float = 0.0
     prefer_height: int = 0  # last applied preview tier (0 = unset)
+    timing_created_mono: float = 0.0
+    timing_seg0_mono: float = 0.0
+    timing_last_seek_mono: float = 0.0
+    timing_last_seek_pos: float = 0.0
 
     def touch(self) -> None:
         self.last_access = time.time()
@@ -336,6 +431,24 @@ class PreviewSession:
             object.__setattr__(self, "prefer_height", 0)
         if not hasattr(self, "vod_duration"):
             object.__setattr__(self, "vod_duration", 0.0)
+        if not hasattr(self, "window_hls_mux_start"):
+            object.__setattr__(self, "window_hls_mux_start", 0.0)
+        if not hasattr(self, "window_hls_mux_end"):
+            object.__setattr__(self, "window_hls_mux_end", 0.0)
+        if not hasattr(self, "preview_audio_fmt"):
+            object.__setattr__(self, "preview_audio_fmt", None)
+        if not hasattr(self, "preview_video_fmt"):
+            object.__setattr__(self, "preview_video_fmt", None)
+        if not hasattr(self, "cached_progressive_path"):
+            object.__setattr__(self, "cached_progressive_path", None)
+        if not hasattr(self, "timing_created_mono"):
+            object.__setattr__(self, "timing_created_mono", 0.0)
+        if not hasattr(self, "timing_seg0_mono"):
+            object.__setattr__(self, "timing_seg0_mono", 0.0)
+        if not hasattr(self, "timing_last_seek_mono"):
+            object.__setattr__(self, "timing_last_seek_mono", 0.0)
+        if not hasattr(self, "timing_last_seek_pos"):
+            object.__setattr__(self, "timing_last_seek_pos", 0.0)
 
 
 def _vod_duration_from_info(info: Optional[dict]) -> float:
@@ -489,8 +602,10 @@ class PreviewMuxPending(RuntimeError):
 
 
 def _clear_preview_url_caches(session: PreviewSession) -> None:
-    session.resource_map.clear()
     session.rewritten_playlists.clear()
+    # ponytail: custom_master playlist lines reference resource_map IDs — never wipe alone.
+    if not session.custom_master:
+        session.resource_map.clear()
 
 
 def _remap_youtube_url_after_refresh(
@@ -498,9 +613,13 @@ def _remap_youtube_url_after_refresh(
     old_entry: str,
     old_variants: List[Tuple[int, str]],
     session: PreviewSession,
+    *,
+    old_audio_url: str = "",
 ) -> Optional[str]:
     if old_url == old_entry:
         return session.entry_url
+    if old_audio_url and old_url == old_audio_url and session.preview_audio_url:
+        return session.preview_audio_url
     for height, upstream in old_variants:
         if upstream == old_url:
             for h2, u2 in session.variant_entries:
@@ -519,8 +638,14 @@ def _youtube_refresh_and_remap(
         return None
     old_entry = session.entry_url
     old_variants = list(session.variant_entries)
-    _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
-    return _remap_youtube_url_after_refresh(failed_url, old_entry, old_variants, session)
+    old_audio = session.preview_audio_url or ""
+    if session.dash_window_hls:
+        _refresh_youtube_window_hls_urls(session, prefer_height=prefer_height)
+    else:
+        _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
+    return _remap_youtube_url_after_refresh(
+        failed_url, old_entry, old_variants, session, old_audio_url=old_audio,
+    )
 
 
 def _total_from_content_range(header: str) -> Optional[int]:
@@ -645,9 +770,26 @@ def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 
         oauth = settings_mgr.get().oauth or None
     except Exception:
         oauth = None
+    was_window = session.dash_window_hls
+    was_progressive = session.kind == "progressive"
+    _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
     raw_entry, headers, _platform, variant_formats, kind, yt_info = resolve_stream_info(
-        session.vod_url, oauth=oauth, prefer_height=prefer_height,
+        session.vod_url, oauth=oauth, prefer_height=prefer_height, force_fresh=True,
     )
+    # ponytail: a progressive session that is being refreshed (e.g. far seek in
+    # explore popup) must stay progressive so byte-range seek stays instant.
+    # DASH-only resolves now return window-HLS; force a muxed progressive fallback
+    # instead of making the user wait for a fresh seg0 mux on every seek.
+    if was_progressive and kind == "hls":
+        muxed = _youtube_muxed_progressive_for_long_explore(
+            session.vod_url, oauth, prefer_height, yt_info=yt_info,
+        )
+        if muxed:
+            prog_url, prog_formats, prog_info = muxed
+            _apply_muxed_progressive_session(
+                session, prog_url, prog_formats, prog_info, prefer_height,
+            )
+            return
     proxy_master_url: Optional[str] = None
     if kind == "progressive":
         proxy_master_url = f"/api/preview/hls/{session.session_id}/master.m3u8"
@@ -681,11 +823,16 @@ def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 
         except Exception:
             pass
     session.custom_master = None
-    session.dash_window_hls = False
     _clear_youtube_mux_cache(session)
-    _clear_youtube_window_hls_cache(session)
+    if was_window:
+        _clear_youtube_window_hls_cache(session)
+    else:
+        session.dash_window_hls = False
+        _clear_youtube_window_hls_cache(session)
     if kind == "hls":
         _apply_youtube_custom_master(session, variant_formats, yt_info)
+    elif was_window:
+        session.dash_window_hls = False
     for _height, upstream in session.variant_entries:
         session.allowed_hosts.update(_hosts_for_url(upstream))
     session.allowed_hosts.update(_hosts_for_url(session.entry_url))
@@ -697,8 +844,41 @@ def _refresh_youtube_preview_urls(session: PreviewSession, prefer_height: int = 
             session.variant_entries, prefer_height,
         ) or session.variant_entries[0][1]
         session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    _stash_youtube_preview_formats(
+        session, variant_formats, yt_info, prefer_height, session.entry_url,
+    )
     _clear_preview_url_caches(session)
     session.touch()
+
+
+def _pick_format_for_url(formats: List[dict], url: str, prefer_height: int) -> Optional[dict]:
+    for fmt in formats:
+        if fmt.get("url") == url:
+            return fmt
+    for fmt in formats:
+        if int(fmt.get("height") or 0) == prefer_height:
+            return fmt
+    for fmt in formats:
+        if int(fmt.get("height") or 0) > 0:
+            return fmt
+    return None
+
+
+def _stash_youtube_preview_formats(
+    session: PreviewSession,
+    variant_formats: List[dict],
+    yt_info: Optional[dict],
+    prefer_height: int,
+    entry_url: str,
+) -> None:
+    """Keep format metadata for byte-range mux when googlevideo URLs omit clen/dur."""
+    if yt_info:
+        audio = yt_info.get("_preview_audio_format")
+        session.preview_audio_fmt = audio if isinstance(audio, dict) else None
+        session.explore_yt_info = yt_info
+    session.preview_video_fmt = _pick_format_for_url(
+        variant_formats, entry_url, prefer_height,
+    )
 
 
 def _refresh_youtube_window_hls_urls(session: PreviewSession, prefer_height: int = 720) -> None:
@@ -710,8 +890,9 @@ def _refresh_youtube_window_hls_urls(session: PreviewSession, prefer_height: int
         oauth = settings_mgr.get().oauth or None
     except Exception:
         oauth = None
+    _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
     _raw, headers, _platform, variant_formats, _kind, yt_info = resolve_stream_info(
-        session.vod_url, oauth=oauth, prefer_height=prefer_height,
+        session.vod_url, oauth=oauth, prefer_height=prefer_height, force_fresh=True,
     )
     session.http_headers = _merge_youtube_session_cookies(headers, session.vod_url)
     session.variant_entries = [
@@ -734,6 +915,9 @@ def _refresh_youtube_window_hls_urls(session: PreviewSession, prefer_height: int
         if picked:
             session.entry_url = picked
             session.allowed_hosts.update(_hosts_for_url(picked))
+    _stash_youtube_preview_formats(
+        session, variant_formats, yt_info, prefer_height, session.entry_url,
+    )
     session.touch()
 
 
@@ -764,13 +948,19 @@ def _pick_mux_height(session: PreviewSession, *, fast: bool = True) -> int:
     if not fast:
         return prefer
     cap = _PREVIEW_MUX_FAST_HEIGHT
-    heights = sorted({h for h, _ in session.variant_entries if h > 0}, reverse=True)
+    heights = sorted({h for h, _ in session.variant_entries if h > 0})
     if not heights:
         return min(prefer, cap) or cap
-    for h in heights:
-        if h <= cap:
-            return h
-    return heights[-1]
+    # Fast mux should respect the requested preview height. If the user asked
+    # for 360p, don't silently upgrade to 480p just because it's under the cap.
+    target = min(prefer, cap)
+    at_or_below = [h for h in heights if h <= target]
+    if at_or_below:
+        return at_or_below[-1]
+    at_or_below_cap = [h for h in heights if h <= cap]
+    if at_or_below_cap:
+        return at_or_below_cap[-1]
+    return heights[0]
 
 
 def _variant_url_for_height(session: PreviewSession, height: int) -> Optional[str]:
@@ -798,7 +988,7 @@ def _youtube_mux_file_if_ready(session: PreviewSession) -> Optional[Path]:
 def preview_playlist_ready(session: PreviewSession) -> bool:
     """True when the player can attach (full VOD playlist or direct URL exists)."""
     if session.dash_window_hls:
-        return bool(session.custom_master)
+        return _window_hls_seg0_matches_bounds(session)
     if session.platform == "YouTube" and _youtube_entry_needs_mux(session):
         if session.mux_status == "ready" or _youtube_mux_file_if_ready(session):
             return True
@@ -809,7 +999,7 @@ def preview_playlist_ready(session: PreviewSession) -> bool:
 def preview_segment_buffer_ready(session: PreviewSession) -> bool:
     """True when the first playback segment is on disk (window HLS seg0 ready)."""
     if session.dash_window_hls:
-        return _window_hls_seg0_ready(session)
+        return _window_hls_seg0_matches_bounds(session)
     return preview_playlist_ready(session)
 
 
@@ -859,6 +1049,8 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
         "segment_buffer_ready": preview_segment_buffer_ready(session),
         "mux_status": session.mux_status,
         "mux_error": session.mux_error or "",
+        "window_hls_mux_start": float(getattr(session, "window_hls_mux_start", 0) or 0),
+        "window_hls_mux_end": float(getattr(session, "window_hls_mux_end", 0) or 0),
     }
 
 
@@ -904,10 +1096,188 @@ def _clear_youtube_mux_cache(session: PreviewSession) -> None:
         pass
 
 
+
+def _full_mux_cache_path(video_id: str, height: int, crop_start: float, crop_end: float) -> Path:
+    """Path to cached full-VOD mux — keyed by video_id and quality only.
+
+    The cache file covers the entire VOD so any subsequent trim window is
+    served via byte-range seeks against the same file. Older cache entries
+    with crop-range keys are no longer written; existing ones are tolerated
+    until TTL evicts them.
+    """
+    cache_key = f"{video_id}_{height}_full"
+    return _FULL_MUX_CACHE_DIR / f"{cache_key}.mp4"
+
+
+def _try_use_full_mux_cache(session: PreviewSession) -> Optional[Path]:
+    """Return cached full mux path if it exists and is within TTL."""
+    from services.youtube_innertube import extract_video_id
+    vid = extract_video_id(session.vod_url or "")
+    if not vid:
+        return None
+    height = session_active_height(session) or 720
+    cached = _full_mux_cache_path(vid, height, session.crop_start, session.crop_end)
+    if cached.is_file() and cached.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
+        age = time.time() - cached.stat().st_mtime
+        if age < FULL_MUX_CACHE_TTL_SEC:
+            return cached
+        try:
+            cached.unlink()
+        except OSError:
+            pass
+    return None
+
+
+
+def _enforce_full_mux_cache_budget(max_mb: int = 2000) -> None:
+    """LRU eviction for full-mux persistent cache — removes oldest files when budget exceeded."""
+    cache_dir = _FULL_MUX_CACHE_DIR
+    if not cache_dir.is_dir():
+        return
+    files = list(cache_dir.glob("*.mp4"))
+    if not files:
+        return
+    total = sum(f.stat().st_size for f in files if f.is_file())
+    max_bytes = max_mb * 1024 * 1024
+    if total <= max_bytes:
+        return
+    files.sort(key=lambda f: f.stat().st_mtime)
+    for f in files:
+        if total <= max_bytes:
+            break
+        try:
+            sz = f.stat().st_size
+            f.unlink()
+            total -= sz
+            logger.debug("full-mux cache evicted %s (%d MB), total now %d MB",
+                         f.name, sz // (1024 * 1024), total // (1024 * 1024))
+        except OSError:
+            continue
+
+
+def _schedule_background_full_mux(session_id: str) -> None:
+    """Kick off background job to mux full VOD at current quality to cache."""
+    session = get_session(session_id)
+    if not session or session.platform != "YouTube":
+        return
+    # CDN HLS already serves a muxed stream at the chosen tier — no mux needed.
+    # Window-HLS, on the other hand, serves tiny chunks and benefits from a
+    # background full-file mux so subsequent opens are instant from cache.
+    if session.kind == "hls" and not session.dash_window_hls:
+        return
+    if session.custom_master:
+        return
+    if not _youtube_entry_needs_mux(session):
+        return
+    from services.youtube_innertube import extract_video_id
+    vid = extract_video_id(session.vod_url or "")
+    if not vid:
+        return
+    height = session_active_height(session) or 720
+    cached = _full_mux_cache_path(vid, height, session.crop_start, session.crop_end)
+    if cached.is_file() and cached.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
+        return
+    threading.Thread(
+        target=_run_background_full_mux,
+        args=(session_id,),
+        daemon=True,
+        name=f"yt-full-mux-{session_id[:8]}",
+    ).start()
+
+
+# ponytail: MuxJob — single abstraction over the byte-range + ffmpeg pipeline.
+# Both clip (window-HLS) and full (persistent cache) modes share authentication,
+# retry, and validation logic through this struct. The actual download/mux
+# implementation lives in ytdlp_hls._download_muxed_dash_clip — only the window
+# and output path differ between modes.
+@dataclass
+class MuxJob:
+    video_url: str
+    audio_url: Optional[str]
+    output_path: Path
+    start_sec: float
+    end_sec: float
+    headers: Dict[str, str]
+    prefer_height: int
+    vod_url: str
+    job_kind: str  # "clip" | "full" — for logging + telemetry only
+    vod_duration: float = 0.0
+
+    def run(self) -> bool:
+        from services.ytdlp_hls import _download_muxed_dash_clip
+        try:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            _download_muxed_dash_clip(
+                self.video_url,
+                self.audio_url or "",
+                str(self.output_path),
+                start_sec=self.start_sec,
+                end_sec=self.end_sec,
+                headers=self.headers,
+                allow_remote_retry=True,
+            )
+            ok = (
+                self.output_path.is_file()
+                and self.output_path.stat().st_size >= MIN_VALID_OUTPUT_BYTES
+            )
+            if ok:
+                logger.info(
+                    "mux job done kind=%s height=%s bytes=%d start=%.1f end=%.1f",
+                    self.job_kind, self.prefer_height,
+                    self.output_path.stat().st_size, self.start_sec, self.end_sec,
+                )
+            return ok
+        except Exception as exc:
+            logger.debug("mux job failed kind=%s: %s", self.job_kind, exc)
+            return False
+
+
+def _mux_job_from_session(session: PreviewSession) -> Optional[MuxJob]:
+    """Build a clip-window MuxJob from an active preview session."""
+    from services.youtube_innertube import extract_video_id
+    vid = extract_video_id(session.vod_url or "")
+    if not vid:
+        return None
+    height = _pick_mux_height(session, fast=True)
+    out = _full_mux_cache_path(vid, height, session.crop_start, session.crop_end)
+    video_url = _variant_url_for_height(session, height) or session.entry_url
+    return MuxJob(
+        video_url=video_url,
+        audio_url=session.preview_audio_url,
+        output_path=out,
+        start_sec=max(0.0, float(session.crop_start)),
+        end_sec=max(float(session.crop_start) + 0.5, float(session.crop_end)),
+        headers=_merge_youtube_session_cookies(session.http_headers, session.vod_url),
+        prefer_height=height,
+        vod_url=session.vod_url,
+        job_kind="clip",
+    )
+
+
+def _run_background_full_mux(session_id: str) -> None:
+    """Background: mux the session's crop window to MP4 and persist to cache."""
+    session = get_session(session_id)
+    if not session:
+        return
+    job = _mux_job_from_session(session)
+    if job is None:
+        return
+    if job.output_path.is_file() and job.output_path.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
+        return
+    job.run()
+
+
 def _youtube_entry_needs_mux(session: PreviewSession) -> bool:
     if session.platform != "YouTube":
         return False
+    # Window-HLS already serves playable chunks via its own mux. We still want
+    # to kick off a background full-file mux at the user's chosen quality so
+    # re-opens of the same VOD are instant from cache (window-HLS cold-start
+    # is ~1-3s; cached full mux is <100ms).
     if session.dash_window_hls:
+        return bool(session.preview_audio_url) and bool(session.variant_entries)
+    # Synthetic / CDN HLS — hls.js proxies googlevideo; no full-file ffmpeg mux.
+    if session.kind == "hls" or session.custom_master:
         return False
     if session.preview_audio_url:
         height = session_active_height(session)
@@ -1098,6 +1468,15 @@ def open_progressive_proxy(
         raise ValueError("Preview session not found or expired")
     if session.kind != "progressive":
         raise ValueError("Preview session is not progressive")
+    # ponytail: cached full-VOD mux shortcut. The session was originally HLS
+    # (window-HLS) but a full mux finished in the background; flipping kind
+    # to progressive + setting cached_progressive_path is the bridge. Serve
+    # the local MP4 directly so the browser can do native byte-range seeks.
+    cached_path = getattr(session, "cached_progressive_path", None)
+    if cached_path:
+        p = Path(cached_path)
+        if p.is_file() and p.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
+            return _open_local_file_proxy(p, range_header)
     if _youtube_entry_needs_mux(session):
         from services.youtube_diag import log as yt_log
         ready = _youtube_mux_file_if_ready(session)
@@ -1467,6 +1846,29 @@ def _is_muxed_format(fmt: dict) -> bool:
     return True
 
 
+def _looks_like_direct_mp4_file(fmt: dict) -> bool:
+    """True for plain https/http MP4/MOV files even when codec metadata is missing.
+
+    Twitch clip formats from yt-dlp come through without vcodec/acodec, but the
+    URLs are direct progressive MP4s. This keeps them in the progressive pool
+    while staying conservative enough to avoid treating YouTube DASH video-only
+    MP4s as muxed previews.
+    """
+    proto = (fmt.get("protocol") or "").lower()
+    ext = (fmt.get("ext") or "").lower()
+    if proto and proto not in ("https", "http"):
+        return False
+    if ext not in ("mp4", "m4v", "mov"):
+        return False
+    url = (fmt.get("url") or "").lower()
+    if ".m3u8" in url or "/manifest" in url or ".mpd" in url:
+        return False
+    # Only trust codec-less MP4s for Twitch clip CDNs.
+    if "twitch.tv" not in url and "cloudfront.net" not in url:
+        return False
+    return True
+
+
 def _deduped_progressive_variants(info: dict) -> List[dict]:
     """Pick distinct heights from yt-dlp's progressive (direct MP4) formats.
 
@@ -1495,7 +1897,7 @@ def _deduped_progressive_variants(info: dict) -> List[dict]:
         fid = (f.get("format_id") or "").lower()
         if fid.startswith("portrait"):
             continue
-        if not _is_muxed_format(f):
+        if not _is_muxed_format(f) and not _looks_like_direct_mp4_file(f):
             continue
         progressive.append(f)
 
@@ -1517,6 +1919,93 @@ def _deduped_progressive_variants(info: dict) -> List[dict]:
         seen_urls.add(url)
         out.append(fmt)
     return out
+
+
+def _youtube_muxed_progressive_for_long_explore(
+    vod_url: str,
+    oauth: Optional[str],
+    prefer_height: int,
+    *,
+    yt_info: Optional[dict] = None,
+) -> Optional[Tuple[str, List[dict], dict]]:
+    """Fresh muxed URL for long-VOD explore — accepts sole low tier (360p) for byte-range seek."""
+    from services.youtube_innertube import _dedupe_youtube_formats
+
+    def _pick_from_info(info: dict) -> Optional[Tuple[str, List[dict], dict]]:
+        _resolve_youtube_preview_audio(info)
+        merged = _dedupe_youtube_formats(info.get("formats") or [])
+        muxed = _deduped_progressive_variants({"formats": merged})
+        if not muxed:
+            return None
+        prog_urls = [
+            (int(v.get("height") or 0), v.get("url") or "") for v in muxed
+        ]
+        prog_url = _pick_variant_by_height(prog_urls, prefer_height) or (
+            muxed[0].get("url") or ""
+        )
+        if not prog_url:
+            return None
+        out_info = dict(info)
+        picked = next((f for f in muxed if f.get("url") == prog_url), muxed[0])
+        if picked.get("http_headers"):
+            out_info["http_headers"] = {
+                **(out_info.get("http_headers") or {}),
+                **picked["http_headers"],
+            }
+        return prog_url, muxed, out_info
+
+    if yt_info:
+        picked = _pick_from_info(yt_info)
+        if picked:
+            return picked
+    try:
+        info = _reextract_youtube_for_preview(vod_url, oauth)
+    except Exception as exc:
+        logger.debug("long explore muxed re-extract: %s", exc)
+        return None
+    return _pick_from_info(info)
+
+
+def _apply_muxed_progressive_session(
+    session: PreviewSession,
+    prog_url: str,
+    prog_formats: List[dict],
+    prog_info: dict,
+    prefer_height: int,
+) -> None:
+    """Switch session from window-HLS/DASH to native progressive playback."""
+    session.kind = "progressive"
+    session.dash_window_hls = False
+    session.custom_master = None
+    session.master_url = f"/api/preview/hls/{session.session_id}/master.m3u8"
+    session.entry_url = prog_url
+    session.variant_entries = [
+        (int(fmt.get("height") or 0), fmt.get("url") or "")
+        for fmt in prog_formats
+        if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+    ]
+    session.variant_muxed = {
+        int(fmt.get("height") or 0): True
+        for fmt in prog_formats
+        if int(fmt.get("height") or 0) > 0
+    }
+    session.preview_audio_url = _resolve_youtube_preview_audio(prog_info)
+    if prog_info.get("http_headers"):
+        session.http_headers = _merge_youtube_session_cookies(
+            prog_info.get("http_headers") or session.http_headers,
+            session.vod_url,
+        )
+    for _height, upstream in session.variant_entries:
+        session.allowed_hosts.update(_hosts_for_url(upstream))
+    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    _clear_youtube_window_hls_cache(session)
+    _clear_youtube_mux_cache(session)
+    _stash_youtube_preview_formats(
+        session, prog_formats, prog_info, prefer_height, session.entry_url,
+    )
+    _clear_preview_url_caches(session)
+    session.mux_status = "ready"
+    session.mux_error = None
 
 
 def _url_looks_like_master(url: str) -> bool:
@@ -1600,8 +2089,23 @@ def _build_youtube_synthetic_hls_master(
     return "\n".join(lines) + "\n"
 
 
-def _youtube_needs_dash_window_hls(formats: List[dict], yt_info: Optional[dict]) -> bool:
-    """DASH-only (separate video+audio googlevideo HTTPS) — needs local HLS mux of crop window."""
+def _session_crop_span_sec(session: PreviewSession) -> float:
+    return max(0.0, float(session.crop_end) - float(session.crop_start))
+
+
+def session_trim_timeline(session: PreviewSession) -> bool:
+    """Clip-relative 0-based timeline — only short trim window-HLS, not full-VOD explore."""
+    return bool(
+        getattr(session, "dash_window_hls", False)
+        and _session_crop_span_sec(session) <= WINDOW_HLS_SHORT_VOD_MAX_SEC
+    )
+
+
+def _youtube_is_dash_separate_audio(
+    formats: List[dict],
+    yt_info: Optional[dict],
+) -> bool:
+    """True when YouTube only offers separate video+audio googlevideo HTTPS (no muxed tier)."""
     if not yt_info:
         return False
     _resolve_youtube_preview_audio(yt_info)
@@ -1614,12 +2118,32 @@ def _youtube_needs_dash_window_hls(formats: List[dict], yt_info: Optional[dict])
     return any(f.get("acodec") in ("none", None) for f in video_fmts)
 
 
+def _youtube_needs_dash_window_hls(
+    formats: List[dict],
+    yt_info: Optional[dict],
+    *,
+    crop_span_sec: float = WINDOW_HLS_SHORT_VOD_MAX_SEC,
+) -> bool:
+    """DASH-only — local ffmpeg HLS mux (short trim or long explore when synthetic MP4 fails).
+
+    ponytail: crop_span gate removed for long VOD — synthetic DASH master is not hls.js-playable.
+    Window HLS initial chunk is 8s; frontend must not block session open on seg0 poll.
+    """
+    if not _youtube_is_dash_separate_audio(formats, yt_info):
+        return False
+    return True
+
+
 def _apply_youtube_custom_master(
     session: PreviewSession,
     variant_formats: List[dict],
     yt_info: Optional[dict],
 ) -> None:
-    if _youtube_needs_dash_window_hls(variant_formats, yt_info):
+    if _youtube_needs_dash_window_hls(
+        variant_formats,
+        yt_info,
+        crop_span_sec=_session_crop_span_sec(session),
+    ):
         session.dash_window_hls = True
         session.resource_map = {
             k: v for k, v in session.resource_map.items()
@@ -1628,7 +2152,10 @@ def _apply_youtube_custom_master(
         session.custom_master = _build_youtube_window_hls_master(session)
         return
     session.dash_window_hls = False
-    if len(session.variant_entries) >= 2:
+    # ponytail: synthetic master points hls.js at raw googlevideo MP4 — not playable.
+    if len(session.variant_entries) >= 2 and not _youtube_is_dash_separate_audio(
+        variant_formats, yt_info,
+    ):
         session.custom_master = _build_synthetic_master_playlist(session, variant_formats)
     else:
         session.custom_master = None
@@ -1678,6 +2205,33 @@ def _window_hls_seg0_ready(session: PreviewSession) -> bool:
     if seg0.is_file() and seg0.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
         return True
     return False
+
+
+def _window_hls_mux_start_marker(session: PreviewSession) -> Path:
+    return _window_hls_dir(session) / ".mux_start"
+
+
+def _window_hls_seg0_matches_bounds(session: PreviewSession) -> bool:
+    """Seg0 on disk belongs to the session's current window_hls_mux_start (not a stale seek)."""
+    if not _window_hls_seg0_ready(session):
+        return False
+    marker = _window_hls_mux_start_marker(session)
+    if not marker.is_file():
+        return float(session.window_hls_mux_start or 0) < 0.01
+    try:
+        stamped = float(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return abs(stamped - float(session.window_hls_mux_start or 0)) < 0.01
+
+
+def _stamp_window_hls_mux_start(session: PreviewSession, start_sec: float) -> None:
+    try:
+        _window_hls_mux_start_marker(session).write_text(
+            f"{float(start_sec):.3f}", encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _window_hls_playlist_complete(session: PreviewSession) -> bool:
@@ -1735,35 +2289,382 @@ def _clear_youtube_window_hls_cache(session: PreviewSession) -> None:
         pass
 
 
-def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
-    """Background job — mux crop window [crop_start, crop_end] to local HLS.
 
-    Delegates the actual byte-window fetch + ffmpeg invocation to
-    :func:`services.ytdlp_hls._mux_dash_window_to_hls`, then registers the
-    window-playlist + segment resource IDs in ``session.resource_map``.
+def _enforce_window_hls_cache_budget(
+    session: PreviewSession,) -> None:
+    """Evict LRU window-HLS segments when total cache exceeds budget (default 500 MB)."""
+    out_dir = _window_hls_dir(session)
+    if not out_dir.is_dir():
+        return
+    segs = list(out_dir.glob("seg_[0-9][0-9][0-9].ts"))
+    if not segs:
+        return
+    total = sum(s.stat().st_size for s in segs if s.is_file())
+    max_bytes = WINDOW_HLS_CACHE_MB * 1024 * 1024
+    if total <= max_bytes:
+        return
+    segs.sort(key=lambda s: s.stat().st_mtime)
+    for s in segs:
+        if total <= max_bytes:
+            break
+        try:
+            sz = s.stat().st_size
+            s.unlink()
+            total -= sz
+            logger.debug("window-HLS evicted %s (%d bytes), cache now %d MB", s.name, sz, total // (1024 * 1024))
+        except OSError:
+            continue
 
-    Output: ``cache_dir/window_hls/window.m3u8`` (VOD playlist) + ``seg_NNN.ts``.
+
+def _window_hls_seek_chunk_sec(session: PreviewSession) -> float:
+    """Seek remux window — wider on long VODs to cut remux frequency."""
+    dur = float(session.vod_duration or 0)
+    if dur >= WINDOW_HLS_LONG_VOD_MIN_SEC:
+        return WINDOW_HLS_MUX_CHUNK_LONG_SEC
+    return WINDOW_HLS_MUX_CHUNK_SEC
+
+
+def _window_hls_mux_bounds(
+    session: PreviewSession,
+    *,
+    around_sec: Optional[float] = None,
+) -> Tuple[float, float]:
+    """Return [start, end) seconds to mux — capped chunk inside crop trim."""
+    crop_lo = max(0.0, float(session.crop_start))
+    crop_hi = max(crop_lo + 0.5, float(session.crop_end))
+    chunk = (
+        _window_hls_seek_chunk_sec(session)
+        if around_sec is not None
+        else WINDOW_HLS_INITIAL_CHUNK_SEC
+    )
+    if around_sec is not None:
+        pos = max(crop_lo, min(float(around_sec), crop_hi - 0.1))
+        # ponytail: put the target near the start of the chunk (one segment in)
+        # instead of in the middle. This makes the first buffered segment start
+        # close to the seek target, so the explicit currentTime seek lands on a
+        # keyframe and the user does not see pre-target content while the decoder
+        # catches up. The rest of the chunk still provides enough runway for
+        # playback.
+        start = max(crop_lo, pos - WINDOW_HLS_SEGMENT_SEC)
+        end = min(crop_hi, start + chunk)
+        if end - start < min(chunk, crop_hi - crop_lo):
+            start = max(crop_lo, end - chunk)
+        return start, end
+    span = crop_hi - crop_lo
+    if span <= WINDOW_HLS_SHORT_VOD_MAX_SEC:
+        return crop_lo, crop_hi
+    end = min(crop_hi, crop_lo + chunk)
+    return crop_lo, end
+
+
+def _init_window_hls_mux_bounds(session: PreviewSession) -> None:
+    start, end = _window_hls_mux_bounds(session)
+    session.window_hls_mux_start = start
+    session.window_hls_mux_end = end
+
+
+def _position_in_window_hls_mux(session: PreviewSession, position_sec: float) -> bool:
+    if session.window_hls_mux_end <= session.window_hls_mux_start:
+        return False
+    span = session.window_hls_mux_end - session.window_hls_mux_start
+    # ponytail: keep a one-segment safety margin, but never eat the whole short
+    # initial chunk (e.g. 3 s) — cap margin at 25 % of the current window.
+    margin = min(WINDOW_HLS_SEGMENT_SEC, max(0.5, span * 0.25))
+    return (
+        session.window_hls_mux_start - margin
+        <= float(position_sec)
+        < session.window_hls_mux_end - margin
+    )
+
+
+
+def _window_hls_bytes_cached(session: PreviewSession, position_sec: float) -> int:
+    """Bytes already on disk for a given position — used for seek detection.
+    
+    Returns the total bytes cached around *position_sec* within the active mux window.
+    A non-zero return means the browser can range-seek without a new remux.
     """
+    if not _window_hls_seg0_ready(session):
+        return 0
+    if not _position_in_window_hls_mux(session, position_sec):
+        return 0
+    total = 0
+    for seg in _window_hls_existing_segments(session):
+        try:
+            total += seg.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def youtube_window_hls_seek_remux(session_id: str, position_sec: float) -> bool:
+    """Remux a fresh chunk around *position_sec* when outside the active window."""
+    session = get_session(session_id)
+    if not session or not session.dash_window_hls:
+        return False
+    if _position_in_window_hls_mux(session, position_sec) and _window_hls_seg0_matches_bounds(session):
+        cached = _window_hls_bytes_cached(session, position_sec)
+        if cached > 0:
+            return False  # bytes already on disk — native range seek is instant
+    start, end = _window_hls_mux_bounds(session, around_sec=position_sec)
+    session.window_hls_mux_start = start
+    session.window_hls_mux_end = end
+    session.mux_status = "pending"
+    session.mux_error = None
+    height = _pick_mux_height(session, fast=True)
+    _refresh_youtube_window_hls_urls(session, prefer_height=height)
+    _clear_youtube_window_hls_cache(session)
+    with _WINDOW_HLS_LOCK:
+        _WINDOW_HLS_RUNNING.discard(session_id)
+    schedule_youtube_window_hls_mux(session_id)
+    return True
+
+
+def _preflight_mux_dir(video_id: str, prefer_height: int) -> Path:
+    return _PREVIEW_ROOT / "preflight" / f"{video_id}_{prefer_height}"
+
+
+def _preflight_seg0_ready(out_dir: Path) -> bool:
+    seg0 = out_dir / "seg_000.ts"
+    return seg0.is_file() and seg0.stat().st_size >= MIN_VALID_OUTPUT_BYTES
+
+
+def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
+    """Reuse paste-warm mux when crop starts at 0 and tier matches."""
+    from services.youtube_innertube import extract_video_id
+
+    if float(session.window_hls_mux_start) > 0.01:
+        return False
+    vid = extract_video_id(session.vod_url or "")
+    if not vid:
+        return False
+    height = int(session.prefer_height or 720)
+    src = _preflight_mux_dir(vid, height)
+    if not _preflight_seg0_ready(src):
+        return False
+    dst = _window_hls_dir(session)
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ("seg_000.ts", "window.m3u8", "_v.mp4", "_a.m4a"):
+        src_file = src / name
+        if src_file.is_file():
+            shutil.copy2(src_file, dst / name)
+    for seg in sorted(src.glob("seg_[0-9][0-9][0-9].ts")):
+        if seg.name == "seg_000.ts":
+            continue
+        shutil.copy2(seg, dst / seg.name)
+    return _window_hls_seg0_ready(session)
+
+
+def kickoff_youtube_preflight_mux(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 720,
+) -> None:
+    """Background mux of the initial window chunk — adopted on create_session."""
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id((url or "").strip())
+    if not vid:
+        return
+    key = f"{vid}:{prefer_height}"
+    with _PREFLIGHT_MUX_LOCK:
+        if key in _PREFLIGHT_MUX_INFLIGHT:
+            return
+        out_dir = _preflight_mux_dir(vid, prefer_height)
+        if _preflight_seg0_ready(out_dir):
+            return
+        done = threading.Event()
+        _PREFLIGHT_MUX_INFLIGHT[key] = done
+
+    def _run() -> None:
+        try:
+            _youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
+        finally:
+            with _PREFLIGHT_MUX_LOCK:
+                _PREFLIGHT_MUX_INFLIGHT.pop(key, None)
+            done.set()
+
+    from deps import INFO_EXECUTOR
+
+    INFO_EXECUTOR.submit(_run)
+
+
+def _youtube_preflight_mux(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 720,
+) -> bool:
+    """Mux [0, INITIAL_CHUNK) to preflight cache — no session required."""
+    from services.youtube_innertube import extract_video_id
     from services.ytdlp_hls import _mux_dash_window_to_hls
+
+    vid = extract_video_id((url or "").strip())
+    if not vid:
+        return False
+    out_dir = _preflight_mux_dir(vid, prefer_height)
+    if _preflight_seg0_ready(out_dir):
+        return True
+    try:
+        _raw, headers, platform, variant_formats, _kind, yt_info = resolve_stream_info(
+            url, oauth=oauth, prefer_height=prefer_height,
+        )
+    except Exception as exc:
+        logger.debug("preflight mux resolve skipped %s: %s", vid, exc)
+        return False
+    if platform != "YouTube" or not _youtube_needs_dash_window_hls(variant_formats, yt_info):
+        return False
+    _resolve_youtube_preview_audio(yt_info)
+    audio_fmt = yt_info.get("_preview_audio_format") if yt_info else None
+    audio_url = (audio_fmt or {}).get("url") or ""
+    video_url = _pick_variant_by_height(
+        [(int(f.get("height") or 0), f.get("url") or "") for f in variant_formats],
+        prefer_height=prefer_height,
+    ) or ""
+    if not video_url or not audio_url:
+        return False
+    video_fmt = next((f for f in variant_formats if f.get("url") == video_url), None)
+    mux_hdrs = _merge_youtube_session_cookies(headers, url)
+    end = WINDOW_HLS_INITIAL_CHUNK_SEC
+    vod_dur = float((yt_info or {}).get("duration") or 0)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _mux_dash_window_to_hls(
+            video_url,
+            audio_url,
+            str(out_dir),
+            start_sec=0.0,
+            end_sec=end,
+            headers=mux_hdrs,
+            video_fmt=video_fmt,
+            audio_fmt=audio_fmt if isinstance(audio_fmt, dict) else None,
+            vod_duration=vod_dur,
+        )
+    except Exception as exc:
+        logger.debug("preflight mux failed %s: %s", vid, exc)
+        return False
+    return _preflight_seg0_ready(out_dir)
+
+
+def _try_fallback_from_window_hls(session: PreviewSession, prefer_height: int = 720) -> bool:
+    """On window-HLS mux failure, switch to muxed HLS when InnerTube offers it."""
+    if not session.dash_window_hls or session.platform != "YouTube":
+        return False
+    try:
+        from deps import settings_mgr
+
+        oauth = settings_mgr.get().oauth or None
+    except Exception:
+        oauth = None
+    if _session_crop_span_sec(session) > WINDOW_HLS_SHORT_VOD_MAX_SEC:
+        muxed = _youtube_muxed_progressive_for_long_explore(
+            session.vod_url, oauth, prefer_height,
+            yt_info=getattr(session, "explore_yt_info", None),
+        )
+        if muxed:
+            prog_url, prog_formats, prog_info = muxed
+            _apply_muxed_progressive_session(
+                session, prog_url, prog_formats, prog_info, prefer_height,
+            )
+            logger.info(
+                "window hls fallback to progressive session=%s",
+                session.session_id[:8],
+            )
+            return True
+    _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
+    try:
+        raw_entry, headers, _platform, variant_formats, kind, yt_info = resolve_stream_info(
+            session.vod_url, oauth=oauth, prefer_height=prefer_height, force_fresh=True,
+        )
+    except Exception as exc:
+        logger.debug("window hls fallback resolve failed session=%s: %s", session.session_id[:8], exc)
+        return False
+    if _youtube_needs_dash_window_hls(
+        variant_formats, yt_info, crop_span_sec=_session_crop_span_sec(session),
+    ):
+        return False
+    session.kind = kind
+    session.entry_url = raw_entry
+    session.http_headers = _merge_youtube_session_cookies(headers, session.vod_url)
+    session.allowed_hosts = _hosts_for_url(raw_entry)
+    session.variant_entries = [
+        (int(fmt.get("height") or 0), fmt.get("url") or "")
+        for fmt in variant_formats
+        if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+    ]
+    session.variant_muxed = {
+        int(fmt.get("height") or 0): fmt.get("acodec") not in ("none", None)
+        for fmt in variant_formats
+        if int(fmt.get("height") or 0) > 0
+    }
+    session.preview_audio_url = _resolve_youtube_preview_audio(yt_info)
+    session.dash_window_hls = False
+    session.custom_master = None
+    _clear_youtube_window_hls_cache(session)
+    _clear_youtube_mux_cache(session)
+    proxy_master_url: Optional[str] = None
+    if kind == "progressive":
+        proxy_master_url = f"/api/preview/hls/{session.session_id}/master.m3u8"
+    session.master_url = proxy_master_url or raw_entry
+    if kind == "hls":
+        _apply_youtube_custom_master(session, variant_formats, yt_info)
+        for _height, upstream in session.variant_entries:
+            session.allowed_hosts.update(_hosts_for_url(upstream))
+    if kind == "progressive":
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    elif session.custom_master and session.variant_entries:
+        session.entry_url = _pick_variant_by_height(
+            session.variant_entries, prefer_height,
+        ) or session.variant_entries[0][1]
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    elif kind == "hls" and not session.custom_master:
+        session.entry_url = _resolve_preview_entry(session, raw_entry, prefer_height)
+        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+    _stash_youtube_preview_formats(
+        session, variant_formats, yt_info, prefer_height, session.entry_url,
+    )
+    _clear_preview_url_caches(session)
+    session.mux_status = "ready"
+    session.mux_error = None
+    logger.info(
+        "window hls fallback to %s session=%s",
+        kind,
+        session.session_id[:8],
+    )
+    return True
+
+
+def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
+    """Background job — mux a capped chunk of the crop window to local HLS.
+
+    Full ``crop_end`` stays on the session for trim UI; only
+    ``window_hls_mux_start/end`` (capped chunk) are fetched/muxed per pass.
+    Seek remux recenters the chunk via :func:`youtube_window_hls_seek_remux`.
+    """
+    from services.ytdlp_hls import StaleGooglevideoUrl, _mux_dash_window_to_hls
 
     if not session.dash_window_hls:
         return False
     out_dir = _window_hls_dir(session)
-    playlist = _window_hls_playlist_path(session)
-    if _window_hls_seg0_ready(session):
+    if _window_hls_seg0_matches_bounds(session):
+        _register_youtube_window_hls_resources(session)
+        return True
+    if _try_adopt_preflight_mux(session):
+        _stamp_window_hls_mux_start(session, float(session.window_hls_mux_start or 0))
         _register_youtube_window_hls_resources(session)
         return True
     out_dir.mkdir(parents=True, exist_ok=True)
-    start = max(0.0, float(session.crop_start))
-    end = max(start + 0.5, float(session.crop_end))
+    if session.window_hls_mux_end <= session.window_hls_mux_start:
+        _init_window_hls_mux_bounds(session)
+    start = max(0.0, float(session.window_hls_mux_start))
+    end = max(start + 0.5, float(session.window_hls_mux_end))
     height = _pick_mux_height(session, fast=True)
+    _refresh_youtube_window_hls_urls(session, prefer_height=height)
     video_url = _variant_url_for_height(session, height) or session.entry_url
     audio_url = session.preview_audio_url or ""
     if not audio_url:
-        _refresh_youtube_window_hls_urls(session, prefer_height=height)
-        audio_url = session.preview_audio_url or ""
-    if not audio_url or not video_url:
-        raise RuntimeError("YouTube window HLS missing video/audio URL")
+        raise RuntimeError("YouTube window HLS missing audio URL")
+    if not video_url:
+        raise RuntimeError("YouTube window HLS missing video URL")
     if not _hosts_for_url(video_url) & session.allowed_hosts:
         session.allowed_hosts.update(_hosts_for_url(video_url))
     if not _hosts_for_url(audio_url) & session.allowed_hosts:
@@ -1779,6 +2680,9 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
                 start_sec=start,
                 end_sec=end,
                 headers=mux_hdrs,
+                video_fmt=getattr(session, "preview_video_fmt", None),
+                audio_fmt=getattr(session, "preview_audio_fmt", None),
+                vod_duration=float(session.vod_duration or 0),
             )
             last_exc = None
             break
@@ -1800,9 +2704,13 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
                 continue
             break
     if last_exc is not None:
+        if isinstance(last_exc, StaleGooglevideoUrl) or "403" in str(last_exc):
+            if _try_fallback_from_window_hls(session, prefer_height=height):
+                return True
         raise last_exc
+    _stamp_window_hls_mux_start(session, start)
     _register_youtube_window_hls_resources(session)
-    return _window_hls_seg0_ready(session)
+    return _window_hls_seg0_matches_bounds(session)
 
 
 def schedule_youtube_window_hls_mux(session_id: str) -> None:
@@ -1817,7 +2725,7 @@ def schedule_youtube_window_hls_mux(session_id: str) -> None:
             session = get_session(session_id)
             if not session or not session.dash_window_hls:
                 return
-            if _window_hls_seg0_ready(session):
+            if _window_hls_seg0_matches_bounds(session):
                 session.mux_status = "ready"
                 return
             session.mux_status = "pending"
@@ -1827,7 +2735,34 @@ def schedule_youtube_window_hls_mux(session_id: str) -> None:
                 session.mux_status = "ready" if ok else "pending"
                 if not ok and not session.mux_error:
                     session.mux_error = "window HLS mux produced no seg0"
+                if ok and _window_hls_seg0_matches_bounds(session):
+                    now = time.monotonic()
+                    if session.timing_seg0_mono <= 0:
+                        session.timing_seg0_mono = now
+                        from services.preview_timing import (
+                            log_server_seg0_ready,
+                            log_server_seek_seg0,
+                        )
+                        created = session.timing_created_mono or now
+                        if (
+                            session.timing_last_seek_mono > 0
+                            and session.timing_last_seek_mono >= created
+                        ):
+                            log_server_seek_seg0(
+                                session,
+                                since_seek_ms=(now - session.timing_last_seek_mono) * 1000.0,
+                                position_sec=session.timing_last_seek_pos,
+                            )
+                        else:
+                            log_server_seg0_ready(
+                                session,
+                                since_create_ms=(now - created) * 1000.0,
+                            )
             except Exception as exc:
+                if _try_fallback_from_window_hls(
+                    session, prefer_height=session.prefer_height or 720,
+                ):
+                    return
                 session.mux_status = "error"
                 session.mux_error = str(exc)[:240]
                 logger.warning(
@@ -2035,6 +2970,31 @@ def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
         _RESOLVED_STREAM_CACHE[key] = (time.time(), value)
 
 
+def invalidate_resolved_stream_cache(
+    url: str,
+    prefer_height: int = 720,
+) -> None:
+    """Drop cached resolve for *url* — refresh must not recycle expired googlevideo URLs."""
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id((url or "").strip())
+    if not vid:
+        return
+    key = f"{vid}:{prefer_height}:v2"
+    with _RESOLVED_STREAM_LOCK:
+        _RESOLVED_STREAM_CACHE.pop(key, None)
+
+
+def _invalidate_youtube_resolve_caches(
+    url: str,
+    prefer_height: int = 720,
+) -> None:
+    from services.ytdlp_hls import invalidate_youtube_extract_cache
+
+    invalidate_youtube_extract_cache(url)
+    invalidate_resolved_stream_cache(url, prefer_height)
+
+
 def _youtube_warm_inflight_key(url: str) -> str:
     """Dedup paste warm + create_session await on video id, not shorts vs watch URL."""
     from services.youtube_innertube import extract_video_id
@@ -2049,6 +3009,10 @@ def kickoff_youtube_warm(
     cookies_file: Optional[str] = None,
 ) -> None:
     """Fire-and-forget warm on URL paste — deduped per canonical URL."""
+    from services.ytdlp_hls import preview_fast_only_mode
+
+    if preview_fast_only_mode():
+        return
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
@@ -2059,19 +3023,19 @@ def kickoff_youtube_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
-        ok = False
         try:
+            # Bail out cheaply if the user has moved on to a different VOD.
+            # This keeps stale warm jobs from hogging INFO_EXECUTOR workers.
+            with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
+                active = _ACTIVE_YOUTUBE_PREVIEW_KEY
+            if active is not None and active != key:
+                logger.debug("YouTube warm bailing — active preview is %s", active[:80])
+                return
             from services.ytdlp_hls import warm_youtube_extract
 
-            ok = warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
+            warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
         finally:
-            if not ok:
-                try:
-                    from services.youtube_session import invalidate_anonymous_session
-
-                    invalidate_anonymous_session()
-                except Exception:
-                    pass
+            # ponytail: failed warm on slow VOD must not nuke session before create_session runs
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
             if ev is not None:
@@ -2082,8 +3046,96 @@ def kickoff_youtube_warm(
     INFO_EXECUTOR.submit(_run)
 
 
-def await_youtube_warm_if_pending(url: str, timeout_sec: float = 45.0) -> None:
-    """Block create_session until an in-flight paste warm finishes."""
+def kickoff_youtube_full_mux_warm(
+    url: str,
+    oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+    prefer_height: int = 720,
+) -> None:
+    """ponytail: hover-triggered full-VOD mux. Resolves the URL's variants and
+    muxes the full VOD to the persistent cache in a daemon thread. If the user
+    opens the preview before the mux finishes, the session falls back to
+    window-HLS and the cache lands for next time.
+
+    Respects the active-preview marker so we don't steal workers when the user
+    has already opened a different VOD.
+    """
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id(url or "")
+    if not vid:
+        return
+    cache_path = _full_mux_cache_path(vid, prefer_height, 0.0, 0.0)
+    if cache_path.is_file() and cache_path.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
+        return
+    key = _youtube_warm_inflight_key(url)
+    if not key:
+        return
+
+    def _run() -> None:
+        with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
+            active = _ACTIVE_YOUTUBE_PREVIEW_KEY
+        if active is not None and active != key:
+            logger.debug("full-mux warm bailing — active preview is %s", active[:80])
+            return
+        try:
+            from services.ytdlp_hls import warm_youtube_extract
+
+            if not warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file):
+                return
+            try:
+                _entry, headers, _platform, variant_formats, _kind, yt_info = (
+                    resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+                )
+            except Exception as exc:
+                logger.debug("full-mux warm resolve failed for %s: %s", url[:80], exc)
+                return
+            audio_url = _resolve_youtube_preview_audio(yt_info) if yt_info else None
+            variant_url = None
+            for f in (variant_formats or []):
+                if int(f.get("height") or 0) == prefer_height and f.get("url"):
+                    variant_url = f["url"]
+                    break
+            if not variant_url:
+                return
+            vod_dur = 0.0
+            if yt_info:
+                try:
+                    vod_dur = float(yt_info.get("duration") or 0)
+                except (TypeError, ValueError):
+                    vod_dur = 0.0
+            MuxJob(
+                video_url=variant_url,
+                audio_url=audio_url,
+                output_path=cache_path,
+                start_sec=0.0,
+                end_sec=max(0.5, vod_dur),
+                headers=headers or {},
+                prefer_height=prefer_height,
+                vod_url=url,
+                job_kind="full",
+                vod_duration=vod_dur,
+            ).run()
+        except Exception as exc:
+            logger.debug("full-mux warm failed for %s: %s", url[:80], exc)
+
+    threading.Thread(target=_run, daemon=True, name=f"yt-hover-mux-{vid}").start()
+
+
+def set_active_youtube_preview(url: Optional[str]) -> None:
+    """Mark which URL the user is actively previewing. Warm jobs for other URLs
+    will skip their yt-dlp probe when they wake up."""
+    global _ACTIVE_YOUTUBE_PREVIEW_KEY
+    try:
+        key = _youtube_warm_inflight_key(url) if url else None
+        with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
+            _ACTIVE_YOUTUBE_PREVIEW_KEY = key
+    except Exception:
+        pass
+
+
+def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:
+    """Briefly reuse paste warm; never let warm make preview feel stuck."""
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
@@ -2101,6 +3153,7 @@ def warm_youtube_preview_resolve(
     """Populate resolved-stream cache on hover — same path as create_session."""
     try:
         resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+        kickoff_youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
         return True
     except Exception as exc:
         logger.debug("YouTube warm resolve skipped for %s: %s", url[:80], exc)
@@ -2111,6 +3164,8 @@ def resolve_stream_info(
     url: str,
     oauth: Optional[str] = None,
     prefer_height: int = 720,
+    *,
+    force_fresh: bool = False,
 ) -> Tuple[str, dict, str, List[dict], str, Optional[dict]]:
     """Return (master_url, headers, platform, variant_formats, kind, yt_info).
 
@@ -2144,43 +3199,42 @@ def resolve_stream_info(
 
         full_url = canonical_youtube_watch_url(full_url) or full_url
 
-    # Twitch clips — prefer yt-dlp for progressive MP4 resolution.
-    # yt-dlp uses OAuth tokens (when available) for authenticating CDN requests.
-    # GQL is used as a fast fallback when yt-dlp fails.
+    # Twitch clips — fast signed GQL path with yt-dlp fallback.
+    # GQL's sourceURLs need a sig/token query string; VideoAccessToken_Clip
+    # returns both, so we can avoid the slow yt-dlp extract in the hot path.
     if platform == "Twitch" and is_clip_url(url):
         variants: List[dict] = []
-        headers: dict = {
-            "Referer": "https://www.twitch.tv/",
-            "Origin": "https://www.twitch.tv",
-        }
+        headers: dict = dict(_DEFAULT_TWITCH_HEADERS)
 
-        # yt-dlp first — uses OAuth and returns accessible MP4 URLs.
+        from services.twitch_gql_service import _extract_clip_slug, get_clip_signed_variants_sync
+
+        slug = _extract_clip_slug(url)
+        cache_key = f"twclip:{slug}:{prefer_height}" if slug else None
+        if cache_key and not force_fresh:
+            cached = _get_resolved_stream_cached(cache_key)
+            if cached is not None:
+                return cached
+
         try:
-            opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
-            clip_info = _extract_hls_info(full_url, opts)
-            variants = _deduped_progressive_variants(clip_info)
-            first_with_headers = next(
-                (v for v in variants if v.get("http_headers")), None
-            )
-            if first_with_headers:
-                headers = first_with_headers.get("http_headers") or {}
-            else:
-                headers = clip_info.get("http_headers") or headers
-        # ponytail: survival guarantee for yt-dlp resolve — best-effort fallback; GQL is next
+            variants = get_clip_signed_variants_sync(url)
         except Exception as exc:
-        # ponytail: best-effort — network errors only
-            logger.debug("Twitch clip yt-dlp resolve failed: %s", exc)
+            logger.debug("Twitch clip signed GQL resolve failed: %s", exc)
 
-        # GQL fallback — faster but URLs may require auth cookies.
+        # yt-dlp fallback — slower, may provide working URLs if GQL/auth fails.
         if not variants:
             try:
-                from services.twitch_gql_service import get_clip_progressive_variants_sync
-
-                variants = get_clip_progressive_variants_sync(url)
-            # ponytail: survival guarantee for GQL fallback — best-effort; clip will fail with RuntimeError if both resolvers fail
+                opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+                clip_info = _extract_hls_info(full_url, opts)
+                variants = _deduped_progressive_variants(clip_info)
+                first_with_headers = next(
+                    (v for v in variants if v.get("http_headers")), None
+                )
+                if first_with_headers:
+                    headers = first_with_headers.get("http_headers") or {}
+                else:
+                    headers = clip_info.get("http_headers") or headers
             except Exception as exc:
-            # ponytail: best-effort — variants = get_clip_progressive_variants_sync(url)
-                logger.debug("Twitch clip GQL fallback failed: %s", exc)
+                logger.debug("Twitch clip yt-dlp fallback failed: %s", exc)
 
         if not variants:
             raise RuntimeError("Twitch clip has no progressive formats")
@@ -2190,7 +3244,10 @@ def resolve_stream_info(
         )
         if not chosen_url:
             raise RuntimeError("Twitch clip has no progressive URL")
-        return chosen_url, headers, platform, variants, "progressive", None
+        result = (chosen_url, headers, platform, variants, "progressive", None)
+        if cache_key and not force_fresh:
+            _put_resolved_stream_cache(cache_key, result)
+        return result
 
     if platform == "YouTube":
         from services.youtube_innertube import _dedupe_youtube_formats, extract_video_id
@@ -2200,11 +3257,18 @@ def resolve_stream_info(
         vid = extract_video_id(full_url)
         if vid:
             cache_key = f"{vid}:{prefer_height}:v2"
-            cached = _get_resolved_stream_cached(cache_key)
-            if cached is not None:
-                return cached
+            if force_fresh:
+                _invalidate_youtube_resolve_caches(full_url, prefer_height)
+            else:
+                cached = _get_resolved_stream_cached(cache_key)
+                if cached is not None:
+                    return cached
 
-        info = _extract_youtube_preview_info(full_url, oauth)
+        info = (
+            _reextract_youtube_for_preview(full_url, oauth)
+            if force_fresh
+            else _extract_youtube_preview_info(full_url, oauth)
+        )
         _resolve_youtube_preview_audio(info)
         if _youtube_info_is_dash_only_progressive(info):
             try:
@@ -2240,22 +3304,20 @@ def resolve_stream_info(
                 entry_url=entry,
             )
             result = (entry, headers, platform, variants, kind, info)
-            if cache_key:
+            if cache_key and not force_fresh:
                 _put_resolved_stream_cache(cache_key, result)
             return result
 
         # MP4 (muxed progressive) → muxed HLS → DASH window HLS (ffmpeg last resort).
         muxed_hls = [f for f in hls_variants if _is_muxed_format(f)]
         muxed_with_height = [f for f in muxed_hls if int(f.get("height") or 0) > 0]
-        video_heights_all = [f for f in merged if int(f.get("height") or 0) > 0]
-        max_video_h = max((int(f.get("height") or 0) for f in video_heights_all), default=0)
         muxed_progressive = _deduped_progressive_variants({"formats": merged})
-        # ponytail: one low progressive tier (e.g. 360p) hides 720p/1080p DASH/HLS ladder
-        if muxed_progressive and len(muxed_progressive) < 2:
-            max_prog_h = max(int(f.get("height") or 0) for f in muxed_progressive)
-            if max_video_h > max_prog_h:
-                muxed_progressive = []
-        if muxed_progressive:
+        # ponytail: use any available muxed progressive tier for instant preview.
+        # For DASH-only VODs the lone 360p muxed tier is fast but leaves the quality
+        # menu with only one option; fall through to window-HLS so all adaptive
+        # video heights are exposed. Higher tiers are still reachable later via
+        # POST /quality on genuinely muxed sources.
+        if muxed_progressive and not _youtube_is_dash_separate_audio(merged, info):
             prog_urls = [
                 (int(v.get("height") or 0), v.get("url") or "") for v in muxed_progressive
             ]
@@ -2379,6 +3441,25 @@ def resolve_stream_info(
         )
         raise RuntimeError("YouTube video has no playable stream URL")
 
+    # Twitch VODs — fast GQL + Usher path; fall back to yt-dlp if auth/geo fails.
+    if platform == "Twitch" and not is_clip_url(url):
+        try:
+            from services.twitch_gql_service import get_vod_playback_sync
+
+            master_url, vod_headers, vod_variants = get_vod_playback_sync(url)
+            with_height = [v for v in vod_variants if int(v.get("height") or 0) > 0]
+            if master_url:
+                return (
+                    master_url,
+                    vod_headers,
+                    platform,
+                    with_height or vod_variants,
+                    "hls",
+                    None,
+                )
+        except Exception as exc:
+            logger.debug("Twitch VOD GQL resolve failed, falling back to yt-dlp: %s", exc)
+
     opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
     hls_info = _extract_hls_info(full_url, opts)
     variants = _deduped_hls_variants(hls_info)
@@ -2482,6 +3563,18 @@ def _proxy_url(session: PreviewSession, upstream: str) -> str:
     return f"/api/preview/hls/{session.session_id}/resource?id={rid}"
 
 
+def _rebuild_synthetic_resource_map(session: PreviewSession) -> None:
+    """Re-register googlevideo URLs when resource_map was cleared but master text remains."""
+    if not session.custom_master:
+        return
+    for _height, url in session.variant_entries:
+        if url:
+            _resource_id(session, url)
+    audio = session.preview_audio_url or ""
+    if audio:
+        _resource_id(session, audio)
+
+
 def _parse_playlist_assets(text: str, playlist_url: str) -> Tuple[list[str], list[str]]:
     """Return (init/key URLs, media segment URLs in playlist order)."""
     base = playlist_url.rsplit("/", 1)[0] + "/"
@@ -2519,26 +3612,76 @@ def _segment_index_for_time(text: str, target_sec: float) -> int:
     return max(0, index - 1)
 
 
+def _rewrite_playlist_line(
+    line: str,
+    session: PreviewSession,
+    playlist_url: str,
+    base: str,
+) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return line
+    if stripped.startswith("#"):
+        if 'URI="' in stripped:
+            def _sub(m: re.Match) -> str:
+                abs_url = urljoin(playlist_url, m.group(1))
+                return f'URI="{_proxy_url(session, abs_url)}"'
+            return _URI_IN_TAG.sub(_sub, line)
+        return line
+    abs_url = urljoin(base, stripped)
+    return _proxy_url(session, abs_url)
+
+
 def _rewrite_playlist(content: str, session: PreviewSession, playlist_url: str) -> str:
     base = playlist_url.rsplit("/", 1)[0] + "/"
-    out: list[str] = []
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            out.append(line)
-            continue
-        if stripped.startswith("#"):
-            if 'URI="' in stripped:
-                def _sub(m: re.Match) -> str:
-                    abs_url = urljoin(playlist_url, m.group(1))
-                    return f'URI="{_proxy_url(session, abs_url)}"'
-                out.append(_URI_IN_TAG.sub(_sub, line))
-            else:
-                out.append(line)
-            continue
-        abs_url = urljoin(base, stripped)
-        out.append(_proxy_url(session, abs_url))
+    out = [
+        _rewrite_playlist_line(line, session, playlist_url, base)
+        for line in content.splitlines()
+    ]
     return "\n".join(out) + "\n"
+
+
+def _fetch_and_rewrite_playlist_streaming(
+    session: PreviewSession,
+    upstream_url: str,
+) -> Tuple[bytes, int]:
+    """Stream upstream m3u8 and rewrite line-by-line (long VOD playlists exceed 512KB)."""
+    base = upstream_url.rsplit("/", 1)[0] + "/"
+    resp = _open_upstream_stream(session, upstream_url)
+    out = bytearray()
+    status = resp.status_code
+    pending = ""
+    try:
+        for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+            if not chunk:
+                continue
+            pending += chunk.decode("utf-8", errors="replace")
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                rewritten = _rewrite_playlist_line(line, session, upstream_url, base)
+                row = (rewritten + "\n").encode("utf-8")
+                if len(out) + len(row) > _MAX_REWRITTEN_PLAYLIST_BYTES:
+                    raise RuntimeError(
+                        f"Rewritten playlist exceeds {_MAX_REWRITTEN_PLAYLIST_BYTES} byte cap",
+                    )
+                out.extend(row)
+        if pending:
+            rewritten = _rewrite_playlist_line(pending, session, upstream_url, base)
+            row = (rewritten + "\n").encode("utf-8")
+            if len(out) + len(row) > _MAX_REWRITTEN_PLAYLIST_BYTES:
+                raise RuntimeError(
+                    f"Rewritten playlist exceeds {_MAX_REWRITTEN_PLAYLIST_BYTES} byte cap",
+                )
+            out.extend(row)
+    finally:
+        try:
+            resp.close()
+        except OSError:
+            pass
+    if not out:
+        raise RuntimeError("Upstream playlist is empty")
+    session.touch()
+    return bytes(out), status
 
 
 def _cache_path(session: PreviewSession, url: str) -> Path:
@@ -2785,6 +3928,9 @@ def resolve_upstream(session_id: str, resource_id: Optional[str]) -> str:
     ):
         _register_youtube_window_hls_resources(session)
     upstream = session.resource_map.get(resource_id)
+    if not upstream and session.custom_master:
+        _rebuild_synthetic_resource_map(session)
+        upstream = session.resource_map.get(resource_id)
     if not upstream:
         raise ValueError("Unknown preview resource")
     return upstream
@@ -2841,18 +3987,16 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
     if cached and now - cached[1] < PLAYLIST_REWRITE_TTL_SEC:
         return cached[0], "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, 200
 
-    data, _, _, status = _http_get_bytes(session, upstream_url)
-
-    if not data:
-        raise RuntimeError("Upstream playlist is empty")
-
-    if data.lstrip().startswith(b"#EXTM3U") or _is_playlist_url(upstream_url):
-        text = data.decode("utf-8", errors="replace")
-        rewritten = _rewrite_playlist(text, session, upstream_url)
-        data = rewritten.encode("utf-8")
+    if _is_playlist_url(upstream_url):
+        data, status = _fetch_and_rewrite_playlist_streaming(session, upstream_url)
+        if not data.lstrip().startswith(b"#EXTM3U"):
+            raise RuntimeError("Upstream playlist body is not HLS m3u8")
         cache[upstream_url] = (data, now)
         return data, "application/vnd.apple.mpegurl", {"Cache-Control": "no-cache"}, status
 
+    data, _, _, status = _http_get_bytes(session, upstream_url)
+    if not data:
+        raise RuntimeError("Upstream playlist is empty")
     ctype = _guess_content_type(upstream_url)
     return data, ctype, {"Cache-Control": "no-cache"}, status
 
@@ -2908,7 +4052,7 @@ _window_pl_sess = PreviewSession(
     cache_dir=Path("/tmp"), crop_start=0, crop_end=60, dash_window_hls=True,
     custom_master="#EXTM3U\n",
 )
-assert preview_playlist_ready(_window_pl_sess)
+assert not preview_playlist_ready(_window_pl_sess)
 # mux_ready requires on-disk seg0; custom_master alone does not flip mux_ready
 assert not preview_mux_ready(_window_pl_sess)
 assert not preview_segment_buffer_ready(_window_pl_sess)
@@ -2927,6 +4071,12 @@ assert not _youtube_info_is_dash_only_progressive({
 assert _youtube_needs_dash_window_hls(
     _dash_only["formats"],
     {"_preview_audio_format": {"url": "https://x/a.m4a"}},
+    crop_span_sec=30,
+)
+assert _youtube_needs_dash_window_hls(
+    _dash_only["formats"],
+    {"_preview_audio_format": {"url": "https://x/a.m4a"}},
+    crop_span_sec=120,
 )
 assert not _youtube_needs_dash_window_hls(_dash_only["formats"], {})
 _window_sess = PreviewSession(
@@ -2939,6 +4089,13 @@ assert _pl.startswith("#EXTM3U") and "window-playlist" in _pl
 assert _pl.splitlines()[3].startswith("#EXT-X-STREAM-INF:")
 assert "resource?id=window-playlist" in _pl
 assert _window_pl_sess.dash_window_hls is True
+assert session_trim_timeline(_window_sess) is True
+_explore_sess = PreviewSession(
+    session_id="y", vod_url="https://www.youtube.com/watch?v=y", platform="YouTube",
+    master_url="", entry_url="https://example.com/v",
+    cache_dir=Path("/tmp"), crop_start=0, crop_end=7200, dash_window_hls=True,
+)
+assert session_trim_timeline(_explore_sess) is False
 assert _window_hls_dir(_window_sess).name == "window_hls"
 assert _window_hls_playlist_path(_window_sess).name == "window.m3u8"
 assert _window_hls_segment_path(_window_sess, 0).name == "seg_000.ts"
@@ -2948,8 +4105,10 @@ assert not _window_hls_playlist_complete(_window_sess)
 _window_hls_dir(_window_sess).mkdir(parents=True, exist_ok=True)
 (_window_hls_dir(_window_sess) / "seg_000.ts").write_bytes(b"\x47" * 60000)
 assert _window_hls_seg0_ready(_window_sess)
+_stamp_window_hls_mux_start(_window_sess, 0)
+assert _window_hls_seg0_matches_bounds(_window_sess)
 _clear_youtube_window_hls_cache(_window_sess)
-assert not _window_hls_seg0_ready(_window_sess)
+assert not _window_hls_seg0_matches_bounds(_window_sess)
 import shutil as _sh
 _sh.rmtree(_window_hls_dir(_window_sess), ignore_errors=True)
 # Build a synthetic session for media-playlist builder assertions (no network).
@@ -3011,3 +4170,21 @@ _clamp_session_crop_to_vod_duration(_placeholder, {"duration": 19})
 assert _placeholder.crop_end == 19, "placeholder clamp without extract dur stays at extract dur"
 assert _youtube_warm_inflight_key("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert _youtube_warm_inflight_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+_long = PreviewSession(
+    session_id="long", vod_url="", master_url="", entry_url="", platform="YouTube",
+    cache_dir=Path("/tmp"), crop_start=0, crop_end=1158, dash_window_hls=True,
+)
+_lo, _hi = _window_hls_mux_bounds(_long)
+assert _hi - _lo <= WINDOW_HLS_INITIAL_CHUNK_SEC + 0.01
+assert _hi == WINDOW_HLS_INITIAL_CHUNK_SEC
+_short = PreviewSession(
+    session_id="short", vod_url="", master_url="", entry_url="", platform="YouTube",
+    cache_dir=Path("/tmp"), crop_start=0, crop_end=30, dash_window_hls=True,
+)
+_slo, _shi = _window_hls_mux_bounds(_short)
+assert _shi == 30 and _slo == 0
+_seek_lo, _seek_hi = _window_hls_mux_bounds(_long, around_sec=868.5)
+assert _seek_lo < 868.5 < _seek_hi
+assert _seek_hi - _seek_lo <= WINDOW_HLS_MUX_CHUNK_SEC + 0.01
+_long.vod_duration = WINDOW_HLS_LONG_VOD_MIN_SEC + 1
+assert _window_hls_seek_chunk_sec(_long) == WINDOW_HLS_MUX_CHUNK_LONG_SEC

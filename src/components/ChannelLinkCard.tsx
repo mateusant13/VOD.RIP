@@ -91,7 +91,7 @@ export default function ChannelLinkCard({
   }, [onCancel]);
 
   const patchRow = (
-    row: typeof ROWS[number],
+    _row: typeof ROWS[number],
     patch: Partial<Pick<ChannelLinkDraft, 'kickEnabled' | 'twitchEnabled' | 'youtubeEnabled' | 'kickSlug' | 'twitchSlug' | 'youtubeSlug'>>,
   ) => onChange({ ...draft, ...patch });
 

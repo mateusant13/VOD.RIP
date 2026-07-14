@@ -107,20 +107,63 @@ input[type="range"].url-trim-range::-moz-range-thumb {
 }
 
 .preview-fs-host:fullscreen {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  height: 100%;
+  position: fixed !important;
+  inset: 0 !important;
+  display: block !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
   background: #000;
+  overflow: hidden !important;
+}
+
+.preview-fs-host:fullscreen > div:first-child {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 0 !important;
 }
 
 .explore-fs-host:fullscreen {
-  width: 100%;
-  height: 100%;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
   border: none !important;
   box-shadow: none !important;
   padding: 0 !important;
   background: #000;
+}
+
+.youtube-embed-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  /* Slight overscan keeps YouTube's edge branding/controls outside the viewport.
+     The inert overlay above the iframe owns every pointer event. */
+  width: 102%;
+  height: 102%;
+  transform: translate(-1%, -1%);
+  border: 0;
+  display: block;
+  background: #000;
+  pointer-events: none;
+}
+
+.preview-fs-host:fullscreen .youtube-embed-frame,
+.explore-fs-host:fullscreen .youtube-embed-frame {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 102vw !important;
+  height: 102vh !important;
+  min-width: 102vw !important;
+  min-height: 102vh !important;
+  transform: translate(-1vw, -1vh) !important;
 }
 
 .preview-needle-rail {

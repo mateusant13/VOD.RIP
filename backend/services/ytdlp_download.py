@@ -23,6 +23,8 @@ from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
 from models.schemas import VideoInfo
 
+logger = logging.getLogger(__name__)
+
 from services.ytdlp_ffmpeg import (
     CancelledError, PausedError, DownloadTimeoutError,
     MIN_VALID_OUTPUT_BYTES,
@@ -44,6 +46,7 @@ from services.ytdlp_ffmpeg import (
 from services.ytdlp_hls import (
     _download_hls_clip,
     _parse_prefer_height,
+    _pick_format_by_height,
     prefer_height_from_quality,
     HLS_DOWNLOAD_PROGRESS_CAP,
 )
@@ -198,7 +201,31 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                     if fallback > dur:
                         info["duration"] = int(fallback)
 
-    formats = info.get("formats", [])
+    formats = list(info.get("formats") or [])
+    # Fast YouTube extraction may return only the muxed 360p stream.  That is
+    # useful for instant playback but must not become the download quality list.
+    # Merge adaptive formats from the multi-client InnerTube resolver so the UI
+    # exposes 720p/1080p/source tiers even though those need audio muxing.
+    if platform == "YouTube":
+        try:
+            from services.youtube_innertube import innertube_extract_info
+
+            rich = innertube_extract_info(full_url, timeout=12.0, preview_fast=False)
+            if rich:
+                by_key = {
+                    (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
+                    for f in formats
+                }
+                for fmt in rich.get("formats") or []:
+                    key = (
+                        str(fmt.get("format_id") or ""),
+                        int(fmt.get("height") or 0),
+                        str(fmt.get("url") or ""),
+                    )
+                    by_key.setdefault(key, fmt)
+                formats = list(by_key.values())
+        except Exception as exc:
+            logger.debug("YouTube quality enrichment failed: %s", exc)
     qualities = _qualities_from_formats(formats, is_clip_url(full_url))
 
     created_at = info.get("created_at") or info.get("upload_date")
@@ -675,6 +702,8 @@ def _build_ydl_opts(
 ) -> dict:
     from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 
+    from pathlib import Path as _Path
+
     opts = {
         "outtmpl": output_path,
         "noplaylist": True,
@@ -683,6 +712,10 @@ def _build_ydl_opts(
         "concurrent_fragment_downloads": 8,
         **_ytdlp_engine_opts(),
     }
+    if audio_only:
+        # Let yt-dlp append the postprocessor codec extension so the final
+        # file is e.g. ``...mp3`` rather than ``...mp3.mp3``.
+        opts["outtmpl"] = str(_Path(output_path).with_suffix("")) + ".%(ext)s"
     if not audio_only:
         opts["merge_output_format"] = "mp4"
 
@@ -846,6 +879,84 @@ def _ydl_download(
             finally:
                 _check_pause_cancel(cancel_event, pause_event)
 
+def _download_twitch_clip_sync(
+    url: str,
+    output_path: str,
+    quality: Optional[str],
+    crop_start: float,
+    crop_end: float,
+    progress_hook: Optional[Callable],
+    cancel_event: Optional[threading.Event],
+    pause_event: Optional[threading.Event],
+    register_abort: Optional[Callable[[Callable[[], None]], None]],
+    audio_only: bool = False,
+) -> None:
+    """Download a Twitch clip (full or trimmed, video or audio-only) via signed
+    progressive MP4 + ffmpeg.
+
+    yt-dlp's ``download_sections`` does not reliably trim or parallelize Twitch
+    clip MP4s, so we pick a signed variant from Twitch's GQL API and either
+    stream-copy the video window or extract the audio track to MP3.
+    """
+    from services.twitch_gql_service import get_clip_signed_variants_sync
+    from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _run_ffmpeg, _verify_output_file
+
+    variants = get_clip_signed_variants_sync(url)
+    if not variants:
+        raise RuntimeError("No signed Twitch clip variants found")
+
+    prefer_height = _parse_prefer_height(quality, default=1080)
+    variant = _pick_format_by_height(variants, prefer_height)
+    signed_url = variant.get("url")
+    if not signed_url:
+        raise RuntimeError("Selected Twitch clip variant has no URL")
+
+    duration = max(0.1, crop_end - crop_start)
+    ffmpeg_exe = _resolve_ffmpeg_exe()
+    out_parent = os.path.dirname(os.path.abspath(output_path))
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
+
+    if progress_hook:
+        progress_hook({
+            "status": "downloading",
+            "percent": 0,
+            "phase": "Downloading" if not audio_only else "Encoding",
+            "phase_id": _phase_id("Downloading" if not audio_only else "Encoding"),
+        })
+
+    cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", str(crop_start),
+        "-i", signed_url,
+        "-t", str(duration),
+    ]
+    if audio_only:
+        cmd += ["-vn", "-acodec", "libmp3lame", "-b:a", "192k", output_path]
+    else:
+        cmd += ["-c", "copy", "-movflags", "+faststart", output_path]
+    _run_ffmpeg(
+        cmd,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        register_abort=register_abort,
+        progress_hook=progress_hook,
+        encode_duration=duration,
+        progress_from=0.0,
+        progress_to=95.0,
+        phase="Encoding" if audio_only else "Downloading",
+    )
+    _verify_output_file(output_path)
+    if progress_hook:
+        progress_hook({
+            "status": "postprocessing",
+            "percent": 99,
+            "phase": "Finalising",
+            "phase_id": _phase_id("Finalising"),
+        })
+        progress_hook({"status": "finished"})
+
+
 def download_video_sync(
     url: str,
     output_path: str,
@@ -938,6 +1049,23 @@ def download_video_sync(
     if trim:
         expected_duration = trim[1] - trim[0]
 
+    # Twitch clip downloads: yt-dlp's download_sections does not reliably crop
+    # or parallelize clip MP4s, so use a signed GQL variant for all Twitch clip
+    # downloads (full clip uses 0..duration; audio-only extracts MP3).
+    if platform == "Twitch" and is_clip_url(full_url):
+        clip_start = trim[0] if trim else 0.0
+        clip_end = trim[1] if trim else (expected_duration if expected_duration else 0.0)
+        if clip_end > clip_start:
+            _download_twitch_clip_sync(
+                full_url, output_path, quality, clip_start, clip_end,
+                progress_hook=progress_hook,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+                register_abort=register_abort,
+                audio_only=audio_only,
+            )
+            return output_path
+
     opts = _build_ydl_opts(
         full_url, output_path, quality, oauth, progress_hook, cachedir=str(cache_dir),
         temp_folder=settings_mgr.get().temp_folder if settings_mgr is not None else None,
@@ -987,8 +1115,7 @@ def download_video_sync(
     is_hls = (
         platform == "YouTube"
         or (
-            not audio_only
-            and platform in ("Twitch", "Kick")
+            platform in ("Twitch", "Kick")
             and not is_clip_url(full_url)
         )
     )
@@ -1025,7 +1152,7 @@ def download_video_sync(
             # download_hls_media_clip caps end_sec at actual segment length,
             # so a large fallback is safe (ffmpeg stops at EOF anyway).
             start_sec = 0.0
-            end_sec = expected_duration if expected_duration and expected_duration > 0 else 1e18
+            end_sec = expected_duration if expected_duration and expected_duration > 0 else 1_000_000_000.0
         mp4_faststart = bool(settings_mgr.get().mp4_faststart) if settings_mgr else False
         from services.youtube_diag import log as yt_log
         yt_log.info(

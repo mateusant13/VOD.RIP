@@ -11,9 +11,7 @@ import {
   channelClipsMissing,
   channelVodsMissing,
   channelStreamsMissing,
-  mergeClipPlatformsFetched,
   mergeVodPlatformsFetched,
-  channelHasCachedContent,
   channelPlatformVisibleSlice,
   channelPlatformCanExpand,
   channelLinkDraftFromParsed,
@@ -31,7 +29,7 @@ import {
   syncDurationFromPreviewSession,
   videoInfoDurationSec,
 } from './channelUtils';
-import type { ChannelVideo, SavedChannel } from './types';
+import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
 const makeVod = (overrides: Partial<ChannelVideo> = {}): ChannelVideo => ({
   id: 'v123',
@@ -219,7 +217,7 @@ describe('channelLinkDraftFromParsed', () => {
 describe('channelPlatformVisibleSlice', () => {
   const oldDate = new Date(Date.now() - 60 * 86_400_000).toISOString();
   const newDate = new Date().toISOString();
-  const oldVod = (id: string): ChannelVideo => ({
+  const oldVod = (id: string): ChannelVideo => makeVod({
     id,
     platform: 'Kick',
     title: id,
@@ -472,7 +470,7 @@ describe('isHiddenChannelPlatformError', () => {
     expect(formatChannelErrorMessage(
       {
         id: '1', displayName: 'x', kickSlug: '', twitchSlug: '', youtubeSlug: 'yt',
-        vodVideos: [{ id: 'a', platform: 'YouTube', title: 't', duration: 1, created_at: '', views: 0 }],
+        vodVideos: [makeVod({ id: 'a', platform: 'YouTube', title: 't', duration: 1, created_at: '', views: 0 })],
         clipVideos: [], updatedAt: '',
         vodErrors: { YouTube: 'Stream VOD fetch timed out — try again' },
       },
@@ -484,7 +482,7 @@ describe('isHiddenChannelPlatformError', () => {
 describe('videoInfoDurationSec', () => {
   it('returns 0 when duration unknown', () => {
     expect(videoInfoDurationSec(null)).toBe(0);
-    expect(videoInfoDurationSec({ title: 'x' })).toBe(0);
+    expect(videoInfoDurationSec({ title: 'x' } as VideoInfo)).toBe(0);
   });
 });
 

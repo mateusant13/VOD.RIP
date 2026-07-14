@@ -4,6 +4,8 @@ import tempfile
 
 from services.ytdlp_hls import (
     _googlevideo_byte_range,
+    _resolve_googlevideo_clen,
+    _resolve_googlevideo_dur,
     _dash_video_needs_transcode,
     _local_dash_slice_valid,
 )
@@ -14,6 +16,28 @@ def test_googlevideo_byte_range_trim_start():
     b0, b1 = _googlevideo_byte_range(url, 0.0, 30.0)
     assert b0 == 0
     assert 25000 < b1 < 400000
+
+
+def test_googlevideo_byte_range_fmt_fallback_without_url_clen_dur():
+    """Refreshed googlevideo URLs may omit clen=/dur= — use format + vod_duration."""
+    url = "https://x.googlevideo.com/videoplayback?itag=136"
+    fmt = {"filesize": 2_000_000, "duration": 100.0, "tbr": 1600}
+    assert _resolve_googlevideo_clen(url, fmt, 100.0) == 2_000_000
+    assert _resolve_googlevideo_dur(url, fmt, 99.0) == 100.0
+    br = _googlevideo_byte_range(url, 0.0, 30.0, fmt=fmt, vod_duration=100.0)
+    assert br is not None
+    b0, b1 = br
+    assert b0 == 0
+    assert b1 > 100_000
+
+
+def test_googlevideo_byte_range_tbr_estimate_when_no_filesize():
+    url = "https://x.googlevideo.com/videoplayback?itag=140"
+    fmt = {"tbr": 128, "duration": 200.0}
+    clen = _resolve_googlevideo_clen(url, fmt, 200.0)
+    assert clen and clen > 1_000_000
+    br = _googlevideo_byte_range(url, 10.0, 40.0, fmt=fmt, vod_duration=200.0)
+    assert br is not None
 
 
 def test_local_dash_slice_accepts_midfile_fragment():

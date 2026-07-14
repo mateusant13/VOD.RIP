@@ -1,72 +1,142 @@
-# Ponytail, lazy senior dev mode — VOD.RIP edition
+# VOD.RIP-remake — Agent Instructions
 
-You are a lazy senior developer working on **VOD.RIP**, a Kick & Twitch VOD/clip downloader with a Python/FastAPI backend and a React/TypeScript frontend.
+## consultgpt — Terminal ChatGPT (No API Key)
 
-This codebase has **accumulated debt** (see `report.md`). Your job is to fix it — but fix it **lazily**: the shortest correct solution, the fewest files changed, no abstractions that weren't asked for.
+consultgpt is installed globally and available as `gpt` and `codeintel` commands.
 
-Before writing any code, stop at the first rung that holds:
+It uses a **real browser session** to interact with ChatGPT. No API key needed — just log in once.
 
-1. **Does this need to exist at all?** (YAGNI) — Half the debt in this repo is code that was built "just in case." Don't add more.
-2. **Stdlib does it?** — Python stdlib, React built-ins, HTML/CSS native features. Use them.
-3. **Native platform feature?** — `<input type="date">` over a date picker lib. `window.fetch` over axios. CSS over JS animations.
-4. **Already-installed dependency?** — FastAPI, yt-dlp, hls.js, lucide-react, Tailwind. They're already here. Use them before adding anything new.
-5. **One line?** — One line.
-6. **Only then:** the minimum code that works.
-
-## Rules specific to VOD.RIP
-
-- **No new npm/PyPI dependency unless the stdlib alternative is >10 lines of your own code.** The dependency list is already fragile (no lockfile, curl_cffi is a binary risk). Every new dep multiplies the audit surface.
-- **Do NOT create abstractions.** This codebase is drowning in them: a preview module that is also a full HTTP proxy, a download manager with 5 separate lock dictionaries, a 6,000-line component. The fix is deletion, not wrapping.
-- **Delete before you add.** Found dead code? Delete it. Found duplicated logic? Delete one copy, not wrap both. The audit flagged deprecated, never-called functions — remove them.
-- **One test per non-trivial change.** Not a test suite. Not a framework. One `assert`-based self-check or one small `test_*.py` that runs with `python -m pytest` (no fixtures, no mocks unless the code can't run without them). Trivial one-liners need no test.
-- **Verify before ship** — see `.cursor/rules/verify-before-ship.mdc`. Run **real** integration checks yourself (live URLs, strict body assertions). Mocks prove logic, not that preview/download works. Never ask the user to be your QA for paths you can hit in the shell. Fail → fix → re-run until green, then report what you actually ran.
-- **Mark every shortcut with `ponytail:`** — If you defer something, leave a `# ponytail: <what, upgrade path>` comment. The audit identifies the ceilings; use them.
-
-## Not lazy about
-
-- Input validation at trust boundaries (the API accepts user URLs — validate them)
-- Error handling that prevents data loss (partial downloads, corrupt files — never silently swallow)
-- Security (OAuth tokens in plaintext settings.json is a known issue, do not make it worse)
-- Accessibility (the UI is a native desktop app + browser — keyboard nav, screen reader labels)
-- Anything explicitly requested by the user
-- **Verification** — real tests you run yourself before claiming success (see `verify-before-ship.mdc`)
-
-## The audit as your guide
-
-`report.md` in this branch catalogues 34 findings. When working on VOD.RIP:
-
-1. Check if the task touches any of the flagged areas (App.tsx, preview_service, download_manager, os_services, circular imports)
-2. Prefer the simplest fix from the report's recommendations — not a grand refactor
-3. Every change should reduce the finding count, not keep it the same
-
-## Intensity levels
-
-| Level | Behavior |
-|-------|----------|
-| **lite** | Build what's asked, name the lazier alternative in one line. User picks. |
-| **full** | The ladder enforced. Stdlib and native first. Shortest diff. Default. |
-| **ultra** | YAGNI extremist. Deletion before addition. Challenge every requirement. |
-
-## Commands
+### Quick Reference
 
 | Command | What it does |
 |---------|--------------|
-| `/ponytail [lite\|full\|ultra\|off]` | Set intensity or turn off |
-| `/ponytail-review` | Review current diff for over-engineering |
-| `/ponytail-audit` | Audit whole repo for over-engineering |
-| `/ponytail-debt` | Harvest `ponytail:` shortcuts into a ledger |
+| `gpt "question"` | One-shot question to ChatGPT |
+| `gpt -f file.py "review"` | Inject file contents + ask |
+| `gpt @src/main.py "explain"` | Same via @file syntax |
+| `gpt -s name "question"` | Start named session (persistent) |
+| `gpt -s name "follow-up"` | Continue previous session |
+| `gpt kill name` | Kill a session |
+| `gpt audit` | Full codebase audit |
+| `codeintel search "query"` | Search code index |
+| `codeintel ask "how does X work?"` | Synthesize architecture answer |
 
-## Scope: simple ≠ incomplete
+### Code Review Loop (MANDATORY)
 
-**Simple** means shortest correct diff — not "do half the obvious surface."
+Every significant code change must go through this loop:
 
-When you touch themed UI, platform logic, or a bug in one control:
-- Fix **siblings on the same surface** (same toolbar, same panel, same proxy path) if they'd look or behave wrong left half-done.
-- **Don't** expand into unrelated tabs, refactors, or new abstractions.
-- **Don't** end with "skipped: X, add when Y" for work that clearly belongs in the same pass. Either do it or leave a `ponytail:` comment in code with a real upgrade path.
+```
+1. codeintel search "concept"     → find relevant files
+2. make changes                   → implement
+3. gpt -f changed.py "review"     → get ChatGPT review
+4. fix issues found               → iterate
+5. done                           → only when gpt says pass
+```
 
-Autonomous is fine. Scope creep isn't.
+### File Injection
 
-## Output
+```bash
+# Inject single file
+gpt -f backend/services/preview_service.py "Review for bugs"
 
-Code first. **Do not** end with `→ skipped: X, add when Y` for work that belongs in the same task — ship it or leave a `ponytail:` comment in code with a real upgrade path. One deferral line at the end only when something is genuinely out of scope.
+# Inject multiple files
+gpt -f file1.py -f file2.py "Review these two files"
+
+# Line ranges
+gpt -f backend/app.py:50-100 "Explain this section"
+
+# @file syntax (inline in question)
+gpt "Review @backend/services/preview_service.py for security issues"
+```
+
+### Multi-Turn Sessions
+
+```bash
+# Start a named session (injects code on first turn)
+gpt -s review "Review @src/main.py for bugs"
+
+# Follow-up (context preserved automatically)
+gpt -s review "Now fix the issues you found"
+
+# Verify fixes
+gpt -s review "Verify my changes are correct"
+
+# Kill when done
+gpt kill review
+```
+
+### Code Index (codeintel)
+
+```bash
+# Index the project
+codeintel index .
+
+# Search for symbols
+codeintel search "PreviewSession"
+
+# Search for callers
+codeintel search "callers of create_session"
+
+# Ask architectural questions
+codeintel ask "how does the preview pipeline work?"
+
+# Code health check
+codeintel health
+```
+
+### Audit Mode
+
+```bash
+# Full codebase audit
+gpt audit
+
+# Audit specific files
+gpt audit --files backend/app.py
+
+# Audit specific folders
+gpt audit --folders backend/services/
+```
+
+### Flags
+
+| Flag | Purpose |
+|------|---------|
+| `-f, --files` | Inject files as code context |
+| `-s, --session` | Named session for persistence |
+| `--no-code` | Skip code injection (required when no files) |
+| `--headed` | Show browser window |
+| `--auto` | Auto-route based on prompt size |
+| `--kill-after N` | Timeout in minutes |
+| `--codeintel` | Use index for search (NOT for local file review) |
+
+### Common Patterns for This Project
+
+```bash
+# Review a router change
+gpt -f backend/routers/preview.py "Review for API correctness"
+
+# Review a service change
+gpt -f backend/services/preview_service.py "Check for race conditions"
+
+# Review frontend changes
+gpt -f src/App.tsx "Review for React best practices"
+
+# Full backend audit
+gpt audit --folders backend/
+
+# Find where a function is used
+codeintel search "callers of schedule_youtube_window_hls_mux"
+```
+
+### Rules
+
+1. **Always review after changes** — `gpt -f changed_file.py "review"` before commit
+2. **Use codeintel first** — search before writing code
+3. **Don't mix --codeintel and -f** — they're different paths
+4. **--kill-after on long runs** — prevent runaway processes
+5. **CLI only** — use terminal commands, not workarounds
+
+### Windows/PowerShell Notes
+
+- `--files a b c` works with space-separated paths
+- Use `--` to separate flags from question: `gpt -f a.py -- "review this"`
+- Progress prints to stderr, response to stdout

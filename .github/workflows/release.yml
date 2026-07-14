@@ -102,6 +102,16 @@ jobs:
         shell: bash
         run: bash scripts/download-ffmpeg.sh || true
 
+      - name: Bundle Node runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -File scripts/download-node.ps1
+
+      - name: Build bgutil POT server bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -File scripts/build-bgutil-bundle.ps1
+
       - name: Build with PyInstaller
         shell: bash
         run: pyinstaller vod-rip.spec --clean --noconfirm

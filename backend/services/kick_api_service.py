@@ -11,6 +11,7 @@ Endpoints used:
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -419,6 +420,7 @@ def download_vod_sync(
     register_abort=None,
     video_encoder=None,
     settings_mgr=None,
+    audio_only: bool = False,
     **_,
 ) -> str:
     """Download a Kick VOD clip via the fast JSON API + HLS segments (no browser)."""
@@ -448,20 +450,38 @@ def download_vod_sync(
         end_sec = info.duration if info.duration and info.duration > 0 else 1e18
     page_url = info.url or url
     headers = {"referer": page_url, "origin": _BASE}
-    download_hls_media_clip(
-        info.m3u8_url,
-        start_sec,
-        end_sec,
-        output_path,
-        headers=headers,
-        ffmpeg_exe=_resolve_ffmpeg_exe(),
-        progress_hook=progress_hook,
-        cancel_event=cancel_event,
-        pause_event=pause_event,
-        register_abort=register_abort,
-        prefer_height=_parse_prefer_height(quality),
-        video_encoder=video_encoder,
-        mp4_faststart=mp4_faststart,
-    )
-    _verify_output_file(output_path)
+    clip_target = output_path
+    temp_video: Optional[str] = None
+    if audio_only:
+        import tempfile
+
+        temp_video = tempfile.mktemp(suffix=".mp4", prefix="kick_audio_")
+        clip_target = temp_video
+    try:
+        download_hls_media_clip(
+            info.m3u8_url,
+            start_sec,
+            end_sec,
+            clip_target,
+            headers=headers,
+            ffmpeg_exe=_resolve_ffmpeg_exe(),
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            prefer_height=_parse_prefer_height(quality),
+            video_encoder=video_encoder,
+            mp4_faststart=mp4_faststart,
+        )
+        if audio_only and temp_video:
+            from services.ytdlp_hls import _extract_hls_audio
+
+            _extract_hls_audio(temp_video, output_path)
+        _verify_output_file(output_path)
+    finally:
+        if temp_video and os.path.isfile(temp_video):
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
     return output_path
