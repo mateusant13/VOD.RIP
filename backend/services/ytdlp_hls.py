@@ -1987,9 +1987,15 @@ def _fetch_googlevideo_range_once(
     try:
         from curl_cffi import requests as cffi_requests
 
+        # QUIC/HTTP3 for googlevideo CDN
+        http_version = None
+        if "googlevideo.com" in url:
+            http_version = "3"
+
         resp = cffi_requests.get(
             url, headers=hdrs, impersonate="chrome", stream=True,
             timeout=(10, 180),
+            http_version=http_version,
         )
     except ImportError:
         resp = requests.get(url, headers=hdrs, stream=True, timeout=180)
@@ -2425,6 +2431,11 @@ def _download_muxed_dash_clip(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# Improvement 1: fMP4/CMAF segments instead of MPEG-TS for the DASH window mux.
+# Enabled by default; set VODRIP_PREVIEW_FMP4=0 to fall back to MPEG-TS.
+USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
+
+
 def _mux_dash_window_to_hls(
     video_url: str,
     audio_url: str,
@@ -2439,13 +2450,15 @@ def _mux_dash_window_to_hls(
     audio_fmt: Optional[dict] = None,
     vod_duration: float = 0.0,
 ) -> Path:
-    """Mux a DASH crop window into a local HLS playlist (window.m3u8 + seg_NNN.ts).
+    """Mux a DASH crop window into a local HLS playlist (window.m3u8 + seg_NNN.m4s).
 
     Reuses the ``_fetch_googlevideo_window_local`` Range-fetch path so we never
     pull the full adaptive-format MP4 — just the byte window the trim needs.
     Output is ``{output_dir}/window.m3u8`` (VOD playlist, independent segments,
     4-second target duration) so the frontend MSE player can attach the instant
-    ``seg_000.ts`` lands and HLS.js finalises when ``#EXT-X-ENDLIST`` appears.
+    ``seg_000.m4s`` lands and HLS.js finalises when ``#EXT-X-ENDLIST`` appears.
+    When ``USE_FMP4`` is enabled (default), segments are fragmented MP4 (CMAF)
+    with an ``init.mp4`` init fragment instead of MPEG-TS.
     """
     from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 
@@ -2488,7 +2501,7 @@ def _mux_dash_window_to_hls(
         if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
             # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
             playlist = os.path.join(output_dir, "window.m3u8")
-            seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
+            seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
             hdr = _ffmpeg_input_headers(headers or {})
             reconnect = _ffmpeg_reconnect_args()
             probe = ["-probesize", "8M", "-analyzeduration", "2M"]
@@ -2503,7 +2516,8 @@ def _mux_dash_window_to_hls(
                 "-f", "hls",
                 "-hls_time", "4",
                 "-hls_playlist_type", "vod",
-                "-hls_flags", "independent_segments",
+                "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+                *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
                 "-hls_segment_filename", seg_pattern,
                 playlist,
             ]
@@ -2520,7 +2534,7 @@ def _mux_dash_window_to_hls(
             return playlist_path
         raise
     playlist = os.path.join(output_dir, "window.m3u8")
-    seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
+    seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
     cmd = [
         ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
         "-probesize", "8M", "-analyzeduration", "2M",
@@ -2534,7 +2548,8 @@ def _mux_dash_window_to_hls(
         "-f", "hls",
         "-hls_time", "4",
         "-hls_playlist_type", "vod",
-        "-hls_flags", "independent_segments",
+        "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+        *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
         "-hls_segment_filename", seg_pattern,
         playlist,
     ]

@@ -54,6 +54,10 @@ YOUTUBE_WINDOW_HLS_MARKER = WINDOW_HLS_MARKER
 # resource IDs registered in session.resource_map for window HLS access
 WINDOW_HLS_PLAYLIST_RESOURCE = "window-playlist"
 WINDOW_HLS_SEGMENT_RESOURCE_PREFIX = "window-seg-"
+WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
+# ponytail: fMP4 / LL-HLS opt-in — gate the EXT-X-MAP + EXT-X-PART metadata behind a
+# flag so legacy .ts playlists keep working if an operator sets VODRIP_PREVIEW_FMP4=0.
+USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 # Signed googlevideo URLs expire in minutes — long cache recycles stale 403s.
 _RESOLVED_STREAM_TTL_SEC = 60
 _RESOLVED_STREAM_MAX = 64
@@ -684,12 +688,18 @@ def _open_upstream_stream(
     try:
         from curl_cffi import requests as cffi_requests
 
+        # QUIC/HTTP3 for googlevideo CDN (faster segment fetch, 0-RTT resumption)
+        http_version = None
+        if "googlevideo.com" in url:
+            http_version = "v3"  # HTTP/3
+
         resp = cffi_requests.get(
             url,
             headers=headers,
             impersonate="chrome",
             stream=True,
             timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 3600),
+            http_version=http_version,
         )
     except ImportError:
         import requests
@@ -1638,12 +1648,18 @@ def _http_get_bytes(
     try:
         from curl_cffi import requests as cffi_requests
 
+        # QUIC/HTTP3 for googlevideo CDN
+        http_version = None
+        if "googlevideo.com" in url:
+            http_version = "v3"
+
         resp = cffi_requests.get(
             url,
             headers=headers,
             impersonate="chrome",
             stream=True,
             timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 90),
+            http_version=http_version,
         )
     except ImportError:
         import requests
@@ -2197,15 +2213,22 @@ def _window_hls_playlist_path(session: PreviewSession) -> Path:
 
 
 def _window_hls_segment_path(session: PreviewSession, index: int) -> Path:
-    """Path to a single muxed segment index (seg_NNN.ts)."""
-    return _window_hls_dir(session) / f"seg_{index:03d}.ts"
+    """Path to a single muxed segment index (seg_NNN.ts or seg_NNN.m4s when fMP4)."""
+    out_dir = _window_hls_dir(session)
+    if USE_FMP4 and (out_dir / f"seg_{index:03d}.m4s").is_file():
+        return out_dir / f"seg_{index:03d}.m4s"
+    return out_dir / f"seg_{index:03d}.ts"
 
 
 def _window_hls_existing_segments(session: PreviewSession) -> List[Path]:
-    """Return sorted seg_NNN.ts files currently on disk (empty until mux starts)."""
+    """Return sorted seg_NNN.ts (or .m4s when fMP4) files on disk (empty until mux starts)."""
     out_dir = _window_hls_dir(session)
     if not out_dir.is_dir():
         return []
+    if USE_FMP4:
+        m4s = sorted(out_dir.glob("seg_[0-9][0-9][0-9].m4s"))
+        if m4s:
+            return m4s
     return sorted(out_dir.glob("seg_[0-9][0-9][0-9].ts"))
 
 
@@ -2816,21 +2839,31 @@ def _register_youtube_window_hls_resources(session: PreviewSession) -> None:
         and not k.startswith(WINDOW_HLS_SEGMENT_RESOURCE_PREFIX)
     }
     session.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE] = f"{WINDOW_HLS_MARKER}playlist"
+    if USE_FMP4:
+        # fMP4 init segment — served via ?id=window-init
+        session.resource_map[WINDOW_HLS_INIT_RESOURCE] = f"{WINDOW_HLS_MARKER}init.mp4"
     for seg in _window_hls_existing_segments(session):
         try:
             idx = int(seg.stem.split("_", 1)[1])
         except (IndexError, ValueError):
             continue
         rid = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
-        session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.ts"
+        ext = ".m4s" if USE_FMP4 else ".ts"
+        session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}{ext}"
 
 
 def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
     """Build the window HLS media playlist on-the-fly from disk-state.
 
-    Scans ``seg_*.ts`` files in the window_hls dir, registers each segment
-    resource ID on the session, and emits an HLS playlist whose segment
-    URLs point to ``/api/preview/hls/{sid}/resource?id=window-seg-NNN``.
+    Scans ``seg_*.ts`` (or ``seg_*.m4s`` when fMP4) files in the window_hls dir,
+    registers each segment resource ID on the session, and emits an HLS playlist
+    whose segment URLs point to
+    ``/api/preview/hls/{sid}/resource?id=window-seg-NNN``.
+
+    When ``USE_FMP4`` is enabled, the playlist is emitted as an LL-HLS (v9)
+    fMP4 playlist: an ``#EXT-X-MAP`` init reference, ``#EXT-X-PART-INF`` /
+    ``#EXT-X-SERVER-CONTROL`` tags, and per-segment ``#EXT-X-PART`` +
+    ``#EXT-X-PRELOAD-HINT`` hints pointing at ``seg_NNN_part_*.m4s`` chunks.
     """
     base = f"/api/preview/hls/{session.session_id}/resource?id="
     segs = _window_hls_existing_segments(session)
@@ -2840,28 +2873,51 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
         # the playlist resource itself so HLS.js polls without 404s.
         lines = [
             "#EXTM3U",
-            "#EXT-X-VERSION:6",
+            "#EXT-X-VERSION:9" if USE_FMP4 else "#EXT-X-VERSION:6",
             f"#EXT-X-TARGETDURATION:{target_duration}",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
         ]
         return "\n".join(lines).encode("utf-8") + b"\n"
     duration = max(1, int(WINDOW_HLS_SEGMENT_SEC))
-    lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:6",
-        "#EXT-X-INDEPENDENT-SEGMENTS",
-        f"#EXT-X-TARGETDURATION:{target_duration}",
-        "#EXT-X-MEDIA-SEQUENCE:0",
-        "#EXT-X-PLAYLIST-TYPE:VOD",
-    ]
+    if USE_FMP4:
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:9",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+            "#EXT-X-PART-INF:PART-TARGET=0.5",
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=60,HOLD-BACK=2.0",
+            f"#EXT-X-MAP:URI=\"{base}init.mp4\"",
+        ]
+    else:
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:6",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
     for seg in segs:
         try:
             idx = int(seg.stem.split("_", 1)[1])
         except (IndexError, ValueError):
             continue
         rid = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
-        session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.ts"
+        if USE_FMP4:
+            session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.m4s"
+            # LL-HLS partial-segment hints for the first two parts of this segment.
+            lines.append(
+                f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"seg_{idx:03d}_part_000.m4s\"'
+            )
+            lines.append(
+                f'#EXT-X-PART:DURATION=0.5,URI=\"seg_{idx:03d}_part_001.m4s\",INDEPENDENT=YES'
+            )
+        else:
+            session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.ts"
         lines.append(f"#EXTINF:{duration:.3f},")
         lines.append(f"{base}{rid}")
     if _window_hls_playlist_complete(session):
@@ -2891,6 +2947,19 @@ def open_youtube_window_hls_proxy(
             range_header,
         )
         return generator, ctype, hdrs, status, cleanup
+    # fMP4 init segment (init.mp4) — served either via the window-init resource
+    # id or the literal "init.mp4" URI referenced by the playlist's EXT-X-MAP.
+    if resource_id == WINDOW_HLS_INIT_RESOURCE or resource_id == "init.mp4":
+        init_path = _window_hls_dir(session) / "init.mp4"
+        if not init_path.is_file():
+            schedule_youtube_window_hls_mux(session_id)
+            raise PreviewMuxPending("window HLS init.mp4 not ready")
+        session.resource_map[WINDOW_HLS_INIT_RESOURCE] = f"{WINDOW_HLS_MARKER}init.mp4"
+        init_gen, _init_ctype, init_hdrs, init_status, init_cleanup = _open_local_file_proxy(
+            init_path, range_header
+        )
+        # fMP4 init segment — advertise as mp4 (iso.segment also acceptable).
+        return init_gen, "video/mp4", init_hdrs, init_status, init_cleanup
     # segment resource
     m = re.match(rf"^{re.escape(WINDOW_HLS_SEGMENT_RESOURCE_PREFIX)}(\d+)$", resource_id or "")
     if not m:
@@ -2899,7 +2968,9 @@ def open_youtube_window_hls_proxy(
     path = _window_hls_segment_path(session, idx)
     if not path.is_file():
         schedule_youtube_window_hls_mux(session_id)
-        raise PreviewMuxPending(f"window HLS segment seg_{idx:03d}.ts not ready")
+        raise PreviewMuxPending(
+            f"window HLS segment seg_{idx:03d}{'.m4s' if USE_FMP4 else '.ts'} not ready"
+        )
     return _open_local_file_proxy(path, range_header)
 
 
@@ -4147,8 +4218,17 @@ assert preview_mux_ready(_mp_sess)
 assert _window_hls_playlist_complete(_mp_sess)
 _register_youtube_window_hls_resources(_mp_sess)
 assert _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE] == f"{WINDOW_HLS_MARKER}playlist"
-assert _mp_sess.resource_map["window-seg-000"] == f"{WINDOW_HLS_MARKER}seg_000.ts"
-assert _mp_sess.resource_map["window-seg-001"] == f"{WINDOW_HLS_MARKER}seg_001.ts"
+_mp_seg_ext = ".m4s" if USE_FMP4 else ".ts"
+assert _mp_sess.resource_map["window-seg-000"] == f"{WINDOW_HLS_MARKER}seg_000{_mp_seg_ext}"
+assert _mp_sess.resource_map["window-seg-001"] == f"{WINDOW_HLS_MARKER}seg_001{_mp_seg_ext}"
+if USE_FMP4:
+    assert _mp_sess.resource_map[WINDOW_HLS_INIT_RESOURCE] == f"{WINDOW_HLS_MARKER}init.mp4"
+    assert b"#EXT-X-PART-INF" in _mp_body
+    assert b"#EXT-X-SERVER-CONTROL" in _mp_body
+    assert b"#EXT-X-MAP:URI=\"" in _mp_body
+    assert b"#EXT-X-PART:DURATION=0.5" in _mp_body
+    assert b"#EXT-X-PRELOAD-HINT" in _mp_body
+    assert _mp_body.splitlines()[1].startswith(b"#EXT-X-VERSION:9")
 assert _is_youtube_window_hls_resource(
     _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE]
 )
