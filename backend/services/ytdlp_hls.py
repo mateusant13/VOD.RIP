@@ -2,56 +2,62 @@
 HLS playlist parsing, segment downloading, and clip assembly ÔÇö the segment-level
 HLS downloader that avoids yt-dlp for Twitch/Kick VODs.
 """
+
 import contextlib
 import errno
 import io
-import json
 import logging
 import os
 import re
+import shutil
+import subprocess as sp
 import sys
+import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from urllib.parse import urljoin
 
 import requests
-import shutil
-import subprocess as sp
-import tempfile
 
 from services import ytdlp_env  # noqa: F401 ÔÇö YTDLP_NO_PLUGINS before yt-dlp import
-from services.ytdlp_guard import assert_ytdlp_safe, guarded_youtube_dl, YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK
-import yt_dlp
+from services.ytdlp_guard import (
+    guarded_youtube_dl,
+    YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK,
+)
 
 from services.ytdlp_ffmpeg import (
-    CancelledError, PausedError,
+    CancelledError,
+    PausedError,  # noqa: F401 — re-exported for download_manager
     MIN_VALID_OUTPUT_BYTES,
-    _track_ffmpeg_proc, _untrack_ffmpeg_proc, _terminate_ffmpeg_proc,
-    resolve_video_encoder, resolve_concat_encoder,
+    _track_ffmpeg_proc,
+    _untrack_ffmpeg_proc,
+    _terminate_ffmpeg_proc,
+    resolve_video_encoder,
+    resolve_concat_encoder,
     _check_pause_cancel,
     ffmpeg_h264_encode_args,
     probe_segment_codec,
     _apply_mp4_faststart,
     _atomic_replace,
-    _chunked_copy,
-    _format_ts,
     _phase_id,
     _resolve_ffmpeg_exe,
     _run_ffmpeg,
     _verify_output_file,
     _codecs_from_stream_inf,
 )
-from services.os_services import _NO_WINDOW, register_child_pid, unregister_child_pid
+from services.os_services import _NO_WINDOW
 
 logger = logging.getLogger(__name__)
 
 
 class StaleGooglevideoUrl(RuntimeError):
     """Signed googlevideo URL expired (403/404/410) — re-resolve before retry."""
+
 
 # These constants are also used by ytdlp_ffmpeg and will be kept there
 # while re-exported via the shim.
@@ -60,10 +66,17 @@ _SEGMENT_CONNECT_TIMEOUT = 15
 _SEGMENT_READ_TIMEOUT = 60
 _SEGMENT_STALL_SECONDS = 90
 
-_HLS_FORWARD_KEYS = frozenset({
-    "format", "username", "password",
-    "cachedir", "quiet", "no_warnings", "cookiefile",
-})
+_HLS_FORWARD_KEYS = frozenset(
+    {
+        "format",
+        "username",
+        "password",
+        "cachedir",
+        "quiet",
+        "no_warnings",
+        "cookiefile",
+    }
+)
 
 
 class _YtdlpQuietLogger:
@@ -126,15 +139,22 @@ _PREVIEW_EXTRACT_RACE_SEC = 5.5  # wall clock — innertube + yt-dlp paths race 
 _YOUTUBE_PREVIEW_SOCKET_SEC = 3
 _PREVIEW_EXTRACT_WAIT_SEC = 24.0
 _PREVIEW_EXTRACT_MAX_WALL_SEC = 8.0
-_PREVIEW_EXTRACT_FALLBACK_SEC = 24.0  # total wall incl. full yt-dlp retries on cache miss
-_PREVIEW_MUX_FAST_SEC = 10.0  # ponytail: unused teaser cap ÔÇö mux uses session trim window
+_PREVIEW_EXTRACT_FALLBACK_SEC = (
+    24.0  # total wall incl. full yt-dlp retries on cache miss
+)
+_PREVIEW_MUX_FAST_SEC = (
+    10.0  # ponytail: unused teaser cap ÔÇö mux uses session trim window
+)
 _PREVIEW_MUX_FAST_HEIGHT = 480
 
 
 def preview_fast_only_mode() -> bool:
     """dev:2 — innertube race only; no cookies, POT, browser, or slow extract fallback."""
     return os.environ.get("VODRIP_PREVIEW_FAST_ONLY", "").strip().lower() in (
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -144,6 +164,7 @@ def _youtube_manual_auth_configured() -> bool:
         return False
     try:
         from deps import settings_mgr
+
         s = settings_mgr.get()
         path = (getattr(s, "youtube_cookies_file", "") or "").strip()
         if path and Path(path).is_file() and not Path(path).name.startswith("yt_anon_"):
@@ -196,11 +217,7 @@ def _extract_cache_key(url: str, opts: dict) -> str:
     from services.youtube_innertube import canonical_youtube_watch_url
 
     cache_url = canonical_youtube_watch_url(url) or url
-    clients = (
-        (opts.get("extractor_args") or {})
-        .get("youtube", {})
-        .get("player_client")
-    )
+    clients = (opts.get("extractor_args") or {}).get("youtube", {}).get("player_client")
     oauth = opts.get("password") or opts.get("username") or ""
     cookie = opts.get("cookiefile") or ""
     browser = opts.get("cookiesfrombrowser") or ""
@@ -273,14 +290,18 @@ def youtube_preview_ytdl_opts(
         else:
             try:
                 from deps import settings_mgr
+
                 s = settings_mgr.get()
                 auto_auth = getattr(s, "youtube_auto_auth", True)
                 session = youtube_session_from_values(
                     visitor_data=getattr(s, "youtube_visitor_data", "") or None,
                     po_token=getattr(s, "youtube_po_token", "") or None,
-                    cookies_file=cookies_file or getattr(s, "youtube_cookies_file", "") or None,
+                    cookies_file=cookies_file
+                    or getattr(s, "youtube_cookies_file", "")
+                    or None,
                     tokens_file=getattr(s, "youtube_tokens_file", "") or None,
-                    cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or None,
+                    cookies_from_browser=getattr(s, "youtube_cookies_browser", "")
+                    or None,
                     video_id=vid,
                     auto_auth=auto_auth,
                 )
@@ -309,7 +330,9 @@ def youtube_preview_ytdl_opts(
         opts["password"] = oauth
     from services.youtube_session import apply_ytdlp_cookie_opts
 
-    apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth, cookies_file=cookies_file)
+    apply_ytdlp_cookie_opts(
+        opts, session, auto_auth=auto_auth, cookies_file=cookies_file
+    )
     found = _find_ffmpeg()
     if found:
         opts["ffmpeg_location"] = found
@@ -364,10 +387,7 @@ def _pick_format_by_height(formats: list, prefer_height: int) -> dict:
 
 def _pick_youtube_clip_video_format(formats: list, prefer_height: int) -> dict:
     """Pick video for trimmed download ÔÇö prefer muxed MP4, then h264 DASH at height."""
-    candidates = [
-        f for f in formats
-        if f.get("url") and int(f.get("height") or 0) > 0
-    ]
+    candidates = [f for f in formats if f.get("url") and int(f.get("height") or 0) > 0]
     if not candidates:
         raise RuntimeError("No video formats with height")
     at_height = [f for f in candidates if int(f["height"]) == prefer_height]
@@ -397,7 +417,10 @@ def _youtube_format_playable(fmt: dict) -> bool:
         return False
     if int(fmt.get("height") or 0) > 0:
         return True
-    return fmt.get("acodec") not in (None, "none") and fmt.get("vcodec") not in (None, "none")
+    return fmt.get("acodec") not in (None, "none") and fmt.get("vcodec") not in (
+        None,
+        "none",
+    )
 
 
 def _youtube_info_playable(info: dict) -> bool:
@@ -414,12 +437,18 @@ def _youtube_cache_ok(url: str, opts: dict, info: dict) -> bool:
 
 
 def _try_innertube_info_retry(
-    url: str, attempts: int = 1, session=None, *, allow_session_refresh: bool = True,
+    url: str,
+    attempts: int = 1,
+    session=None,
+    *,
+    allow_session_refresh: bool = True,
 ) -> Optional[dict]:
     """InnerTube multi-client chain ÔÇö one pass; outer extract loop handles retries."""
     for i in range(attempts):
         info = _try_innertube_info(
-            url, session=session, allow_session_refresh=allow_session_refresh,
+            url,
+            session=session,
+            allow_session_refresh=allow_session_refresh,
         )
         if info and _youtube_info_playable(info):
             return info
@@ -431,7 +460,8 @@ def _try_innertube_info_retry(
 def _bare_ytdlp_opts(opts: dict) -> dict:
     """Strip all cookie/session auth ÔÇö last-resort yt-dlp pass."""
     return {
-        k: v for k, v in opts.items()
+        k: v
+        for k, v in opts.items()
         if k not in ("cookiefile", "cookiesfrombrowser", "_youtube_session")
     }
 
@@ -511,7 +541,8 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
         if not winner and pending:
             grace_deadline = time.monotonic() + min(
                 6.0,
-                max(0.0, _PREVIEW_EXTRACT_MAX_WALL_SEC - _PREVIEW_EXTRACT_RACE_SEC) + 2.0,
+                max(0.0, _PREVIEW_EXTRACT_MAX_WALL_SEC - _PREVIEW_EXTRACT_RACE_SEC)
+                + 2.0,
             )
             while pending and time.monotonic() < grace_deadline:
                 done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
@@ -519,7 +550,9 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                     try:
                         info = fut.result()
                     except Exception as exc:
-                        logger.debug("preview race grace %s %s: %s", vid, futures[fut], exc)
+                        logger.debug(
+                            "preview race grace %s %s: %s", vid, futures[fut], exc
+                        )
                         continue
                     if info and _youtube_info_playable(info):
                         winner = info
@@ -547,12 +580,15 @@ def _youtube_extract_parallel_fast(
 
     cookie_opts = dict(opts)
     cookie_opts["socket_timeout"] = min(
-        int(cookie_opts.get("socket_timeout") or 10), _YOUTUBE_PREVIEW_SOCKET_SEC,
+        int(cookie_opts.get("socket_timeout") or 10),
+        _YOUTUBE_PREVIEW_SOCKET_SEC,
     )
 
     def _inn() -> Optional[dict]:
         return _try_innertube_info_retry(
-            url, session=yt_session, allow_session_refresh=False,
+            url,
+            session=yt_session,
+            allow_session_refresh=False,
         )
 
     def _ydl() -> Optional[dict]:
@@ -574,7 +610,9 @@ def _youtube_extract_parallel_fast(
                 try:
                     info = fut.result()
                 except Exception as exc:
-                    logger.debug("parallel extract %s failed %s: %s", vid, futures[fut], exc)
+                    logger.debug(
+                        "parallel extract %s failed %s: %s", vid, futures[fut], exc
+                    )
                     continue
                 if info and _youtube_info_playable(info):
                     winner = info
@@ -635,7 +673,9 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
     if has_auth and _youtube_manual_auth_configured():
         from services.youtube_diag import log_extract_fail
 
-        log_extract_fail(vid, "auth_fallback_anon", yt_session, detail="manual cookies exhausted")
+        log_extract_fail(
+            vid, "auth_fallback_anon", yt_session, detail="manual cookies exhausted"
+        )
         anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
         anon_session = anon_opts.get("_youtube_session")
         info = _youtube_extract_parallel_fast(url, anon_opts, anon_session, vid)
@@ -720,7 +760,11 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
             from services.youtube_innertube import extract_video_id
 
             vid = extract_video_id(url)
-            if vid and yt_session is not None and not getattr(yt_session, "po_token", None):
+            if (
+                vid
+                and yt_session is not None
+                and not getattr(yt_session, "po_token", None)
+            ):
                 from services.youtube_session import resolve_video_po_token
 
                 auto_po = resolve_video_po_token(vid)
@@ -737,7 +781,9 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
                         http_session=yt_session.http_session,
                     )
                     slow_opts["_youtube_session"] = yt_session
-            if not _youtube_cookie_path(slow_opts) and not slow_opts.get("cookiesfrombrowser"):
+            if not _youtube_cookie_path(slow_opts) and not slow_opts.get(
+                "cookiesfrombrowser"
+            ):
                 from services.youtube_auth import find_fresh_cookie_cache
 
                 cached_cookie = find_fresh_cookie_cache()
@@ -775,7 +821,16 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
     raise RuntimeError("YouTube preview unavailable for this video")
 
 
-assert _youtube_format_playable({"format_id": "hls-master", "url": "https://x/master.m3u8", "protocol": "m3u8_native"}) is True
+assert (
+    _youtube_format_playable(
+        {
+            "format_id": "hls-master",
+            "url": "https://x/master.m3u8",
+            "protocol": "m3u8_native",
+        }
+    )
+    is True
+)
 assert _PREVIEW_EXTRACT_RACE_SEC <= _PREVIEW_EXTRACT_MAX_WALL_SEC
 assert _PREVIEW_EXTRACT_FALLBACK_SEC >= _PREVIEW_EXTRACT_WAIT_SEC
 assert preview_fast_only_mode.__name__ == "preview_fast_only_mode"
@@ -797,7 +852,11 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     now = time.time()
     with _EXTRACT_CACHE_LOCK:
         hit = _EXTRACT_INFO_CACHE.get(key)
-        if hit and (now - hit[0]) < _EXTRACT_CACHE_TTL_SEC and _youtube_cache_ok(url, opts, hit[1]):
+        if (
+            hit
+            and (now - hit[0]) < _EXTRACT_CACHE_TTL_SEC
+            and _youtube_cache_ok(url, opts, hit[1])
+        ):
             return hit[1]
         if hit and not _youtube_cache_ok(url, opts, hit[1]):
             _EXTRACT_INFO_CACHE.pop(key, None)
@@ -812,7 +871,11 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
     if not leader:
         event, box = inflight
-        wait_sec = _PREVIEW_EXTRACT_WAIT_SEC if opts.get("_preview_fast") else _EXTRACT_WAIT_SEC
+        wait_sec = (
+            _PREVIEW_EXTRACT_WAIT_SEC
+            if opts.get("_preview_fast")
+            else _EXTRACT_WAIT_SEC
+        )
         if preview_fast_only_mode():
             wait_sec = min(wait_sec, _PREVIEW_EXTRACT_MAX_WALL_SEC + 2.0)
         if not event.wait(timeout=wait_sec):
@@ -842,6 +905,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         if info is None:
             from services.youtube_innertube import extract_video_id
             from services.youtube_diag import log_extract_fail
+
             log_extract_fail(
                 extract_video_id(url) or "?",
                 "extract_returned_none",
@@ -853,6 +917,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
             from services.youtube_innertube import extract_video_id
             from services.youtube_diag import format_summary, log_extract_fail
+
             log_extract_fail(
                 extract_video_id(url) or "?",
                 "not_playable",
@@ -868,6 +933,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         if _youtube_url_from_opts(url, opts):
             from services.youtube_innertube import extract_video_id
             from services.youtube_diag import log_extract_fail
+
             log_extract_fail(
                 extract_video_id(url) or "?",
                 "extract_exception",
@@ -884,14 +950,27 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
 
 assert cached_extract_info.__name__ == "cached_extract_info"
-assert _youtube_has_user_auth({"_youtube_session": type("S", (), {"anonymous": True})(), "cookiefile": "/x"}) is False
+assert (
+    _youtube_has_user_auth(
+        {"_youtube_session": type("S", (), {"anonymous": True})(), "cookiefile": "/x"}
+    )
+    is False
+)
 assert isinstance(_YTDLP_EXTRACT_LOCK, type(threading.Lock()))
-assert _youtube_info_has_hls({"formats": [{"url": "https://x/a.m3u8", "protocol": "m3u8_native"}]})
-assert _youtube_info_use_clip_path({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
-assert _youtube_info_playable({"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]})
+assert _youtube_info_has_hls(
+    {"formats": [{"url": "https://x/a.m3u8", "protocol": "m3u8_native"}]}
+)
+assert _youtube_info_use_clip_path(
+    {"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]}
+)
+assert _youtube_info_playable(
+    {"formats": [{"url": "https://x/v.mp4", "protocol": "https", "height": 720}]}
+)
 
 
-def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None) -> bool:
+def warm_youtube_extract(
+    url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None
+) -> bool:
     """Prefetch resolved-stream cache on hover — same path as create_session."""
     from services.youtube_innertube import extract_video_id
 
@@ -903,6 +982,7 @@ def warm_youtube_extract(url: str, oauth: Optional[str] = None, cookies_file: Op
         return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=360)
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
+
         log_extract_fail(extract_video_id(url) or "?", "warm_skipped", exc=exc)
         logger.debug("YouTube warm extract skipped for %s: %s", url[:80], exc)
         return False
@@ -961,6 +1041,7 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         if ydl_log.lines and logger.isEnabledFor(logging.DEBUG):
             logger.debug("yt-dlp: %s", "\n".join(ydl_log.lines))
 
+
 def _is_muxed_progressive(fmt: dict) -> bool:
     fid = (fmt.get("format_id") or "").lower()
     if fid == "hls-master":
@@ -977,7 +1058,8 @@ def _is_muxed_progressive(fmt: dict) -> bool:
 def _find_progressive_format(info: dict) -> dict:
     formats = info.get("formats") or []
     prog = [
-        f for f in formats
+        f
+        for f in formats
         if f.get("url")
         and (f.get("protocol") or "").lower() in ("https", "http")
         and int(f.get("height") or 0) > 0
@@ -1006,7 +1088,8 @@ def _find_hls_format(info: dict) -> dict:
     """
     formats = info.get("formats") or []
     hls_formats = [
-        f for f in formats
+        f
+        for f in formats
         if f.get("protocol") in ("m3u8", "m3u8_native", "m3u8_ffmpeg")
         or (f.get("format_id") or "").lower() == "hls-master"
     ]
@@ -1022,16 +1105,19 @@ def _find_hls_format(info: dict) -> dict:
     )
     return hls_formats[0]
 
+
 def _parse_prefer_height(quality: Optional[str], default: int = 1080) -> int:
     if not quality or quality.lower() == "source":
         return 10_000
     m = re.search(r"(\d+)", quality)
     return int(m.group(1)) if m else default
 
+
 def prefer_height_from_quality(quality: Optional[str]) -> int:
     """Height used for HLS variant selection and size estimates (public helper)."""
     h = _parse_prefer_height(quality)
     return 10_000 if h >= 10_000 else h
+
 
 def _resolve_media_playlist(
     media_url: str,
@@ -1042,7 +1128,9 @@ def _resolve_media_playlist(
 ) -> tuple[str, dict]:
     """Follow HLS master playlists (Kick IVS, Twitch variants) to a media playlist."""
     if _depth > 10:
-        raise RuntimeError(f"HLS playlist resolution exceeded max depth (10) at {media_url}")
+        raise RuntimeError(
+            f"HLS playlist resolution exceeded max depth (10) at {media_url}"
+        )
     r = requests.get(media_url, headers=headers, timeout=30)
     r.raise_for_status()
     text = r.text
@@ -1066,12 +1154,14 @@ def _resolve_media_playlist(
             pending_codecs = _codecs_from_stream_inf(stripped)
             continue
         if stripped and not stripped.startswith("#"):
-            variants.append((
-                pending_height,
-                pending_bandwidth,
-                urljoin(media_url, stripped),
-                pending_codecs,
-            ))
+            variants.append(
+                (
+                    pending_height,
+                    pending_bandwidth,
+                    urljoin(media_url, stripped),
+                    pending_codecs,
+                )
+            )
             pending_bandwidth = 0
             pending_height = 0
             pending_codecs = {}
@@ -1094,8 +1184,13 @@ def _resolve_media_playlist(
         chosen = max(variants, key=lambda item: item[1])
 
     return _resolve_media_playlist(
-        chosen[2], headers, prefer_height, _depth=_depth + 1, _stream_info=chosen[3],
+        chosen[2],
+        headers,
+        prefer_height,
+        _depth=_depth + 1,
+        _stream_info=chosen[3],
     )
+
 
 def _parse_m3u8(
     media_url: str,
@@ -1109,7 +1204,9 @@ def _parse_m3u8(
     lines = r.text.splitlines()
     MAX_PLAYLIST_LINES = 100_000
     if len(lines) > MAX_PLAYLIST_LINES:
-        raise RuntimeError(f"HLS media playlist too large ({len(lines)} lines) at {media_url}")
+        raise RuntimeError(
+            f"HLS media playlist too large ({len(lines)} lines) at {media_url}"
+        )
 
     segments = []
     current_duration = None
@@ -1118,12 +1215,15 @@ def _parse_m3u8(
         if line.startswith("#EXTINF:"):
             current_duration = float(line.split(":")[1].split(",")[0])
         elif line and not line.startswith("#") and current_duration is not None:
-            segments.append({
-                "duration": current_duration,
-                "url": urljoin(media_url, line),
-            })
+            segments.append(
+                {
+                    "duration": current_duration,
+                    "url": urljoin(media_url, line),
+                }
+            )
             current_duration = None
     return segments, stream_info
+
 
 def _select_segments(
     segments: list[dict],
@@ -1164,6 +1264,7 @@ def _iter_response_chunks(response, chunk_size: int, stall_seconds: float):
             deadline = time.monotonic() + stall_seconds
         yield chunk
 
+
 def _download_one_segment(
     index: int,
     seg: dict,
@@ -1191,6 +1292,7 @@ def _download_one_segment(
     if size < 1024:
         raise RuntimeError(f"HLS segment {index} is too small ({size} bytes)")
     return path
+
 
 def _download_segments(
     segments: list[dict],
@@ -1228,10 +1330,12 @@ def _download_segments(
             files[index] = fut.result()
             completed += 1
             if progress_hook:
-                progress_hook({
-                    "status": "downloading",
-                    "percent": completed / total * 100.0,
-                })
+                progress_hook(
+                    {
+                        "status": "downloading",
+                        "percent": completed / total * 100.0,
+                    }
+                )
 
     if any(path is None for path in files):
         raise RuntimeError("HLS segment download incomplete")
@@ -1277,6 +1381,7 @@ def _feed_path_to_stdin(
     except OSError:
         pass
 
+
 def _progressive_hls_copy_to_mp4(
     segments: list[dict],
     headers: dict,
@@ -1298,28 +1403,45 @@ def _progressive_hls_copy_to_mp4(
         raise RuntimeError("No HLS segments to mux")
 
     if progress_hook:
-        progress_hook({
-            "status": "downloading",
-            "percent": 0,
-            "phase": "Downloading",
-            "phase_id": _phase_id("Downloading"),
-        })
+        progress_hook(
+            {
+                "status": "downloading",
+                "percent": 0,
+                "phase": "Downloading",
+                "phase_id": _phase_id("Downloading"),
+            }
+        )
 
     tmp_mp4 = os.path.join(temp_dir, f"stream_{uuid.uuid4().hex}.mp4")
     mux_cmd = [
-        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-        "-fflags", "+genpts+igndts",
-        "-f", "mpegts", "-i", "pipe:0",
+        ffmpeg_exe,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts+igndts",
+        "-f",
+        "mpegts",
+        "-i",
+        "pipe:0",
     ]
     if offset > 0.001:
         mux_cmd += ["-ss", str(offset)]
     mux_cmd += [
-        "-t", str(duration),
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-avoid_negative_ts", "make_zero",
-        "-max_muxing_queue_size", "9999",
-        "-f", "mp4", tmp_mp4,
+        "-t",
+        str(duration),
+        "-c",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-max_muxing_queue_size",
+        "9999",
+        "-f",
+        "mp4",
+        tmp_mp4,
     ]
     try:
         proc = sp.Popen(
@@ -1374,22 +1496,31 @@ def _progressive_hls_copy_to_mp4(
             return
         try:
             seg_paths[i] = _download_one_segment(
-                i, segments[i], headers, temp_dir, cancel_event, pause_event,
+                i,
+                segments[i],
+                headers,
+                temp_dir,
+                cancel_event,
+                pause_event,
             )
         # ponytail: survival guarantee for per-segment download ÔÇö segment I/O may fail in many ways; skip to next segment
         except Exception as exc:
-        # ponytail: subprocess/codec errors only ÔÇö best-effort encoder detection
+            # ponytail: subprocess/codec errors only ÔÇö best-effort encoder detection
             with err_lock:
                 errors.append(exc)
         finally:
             ready[i].set()
 
-    stderr_thread = threading.Thread(target=_drain_stderr, name="hls-mux-stderr", daemon=True)
+    stderr_thread = threading.Thread(
+        target=_drain_stderr, name="hls-mux-stderr", daemon=True
+    )
     stderr_thread.start()
 
     try:
         futures: dict[int, Any] = {}
-        with ThreadPoolExecutor(max_workers=min(SEGMENT_DOWNLOAD_WORKERS, total)) as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(SEGMENT_DOWNLOAD_WORKERS, total)
+        ) as pool:
 
             def _schedule_through(cap: int) -> None:
                 for idx in range(total):
@@ -1416,17 +1547,22 @@ def _progressive_hls_copy_to_mp4(
                     if proc.poll() is not None:
                         break
                     _feed_path_to_stdin(
-                        path, proc.stdin, cancel_event, pause_event,
+                        path,
+                        proc.stdin,
+                        cancel_event,
+                        pause_event,
                         on_chunk=_touch_ffmpeg_activity,
                     )
                     seg_paths[i] = None
                     if progress_hook:
-                        progress_hook({
-                            "status": "downloading",
-                            "percent": (i + 1) / total * HLS_DOWNLOAD_PROGRESS_CAP,
-                            "phase": "Downloading",
-                            "concat_encoder": "copy",
-                        })
+                        progress_hook(
+                            {
+                                "status": "downloading",
+                                "percent": (i + 1) / total * HLS_DOWNLOAD_PROGRESS_CAP,
+                                "phase": "Downloading",
+                                "concat_encoder": "copy",
+                            }
+                        )
                 try:
                     proc.stdin.close()
                 except (BrokenPipeError, OSError):
@@ -1467,8 +1603,13 @@ def _progressive_hls_copy_to_mp4(
                         raise errors[0]
                 if rc != 0:
                     err_tail = stderr.decode(errors="ignore")[-800:]
-                    raise RuntimeError(f"FFmpeg stream mux failed (exit {rc}): {err_tail}")
-                if not os.path.isfile(tmp_mp4) or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES:
+                    raise RuntimeError(
+                        f"FFmpeg stream mux failed (exit {rc}): {err_tail}"
+                    )
+                if (
+                    not os.path.isfile(tmp_mp4)
+                    or os.path.getsize(tmp_mp4) < MIN_VALID_OUTPUT_BYTES
+                ):
                     err_tail = stderr.decode(errors="ignore")[-800:]
                     raise RuntimeError(f"FFmpeg produced no output: {err_tail}")
     finally:
@@ -1479,7 +1620,9 @@ def _progressive_hls_copy_to_mp4(
     if mp4_faststart:
         fast_tmp = os.path.join(temp_dir, f"faststart_{uuid.uuid4().hex}.mp4")
         _apply_mp4_faststart(
-            tmp_mp4, fast_tmp, ffmpeg_exe,
+            tmp_mp4,
+            fast_tmp,
+            ffmpeg_exe,
             progress_hook=progress_hook,
             cancel_event=cancel_event,
             pause_event=pause_event,
@@ -1490,33 +1633,40 @@ def _progressive_hls_copy_to_mp4(
         except OSError:
             pass
         if progress_hook:
-            progress_hook({
-                "status": "postprocessing",
-                "percent": 97,
-                "phase": "Finalising",
-                "phase_id": _phase_id("Finalising"),
-                "concat_encoder": "copy",
-            })
+            progress_hook(
+                {
+                    "status": "postprocessing",
+                    "percent": 97,
+                    "phase": "Finalising",
+                    "phase_id": _phase_id("Finalising"),
+                    "concat_encoder": "copy",
+                }
+            )
         _atomic_replace(
-            fast_tmp, output_path,
+            fast_tmp,
+            output_path,
             cancel_event=cancel_event,
             progress_hook=progress_hook,
         )
     else:
         if progress_hook:
-            progress_hook({
-                "status": "postprocessing",
-                "percent": 97,
-                "phase": "Finalising",
-                "phase_id": _phase_id("Finalising"),
-                "concat_encoder": "copy",
-            })
+            progress_hook(
+                {
+                    "status": "postprocessing",
+                    "percent": 97,
+                    "phase": "Finalising",
+                    "phase_id": _phase_id("Finalising"),
+                    "concat_encoder": "copy",
+                }
+            )
         _atomic_replace(
-            tmp_mp4, output_path,
+            tmp_mp4,
+            output_path,
             cancel_event=cancel_event,
             progress_hook=progress_hook,
         )
     _verify_output_file(output_path)
+
 
 def _concat_and_trim(
     files: list[str],
@@ -1543,14 +1693,16 @@ def _concat_and_trim(
     encoder = resolve_video_encoder(video_encoder)
     phase = "Remuxing" if encoder == "copy" else "Encoding"
     if progress_hook:
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 85,
-            "phase": phase,
-            "phase_id": _phase_id(phase),
-            "speed": None,
-            "eta_seconds": None,
-        })
+        progress_hook(
+            {
+                "status": "postprocessing",
+                "percent": 85,
+                "phase": phase,
+                "phase_id": _phase_id(phase),
+                "speed": None,
+                "eta_seconds": None,
+            }
+        )
 
     encode_args = ffmpeg_h264_encode_args(encoder)
     cmd = [ffmpeg_exe, "-y", "-loglevel", "error"]
@@ -1563,7 +1715,14 @@ def _concat_and_trim(
     if encode_args:
         cmd += encode_args
     else:
-        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
+        cmd += [
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
+        ]
     cmd += ["-f", "mp4", tmp_out]
     _check_pause_cancel(cancel_event, pause_event)
     _run_ffmpeg(
@@ -1585,14 +1744,16 @@ def _concat_and_trim(
         # of multi-GB files can take 10+ seconds on a slow disk; we want
         # the user to see explicit feedback that the bar is moving
         # through the disk-write phase, not frozen at 99).
-        progress_hook({
-            "status": "postprocessing",
-            "percent": 99,
-            "phase": "Finalising",
-            "phase_id": _phase_id("Finalising"),
-            "speed": None,
-            "eta_seconds": None,
-        })
+        progress_hook(
+            {
+                "status": "postprocessing",
+                "percent": 99,
+                "phase": "Finalising",
+                "phase_id": _phase_id("Finalising"),
+                "speed": None,
+                "eta_seconds": None,
+            }
+        )
 
     # Atomic replace when possible; copy fallback for cross-drive temp (Windows).
     # Thread the cancel/pause events and progress hook through so the
@@ -1602,7 +1763,8 @@ def _concat_and_trim(
     # microseconds on the same drive; only the chunked copy needs the
     # cancel plumbing).
     _atomic_replace(
-        tmp_out, output_path,
+        tmp_out,
+        output_path,
         cancel_event=cancel_event,
         progress_hook=progress_hook,
     )
@@ -1611,6 +1773,7 @@ def _concat_and_trim(
     if progress_hook:
         progress_hook({"status": "downloading", "percent": 100})
         progress_hook({"status": "finished"})
+
 
 def download_hls_media_clip(
     media_url: str,
@@ -1646,20 +1809,27 @@ def download_hls_media_clip(
     selected, first_offset = _select_segments(segments, start_sec, end_sec)
     playlist_encoder = resolve_concat_encoder(stream_info, None, video_encoder)
     if progress_hook and playlist_encoder != "copy":
-        progress_hook({
-            "status": "downloading",
-            "concat_encoder": playlist_encoder,
-            "phase": "Encoding",
-        })
+        progress_hook(
+            {
+                "status": "downloading",
+                "concat_encoder": playlist_encoder,
+                "phase": "Encoding",
+            }
+        )
     selected_duration = sum(s["duration"] for s in selected)
     logger.info(
         "HLS clip %.2f-%.2fs: %d segments, %.1fs media (offset %.2fs)",
-        start_sec, end_sec, len(selected), selected_duration, first_offset,
+        start_sec,
+        end_sec,
+        len(selected),
+        selected_duration,
+        first_offset,
     )
     if selected_duration > duration * 2 + 120:
         logger.warning(
             "HLS clip selected %.1fs of media for %.1fs trim ÔÇö check segment selection",
-            selected_duration, duration,
+            selected_duration,
+            duration,
         )
 
     resolved_ffmpeg = ffmpeg_exe or _resolve_ffmpeg_exe()
@@ -1678,13 +1848,18 @@ def download_hls_media_clip(
             register_temp_dir(tmpdir)
         # ponytail: survival guarantee for register_pp_state callback ÔÇö arbitrary callback
         except Exception:
-        # ponytail: best-effort ÔÇö register_temp_dir(tmpdir)
+            # ponytail: best-effort ÔÇö register_temp_dir(tmpdir)
             pass
     try:
         first_path: Optional[str] = None
         if selected:
             first_path = _download_one_segment(
-                0, selected[0], headers, tmpdir, cancel_event, pause_event,
+                0,
+                selected[0],
+                headers,
+                tmpdir,
+                cancel_event,
+                pause_event,
             )
             probe_info = probe_segment_codec(first_path, resolved_ffmpeg)
         else:
@@ -1692,18 +1867,27 @@ def download_hls_media_clip(
         hls_encoder = resolve_concat_encoder(stream_info, probe_info, video_encoder)
         logger.info(
             "HLS concat: %s (playlist=%s, probe=%s)",
-            hls_encoder, stream_info or {}, probe_info or {},
+            hls_encoder,
+            stream_info or {},
+            probe_info or {},
         )
         if progress_hook:
-            progress_hook({
-                "status": "downloading",
-                "concat_encoder": hls_encoder,
-                "phase": "Remuxing" if hls_encoder == "copy" else "Encoding",
-            })
+            progress_hook(
+                {
+                    "status": "downloading",
+                    "concat_encoder": hls_encoder,
+                    "phase": "Remuxing" if hls_encoder == "copy" else "Encoding",
+                }
+            )
         if hls_encoder == "copy":
             _progressive_hls_copy_to_mp4(
-                selected, headers, tmpdir, output_path,
-                first_offset, duration, resolved_ffmpeg,
+                selected,
+                headers,
+                tmpdir,
+                output_path,
+                first_offset,
+                duration,
+                resolved_ffmpeg,
                 progress_hook=progress_hook,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
@@ -1716,14 +1900,27 @@ def download_hls_media_clip(
                 progress_hook({"status": "finished"})
             return
 
-        files = _download_segments(
-            selected[1:], headers, tmpdir, progress_hook, cancel_event, pause_event,
-            index_offset=1,
-        ) if len(selected) > 1 else []
+        files = (
+            _download_segments(
+                selected[1:],
+                headers,
+                tmpdir,
+                progress_hook,
+                cancel_event,
+                pause_event,
+                index_offset=1,
+            )
+            if len(selected) > 1
+            else []
+        )
         if first_path:
             files = [first_path, *files]
         _concat_and_trim(
-            files, output_path, first_offset, duration, resolved_ffmpeg,
+            files,
+            output_path,
+            first_offset,
+            duration,
+            resolved_ffmpeg,
             progress_hook,
             cancel_event=cancel_event,
             pause_event=pause_event,
@@ -1733,13 +1930,23 @@ def download_hls_media_clip(
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def _extract_hls_audio(video_path: str, output_path: str, ffmpeg_exe: Optional[str] = None) -> None:
+
+def _extract_hls_audio(
+    video_path: str, output_path: str, ffmpeg_exe: Optional[str] = None
+) -> None:
     """Strip video track from an HLS clip mux to mp3."""
     resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
     _run_ffmpeg(
         [
-            resolved, "-y", "-i", video_path,
-            "-vn", "-acodec", "libmp3lame", "-b:a", "192k",
+            resolved,
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            "192k",
             output_path,
         ],
         cancel_event=None,
@@ -1805,12 +2012,14 @@ def _download_progressive_clip(
             cmd += ["-movflags", "+faststart"]
         cmd.append(output_path)
     if progress_hook:
-        progress_hook({
-            "status": "downloading",
-            "percent": 5,
-            "phase": "Downloading",
-            "phase_id": _phase_id("Downloading"),
-        })
+        progress_hook(
+            {
+                "status": "downloading",
+                "percent": 5,
+                "phase": "Downloading",
+                "phase_id": _phase_id("Downloading"),
+            }
+        )
     try:
         _run_ffmpeg(
             cmd,
@@ -1825,12 +2034,14 @@ def _download_progressive_clip(
         )
         _verify_output_file(output_path)
         if progress_hook:
-            progress_hook({
-                "status": "postprocessing",
-                "percent": 99,
-                "phase": "Finalising",
-                "phase_id": _phase_id("Finalising"),
-            })
+            progress_hook(
+                {
+                    "status": "postprocessing",
+                    "percent": 99,
+                    "phase": "Finalising",
+                    "phase_id": _phase_id("Finalising"),
+                }
+            )
             progress_hook({"status": "finished"})
     finally:
         if tmpdir:
@@ -1993,7 +2204,10 @@ def _fetch_googlevideo_range_once(
             http_version = "3"
 
         resp = cffi_requests.get(
-            url, headers=hdrs, impersonate="chrome", stream=True,
+            url,
+            headers=hdrs,
+            impersonate="chrome",
+            stream=True,
             timeout=(10, 180),
             http_version=http_version,
         )
@@ -2043,10 +2257,18 @@ def _fetch_googlevideo_span_resilient(
         part = f"{dest}.hi"
         try:
             _fetch_googlevideo_span_resilient(
-                url, (b0, mid), headers, dest, cancel_event,
+                url,
+                (b0, mid),
+                headers,
+                dest,
+                cancel_event,
             )
             _fetch_googlevideo_span_resilient(
-                url, (mid + 1, b1), headers, part, cancel_event,
+                url,
+                (mid + 1, b1),
+                headers,
+                part,
+                cancel_event,
             )
             with open(dest, "ab") as out, open(part, "rb") as src:
                 shutil.copyfileobj(src, out)
@@ -2092,7 +2314,12 @@ def _fetch_googlevideo_range(
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Download cancelled by user")
                 _fetch_googlevideo_range(
-                    url, part_ranges[idx], headers, part_files[idx], cancel_event, max_workers=1,
+                    url,
+                    part_ranges[idx],
+                    headers,
+                    part_files[idx],
+                    cancel_event,
+                    max_workers=1,
                 )
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2112,13 +2339,19 @@ def _fetch_googlevideo_range(
             part = f"{dest}.part"
             try:
                 _fetch_googlevideo_span_resilient(
-                    url, (pos, end), headers, part, cancel_event,
+                    url,
+                    (pos, end),
+                    headers,
+                    part,
+                    cancel_event,
                 )
                 with open(part, "rb") as src:
                     shutil.copyfileobj(src, out)
             except Exception as exc:
                 if out.tell() >= 65536 and end >= b1 - _GOOGLEVIDEO_RANGE_CHUNK_BYTES:
-                    logger.debug("googlevideo range tail skipped %d-%d: %s", pos, end, exc)
+                    logger.debug(
+                        "googlevideo range tail skipped %d-%d: %s", pos, end, exc
+                    )
                     break
                 raise
             finally:
@@ -2143,7 +2376,9 @@ def _grow_googlevideo_prefix_cache(
     start_b = max(0, have_end + 1)
     part = f"{cache_path}.grow"
     try:
-        _fetch_googlevideo_range(url, (start_b, need_byte_end), headers, part, cancel_event)
+        _fetch_googlevideo_range(
+            url, (start_b, need_byte_end), headers, part, cancel_event
+        )
         mode = "ab" if have_end >= 0 else "wb"
         with open(cache_path, mode) as out, open(part, "rb") as src:
             shutil.copyfileobj(src, out)
@@ -2177,10 +2412,24 @@ def _concat_googlevideo_init_media(
                 for p in (init_p, media_p):
                     f.write(f"file '{p.replace(chr(92), '/')}'\n")
             ff = _resolve_ffmpeg_exe()
-            _run_ffmpeg([
-                ff, "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "concat", "-safe", "0", "-i", clist, "-c", "copy", dest,
-            ])
+            _run_ffmpeg(
+                [
+                    ff,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    clist,
+                    "-c",
+                    "copy",
+                    dest,
+                ]
+            )
         elif os.path.isfile(media_p):
             shutil.copyfile(media_p, dest)
         else:
@@ -2204,7 +2453,11 @@ def _fetch_googlevideo_window_local(
 ) -> float:
     """Fetch a seekable local googlevideo window; return ffmpeg -ss for the clip start."""
     media = _googlevideo_byte_range(
-        url, start_sec, end_sec, fmt=fmt, vod_duration=vod_duration,
+        url,
+        start_sec,
+        end_sec,
+        fmt=fmt,
+        vod_duration=vod_duration,
     )
     if not media:
         raise RuntimeError("no googlevideo byte range for clip window")
@@ -2216,11 +2469,15 @@ def _fetch_googlevideo_window_local(
         _grow_googlevideo_prefix_cache(url, headers, prefix_cache, mb1, cancel_event)
         shutil.copyfile(prefix_cache, dest)
         return start_sec
-    _fetch_googlevideo_range(url, (0, mb1), headers, dest, cancel_event, max_workers=max_workers)
+    _fetch_googlevideo_range(
+        url, (0, mb1), headers, dest, cancel_event, max_workers=max_workers
+    )
     return start_sec
 
 
-def _dash_video_needs_transcode(video_url: str, video_fmt: Optional[dict] = None) -> bool:
+def _dash_video_needs_transcode(
+    video_url: str, video_fmt: Optional[dict] = None
+) -> bool:
     """VP9/AV1/webm cannot be copied into MP4."""
     if video_fmt:
         ext = (video_fmt.get("ext") or "").lower()
@@ -2288,15 +2545,25 @@ def _download_muxed_dash_clip(
 
     v_range = (
         _googlevideo_byte_range(
-            video_url, start_sec, end_sec,
-            fmt=video_fmt, vod_duration=0.0,
-        ) if use_byte_range else None
+            video_url,
+            start_sec,
+            end_sec,
+            fmt=video_fmt,
+            vod_duration=0.0,
+        )
+        if use_byte_range
+        else None
     )
     a_range = (
         _googlevideo_byte_range(
-            audio_url, start_sec, end_sec,
-            fmt=None, vod_duration=0.0,
-        ) if use_byte_range else None
+            audio_url,
+            start_sec,
+            end_sec,
+            fmt=None,
+            vod_duration=0.0,
+        )
+        if use_byte_range
+        else None
     )
     tmpdir: Optional[str] = None
     v_input, a_input = video_url, audio_url
@@ -2308,22 +2575,36 @@ def _download_muxed_dash_clip(
         v_local = os.path.join(tmpdir, "v.mp4")
         a_local = os.path.join(tmpdir, "a.m4a")
         if progress_hook:
-            progress_hook({
-                "status": "downloading",
-                "percent": 8,
-                "phase": "Downloading",
-                "phase_id": _phase_id("Downloading"),
-            })
+            progress_hook(
+                {
+                    "status": "downloading",
+                    "percent": 8,
+                    "phase": "Downloading",
+                    "phase_id": _phase_id("Downloading"),
+                }
+            )
         try:
             v_ss = _fetch_googlevideo_window_local(
-                video_url, start_sec, end_sec, headers, v_local, cancel_event,
+                video_url,
+                start_sec,
+                end_sec,
+                headers,
+                v_local,
+                cancel_event,
                 prefix_cache=video_prefix_cache,
             )
             a_ss = _fetch_googlevideo_window_local(
-                audio_url, start_sec, end_sec, headers, a_local, cancel_event,
+                audio_url,
+                start_sec,
+                end_sec,
+                headers,
+                a_local,
+                cancel_event,
                 prefix_cache=audio_prefix_cache,
             )
-            if _local_dash_slice_valid(v_local) and _local_dash_slice_valid(a_local, audio=True):
+            if _local_dash_slice_valid(v_local) and _local_dash_slice_valid(
+                a_local, audio=True
+            ):
                 used_local = True
                 v_input, a_input = v_local, a_local
             else:
@@ -2350,7 +2631,16 @@ def _download_muxed_dash_clip(
     elif is_ts:
         # ponytail: m4a→mpegts needs AAC ADTS for browser MSE — plain -c copy is silent
         # initial_discontinuity: each on-demand segment resets PTS; pairs with #EXT-X-DISCONTINUITY
-        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-mpegts_flags", "+initial_discontinuity"]
+        cmd += [
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-mpegts_flags",
+            "+initial_discontinuity",
+        ]
     else:
         cmd += ["-c", "copy"]
     if is_ts:
@@ -2361,12 +2651,14 @@ def _download_muxed_dash_clip(
         cmd.append(output_path)
     try:
         if progress_hook and remote:
-            progress_hook({
-                "status": "downloading",
-                "percent": 5,
-                "phase": "Downloading",
-                "phase_id": _phase_id("Downloading"),
-            })
+            progress_hook(
+                {
+                    "status": "downloading",
+                    "percent": 5,
+                    "phase": "Downloading",
+                    "phase_id": _phase_id("Downloading"),
+                }
+            )
         _run_ffmpeg(
             cmd,
             cancel_event=cancel_event,
@@ -2380,12 +2672,14 @@ def _download_muxed_dash_clip(
         )
         _verify_output_file(output_path)
         if progress_hook:
-            progress_hook({
-                "status": "postprocessing",
-                "percent": 99,
-                "phase": "Finalising",
-                "phase_id": _phase_id("Finalising"),
-            })
+            progress_hook(
+                {
+                    "status": "postprocessing",
+                    "percent": 99,
+                    "phase": "Finalising",
+                    "phase_id": _phase_id("Finalising"),
+                }
+            )
             progress_hook({"status": "finished"})
     except RuntimeError:
         if used_local and allow_remote_retry and not use_byte_range:
@@ -2403,8 +2697,19 @@ def _download_muxed_dash_clip(
             enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
             if enc_args:
                 cmd += enc_args
-            elif _dash_video_needs_transcode(video_url, video_fmt) and output_path.lower().endswith(".mp4"):
-                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
+            elif _dash_video_needs_transcode(
+                video_url, video_fmt
+            ) and output_path.lower().endswith(".mp4"):
+                cmd += [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "22",
+                    "-c:a",
+                    "copy",
+                ]
             else:
                 cmd += ["-c", "copy"]
             if mp4_faststart:
@@ -2449,6 +2754,7 @@ def _mux_dash_window_to_hls(
     video_fmt: Optional[dict] = None,
     audio_fmt: Optional[dict] = None,
     vod_duration: float = 0.0,
+    mux_timeout_sec: Optional[float] = None,
 ) -> Path:
     """Mux a DASH crop window into a local HLS playlist (window.m3u8 + seg_NNN.m4s).
 
@@ -2459,111 +2765,135 @@ def _mux_dash_window_to_hls(
     ``seg_000.m4s`` lands and HLS.js finalises when ``#EXT-X-ENDLIST`` appears.
     When ``USE_FMP4`` is enabled (default), segments are fragmented MP4 (CMAF)
     with an ``init.mp4`` init fragment instead of MPEG-TS.
+
+    ``mux_timeout_sec`` enforces a hard ceiling on the whole ffmpeg mux (including
+    the remote-URL fallback path). googlevideo CDN connections can stall without
+    EOF; without this guard the background mux thread blocks forever and the
+    preview never leaves the loading state.
     """
     from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 
+    # Hard timeout guard: a Timer sets a cancel_event that _run_ffmpeg polls.
+    cancel_event: Optional[threading.Event] = None
+    mux_timer: Optional[threading.Timer] = None
+    if mux_timeout_sec and mux_timeout_sec > 0:
+        cancel_event = threading.Event()
+
+        def _on_mux_timeout() -> None:
+            if cancel_event is not None:
+                cancel_event.set()
+
+        mux_timer = threading.Timer(mux_timeout_sec, _on_mux_timeout)
+        mux_timer.daemon = True
+        mux_timer.start()
     os.makedirs(output_dir, exist_ok=True)
-    duration = max(0.1, end_sec - start_sec)
-    ffmpeg_exe = _resolve_ffmpeg_exe()
-    v_local = os.path.join(output_dir, "_v.mp4")
-    a_local = os.path.join(output_dir, "_a.m4a")
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            v_future = pool.submit(
-                _fetch_googlevideo_window_local,
-                video_url,
-                start_sec,
-                end_sec,
-                headers,
-                v_local,
-                None,
-                video_prefix_cache,
-                fmt=video_fmt,
-                vod_duration=vod_duration,
-            )
-            a_future = pool.submit(
-                _fetch_googlevideo_window_local,
-                audio_url,
-                start_sec,
-                end_sec,
-                headers,
-                a_local,
-                None,
-                audio_prefix_cache,
-                fmt=audio_fmt,
-                vod_duration=vod_duration,
-            )
-            v_ss = v_future.result()
-            a_ss = a_future.result()
-        v_input, a_input = v_local, a_local
-    except Exception as exc:
-        err = str(exc).lower()
-        if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
-            # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
-            playlist = os.path.join(output_dir, "window.m3u8")
-            seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
-            hdr = _ffmpeg_input_headers(headers or {})
-            reconnect = _ffmpeg_reconnect_args()
-            probe = ["-probesize", "8M", "-analyzeduration", "2M"]
-            cmd = [
-                ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-                *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
-                *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-t", str(duration),
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k",
-                "-f", "hls",
-                "-hls_time", "4",
-                "-hls_playlist_type", "vod",
-                "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
-                *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
-                "-hls_segment_filename", seg_pattern,
-                playlist,
-            ]
-            _run_ffmpeg(
-                cmd,
-                encode_duration=duration,
-                progress_from=10.0,
-                progress_to=92.0,
-                phase="Muxing",
-            )
-            playlist_path = Path(playlist)
-            if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
-                raise RuntimeError("remote window HLS mux produced no playlist") from exc
-            return playlist_path
-        raise
-    playlist = os.path.join(output_dir, "window.m3u8")
-    seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
-    cmd = [
-        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-        "-probesize", "8M", "-analyzeduration", "2M",
-        "-ss", str(v_ss), "-i", v_input,
-        "-probesize", "8M", "-analyzeduration", "2M",
-        "-ss", str(a_ss), "-i", a_input,
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-t", str(duration),
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "128k",
-        "-f", "hls",
-        "-hls_time", "4",
-        "-hls_playlist_type", "vod",
-        "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
-        *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
-        "-hls_segment_filename", seg_pattern,
-        playlist,
-    ]
-    _run_ffmpeg(
-        cmd,
-        encode_duration=duration,
-        progress_from=10.0,
-        progress_to=92.0,
-        phase="Muxing",
-    )
-    playlist_path = Path(playlist)
-    if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
-        raise RuntimeError("window HLS mux produced no playlist")
-    return playlist_path
+        duration = max(0.1, end_sec - start_sec)
+        ffmpeg_exe = _resolve_ffmpeg_exe()
+        v_local = os.path.join(output_dir, "_v.mp4")
+        a_local = os.path.join(output_dir, "_a.m4a")
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                v_future = pool.submit(
+                    _fetch_googlevideo_window_local,
+                    video_url,
+                    start_sec,
+                    end_sec,
+                    headers,
+                    v_local,
+                    None,
+                    video_prefix_cache,
+                    fmt=video_fmt,
+                    vod_duration=vod_duration,
+                )
+                a_future = pool.submit(
+                    _fetch_googlevideo_window_local,
+                    audio_url,
+                    start_sec,
+                    end_sec,
+                    headers,
+                    a_local,
+                    None,
+                    audio_prefix_cache,
+                    fmt=audio_fmt,
+                    vod_duration=vod_duration,
+                )
+                v_ss = v_future.result()
+                a_ss = a_future.result()
+            v_input, a_input = v_local, a_local
+        except Exception as exc:
+            err = str(exc).lower()
+            if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
+                # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
+                playlist = os.path.join(output_dir, "window.m3u8")
+                seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
+                hdr = _ffmpeg_input_headers(headers or {})
+                reconnect = _ffmpeg_reconnect_args()
+                probe = ["-probesize", "8M", "-analyzeduration", "2M"]
+                cmd = [
+                    ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                    *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
+                    *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-t", str(duration),
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-f", "hls",
+                    "-hls_time", "4",
+                    "-hls_playlist_type", "vod",
+                    "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+                    *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
+                    "-hls_segment_filename", seg_pattern,
+                    playlist,
+                ]
+                _run_ffmpeg(
+                    cmd,
+                    encode_duration=duration,
+                    progress_from=10.0,
+                    progress_to=92.0,
+                    phase="Muxing",
+                    cancel_event=cancel_event,
+                )
+                playlist_path = Path(playlist)
+                if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
+                    raise RuntimeError("remote window HLS mux produced no playlist") from exc
+                return playlist_path
+            raise
+        playlist = os.path.join(output_dir, "window.m3u8")
+        seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
+        cmd = [
+            ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+            "-probesize", "8M", "-analyzeduration", "2M",
+            "-ss", str(v_ss), "-i", v_input,
+            "-probesize", "8M", "-analyzeduration", "2M",
+            "-ss", str(a_ss), "-i", a_input,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-t", str(duration),
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k",
+            "-f", "hls",
+            "-hls_time", "4",
+            "-hls_playlist_type", "vod",
+            "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+            *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
+            "-hls_segment_filename", seg_pattern,
+            playlist,
+        ]
+        _run_ffmpeg(
+            cmd,
+            encode_duration=duration,
+            progress_from=10.0,
+            progress_to=92.0,
+            phase="Muxing",
+            cancel_event=cancel_event,
+        )
+        playlist_path = Path(playlist)
+        if not playlist_path.is_file() or playlist_path.stat().st_size < 32:
+            raise RuntimeError("window HLS mux produced no playlist")
+        return playlist_path
+    finally:
+        if mux_timer is not None:
+            mux_timer.cancel()
 
 
 def _resolve_youtube_audio_format(info: dict) -> Optional[dict]:
@@ -2572,7 +2902,8 @@ def _resolve_youtube_audio_format(info: dict) -> Optional[dict]:
     if tagged and tagged.get("url"):
         return tagged
     candidates = [
-        f for f in info.get("formats") or []
+        f
+        for f in info.get("formats") or []
         if f.get("url")
         and (f.get("protocol") or "").lower() in ("https", "http")
         and f.get("acodec") not in (None, "none")
@@ -2602,20 +2933,24 @@ def _ytdlp_audio_section_download(
     try:
         out_tmpl = os.path.join(tmpdir, "clip.%(ext)s")
         ydl_opts = dict(opts)
-        ydl_opts.update({
-            "outtmpl": out_tmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "format": "bestaudio/best",
-            "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
-            "force_keyframes_at_cuts": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
+        ydl_opts.update(
+            {
+                "outtmpl": out_tmpl,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": "bestaudio/best",
+                "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
+                "force_keyframes_at_cuts": True,
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+            }
+        )
         if progress_hook:
             ydl_opts["progress_hooks"] = [progress_hook]
         with guarded_youtube_dl(ydl_opts) as ydl:
@@ -2674,7 +3009,8 @@ def _download_hls_clip(
 
     if extract_video_id(url) and not _youtube_info_has_hls(info):
         https_formats = [
-            f for f in info.get("formats") or []
+            f
+            for f in info.get("formats") or []
             if f.get("url")
             and int(f.get("height") or 0) > 0
             and (f.get("protocol") or "").lower() in ("https", "http")
@@ -2684,7 +3020,11 @@ def _download_hls_clip(
             if audio_fmt and audio_fmt.get("url"):
                 aheaders = audio_fmt.get("http_headers") or headers
                 _download_progressive_clip(
-                    audio_fmt["url"], output_path, start_sec, end_sec, headers=aheaders,
+                    audio_fmt["url"],
+                    output_path,
+                    start_sec,
+                    end_sec,
+                    headers=aheaders,
                     ffmpeg_exe=ffmpeg_exe,
                     progress_hook=progress_hook,
                     cancel_event=cancel_event,
@@ -2701,7 +3041,11 @@ def _download_hls_clip(
             vheaders = video_fmt.get("http_headers") or headers
             if _is_muxed_progressive(video_fmt):
                 _download_progressive_clip(
-                    video_fmt["url"], output_path, start_sec, end_sec, headers=vheaders,
+                    video_fmt["url"],
+                    output_path,
+                    start_sec,
+                    end_sec,
+                    headers=vheaders,
                     ffmpeg_exe=ffmpeg_exe,
                     progress_hook=progress_hook,
                     cancel_event=cancel_event,
@@ -2717,8 +3061,12 @@ def _download_hls_clip(
             audio_fmt = info.get("_preview_audio_format")
             if audio_fmt and audio_fmt.get("url") and not audio_only:
                 _download_muxed_dash_clip(
-                    video_fmt["url"], audio_fmt["url"], output_path,
-                    start_sec, end_sec, headers=vheaders,
+                    video_fmt["url"],
+                    audio_fmt["url"],
+                    output_path,
+                    start_sec,
+                    end_sec,
+                    headers=vheaders,
                     ffmpeg_exe=ffmpeg_exe,
                     progress_hook=progress_hook,
                     cancel_event=cancel_event,
@@ -2731,7 +3079,11 @@ def _download_hls_clip(
                 return
         if audio_only:
             _ytdlp_audio_section_download(
-                url, output_path, start_sec, end_sec, extract_opts,
+                url,
+                output_path,
+                start_sec,
+                end_sec,
+                extract_opts,
                 progress_hook=progress_hook,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
@@ -2746,7 +3098,11 @@ def _download_hls_clip(
 
     if is_progressive and extract_video_id(url):
         _download_progressive_clip(
-            media_url, output_path, start_sec, end_sec, headers=headers,
+            media_url,
+            output_path,
+            start_sec,
+            end_sec,
+            headers=headers,
             ffmpeg_exe=ffmpeg_exe,
             progress_hook=progress_hook,
             cancel_event=cancel_event,
@@ -2768,7 +3124,11 @@ def _download_hls_clip(
 
     try:
         download_hls_media_clip(
-            media_url, start_sec, end_sec, clip_target, headers=headers,
+            media_url,
+            start_sec,
+            end_sec,
+            clip_target,
+            headers=headers,
             ffmpeg_exe=ffmpeg_exe,
             progress_hook=progress_hook,
             cancel_event=cancel_event,
@@ -2802,13 +3162,15 @@ def ytdlp_section_mux_to_ts(
     try:
         base = os.path.join(tmpdir, "clip")
         opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
-        opts.update({
-            "outtmpl": base + ".%(ext)s",
-            "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
-            "force_keyframes_at_cuts": True,
-            "format": "bv*+ba/b",
-            "merge_output_format": "mp4",
-        })
+        opts.update(
+            {
+                "outtmpl": base + ".%(ext)s",
+                "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
+                "force_keyframes_at_cuts": True,
+                "format": "bv*+ba/b",
+                "merge_output_format": "mp4",
+            }
+        )
         with YoutubeDL(opts) as ydl:
             ydl.download([url])
         mp4s = sorted(Path(tmpdir).glob("clip.*"))
@@ -2817,10 +3179,22 @@ def ytdlp_section_mux_to_ts(
         src = str(mp4s[0])
         if output_path.lower().endswith(".ts"):
             ff = _resolve_ffmpeg_exe()
-            _run_ffmpeg([
-                ff, "-y", "-hide_banner", "-loglevel", "error",
-                "-i", src, "-c", "copy", "-f", "mpegts", output_path,
-            ])
+            _run_ffmpeg(
+                [
+                    ff,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    src,
+                    "-c",
+                    "copy",
+                    "-f",
+                    "mpegts",
+                    output_path,
+                ]
+            )
         else:
             shutil.copyfile(src, output_path)
         _verify_output_file(output_path)
@@ -2828,21 +3202,45 @@ def ytdlp_section_mux_to_ts(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-assert _resolve_youtube_audio_format({
-    "formats": [
-        {"url": "https://x/v.mp4", "protocol": "https", "height": 720, "vcodec": "avc1", "acodec": "mp4a"},
-        {"url": "https://x/a.m4a", "protocol": "https", "vcodec": "none", "acodec": "mp4a", "abr": 128},
-    ],
-})["url"] == "https://x/a.m4a"
-assert _find_media_format({
-    "formats": [{
-        "url": "https://x/v.mp4",
-        "protocol": "https",
-        "height": 720,
-        "vcodec": "avc1",
-        "acodec": "mp4a",
-    }],
-}).get("height") == 720
+assert (
+    _resolve_youtube_audio_format(
+        {
+            "formats": [
+                {
+                    "url": "https://x/v.mp4",
+                    "protocol": "https",
+                    "height": 720,
+                    "vcodec": "avc1",
+                    "acodec": "mp4a",
+                },
+                {
+                    "url": "https://x/a.m4a",
+                    "protocol": "https",
+                    "vcodec": "none",
+                    "acodec": "mp4a",
+                    "abr": 128,
+                },
+            ],
+        }
+    )["url"]
+    == "https://x/a.m4a"
+)
+assert (
+    _find_media_format(
+        {
+            "formats": [
+                {
+                    "url": "https://x/v.mp4",
+                    "protocol": "https",
+                    "height": 720,
+                    "vcodec": "avc1",
+                    "acodec": "mp4a",
+                }
+            ],
+        }
+    ).get("height")
+    == 720
+)
 assert _local_dash_slice_valid("nonexistent_dash_slice_abc123") is False
 assert _local_dash_slice_valid("nonexistent_dash_slice_abc123", audio=True) is False
 assert _GOOGLEVIDEO_RANGE_CHUNK_BYTES == 1 * 1024 * 1024
