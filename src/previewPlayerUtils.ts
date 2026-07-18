@@ -134,6 +134,9 @@ export function isYouTubePreviewPlatform(platform: string | null | undefined): b
   return (platform || '').toLowerCase() === 'youtube';
 }
 
+/** YouTube progressive preview offers these switchable tiers (re-muxed on demand). */
+export const YOUTUBE_PREVIEW_ALLOW_HEIGHTS = [360, 720, 1080];
+
 /** Validate URL protocol — only https, http, blob:, and relative proxy paths are allowed. */
 export function isValidPreviewUrl(u: string): boolean {
   if (u.startsWith('/')) return true;
@@ -1341,11 +1344,14 @@ export function resolveProgressivePreviewLevels(
     variantHeights?: number[];
     qualityLabels?: string[];
     initialHeight: number;
+    /** Extra tiers to offer even if not yet downloaded (e.g. 360/720/1080 for YouTube). */
+    allowHeights?: number[];
   },
 ): { mapped: PreviewLevelOption[]; defaultIndex: number } {
   const heights = mergeVariantHeights(
     opts.variantHeights,
     parseQualityHeights(opts.qualityLabels ?? []),
+    opts.allowHeights ?? [],
   );
   const mapped = mapHeightsToPreviewLevels(heights);
   if (!mapped.length) {

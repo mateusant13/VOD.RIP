@@ -29,7 +29,7 @@ export function isClipUrl(u: string): boolean {
   return false;
 }
 
-export function channelVideoDurationSec(v: ChannelVideo): number | null {
+export function channelVideoDurationSec(v: ChannelVodMetaInput): number | null {
   if (v.duration != null && v.duration > 0) return Math.floor(v.duration);
   if (v.duration_string) return parseHmsDurationString(v.duration_string);
   return null;
@@ -693,7 +693,14 @@ export function reorderChannelsById(
   return next;
 }
 
-export function channelVodSubline(v: ChannelVideo): string {
+export interface ChannelVodMetaInput {
+  created_at?: string | null;
+  views?: number | null;
+  duration?: number | null;
+  duration_string?: string | null;
+}
+
+export function channelVodSubline(v: ChannelVodMetaInput): string {
   const parts: string[] = [];
   const when = fmtDaysAgo(v.created_at);
   if (when) parts.push(when);

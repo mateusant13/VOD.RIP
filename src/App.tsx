@@ -43,6 +43,7 @@ import {
   bindYoutubeChannelScrollWarm,
   clampPreviewTimeToVodTrim,
   PREVIEW_SEEK_DEBOUNCE_MS,
+  YOUTUBE_PREVIEW_ALLOW_HEIGHTS,
   seekYoutubeWindowHls,
   windowHlsVideoTimeSec,
   isPositionInWindowHlsMux,
@@ -1332,6 +1333,7 @@ export default function App() {
           ?? previewPlayback.qualityLabels
           ?? videoInfo?.qualities,
         initialHeight: activeH,
+        allowHeights: detectUrlPlatform(previewPageUrl) === 'youtube' ? YOUTUBE_PREVIEW_ALLOW_HEIGHTS : undefined,
       };
       const immediate = resolveProgressivePreviewLevels(levelOpts);
       syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
@@ -2278,6 +2280,9 @@ export default function App() {
       platformListIndex: v.platformListIndex,
       isClip: isClipItem,
       thumbnailUrl: resolveVideoThumbnail(v.thumbnail_url ?? null, 640, 360),
+      created_at: v.created_at ?? null,
+      views: v.views ?? null,
+      duration_string: v.duration_string ?? null,
     };
     const id = crypto.randomUUID();
     assignExplorePopupZ(id);

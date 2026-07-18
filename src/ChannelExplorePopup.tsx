@@ -32,6 +32,7 @@ import {
   isYoutubeWindowHlsPreview,
   isPositionInWindowHlsMux,
   PREVIEW_SEEK_DEBOUNCE_MS,
+  YOUTUBE_PREVIEW_ALLOW_HEIGHTS,
   attachPreviewBufferingListeners,
   applyVideoLocalSeek,
   reloadWindowHlsAtPosition,
@@ -63,6 +64,7 @@ import { formatHmsFull } from './utils';
 import type { PreviewSessionResponse, VideoInfo } from './types';
 import { resolveVideoThumbnail } from './channelUtils';
 import { videoInfoDurationSec, syncDurationFromPreviewSession } from './channelUtils';
+import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
 
@@ -85,6 +87,10 @@ export interface ExplorePopupVod {
   platformListIndex: number;
   isClip: boolean;
   thumbnailUrl?: string | null;
+  /** Channel metadata for the subline (days-ago · length · views). */
+  created_at?: string | null;
+  views?: number | null;
+  duration_string?: string | null;
 }
 
 interface ChannelExplorePopupProps {
@@ -931,6 +937,7 @@ export default function ChannelExplorePopup({
         variantHeights: meta?.variantHeights ?? playback.variantHeights,
         qualityLabels: meta?.qualityLabels ?? playback.qualityLabels,
         initialHeight: activeH,
+        allowHeights: vod.platform === 'youtube' ? YOUTUBE_PREVIEW_ALLOW_HEIGHTS : undefined,
       };
       const immediate = resolveProgressivePreviewLevels(levelOpts);
       syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
@@ -1276,6 +1283,11 @@ export default function ChannelExplorePopup({
                 <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
                   {vod.title}
                 </p>
+                {channelVodSubline(vod) && (
+                  <p className="text-[10px] text-zinc-400 truncate leading-tight">
+                    {channelVodSubline(vod)}
+                  </p>
+                )}
               </div>
             </div>
             <button
