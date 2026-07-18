@@ -578,9 +578,19 @@ export default function App() {
         clips,
       ));
     }
-    const sorted = clips
-      ? items.sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0))
-      : items.sort((a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at));
+    const sorted = [...items].sort(
+      clips
+        ? (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)
+        : (a, b) => {
+            const ta = parseVideoTs(a.created_at);
+            const tb = parseVideoTs(b.created_at);
+            // Null/empty dates sort to end
+            if (ta === 0 && tb === 0) return 0;
+            if (ta === 0) return 1;
+            if (tb === 0) return -1;
+            return tb - ta; // newest first
+          },
+    );
     let kickN = 0;
     let twitchN = 0;
     let youtubeN = 0;
@@ -4645,7 +4655,7 @@ export default function App() {
         <div
           ref={previewPanelRef}
           className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(layoutPlatform, true)}`}
-          style={{ width: previewPanelWidth }}
+          style={{ width: previewPanelWidth, transition: 'width 0.18s ease-out' }}
         >
           <div className="flex items-start justify-between gap-2 shrink-0">
             {previewChannelBadge ? (
@@ -4798,7 +4808,7 @@ export default function App() {
         <div
           ref={urlAsidePanelRef}
           className={`group relative shrink-0 overflow-hidden bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
-          style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
+          style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h, transition: 'width 0.18s ease-out, height 0.18s ease-out' }}
         >
           {showUrlInSidebar && (
             <div className="flex items-center justify-between shrink-0">
@@ -4835,7 +4845,7 @@ export default function App() {
         className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col min-h-0 ${
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
         } ${platformCardShadow(layoutPlatform)}`}
-        style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
+        style={{ width: mainPanelSize.w, height: mainPanelSize.h, transition: 'width 0.18s ease-out, height 0.18s ease-out' }}
       >
 
         {/* ── HEADER ── */}

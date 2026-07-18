@@ -2,7 +2,7 @@
  * Channel and video utility functions extracted from App.tsx.
  */
 
-import { parseVideoTs, parseHmsDurationString, fmtDuration, fmtDaysAgo, fmtViews } from './formatters';
+import { parseVideoTs, parseHmsDurationString, fmtDuration, fmtDaysAgo, fmtViews, fmtDateAndAgo } from './formatters';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
 export function bestAvailableQuality(info: VideoInfo): string {
@@ -144,7 +144,15 @@ export function sortChannelVideosByMode(videos: ChannelVideo[], clips: boolean):
   return [...videos].sort(
     clips
       ? (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)
-      : (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
+      : (a, b) => {
+          const ta = parseVideoTs(a.created_at);
+          const tb = parseVideoTs(b.created_at);
+          // Null/empty dates sort to end (never above valid dates)
+          if (ta === 0 && tb === 0) return 0;
+          if (ta === 0) return 1;
+          if (tb === 0) return -1;
+          return tb - ta; // newest first
+        },
   );
 }
 
@@ -702,7 +710,11 @@ export interface ChannelVodMetaInput {
 
 export function channelVodSubline(v: ChannelVodMetaInput): string {
   const parts: string[] = [];
-  const when = fmtDaysAgo(v.created_at);
+  let when = fmtDaysAgo(v.created_at);
+  // Fallback: if fmtDaysAgo returned empty but created_at is present, show raw date
+  if (!when && v.created_at) {
+    when = fmtDateAndAgo(v.created_at);
+  }
   if (when) parts.push(when);
   const durSec = channelVideoDurationSec(v);
   if (durSec != null) parts.push(fmtDuration(durSec));
