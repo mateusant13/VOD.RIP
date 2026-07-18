@@ -108,6 +108,25 @@ export function fmtViews(n: number): string {
   return String(n);
 }
 
+export function fmtDaysAgo(value: string | null | undefined): string {
+  const ts = parseVideoTs(value);
+  if (!ts) return '';
+  const diffMs = Math.max(0, Date.now() - ts);
+  const mins = Math.floor(diffMs / (1000 * 60));
+  if (mins < 1) return 'now';
+  const hours = Math.floor(mins / 60);
+  if (hours < 1) return `${mins}m`;
+  const days = Math.floor(hours / 24);
+  if (days < 1) return `${hours}h`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 1) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 1) return `${weeks}w`;
+  const years = Math.floor(days / 365);
+  if (years < 1) return `${months}mo`;
+  return `${years}y`;
+}
+
 export function formatBytes(nbytes: number): string {
   if (!Number.isFinite(nbytes) || nbytes <= 0) return '—';
   const mb = nbytes / (1024 * 1024);
