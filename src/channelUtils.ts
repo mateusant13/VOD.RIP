@@ -2,7 +2,7 @@
  * Channel and video utility functions extracted from App.tsx.
  */
 
-import { parseVideoTs, parseHmsDurationString, fmtDuration, fmtDateAndAgo, fmtViews } from './formatters';
+import { parseVideoTs, parseHmsDurationString, fmtDuration, fmtDaysAgo, fmtViews } from './formatters';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
 export function bestAvailableQuality(info: VideoInfo): string {
@@ -695,7 +695,7 @@ export function reorderChannelsById(
 
 export function channelVodSubline(v: ChannelVideo): string {
   const parts: string[] = [];
-  const when = fmtDateAndAgo(v.created_at);
+  const when = fmtDaysAgo(v.created_at);
   if (when) parts.push(when);
   const durSec = channelVideoDurationSec(v);
   if (durSec != null) parts.push(fmtDuration(durSec));

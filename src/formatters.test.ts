@@ -11,6 +11,7 @@ import {
   fmtDate,
   fmtRelativeAgo,
   fmtDateAndAgo,
+  fmtDaysAgo,
   parseVideoTs,
   parseHmsDurationString,
   fmtViews,
@@ -148,6 +149,34 @@ describe('fmtDateAndAgo', () => {
 
   it('returns empty string when value is null', () => {
     expect(fmtDateAndAgo(null)).toBe('');
+  });
+});
+
+describe('fmtDaysAgo', () => {
+  it('returns "now" for current time', () => {
+    expect(fmtDaysAgo(new Date().toISOString())).toBe('now');
+  });
+
+  it('formats minutes and hours', () => {
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(fiveMinAgo)).toBe('5m');
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(twoHoursAgo)).toBe('2h');
+  });
+
+  it('formats days, weeks, months, years', () => {
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(threeDaysAgo)).toBe('3d');
+    const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(twoWeeksAgo)).toBe('2w');
+    const fiveMonthsAgo = new Date(Date.now() - 150 * 24 * 60 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(fiveMonthsAgo)).toBe('5mo');
+    const twoYearsAgo = new Date(Date.now() - 800 * 24 * 60 * 60 * 1000).toISOString();
+    expect(fmtDaysAgo(twoYearsAgo)).toBe('2y');
+  });
+
+  it('returns empty for null', () => {
+    expect(fmtDaysAgo(null)).toBe('');
   });
 });
 
