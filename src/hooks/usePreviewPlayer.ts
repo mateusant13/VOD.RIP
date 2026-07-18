@@ -16,6 +16,7 @@ import { useCallback, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
+  WINDOW_HLS_SEGMENT_SEC,
   applyHlsQualityLevel,
   attachProgressivePreview,
   effectiveHlsLevelIndex,
@@ -31,6 +32,7 @@ import {
   resumePreviewAtTime,
   VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS,
   VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS,
+  WINDOW_HLS_SEGMENT_SEC,
   type PreviewLevelOption,
 } from '../previewPlayerUtils';
 
@@ -329,6 +331,50 @@ export function usePreviewPlayer({
     }
   }, [setLevels]);
 
+  // Predictive segment prefetch for window-HLS (YouTube window-HLS only)
+  // Consumers call this from their video onTimeUpdate handler.
+  // Fetches the next N segments in background so they're ready when needed.
+  const prefetchNextSegments = useCallback(async (currentTime: number) => {
+    if (!sessionId) return;
+    // Only prefetch for YouTube window-HLS sessions (trimTimeline = true)
+    if (!trimTimelineRef?.current) return;
+    if (!isYoutubePreview) return;
+
+    const segmentDuration = WINDOW_HLS_SEGMENT_SEC; // 4s segments
+    const currentSegmentIdx = Math.floor(currentTime / segmentDuration);
+    const prefetchCount = 3; // N+1, N+2, N+3
+
+    // Avoid re-fetching already-prefetched segments
+    const alreadyPrefetched = prefetchedSegmentsRef.current;
+    const toFetch = [];
+    for (let i = 1; i <= prefetchCount; i++) {
+      const idx = currentSegmentIdx + i;
+      if (!alreadyPrefetched.has(idx)) {
+        toFetch.push(idx);
+        alreadyPrefetched.add(idx);
+      }
+    }
+    if (!toFetch.length) return;
+
+    const sessionIdStr = sessionId;
+    await Promise.allSettled(
+      toFetch.map((idx) =>
+        fetch(`/api/preview/hls/${sessionIdStr}/resource?id=window-seg-${idx.toString().padStart(3, '0')}`, {
+          method: 'GET',
+          cache: 'no-cache',
+        }).then((r) => r.ok && r.arrayBuffer().catch(() => {})),
+      ),
+    );
+  }, [sessionId, isYoutubePreview]);
+
+  // Track which segments have already been prefetched
+  const prefetchedSegmentsRef = useRef<Set<number>>(new Set());
+
+  // Reset prefetched set on session change
+  useEffect(() => {
+    prefetchedSegmentsRef.current.clear();
+  }, [sessionId]);
+
   const resolveAndSyncProgressive = useCallback(async (
     pageUrl: string,
     meta: {
@@ -382,11 +428,14 @@ export function usePreviewPlayer({
     syncHlsLevels,
     resolveAndSyncProgressive,
     resolveAndSyncHls,
+    // Predictive prefetch for window-HLS
+    prefetchNextSegments,
   } as PreviewPlayerState & PreviewPlayerActions & {
     setHlsRef: (hls: Hls | null) => void;
     syncProgressiveLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
     syncHlsLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
     resolveAndSyncProgressive: typeof resolveAndSyncProgressive;
     resolveAndSyncHls: typeof resolveAndSyncHls;
+    prefetchNextSegments: typeof prefetchNextSegments;
   };
 }

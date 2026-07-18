@@ -7,8 +7,10 @@ from pathlib import Path
 from services.preview_service import (
     WINDOW_HLS_INITIAL_CHUNK_SEC,
     WINDOW_HLS_LONG_VOD_MIN_SEC,
+    WINDOW_HLS_MARKER,
     WINDOW_HLS_MUX_CHUNK_LONG_SEC,
     WINDOW_HLS_MUX_CHUNK_SEC,
+    WINDOW_HLS_INIT_RESOURCE,
     WINDOW_HLS_SHORT_VOD_MAX_SEC,
     WINDOW_HLS_PLAYLIST_RESOURCE,
     WINDOW_HLS_SEGMENT_RESOURCE_PREFIX,
@@ -157,3 +159,45 @@ def test_preflight_mux_adoption():
     _register_youtube_window_hls_resources(s)
     assert s.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE]
     assert f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}000" in s.resource_map
+
+
+def test_fmp4_llhls_playlist_emits_cmaf_tags():
+    """When USE_FMP4 is on, the media playlist is LL-HLS (v9) fMP4."""
+    s = _sess(crop_end=20.0)
+    out_dir = _window_hls_dir(s)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # fMP4 init + two CMAF segments on disk.
+    (out_dir / "init.mp4").write_bytes(b"\x00\x00\x00\x18ftyp")
+    (out_dir / "seg_000.m4s").write_bytes(b"\x00\x00\x00\x18moof")
+    (out_dir / "seg_001.m4s").write_bytes(b"\x00\x00\x00\x18moof")
+    # Mark the mux complete so the playlist carries EXT-X-ENDLIST.
+    (out_dir / "window.m3u8").write_text(
+        "#EXTM3U\n#EXT-X-ENDLIST\n", encoding="utf-8"
+    )
+    body = _build_youtube_window_hls_media_playlist(s)
+    text = body.decode("utf-8")
+    assert "#EXT-X-VERSION:9" in text
+    assert "#EXT-X-MAP:URI=" in text and "init.mp4" in text
+    assert "#EXT-X-PART-INF:PART-TARGET=" in text
+    assert "#EXT-X-SERVER-CONTROL:" in text
+    assert "#EXT-X-PART:" in text
+    assert "#EXT-X-PRELOAD-HINT:" in text
+    assert f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}000" in text
+    assert "#EXT-X-ENDLIST" in text
+
+
+def test_fmp4_resource_registration_maps_init_and_m4s():
+    """Resource map registers window-init and .m4s segment entries under fMP4."""
+    s = _sess(crop_end=20.0)
+    out_dir = _window_hls_dir(s)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "init.mp4").write_bytes(b"\x00\x00\x00\x18ftyp")
+    (out_dir / "seg_000.m4s").write_bytes(b"\x00\x00\x00\x18moof")
+    (out_dir / "seg_001.m4s").write_bytes(b"\x00\x00\x00\x18moof")
+    _register_youtube_window_hls_resources(s)
+    assert s.resource_map[WINDOW_HLS_INIT_RESOURCE] == f"{WINDOW_HLS_MARKER}init.mp4"
+    rid0 = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}000"
+    rid1 = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}001"
+    assert s.resource_map[rid0] == f"{WINDOW_HLS_MARKER}seg_000.m4s"
+    assert s.resource_map[rid1] == f"{WINDOW_HLS_MARKER}seg_001.m4s"
+

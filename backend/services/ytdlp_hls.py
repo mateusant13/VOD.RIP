@@ -2201,7 +2201,7 @@ def _fetch_googlevideo_range_once(
         # QUIC/HTTP3 for googlevideo CDN
         http_version = None
         if "googlevideo.com" in url:
-            http_version = "3"
+            http_version = "v3"  # curl_cffi needs "v3" (not "3") for HTTP/3
 
         resp = cffi_requests.get(
             url,

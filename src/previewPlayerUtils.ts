@@ -127,6 +127,9 @@ export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
 export const VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS = 450;
 export const VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS = 120;
 
+/** YouTube window-HLS segment duration (seconds) — matches backend mux cadence. */
+export const WINDOW_HLS_SEGMENT_SEC = 4;
+
 export function isYouTubePreviewPlatform(platform: string | null | undefined): boolean {
   return (platform || '').toLowerCase() === 'youtube';
 }

@@ -77,10 +77,14 @@ import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
+import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 
 // ─── TYPES (migrated to src/types.ts) ───────────────
 const IS_DEV_UI = import.meta.env.DEV;
+const USE_MSE_DIRECT = import.meta.env.VITE_PREVIEW_MSE_DIRECT === "true";
+// Expose the flag for e2e probes (see e2e/tests/preview-mse-direct.spec.ts).
+(window as unknown as { __VITE_PREVIEW_MSE_DIRECT__?: boolean }).__VITE_PREVIEW_MSE_DIRECT__ = USE_MSE_DIRECT;
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -282,6 +286,7 @@ export default function App() {
     setQualityLevel: setPreviewQualityLevel,
     setHlsRef,
     syncHlsLevels: syncPreviewHlsLevels,
+    prefetchNextSegments,
   } = usePreviewPlayer({
     videoRef: previewVideoRef,
     playback: previewPlayback,
@@ -295,6 +300,11 @@ export default function App() {
       if (msg) setError(msg);
     },
   });
+
+  // Direct MSE player for YouTube window-HLS (opt-in via VITE_PREVIEW_MSE_DIRECT).
+  const msePlayer = useDirectMSEPlayer(previewVideoRef);
+  const msePlayerRef = useRef<typeof msePlayer | null>(null);
+  msePlayerRef.current = msePlayer;
 
   useEffect(() => {
     previewPlaybackKindRef.current = previewPlayback?.kind ?? 'progressive';
@@ -720,6 +730,8 @@ export default function App() {
       previewHlsRef.current = null;
       setHlsRef(null);
     }
+    // Tear down direct-MSE player if it was used for this session.
+    msePlayerRef.current?.destroy();
     const video = previewVideoRef.current;
     if (video) {
       detachProgressivePreview(video);
@@ -838,6 +850,31 @@ export default function App() {
             previewSeekTargetRef.current = null;
             clearLockIfCurrent();
           });
+        return;
+      }
+      // MSE-direct: out-of-window seek → tell the MSE player to remux+seek.
+      if (USE_MSE_DIRECT && msePlayerRef.current) {
+        previewSeekLockedRef.current = true;
+        video.pause();
+        setPreviewPlaying(false);
+        setPreviewBuffering(true);
+        void msePlayerRef.current.seek(t).then(() => {
+          if (seekId !== previewSeekInflightRef.current) return;
+          previewSeekLockedRef.current = false;
+          finishSeek();
+          previewBufferingClearRef.current?.();
+          waitVideoPlayable(
+            video,
+            previewTimingRef.current ?? new PreviewTiming("youtube", "main"),
+          );
+          if (resumePlay)
+            void video.play().then(() => setPreviewPlaying(true)).catch(() => {});
+        }).catch(() => {
+          if (seekId === previewSeekInflightRef.current) {
+            setError("MSE seek failed");
+            previewSeekTargetRef.current = null;
+          }
+        });
         return;
       }
       // Out-of-window seek: keep the slider at the target (already set
@@ -1367,7 +1404,54 @@ export default function App() {
       return;
     }
 
+    // ── Direct MSE path (opt-in, YouTube window-HLS only) ──────────────
+    let attachViaHls: () => void;
+    if (
+      USE_MSE_DIRECT &&
+      youtubePreview &&
+      previewTrimTimelineRef.current &&
+      Hls.isSupported()
+    ) {
+      const sid = previewSessionIdRef.current;
+      if (!sid) {
+        setError("Preview session missing");
+        setPreviewVideoLoading(false);
+        return;
+      }
+      const mse = msePlayerRef.current;
+      if (!mse) {
+        setError("MSE player unavailable");
+        setPreviewVideoLoading(false);
+        return;
+      }
+      mse.attach(sid)
+        .then(() => {
+          if (cancelled) return;
+          // onCanPlay-equivalent: MSE ready → video fires canplay once buffered.
+          video.addEventListener(
+            "canplay",
+            () => {
+              if (cancelled) return;
+              onCanPlay();
+            },
+            { once: true },
+          );
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          console.error("[MSE] attach failed, falling back to hls.js:", err);
+          // Fall back to hls.js for this session.
+          attachViaHls();
+        });
+      // Expose seek override for window-HLS remux via MSE.
+      cleanup = () => {
+        mse.destroy();
+      };
+      return;
+    }
+
     if (Hls.isSupported()) {
+      attachViaHls = () => {
       const dashSegTimeline = previewTrimTimelineRef.current;
       const hls = new Hls({
         enableWorker: true,
@@ -1522,6 +1606,8 @@ export default function App() {
         previewHlsRef.current = null;
       };
       return;
+      };
+      attachViaHls();
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -1625,6 +1711,8 @@ export default function App() {
         return;
       }
       syncPreviewTimeUi(Math.max(start, vodTime));
+      // Predictive prefetch: fetch upcoming window-HLS segments in the background.
+      prefetchNextSegments(video.currentTime);
       return;
     }
     const clipRel = previewClipRelativeRef.current;
