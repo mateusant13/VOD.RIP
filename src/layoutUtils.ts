@@ -41,15 +41,14 @@ export function layoutRowHasMultiplePanels(layout: LayoutPanelBoundsInput): bool
   if (layout.urlPanelAside) count += 1;
   return count > 1;
 }
-/** Max width for one panel when siblings are at their current width (preview anchor) or minimum. */
+/** Max width for one panel when every sibling is at its minimum width. */
 export function layoutMaxPanelWidthAtSiblingMins(
   target: LayoutPanelKey,
   layout: LayoutPanelBoundsInput,
 ): number {
   const budget = layoutRowWidthBudget(layout);
   let minOthers = 0;
-  // Preview is the anchor — use its current width, not minimum
-  if (layout.previewOpen && target !== 'preview') minOthers += layout.preview.w;
+  if (layout.previewOpen && target !== 'preview') minOthers += PREVIEW_PANEL_MIN_W;
   if (layout.urlPanelAside && target !== 'urlAside') minOthers += PANEL_MIN.w;
   if (target !== 'main') minOthers += PANEL_MIN.w;
   const minTarget = target === 'preview' ? PREVIEW_PANEL_MIN_W : PANEL_MIN.w;
@@ -122,9 +121,13 @@ export function resizeLayoutGivingWidthTo(
 
   type Slot = { get: () => number; set: (w: number) => void; minW: number };
   const siblingSlots: Slot[] = [];
-  // Preview is the anchor — it only gives up space when it is the one being resized.
-  // When another panel is resized, the preview keeps its current width and other
-  // non-target siblings absorb the overflow.
+  if (layout.previewOpen && target !== 'preview') {
+    siblingSlots.push({
+      get: () => preview.w,
+      set: (w) => { preview = { ...preview, w }; },
+      minW: PREVIEW_PANEL_MIN_W,
+    });
+  }
   if (layout.urlPanelAside && target !== 'urlAside') {
     siblingSlots.push({
       get: () => urlAside.w,
@@ -141,16 +144,12 @@ export function resizeLayoutGivingWidthTo(
   }
 
   const budget = layoutRowWidthBudget(layout);
-  // When preview is the anchor, subtract its current width from the budget
-  const effectiveBudget = layout.previewOpen && target !== 'preview'
-    ? budget - preview.w
-    : budget;
   let total = getW(target) + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
-  if (total <= effectiveBudget) {
+  if (total <= budget) {
     return { preview, urlAside, main };
   }
 
-  let overflow = total - effectiveBudget;
+  let overflow = total - budget;
   const flexTotal = siblingSlots.reduce((sum, slot) => sum + (slot.get() - slot.minW), 0);
   if (flexTotal > 0) {
     for (const slot of siblingSlots) {
@@ -160,7 +159,7 @@ export function resizeLayoutGivingWidthTo(
     }
   }
 
-  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main }, target !== 'preview');
+  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
 }
 
 /** Shrink siblings when preview grows so the row stays within the viewport budget. */
@@ -172,10 +171,7 @@ export function resizeLayoutWithPreviewWidth(
 }
 
 /** Shrink visible panel widths proportionally when the row exceeds the viewport. */
-export function shrinkLayoutPanelsToFit(
-  layout: LayoutPanelBoundsInput,
-  preservePreview = false,
-): {
+export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
   urlAside: PanelSize;
   main: PanelSize;
@@ -190,8 +186,7 @@ export function shrinkLayoutPanelsToFit(
     minW: number;
   };
   const slots: Slot[] = [];
-  // When preserving preview as anchor, skip adding it to shrinkable slots
-  if (layout.previewOpen && !preservePreview) {
+  if (layout.previewOpen) {
     slots.push({
       get: () => preview.w,
       set: (w) => { preview = { ...preview, w }; },
