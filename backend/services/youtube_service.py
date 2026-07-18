@@ -132,12 +132,15 @@ def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
             _apply_youtube_row_metadata(row, meta)
 
 
-def _fetch_youtube_rss_rows(channel_id: str) -> list[dict[str, Any]]:
+def _fetch_youtube_rss_rows(
+    channel_id: str,
+    content_kind: Optional[str] = "vod",
+) -> list[dict[str, Any]]:
     """Fetch the channel's public RSS feed and return rows with reliable dates.
 
     The RSS feed (feeds/videos.xml?channel_id=) returns the channel's TRUE
-    most-recent-first uploads with publish dates and NO auth/POT dependency.
-    Returns [] on any failure (best-effort, never blocks the listing).
+    most-recent-first uploads with publish dates, view counts and NO auth/POT
+    dependency. Returns [] on any failure (best-effort, never blocks the listing).
     """
     try:
         import re as _re
@@ -156,6 +159,7 @@ def _fetch_youtube_rss_rows(channel_id: str) -> list[dict[str, Any]]:
             "a": "http://www.w3.org/2005/Atom",
             # YouTube's RSS feed declares xmlns:yt="http://www.youtube.com/xml/schemas/2015"
             "yt": "http://www.youtube.com/xml/schemas/2015",
+            "media": "http://search.yahoo.com/mrss/",
         }
         root = ET.fromstring(raw)
         rows: list[dict[str, Any]] = []
@@ -165,13 +169,22 @@ def _fetch_youtube_rss_rows(channel_id: str) -> list[dict[str, Any]]:
             title_el = e.find("a:title", ns)
             if vid_el is None or not vid_el.text or pub_el is None or not pub_el.text:
                 continue
-            thumb_el = e.find("media:group/media:thumbnail", ns) if False else None
             created_at = pub_el.text
             try:
                 dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 created_at = dt.astimezone(timezone.utc).isoformat()
             except (ValueError, TypeError):
                 pass
+            # RSS exposes a reliable view count (no auth needed).
+            views = None
+            stat = e.find("media:group/media:community/media:statistics", ns)
+            if stat is not None:
+                vc = stat.get("views")
+                if vc:
+                    try:
+                        views = int(vc)
+                    except (TypeError, ValueError):
+                        pass
             rows.append({
                 "id": vid_el.text,
                 "platform": "YouTube",
@@ -179,55 +192,16 @@ def _fetch_youtube_rss_rows(channel_id: str) -> list[dict[str, Any]]:
                 "duration": None,
                 "duration_string": None,
                 "created_at": created_at,
-                "views": None,
+                "views": views,
                 "thumbnail_url": f"https://i.ytimg.com/vi/{vid_el.text}/mqdefault.jpg",
                 "url": f"https://www.youtube.com/watch?v={vid_el.text}",
                 "channel": channel_id,
-                "content_kind": None,
-                "_norm_title": _norm_title(title_el.text if title_el is not None else ""),
+                "content_kind": content_kind,
             })
         return rows
     except Exception as exc:  # RSS is best-effort
         logger.debug("youtube rss fetch failed: %s", exc)
         return []
-
-
-def _merge_youtube_list_with_rss(
-    flat_rows: list[dict[str, Any]],
-    rss_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Use RSS as the authoritative, chronological listing and merge in
-    views/duration scraped from the yt-dlp flat pass (matched by id/title).
-
-    yt-dlp's flat playlist can return a different (older/popular) video set than
-    the RSS feed, so we trust RSS for order + dates and only borrow the
-    views/duration fields from flat_rows when they line up.
-    """
-    import re as _re
-
-    def _norm_title(t: str) -> str:
-        return _re.sub(r"[^a-z0-9]", "", (t or "").lower())
-
-    flat_by_id: dict[str, dict[str, Any]] = {}
-    flat_by_title: dict[str, dict[str, Any]] = {}
-    for r in flat_rows:
-        if r.get("id"):
-            flat_by_id[r["id"]] = r
-        nt = _norm_title(r.get("title") or "")
-        if nt:
-            flat_by_title.setdefault(nt, r)
-
-    merged: list[dict[str, Any]] = []
-    for rss in rss_rows:
-        flat = flat_by_id.get(rss["id"]) or flat_by_title.get(rss.get("_norm_title", ""))
-        if flat:
-            rss["duration"] = flat.get("duration")
-            rss["duration_string"] = flat.get("duration_string")
-            rss["views"] = flat.get("views")
-            rss["content_kind"] = flat.get("content_kind")
-        rss.pop("_norm_title", None)
-        merged.append(rss)
-    return merged
 
 
 def list_channel_videos_sync(
@@ -314,17 +288,22 @@ def list_channel_videos_sync(
             "content_kind": content_kind,
         })
     if enrich:
-        # RSS is the authoritative, chronological source for YouTube channel
-        # uploads — it carries reliable publish dates WITHOUT any auth/POT token
-        # and returns the TRUE most-recent-first order. yt-dlp's flat playlist
-        # (even with player_client overrides) can return a different, older/popular
-        # video set with no upload_date, so we prefer the RSS list when available
-        # and merge in views/duration scraped from the yt-dlp pass below.
-        channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
-        rss_rows = _fetch_youtube_rss_rows(channel_id) if channel_id else []
-        if rss_rows:
-            out = _merge_youtube_list_with_rss(out, rss_rows)
-        # Innertube per-video enrichment fills any remaining gaps (views/duration).
+        # For the uploads tab (playlist="videos"), the public RSS feed is the
+        # authoritative, chronological source: it carries reliable publish dates
+        # AND view counts with NO auth/POT dependency, and returns the TRUE
+        # most-recent-first order. yt-dlp's flat playlist (even with
+        # player_client overrides) can return a different, older/popular video
+        # set with no upload_date, so we prefer the RSS list for videos.
+        #
+        # For shorts/streams we keep the yt-dlp flat extraction, which returns
+        # the correct content types (with duration) for those tabs.
+        if playlist == "videos":
+            channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
+            rss_rows = _fetch_youtube_rss_rows(channel_id, content_kind="vod") if channel_id else []
+            if rss_rows:
+                out = rss_rows
+        # Innertube per-video enrichment fills any remaining gaps (views/duration)
+        # when YouTube auth (POT/cookies) is available.
         _enrich_youtube_channel_rows(out)
     return out
 

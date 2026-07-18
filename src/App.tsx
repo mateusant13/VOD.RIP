@@ -2507,6 +2507,8 @@ export default function App() {
     durationSec?: number;
     title?: string;
     thumbnailUrl?: string | null;
+    createdAt?: string | null;
+    views?: number | null;
     /** Skip the /api/info/video round-trip when the caller already has enough metadata
      *  (e.g. from the channel list). The VOD · Trim panel renders immediately from the
      *  hint; explicit Extract Info can still refresh later. */
@@ -2550,6 +2552,39 @@ export default function App() {
     }
     const hintDuration = hint?.durationSec;
     const hintTitle = hint?.title;
+    // ponytail: when the caller passes channel-list metadata (skipNetwork), render it
+    // immediately WITHOUT hitting /api/info/video. We do this even when duration is
+    // unknown (e.g. YouTube RSS rows have no duration) so the user sees the
+    // title/date/views they already fetched from the channel list instead of a
+    // redundant, slow re-extraction.
+    if (hint?.skipNetwork && hintTitle) {
+      const end = hintDuration && hintDuration > 0 ? Math.max(1, Math.floor(hintDuration)) : 0;
+      if (end > 0) applyVideoInfoTrim(trimmed, end);
+      const platform = detectUrlPlatform(trimmed);
+      const synthetic: VideoInfo = {
+        id: trimmed,
+        title: hintTitle,
+        duration: end,
+        duration_string: end > 0 ? fmtDuration(end) : null,
+        created_at: hint.createdAt ?? null,
+        views: hint.views ?? null,
+        uploader: null,
+        thumbnail: hint.thumbnailUrl || findCachedVideoThumbnail(trimmed, savedChannels),
+        webpage_url: trimmed,
+        extractor: platform,
+        is_live: null,
+        qualities: ['source'],
+        platform: platform === 'youtube' ? 'YouTube' : platform === 'twitch' ? 'Twitch' : platform === 'kick' ? 'Kick' : null,
+      };
+      setUrl(trimmed);
+      setVideoInfo(synthetic);
+      setQuality(bestAvailableQuality(synthetic));
+      if (!previewOpen) {
+        void resetPreview();
+      }
+      setLoading(false);
+      return;
+    }
     if (hintDuration && hintDuration > 0 && hintTitle) {
       const end = Math.max(1, Math.floor(hintDuration));
       applyVideoInfoTrim(trimmed, end);
@@ -3966,6 +4001,8 @@ export default function App() {
       durationSec: vod.durationSec > 0 ? vod.durationSec : undefined,
       title: vod.title,
       thumbnailUrl: vod.thumbnailUrl ?? undefined,
+      createdAt: vod.created_at ?? null,
+      views: vod.views ?? null,
       skipNetwork: true,
     });
   }, [selectVod]);
@@ -5235,6 +5272,8 @@ export default function App() {
                                   durationSec: durSec ?? undefined,
                                   title: v.title || undefined,
                                   thumbnailUrl: v.thumbnail_url ?? undefined,
+                                  createdAt: v.created_at ?? null,
+                                  views: v.views ?? null,
                                   skipNetwork: true,
                                 })}
                                 onMouseEnter={() => {
@@ -5262,6 +5301,8 @@ export default function App() {
                                       durationSec: durSec ?? undefined,
                                       title: v.title || undefined,
                                       thumbnailUrl: v.thumbnail_url ?? undefined,
+                                      createdAt: v.created_at ?? null,
+                                      views: v.views ?? null,
                                       skipNetwork: true,
                                     });
                                   }
