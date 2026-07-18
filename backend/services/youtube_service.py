@@ -318,6 +318,7 @@ def list_channel_videos_sync(
 
     all_videos: dict[str, dict[str, Any]] = {}
     channel_id: Optional[str] = None
+    list_order = 0
 
     for pl in ("videos", "shorts", "streams"):
         pl_url = channel_playlist_url(channel_ref, pl)
@@ -368,7 +369,9 @@ def list_channel_videos_sync(
                 playlist_source=pl,
             )
 
+            list_order += 1
             all_videos[vid] = {
+                "_list_order": list_order,
                 "id": vid,
                 "platform": "YouTube",
                 "title": e.get("title") or "Untitled",
@@ -392,8 +395,8 @@ def list_channel_videos_sync(
     else:
         filtered = list(all_videos.values())
 
-    # Sort by date newest first
-    filtered.sort(key=lambda v: _parse_video_ts(v.get("created_at")) or 0, reverse=True)
+    # Sort by date newest first; items without dates preserve playlist order
+    filtered.sort(key=lambda v: (_parse_video_ts(v.get("created_at")) or 0, v.get("_list_order", 0)), reverse=True)
     filtered = filtered[:limit]
 
     # Enrich with RSS dates/views where available
