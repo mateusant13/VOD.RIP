@@ -23,34 +23,34 @@ from typing import Any, Optional
 from urllib.parse import urljoin
 
 import requests
-
 from services import ytdlp_env  # noqa: F401 ÔÇö YTDLP_NO_PLUGINS before yt-dlp import
-from services.ytdlp_guard import (
-    guarded_youtube_dl,
-    YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK,
-)
-
+from services.os_services import _NO_WINDOW
 from services.ytdlp_ffmpeg import (
+    MIN_VALID_OUTPUT_BYTES,
     CancelledError,
     PausedError,  # noqa: F401 — re-exported for download_manager
-    MIN_VALID_OUTPUT_BYTES,
-    _track_ffmpeg_proc,
-    _untrack_ffmpeg_proc,
-    _terminate_ffmpeg_proc,
-    resolve_video_encoder,
-    resolve_concat_encoder,
-    _check_pause_cancel,
-    ffmpeg_h264_encode_args,
-    probe_segment_codec,
     _apply_mp4_faststart,
     _atomic_replace,
+    _check_pause_cancel,
+    _codecs_from_stream_inf,
     _phase_id,
     _resolve_ffmpeg_exe,
     _run_ffmpeg,
+    _terminate_ffmpeg_proc,
+    _track_ffmpeg_proc,
+    _untrack_ffmpeg_proc,
     _verify_output_file,
-    _codecs_from_stream_inf,
+    ffmpeg_h264_encode_args,
+    probe_segment_codec,
+    resolve_concat_encoder,
+    resolve_video_encoder,
 )
-from services.os_services import _NO_WINDOW
+from services.ytdlp_guard import (
+    YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK,
+)
+from services.ytdlp_guard import (
+    guarded_youtube_dl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,16 +270,15 @@ def youtube_preview_ytdl_opts(
     session=None,
 ) -> dict:
     """Fast YouTube extract profile for preview (HLS ladder, disk cache)."""
-    from services.ytdlp_cache import _get_cache_dir
-    from services.ytdlp_ffmpeg import _find_ffmpeg
     from services.youtube_innertube import extract_video_id
     from services.youtube_session import (
-        resolve_ytdlp_cookiefile,
         youtube_session_bootstrap_only,
         youtube_session_from_settings,
         youtube_session_from_values,
         ytdlp_extractor_args,
     )
+    from services.ytdlp_cache import _get_cache_dir
+    from services.ytdlp_ffmpeg import _find_ffmpeg
 
     vid = extract_video_id(full_url)
     fast_only = preview_fast_only_mode()
@@ -488,8 +487,8 @@ def _merge_fresh_youtube_session(opts: dict, url: str) -> dict:
 
 def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
     """Preview SLA: race InnerTube + yt-dlp (cookies + bare) — first playable wins."""
-    from services.youtube_innertube import extract_video_id
     from services.youtube_diag import log_extract_ok
+    from services.youtube_innertube import extract_video_id
 
     vid = extract_video_id(url) or url[:32]
     yt_session = opts.get("_youtube_session")
@@ -629,8 +628,8 @@ def _youtube_extract_parallel_fast(
 
 
 def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
-    from services.youtube_innertube import extract_video_id
     from services.youtube_diag import log_extract_ok
+    from services.youtube_innertube import extract_video_id
 
     vid = extract_video_id(url) or url[:32]
     if opts.get("_preview_fast"):
@@ -711,8 +710,8 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> di
                 time.sleep(0.2 * (i + 1))
     if last_err is not None:
         raise last_err
-    from services.youtube_innertube import extract_video_id
     from services.youtube_diag import log_extract_fail
+    from services.youtube_innertube import extract_video_id
 
     log_extract_fail(
         extract_video_id(url) or "?",
@@ -808,8 +807,8 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
                 except Exception as exc:
                     logger.debug("preview slow ytdlp %s: %s", url[:60], exc)
 
-    from services.youtube_innertube import extract_video_id
     from services.youtube_diag import log_extract_fail
+    from services.youtube_innertube import extract_video_id
 
     log_extract_fail(
         extract_video_id(url) or "?",
@@ -903,8 +902,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         else:
             info = _extract_hls_info(url, opts)
         if info is None:
-            from services.youtube_innertube import extract_video_id
             from services.youtube_diag import log_extract_fail
+            from services.youtube_innertube import extract_video_id
 
             log_extract_fail(
                 extract_video_id(url) or "?",
@@ -915,8 +914,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 "YouTube blocked this video — try again or add youtube_cookies_file in settings.json"
             )
         if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
-            from services.youtube_innertube import extract_video_id
             from services.youtube_diag import format_summary, log_extract_fail
+            from services.youtube_innertube import extract_video_id
 
             log_extract_fail(
                 extract_video_id(url) or "?",
@@ -931,8 +930,8 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         return info
     except BaseException as exc:
         if _youtube_url_from_opts(url, opts):
-            from services.youtube_innertube import extract_video_id
             from services.youtube_diag import log_extract_fail
+            from services.youtube_innertube import extract_video_id
 
             log_extract_fail(
                 extract_video_id(url) or "?",
@@ -2061,8 +2060,9 @@ def _dur_sec_from_googlevideo_url(url: str) -> Optional[float]:
 
 def _clen_dur_from_googlevideo_url(url: str) -> tuple[Optional[int], Optional[float]]:
     """Parse clen/dur from query params or embedded sgovp blob."""
-    from services.size_estimate import _clen_bytes_from_url
     from urllib.parse import unquote
+
+    from services.size_estimate import _clen_bytes_from_url
 
     clen = _clen_bytes_from_url(url)
     dur = _dur_sec_from_googlevideo_url(url)
@@ -2926,7 +2926,6 @@ def _ytdlp_audio_section_download(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
 ) -> None:
     """ponytail: yt-dlp section + extract when DASH audio URL unavailable."""
-    from yt_dlp import YoutubeDL
     from yt_dlp.utils import download_range_func
 
     tmpdir = tempfile.mkdtemp(prefix="ytdlp_aud_")
