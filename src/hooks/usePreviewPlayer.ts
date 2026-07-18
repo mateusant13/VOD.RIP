@@ -12,7 +12,7 @@
  * control surfaces differ. Only the *quality state machine* lives here.
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
@@ -32,7 +32,6 @@ import {
   resumePreviewAtTime,
   VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS,
   VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS,
-  WINDOW_HLS_SEGMENT_SEC,
   type PreviewLevelOption,
 } from '../previewPlayerUtils';
 
@@ -103,6 +102,7 @@ export function usePreviewPlayer({
   syncHlsLevels: (mapped: PreviewLevelOption[], defaultIndex: number) => void;
   resolveAndSyncProgressive: typeof resolveAndSyncProgressive;
   resolveAndSyncHls: typeof resolveAndSyncHls;
+  prefetchNextSegments: (currentTime: number) => Promise<void>;
 } {
   const [previewLevels, setPreviewLevels] = useState<PreviewLevelOption[]>([]);
   const [qualityLevel, setQualityLevel] = useState(0);
@@ -362,7 +362,9 @@ export function usePreviewPlayer({
         fetch(`/api/preview/hls/${sessionIdStr}/resource?id=window-seg-${idx.toString().padStart(3, '0')}`, {
           method: 'GET',
           cache: 'no-cache',
-        }).then((r) => r.ok && r.arrayBuffer().catch(() => {})),
+        }).then((r) => {
+          if (r.ok) void r.arrayBuffer().catch(() => {});
+        }),
       ),
     );
   }, [sessionId, isYoutubePreview]);

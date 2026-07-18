@@ -21,7 +21,6 @@
  *   // on seek: await seek(newTime);
  */
 import { useCallback, useRef, useState, useEffect } from 'react';
-import type { ReactElement } from 'react';
 
 interface DirectMSEPlayerState {
   ready: boolean;
@@ -57,7 +56,7 @@ async function fetchSegment(
   sessionId: string,
   resourceId: string,
   signal: AbortSignal
-): Promise<Uint8Array> {
+): Promise<Uint8Array<ArrayBuffer>> {
   const res = await fetch(`/api/preview/hls/${sessionId}/resource?id=${resourceId}`, {
     signal,
     cache: 'no-cache',
@@ -79,10 +78,10 @@ export function useDirectMSEPlayer(
   const mediaSourceRef = useRef<MediaSource | null>(null);
   const sourceBufferRef = useRef<SourceBuffer | null>(null);
   const sessionIdRef = useRef<string | null>(null);
-  const initSegmentRef = useRef<Uint8Array | null>(null);
+  const initSegmentRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const appendedSegmentsRef = useRef<Set<number>>(new Set());
   const appendingRef = useRef(false);
-  const appendQueueRef = useRef<Array<{ segmentIndex: number; data: Uint8Array }>>([]);
+  const appendQueueRef = useRef<Array<{ segmentIndex: number; data: Uint8Array<ArrayBuffer> }>>([]);
   const pendingSeekRef = useRef<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -100,8 +99,11 @@ export function useDirectMSEPlayer(
     while (appendQueueRef.current.length > 0 && !sb.updating) {
       const { segmentIndex, data } = appendQueueRef.current.shift()!;
       try {
-        sb.appendBuffer(data.buffer, data.byteOffset, data.byteLength);
+        sb.appendBuffer(data);
         appendedSegmentsRef.current.add(segmentIndex);
+        // Evict segments beyond the ahead-window relative to the playhead.
+        const playhead = videoRef.current?.currentTime ?? 0;
+        void evictAheadSegments(sb, playhead);
       } catch (e) {
         console.error('[MSE] appendBuffer failed:', e);
         // Re-queue on QuotaExceededError
@@ -230,7 +232,7 @@ export function useDirectMSEPlayer(
       initSegmentRef.current = initData;
 
       // 4. Append init segment
-      sb.appendBuffer(initData.buffer, initData.byteOffset, initData.byteLength);
+      sb.appendBuffer(initData);
       await new Promise<void>((resolve, reject) => {
         const onUpdateEnd = () => {
           sb.removeEventListener('updateend', onUpdateEnd);
@@ -275,7 +277,7 @@ export function useDirectMSEPlayer(
     console.log(`[MSE] seek to ${targetTime.toFixed(2)}s (segment ${targetIndex})`);
 
     // If we already have this segment buffered, just let video seek natively
-    const { start: segStart, end: segEnd } = segmentTimeRange(targetIndex);
+    segmentTimeRange(targetIndex);
     if (sb.buffered.length > 0) {
       for (let i = 0; i < sb.buffered.length; i++) {
         const bufStart = sb.buffered.start(i);
@@ -326,11 +328,7 @@ export function useDirectMSEPlayer(
 
       // 4. Re-append init segment (required after remove())
       if (initSegmentRef.current) {
-        sb.appendBuffer(
-          initSegmentRef.current.buffer,
-          initSegmentRef.current.byteOffset,
-          initSegmentRef.current.byteLength
-        );
+        sb.appendBuffer(initSegmentRef.current);
         await new Promise<void>(resolve => {
           const onUpdateEnd = () => {
             sb.removeEventListener('updateend', onUpdateEnd);
