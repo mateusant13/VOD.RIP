@@ -4698,7 +4698,7 @@ export default function App() {
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { aspectRatio: previewVideoAspect, maxHeight: previewVideoAspect < 1 ? '80vh' : undefined } : undefined}
+              style={!previewFullscreen ? { aspectRatio: previewVideoAspect, maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
             >
               <div
                 className="relative bg-black overflow-hidden cursor-pointer absolute inset-0 z-0"

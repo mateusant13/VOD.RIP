@@ -1261,9 +1261,10 @@ export default function ChannelExplorePopup({
           }),
       }}
       onMouseMove={fullscreen ? bumpFsControls : undefined}
-    >
+      >
       <div
         className={`flex flex-col ${fullscreen ? 'relative h-full min-h-0 w-full gap-0' : 'gap-2 relative cursor-grab active:cursor-grabbing select-none'}`}
+        style={fullscreen ? undefined : { transition: 'width 0.3s ease, height 0.3s ease' }}
         onPointerDown={fullscreen ? undefined : onPopupDrag}
       >
         {!fullscreen && (
@@ -1305,7 +1306,7 @@ export default function ChannelExplorePopup({
           className={`relative bg-black overflow-hidden w-full cursor-pointer ${
             fullscreen ? 'absolute inset-0 z-0 border-0' : 'border-2 border-zinc-700 shrink-0'
           }`}
-          style={fullscreen ? undefined : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined }}
+          style={fullscreen ? undefined : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' }}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
             if (!ready) return;
