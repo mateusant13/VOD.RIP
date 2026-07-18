@@ -26,6 +26,7 @@ export default defineConfig({
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
   server: {
+    host: true,
     port: 5173,
     strictPort: true,
     proxy: {

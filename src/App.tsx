@@ -5288,7 +5288,7 @@ export default function App() {
                                     </span>
                                   </span>
                                   {subline && (
-                                    <span className="text-[9px] text-zinc-400 block truncate">
+                                    <span className="text-[11px] text-zinc-300 block truncate font-medium">
                                       {subline}
                                     </span>
                                   )}
