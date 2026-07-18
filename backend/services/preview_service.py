@@ -196,7 +196,16 @@ class PreviewManager:
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
         if detect_platform(url) == "YouTube":
-            await_youtube_warm_if_pending(url)
+            # Wait for a genuinely in-flight hover/paste warm so create_session
+            # reuses the resolved-stream cache (avoids a second ~7s extract).
+            # Capped at the YouTube extract SLA so a stale/bailed warm can't
+            # make the preview feel stuck.
+            try:
+                from services.ytdlp_hls import _PREVIEW_EXTRACT_MAX_WALL_SEC
+                _warm_budget = float(_PREVIEW_EXTRACT_MAX_WALL_SEC)
+            except Exception:
+                _warm_budget = 8.0
+            await_youtube_warm_if_pending(url, timeout_sec=_warm_budget)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 url,
@@ -3313,8 +3322,17 @@ def kickoff_youtube_warm(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
+    prefer_height: int = 360,
 ) -> None:
-    """Fire-and-forget warm on URL paste — deduped per canonical URL."""
+    """Fire-and-forget warm on URL paste — deduped per canonical URL.
+
+    ``prefer_height`` is forwarded so the warmed resolved-stream cache is keyed
+    by the same ``{vid}:{prefer_height}:v2`` key that ``create_session`` will
+    later read. It defaults to 360 (the YouTube fast-start height that
+    ``create_session`` uses for progressive previews) so a plain hover warm
+    actually lands in the cache the preview open will read. The full-mux warm
+    path passes its own (typically 720) height explicitly.
+    """
     from services.ytdlp_hls import preview_fast_only_mode
 
     if preview_fast_only_mode():
@@ -3339,7 +3357,9 @@ def kickoff_youtube_warm(
                 return
             from services.ytdlp_hls import warm_youtube_extract
 
-            warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file)
+            warm_youtube_extract(
+                url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height
+            )
         finally:
             # ponytail: failed warm on slow VOD must not nuke session before create_session runs
             with _YOUTUBE_WARM_LOCK:

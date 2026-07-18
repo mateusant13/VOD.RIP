@@ -2,9 +2,37 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Optional
 
 logger = logging.getLogger("VOD.RIP.preview_timing")
+
+
+def _safe_stdout_write(line: str) -> None:
+    """Write a line to stdout in a way that survives non-UTF-8 consoles.
+
+    On Windows the inherited console is typically cp1252, which cannot
+    encode characters like the U+2192 arrow ("\u2192"). A bare ``print``
+    raises ``UnicodeEncodeError`` and aborts the caller. Encode as UTF-8
+    with replacement and write to the raw buffer, falling back to a
+    lossy ``print`` if even that is unavailable.
+    """
+    try:
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write((line + "\n").encode("utf-8", "replace"))
+            buf.flush()
+            return
+    except Exception:
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:
+        # Last-resort: drop unencodable chars and retry.
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
 
 
 def _platform_label(platform: str) -> str:
@@ -52,8 +80,10 @@ def log_preview_timing(
         parts.append(detail)
     line = " ".join(parts)
     logger.info(line)
-    # ponytail: uvicorn dev config swallows child loggers — mirror to inherited stdout
-    print(line, flush=True)
+    # ponytail: uvicorn dev config swallows child loggers — mirror to inherited stdout.
+    # Use a console-safe writer so non-UTF-8 consoles (e.g. Windows cp1252) don't
+    # raise UnicodeEncodeError on characters like the U+2192 arrow.
+    _safe_stdout_write(line)
 
 
 def log_server_session_created(

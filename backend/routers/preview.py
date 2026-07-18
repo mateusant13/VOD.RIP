@@ -127,10 +127,15 @@ async def preview_warm(req: PreviewWarmRequest):
         kickoff_youtube_full_mux_warm,
     )
 
+    # Plain hover warm resolves at the YouTube fast-start height (360) so the
+    # warmed resolved-stream cache matches what create_session will read by
+    # default for progressive previews. The full_mux warm below uses the client
+    # height (typically 720) for its own mux/cache path.
     kickoff_youtube_warm(
         url,
         oauth=opts.oauth or None,
         cookies_file=opts.youtube_cookies_file or None,
+        prefer_height=360,
     )
     if req.full_mux:
         kickoff_youtube_full_mux_warm(
