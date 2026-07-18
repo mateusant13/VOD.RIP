@@ -338,7 +338,18 @@ def list_channel_videos_sync(
             vid = (e.get("id") or "").strip()
             if not vid:
                 continue
+            # Prefer the entry from the playlist that gives the BEST classification.
+            # /streams = best for long content (has duration), /shorts = best for shorts.
+            # Replace if existing is generic (vod) and new is specific (stream/clip).
             if vid in all_videos:
+                existing = all_videos[vid]
+                existing_kind = existing.get("content_kind", "")
+                new_kind = content_kind
+                # Upgrade: vod -> stream/clip (streams/shorts win over generic videos)
+                if existing_kind == "vod" and new_kind in ("stream", "clip"):
+                    all_videos[vid] = row
+                elif pl == "streams" and existing_kind == "clip" and new_kind == "stream":
+                    all_videos[vid] = row
                 continue
 
             if pl == "shorts":
@@ -396,7 +407,7 @@ def list_channel_videos_sync(
         filtered = list(all_videos.values())
 
     # Sort by date newest first; items without dates preserve playlist order
-    filtered.sort(key=lambda v: (_parse_video_ts(v.get("created_at")) or 0, v.get("_list_order", 0)), reverse=True)
+    filtered.sort(key=lambda v: (_parse_video_ts(v.get("created_at")) or 0, -(v.get("_list_order", 0))), reverse=True)
     filtered = filtered[:limit]
 
     # Enrich with RSS dates/views where available
