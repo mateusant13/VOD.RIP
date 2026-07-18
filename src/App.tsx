@@ -4176,19 +4176,22 @@ export default function App() {
           <div className="grid grid-cols-2 gap-2 shrink-0">
             <div className="flex flex-col gap-0.5">
               <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">Quality</span>
-              <select value={quality} onChange={(e) => setQuality(e.target.value)}
+                <select value={quality} onChange={(e) => setQuality(e.target.value)}
                 className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono py-1 px-1.5 focus:outline-none focus:border-white text-[10px] cursor-pointer">
-                {videoInfo.qualities.length > 0 ? (
-                  videoInfo.qualities.map((q) => <option key={q} value={q.toLowerCase()}>{q}</option>)
-                ) : (
-                  <>
-                    <option value="source">{sourceQualityLabel}</option>
-                    <option value="1080p">1080p</option>
-                    <option value="720p">720p</option>
-                    <option value="480p">480p</option>
-                    <option value="360p">360p</option>
-                  </>
-                )}
+                {/* Always offer quality tiers so users can pick higher resolutions.
+                    Backend fetches the requested height on demand (yt-dlp format filter).
+                    When the API returned specific tiers we list those; otherwise the
+                    standard ladder is shown as a fallback. */}
+                <option value="source">{sourceQualityLabel}</option>
+                {['1080p', '720p', '480p', '360p'].map((q) => {
+                  const lower = q.toLowerCase();
+                  const haveIt = (videoInfo.qualities || []).some((x) => x.toLowerCase() === lower);
+                  if (haveIt) return null; // already listed below from API
+                  return <option key={q} value={lower}>{q}</option>;
+                })}
+                {(videoInfo.qualities || []).map((q) => (
+                  <option key={q} value={q.toLowerCase()}>{q}</option>
+                ))}
               </select>
             </div>
             <div className="flex flex-col gap-0.5">
