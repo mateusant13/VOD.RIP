@@ -1284,7 +1284,7 @@ export default function ChannelExplorePopup({
                   {vod.title}
                 </p>
                 {channelVodSubline(vod) && (
-                  <p className="text-[10px] text-zinc-400 truncate leading-tight">
+                  <p className="text-[9px] font-mono text-zinc-500 truncate leading-tight mt-0.5">
                     {channelVodSubline(vod)}
                   </p>
                 )}
@@ -1305,7 +1305,7 @@ export default function ChannelExplorePopup({
           className={`relative bg-black overflow-hidden w-full cursor-pointer ${
             fullscreen ? 'absolute inset-0 z-0 border-0' : 'border-2 border-zinc-700 shrink-0'
           }`}
-          style={fullscreen ? undefined : { aspectRatio: videoAspect }}
+          style={fullscreen ? undefined : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined }}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
             if (!ready) return;

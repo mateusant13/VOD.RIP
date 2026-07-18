@@ -3244,14 +3244,14 @@ export default function App() {
         try {
           let data: ChannelClipsResponse;
           try {
-            data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${params}`);
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${params}&_t=${Date.now()}`);
           } catch (clipErr: unknown) {
             const msg = clipErr instanceof Error ? clipErr.message : '';
             if (!msg.includes('Clips API not on server') && !msg.includes('Clips API unavailable')) {
               throw clipErr;
             }
             params.set('content', 'clips');
-            data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${params}`);
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
           }
           if (data.content && data.content !== 'clips') {
             errs.Kick = IS_DEV_UI
@@ -3314,7 +3314,7 @@ export default function App() {
             twitch_login: ch.twitchSlug,
           });
           try {
-            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}`);
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
             attempted.YouTube = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs.YouTube;
@@ -3360,7 +3360,7 @@ export default function App() {
             youtube_slug: ch.youtubeSlug,
           });
           try {
-            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}`);
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
             attempted[platform] = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
@@ -4698,7 +4698,7 @@ export default function App() {
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { aspectRatio: previewVideoAspect } : undefined}
+              style={!previewFullscreen ? { aspectRatio: previewVideoAspect, maxHeight: previewVideoAspect < 1 ? '80vh' : undefined } : undefined}
             >
               <div
                 className="relative bg-black overflow-hidden cursor-pointer absolute inset-0 z-0"
