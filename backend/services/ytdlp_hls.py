@@ -968,9 +968,18 @@ assert _youtube_info_playable(
 
 
 def warm_youtube_extract(
-    url: str, oauth: Optional[str] = None, cookies_file: Optional[str] = None
+    url: str,
+    oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+    prefer_height: int = 360,
 ) -> bool:
-    """Prefetch resolved-stream cache on hover — same path as create_session."""
+    """Prefetch resolved-stream cache on hover — same path as create_session.
+
+    ``prefer_height`` must match the height the client will later request in
+    ``create_session`` (and therefore the resolved-stream cache key). It
+    defaults to 360 (the YouTube fast-start height) so a plain hover warm lands
+    in the cache the progressive preview open will read.
+    """
     from services.youtube_innertube import extract_video_id
 
     if not extract_video_id(url):
@@ -978,7 +987,7 @@ def warm_youtube_extract(
     try:
         from services.preview_service import warm_youtube_preview_resolve
 
-        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=360)
+        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=prefer_height)
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
 
