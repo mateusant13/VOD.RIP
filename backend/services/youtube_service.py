@@ -60,6 +60,17 @@ def _created_at_from_entry(e: dict) -> Optional[str]:
     return None
 
 
+def _parse_video_ts(value: Optional[str]) -> int:
+    """Parse ISO date string to epoch milliseconds. Returns 0 if invalid."""
+    if not value:
+        return 0
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return 0
+
+
 def _duration_string_from_sec(sec: int) -> str:
     m, s = divmod(max(0, int(sec)), 60)
     h, m = divmod(m, 60)
@@ -204,6 +215,63 @@ def _fetch_youtube_rss_rows(
         return []
 
 
+def _classify_youtube_video(
+    *,
+    vid: str,
+    title: str,
+    url: str,
+    duration: Optional[int],
+    live_status: Optional[str],
+    playlist_source: str,
+) -> str:
+    """Classify YouTube video using multiple signals.
+
+    Priority:
+    1. URL pattern: /shorts/ in URL -> short
+    2. Live status: live/completed -> stream
+    3. Duration: < 60s -> short, > 1 hour -> stream
+    4. Playlist source as fallback
+    """
+    # 1. URL pattern (strongest signal for shorts)
+    if "/shorts/" in url:
+        return "clip"
+    
+    # 2. Live status (strongest signal for streams)
+    if live_status in ("live", "is_live", "is_upcoming", "was_live", "post_live"):
+        return "stream"
+    
+    # 3. Duration-based classification
+    if duration is not None:
+        if duration < 60:
+            return "clip"  # Under 60s = short
+        if duration > 3600:  # Over 1 hour
+            return "stream"
+    
+    # 4. Playlist source as final fallback
+    if playlist_source == "shorts":
+        return "clip"
+    if playlist_source == "streams":
+        return "stream"
+    return "vod"
+
+
+def _enrich_with_rss_dates(rows: list[dict[str, Any]], channel_id: Optional[str]) -> None:
+    """Fill missing created_at and views from the public RSS feed."""
+    if not channel_id or not rows:
+        return
+    rss = _fetch_youtube_rss_rows(channel_id)
+    if not rss:
+        return
+    rss_by_id: dict[str, dict[str, Any]] = {r["id"]: r for r in rss if r.get("id")}
+    for row in rows:
+        r = rss_by_id.get(row.get("id") or "")
+        if r:
+            if not row.get("created_at") and r.get("created_at"):
+                row["created_at"] = r["created_at"]
+            if row.get("views") is None and r.get("views") is not None:
+                row["views"] = r["views"]
+
+
 def list_channel_videos_sync(
     channel_ref: str,
     limit: int = 50,
@@ -220,7 +288,6 @@ def list_channel_videos_sync(
         ytdlp_extractor_args,
     )
 
-    url = channel_playlist_url(channel_ref, playlist)
     session = youtube_session_from_settings()
     try:
         from deps import settings_mgr
@@ -228,8 +295,9 @@ def list_channel_videos_sync(
     except Exception:
         auto_auth = True
     ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
-    opts: dict[str, Any] = {
-        "playlistend": max(1, min(int(limit), 100)),
+
+    base_opts: dict[str, Any] = {
+        "playlistend": max(1, min(int(limit) * 3, 300)),
         "extract_flat": "in_playlist",
         "quiet": True,
         "no_warnings": True,
@@ -246,66 +314,97 @@ def list_channel_videos_sync(
     }
     from services.youtube_session import apply_ytdlp_cookie_opts
 
-    apply_ytdlp_cookie_opts(opts, session, auto_auth=auto_auth)
-    with guarded_youtube_dl_channel(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    entries = (info or {}).get("entries") or []
-    content_kind = _content_kind_for_playlist(playlist)
-    out: list[dict[str, Any]] = []
-    for e in entries:
-        if not e:
+    apply_ytdlp_cookie_opts(base_opts, session, auto_auth=auto_auth)
+
+    all_videos: dict[str, dict[str, Any]] = {}
+    channel_id: Optional[str] = None
+
+    for pl in ("videos", "shorts", "streams"):
+        pl_url = channel_playlist_url(channel_ref, pl)
+        try:
+            with guarded_youtube_dl_channel(base_opts) as ydl:
+                info = ydl.extract_info(pl_url, download=False)
+            if channel_id is None:
+                channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
+        except Exception as exc:
+            logger.debug("youtube playlist %s failed: %s", pl, exc)
             continue
-        vid = (e.get("id") or "").strip()
-        if not vid:
-            continue
-        if playlist == "shorts":
-            webpage = f"https://www.youtube.com/shorts/{vid}"
-        else:
-            webpage = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
-        if not str(webpage).startswith("http"):
-            webpage = f"https://www.youtube.com/watch?v={vid}"
-        created_at = _created_at_from_entry(e)
-        thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
-        dur = e.get("duration")
-        dur_str = None
-        if dur is not None:
-            try:
-                sec = int(float(dur))
-                dur_str = _duration_string_from_sec(sec)
-            except (TypeError, ValueError):
-                pass
-        out.append({
-            "id": vid,
-            "platform": "YouTube",
-            "title": e.get("title") or "Untitled",
-            "duration": dur,
-            "duration_string": dur_str,
-            "created_at": created_at,
-            "views": e.get("view_count"),
-            "thumbnail_url": thumb,
-            "url": webpage,
-            "channel": e.get("channel") or e.get("uploader") or channel_ref,
-            "content_kind": content_kind,
-        })
+
+        entries = (info or {}).get("entries") or []
+        for e in entries:
+            if not e:
+                continue
+            vid = (e.get("id") or "").strip()
+            if not vid:
+                continue
+            if vid in all_videos:
+                continue
+
+            if pl == "shorts":
+                webpage = f"https://www.youtube.com/shorts/{vid}"
+            else:
+                webpage = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
+            if not str(webpage).startswith("http"):
+                webpage = f"https://www.youtube.com/watch?v={vid}"
+
+            created_at = _created_at_from_entry(e)
+            thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+            dur = e.get("duration")
+            dur_str = None
+            duration_sec = None
+            if dur is not None:
+                try:
+                    duration_sec = int(float(dur))
+                    dur_str = _duration_string_from_sec(duration_sec)
+                except (TypeError, ValueError):
+                    pass
+
+            content_kind = _classify_youtube_video(
+                vid=vid,
+                title=e.get("title") or "",
+                url=webpage,
+                duration=duration_sec,
+                live_status=e.get("live_status"),
+                playlist_source=pl,
+            )
+
+            all_videos[vid] = {
+                "id": vid,
+                "platform": "YouTube",
+                "title": e.get("title") or "Untitled",
+                "duration": duration_sec,
+                "duration_string": dur_str,
+                "created_at": created_at,
+                "views": e.get("view_count"),
+                "thumbnail_url": thumb,
+                "url": webpage,
+                "channel": e.get("channel") or e.get("uploader") or channel_ref,
+                "content_kind": content_kind,
+            }
+
+    # Filter by requested playlist type
+    if playlist == "videos":
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "vod"]
+    elif playlist == "shorts":
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "clip"]
+    elif playlist == "streams":
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "stream"]
+    else:
+        filtered = list(all_videos.values())
+
+    # Sort by date newest first
+    filtered.sort(key=lambda v: _parse_video_ts(v.get("created_at")) or 0, reverse=True)
+    filtered = filtered[:limit]
+
+    # Enrich with RSS dates/views where available
+    if enrich and channel_id:
+        _enrich_with_rss_dates(filtered, channel_id)
+
+    # Innertube enrichment
     if enrich:
-        # For the uploads tab (playlist="videos"), the public RSS feed is the
-        # authoritative, chronological source: it carries reliable publish dates
-        # AND view counts with NO auth/POT dependency, and returns the TRUE
-        # most-recent-first order. yt-dlp's flat playlist (even with
-        # player_client overrides) can return a different, older/popular video
-        # set with no upload_date, so we prefer the RSS list for videos.
-        #
-        # For shorts/streams we keep the yt-dlp flat extraction, which returns
-        # the correct content types (with duration) for those tabs.
-        if playlist == "videos":
-            channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
-            rss_rows = _fetch_youtube_rss_rows(channel_id, content_kind="vod") if channel_id else []
-            if rss_rows:
-                out = rss_rows
-        # Innertube per-video enrichment fills any remaining gaps (views/duration)
-        # when YouTube auth (POT/cookies) is available.
-        _enrich_youtube_channel_rows(out)
-    return out
+        _enrich_youtube_channel_rows(filtered)
+
+    return filtered
 
 
 assert channel_playlist_url("cellbit", "videos").endswith("/videos")

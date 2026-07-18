@@ -746,7 +746,7 @@ def looks_like_clip_entry(entry: dict) -> bool:
     elif entry.get("content_kind") != "clip":
         return False
     duration = entry.get("duration")
-    if duration is not None:
+    if duration is not None and entry.get("platform") != "YouTube":
         try:
             if float(duration) > 60:
                 return False
