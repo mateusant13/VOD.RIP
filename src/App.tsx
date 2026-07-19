@@ -3573,33 +3573,61 @@ export default function App() {
     let idx = 0;
     const BATCH = 2; // 2 per channel per batch
 
-    const sendNextBatch = () => {
+    const sendBatch = () => {
       const batch: string[] = [];
-      let anyLeft = false;
       for (const chUrls of perChannel) {
         const remaining = chUrls.slice(idx);
         if (remaining.length) {
-          anyLeft = true;
           batch.push(...remaining.slice(0, BATCH));
         }
       }
-      if (!batch.length || !anyLeft) return;
+      if (!batch.length) return;
 
       idx += BATCH;
 
       fetch('/api/preview/warm/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls: batch, prefer_height: 360 }),
+        body: JSON.stringify({ urls: batch, prefer_height: 720 }),
       }).catch(() => {});
 
-      // Schedule next batch after a delay (let each warm complete before next)
-      setTimeout(sendNextBatch, 3000);
+      // Next batch immediately - executor handles queue
+      sendBatch();
     };
 
     // Start warming after a short delay so page render isn't affected
-    setTimeout(sendNextBatch, 500);
+    setTimeout(sendBatch, 500);
   }, []);
+
+  // Warm newly fetched YouTube videos whenever channel data updates
+  const warmedUrlsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const channels = savedChannels;
+    if (!channels.length) return;
+
+    const urls: string[] = [];
+    for (const ch of channels) {
+      for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
+        if ((v.platform === 'YouTube' || v.platform === 'youtube') && v.url && !warmedUrlsRef.current.has(v.url)) {
+          warmedUrlsRef.current.add(v.url);
+          urls.push(v.url);
+        }
+      }
+    }
+    if (!urls.length) return;
+
+    // Batch to avoid too-large requests
+    for (let i = 0; i < urls.length; i += 20) {
+      const batch = urls.slice(i, i + 20);
+      setTimeout(() => {
+        fetch('/api/preview/warm/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: batch, prefer_height: 720 }),
+        }).catch(() => {});
+      }, i * 10); // Spread requests over time
+    }
+  }, [savedChannels]);
 
   const addChannelFromSlugs = useCallback(async (
     kickSlug: string,
