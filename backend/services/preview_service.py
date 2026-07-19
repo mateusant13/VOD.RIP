@@ -73,6 +73,12 @@ _RESOLVED_STREAM_TTL_SEC = 60
 _RESOLVED_STREAM_MAX = 64
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
+# Persistent dedup for the batch warm startup path — once a URL has been
+# warmed once this process lifetime, skip re-warming it. The 60-second
+# _RESOLVED_STREAM_CACHE TTL would otherwise cause redundant re-extracts
+# when the frontend re-fires the batch warm on every state change.
+_WARMED_URLS: set = set()
+_WARMED_URLS_LOCK = threading.Lock()
 # In-flight YouTube warm keyed by canonical URL — create_session awaits paste warm.
 _YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
 _YOUTUBE_WARM_LOCK = threading.Lock()

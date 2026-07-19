@@ -78,18 +78,17 @@ async def _app_lifespan(_app: FastAPI):
 
             # Start-up preview warm from saved_channels — runs BEFORE the user
             # opens the page so the first preview click is instant.
-            # Frontend also keeps calling /api/preview/warm/batch on mount to
-            # warm anything new since last save.
+            # Wave 0 (newest from each channel) gets full warm (resolve +
+            # preflight mux). Subsequent waves are resolve-only and run in
+            # background.
             try:
                 saved = getattr(s, "saved_channels", None) or []
-                urls = _collect_saved_youtube_urls(saved)
-                if urls:
+                if saved:
                     logger.info(
-                        "Startup preview warm: %d URLs from %d saved channels",
-                        len(urls),
+                        "Startup preview warm: scheduling for %d saved channels",
                         len(saved),
                     )
-                    _startup_batch_warm(urls)
+                    _startup_wave_warm(saved)
             except Exception:
                 logger.debug("Startup preview warm skipped", exc_info=True)
         except Exception:
@@ -116,14 +115,107 @@ async def _app_lifespan(_app: FastAPI):
                         urls.append(url)
         return urls
 
-    def _startup_batch_warm(urls: list) -> None:
-        """Fire-and-forget warm for all URLs on startup.
+    def _startup_wave_warm(saved_channels) -> None:
+        """Wave-based warm sorted by recency, 2-per-channel per wave.
 
-        Uses kickoff_youtube_batch_warm which:
-        - skips the active-preview bail (user hasn't clicked anything yet)
-        - skips the preflight mux (avoids duplicate extracts)
-        - dedupes via _YOUTUBE_WARM_INFLIGHT
+        Wave 0 (newest from each channel) fires immediately via full warm
+        (resolve + preflight mux) so the first click is instant.
+        Subsequent waves are resolve-only (lighter, faster) and run in
+        background. The CHANNEL_EXECUTOR (16 workers) handles the fan-out.
         """
+        from services.preview_service import _WARMED_URLS, kickoff_youtube_warm
+        from deps import CHANNEL_EXECUTOR
+
+        # Collect per-channel YouTube video lists, sorted newest-first by date.
+        sorted_channels: list[list[dict]] = []
+        for ch in saved_channels or []:
+            if not isinstance(ch, dict):
+                continue
+            videos: list[dict] = []
+            for key in ("vodVideos", "clipVideos"):
+                for v in ch.get(key) or []:
+                    if not isinstance(v, dict):
+                        continue
+                    url = v.get("url") or ""
+                    if "youtube.com" in url or "youtu.be" in url:
+                        videos.append(v)
+            videos.sort(
+                key=lambda v: (
+                    v.get("created_at") or v.get("published_at") or v.get("upload_date") or ""
+                ),
+                reverse=True,
+            )
+            if videos:
+                sorted_channels.append(videos)
+
+        if not sorted_channels:
+            return
+
+        BATCH = 2
+        MAX_WAVES = 100
+        submitted = 0
+
+        for wave_idx in range(MAX_WAVES):
+            wave_urls: list[str] = []
+            for ch_videos in sorted_channels:
+                start = wave_idx * BATCH
+                wave_urls.extend(v["url"] for v in ch_videos[start : start + BATCH])
+            if not wave_urls:
+                break
+
+            with _WARMED_URLS_LOCK:
+                fresh = [u for u in wave_urls if u not in _WARMED_URLS]
+                for u in fresh:
+                    _WARMED_URLS.add(u)
+
+            if not fresh:
+                continue
+
+            # Wave 0: full warm (resolve + preflight mux) so first click is instant.
+            # Later waves: resolve-only (lighter, runs in background).
+            use_full_warm = wave_idx == 0
+
+            logger.info(
+                "Startup warm wave %d: %d URLs%s",
+                wave_idx + 1,
+                len(fresh),
+                " (FULL: resolve + preflight mux)" if use_full_warm else " (resolve-only)",
+            )
+
+            def _fire(url: str, full: bool) -> None:
+                try:
+                    if full:
+                        CHANNEL_EXECUTOR.submit(
+                            kickoff_youtube_warm,
+                            url,
+                            prefer_height=720,
+                            force=True,
+                        )
+                    else:
+                        from services.preview_service import (
+                            kickoff_youtube_batch_warm,
+                        )
+                        CHANNEL_EXECUTOR.submit(
+                            kickoff_youtube_batch_warm,
+                            url,
+                            prefer_height=720,
+                        )
+                except Exception:
+                    pass
+
+            for u in fresh:
+                _fire(u, use_full_warm)
+                submitted += 1
+
+        logger.info(
+            "Startup preview warm: queued %d URLs across %d waves (priority: %d newest)",
+            submitted,
+            min(len(sorted_channels[0]) // BATCH + 1 if sorted_channels else 0, MAX_WAVES),
+            min(BATCH * len(sorted_channels), submitted),
+        )
+
+    def _startup_batch_warm(urls: list) -> None:
+        """Legacy helper retained for backward compat — unused by new wave path."""
         from services.preview_service import kickoff_youtube_batch_warm
         from deps import INFO_EXECUTOR, CHANNEL_EXECUTOR
 
