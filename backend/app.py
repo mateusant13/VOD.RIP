@@ -75,8 +75,67 @@ async def _app_lifespan(_app: FastAPI):
                     auto_auth=False,
                     cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
                 )
+
+            # Start-up preview warm from saved_channels — runs BEFORE the user
+            # opens the page so the first preview click is instant.
+            # Frontend also keeps calling /api/preview/warm/batch on mount to
+            # warm anything new since last save.
+            try:
+                saved = getattr(s, "saved_channels", None) or []
+                urls = _collect_saved_youtube_urls(saved)
+                if urls:
+                    logger.info(
+                        "Startup preview warm: %d URLs from %d saved channels",
+                        len(urls),
+                        len(saved),
+                    )
+                    _startup_batch_warm(urls)
+            except Exception:
+                logger.debug("Startup preview warm skipped", exc_info=True)
         except Exception:
             logger.debug("YouTube warm-up skipped", exc_info=True)
+
+    def _collect_saved_youtube_urls(saved_channels) -> list:
+        """Pull YouTube URLs out of the saved channel list (any field that
+        looks like a YouTube link is a candidate)."""
+        import re
+
+        urls = []
+        seen = set()
+        yt_re = re.compile(r"youtube\.com|youtu\.be")
+        for ch in saved_channels or []:
+            if not isinstance(ch, dict):
+                continue
+            for key in ("vodVideos", "clipVideos", "videos"):
+                for v in ch.get(key) or []:
+                    if not isinstance(v, dict):
+                        continue
+                    url = v.get("url") or ""
+                    if url and yt_re.search(url) and url not in seen:
+                        seen.add(url)
+                        urls.append(url)
+        return urls
+
+    def _startup_batch_warm(urls: list) -> None:
+        """Fire-and-forget warm for all URLs on startup.
+
+        Uses kickoff_youtube_batch_warm which:
+        - skips the active-preview bail (user hasn't clicked anything yet)
+        - skips the preflight mux (avoids duplicate extracts)
+        - dedupes via _YOUTUBE_WARM_INFLIGHT
+        """
+        from services.preview_service import kickoff_youtube_batch_warm
+        from deps import INFO_EXECUTOR, CHANNEL_EXECUTOR
+
+        for u in urls:
+            try:
+                CHANNEL_EXECUTOR.submit(
+                    kickoff_youtube_batch_warm,
+                    u,
+                    prefer_height=720,
+                )
+            except Exception:
+                pass
 
     threading.Thread(target=_warm_youtube, daemon=True, name="yt-warm").start()
     yield
