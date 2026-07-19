@@ -3550,6 +3550,57 @@ export default function App() {
     });
   }, []);
 
+  // Start-up: warm YouTube preview cache for cached videos (2 per channel first).
+  // Collects YouTube URLs from saved channels' vodVideos/clipVideos (loaded from localStorage on mount).
+  // Sends in batches of 2 per channel to minimize latency for the first click.
+  useEffect(() => {
+    const channels = savedChannelsRef.current;
+    if (!channels.length) return;
+
+    // Collect YouTube URLs from each channel's cached videos
+    const perChannel: string[][] = [];
+    for (const ch of channels) {
+      const urls: string[] = [];
+      for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
+        if ((v.platform === 'YouTube' || v.platform === 'youtube') && v.url) {
+          urls.push(v.url);
+        }
+      }
+      if (urls.length) perChannel.push(urls);
+    }
+    if (!perChannel.length) return;
+
+    let idx = 0;
+    const BATCH = 2; // 2 per channel per batch
+
+    const sendNextBatch = () => {
+      const batch: string[] = [];
+      let anyLeft = false;
+      for (const chUrls of perChannel) {
+        const remaining = chUrls.slice(idx);
+        if (remaining.length) {
+          anyLeft = true;
+          batch.push(...remaining.slice(0, BATCH));
+        }
+      }
+      if (!batch.length || !anyLeft) return;
+
+      idx += BATCH;
+
+      fetch('/api/preview/warm/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls: batch, prefer_height: 360 }),
+      }).catch(() => {});
+
+      // Schedule next batch after a delay (let each warm complete before next)
+      setTimeout(sendNextBatch, 3000);
+    };
+
+    // Start warming after a short delay so page render isn't affected
+    setTimeout(sendNextBatch, 500);
+  }, []);
+
   const addChannelFromSlugs = useCallback(async (
     kickSlug: string,
     twitchSlug: string,

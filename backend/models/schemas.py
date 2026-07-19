@@ -135,6 +135,11 @@ class PreviewWarmRequest(BaseModel):
     prefer_height: int = 720
 
 
+class PreviewBatchWarmRequest(BaseModel):
+    urls: list[str]
+    prefer_height: int = 360
+
+
 class PreviewSessionCreateRequest(BaseModel):
     url: str
     crop_start: float = 0.0

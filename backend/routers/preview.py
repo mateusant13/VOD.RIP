@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest
+from models.schemas import PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
 from deps import INFO_EXECUTOR
 from services.preview_service import (
@@ -145,6 +145,33 @@ async def preview_warm(req: PreviewWarmRequest):
             prefer_height=req.prefer_height or 720,
         )
     return {"warmed": True}
+
+
+@router.post("/api/preview/warm/batch")
+async def preview_warm_batch(req: PreviewBatchWarmRequest):
+    """Fire-and-forget: warm all YouTube URLs in the batch."""
+    urls = [u.strip() for u in (req.urls or []) if u.strip()]
+    if not urls:
+        return {"warmed": 0}
+    from deps import INFO_EXECUTOR
+    from services.preview_service import kickoff_youtube_warm
+
+    sem = asyncio.Semaphore(min(6, len(urls)))
+
+    async def _warm_one(url: str) -> None:
+        async with sem:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    INFO_EXECUTOR,
+                    lambda u=url: kickoff_youtube_warm(u, prefer_height=req.prefer_height or 360),
+                )
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(_warm_one(u)) for u in urls]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    return {"warmed": len(urls)}
 
 
 @router.post("/api/preview/timing")
