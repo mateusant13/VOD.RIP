@@ -290,6 +290,7 @@ async def channel_videos(
                 "per_platform_errors": per_platform_errors,
             }
             _cache_channel_payload(cache_key, payload)
+            asyncio.create_task(_warm_youtube_previews(all_videos))
             return payload
         limit = limit_norm
         per_platform_errors: Dict[str, str] = {}
@@ -424,6 +425,7 @@ async def channel_videos(
             "per_platform_errors": per_platform_errors,
         }
         _cache_channel_payload(cache_key, payload)
+        asyncio.create_task(_warm_youtube_previews(all_videos))
         return payload
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -494,3 +496,32 @@ async def channel_clips(
     except Exception as e:
     # ponytail: best-effort — network errors only
         raise HTTPException(status_code=400, detail=str(e))
+
+async def _warm_youtube_previews(videos: list[dict]) -> None:
+    """Fire-and-forget: warm YouTube preview caches for all YouTube videos in the list."""
+    urls = [v["url"] for v in videos if v.get("platform") == "YouTube" and v.get("url")]
+    if not urls:
+        return
+
+    seen: set[str] = set()
+    unique = [u for u in urls if not (u in seen or seen.add(u))]
+    if not unique:
+        return
+
+    from services.preview_service import kickoff_youtube_warm
+
+    sem = asyncio.Semaphore(4)
+
+    async def _warm_one(url: str) -> None:
+        async with sem:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    CHANNEL_EXECUTOR,
+                    lambda u=url: kickoff_youtube_warm(u, prefer_height=360),
+                )
+            except Exception as exc:
+                logger.debug("YouTube preview warm failed for %s: %s", url[:50], exc)
+
+    tasks = [asyncio.create_task(_warm_one(u)) for u in unique]
+    await asyncio.gather(*tasks, return_exceptions=True)

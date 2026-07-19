@@ -1991,15 +1991,22 @@ def _download_progressive_clip(
     del prefer_height
     duration = max(0.1, end_sec - start_sec)
     resolved = ffmpeg_exe or _resolve_ffmpeg_exe()
-    media_rng = _googlevideo_byte_range(media_url, start_sec, end_sec)
     tmpdir: Optional[str] = None
     media_input = media_url
     ss = start_sec
-    if media_rng:
-        tmpdir = tempfile.mkdtemp(prefix="prog_clip_")
-        media_input = os.path.join(tmpdir, "in.mp4")
-        _fetch_googlevideo_range(media_url, media_rng, headers, media_input)
-        ss = max(0.0, start_sec - _range_lead_sec(media_url, media_rng[0]))
+    if _googlevideo_byte_range(media_url, start_sec, end_sec) is not None:
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="prog_clip_")
+            media_input = os.path.join(tmpdir, "in.mp4")
+            ss = _fetch_googlevideo_window_local(
+                media_url, start_sec, end_sec, headers, media_input, cancel_event,
+            )
+        except Exception:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                tmpdir = None
+            media_input = media_url
+            ss = start_sec
     cmd = [resolved, "-y", "-hide_banner", "-loglevel", "error"]
     if not media_rng:
         cmd += _ffmpeg_input_headers(headers or {})
@@ -3067,6 +3074,26 @@ def _download_hls_clip(
                 )
                 return
             audio_fmt = info.get("_preview_audio_format")
+            if audio_fmt and audio_fmt.get("url") and not audio_only:
+                _download_muxed_dash_clip(
+                    video_fmt["url"],
+                    audio_fmt["url"],
+                    output_path,
+                    start_sec,
+                    end_sec,
+                    headers=vheaders,
+                    ffmpeg_exe=ffmpeg_exe,
+                    progress_hook=progress_hook,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    register_abort=register_abort,
+                    video_encoder=video_encoder,
+                    mp4_faststart=mp4_faststart,
+                    video_fmt=video_fmt,
+                )
+                return
+            # Fallback: try to resolve audio from formats list when _preview_audio_format not set
+            audio_fmt = _resolve_youtube_audio_format(info)
             if audio_fmt and audio_fmt.get("url") and not audio_only:
                 _download_muxed_dash_clip(
                     video_fmt["url"],
