@@ -3550,89 +3550,61 @@ export default function App() {
     });
   }, []);
 
-  // Start-up: warm YouTube preview cache for cached videos (2 per channel first).
-  // Collects YouTube URLs from saved channels' vodVideos/clipVideos (loaded from localStorage on mount).
-  // Sends in batches of 2 per channel to minimize latency for the first click.
+  // Warm YouTube preview cache for all currently-known channel videos.
+  // - Runs on mount with whatever localStorage had cached.
+  // - Re-runs on every savedChannels change to warm newly-fetched videos.
+  // - Uses warmedUrlsRef to dedupe so the same URL is never sent twice.
+  const warmedUrlsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const channels = savedChannelsRef.current;
-    console.log('[warm] startup effect, channels:', channels.length);
+    const channels = savedChannels;
+    console.log('[warm] effect fired, channels:', channels.length);
     if (!channels.length) return;
 
-    // Collect YouTube URLs from each channel's cached videos (platform field may not be set)
     const perChannel: string[][] = [];
     for (const ch of channels) {
       const urls: string[] = [];
       for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
-        if (v.url && /youtube\.com|youtu\.be/.test(v.url)) {
+        if (
+          v.url &&
+          /youtube\.com|youtu\.be/.test(v.url) &&
+          !warmedUrlsRef.current.has(v.url)
+        ) {
+          warmedUrlsRef.current.add(v.url);
           urls.push(v.url);
         }
       }
       if (urls.length) perChannel.push(urls);
     }
-    console.log('[warm] startup per-channel YouTube urls:', perChannel.map(u => u.length));
+    console.log(
+      '[warm] per-channel YouTube URLs to warm:',
+      perChannel.map((u) => u.length),
+      'already-warmed total:',
+      warmedUrlsRef.current.size - perChannel.reduce((n, u) => n + u.length, 0),
+    );
     if (!perChannel.length) return;
 
+    // Fire batches in waves of 2-per-channel so all channels progress together
+    // and the executor queue (sem=6) gets steady input.
     let idx = 0;
-    const BATCH = 2; // 2 per channel per batch
-
+    const BATCH = 2;
     const sendBatch = () => {
       const batch: string[] = [];
       for (const chUrls of perChannel) {
         const remaining = chUrls.slice(idx);
-        if (remaining.length) {
-          batch.push(...remaining.slice(0, BATCH));
-        }
+        if (remaining.length) batch.push(...remaining.slice(0, BATCH));
       }
       if (!batch.length) return;
-
       idx += BATCH;
-      console.log('[warm] startup batch idx=' + idx, 'size=' + batch.length, 'first=', batch[0]?.slice(0, 50));
-
+      console.log('[warm] sending batch idx=' + idx, 'size=' + batch.length);
       fetch('/api/preview/warm/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ urls: batch, prefer_height: 720 }),
-      }).catch((e) => console.warn('[warm] startup batch fetch failed:', e));
-
-      // Next batch immediately - executor handles queue
-      sendBatch();
+      }).catch((e) => console.warn('[warm] fetch failed:', e));
+      // Yield to event loop so we don't starve render
+      setTimeout(sendBatch, 0);
     };
-
-    // Start warming after a short delay so page render isn't affected
-    setTimeout(sendBatch, 500);
-  }, []);
-
-  // Warm newly fetched YouTube videos whenever channel data updates
-  const warmedUrlsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    const channels = savedChannels;
-    console.log('[warm] onChange effect, channels:', channels.length);
-    if (!channels.length) return;
-
-    const urls: string[] = [];
-    for (const ch of channels) {
-      for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
-        if (v.url && !warmedUrlsRef.current.has(v.url) && /youtube\.com|youtu\.be/.test(v.url)) {
-          warmedUrlsRef.current.add(v.url);
-          urls.push(v.url);
-        }
-      }
-    }
-    console.log('[warm] onChange new URLs to warm:', urls.length, 'already-warmed:', warmedUrlsRef.current.size);
-    if (!urls.length) return;
-
-    // Batch to avoid too-large requests
-    for (let i = 0; i < urls.length; i += 20) {
-      const batch = urls.slice(i, i + 20);
-      setTimeout(() => {
-        console.log('[warm] onChange batch size=' + batch.length, 'first=', batch[0]?.slice(0, 50));
-        fetch('/api/preview/warm/batch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ urls: batch, prefer_height: 720 }),
-        }).catch((e) => console.warn('[warm] onChange batch fetch failed:', e));
-      }, i * 10); // Spread requests over time
-    }
+    sendBatch();
   }, [savedChannels]);
 
   const addChannelFromSlugs = useCallback(async (
