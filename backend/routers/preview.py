@@ -153,6 +153,7 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
     urls = [u.strip() for u in (req.urls or []) if u.strip()]
     if not urls:
         return {"warmed": 0}
+    logger.info("Batch warm received %d URLs", len(urls))
     from deps import INFO_EXECUTOR
     from services.preview_service import kickoff_youtube_warm
 
@@ -164,14 +165,16 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     INFO_EXECUTOR,
-                    lambda u=url: kickoff_youtube_warm(u, prefer_height=req.prefer_height or 360),
+                    lambda u=url: kickoff_youtube_warm(u, prefer_height=req.prefer_height or 720),
                 )
             except Exception:
                 pass
 
     tasks = [asyncio.create_task(_warm_one(u)) for u in urls]
     await asyncio.gather(*tasks, return_exceptions=True)
-    return {"warmed": len(urls)}
+    log_total = len(urls)
+    logger.info("Batch warm done: %d URLs warmed (h=%d)", log_total, req.prefer_height or 720)
+    return {"warmed": log_total}
 
 
 @router.post("/api/preview/timing")

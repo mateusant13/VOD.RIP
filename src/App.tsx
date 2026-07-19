@@ -3557,12 +3557,12 @@ export default function App() {
     const channels = savedChannelsRef.current;
     if (!channels.length) return;
 
-    // Collect YouTube URLs from each channel's cached videos
+    // Collect YouTube URLs from each channel's cached videos (platform field may not be set)
     const perChannel: string[][] = [];
     for (const ch of channels) {
       const urls: string[] = [];
       for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
-        if ((v.platform === 'YouTube' || v.platform === 'youtube') && v.url) {
+        if (v.url && /youtube\.com|youtu\.be/.test(v.url)) {
           urls.push(v.url);
         }
       }
@@ -3608,7 +3608,7 @@ export default function App() {
     const urls: string[] = [];
     for (const ch of channels) {
       for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
-        if ((v.platform === 'YouTube' || v.platform === 'youtube') && v.url && !warmedUrlsRef.current.has(v.url)) {
+        if (v.url && !warmedUrlsRef.current.has(v.url) && /youtube\.com|youtu\.be/.test(v.url)) {
           warmedUrlsRef.current.add(v.url);
           urls.push(v.url);
         }
