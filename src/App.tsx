@@ -3555,6 +3555,7 @@ export default function App() {
   // Sends in batches of 2 per channel to minimize latency for the first click.
   useEffect(() => {
     const channels = savedChannelsRef.current;
+    console.log('[warm] startup effect, channels:', channels.length);
     if (!channels.length) return;
 
     // Collect YouTube URLs from each channel's cached videos (platform field may not be set)
@@ -3568,6 +3569,7 @@ export default function App() {
       }
       if (urls.length) perChannel.push(urls);
     }
+    console.log('[warm] startup per-channel YouTube urls:', perChannel.map(u => u.length));
     if (!perChannel.length) return;
 
     let idx = 0;
@@ -3584,12 +3586,13 @@ export default function App() {
       if (!batch.length) return;
 
       idx += BATCH;
+      console.log('[warm] startup batch idx=' + idx, 'size=' + batch.length, 'first=', batch[0]?.slice(0, 50));
 
       fetch('/api/preview/warm/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ urls: batch, prefer_height: 720 }),
-      }).catch(() => {});
+      }).catch((e) => console.warn('[warm] startup batch fetch failed:', e));
 
       // Next batch immediately - executor handles queue
       sendBatch();
@@ -3603,6 +3606,7 @@ export default function App() {
   const warmedUrlsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const channels = savedChannels;
+    console.log('[warm] onChange effect, channels:', channels.length);
     if (!channels.length) return;
 
     const urls: string[] = [];
@@ -3614,17 +3618,19 @@ export default function App() {
         }
       }
     }
+    console.log('[warm] onChange new URLs to warm:', urls.length, 'already-warmed:', warmedUrlsRef.current.size);
     if (!urls.length) return;
 
     // Batch to avoid too-large requests
     for (let i = 0; i < urls.length; i += 20) {
       const batch = urls.slice(i, i + 20);
       setTimeout(() => {
+        console.log('[warm] onChange batch size=' + batch.length, 'first=', batch[0]?.slice(0, 50));
         fetch('/api/preview/warm/batch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ urls: batch, prefer_height: 720 }),
-        }).catch(() => {});
+        }).catch((e) => console.warn('[warm] onChange batch fetch failed:', e));
       }, i * 10); // Spread requests over time
     }
   }, [savedChannels]);
