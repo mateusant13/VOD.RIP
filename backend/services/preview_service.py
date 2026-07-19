@@ -2709,6 +2709,51 @@ def kickoff_youtube_preflight_mux(
     INFO_EXECUTOR.submit(_run)
 
 
+def kickoff_youtube_batch_warm(
+    url: str,
+    oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
+    prefer_height: int = 720,
+) -> None:
+    """Lightweight warm for batch (startup) use.
+
+    - Deduped via the same _YOUTUBE_WARM_INFLIGHT set as kickoff_youtube_warm.
+    - Skips the "active preview" bail so the user's first click doesn't
+      cancel preloading.
+    - Populates only the resolve cache (no preflight mux) so concurrent
+      batch warm jobs don't fight over _PREFLIGHT_MUX_INFLIGHT.
+    """
+    from services.ytdlp_hls import preview_fast_only_mode
+
+    if preview_fast_only_mode():
+        return
+    key = _youtube_warm_inflight_key(url)
+    if not key:
+        return
+    with _YOUTUBE_WARM_LOCK:
+        if key in _YOUTUBE_WARM_INFLIGHT:
+            return
+        done = threading.Event()
+        _YOUTUBE_WARM_INFLIGHT[key] = done
+
+    def _run() -> None:
+        try:
+            from services.preview_service import warm_youtube_resolve_only
+
+            warm_youtube_resolve_only(
+                url, oauth=oauth, prefer_height=prefer_height,
+            )
+        finally:
+            with _YOUTUBE_WARM_LOCK:
+                ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+    from deps import INFO_EXECUTOR
+
+    INFO_EXECUTOR.submit(_run)
+
+
 def _youtube_preflight_mux(
     url: str,
     oauth: Optional[str] = None,
@@ -3323,6 +3368,8 @@ def kickoff_youtube_warm(
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
+    *,
+    force: bool = False,
 ) -> None:
     """Fire-and-forget warm on URL paste — deduped per canonical URL.
 
@@ -3332,6 +3379,10 @@ def kickoff_youtube_warm(
     ``create_session`` uses for progressive previews) so a plain hover warm
     actually lands in the cache the preview open will read. The full-mux warm
     path passes its own (typically 720) height explicitly.
+
+    ``force=True`` skips the "active preview" bail check. Use for batch
+    warm on startup so preloading doesn't get cancelled the moment the
+    user clicks their first video.
     """
     from services.ytdlp_hls import preview_fast_only_mode
 
@@ -3348,13 +3399,14 @@ def kickoff_youtube_warm(
 
     def _run() -> None:
         try:
-            # Bail out cheaply if the user has moved on to a different VOD.
-            # This keeps stale warm jobs from hogging INFO_EXECUTOR workers.
-            with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
-                active = _ACTIVE_YOUTUBE_PREVIEW_KEY
-            if active is not None and active != key:
-                logger.debug("YouTube warm bailing — active preview is %s", active[:80])
-                return
+            if not force:
+                # Bail out cheaply if the user has moved on to a different VOD.
+                # This keeps stale warm jobs from hogging INFO_EXECUTOR workers.
+                with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
+                    active = _ACTIVE_YOUTUBE_PREVIEW_KEY
+                if active is not None and active != key:
+                    logger.debug("YouTube warm bailing — active preview is %s", active[:80])
+                    return
             from services.ytdlp_hls import warm_youtube_extract
 
             warm_youtube_extract(
@@ -3483,6 +3535,26 @@ def warm_youtube_preview_resolve(
         return True
     except Exception as exc:
         logger.debug("YouTube warm resolve skipped for %s: %s", url[:80], exc)
+        return False
+
+
+def warm_youtube_resolve_only(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 720,
+) -> bool:
+    """Populate resolved-stream cache only — skip the preflight mux.
+
+    Used by the batch warm endpoint on startup so concurrent warm jobs don't
+    fight for the preflight mux (which would re-trigger resolve_stream_info
+    inside _youtube_preflight_mux and cause a second extract). The preflight
+    mux is still triggered on the user's first preview click.
+    """
+    try:
+        resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+        return True
+    except Exception as exc:
+        logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
         return False
 
 

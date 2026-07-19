@@ -155,7 +155,7 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
         return {"warmed": 0}
     logger.info("Batch warm received %d URLs", len(urls))
     from deps import INFO_EXECUTOR
-    from services.preview_service import kickoff_youtube_warm
+    from services.preview_service import kickoff_youtube_batch_warm
 
     sem = asyncio.Semaphore(min(6, len(urls)))
 
@@ -165,7 +165,9 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     INFO_EXECUTOR,
-                    lambda u=url: kickoff_youtube_warm(u, prefer_height=req.prefer_height or 720),
+                    lambda u=url: kickoff_youtube_batch_warm(
+                        u, prefer_height=req.prefer_height or 720,
+                    ),
                 )
             except Exception:
                 pass
