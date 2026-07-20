@@ -3550,64 +3550,73 @@ export default function App() {
     });
   }, []);
 
-  // Warm YouTube preview cache for all currently-known channel videos.
-  // - Runs on mount with whatever localStorage had cached.
-  // - Re-runs on every savedChannels change to warm newly-fetched videos.
-  // - Uses warmedUrlsRef to dedupe so the same URL is never sent twice.
+  // Warm YouTube preview cache for the top N URLs of every (channel, content_kind)
+  // so the first few previews are instant regardless of which filter the user
+  // opens (Videos / Shorts / Streams). Batches are rate-limited so the warm
+  // executor never gets flooded and the user's click isn't queued behind
+  // hundreds of background extracts.
   const warmedUrlsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const channels = savedChannels;
-    console.log('[warm] effect fired, channels:', channels.length);
     if (!channels.length) return;
-
-    const perChannel: string[][] = [];
-    for (const ch of channels) {
-      const urls: string[] = [];
-      for (const v of (ch.vodVideos ?? []).concat(ch.clipVideos ?? [])) {
-        if (
-          v.url &&
-          /youtube\.com|youtu\.be/.test(v.url) &&
-          !warmedUrlsRef.current.has(v.url)
-        ) {
-          warmedUrlsRef.current.add(v.url);
-          urls.push(v.url);
+    const PER_KIND = 2;
+    const STAGGER_MS = 150;
+    const KINDS = ['vods', 'clips', 'streams'] as const;
+    const isYouTubeUrl = (u: string) => /youtube\.com|youtu\.be/.test(u || '');
+    const urlsForKind = (ch: typeof channels[number], kind: typeof KINDS[number]): string[] => {
+      const pool = kind === 'clips'
+        ? ch.clipVideos ?? []
+        : (ch.vodVideos ?? []).filter((v) =>
+            kind === 'streams' ? v.content_kind === 'stream' : v.content_kind !== 'stream' && v.content_kind !== 'clip',
+          );
+      const out: string[] = [];
+      for (const v of pool) {
+        const u = v?.url;
+        if (u && isYouTubeUrl(u) && !warmedUrlsRef.current.has(u)) {
+          warmedUrlsRef.current.add(u);
+          out.push(u);
+          if (out.length >= PER_KIND) break;
         }
       }
-      if (urls.length) perChannel.push(urls);
+      return out;
     }
-    console.log(
-      '[warm] per-channel YouTube URLs to warm:',
-      perChannel.map((u) => u.length),
-      'already-warmed total:',
-      warmedUrlsRef.current.size - perChannel.reduce((n, u) => n + u.length, 0),
-    );
-    if (!perChannel.length) return;
-
-    // Fire batches in waves of 2-per-channel so all channels progress together
-    // and the executor queue (sem=6) gets steady input.
-    let idx = 0;
-    const BATCH = 2;
-    const sendBatch = () => {
-      const batch: string[] = [];
-      for (const chUrls of perChannel) {
-        const remaining = chUrls.slice(idx);
-        if (remaining.length) batch.push(...remaining.slice(0, BATCH));
+    // ponytail: dedup across kinds so the same URL doesn't get re-warmed
+    // (a VOD could appear in both vods and clips in stale localStorage).
+    const seenForBatch = new Set<string>();
+    const queue: string[] = [];
+    for (const ch of channels) {
+      for (const kind of KINDS) {
+        for (const u of urlsForKind(ch, kind)) {
+          if (seenForBatch.has(u)) continue;
+          seenForBatch.add(u);
+          queue.push(u);
+        }
       }
-      if (!batch.length) return;
-      idx += BATCH;
-      console.log('[warm] sending batch idx=' + idx, 'size=' + batch.length);
+    }
+    if (!queue.length) return;
+    const sendBatch = (urls: string[]) => {
       fetch('/api/preview/warm/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // ponytail: 360 = PREVIEW_FAST_START_HEIGHT — must match the height
         // create_session reads on click ({vid}:360:v2), or the whole batch
         // warm lands in a cache key nobody reads and every click re-extracts.
-        body: JSON.stringify({ urls: batch, prefer_height: 360 }),
+        body: JSON.stringify({ urls, prefer_height: 360 }),
       }).catch((e) => console.warn('[warm] fetch failed:', e));
-      // Yield to event loop so we don't starve render
-      setTimeout(sendBatch, 0);
     };
-    sendBatch();
+    // ponytail: small batches of 2 URLs at a time, 150ms between batches.
+    // Keeps WARM_EXECUTOR (4 workers) under saturation and leaves room for
+    // the user's click path.
+    let i = 0;
+    const BATCH = 2;
+    const tick = () => {
+      const slice = queue.slice(i, i + BATCH);
+      i += BATCH;
+      if (!slice.length) return;
+      sendBatch(slice);
+      if (i < queue.length) setTimeout(tick, STAGGER_MS);
+    };
+    tick();
   }, [savedChannels]);
 
   const addChannelFromSlugs = useCallback(async (

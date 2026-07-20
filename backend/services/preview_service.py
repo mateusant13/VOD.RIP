@@ -35,6 +35,10 @@ from services.ytdlp_service import (
 logger = logging.getLogger(__name__)
 
 SESSION_TTL_SEC = 30 * 60
+# ponytail: a DELETE marks the session closed but keeps the cache_dir on disk
+# for this long so late byte requests from the browser don't 404. After the
+# grace window the cache_dir is wiped.
+_SESSION_DELETE_GRACE_SEC = 3.0
 PLAYLIST_REWRITE_TTL_SEC = 20 * 60
 _MAX_PLAYLIST_FETCH_BYTES = (
     512 * 1024
@@ -425,20 +429,27 @@ class PreviewManager:
         self,
     ) -> None:
         now = time.time()
-        stale = [
-            sid
-            for sid, s in self._sessions.items()
-            if now - s.last_access > SESSION_TTL_SEC
-        ]
-        for sid in stale:
-            self.delete_session(sid)
+        # ponytail: closed sessions get a grace window before cache wipe; open
+        # sessions follow the normal SESSION_TTL_SEC.
+        to_wipe: List[str] = []
+        stale_open: List[str] = []
+        for sid, s in self._sessions.items():
+            if s.closed:
+                if now - s.closed_at >= _SESSION_DELETE_GRACE_SEC:
+                    to_wipe.append(sid)
+            elif now - s.last_access > SESSION_TTL_SEC:
+                stale_open.append(sid)
+        for sid in to_wipe:
+            self._finalize_delete(sid)
+        for sid in stale_open:
+            self._finalize_delete(sid)
 
-    def delete_session(self, session_id: str) -> bool:
+    def _finalize_delete(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.pop(session_id, None)
         _PREVIEW_MUX_LOCKS.pop(session_id, None)
         if not session:
-            return False
+            return
         from services.os_services import kill_child_processes
 
         kill_child_processes()
@@ -449,13 +460,38 @@ class PreviewManager:
                 shutil.rmtree(session.cache_dir, ignore_errors=True)
         except OSError:
             pass
+
+    def delete_session(self, session_id: str) -> bool:
+        # ponytail: mark closed + schedule the actual wipe after the grace
+        # window so in-flight byte requests from the browser still hit the
+        # proxy and don't 404.
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return False
+            session.closed = True
+            session.closed_at = time.time()
+        _PREVIEW_MUX_LOCKS.pop(session_id, None)
+        from services.os_services import kill_child_processes
+
+        timer = threading.Timer(
+            _SESSION_DELETE_GRACE_SEC,
+            self._finalize_delete,
+            args=(session_id,),
+        )
+        timer.daemon = True
+        timer.start()
         return True
 
     def get_session(self, session_id: str) -> Optional[PreviewSession]:
         with self._lock:
             session = self._sessions.get(session_id)
         if session:
-            session.touch()
+            # ponytail: skip touch() on closed sessions — they're in the grace
+            # window after DELETE and we don't want a late GET extending their
+            # life beyond the scheduled wipe.
+            if not session.closed:
+                session.touch()
         return session
 
     def _reuse_youtube_snapshot(
@@ -717,6 +753,12 @@ class PreviewSession:
     cache_bytes: int = 0
     last_access: float = field(default_factory=time.time)
     cache_dir: Path = field(default_factory=Path)
+    # ponytail: when True, DELETE has been called but the session is kept in
+    # the dict for _SESSION_DELETE_GRACE_SEC so in-flight byte requests from
+    # the browser don't 404. Late GETs still hit the proxy, just won't be
+    # touched/extended. cleanup_stale_sessions sweeps expired sessions later.
+    closed: bool = False
+    closed_at: float = 0.0
     mux_status: str = "unnecessary"  # unnecessary | pending | ready | error
     mux_error: Optional[str] = None
     dash_window_hls: bool = False  # YouTube DASH: crop window muxed to local HLS
@@ -4140,12 +4182,10 @@ def warm_youtube_resolve_only(
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
 ) -> bool:
-    """Populate resolved-stream cache only — skip the preflight mux.
-
-    Used by the batch warm endpoint on startup so concurrent warm jobs don't
-    fight for the preflight mux (which would re-trigger resolve_stream_info
-    inside _youtube_preflight_mux and cause a second extract). The preflight
-    mux is still triggered on the user's first preview click.
+    """Populate resolved-stream cache + preflight the head so the click can play
+    immediately. Uses the light extract so concurrent warm jobs don't fight for
+    yt-dlp locks during a startup storm. The full InnerTube race path runs on
+    the user's first preview click.
 
     Also prebuilds the session snapshot so the click path skips the ~5s
     extract + variant-build work on a warm hit. Every warm path that lands
@@ -4159,6 +4199,13 @@ def warm_youtube_resolve_only(
     except Exception as exc:
         logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
         return False
+    # ponytail: preflight the head + mux so the first 5s of playable bytes are
+    # on disk before the user clicks. 360p muxed progressive is unauthenticated
+    # and survives without cookies/POT/visitor_data.
+    try:
+        kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
+    except Exception as exc:
+        logger.debug("YouTube batch warm head skipped for %s: %s", url[:80], exc)
     # ponytail: build the session shell so the click fast-path applies. Cached
     # resolve + build once during warm = sub-50ms click instead of ~5s.
     try:
