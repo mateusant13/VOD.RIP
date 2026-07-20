@@ -8,6 +8,7 @@ the dev ``__main__`` entry point.
 from services import ytdlp_env  # noqa: F401 — import order before yt-dlp
 from services.ytdlp_guard import assert_ytdlp_safe
 
+import asyncio
 import logging
 import os
 import threading
@@ -55,6 +56,23 @@ async def _app_lifespan(_app: FastAPI):
             logger.info("YouTube warm-up skipped (VODRIP_PREVIEW_FAST_ONLY)")
             return
         try:
+            # Step 1: Sync warm first 2 URLs per channel — this populates the
+            # resolve cache BEFORE POT/session warmup so the user's very first
+            # preview click lands in cache (<30ms). Parallel resolves take ~5s.
+            try:
+                from deps import settings_mgr as _sm
+                _saved = getattr(_sm.get(), "saved_channels", None) or []
+                if _saved:
+                    logger.info(
+                        "Daemon warm: sync-first then wave for %d saved channels",
+                        len(_saved),
+                    )
+                    _warm_first_wave_sync(_saved)
+                    _startup_wave_warm(_saved)
+            except Exception:
+                logger.exception("Daemon preview warm crashed")
+
+            # Step 2: Background warm-ups (POT, session, yt-dlp)
             from services.youtube_pot_service import schedule_pot_service_warm
             from services.youtube_ytdlp_update import schedule_ytdlp_update_check
 
@@ -75,41 +93,18 @@ async def _app_lifespan(_app: FastAPI):
                     auto_auth=False,
                     cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
                 )
-
-            # Start-up preview warm from saved_channels — runs BEFORE the user
-            # opens the page so the first preview click is instant.
-            try:
-                saved = getattr(s, "saved_channels", None) or []
-                if saved:
-                    logger.info(
-                        "Startup preview warm: scheduling for %d saved channels",
-                        len(saved),
-                    )
-                    # FIRST: warm the newest URL from each channel SYNCHRONOUSLY
-                    # in this daemon thread so the cache is populated BEFORE the
-                    # server accepts page-load requests. This adds ~5s to startup
-                    # but guarantees the user's first click on any of those URLs
-                    # is a cache hit (<30ms).
-                    _warm_first_wave_sync(saved)
-                    # THEN: fire the rest in background
-                    _startup_wave_warm(saved)
-            except Exception:
-                logger.exception("Startup preview warm crashed")
         except Exception:
             logger.debug("YouTube warm-up skipped", exc_info=True)
 
+    # _warm_first_wave_sync is defined OUTSIDE _warm_youtube at lifespan
+    # scope so both the daemon thread and the blocking lifespan warm can
+    # call it.
     def _warm_first_wave_sync(saved_channels) -> None:
-        """Synchronous warm of the first 2 URLs per channel.
-
-        Blocks the startup thread for ~5s so the cache is populated before
-        the user's first click. The wave warm (below) skips already-warmed
-        URLs via _WARMED_URLS.
-        """
-        from services.preview_service import (
-            _WARMED_URLS,
-            _WARMED_URLS_LOCK,
-            warm_youtube_resolve_only,
-        )
+        """Synchronous warm of the first 2 URLs per channel."""
+        from services.preview_service import (_WARMED_URLS, _WARMED_URLS_LOCK)
+        from services.preview_service import resolve_stream_info
+        from concurrent.futures import ThreadPoolExecutor, wait
+        import time as _tm
 
         sorted_channels: list[list[dict]] = []
         for ch in saved_channels or []:
@@ -135,27 +130,29 @@ async def _app_lifespan(_app: FastAPI):
         if not sorted_channels:
             return
 
-        # Warm first 2 from each channel synchronously
         first_urls: list[str] = []
         for ch_videos in sorted_channels:
             first_urls.extend(v["url"] for v in ch_videos[:2])
 
-        from services.preview_service import resolve_stream_info
+        logger.info("STARTUP_SYNC_WARM: warming %d URLs in parallel", len(first_urls))
 
-        for u in first_urls:
-            try:
-                t0 = __import__("time").time()
-                resolve_stream_info(u, prefer_height=720)
-                with _WARMED_URLS_LOCK:
-                    _WARMED_URLS.add(u)
-                logger.info(
-                    "STARTUP_SYNC_WARM: %s done in %.1fs (cache=%s)",
-                    u[:50],
-                    __import__("time").time() - t0,
-                    "populated",
-                )
-            except Exception as exc:
-                logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
+        def _resolve_one(u: str) -> None:
+            t0 = _tm.time()
+            resolve_stream_info(u, prefer_height=720)
+            with _WARMED_URLS_LOCK:
+                _WARMED_URLS.add(u)
+            logger.info("STARTUP_SYNC_WARM: %s done in %.1fs", u[:50], _tm.time() - t0)
+
+        pool = ThreadPoolExecutor(max_workers=len(first_urls))
+        futs = [pool.submit(_resolve_one, u) for u in first_urls]
+        done, not_done = wait(futs, timeout=30.0)
+        for fut in not_done:
+            fut.cancel()
+        for fut in done:
+            exc = fut.exception()
+            if exc:
+                logger.warning("STARTUP_SYNC_WARM: %s", exc)
+        pool.shutdown(wait=False)
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
         """Pull YouTube URLs out of the saved channel list (any field that

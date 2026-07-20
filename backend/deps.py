@@ -29,6 +29,9 @@ set_download_manager(download_mgr)
 # cannot starve /api/info/* and /api/channel/videos.
 INFO_EXECUTOR = ThreadPoolExecutor(max_workers=24, thread_name_prefix="info")
 CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channel")
+# Preview operations (session create/seek/quality/stream) run on their own
+# pool so the user's click is never queued behind batch warm tasks.
+PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")

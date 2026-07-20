@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from models.schemas import PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
-from deps import INFO_EXECUTOR
+from deps import INFO_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
     PreviewMuxPending,
     StalePreviewUrls,
@@ -215,15 +215,13 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     try:
         import time as _time
         t0 = _time.monotonic()
-        session = await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR,
-            lambda: create_session(
-                preview_url,
-                req.crop_start,
-                req.crop_end,
-                oauth=opts.oauth or None,
-                prefer_height=req.prefer_height,
-            ),
+        session = await asyncio.to_thread(
+            create_session,
+            preview_url,
+            req.crop_start,
+            req.crop_end,
+            oauth=opts.oauth or None,
+            prefer_height=req.prefer_height,
         )
         resolve_ms = (_time.monotonic() - t0) * 1000.0
         logger.info(
