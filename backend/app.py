@@ -78,9 +78,6 @@ async def _app_lifespan(_app: FastAPI):
 
             # Start-up preview warm from saved_channels — runs BEFORE the user
             # opens the page so the first preview click is instant.
-            # Wave 0 (newest from each channel) gets full warm (resolve +
-            # preflight mux). Subsequent waves are resolve-only and run in
-            # background.
             try:
                 saved = getattr(s, "saved_channels", None) or []
                 if saved:
@@ -88,11 +85,77 @@ async def _app_lifespan(_app: FastAPI):
                         "Startup preview warm: scheduling for %d saved channels",
                         len(saved),
                     )
+                    # FIRST: warm the newest URL from each channel SYNCHRONOUSLY
+                    # in this daemon thread so the cache is populated BEFORE the
+                    # server accepts page-load requests. This adds ~5s to startup
+                    # but guarantees the user's first click on any of those URLs
+                    # is a cache hit (<30ms).
+                    _warm_first_wave_sync(saved)
+                    # THEN: fire the rest in background
                     _startup_wave_warm(saved)
             except Exception:
-                logger.exception("Startup preview warm crashed")  # was debug — crashes invisible!
+                logger.exception("Startup preview warm crashed")
         except Exception:
             logger.debug("YouTube warm-up skipped", exc_info=True)
+
+    def _warm_first_wave_sync(saved_channels) -> None:
+        """Synchronous warm of the first 2 URLs per channel.
+
+        Blocks the startup thread for ~5s so the cache is populated before
+        the user's first click. The wave warm (below) skips already-warmed
+        URLs via _WARMED_URLS.
+        """
+        from services.preview_service import (
+            _WARMED_URLS,
+            _WARMED_URLS_LOCK,
+            warm_youtube_resolve_only,
+        )
+
+        sorted_channels: list[list[dict]] = []
+        for ch in saved_channels or []:
+            if not isinstance(ch, dict):
+                continue
+            videos: list[dict] = []
+            for key in ("vodVideos", "clipVideos"):
+                for v in ch.get(key) or []:
+                    if not isinstance(v, dict):
+                        continue
+                    url = v.get("url") or ""
+                    if "youtube.com" in url or "youtu.be" in url:
+                        videos.append(v)
+            videos.sort(
+                key=lambda v: (
+                    v.get("created_at") or v.get("published_at") or v.get("upload_date") or ""
+                ),
+                reverse=True,
+            )
+            if videos:
+                sorted_channels.append(videos)
+
+        if not sorted_channels:
+            return
+
+        # Warm first 2 from each channel synchronously
+        first_urls: list[str] = []
+        for ch_videos in sorted_channels:
+            first_urls.extend(v["url"] for v in ch_videos[:2])
+
+        from services.preview_service import resolve_stream_info
+
+        for u in first_urls:
+            try:
+                t0 = __import__("time").time()
+                resolve_stream_info(u, prefer_height=720)
+                with _WARMED_URLS_LOCK:
+                    _WARMED_URLS.add(u)
+                logger.info(
+                    "STARTUP_SYNC_WARM: %s done in %.1fs (cache=%s)",
+                    u[:50],
+                    __import__("time").time() - t0,
+                    "populated",
+                )
+            except Exception as exc:
+                logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
         """Pull YouTube URLs out of the saved channel list (any field that
