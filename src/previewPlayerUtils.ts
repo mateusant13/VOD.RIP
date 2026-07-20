@@ -46,7 +46,7 @@ export function warmYoutubePreview(url: string, delayMs = 0): void {
 const _warmFullInflight = new Set<string>();
 const _warmFullTimers = new Map<string, number>();
 
-export function warmYoutubePreviewFull(url: string, delayMs = 600, preferHeight = 720): void {
+export function warmYoutubePreviewFull(url: string, delayMs = 600, preferHeight = PREVIEW_FAST_START_HEIGHT): void {
   const trimmed = url.trim();
   if (!trimmed || detectUrlPlatform(trimmed) !== 'youtube' || isClipUrl(trimmed)) return;
   if (_warmFullInflight.has(trimmed)) return;

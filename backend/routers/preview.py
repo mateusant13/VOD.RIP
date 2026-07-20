@@ -175,7 +175,9 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
     tasks = [asyncio.create_task(_warm_one(u)) for u in urls]
     await asyncio.gather(*tasks, return_exceptions=True)
     log_total = len(urls)
-    logger.info("Batch warm done: %d URLs warmed (h=%d)", log_total, req.prefer_height or 720)
+    # Fire-and-forget: jobs are queued on WARM_EXECUTOR, resolves happen later.
+    # Logging "warmed" here claimed success before any extract actually ran.
+    logger.info("Batch warm queued: %d URLs (h=%d)", log_total, req.prefer_height or 720)
     return {"warmed": log_total}
 
 
@@ -215,13 +217,15 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     try:
         import time as _time
         t0 = _time.monotonic()
-        session = await asyncio.to_thread(
-            create_session,
-            preview_url,
-            req.crop_start,
-            req.crop_end,
-            oauth=opts.oauth or None,
-            prefer_height=req.prefer_height,
+        session = await asyncio.get_running_loop().run_in_executor(
+            PREVIEW_EXECUTOR,
+            lambda: create_session(
+                preview_url,
+                req.crop_start,
+                req.crop_end,
+                oauth=opts.oauth or None,
+                prefer_height=req.prefer_height,
+            ),
         )
         resolve_ms = (_time.monotonic() - t0) * 1000.0
         logger.info(
@@ -247,7 +251,7 @@ async def preview_session_status(session_id: str):
     """Poll YouTube DASH mux readiness (background job started at session create)."""
     try:
         status = await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR,
+            PREVIEW_EXECUTOR,
             lambda: preview_session_mux_status(session_id),
         )
         return PreviewSessionStatusResponse(**status)
@@ -272,7 +276,7 @@ async def preview_session_seek(session_id: str, req: PreviewSeekRequest):
         session.timing_last_seek_pos = position
         return youtube_window_hls_seek_remux(session_id, position)
 
-    remuxed = await loop.run_in_executor(INFO_EXECUTOR, _kick)
+    remuxed = await loop.run_in_executor(PREVIEW_EXECUTOR, _kick)
     if remuxed:
         pass
     elif not _position_in_window_hls_mux(session, position) or not _window_hls_seg0_ready(session):
@@ -293,7 +297,7 @@ async def preview_refresh_session(session_id: str, request: Request):
     prefer_height = _parse_prefer_height_query(request) or 720
     try:
         session = await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR,
+            PREVIEW_EXECUTOR,
             lambda: refresh_youtube_preview_session(session_id, prefer_height=prefer_height),
         )
         return _preview_session_response(session)
@@ -307,7 +311,7 @@ async def preview_refresh_session(session_id: str, request: Request):
 async def preview_set_quality(session_id: str, req: PreviewQualityUpdateRequest):
     try:
         session = await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR,
+            PREVIEW_EXECUTOR,
             lambda: set_session_prefer_height(session_id, req.prefer_height),
         )
         return _preview_session_response(session)
@@ -323,7 +327,7 @@ async def _preview_apply_prefer_height(session_id: str, prefer_height: Optional[
         return
     try:
         await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR,
+            PREVIEW_EXECUTOR,
             lambda: set_session_prefer_height(session_id, prefer_height),
         )
     except ValueError:
@@ -344,7 +348,7 @@ async def _preview_master_response(
     if force_streaming:
         try:
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                INFO_EXECUTOR,
+                PREVIEW_EXECUTOR,
                 lambda: open_progressive_proxy(session_id, range_header),
             )
         except ValueError as e:
@@ -365,7 +369,7 @@ async def _preview_master_response(
         )
     try:
         data, ctype, extra_headers, status = await loop.run_in_executor(
-            INFO_EXECUTOR, proxy_master, session_id, range_header
+            PREVIEW_EXECUTOR, proxy_master, session_id, range_header
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -387,7 +391,7 @@ async def _preview_master_response(
 @router.get("/api/preview/hls/{session_id}/master.m3u8")
 async def preview_hls_master(session_id: str, request: Request):
     loop = asyncio.get_running_loop()
-    kind = await loop.run_in_executor(INFO_EXECUTOR, preview_session_kind, session_id)
+    kind = await loop.run_in_executor(PREVIEW_EXECUTOR, preview_session_kind, session_id)
     return await _preview_master_response(
         session_id,
         request.headers.get("range"),
@@ -413,7 +417,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     loop = asyncio.get_running_loop()
     try:
         upstream = await loop.run_in_executor(
-            None, lambda: resolve_upstream(session_id, id),
+            PREVIEW_EXECUTOR, lambda: resolve_upstream(session_id, id),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -423,7 +427,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
         if upstream.startswith(WINDOW_HLS_MARKER):
             # window-playlist → dynamic media playlist, window-seg-NNN → local .ts
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                INFO_EXECUTOR,
+                PREVIEW_EXECUTOR,
                 lambda: open_youtube_window_hls_proxy(session_id, id, range_header),
             )
             response_headers = dict(extra_headers or {})
@@ -438,13 +442,13 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
             )
         if _is_playlist_url(upstream):
             data, ctype, extra_headers, status = await loop.run_in_executor(
-                INFO_EXECUTOR,
+                PREVIEW_EXECUTOR,
                 lambda: proxy_playlist(session_id, upstream),
             )
             return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
         if _is_rangeable_cdn_media(upstream):
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                INFO_EXECUTOR,
+                PREVIEW_EXECUTOR,
                 lambda: open_segment_proxy(session_id, upstream, range_header),
             )
             response_headers = dict(extra_headers or {})
@@ -458,7 +462,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
                 background=BackgroundTask(cleanup),
             )
         data, ctype, extra_headers, status = await loop.run_in_executor(
-            INFO_EXECUTOR,
+            PREVIEW_EXECUTOR,
             lambda: proxy_segment(session_id, upstream, range_header),
         )
         response_headers = dict(extra_headers or {})
@@ -504,7 +508,7 @@ async def preview_delete_session(session_id: str):
     # Capture the URL before deleting so we can clear the active-preview marker.
     from services.preview_service import get_session, set_active_youtube_preview
     sess = get_session(session_id)
-    await loop.run_in_executor(None, delete_session, session_id)
+    await loop.run_in_executor(PREVIEW_EXECUTOR, delete_session, session_id)
     if sess is not None:
         set_active_youtube_preview(None)
     return {"ok": True}

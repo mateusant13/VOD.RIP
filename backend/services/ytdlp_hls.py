@@ -142,6 +142,31 @@ _PREVIEW_EXTRACT_MAX_WALL_SEC = 8.0
 _PREVIEW_EXTRACT_FALLBACK_SEC = (
     24.0  # total wall incl. full yt-dlp retries on cache miss
 )
+# Delay before a race's yt-dlp branch may enter the process-wide
+# guarded_youtube_dl lock. InnerTube wins the race in ~2s in the common case;
+# without this gate every extract spawns yt-dlp branches that can't be
+# cancelled (threads already inside the lock) and a bulk warm queues hundreds
+# of them, stalling the user's preview click for minutes behind the lock.
+_PREVIEW_YTDLP_GATE_SEC = 2.5
+
+# Definitive unplayable markers (yt-dlp DownloadError text) — retrying these
+# just burns the global yt-dlp lock. Fail fast instead of grinding 6+ retries.
+_YT_FATAL_MARKERS = (
+    "members-only content",
+    "join this channel",  # members-only variant: "Join this channel ... to get access"
+    "private video",
+    "this video has been removed",
+    "this video is not available",
+)
+# Negative cache for fatal extracts — a members-only row in a channel list gets
+# warmed, clicked, and re-clicked; don't re-run the whole chain every time.
+_EXTRACT_FATAL_CACHE: dict[str, tuple[float, str]] = {}
+_EXTRACT_FATAL_TTL_SEC = 300
+
+
+def _youtube_fatal_extract_error(exc: BaseException) -> bool:
+    msg = (str(exc) or "").lower()
+    return any(m in msg for m in _YT_FATAL_MARKERS)
 _PREVIEW_MUX_FAST_SEC = (
     10.0  # ponytail: unused teaser cap ÔÇö mux uses session trim window
 )
@@ -220,6 +245,11 @@ def _extract_cache_key(url: str, opts: dict) -> str:
     clients = (opts.get("extractor_args") or {}).get("youtube", {}).get("player_client")
     oauth = opts.get("password") or opts.get("username") or ""
     cookie = opts.get("cookiefile") or ""
+    if Path(cookie).name.startswith("yt_anon_"):
+        # Anonymous bootstrap jars are volatile — every re-bootstrap mints a new
+        # tempfile, which would bust both the extract cache and the fatal
+        # negative cache. The session bools below already capture anon state.
+        cookie = ""
     browser = opts.get("cookiesfrombrowser") or ""
     session = opts.get("_youtube_session")
     sess_key = ""
@@ -504,7 +534,13 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
             preview_fast=True,
         )
 
+    # Set once the race has a winner (or ends) — gated yt-dlp branches bail out
+    # before taking the global lock instead of running orphaned for minutes.
+    settled = threading.Event()
+
     def _ydl(ytdl_opts: dict) -> Optional[dict]:
+        if settled.wait(_PREVIEW_YTDLP_GATE_SEC):
+            return None
         return _extract_hls_info_quiet(url, ytdl_opts)
 
     tasks: list[tuple[object, str]] = [
@@ -515,6 +551,7 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
 
     winner: Optional[dict] = None
     source = ""
+    fatal: Optional[BaseException] = None
     pool = ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="yt-preview")
     pending: set = set()
     try:
@@ -527,6 +564,10 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                 try:
                     info = fut.result()
                 except Exception as exc:
+                    if _youtube_fatal_extract_error(exc):
+                        fatal = exc
+                        pending.clear()
+                        break
                     logger.debug("preview race %s %s: %s", vid, futures[fut], exc)
                     continue
                 if info and _youtube_info_playable(info):
@@ -534,10 +575,10 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                     source = futures[fut]
                     pending.clear()
                     break
-            if winner:
+            if winner or fatal:
                 break
         # ponytail: long VOD yt-dlp often lands just after race deadline — brief grace
-        if not winner and pending:
+        if not winner and not fatal and pending:
             grace_deadline = time.monotonic() + min(
                 6.0,
                 max(0.0, _PREVIEW_EXTRACT_MAX_WALL_SEC - _PREVIEW_EXTRACT_RACE_SEC)
@@ -549,6 +590,10 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                     try:
                         info = fut.result()
                     except Exception as exc:
+                        if _youtube_fatal_extract_error(exc):
+                            fatal = exc
+                            pending.clear()
+                            break
                         logger.debug(
                             "preview race grace %s %s: %s", vid, futures[fut], exc
                         )
@@ -558,14 +603,18 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                         source = futures[fut]
                         pending.clear()
                         break
-                if winner:
+                if winner or fatal:
                     break
     finally:
+        settled.set()
         with contextlib.suppress(Exception):
             pool.shutdown(wait=False, cancel_futures=True)
     if winner:
         log_extract_ok(vid, source, winner, yt_session)
-    return winner
+        return winner
+    if fatal is not None:
+        raise fatal
+    return None
 
 
 def _youtube_extract_parallel_fast(
@@ -590,11 +639,18 @@ def _youtube_extract_parallel_fast(
             allow_session_refresh=False,
         )
 
+    # See _youtube_extract_preview_race — gated so an InnerTube win cancels the
+    # yt-dlp branch before it takes the process-wide guarded_youtube_dl lock.
+    settled = threading.Event()
+
     def _ydl() -> Optional[dict]:
+        if settled.wait(_PREVIEW_YTDLP_GATE_SEC):
+            return None
         return _extract_hls_info_quiet(url, cookie_opts)
 
     winner: Optional[dict] = None
     source = ""
+    fatal: Optional[BaseException] = None
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-extract")
     try:
         futures = {
@@ -609,6 +665,10 @@ def _youtube_extract_parallel_fast(
                 try:
                     info = fut.result()
                 except Exception as exc:
+                    if _youtube_fatal_extract_error(exc):
+                        fatal = exc
+                        pending.clear()
+                        break
                     logger.debug(
                         "parallel extract %s failed %s: %s", vid, futures[fut], exc
                     )
@@ -617,14 +677,18 @@ def _youtube_extract_parallel_fast(
                     winner = info
                     source = futures[fut]
                     break
-            if winner:
+            if winner or fatal:
                 break
     finally:
+        settled.set()
         with contextlib.suppress(Exception):
             pool.shutdown(wait=False, cancel_futures=True)
     if winner:
         log_extract_ok(vid, source, winner, yt_session)
-    return winner
+        return winner
+    if fatal is not None:
+        raise fatal
+    return None
 
 
 def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
@@ -698,6 +762,8 @@ def _youtube_extract_with_retries(url: str, opts: dict, attempts: int = 3) -> di
             if info and _youtube_info_playable(info):
                 return info
         except Exception as exc:
+            if _youtube_fatal_extract_error(exc):
+                raise
             last_err = exc
         if i + 1 < max_attempts:
             if not has_auth and not refreshed:
@@ -859,6 +925,11 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             return hit[1]
         if hit and not _youtube_cache_ok(url, opts, hit[1]):
             _EXTRACT_INFO_CACHE.pop(key, None)
+        fatal_hit = _EXTRACT_FATAL_CACHE.get(key)
+        if fatal_hit and (now - fatal_hit[0]) < _EXTRACT_FATAL_TTL_SEC:
+            raise RuntimeError(fatal_hit[1])
+        if fatal_hit:
+            _EXTRACT_FATAL_CACHE.pop(key, None)
         inflight = _EXTRACT_INFLIGHT.get(key)
         if inflight is not None:
             leader = False
@@ -885,6 +956,10 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 return hit[1]
         err = box.get("error")
         if err is not None:
+            if box.get("warm_light") and not opts.get("_warm_light"):
+                # Leader was a light bulk warm (InnerTube only); the click's
+                # full chain may still succeed — become the new leader.
+                return cached_extract_info(url, opts)
             raise err
         result = box.get("result")
         if result is not None:
@@ -894,7 +969,17 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     event, box = inflight
     try:
         info = None
-        if _youtube_url_from_opts(url, opts):
+        if opts.get("_warm_light") and _youtube_url_from_opts(url, opts):
+            # Bulk warm: InnerTube only — never the process-wide yt-dlp lock,
+            # no retries. A failing video defers to the click's full chain.
+            box["warm_light"] = True
+            info = _try_innertube_info(
+                url,
+                session=opts.get("_youtube_session"),
+                allow_session_refresh=False,
+                preview_fast=True,
+            )
+        elif _youtube_url_from_opts(url, opts):
             if opts.get("_preview_fast"):
                 info = _youtube_extract_preview_with_retries(url, opts)
             else:
@@ -941,6 +1026,9 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 detail=str(exc)[:200],
             )
         box["error"] = exc
+        if isinstance(exc, Exception) and _youtube_fatal_extract_error(exc):
+            with _EXTRACT_CACHE_LOCK:
+                _EXTRACT_FATAL_CACHE[key] = (time.time(), str(exc)[:300])
         raise
     finally:
         with _EXTRACT_CACHE_LOCK:
@@ -997,10 +1085,16 @@ def warm_youtube_extract(
 
 
 def _extract_hls_info_quiet(url: str, opts: dict) -> Optional[dict]:
-    """yt-dlp extract without raising; stderr suppressed unless DEBUG."""
+    """yt-dlp extract without raising; stderr suppressed unless DEBUG.
+
+    Fatal "definitively unplayable" errors (members-only, private, removed)
+    still raise — swallowing them turned a 1s answer into a 60s retry grind.
+    """
     try:
         return _extract_hls_info(url, opts)
     except Exception as exc:
+        if _youtube_fatal_extract_error(exc):
+            raise
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("yt-dlp fallback failed for %s: %s", url, exc)
         return None

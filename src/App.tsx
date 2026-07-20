@@ -2275,7 +2275,7 @@ export default function App() {
     const vodUrl = buildVodUrl(v);
     if (v.platform === 'youtube') {
       warmYoutubePreview(vodUrl);
-      warmYoutubePreviewFull(vodUrl, 500, 720);
+      warmYoutubePreviewFull(vodUrl, 500);
     }
     const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips' || isLikelyClip(v);
     const vod: ExplorePopupVod = {
@@ -3599,7 +3599,10 @@ export default function App() {
       fetch('/api/preview/warm/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls: batch, prefer_height: 720 }),
+        // ponytail: 360 = PREVIEW_FAST_START_HEIGHT — must match the height
+        // create_session reads on click ({vid}:360:v2), or the whole batch
+        // warm lands in a cache key nobody reads and every click re-extracts.
+        body: JSON.stringify({ urls: batch, prefer_height: 360 }),
       }).catch((e) => console.warn('[warm] fetch failed:', e));
       // Yield to event loop so we don't starve render
       setTimeout(sendBatch, 0);
@@ -4172,7 +4175,7 @@ export default function App() {
                   urlWarmTimerRef.current = null;
                   warmYoutubePreview(trimmed);
                   // ponytail: also queue a full-VOD mux so first preview open is instant.
-                  warmYoutubePreviewFull(trimmed, 1500, 720);
+                  warmYoutubePreviewFull(trimmed, 1500);
                 }, 300);
               }
             }}
@@ -5341,7 +5344,7 @@ export default function App() {
                                     // when the user is genuinely browsing rather than
                                     // sweeping the list. Cache hit makes the next
                                     // click ~instant from local MP4.
-                                    warmYoutubePreviewFull(fullUrl, 1000, 720);
+                                    warmYoutubePreviewFull(fullUrl, 1000);
                                   }
                                 }}
                                 onMouseLeave={() => {
@@ -5411,7 +5414,7 @@ export default function App() {
                                   onMouseEnter={() => {
                                     if (v.platform === 'youtube') {
                                       warmYoutubePreview(fullUrl);
-                                      warmYoutubePreviewFull(fullUrl, 1000, 720);
+                                      warmYoutubePreviewFull(fullUrl, 1000);
                                     }
                                   }}
                                   onClick={(e) => {

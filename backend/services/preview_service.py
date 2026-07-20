@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -68,8 +69,10 @@ WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
 # ponytail: fMP4 / LL-HLS opt-in — gate the EXT-X-MAP + EXT-X-PART metadata behind a
 # flag so legacy .ts playlists keep working if an operator sets VODRIP_PREVIEW_FMP4=0.
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
-# Signed googlevideo URLs expire in minutes — long cache recycles stale 403s.
-_RESOLVED_STREAM_TTL_SEC = 300
+# Signed googlevideo URLs expire in hours, not minutes; a 300s TTL let the warm
+# storm's work evaporate before a user browsed the channel list and clicked.
+# Stale 403s are already handled: the proxy re-resolves on auth errors.
+_RESOLVED_STREAM_TTL_SEC = 900
 _RESOLVED_STREAM_MAX = 256
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
@@ -102,6 +105,260 @@ _PREVIEW_ROOT = (
 # ponytail: full-VOD mux cache persisted by video_id+quality
 _FULL_MUX_CACHE_DIR = _PREVIEW_ROOT / "full_mux_cache"
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
+
+# Progressive head cache — first bytes of a muxed MP4 tier (ftyp + moov +
+# opening media). Multi-hour VOD moovs run 8+ MB; serving them from disk cuts
+# ~1-2s off the browser's canplay wait after a warm.
+_PROG_HEAD_DIR = _PREVIEW_ROOT / "prog_head"
+_PROG_HEAD_BYTES = 12 * 1024 * 1024
+_PROG_HEAD_MAX_BYTES = 256 * 1024 * 1024
+_PROG_HEAD_TTL_SEC = 86400
+
+
+def _prog_head_paths(video_id: str, height: int) -> Tuple[Path, Path]:
+    base = _PROG_HEAD_DIR / f"{video_id}_{height}"
+    return base.with_suffix(".bin"), base.with_suffix(".json")
+
+
+def _prog_head_lookup(video_id: str, height: int) -> Optional[Tuple[Path, int]]:
+    bin_path, meta_path = _prog_head_paths(video_id, height)
+    try:
+        if not bin_path.is_file() or not meta_path.is_file():
+            return None
+        if time.time() - bin_path.stat().st_mtime > _PROG_HEAD_TTL_SEC:
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        total = int(meta.get("total") or 0)
+        if total <= 0 or bin_path.stat().st_size < 1024 * 1024:
+            return None
+        return bin_path, total
+    except Exception:
+        return None
+
+
+def _prog_head_enforce_budget() -> None:
+    try:
+        files = [
+            p
+            for p in _PROG_HEAD_DIR.glob("*.bin")
+            if p.is_file()
+        ]
+        total = sum(p.stat().st_size for p in files)
+        if total <= _PROG_HEAD_MAX_BYTES:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)
+        for p in files:
+            if total <= _PROG_HEAD_MAX_BYTES:
+                break
+            size = p.stat().st_size
+            p.unlink(missing_ok=True)
+            p.with_suffix(".json").unlink(missing_ok=True)
+            total -= size
+    except Exception:
+        pass
+
+
+def kickoff_youtube_prog_head_warm(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 360,
+) -> None:
+    """Background: download the head (ftyp+moov+opening media) of the muxed
+    progressive tier so the browser's canplay path reads from disk."""
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id((url or "").strip())
+    if not vid:
+        return
+    if _prog_head_lookup(vid, prefer_height):
+        return
+    key = f"proghead:{vid}:{prefer_height}"
+    with _YOUTUBE_WARM_LOCK:
+        if key in _YOUTUBE_WARM_INFLIGHT:
+            return
+        done = threading.Event()
+        _YOUTUBE_WARM_INFLIGHT[key] = done
+
+    def _run() -> None:
+        try:
+            _youtube_prog_head_warm(url, vid, oauth=oauth, prefer_height=prefer_height)
+        finally:
+            with _YOUTUBE_WARM_LOCK:
+                ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+    from deps import GESTURE_WARM_EXECUTOR
+
+    GESTURE_WARM_EXECUTOR.submit(_run)
+
+
+def _youtube_prog_head_warm(
+    url: str, vid: str, oauth: Optional[str], prefer_height: int
+) -> bool:
+    try:
+        _raw, headers, _platform, variant_formats, kind, yt_info = resolve_stream_info(
+            url, oauth=oauth, prefer_height=prefer_height
+        )
+    except Exception as exc:
+        logger.debug("prog head warm resolve failed %s: %s", vid, exc)
+        return False
+    from services.youtube_innertube import _dedupe_youtube_formats
+
+    merged = _dedupe_youtube_formats((yt_info or {}).get("formats") or [])
+    muxed = _deduped_progressive_variants({"formats": merged})
+    if not muxed:
+        logger.info(
+            "prog head warm: %s no muxed tier (info=%s merged=%d)",
+            vid, "yes" if yt_info else "no", len(merged),
+        )
+        return False
+    prog_url = _pick_variant_by_height(
+        [(int(f.get("height") or 0), f.get("url") or "") for f in muxed],
+        prefer_height,
+    )
+    if not prog_url:
+        logger.info("prog head warm: %s no prog url at h=%d", vid, prefer_height)
+        return False
+    mux_hdrs = _merge_youtube_session_cookies(headers or {}, url)
+    bin_path, meta_path = _prog_head_paths(vid, prefer_height)
+    tmp = bin_path.with_suffix(".part")
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        _PROG_HEAD_DIR.mkdir(parents=True, exist_ok=True)
+        resp = cffi_requests.get(
+            prog_url,
+            headers={**mux_hdrs, "Range": f"bytes=0-{_PROG_HEAD_BYTES - 1}"},
+            impersonate="chrome",
+            stream=True,
+            timeout=(10, 30),
+        )
+        try:
+            if resp.status_code not in (200, 206):
+                logger.info("prog head warm: %s upstream HTTP %s", vid, resp.status_code)
+                return False
+            total = _total_from_content_range(resp.headers.get("Content-Range", "")) or 0
+            written = 0
+            with open(tmp, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=262144):
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if written >= _PROG_HEAD_BYTES:
+                        break
+        finally:
+            try:
+                resp.close()
+            except OSError:
+                pass
+        if written < 1024 * 1024 or not total:
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, bin_path)
+        meta_path.write_text(json.dumps({"total": total, "ts": time.time()}), encoding="utf-8")
+        _prog_head_enforce_budget()
+        logger.info("prog head warm: %s h=%d bytes=%d", vid, prefer_height, written)
+        return True
+    except Exception as exc:
+        logger.info("prog head warm failed %s: %s", vid, exc)
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def _prog_head_range(
+    range_header: Optional[str], head_len: int, total: int
+) -> Optional[Tuple[int, int]]:
+    """Resolve (start, end) for a head-spliced response, or None when the
+    request lies entirely beyond the cached head (plain upstream path)."""
+    start = 0
+    end = total - 1
+    if range_header:
+        m = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
+        if not m:
+            return None
+        start = int(m.group(1))
+        if m.group(2):
+            end = min(end, int(m.group(2)))
+    if start >= head_len or end < start:
+        return None
+    return start, end
+
+
+# ponytail self-check: head-splice range boundaries
+assert _prog_head_range(None, 100, 1000) == (0, 999)
+assert _prog_head_range("bytes=0-", 100, 1000) == (0, 999)
+assert _prog_head_range("bytes=50-149", 100, 1000) == (50, 149)
+assert _prog_head_range("bytes=50-5000", 100, 1000) == (50, 999)  # clamp to EOF
+assert _prog_head_range("bytes=100-", 100, 1000) is None  # beyond head → upstream
+assert _prog_head_range("bytes=500-100", 100, 1000) is None  # empty range
+assert _prog_head_range("nonsense", 100, 1000) is None
+
+
+def _try_prog_head_proxy(
+    session: PreviewSession,
+    range_header: Optional[str],
+) -> Optional[Tuple[Callable[[], object], str, dict, int, Callable[[], None]]]:
+    """Serve the request's cached-head portion from disk, splicing the upstream
+    for anything beyond. Returns None when no usable head cache exists."""
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id(session.vod_url or "")
+    if not vid:
+        return None
+    height = session_active_height(session) or int(session.prefer_height or 360)
+    found = _prog_head_lookup(vid, height)
+    if not found:
+        return None
+    bin_path, total = found
+    head_len = bin_path.stat().st_size
+    bounds = _prog_head_range(range_header, head_len, total)
+    if bounds is None:
+        return None  # beyond the cached head — plain upstream path
+    start, end = bounds
+
+    def _generate():
+        head_end = min(end, head_len - 1)
+        remaining = head_end - start + 1
+        with open(bin_path, "rb") as fh:
+            fh.seek(start)
+            while remaining > 0:
+                chunk = fh.read(min(262144, remaining))
+                if not chunk:
+                    break
+                yield chunk
+                remaining -= len(chunk)
+        if end >= head_len:
+            resp = _open_upstream_stream(
+                session,
+                session.entry_url,
+                f"bytes={head_len}-{'' if end == total - 1 else end}",
+            )
+            try:
+                for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                    if chunk:
+                        yield chunk
+            finally:
+                try:
+                    resp.close()
+                except OSError:
+                    pass
+
+    status = 206 if (range_header or start or end < total - 1) else 200
+    hdrs = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Content-Range": f"bytes {start}-{end}/{total}",
+        "Content-Length": str(end - start + 1),
+    }
+    if not range_header and start == 0 and end == total - 1:
+        status = 200
+        hdrs.pop("Content-Range", None)
+    return _generate, "video/mp4", hdrs, status, lambda: None
+
+
+assert _prog_head_lookup("__none__", 360) is None
 
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -202,16 +459,13 @@ class PreviewManager:
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
         if detect_platform(url) == "YouTube":
-            # Wait for a genuinely in-flight hover/paste warm so create_session
-            # reuses the resolved-stream cache (avoids a second ~7s extract).
-            # Capped at the YouTube extract SLA so a stale/bailed warm can't
-            # make the preview feel stuck.
-            try:
-                from services.ytdlp_hls import _PREVIEW_EXTRACT_MAX_WALL_SEC
-                _warm_budget = float(_PREVIEW_EXTRACT_MAX_WALL_SEC)
-            except Exception:
-                _warm_budget = 8.0
-            await_youtube_warm_if_pending(url, timeout_sec=_warm_budget)
+            # Wait briefly for a genuinely in-flight hover/paste warm so
+            # create_session reuses the resolved-stream cache (avoids a second
+            # ~3s extract). ponytail: capped low — during a startup/channel warm
+            # storm the warm for this URL may be *queued* (not running); waiting
+            # 8s for it burns the whole preview SLA. A running warm is still
+            # joined via the extract dedup inside cached_extract_info.
+            await_youtube_warm_if_pending(url, timeout_sec=1.5)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 url,
@@ -1618,6 +1872,12 @@ def open_progressive_proxy(
         raise ValueError("Preview session not found or expired")
     if session.kind != "progressive":
         raise ValueError("Preview session is not progressive")
+    # Warmed head cache: serve ftyp+moov+opening media from disk (moov on
+    # multi-hour VODs is 8+ MB — the dominant canplay cost after a warm).
+    if session.platform == "YouTube":
+        spliced = _try_prog_head_proxy(session, range_header)
+        if spliced is not None:
+            return spliced
     # ponytail: cached full-VOD mux shortcut. The session was originally HLS
     # (window-HLS) but a full mux finished in the background; flipping kind
     # to progressive + setting cached_progressive_path is the bridge. Serve
@@ -1971,16 +2231,22 @@ def _recover_youtube_progressive_session(session: PreviewSession) -> bool:
     )
 
 
-def _extract_youtube_preview_info(full_url: str, oauth: Optional[str]) -> dict:
-    """Cached YouTube resolve — InnerTube multi-client, then yt-dlp fallback."""
+def _extract_youtube_preview_info(
+    full_url: str, oauth: Optional[str], *, warm_light: bool = False
+) -> dict:
+    """Cached YouTube resolve — InnerTube multi-client, then yt-dlp fallback.
+
+    ``warm_light=True`` (bulk warm) runs the InnerTube fast pass only — the
+    yt-dlp lock and retry chain are reserved for real user clicks.
+    """
     from deps import settings_mgr
     from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
 
     cookies = settings_mgr.get().youtube_cookies_file or None
-    return cached_extract_info(
-        full_url,
-        youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies),
-    )
+    opts = youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies)
+    if warm_light:
+        opts["_warm_light"] = True
+    return cached_extract_info(full_url, opts)
 
 
 def _deduped_hls_variants(info: dict) -> List[dict]:
@@ -2710,9 +2976,9 @@ def kickoff_youtube_preflight_mux(
                 _PREFLIGHT_MUX_INFLIGHT.pop(key, None)
             done.set()
 
-    from deps import INFO_EXECUTOR
+    from deps import GESTURE_WARM_EXECUTOR
 
-    INFO_EXECUTOR.submit(_run)
+    GESTURE_WARM_EXECUTOR.submit(_run)
 
 
 def kickoff_youtube_batch_warm(
@@ -2736,13 +3002,15 @@ def kickoff_youtube_batch_warm(
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
-    with _YOUTUBE_WARM_LOCK:
-        if key in _YOUTUBE_WARM_INFLIGHT:
-            return
-        done = threading.Event()
-        _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        # See kickoff_youtube_warm — in-flight registration happens at run start
+        # so create_session never waits on a queued (not running) warm.
+        with _YOUTUBE_WARM_LOCK:
+            if key in _YOUTUBE_WARM_INFLIGHT:
+                return
+            done = threading.Event()
+            _YOUTUBE_WARM_INFLIGHT[key] = done
         try:
             from services.preview_service import warm_youtube_resolve_only
 
@@ -2755,9 +3023,9 @@ def kickoff_youtube_batch_warm(
             if ev is not None:
                 ev.set()
 
-    from deps import INFO_EXECUTOR
+    from deps import WARM_EXECUTOR
 
-    INFO_EXECUTOR.submit(_run)
+    WARM_EXECUTOR.submit(_run)
 
 
 def _youtube_preflight_mux(
@@ -3397,13 +3665,15 @@ def kickoff_youtube_warm(
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
-    with _YOUTUBE_WARM_LOCK:
-        if key in _YOUTUBE_WARM_INFLIGHT:
-            return
-        done = threading.Event()
-        _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        # ponytail: register in-flight only once the job actually starts — a
+        # queued-but-not-running warm must not make create_session wait for it.
+        with _YOUTUBE_WARM_LOCK:
+            if key in _YOUTUBE_WARM_INFLIGHT:
+                return
+            done = threading.Event()
+            _YOUTUBE_WARM_INFLIGHT[key] = done
         try:
             if not force:
                 # Bail out cheaply if the user has moved on to a different VOD.
@@ -3413,6 +3683,7 @@ def kickoff_youtube_warm(
                 if active is not None and active != key:
                     logger.debug("YouTube warm bailing — active preview is %s", active[:80])
                     return
+            logger.info("YouTube gesture warm start: %s", key[:24])
             from services.ytdlp_hls import warm_youtube_extract
 
             warm_youtube_extract(
@@ -3425,9 +3696,9 @@ def kickoff_youtube_warm(
             if ev is not None:
                 ev.set()
 
-    from deps import INFO_EXECUTOR
+    from deps import GESTURE_WARM_EXECUTOR
 
-    INFO_EXECUTOR.submit(_run)
+    GESTURE_WARM_EXECUTOR.submit(_run)
 
 
 def kickoff_youtube_full_mux_warm(
@@ -3457,10 +3728,15 @@ def kickoff_youtube_full_mux_warm(
         return
 
     def _run() -> None:
+        logger.info("YouTube full-mux warm start: %s h=%d", vid, prefer_height)
         with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
             active = _ACTIVE_YOUTUBE_PREVIEW_KEY
-        if active is not None and active != key:
-            logger.debug("full-mux warm bailing — active preview is %s", active[:80])
+        # ponytail: full-mux is a background task — let it run even when the user
+        # has another preview open. It must not race the click's session create for
+        # the same URL (they'd both download the same upstream) so we still bail
+        # when the active marker equals this key. Different URLs don't compete.
+        if active is not None and active == key:
+            logger.info("full-mux warm bailing — user already previewing %s", key[:24])
             return
         try:
             from services.ytdlp_hls import warm_youtube_extract
@@ -3472,22 +3748,25 @@ def kickoff_youtube_full_mux_warm(
                     resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
                 )
             except Exception as exc:
-                logger.debug("full-mux warm resolve failed for %s: %s", url[:80], exc)
+                logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
                 return
             audio_url = _resolve_youtube_preview_audio(yt_info) if yt_info else None
-            variant_url = None
-            for f in variant_formats or []:
-                if int(f.get("height") or 0) == prefer_height and f.get("url"):
-                    variant_url = f["url"]
-                    break
-            if not variant_url:
-                return
             vod_dur = 0.0
             if yt_info:
                 try:
                     vod_dur = float(yt_info.get("duration") or 0)
                 except (TypeError, ValueError):
                     vod_dur = 0.0
+            logger.info("full-mux warm resolved %s h=%d dur=%.1fs audio=%s", vid, prefer_height, vod_dur, bool(audio_url))
+            variant_url = None
+            for f in variant_formats or []:
+                if int(f.get("height") or 0) == prefer_height and f.get("url"):
+                    variant_url = f["url"]
+                    break
+            if not variant_url:
+                logger.info("full-mux warm no variant for h=%d (have %s)", prefer_height, [int(f.get("height") or 0) for f in (variant_formats or [])])
+                return
+            logger.info("full-mux warm starting MuxJob %s -> %s", variant_url[:80], cache_path)
             MuxJob(
                 video_url=variant_url,
                 audio_url=audio_url,
@@ -3501,7 +3780,7 @@ def kickoff_youtube_full_mux_warm(
                 vod_duration=vod_dur,
             ).run()
         except Exception as exc:
-            logger.debug("full-mux warm failed for %s: %s", url[:80], exc)
+            logger.warning("full-mux warm failed for %s: %s", url[:80], exc, exc_info=True)
 
     threading.Thread(target=_run, daemon=True, name=f"yt-hover-mux-{vid}").start()
 
@@ -3534,13 +3813,18 @@ def warm_youtube_preview_resolve(
     oauth: Optional[str] = None,
     prefer_height: int = 720,
 ) -> bool:
-    """Populate resolved-stream cache on hover — same path as create_session."""
+    """Populate resolved-stream cache on hover — same path as create_session.
+
+    Uses the full extract race (InnerTube + yt-dlp fallback): gesture warms are
+    few (hover/scroll-visible rows) and must survive InnerTube bot-gating that
+    kills the light-only pass. The bulk startup storm uses warm_youtube_resolve_only."""
     try:
         resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
         kickoff_youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
+        kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
         return True
     except Exception as exc:
-        logger.debug("YouTube warm resolve skipped for %s: %s", url[:80], exc)
+        logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         return False
 
 
@@ -3557,7 +3841,7 @@ def warm_youtube_resolve_only(
     mux is still triggered on the user's first preview click.
     """
     try:
-        resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+        resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height, warm_light=True)
         return True
     except Exception as exc:
         logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
@@ -3570,6 +3854,7 @@ def resolve_stream_info(
     prefer_height: int = 720,
     *,
     force_fresh: bool = False,
+    warm_light: bool = False,
 ) -> Tuple[str, dict, str, List[dict], str, Optional[dict]]:
     """Return (master_url, headers, platform, variant_formats, kind, yt_info).
 
@@ -3674,7 +3959,7 @@ def resolve_stream_info(
         info = (
             _reextract_youtube_for_preview(full_url, oauth)
             if force_fresh
-            else _extract_youtube_preview_info(full_url, oauth)
+            else _extract_youtube_preview_info(full_url, oauth, warm_light=warm_light)
         )
         _resolve_youtube_preview_audio(info)
         if _youtube_info_is_dash_only_progressive(info):

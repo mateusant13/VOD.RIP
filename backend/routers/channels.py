@@ -498,30 +498,22 @@ async def channel_clips(
         raise HTTPException(status_code=400, detail=str(e))
 
 async def _warm_youtube_previews(videos: list[dict]) -> None:
-    """Fire-and-forget: warm YouTube preview caches for all YouTube videos in the list."""
-    urls = [v["url"] for v in videos if v.get("platform") == "YouTube" and v.get("url")]
-    if not urls:
-        return
+    """Fire-and-forget: warm YouTube preview caches for all YouTube videos in the list.
+
+    kickoff_youtube_warm is a non-blocking submit onto the dedicated WARM_EXECUTOR
+    (deduped per canonical URL there), so no executor hop or semaphore is needed.
+    """
+    from services.preview_service import kickoff_youtube_batch_warm
 
     seen: set[str] = set()
-    unique = [u for u in urls if not (u in seen or seen.add(u))]
-    if not unique:
-        return
-
-    from services.preview_service import kickoff_youtube_warm
-
-    sem = asyncio.Semaphore(4)
-
-    async def _warm_one(url: str) -> None:
-        async with sem:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    CHANNEL_EXECUTOR,
-                    lambda u=url: kickoff_youtube_warm(u, prefer_height=360),
-                )
-            except Exception as exc:
-                logger.debug("YouTube preview warm failed for %s: %s", url[:50], exc)
-
-    tasks = [asyncio.create_task(_warm_one(u)) for u in unique]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    for v in videos:
+        url = v.get("url") or ""
+        if v.get("platform") != "YouTube" or not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            # Resolve-only bulk warm — the frontend's scroll/hover warm adds the
+            # heavier preflight/head downloads for rows the user can actually see.
+            kickoff_youtube_batch_warm(url, prefer_height=360)
+        except Exception as exc:
+            logger.debug("YouTube preview warm failed for %s: %s", url[:50], exc)

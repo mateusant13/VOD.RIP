@@ -32,6 +32,16 @@ CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channe
 # Preview operations (session create/seek/quality/stream) run on their own
 # pool so the user's click is never queued behind batch warm tasks.
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
+# Background YouTube warm jobs (startup wave, channel-list, hover/batch).
+# Small dedicated pool: bulk warms must never saturate INFO_EXECUTOR (208+
+# queued startup jobs starved user clicks) and never compete with the
+# user-facing preview path.
+WARM_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="warm")
+# User-intent YouTube warms (hover/scroll/paste) + their spawned head/preflight
+# downloads. Separate pool so a 50+ job startup storm can never make a
+# gesture warm wait minutes (observed: 12 min queue behind the storm, then the
+# extract hit YouTube's bot-gate — the worst of both worlds).
+GESTURE_WARM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="warm-gesture")
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")

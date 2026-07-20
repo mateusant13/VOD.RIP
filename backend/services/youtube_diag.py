@@ -73,6 +73,13 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
             if preview
             else "Could not load this YouTube video — try again in a moment."
         )
+    # Definitive unplayable states — retrying will never help; say so.
+    if "members-only content" in low or "join this channel" in low:
+        return "Members-only video — requires channel membership."
+    if "private video" in low:
+        return "This video is private."
+    if "video has been removed" in low or "video is not available" in low:
+        return "This video is unavailable."
     if preview:
         return "Preview failed — try again."
     return "Could not load video info — try again."

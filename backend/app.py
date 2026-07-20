@@ -151,7 +151,9 @@ async def _app_lifespan(_app: FastAPI):
         for u in first_urls:
             try:
                 t0 = _tm.time()
-                resolve_stream_info(u, prefer_height=720)
+                # warm_light: InnerTube fast pass only — a members-only/deleted
+                # video must not hold startup readiness hostage behind yt-dlp.
+                resolve_stream_info(u, prefer_height=360, warm_light=True)
                 with _WARMED_URLS_LOCK:
                     _WARMED_URLS.add(u)
                 logger.info(
@@ -189,7 +191,7 @@ async def _app_lifespan(_app: FastAPI):
         Wave 0 (newest from each channel) fires immediately via full warm
         (resolve + preflight mux) so the first click is instant.
         Subsequent waves are resolve-only (lighter, faster) and run in
-        background. The INFO_EXECUTOR (24 workers) handles the fan-out.
+        background on the small dedicated WARM_EXECUTOR.
         """
         from services.preview_service import (
             _WARMED_URLS,
@@ -197,7 +199,6 @@ async def _app_lifespan(_app: FastAPI):
             kickoff_youtube_warm,
             kickoff_youtube_batch_warm,
         )
-        from deps import INFO_EXECUTOR
 
         # Collect per-channel YouTube video lists, sorted newest-first by date.
         sorted_channels: list[list[dict]] = []
@@ -257,11 +258,10 @@ async def _app_lifespan(_app: FastAPI):
 
             for u in fresh:
                 try:
-                    INFO_EXECUTOR.submit(
-                        kickoff_youtube_batch_warm,
-                        u,
-                        prefer_height=720,
-                    )
+                    # Non-blocking: kickoff self-submits to WARM_EXECUTOR (bulk
+                    # warms never touch INFO/PREVIEW pools). 360 matches the
+                    # frontend fast-start click so the resolve cache hits.
+                    kickoff_youtube_batch_warm(u, prefer_height=360)
                     submitted += 1
                 except Exception as exc:
                     logger.warning("STARTUP_WAVE: submit failed for %s: %s", u[:60], exc)
