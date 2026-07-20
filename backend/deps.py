@@ -27,8 +27,8 @@ set_download_manager(download_mgr)
 # ── Thread-pool executors ───────────────────────────────────────────────
 # Metadata fetches use their own pool so hung yt-dlp downloads
 # cannot starve /api/info/* and /api/channel/videos.
-INFO_EXECUTOR = ThreadPoolExecutor(max_workers=24, thread_name_prefix="info")
-CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channel")
+INFO_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="info")
+CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="channel")
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")

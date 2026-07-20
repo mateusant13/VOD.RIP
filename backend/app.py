@@ -90,7 +90,7 @@ async def _app_lifespan(_app: FastAPI):
                     )
                     _startup_wave_warm(saved)
             except Exception:
-                logger.debug("Startup preview warm skipped", exc_info=True)
+                logger.exception("Startup preview warm crashed")
         except Exception:
             logger.debug("YouTube warm-up skipped", exc_info=True)
 
@@ -118,14 +118,14 @@ async def _app_lifespan(_app: FastAPI):
     def _startup_wave_warm(saved_channels) -> None:
         """Wave-based warm sorted by recency, 2-per-channel per wave.
 
-        Wave 0 (newest from each channel) fires immediately via full warm
-        (resolve + preflight mux) so the first click is instant.
-        Subsequent waves are resolve-only (lighter, faster) and run in
-        background. The INFO_EXECUTOR (24 workers) handles the fan-out.
+        Fires all waves into INFO_EXECUTOR at once so the 12 workers
+        fan-out in parallel. The newest 2 per channel get submitted first
+        (wave 0) so they land in cache earliest — user's first click hits
+        fastest.
         """
         from services.preview_service import (
             _WARMED_URLS,
-            kickoff_youtube_warm,
+            _WARMED_URLS_LOCK,
             kickoff_youtube_batch_warm,
         )
         from deps import INFO_EXECUTOR
@@ -158,6 +158,7 @@ async def _app_lifespan(_app: FastAPI):
         BATCH = 2
         MAX_WAVES = 100
         submitted = 0
+        wave_count = 0
 
         for wave_idx in range(MAX_WAVES):
             wave_urls: list[str] = []
@@ -175,44 +176,30 @@ async def _app_lifespan(_app: FastAPI):
             if not fresh:
                 continue
 
-            # All waves resolve-only. Preflight mux adds 5s+ per URL which
-            # would push wave 0 past the user's 2s target. The resolve cache
-            # is what makes create_session fast (skips the 2-3s extract).
-            # First-frame playback fetches segments on demand (cached for next
-            # time) — user can already seek to 9/10 fast after the first click.
-            use_full_warm = False
+            wave_count += 1
 
-            logger.info(
-                "STARTUP_WAVE: wave %d firing %d URLs (full=%s)",
-                wave_idx + 1,
-                len(fresh),
-                use_full_warm,
-            )
+            if wave_count <= 3 or wave_count % 15 == 0:
+                logger.info(
+                    "STARTUP_WAVE: wave %d firing %d URLs",
+                    wave_count,
+                    len(fresh),
+                )
 
-            # Submit directly to INFO_EXECUTOR — bypasses CHANNEL_EXECUTOR's
-            # double-hop (CHANNEL→INFO) so waves land in the worker pool faster.
             for u in fresh:
                 try:
-                    if use_full_warm:
-                        INFO_EXECUTOR.submit(
-                            kickoff_youtube_warm,
-                            u,
-                            prefer_height=720,
-                            force=True,
-                        )
-                    else:
-                        INFO_EXECUTOR.submit(
-                            kickoff_youtube_batch_warm,
-                            u,
-                            prefer_height=720,
-                        )
+                    INFO_EXECUTOR.submit(
+                        kickoff_youtube_batch_warm,
+                        u,
+                        prefer_height=720,
+                    )
                     submitted += 1
                 except Exception as exc:
                     logger.warning("STARTUP_WAVE: submit failed for %s: %s", u[:60], exc)
 
         logger.info(
-            "STARTUP_WAVE: done — %d URLs queued",
+            "STARTUP_WAVE: done — %d URLs queued in %d waves",
             submitted,
+            wave_count,
         )
 
     def _startup_batch_warm(urls: list) -> None:
