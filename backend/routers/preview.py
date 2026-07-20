@@ -198,7 +198,11 @@ async def preview_timing_event(req: PreviewTimingRequest):
 
 @router.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
-    if req.crop_end <= req.crop_start:
+    # ponytail: crop_end=0 means "unknown" — let create_session fall back to
+    # the extract's vod_duration so the click isn't blocked on /api/info/video
+    # (which costs 30-60s on a cold YouTube URL). crop_end > 0 must still be
+    # strictly greater than crop_start to avoid degenerate sessions.
+    if req.crop_end <= req.crop_start and req.crop_end != 0:
         raise HTTPException(status_code=400, detail="End must be after start")
     from deps import settings_mgr
     opts = settings_mgr.get()

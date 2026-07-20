@@ -873,9 +873,21 @@ def _clamp_session_crop_to_vod_duration(
     session: PreviewSession,
     info: Optional[dict],
 ) -> None:
-    """Never let placeholder crop_end (3600/7200) exceed real VOD length."""
+    """Never let placeholder crop_end (3600/7200) exceed real VOD length.
+    ponytail: crop_end=0 means "unknown" (frontend couldn't fetch /api/info/video
+    in time) — fall back to the extract's duration or a large placeholder so the
+    session is usable.
+    """
     client_end = float(session.crop_end or 0)
     dur = _vod_duration_from_info(info)
+    if client_end <= 0:
+        # ponytail: client sent 0 (placeholder) — use extract dur or a generous
+        # fallback. The next mux/playlist pass clamps to real bytes anyway.
+        session.crop_end = dur if dur > 0 else 7200.0
+        client_end = session.crop_end
+        if dur > 0:
+            session.vod_duration = dur
+        return
     if dur <= 0:
         if 0 < client_end < 3600:
             session.vod_duration = client_end

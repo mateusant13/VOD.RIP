@@ -61,9 +61,8 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
-import type { PreviewSessionResponse, VideoInfo } from './types';
+import type { PreviewSessionResponse } from './types';
 import { resolveVideoThumbnail } from './channelUtils';
-import { videoInfoDurationSec, syncDurationFromPreviewSession } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
@@ -307,19 +306,16 @@ export default function ChannelExplorePopup({
             `/api/info/clip?id=${encodeURIComponent(vod.url)}`,
           ).catch(() => null)
           : Promise.resolve(null);
-        let cropEnd = vod.durationSec;
-        if (cropEnd <= 0) {
-          const infoPath = vod.isClip ? '/api/info/clip' : '/api/info/video';
-          const info = await apiGet<VideoInfo>(
-            `${infoPath}?id=${encodeURIComponent(vod.url)}`,
-          );
-          cropEnd = videoInfoDurationSec(info);
-          if (cropEnd <= 0) throw new Error('Could not determine video length');
-        }
+        // ponytail: start the session create immediately with crop_end=0
+        // (backend falls back to extract duration) — don't block the click on
+        // /api/info/video which can take 30-60s on a cold YouTube URL. Fire
+        // the info fetch in parallel; if it returns a real duration, send a
+        // seek to clamp the trim window.
+        const knownDuration = vod.durationSec;
         const sessionPromise = apiPost<PreviewSessionResponse>('/api/preview/session', {
           url: vod.url,
           crop_start: 0,
-          crop_end: cropEnd,
+          crop_end: knownDuration > 0 ? knownDuration : 0,
           prefer_height: preferHeight,
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
@@ -327,11 +323,9 @@ export default function ChannelExplorePopup({
           try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
           return;
         }
-        const synced = syncDurationFromPreviewSession(res.duration_sec, 0, cropEnd);
-        if (synced && synced.duration > 0) {
-          cropEnd = synced.end;
-          setSessionDurationSec(synced.duration);
-        } else if (res.duration_sec && res.duration_sec > 0) {
+        // ponytail: res.duration_sec comes from the extract — prefer it over
+        // the channel-list hint (which is 0 for YouTube RSS rows).
+        if (res.duration_sec && res.duration_sec > 0) {
           setSessionDurationSec(Math.floor(res.duration_sec));
         }
         trimTimelineRef.current = res.trim_timeline === true;
