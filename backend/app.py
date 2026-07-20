@@ -100,10 +100,19 @@ async def _app_lifespan(_app: FastAPI):
     # scope so both the daemon thread and the blocking lifespan warm can
     # call it.
     def _warm_first_wave_sync(saved_channels) -> None:
-        """Synchronous warm of the first 2 URLs per channel."""
-        from services.preview_service import (_WARMED_URLS, _WARMED_URLS_LOCK)
-        from services.preview_service import resolve_stream_info
-        from concurrent.futures import ThreadPoolExecutor, wait
+        """Synchronous warm of the first 2 URLs per channel.
+
+        Submits to INFO_EXECUTOR and polls the resolve cache until
+        all first-wave URLs land. This avoids creating nested
+        ThreadPoolExecutors that hang inside lifespan closures.
+        """
+        from services.preview_service import (
+            _WARMED_URLS, _WARMED_URLS_LOCK,
+            _RESOLVED_STREAM_CACHE, _RESOLVED_STREAM_LOCK,
+            kickoff_youtube_batch_warm,
+        )
+        from deps import INFO_EXECUTOR
+        from services.youtube_innertube import extract_video_id
         import time as _tm
 
         sorted_channels: list[list[dict]] = []
@@ -131,28 +140,62 @@ async def _app_lifespan(_app: FastAPI):
             return
 
         first_urls: list[str] = []
+        seen_vids: set[str] = set()
         for ch_videos in sorted_channels:
-            first_urls.extend(v["url"] for v in ch_videos[:2])
+            for v in ch_videos[:2]:
+                url = v["url"]
+                vid = extract_video_id(url)
+                if vid and vid not in seen_vids:
+                    seen_vids.add(vid)
+                    first_urls.append(url)
+                    with _WARMED_URLS_LOCK:
+                        _WARMED_URLS.add(url)
+                elif not vid:
+                    first_urls.append(url)
+                    with _WARMED_URLS_LOCK:
+                        _WARMED_URLS.add(url)
 
-        logger.info("STARTUP_SYNC_WARM: warming %d URLs in parallel", len(first_urls))
+        logger.info(
+            "STARTUP_SYNC_WARM: submitting %d URLs to INFO_EXECUTOR",
+            len(first_urls),
+        )
 
-        def _resolve_one(u: str) -> None:
-            t0 = _tm.time()
-            resolve_stream_info(u, prefer_height=720)
-            with _WARMED_URLS_LOCK:
-                _WARMED_URLS.add(u)
-            logger.info("STARTUP_SYNC_WARM: %s done in %.1fs", u[:50], _tm.time() - t0)
+        # Pre-compute cache keys
+        cache_keys: dict[str, str] = {}
+        for u in first_urls:
+            vid = extract_video_id(u)
+            if vid:
+                cache_keys[u] = f"{vid}:720:v2"
 
-        pool = ThreadPoolExecutor(max_workers=len(first_urls))
-        futs = [pool.submit(_resolve_one, u) for u in first_urls]
-        done, not_done = wait(futs, timeout=30.0)
-        for fut in not_done:
-            fut.cancel()
-        for fut in done:
-            exc = fut.exception()
-            if exc:
-                logger.warning("STARTUP_SYNC_WARM: %s", exc)
-        pool.shutdown(wait=False)
+        # Submit all to INFO_EXECUTOR in parallel
+        for u in first_urls:
+            try:
+                INFO_EXECUTOR.submit(kickoff_youtube_batch_warm, u, prefer_height=720)
+            except Exception as exc:
+                logger.warning("STARTUP_SYNC_WARM: submit failed: %s", exc)
+
+        # Poll the resolve cache until all URLs land (or timeout)
+        deadline = _tm.time() + 25.0
+        while _tm.time() < deadline:
+            with _RESOLVED_STREAM_LOCK:
+                missing = [
+                    u for u in first_urls
+                    if cache_keys.get(u) not in _RESOLVED_STREAM_CACHE
+                ]
+            if not missing:
+                logger.info(
+                    "STARTUP_SYNC_WARM: all %d URLs resolved (%.1fs)",
+                    len(first_urls),
+                    _tm.time() - _tm.time() + 0,
+                )
+                return
+            _tm.sleep(0.1)
+
+        logger.warning(
+            "STARTUP_SYNC_WARM: %d/%d timed out after 25s",
+            len(missing),
+            len(first_urls),
+        )
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
         """Pull YouTube URLs out of the saved channel list (any field that
