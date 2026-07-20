@@ -8,7 +8,6 @@ the dev ``__main__`` entry point.
 from services import ytdlp_env  # noqa: F401 — import order before yt-dlp
 from services.ytdlp_guard import assert_ytdlp_safe
 
-import asyncio
 import logging
 import os
 import threading
