@@ -996,7 +996,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 opts.get("_youtube_session"),
             )
             raise RuntimeError(
-                "YouTube blocked this video — try again or add youtube_cookies_file in settings.json"
+                "Preview unavailable for this video — try again in a moment."
             )
         if _youtube_url_from_opts(url, opts) and not _youtube_info_playable(info):
             from services.youtube_diag import format_summary, log_extract_fail

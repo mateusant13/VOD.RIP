@@ -2414,11 +2414,10 @@ def _extract_youtube_preview_info(
             return anon_info
         # ponytail: anonymous path failed — YouTube is bot-gating this IP for
         # this video. Don't burn 30s on the full yt-dlp chain (it will hit the
-        # same gate). Surface a short, user-readable error so the click can
-        # fail fast with the right hint instead of timing out at 41s.
+        # same gate). Fail fast with a short message so the click returns
+        # promptly; the caller retries on demand.
         raise RuntimeError(
-            "YouTube blocked this video — try again in a moment or"
-            " add youtube_cookies_file in Settings."
+            "Preview unavailable for this video — try again in a moment."
         )
     from deps import settings_mgr
     from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts

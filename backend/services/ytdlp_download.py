@@ -850,7 +850,7 @@ def sanitize_download_error(exc: BaseException) -> str:
     low = msg.lower()
     if "sign in to confirm" in low or "not a bot" in low:
         return (
-            "YouTube blocked this video — try again or add youtube_cookies_file in settings.json"
+            "Preview unavailable for this video — try again in a moment."
         )
     if msg.lower().startswith("error:"):
         msg = msg[6:].strip()
