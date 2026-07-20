@@ -3108,29 +3108,11 @@ def kickoff_youtube_batch_warm(
             done = threading.Event()
             _YOUTUBE_WARM_INFLIGHT[key] = done
         try:
-            from services.preview_service import warm_youtube_resolve_only
-
-            ok = warm_youtube_resolve_only(
+            # ponytail: warm_youtube_resolve_only itself builds + stashes the
+            # session snapshot. Calling it twice would re-extract + re-build.
+            warm_youtube_resolve_only(
                 url, oauth=oauth, prefer_height=prefer_height,
             )
-            if ok:
-                # ponytail: prebuild the session shell so the click path skips the
-                # ~5s extract + variant-build work. Same fast path as the gesture warm.
-                try:
-                    resolve_result = resolve_stream_info(
-                        url, oauth=oauth, prefer_height=prefer_height
-                    )
-                    snap = _build_youtube_session_snapshot(
-                        url, 0.0, 0.0, prefer_height, oauth, resolve_result,
-                    )
-                    if snap:
-                        _put_session_snapshot(snap[0], snap[1], snap[2])
-                        logger.info(
-                            "YouTube session snapshot ready: %s h=%d sid=%s",
-                            snap[0][:11], snap[1], snap[2]["session_id"][:8],
-                        )
-                except Exception as exc:
-                    logger.warning("batch warm snapshot failed for %s: %s", key[:24], exc, exc_info=True)
         finally:
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
@@ -3985,35 +3967,13 @@ def kickoff_youtube_warm(
                     logger.debug("YouTube warm bailing — active preview is %s", active[:80])
                     return
             logger.info("YouTube gesture warm start: %s", key[:24])
+            # ponytail: warm_youtube_extract -> warm_youtube_preview_resolve
+            # now builds + stashes the session snapshot itself.
             from services.ytdlp_hls import warm_youtube_extract
 
-            ok = warm_youtube_extract(
+            warm_youtube_extract(
                 url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height
             )
-            if ok:
-                # ponytail: prebuild the session shell now so the click path
-                # skips the ~5s extract + variant-build + custom-master work
-                # and reuses the resolve result we just cached.
-                try:
-                    resolve_result = resolve_stream_info(
-                        url, oauth=oauth, prefer_height=prefer_height
-                    )
-                    snap = _build_youtube_session_snapshot(
-                        url,
-                        0.0,
-                        0.0,
-                        prefer_height,
-                        oauth,
-                        resolve_result,
-                    )
-                    if snap:
-                        _put_session_snapshot(snap[0], snap[1], snap[2])
-                        logger.info(
-                            "YouTube session snapshot ready: %s h=%d sid=%s",
-                            snap[0][:11], snap[1], snap[2]["session_id"][:8],
-                        )
-                except Exception as exc:
-                    logger.warning("session snapshot failed for %s: %s", key[:24], exc, exc_info=True)
         finally:
             # ponytail: failed warm on slow VOD must not nuke session before create_session runs
             with _YOUTUBE_WARM_LOCK:
@@ -4136,26 +4096,48 @@ def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:
 def warm_youtube_preview_resolve(
     url: str,
     oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
     prefer_height: int = 720,
 ) -> bool:
     """Populate resolved-stream cache on hover — same path as create_session.
 
     Uses the full extract race (InnerTube + yt-dlp fallback): gesture warms are
     few (hover/scroll-visible rows) and must survive InnerTube bot-gating that
-    kills the light-only pass. The bulk startup storm uses warm_youtube_resolve_only."""
+    kills the light-only pass. The bulk startup storm uses warm_youtube_resolve_only.
+
+    Also prebuilds the session snapshot so the click path skips the ~5s
+    extract + variant-build work on a warm hit.
+    """
     try:
-        resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+        resolve_result = resolve_stream_info(
+            url, oauth=oauth, prefer_height=prefer_height
+        )
         kickoff_youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
         kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
-        return True
     except Exception as exc:
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         return False
+    try:
+        snap = _build_youtube_session_snapshot(
+            url, 0.0, 0.0, prefer_height, oauth, resolve_result
+        )
+        if snap:
+            _put_session_snapshot(snap[0], snap[1], snap[2])
+            logger.info(
+                "YouTube session snapshot ready: %s h=%d sid=%s",
+                snap[0][:11], snap[1], snap[2]["session_id"][:8],
+            )
+    except Exception as exc:
+        logger.warning(
+            "session snapshot failed for %s: %s", url[:80], exc, exc_info=True
+        )
+    return True
 
 
 def warm_youtube_resolve_only(
     url: str,
     oauth: Optional[str] = None,
+    cookies_file: Optional[str] = None,
     prefer_height: int = 720,
 ) -> bool:
     """Populate resolved-stream cache only — skip the preflight mux.
@@ -4164,13 +4146,36 @@ def warm_youtube_resolve_only(
     fight for the preflight mux (which would re-trigger resolve_stream_info
     inside _youtube_preflight_mux and cause a second extract). The preflight
     mux is still triggered on the user's first preview click.
+
+    Also prebuilds the session snapshot so the click path skips the ~5s
+    extract + variant-build work on a warm hit. Every warm path that lands
+    a resolve must produce a snapshot — otherwise the user's first click
+    waits the full SLA.
     """
     try:
-        resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height, warm_light=True)
-        return True
+        resolve_result = resolve_stream_info(
+            url, oauth=oauth, prefer_height=prefer_height, warm_light=True
+        )
     except Exception as exc:
         logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
         return False
+    # ponytail: build the session shell so the click fast-path applies. Cached
+    # resolve + build once during warm = sub-50ms click instead of ~5s.
+    try:
+        snap = _build_youtube_session_snapshot(
+            url, 0.0, 0.0, prefer_height, oauth, resolve_result
+        )
+        if snap:
+            _put_session_snapshot(snap[0], snap[1], snap[2])
+            logger.info(
+                "YouTube session snapshot ready: %s h=%d sid=%s",
+                snap[0][:11], snap[1], snap[2]["session_id"][:8],
+            )
+    except Exception as exc:
+        logger.warning(
+            "session snapshot failed for %s: %s", url[:80], exc, exc_info=True
+        )
+    return True
 
 
 def resolve_stream_info(
