@@ -69,8 +69,8 @@ WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
 # flag so legacy .ts playlists keep working if an operator sets VODRIP_PREVIEW_FMP4=0.
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 # Signed googlevideo URLs expire in minutes — long cache recycles stale 403s.
-_RESOLVED_STREAM_TTL_SEC = 60
-_RESOLVED_STREAM_MAX = 64
+_RESOLVED_STREAM_TTL_SEC = 300
+_RESOLVED_STREAM_MAX = 256
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
 # Persistent dedup for the batch warm startup path — once a URL has been
