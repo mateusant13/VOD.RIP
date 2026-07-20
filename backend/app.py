@@ -11,6 +11,7 @@ from services.ytdlp_guard import assert_ytdlp_safe
 import logging
 import os
 import threading
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -53,47 +54,44 @@ async def _app_lifespan(_app: FastAPI):
 
         if preview_fast_only_mode():
             logger.info("YouTube warm-up skipped (VODRIP_PREVIEW_FAST_ONLY)")
+            _lifespan_ready.set()
             return
         try:
-            # Step 1: Sync warm first 2 URLs per channel — this populates the
-            # resolve cache BEFORE POT/session warmup so the user's very first
-            # preview click lands in cache (<30ms). Parallel resolves take ~5s.
-            try:
-                from deps import settings_mgr as _sm
-                _saved = getattr(_sm.get(), "saved_channels", None) or []
-                if _saved:
-                    logger.info(
-                        "Daemon warm: sync-first then wave for %d saved channels",
-                        len(_saved),
-                    )
-                    _warm_first_wave_sync(_saved)
-                    _startup_wave_warm(_saved)
-            except Exception:
-                logger.exception("Daemon preview warm crashed")
-
-            # Step 2: Background warm-ups (POT, session, yt-dlp)
-            from services.youtube_pot_service import schedule_pot_service_warm
-            from services.youtube_ytdlp_update import schedule_ytdlp_update_check
-
-            schedule_pot_service_warm()
-            schedule_ytdlp_update_check()
-            from services.youtube_session import warm_youtube_session
-
-            warm_youtube_session()
-            s = settings_mgr.get()
-            manual = bool(
-                (getattr(s, "youtube_cookies_file", "") or "").strip()
-                or (getattr(s, "youtube_cookies_browser", "") or "").strip()
-            )
-            if manual:
-                from services.youtube_auth import refresh_youtube_cookie_cache
-
-                refresh_youtube_cookie_cache(
-                    auto_auth=False,
-                    cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
+            from deps import settings_mgr as _sm
+            _saved = getattr(_sm.get(), "saved_channels", None) or []
+            if _saved:
+                logger.info(
+                    "Daemon warm: sync-first then wave for %d saved channels",
+                    len(_saved),
                 )
+                _warm_first_wave_sync(_saved)
+                _startup_wave_warm(_saved)
         except Exception:
-            logger.debug("YouTube warm-up skipped", exc_info=True)
+            logger.exception("Daemon preview warm crashed")
+        finally:
+            _lifespan_ready.set()
+
+        # Background warm-ups (POT, session, yt-dlp)
+        from services.youtube_pot_service import schedule_pot_service_warm
+        from services.youtube_ytdlp_update import schedule_ytdlp_update_check
+
+        schedule_pot_service_warm()
+        schedule_ytdlp_update_check()
+        from services.youtube_session import warm_youtube_session
+
+        warm_youtube_session()
+        s = settings_mgr.get()
+        manual = bool(
+            (getattr(s, "youtube_cookies_file", "") or "").strip()
+            or (getattr(s, "youtube_cookies_browser", "") or "").strip()
+        )
+        if manual:
+            from services.youtube_auth import refresh_youtube_cookie_cache
+
+            refresh_youtube_cookie_cache(
+                auto_auth=False,
+                cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
+            )
 
     # _warm_first_wave_sync is defined OUTSIDE _warm_youtube at lifespan
     # scope so both the daemon thread and the blocking lifespan warm can
@@ -101,17 +99,17 @@ async def _app_lifespan(_app: FastAPI):
     def _warm_first_wave_sync(saved_channels) -> None:
         """Synchronous warm of the first 2 URLs per channel.
 
-        Submits to INFO_EXECUTOR and polls the resolve cache until
-        all first-wave URLs land. This avoids creating nested
-        ThreadPoolExecutors that hang inside lifespan closures.
+        Calls resolve_stream_info DIRECTLY in a thread pool (no
+        kickoff_youtube_batch_warm double-hop) so extracts run immediately
+        on INFO_EXECUTOR workers. Polls the resolve cache until all land.
         """
         from services.preview_service import (
             _WARMED_URLS, _WARMED_URLS_LOCK,
             _RESOLVED_STREAM_CACHE, _RESOLVED_STREAM_LOCK,
-            kickoff_youtube_batch_warm,
+            resolve_stream_info,
         )
-        from deps import INFO_EXECUTOR
         from services.youtube_innertube import extract_video_id
+        from deps import INFO_EXECUTOR
         import time as _tm
 
         sorted_channels: list[list[dict]] = []
@@ -144,54 +142,48 @@ async def _app_lifespan(_app: FastAPI):
             for v in ch_videos[:2]:
                 url = v["url"]
                 vid = extract_video_id(url)
-                if vid and vid not in seen_vids:
+                if vid:
+                    if vid in seen_vids:
+                        continue
                     seen_vids.add(vid)
-                    first_urls.append(url)
-                    with _WARMED_URLS_LOCK:
-                        _WARMED_URLS.add(url)
-                elif not vid:
-                    first_urls.append(url)
-                    with _WARMED_URLS_LOCK:
-                        _WARMED_URLS.add(url)
+                first_urls.append(url)
+                with _WARMED_URLS_LOCK:
+                    _WARMED_URLS.add(url)
 
         logger.info(
-            "STARTUP_SYNC_WARM: submitting %d URLs to INFO_EXECUTOR",
+            "STARTUP_SYNC_WARM: resolving %d URLs via INFO_EXECUTOR",
             len(first_urls),
         )
 
-        # Pre-compute cache keys
+        # Submit resolve_stream_info DIRECTLY to INFO_EXECUTOR workers
+        # (no kickoff_youtube_batch_warm double-hop)
         cache_keys: dict[str, str] = {}
+        futs = []
         for u in first_urls:
             vid = extract_video_id(u)
             if vid:
                 cache_keys[u] = f"{vid}:720:v2"
-
-        # Submit all to INFO_EXECUTOR in parallel
-        for u in first_urls:
             try:
-                INFO_EXECUTOR.submit(kickoff_youtube_batch_warm, u, prefer_height=720)
+                fut = INFO_EXECUTOR.submit(resolve_stream_info, u, prefer_height=720)
+                futs.append((u, fut))
             except Exception as exc:
                 logger.warning("STARTUP_SYNC_WARM: submit failed: %s", exc)
 
-        # Poll the resolve cache until all URLs land (or timeout)
+        # Poll the resolve cache until all URLs land
         deadline = _tm.time() + 25.0
         while _tm.time() < deadline:
             with _RESOLVED_STREAM_LOCK:
-                missing = [
-                    u for u in first_urls
-                    if cache_keys.get(u) not in _RESOLVED_STREAM_CACHE
-                ]
+                missing = [u for u, _ in futs if cache_keys.get(u) not in _RESOLVED_STREAM_CACHE]
             if not missing:
                 logger.info(
-                    "STARTUP_SYNC_WARM: all %d URLs resolved (%.1fs)",
+                    "STARTUP_SYNC_WARM: all %d URLs resolved",
                     len(first_urls),
-                    _tm.time() - _tm.time() + 0,
                 )
                 return
             _tm.sleep(0.1)
 
         logger.warning(
-            "STARTUP_SYNC_WARM: %d/%d timed out after 25s",
+            "STARTUP_SYNC_WARM: %d/%d timed out",
             len(missing),
             len(first_urls),
         )
@@ -321,7 +313,16 @@ async def _app_lifespan(_app: FastAPI):
             except Exception:
                 pass
 
+    _lifespan_ready = threading.Event()
     threading.Thread(target=_warm_youtube, daemon=True, name="yt-warm").start()
+
+    # Block server startup until the daemon thread's sync warm completes.
+    # This guarantees the first 2 URLs per channel are in cache before any
+    # HTTP request arrives. Timeout after 30s so a stuck YouTube API call
+    # doesn't hang the server forever.
+    if not _lifespan_ready.wait(timeout=30.0):
+        logger.warning("Lifespan warm timed out after 30s — server starting anyway")
+
     yield
     try:
         from services.shutdown_util import shutdown_downloads_and_children
