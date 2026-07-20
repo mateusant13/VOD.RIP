@@ -76,6 +76,15 @@ _RESOLVED_STREAM_TTL_SEC = 900
 _RESOLVED_STREAM_MAX = 256
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
+# Prebuilt session snapshot keyed by (vid, height) — produced by the YouTube
+# warm job and consumed by create_session so the click path skips the ~5s
+# extract + variant-build + custom-master work entirely on a warm hit.
+# TTL matches _RESOLVED_STREAM_TTL_SEC: signed googlevideo URLs expire in
+# hours, so a warm window of 15min is plenty to cover a browsing session.
+_SESSION_SNAPSHOT_TTL_SEC = _RESOLVED_STREAM_TTL_SEC
+_SESSION_SNAPSHOT_MAX = 256
+_SESSION_SNAPSHOT: Dict[Tuple[str, int], Tuple[float, dict]] = {}
+_SESSION_SNAPSHOT_LOCK = threading.Lock()
 # Persistent dedup for the batch warm startup path — once a URL has been
 # warmed once this process lifetime, skip re-warming it. The 60-second
 # _RESOLVED_STREAM_CACHE TTL would otherwise cause redundant re-extracts
@@ -449,6 +458,69 @@ class PreviewManager:
             session.touch()
         return session
 
+    def _reuse_youtube_snapshot(
+        self,
+        url: str,
+        crop_start: float,
+        crop_end: float,
+        prefer_height: int,
+        snapshot: dict,
+    ) -> PreviewSession:
+        """ponytail: rebuild a PreviewSession from the warm's prebuilt snapshot.
+
+        All post-resolve work (variant build, custom-master, audio URL, host
+        set, window-HLS bounds, format stash, duration clamp) is done once
+        during the warm. The click path just creates the live session object
+        and registers it — no extract, no network, no variant-build.
+
+        The session_id and cache_dir come from the snapshot so the window-HLS
+        master (which bakes session_id into the resource URL) matches the
+        live session. The cache_dir was already created by the warm.
+        """
+        from services.youtube_innertube import extract_video_id
+
+        session_id = snapshot["session_id"]
+        cache_dir = Path(snapshot["cache_dir"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        session = PreviewSession(
+            session_id=session_id,
+            vod_url=url,
+            master_url=snapshot["master_url"],
+            entry_url=snapshot["entry_url"],
+            platform=snapshot["platform"],
+            http_headers=dict(snapshot.get("http_headers") or {}),
+            allowed_hosts=set(snapshot.get("allowed_hosts") or set()),
+            cache_dir=cache_dir,
+            kind=snapshot["kind"],
+            crop_start=crop_start,
+            crop_end=crop_end,
+            preview_audio_url=snapshot.get("preview_audio_url"),
+            variant_muxed=dict(snapshot.get("variant_muxed") or {}),
+            variant_entries=list(snapshot.get("variant_entries") or []),
+            custom_master=snapshot.get("custom_master"),
+            dash_window_hls=bool(snapshot.get("dash_window_hls")),
+            preview_audio_fmt=snapshot.get("preview_audio_fmt"),
+            preview_video_fmt=snapshot.get("preview_video_fmt"),
+            vod_duration=float(snapshot.get("vod_duration") or 0.0),
+            cached_progressive_path=snapshot.get("cached_progressive_path"),
+            mux_status=snapshot.get("mux_status") or "pending",
+            prefer_height=prefer_height,
+        )
+        # explore_yt_info is a dynamic attribute set by _stash_youtube_preview_formats
+        # on the live session; restore it here so post-register code can use it.
+        explore_info = snapshot.get("explore_yt_info")
+        if explore_info is not None:
+            session.explore_yt_info = explore_info
+        # Re-clamp crop_end to the VOD's actual duration (snapshot stored the
+        # last-known value but the click may have a different crop window).
+        if getattr(session, "explore_yt_info", None):
+            _clamp_session_crop_to_vod_duration(session, session.explore_yt_info)
+        with self._lock:
+            self._sessions[session_id] = session
+            session.timing_created_mono = time.monotonic()
+        return session
+
     def create_session(
         self,
         url: str,
@@ -466,6 +538,21 @@ class PreviewManager:
             # 8s for it burns the whole preview SLA. A running warm is still
             # joined via the extract dedup inside cached_extract_info.
             await_youtube_warm_if_pending(url, timeout_sec=1.5)
+            # ponytail: the warm prebuilt a full session shell — reuse it to
+            # skip the ~5s extract + variant-build + custom-master work.
+            from services.youtube_innertube import extract_video_id
+
+            vid = extract_video_id(url or "")
+            snap = _get_session_snapshot(vid, prefer_height) if vid else None
+            if snap:
+                session = self._reuse_youtube_snapshot(
+                    url, crop_start, crop_end, prefer_height, snap
+                )
+                logger.info(
+                    "preview session reused from snapshot sid=%s vid=%s h=%d",
+                    session.session_id[:8], vid[:11], prefer_height,
+                )
+                return _finalize_youtube_session(session, crop_start)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 url,
@@ -598,81 +685,7 @@ class PreviewManager:
                         daemon=True,
                     ).start()
 
-        if _youtube_entry_needs_mux(session):
-            cached_full = _try_use_full_mux_cache(session)
-            if cached_full:
-                # Cached full-VOD mux is available. Mark the session as
-                # progressive and remember the cached file path — the
-                # proxy checks `cached_progressive_path` and serves the
-                # local MP4 directly with HTTP Range support. Original
-                # state (variant_entries, audio_url, etc.) is left
-                # intact for diagnostics.
-                session.kind = "progressive"
-                session.dash_window_hls = False
-                session.cached_progressive_path = str(cached_full)
-                session.mux_status = "ready"
-            else:
-                schedule_youtube_preview_mux(session_id)
-
-        if kind == "progressive":
-            from services.youtube_diag import log_preview_session
-
-            heights = [h for h, _u in session.variant_entries]
-            log_preview_session(
-                session_id,
-                platform,
-                kind,
-                heights,
-                custom_master=bool(session.custom_master),
-                entry_url=session.entry_url or raw_entry,
-            )
-            return session
-
-        if (
-            session.platform == "YouTube"
-            and session.entry_url
-            and not session.custom_master
-        ):
-            for attempt in range(2):
-                try:
-                    proxy_playlist(session_id, session.entry_url)
-                    break
-                except Exception as exc:
-                    if attempt == 0:
-                        time.sleep(0.2)
-                    else:
-                        from services.youtube_diag import log as yt_log
-
-                        yt_log.warning(
-                            "preview playlist warm failed session=%s: %s",
-                            session_id[:8],
-                            exc,
-                        )
-
-        if session.dash_window_hls:
-            _init_window_hls_mux_bounds(session)
-            schedule_youtube_window_hls_mux(session_id)
-
-        _enforce_full_mux_cache_budget()
-        _schedule_background_full_mux(session_id)
-        threading.Thread(
-            target=_warm_and_prewarm_session,
-            args=(session_id, crop_start),
-            daemon=True,
-            name=f"kd-prewarm-{session_id[:8]}",
-        ).start()
-        from services.youtube_diag import log_preview_session
-
-        heights = [h for h, _u in session.variant_entries]
-        log_preview_session(
-            session_id,
-            platform,
-            kind,
-            heights,
-            custom_master=bool(session.custom_master),
-            entry_url=session.entry_url or raw_entry,
-        )
-        return session
+        return _finalize_youtube_session(session, crop_start)
 
 
 @dataclass
@@ -1681,6 +1694,89 @@ def _youtube_entry_needs_mux(session: PreviewSession) -> bool:
     if height and not session.variant_muxed.get(height):
         return True
     return False
+
+
+def _finalize_youtube_session(session: PreviewSession, crop_start: float) -> PreviewSession:
+    """ponytail: post-register work that both the inline and snapshot-reuse
+    create_session paths share. Runs the mux cache check, schedules the
+    background full mux / window-HLS mux, prewarms the first segment,
+    and emits the diagnostic log line."""
+    session_id = session.session_id
+    if _youtube_entry_needs_mux(session):
+        cached_full = _try_use_full_mux_cache(session)
+        if cached_full:
+            # Cached full-VOD mux is available. Mark the session as
+            # progressive and remember the cached file path — the
+            # proxy checks `cached_progressive_path` and serves the
+            # local MP4 directly with HTTP Range support. Original
+            # state (variant_entries, audio_url, etc.) is left
+            # intact for diagnostics.
+            session.kind = "progressive"
+            session.dash_window_hls = False
+            session.cached_progressive_path = str(cached_full)
+            session.mux_status = "ready"
+        else:
+            schedule_youtube_preview_mux(session_id)
+
+    if session.kind == "progressive":
+        from services.youtube_diag import log_preview_session
+
+        heights = [h for h, _u in session.variant_entries]
+        log_preview_session(
+            session_id,
+            session.platform,
+            session.kind,
+            heights,
+            custom_master=bool(session.custom_master),
+            entry_url=session.entry_url,
+        )
+        return session
+
+    if (
+        session.platform == "YouTube"
+        and session.entry_url
+        and not session.custom_master
+    ):
+            for attempt in range(2):
+                try:
+                    proxy_playlist(session_id, session.entry_url)
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        time.sleep(0.2)
+                    else:
+                        from services.youtube_diag import log as yt_log
+
+                        yt_log.warning(
+                            "preview playlist warm failed session=%s: %s",
+                            session_id[:8],
+                            exc,
+                        )
+
+    if session.dash_window_hls:
+        _init_window_hls_mux_bounds(session)
+        schedule_youtube_window_hls_mux(session_id)
+
+    _enforce_full_mux_cache_budget()
+    _schedule_background_full_mux(session_id)
+    threading.Thread(
+        target=_warm_and_prewarm_session,
+        args=(session_id, crop_start),
+        daemon=True,
+        name=f"kd-prewarm-{session_id[:8]}",
+    ).start()
+    from services.youtube_diag import log_preview_session
+
+    heights = [h for h, _u in session.variant_entries]
+    log_preview_session(
+        session_id,
+        session.platform,
+        session.kind,
+        heights,
+        custom_master=bool(session.custom_master),
+        entry_url=session.entry_url,
+    )
+    return session
 
 
 def _best_muxed_variant_url(session: PreviewSession) -> Optional[str]:
@@ -3014,9 +3110,27 @@ def kickoff_youtube_batch_warm(
         try:
             from services.preview_service import warm_youtube_resolve_only
 
-            warm_youtube_resolve_only(
+            ok = warm_youtube_resolve_only(
                 url, oauth=oauth, prefer_height=prefer_height,
             )
+            if ok:
+                # ponytail: prebuild the session shell so the click path skips the
+                # ~5s extract + variant-build work. Same fast path as the gesture warm.
+                try:
+                    resolve_result = resolve_stream_info(
+                        url, oauth=oauth, prefer_height=prefer_height
+                    )
+                    snap = _build_youtube_session_snapshot(
+                        url, 0.0, 0.0, prefer_height, oauth, resolve_result,
+                    )
+                    if snap:
+                        _put_session_snapshot(snap[0], snap[1], snap[2])
+                        logger.info(
+                            "YouTube session snapshot ready: %s h=%d sid=%s",
+                            snap[0][:11], snap[1], snap[2]["session_id"][:8],
+                        )
+                except Exception as exc:
+                    logger.warning("batch warm snapshot failed for %s: %s", key[:24], exc, exc_info=True)
         finally:
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
@@ -3584,6 +3698,153 @@ def _formats_are_dash_https(formats: List[dict]) -> bool:
             return False
     return True
 
+def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
+    with _RESOLVED_STREAM_LOCK:
+        if len(_RESOLVED_STREAM_CACHE) >= _RESOLVED_STREAM_MAX:
+            oldest = min(_RESOLVED_STREAM_CACHE.items(), key=lambda item: item[1][0])
+            _RESOLVED_STREAM_CACHE.pop(oldest[0], None)
+        _RESOLVED_STREAM_CACHE[key] = (time.time(), value)
+
+
+def _build_youtube_session_snapshot(
+    url: str,
+    crop_start: float,
+    crop_end: float,
+    prefer_height: int,
+    oauth: Optional[str],
+    resolve_result: Tuple,
+) -> Optional[Tuple[str, int, dict]]:
+    """ponytail: prebuild a session snapshot during the warm.
+
+    Runs the same YouTube session-construction work that ``create_session``
+    performs after ``resolve_stream_info``, but writes the result into a
+    plain dict instead of a live ``PreviewSession``. Returns ``(vid, height,
+    snapshot)`` so the caller can stash it in ``_SESSION_SNAPSHOT``.
+
+    Returns ``None`` when the resolve result is unusable (e.g. Twitch clip
+    that took a different code path — caller's job to detect via platform).
+    """
+    raw_entry, headers, platform, variant_formats, kind, yt_info = resolve_result
+    if platform != "YouTube":
+        return None
+    from services.youtube_innertube import extract_video_id
+
+    vid = extract_video_id(url or "")
+    if not vid:
+        return None
+
+    session_id = secrets.token_hex(8)
+    cache_dir = _PREVIEW_ROOT / session_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    preview_audio_url: Optional[str] = None
+    variant_muxed: Dict[int, bool] = {}
+    if yt_info:
+        preview_audio_url = _resolve_youtube_preview_audio(yt_info)
+    for fmt in variant_formats or []:
+        h = int(fmt.get("height") or 0)
+        if h > 0:
+            variant_muxed[h] = fmt.get("acodec") not in ("none", None)
+
+    proxy_master_url: Optional[str] = None
+    if kind == "progressive":
+        proxy_master_url = f"/api/preview/hls/{session_id}/master.m3u8"
+
+    # Build a temporary PreviewSession so the existing helpers (which mutate
+    # ``session.*``) can run unchanged. We pull the populated fields back out
+    # into a dict at the end.
+    tmp = PreviewSession(
+        session_id=session_id,
+        vod_url=url,
+        master_url=proxy_master_url or raw_entry,
+        entry_url=raw_entry,
+        platform=platform,
+        http_headers=headers,
+        allowed_hosts=_hosts_for_url(raw_entry),
+        cache_dir=cache_dir,
+        kind=kind,
+        crop_start=crop_start,
+        crop_end=crop_end,
+        preview_audio_url=preview_audio_url,
+        variant_muxed=variant_muxed,
+        prefer_height=prefer_height,
+    )
+    _clamp_session_crop_to_vod_duration(tmp, yt_info)
+    if preview_audio_url:
+        tmp.allowed_hosts.update(_hosts_for_url(preview_audio_url))
+
+    if variant_formats:
+        tmp.variant_entries = [
+            (int(fmt.get("height") or 0), fmt.get("url") or "")
+            for fmt in variant_formats
+            if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+        ]
+        if kind == "hls":
+            from services.ytdlp_hls import preview_fast_only_mode
+
+            if platform == "YouTube":
+                _apply_youtube_custom_master(tmp, variant_formats, yt_info)
+            elif len(tmp.variant_entries) >= 2:
+                tmp.custom_master = _build_synthetic_master_playlist(
+                    tmp, variant_formats
+                )
+            for _height, upstream in tmp.variant_entries:
+                tmp.allowed_hosts.update(_hosts_for_url(upstream))
+            if tmp.dash_window_hls and not preview_fast_only_mode():
+                muxed = _youtube_muxed_progressive_for_long_explore(
+                    url, oauth, prefer_height, yt_info=yt_info
+                )
+                if muxed:
+                    prog_url, prog_formats, prog_info = muxed
+                    _apply_muxed_progressive_session(
+                        tmp, prog_url, prog_formats, prog_info, prefer_height
+                    )
+                    kind = "progressive"
+                    variant_formats = prog_formats
+                    yt_info = prog_info
+                    proxy_master_url = tmp.master_url
+    if kind == "progressive":
+        tmp.allowed_hosts.update(_hosts_for_url(tmp.entry_url))
+    elif tmp.custom_master:
+        if tmp.variant_entries:
+            tmp.entry_url = (
+                _pick_variant_by_height(tmp.variant_entries, prefer_height)
+                or tmp.variant_entries[0][1]
+            )
+        tmp.allowed_hosts.update(_hosts_for_url(tmp.entry_url))
+    else:
+        tmp.entry_url = _resolve_preview_entry(tmp, raw_entry, prefer_height)
+        tmp.allowed_hosts.update(_hosts_for_url(tmp.entry_url))
+
+    if variant_formats:
+        _stash_youtube_preview_formats(
+            tmp, variant_formats, yt_info, prefer_height, tmp.entry_url
+        )
+    if tmp.dash_window_hls:
+        _init_window_hls_mux_bounds(tmp)
+
+    snapshot = {
+        "session_id": session_id,
+        "cache_dir": str(cache_dir),
+        "master_url": tmp.master_url,
+        "entry_url": tmp.entry_url,
+        "platform": platform,
+        "http_headers": dict(tmp.http_headers),
+        "allowed_hosts": set(tmp.allowed_hosts),
+        "kind": kind,
+        "preview_audio_url": tmp.preview_audio_url,
+        "variant_muxed": dict(tmp.variant_muxed),
+        "variant_entries": list(tmp.variant_entries),
+        "custom_master": tmp.custom_master,
+        "dash_window_hls": tmp.dash_window_hls,
+        "preview_audio_fmt": tmp.preview_audio_fmt,
+        "preview_video_fmt": tmp.preview_video_fmt,
+        "explore_yt_info": yt_info,
+        "vod_duration": float(tmp.vod_duration or 0.0),
+        "cached_progressive_path": tmp.cached_progressive_path,
+        "mux_status": "pending",
+    }
+    return vid, int(prefer_height or 0), snapshot
 
 def _get_resolved_stream_cached(key: str) -> Optional[Tuple]:
     now = time.time()
@@ -3602,6 +3863,46 @@ def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
             oldest = min(_RESOLVED_STREAM_CACHE.items(), key=lambda item: item[1][0])
             _RESOLVED_STREAM_CACHE.pop(oldest[0], None)
         _RESOLVED_STREAM_CACHE[key] = (time.time(), value)
+
+
+def _get_session_snapshot(
+    vid: str, height: int
+) -> Optional[dict]:
+    """Return prebuilt session fields for (vid, height) or None on miss/expire."""
+    if not vid:
+        return None
+    key = (vid, int(height or 0))
+    now = time.time()
+    with _SESSION_SNAPSHOT_LOCK:
+        hit = _SESSION_SNAPSHOT.get(key)
+        if hit and (now - hit[0]) < _SESSION_SNAPSHOT_TTL_SEC:
+            return hit[1]
+        if hit:
+            _SESSION_SNAPSHOT.pop(key, None)
+    return None
+
+
+def _put_session_snapshot(vid: str, height: int, snapshot: dict) -> None:
+    """Stash session fields for click-time reuse."""
+    if not vid:
+        return
+    key = (vid, int(height or 0))
+    with _SESSION_SNAPSHOT_LOCK:
+        if len(_SESSION_SNAPSHOT) >= _SESSION_SNAPSHOT_MAX:
+            oldest = min(_SESSION_SNAPSHOT.items(), key=lambda item: item[1][0])
+            _SESSION_SNAPSHOT.pop(oldest[0], None)
+        _SESSION_SNAPSHOT[key] = (time.time(), snapshot)
+
+
+def invalidate_session_snapshot(vid: str, height: Optional[int] = None) -> None:
+    """Drop snapshot(s) for *vid* — used when refresh forces a fresh resolve."""
+    with _SESSION_SNAPSHOT_LOCK:
+        if height is None:
+            for k in list(_SESSION_SNAPSHOT.keys()):
+                if k[0] == vid:
+                    _SESSION_SNAPSHOT.pop(k, None)
+        else:
+            _SESSION_SNAPSHOT.pop((vid, int(height)), None)
 
 
 def invalidate_resolved_stream_cache(
@@ -3686,9 +3987,33 @@ def kickoff_youtube_warm(
             logger.info("YouTube gesture warm start: %s", key[:24])
             from services.ytdlp_hls import warm_youtube_extract
 
-            warm_youtube_extract(
+            ok = warm_youtube_extract(
                 url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height
             )
+            if ok:
+                # ponytail: prebuild the session shell now so the click path
+                # skips the ~5s extract + variant-build + custom-master work
+                # and reuses the resolve result we just cached.
+                try:
+                    resolve_result = resolve_stream_info(
+                        url, oauth=oauth, prefer_height=prefer_height
+                    )
+                    snap = _build_youtube_session_snapshot(
+                        url,
+                        0.0,
+                        0.0,
+                        prefer_height,
+                        oauth,
+                        resolve_result,
+                    )
+                    if snap:
+                        _put_session_snapshot(snap[0], snap[1], snap[2])
+                        logger.info(
+                            "YouTube session snapshot ready: %s h=%d sid=%s",
+                            snap[0][:11], snap[1], snap[2]["session_id"][:8],
+                        )
+                except Exception as exc:
+                    logger.warning("session snapshot failed for %s: %s", key[:24], exc, exc_info=True)
         finally:
             # ponytail: failed warm on slow VOD must not nuke session before create_session runs
             with _YOUTUBE_WARM_LOCK:
