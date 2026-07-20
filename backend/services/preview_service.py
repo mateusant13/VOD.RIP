@@ -2388,7 +2388,38 @@ def _extract_youtube_preview_info(
 
     ``warm_light=True`` (bulk warm) runs the InnerTube fast pass only — the
     yt-dlp lock and retry chain are reserved for real user clicks.
+
+    ponytail: prefer_height <= 360 first tries the anonymous InnerTube path
+    (ANDROID_VR client, no cookies/POT/visitor_data). The muxed progressive 360p
+    URL it returns is publicly fetchable and survives YouTube bot-gate better
+    than the auth-required WEB client. Falls through to the full auth chain
+    only if anonymous fails.
     """
+    # Anonymous-first for 360p preview — avoids the 30s IP rate-limit on the
+    # auth path. The fallback below still uses cookies/POT if the user has them.
+    try:
+        from services.youtube_innertube import (
+            extract_video_id,
+            innertube_extract_360p_anonymous,
+        )
+        vid = extract_video_id(full_url)
+    except Exception:
+        vid = None
+    if vid and not warm_light and not oauth:
+        try:
+            anon_info = innertube_extract_360p_anonymous(full_url, read_timeout=3.0)
+        except Exception:
+            anon_info = None
+        if anon_info and not _youtube_info_is_dash_only_progressive(anon_info):
+            return anon_info
+        # ponytail: anonymous path failed — YouTube is bot-gating this IP for
+        # this video. Don't burn 30s on the full yt-dlp chain (it will hit the
+        # same gate). Surface a short, user-readable error so the click can
+        # fail fast with the right hint instead of timing out at 41s.
+        raise RuntimeError(
+            "YouTube blocked this video — try again in a moment or"
+            " add youtube_cookies_file in Settings."
+        )
     from deps import settings_mgr
     from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
 

@@ -1078,6 +1078,71 @@ def innertube_extract_info(
     return None
 
 
+def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> Optional[dict[str, Any]]:
+    """Anonymous InnerTube extract for 360p-only preview — no cookies, no POT.
+
+    ponytail: bypasses the auth-tower (cookies/POT/visitor_data) for previews.
+    Uses ANDROID_VR client only (least bot-gated, returns muxed progressive 360p
+    + adaptive ladders for all heights if needed). The URL it returns is
+    fetchable directly from the browser proxy — no signing required for the
+    360p itag=18 path on public videos.
+
+    Returns None on any failure (bot-gate, video unavailable, network). Caller
+    should fall back to the full auth path (innertube_extract_info).
+    """
+    video_id = extract_video_id(url)
+    if not video_id:
+        return None
+    profile = _PROFILE_BY_NAME.get("ANDROID_VR")
+    if profile is None:
+        return None
+    try:
+        data, _status, kind = _player_request(
+            video_id, profile, read_timeout, session=None
+        )
+    except Exception as exc:
+        logger.debug("anonymous 360p InnerTube request failed %s: %s", video_id, exc)
+        return None
+    if kind != "ok" or not data:
+        play = (data or {}).get("playabilityStatus") or {}
+        logger.debug(
+            "anonymous 360p InnerTube rejected for %s: status=%s reason=%s",
+            video_id, play.get("status"), (play.get("reason") or "")[:60],
+        )
+        return None
+    streaming = data.get("streamingData") or {}
+    progressive = _formats_from_streaming_progressive(streaming)
+    url_formats = _streaming_url_formats(streaming)
+    adaptive = _formats_from_adaptive(streaming)
+    fmt_360_muxed = next(
+        (f for f in progressive if int(f.get("height") or 0) == 360),
+        None,
+    )
+    fmt_360_url = next(
+        (f for f in url_formats if int(f.get("height") or 0) == 360),
+        None,
+    )
+    fmt_360 = fmt_360_muxed or fmt_360_url
+    if fmt_360 is None:
+        logger.debug(
+            "anonymous 360p InnerTube returned no 360p format for %s (have %d progressive, %d adaptive)",
+            video_id, len(progressive), len(adaptive),
+        )
+        return None
+    formats_for_info = [fmt_360]
+    formats_for_info.extend(adaptive)
+    info = _info_from_player_data(
+        data, video_id, None, None, adaptive_formats=formats_for_info
+    )
+    if not info:
+        logger.debug("anonymous 360p _info_from_player_data failed for %s", video_id)
+        return None
+    from services.youtube_diag import log_extract_ok
+
+    log_extract_ok(video_id, "innertube_anonymous_360p", info, None)
+    return info
+
+
 assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert canonical_youtube_watch_url("https://www.youtube.com/shorts/dQw4w9WgXcQ") == (
