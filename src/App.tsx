@@ -1221,7 +1221,8 @@ export default function App() {
     if (!root) return;
 
     const youtubeUrls = visibleChannelVideos
-      .filter((v) => v.platform === 'youtube' && v.availability !== 'subscriber_only')
+      .filter((v) => v.platform === 'youtube' && v.availability !== 'subscriber_only'
+        && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
       .map((v) => buildVodUrl(v));
     warmYoutubePreviewBatch(youtubeUrls, 3, 120);
 
@@ -1234,7 +1235,7 @@ export default function App() {
       cancelAnimationFrame(raf);
       cleanup?.();
     };
-  }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url]);
+  }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url, channelContentFilter]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -3551,25 +3552,21 @@ export default function App() {
     });
   }, []);
 
-  // Warm YouTube preview cache for the top N URLs of every (channel, content_kind)
-  // so the first few previews are instant regardless of which filter the user
-  // opens (Videos / Shorts / Streams). Batches are rate-limited so the warm
-  // executor never gets flooded and the user's click isn't queued behind
-  // hundreds of background extracts.
+  // Warm YouTube preview cache for the top N long-form URLs of every channel
+  // (VODs + stream VODs only — shorts/clips are cheap to extract on click and
+  // don't justify background warm traffic).
   const warmedUrlsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const channels = savedChannels;
     if (!channels.length) return;
     const PER_KIND = 2;
     const STAGGER_MS = 150;
-    const KINDS = ['vods', 'clips', 'streams'] as const;
+    const KINDS = ['vods', 'streams'] as const;
     const isYouTubeUrl = (u: string) => /youtube\.com|youtu\.be/.test(u || '');
     const urlsForKind = (ch: typeof channels[number], kind: typeof KINDS[number]): string[] => {
-      const pool = kind === 'clips'
-        ? ch.clipVideos ?? []
-        : (ch.vodVideos ?? []).filter((v) =>
-            kind === 'streams' ? v.content_kind === 'stream' : v.content_kind !== 'stream' && v.content_kind !== 'clip',
-          );
+      const pool = (ch.vodVideos ?? []).filter((v) =>
+        kind === 'streams' ? v.content_kind === 'stream' : v.content_kind !== 'stream' && v.content_kind !== 'clip',
+      );
       const out: string[] = [];
       for (const v of pool) {
         const u = v?.url;
@@ -5334,7 +5331,7 @@ export default function App() {
                                 key={`${v.platform}-${v.id}-${i}`}
                                 role="button"
                                 tabIndex={0}
-                                data-youtube-warm={v.platform === 'youtube' && !isMembersOnly ? fullUrl : undefined}
+                                data-youtube-warm={v.platform === 'youtube' && !isMembersOnly && !isClipItem ? fullUrl : undefined}
                                 onClick={() => selectVod(fullUrl, {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,
@@ -5348,7 +5345,7 @@ export default function App() {
                                   skipNetwork: true,
                                 })}
                                 onMouseEnter={() => {
-                                  if (v.platform === 'youtube' && !isMembersOnly) {
+                                  if (v.platform === 'youtube' && !isMembersOnly && !isClipItem) {
                                     warmYoutubePreview(fullUrl);
                                     // ponytail: longer-delay full-VOD mux on hover.
                                     // Fires after ~1s of mouse rest so it only runs
@@ -5432,7 +5429,7 @@ export default function App() {
                                   type="button"
                                   title={isClipItem ? 'Preview clip' : 'Preview VOD'}
                                   onMouseEnter={() => {
-                                    if (v.platform === 'youtube') {
+                                    if (v.platform === 'youtube' && !isClipItem) {
                                       warmYoutubePreview(fullUrl);
                                       warmYoutubePreviewFull(fullUrl, 1000);
                                     }
