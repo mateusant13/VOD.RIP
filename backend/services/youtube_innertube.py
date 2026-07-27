@@ -250,6 +250,10 @@ def _formats_from_streaming_progressive(streaming: dict[str, Any]) -> list[dict[
     """Muxed progressive URLs from streamingData.formats (e.g. ANDROID_VR itag 18)."""
     formats: list[dict[str, Any]] = []
     for fmt in streaming.get("formats") or []:
+        if not isinstance(fmt, dict):
+            # YouTube occasionally returns null entries (partial/bot-gated JSON) —
+            # a crash here silently kills the anon fast path for the video.
+            continue
         url = (fmt.get("url") or "").strip()
         if not url or _is_sabr_stream_url(url):
             continue
@@ -405,6 +409,8 @@ def _formats_from_adaptive(streaming: dict[str, Any]) -> list[dict[str, Any]]:
     """Build yt-dlp-shaped formats from streamingData.adaptiveFormats (DASH/mp4)."""
     formats: list[dict[str, Any]] = []
     for fmt in streaming.get("adaptiveFormats") or []:
+        if not isinstance(fmt, dict):
+            continue
         url = fmt.get("url") or ""
         if not url:
             continue
