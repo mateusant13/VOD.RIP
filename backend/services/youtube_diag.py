@@ -78,7 +78,12 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
         return "Members-only video — requires channel membership."
     if "private video" in low:
         return "This video is private."
-    if "video has been removed" in low or "video is not available" in low:
+    if (
+        "video has been removed" in low
+        or "video is not available" in low
+        or "video is unavailable" in low
+        or "video unavailable" in low
+    ):
         return "This video is unavailable."
     if preview:
         return "Preview failed — try again."

@@ -113,6 +113,12 @@ export function usePreviewPlayer({
   const previewLevelsRef = useRef<PreviewLevelOption[]>([]);
   const viewportSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingViewportHeightRef = useRef(0);
+  // Mirror sessionId into a ref for closures inside debounced /
+  // viewport-sync callbacks. Without this, a session swap would let those
+  // callbacks read a stale sid from the closure and POST /quality against
+  // an expired session -> 400 spam.
+  const sessionIdRef = useRef<string | null>(sessionId);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
   const cancelViewportSync = useCallback(() => {
     if (viewportSyncTimerRef.current != null) {
@@ -174,7 +180,7 @@ export function usePreviewPlayer({
     const video = videoRef.current;
     const wasPaused = video?.paused ?? true;
     const savedTime = video?.currentTime ?? trimStart;
-    const sid = sessionId;
+    const sid = sessionIdRef.current;
 
     const syncSessionQuality = () => apiPost(
       `/api/preview/session/${sid}/quality`,
@@ -335,7 +341,9 @@ export function usePreviewPlayer({
   // Consumers call this from their video onTimeUpdate handler.
   // Fetches the next N segments in background so they're ready when needed.
   const prefetchNextSegments = useCallback(async (currentTime: number) => {
-    if (!sessionId) return;
+    // Re-read sid from ref so an in-progress click on a *different* video
+    // doesn't leak prefetches against the stale session.
+    if (!sessionIdRef.current) return;
     // Only prefetch for YouTube window-HLS sessions (trimTimeline = true)
     if (!trimTimelineRef?.current) return;
     if (!isYoutubePreview) return;
@@ -356,7 +364,7 @@ export function usePreviewPlayer({
     }
     if (!toFetch.length) return;
 
-    const sessionIdStr = sessionId;
+    const sessionIdStr = sessionIdRef.current;
     await Promise.allSettled(
       toFetch.map((idx) =>
         fetch(`/api/preview/hls/${sessionIdStr}/resource?id=window-seg-${idx.toString().padStart(3, '0')}`, {

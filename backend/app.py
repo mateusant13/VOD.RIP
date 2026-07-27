@@ -100,7 +100,7 @@ async def _app_lifespan(_app: FastAPI):
         """Sequential warm of first unique URLs (no thread pool, no double-hop)."""
         from services.preview_service import (
             _WARMED_URLS, _WARMED_URLS_LOCK,
-            resolve_stream_info,
+            warm_youtube_resolve_only,
         )
         from services.youtube_innertube import extract_video_id
         import time as _tm
@@ -129,18 +129,36 @@ async def _app_lifespan(_app: FastAPI):
         if not sorted_channels:
             return
 
-        # Collect first unique URLs (2 per channel, deduped by video ID)
+        # ponytail: warm first-per-kind-per-channel so every tab's top row is
+        # instant on click — not just the newest 2 of each channel. Matches the
+        # frontend's KINDS = ['vods', 'clips', 'streams'] grouping; 'shorts'
+        # live in clipVideos under YouTube-only filter (handled by clips kind).
+        KINDS = ("vods", "clips", "streams")
         first_urls: list[str] = []
         seen_vids: set[str] = set()
         for ch_videos in sorted_channels:
-            for v in ch_videos[:2]:
-                url = v["url"]
-                vid = extract_video_id(url)
-                if vid:
-                    if vid in seen_vids:
+            picked: set[str] = set()
+            for kind in KINDS:
+                for v in ch_videos:
+                    url = v.get("url") or ""
+                    if not url:
                         continue
-                    seen_vids.add(vid)
-                first_urls.append(url)
+                    ckind = v.get("content_kind") or ""
+                    if kind == "vods" and ckind in ("stream", "clip"):
+                        continue
+                    if kind == "clips" and ckind != "clip":
+                        continue
+                    if kind == "streams" and ckind != "stream":
+                        continue
+                    # youtube.com / shorts / youtu.be already filtered above
+                    vid = extract_video_id(url)
+                    if vid and vid in seen_vids:
+                        continue
+                    if vid:
+                        seen_vids.add(vid)
+                    first_urls.append(url)
+                    picked.add(url)
+                    break
 
         logger.info(
             "STARTUP_SYNC_WARM: sequentially resolving %d URLs (takes ~%ds)",
@@ -151,9 +169,12 @@ async def _app_lifespan(_app: FastAPI):
         for u in first_urls:
             try:
                 t0 = _tm.time()
-                # warm_light: InnerTube fast pass only — a members-only/deleted
-                # video must not hold startup readiness hostage behind yt-dlp.
-                resolve_stream_info(u, prefer_height=360, warm_light=True)
+                # warm_youtube_resolve_only does InnerTube fast pass + prog head
+                # warm + session snapshot build. The snapshot is what makes the
+                # click path skip the ~5s extract + variant-build + master work;
+                # the prog head warm serves the first 12 MB from local disk so
+                # the browser's canplay path doesn't hit googlevideo cold.
+                warm_youtube_resolve_only(u, prefer_height=360)
                 with _WARMED_URLS_LOCK:
                     _WARMED_URLS.add(u)
                 logger.info(

@@ -1,7 +1,40 @@
 import Hls from 'hls.js';
 import { apiPost } from './hooks/useApiClient';
 import { detectUrlPlatform, isClipUrl } from './channelUtils';
-import type { PreviewSessionStatusResponse } from './types';
+import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './types';
+
+/** Permanent-failure messages — retrying these can never succeed. */
+const _PREVIEW_CREATE_FATAL_RE = /members-only|membership|unavailable|private|removed/i;
+const _PREVIEW_CREATE_RETRIES = 2;
+
+/**
+ * POST /api/preview/session with bounded retries. A click that hits a cold
+ * extract under load can 500 once while the server-side chain would succeed
+ * a second later (inflight dedupe makes the retry cheap). Permanent failures
+ * (members-only/unavailable/private) throw immediately.
+ */
+export async function createPreviewSessionWithRetry(body: {
+  url: string;
+  crop_start: number;
+  crop_end: number;
+  prefer_height: number;
+}): Promise<PreviewSessionResponse> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= _PREVIEW_CREATE_RETRIES; attempt++) {
+    try {
+      return await apiPost<PreviewSessionResponse>('/api/preview/session', body);
+    } catch (err: unknown) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (_PREVIEW_CREATE_FATAL_RE.test(msg)) throw err;
+      if (attempt < _PREVIEW_CREATE_RETRIES) {
+        // ponytail: same executor form as useApiClient — tsconfig lib predates ES2024 Promise.withResolvers
+        await new Promise<void>((resolve) => { window.setTimeout(resolve, 1200 * (attempt + 1)); });
+      }
+    }
+  }
+  throw lastErr;
+}
 
 const _warmInflight = new Set<string>();
 const _warmTimers = new Map<string, number>();

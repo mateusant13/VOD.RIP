@@ -41,6 +41,7 @@ import {
   unlockPreviewAudioFromGesture,
   type PreviewLevelOption,
   isValidPreviewUrl,
+  createPreviewSessionWithRetry,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable } from './previewTiming';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
@@ -312,7 +313,7 @@ export default function ChannelExplorePopup({
         // the info fetch in parallel; if it returns a real duration, send a
         // seek to clamp the trim window.
         const knownDuration = vod.durationSec;
-        const sessionPromise = apiPost<PreviewSessionResponse>('/api/preview/session', {
+        const sessionPromise = createPreviewSessionWithRetry({
           url: vod.url,
           crop_start: 0,
           crop_end: knownDuration > 0 ? knownDuration : 0,
@@ -320,7 +321,17 @@ export default function ChannelExplorePopup({
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
         if (cancelled) {
-          try { await apiDelete(`/api/preview/session/${res.session_id}`); } catch { /* ignore */ }
+          // ponytail: StrictMode runs this effect twice — the twin run can
+          // apply the SAME session (backend dedups concurrent same-URL
+          // creates via the warm shell). Deleting here killed the live twin
+          // ~3s later (grace expiry), leaving the popup spinning forever.
+          // Delay and re-check: only delete if no run applied this session.
+          const orphanSid = res.session_id;
+          setTimeout(() => {
+            if (sessionIdRef.current !== orphanSid) {
+              void apiDelete(`/api/preview/session/${orphanSid}`).catch(() => {});
+            }
+          }, 5000);
           return;
         }
         // ponytail: res.duration_sec comes from the extract — prefer it over

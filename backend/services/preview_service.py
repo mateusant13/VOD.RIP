@@ -233,8 +233,16 @@ def _youtube_prog_head_warm(
     if not prog_url:
         logger.info("prog head warm: %s no prog url at h=%d", vid, prefer_height)
         return False
+    # Key the cache by the PICKED tier's real height, not the requested one:
+    # _try_prog_head_proxy looks up by session_active_height (the tier actually
+    # being played). Keying by request (360) while the only muxed tier is 640
+    # made every click miss the warm cache and re-fetch the moov upstream (~3s).
+    picked_height = next(
+        (int(f.get("height") or 0) for f in muxed if (f.get("url") or "") == prog_url),
+        prefer_height,
+    )
     mux_hdrs = _merge_youtube_session_cookies(headers or {}, url)
-    bin_path, meta_path = _prog_head_paths(vid, prefer_height)
+    bin_path, meta_path = _prog_head_paths(vid, picked_height or prefer_height)
     tmp = bin_path.with_suffix(".part")
     try:
         from curl_cffi import requests as cffi_requests
@@ -272,7 +280,7 @@ def _youtube_prog_head_warm(
         os.replace(tmp, bin_path)
         meta_path.write_text(json.dumps({"total": total, "ts": time.time()}), encoding="utf-8")
         _prog_head_enforce_budget()
-        logger.info("prog head warm: %s h=%d bytes=%d", vid, prefer_height, written)
+        logger.info("prog head warm: %s h=%d bytes=%d", vid, picked_height or prefer_height, written)
         return True
     except Exception as exc:
         logger.info("prog head warm failed %s: %s", vid, exc)
@@ -2405,20 +2413,32 @@ def _extract_youtube_preview_info(
         vid = extract_video_id(full_url)
     except Exception:
         vid = None
+    anon_fut = None
     if vid and not warm_light and not oauth:
+        # Staggered hedge: the anonymous probe gets a short solo window (its
+        # healthy path lands in <1s — common case starts no chain and burns no
+        # cookie quota). If it hasn't won by then, the full chain starts
+        # alongside; a late anon win is still honored if the chain fails.
+        anon_fut = _ANON_PROBE_EXECUTOR.submit(
+            innertube_extract_360p_anonymous, full_url, read_timeout=3.0
+        )
         try:
-            anon_info = innertube_extract_360p_anonymous(full_url, read_timeout=3.0)
+            anon_info = anon_fut.result(timeout=_ANON_PROBE_HEAD_START_SEC)
+        except FuturesTimeoutError:
+            anon_info = None
+            logger.debug("anonymous 360p slow for %s — hedging with full chain", vid)
         except Exception:
+            anon_fut = None
             anon_info = None
         if anon_info and not _youtube_info_is_dash_only_progressive(anon_info):
             return anon_info
-        # ponytail: anonymous path failed — YouTube is bot-gating this IP for
-        # this video. Don't burn 30s on the full yt-dlp chain (it will hit the
-        # same gate). Fail fast with a short message so the click returns
-        # promptly; the caller retries on demand.
-        raise RuntimeError(
-            "Preview unavailable for this video — try again in a moment."
-        )
+        if anon_fut is None:
+            # Anonymous path failed — fall through to the full chain. It races
+            # InnerTube with po_token/visitor_data + yt-dlp and succeeds on videos
+            # where bare ANDROID_VR is bot-gated (LOGIN_REQUIRED); a hard fail-fast
+            # here 500'd every click on those videos even though the full chain
+            # resolves them in ~3s.
+            logger.debug("anonymous 360p miss for %s — falling through to full chain", vid)
     from deps import settings_mgr
     from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
 
@@ -2426,7 +2446,18 @@ def _extract_youtube_preview_info(
     opts = youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies)
     if warm_light:
         opts["_warm_light"] = True
-    return cached_extract_info(full_url, opts)
+    try:
+        return cached_extract_info(full_url, opts)
+    except Exception:
+        if anon_fut is not None:
+            try:
+                late = anon_fut.result(timeout=0)
+            except Exception:
+                late = None
+            if late and not _youtube_info_is_dash_only_progressive(late):
+                logger.info("anonymous 360p late win for %s after chain failure", vid)
+                return late
+        raise
 
 
 def _deduped_hls_variants(info: dict) -> List[dict]:
@@ -4177,11 +4208,59 @@ def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:
         logger.debug("YouTube warm wait timed out for %s", key[:80])
 
 
+# Bounded background full-chain warm for videos the light (InnerTube-only)
+# batch warm can't resolve — typically bot-gated-on-anon videos that the full
+# auth chain handles in ~3s. Single worker so it can never starve clicks, and
+# a global backoff so a real IP-level bot-gate stops the queue instead of
+# grinding 33s × N videos and feeding the ban.
+from concurrent.futures import ThreadPoolExecutor as _TPE
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+_FULL_WARM_EXECUTOR = _TPE(max_workers=1, thread_name_prefix="yt-full-warm")
+_ANON_PROBE_EXECUTOR = _TPE(max_workers=2, thread_name_prefix="yt-anon")
+# Solo window for the anonymous 360p probe before the full chain hedges in —
+# healthy anon lands in <1s, so the common case never starts the chain at all.
+_ANON_PROBE_HEAD_START_SEC = 1.0
+_full_warm_queued: Set[str] = set()
+_full_warm_backoff_until = 0.0
+_FULL_WARM_BACKOFF_SEC = 600.0
+
+
+def _enqueue_full_warm(
+    url: str, oauth: Optional[str], cookies_file: Optional[str], prefer_height: int
+) -> None:
+    global _full_warm_backoff_until
+    if time.monotonic() < _full_warm_backoff_until:
+        return
+    if url in _full_warm_queued:
+        return
+    _full_warm_queued.add(url)
+
+    def _run() -> None:
+        global _full_warm_backoff_until
+        try:
+            warm_youtube_preview_resolve(
+                url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height,
+                reraise=True,
+            )
+        except Exception as exc:
+            from services.ytdlp_hls import _youtube_soft_neg_error
+
+            if _youtube_soft_neg_error(exc):
+                _full_warm_backoff_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+        finally:
+            _full_warm_queued.discard(url)
+
+    _FULL_WARM_EXECUTOR.submit(_run)
+
+
 def warm_youtube_preview_resolve(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
+    *,
+    reraise: bool = False,
 ) -> bool:
     """Populate resolved-stream cache on hover — same path as create_session.
 
@@ -4200,6 +4279,8 @@ def warm_youtube_preview_resolve(
         kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
     except Exception as exc:
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
+        if reraise:
+            raise
         return False
     try:
         snap = _build_youtube_session_snapshot(
@@ -4239,6 +4320,16 @@ def warm_youtube_resolve_only(
             url, oauth=oauth, prefer_height=prefer_height, warm_light=True
         )
     except Exception as exc:
+        # ponytail: light pass failed — usually anon-bot-gated videos the full
+        # chain resolves in ~3s. Falling back inline here saturated
+        # WARM_EXECUTOR + the yt-dlp lock and starved real clicks (measured:
+        # 90s+ create timeouts during a warm storm), so the full-chain retry
+        # runs on a dedicated single worker with a bot-gate backoff instead.
+        # Fatal failures (members-only/unavailable) are never re-tried.
+        from services.ytdlp_hls import _youtube_fatal_extract_error
+
+        if not _youtube_fatal_extract_error(exc):
+            _enqueue_full_warm(url, oauth, cookies_file, prefer_height)
         logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
         return False
     # ponytail: preflight the head + mux so the first 5s of playable bytes are
@@ -5232,256 +5323,257 @@ delete_session = _manager.delete_session
 get_session = _manager.get_session
 create_session = _manager.create_session
 
-assert _formats_are_dash_https([{"protocol": "https", "url": "https://x/v.mp4"}])
-assert not _formats_are_dash_https(
-    [{"protocol": "m3u8_native", "url": "https://x/m.m3u8"}]
-)
-# ponytail: self-check — YouTube segments must not be classified as playlists
-assert not _is_playlist_url(
-    "https://rr1---sn.example.googlevideo.com/videoplayback/id/x/itag/231"
-    "/source/youtube/playlist/index.m3u8/seg.ts"
-)
-assert _is_playlist_url(
-    "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/master.m3u8"
-)
-assert _clamp_range_header("bytes=8388608-8454143", 3697756) == "bytes=3435612-3697755"
-assert preview_mux_ready(
-    PreviewSession(
+if __name__ == "__main__":  # ponytail: self-checks — were module-level, did disk I/O at import (ENOSPC crash)
+    assert _formats_are_dash_https([{"protocol": "https", "url": "https://x/v.mp4"}])
+    assert not _formats_are_dash_https(
+        [{"protocol": "m3u8_native", "url": "https://x/m.m3u8"}]
+    )
+    # ponytail: self-check — YouTube segments must not be classified as playlists
+    assert not _is_playlist_url(
+        "https://rr1---sn.example.googlevideo.com/videoplayback/id/x/itag/231"
+        "/source/youtube/playlist/index.m3u8/seg.ts"
+    )
+    assert _is_playlist_url(
+        "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/master.m3u8"
+    )
+    assert _clamp_range_header("bytes=8388608-8454143", 3697756) == "bytes=3435612-3697755"
+    assert preview_mux_ready(
+        PreviewSession(
+            session_id="x",
+            vod_url="",
+            master_url="",
+            entry_url="",
+            platform="Kick",
+        )
+    )
+    _window_pl_sess = PreviewSession(
         session_id="x",
         vod_url="",
         master_url="",
         entry_url="",
-        platform="Kick",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=60,
+        dash_window_hls=True,
+        custom_master="#EXTM3U\n",
     )
-)
-_window_pl_sess = PreviewSession(
-    session_id="x",
-    vod_url="",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=60,
-    dash_window_hls=True,
-    custom_master="#EXTM3U\n",
-)
-assert not preview_playlist_ready(_window_pl_sess)
-# mux_ready requires on-disk seg0; custom_master alone does not flip mux_ready
-assert not preview_mux_ready(_window_pl_sess)
-assert not preview_segment_buffer_ready(_window_pl_sess)
-assert _bytes_response_for_range(b"abcdef", "bytes=1-3")[2] == 206
-assert issubclass(PreviewMuxPending, RuntimeError)
-_dash_only = {
-    "formats": [
-        {
-            "height": 720,
-            "protocol": "https",
-            "url": "https://x/v.mp4",
-            "acodec": "none",
-        },
-        {
-            "height": 480,
-            "protocol": "https",
-            "url": "https://x/v2.mp4",
-            "acodec": "none",
-        },
-    ],
-}
-assert _youtube_info_is_dash_only_progressive(_dash_only)
-assert not _youtube_info_is_dash_only_progressive(
-    {
+    assert not preview_playlist_ready(_window_pl_sess)
+    # mux_ready requires on-disk seg0; custom_master alone does not flip mux_ready
+    assert not preview_mux_ready(_window_pl_sess)
+    assert not preview_segment_buffer_ready(_window_pl_sess)
+    assert _bytes_response_for_range(b"abcdef", "bytes=1-3")[2] == 206
+    assert issubclass(PreviewMuxPending, RuntimeError)
+    _dash_only = {
         "formats": [
-            {"height": 720, "protocol": "m3u8_native", "url": "https://x/m.m3u8"}
+            {
+                "height": 720,
+                "protocol": "https",
+                "url": "https://x/v.mp4",
+                "acodec": "none",
+            },
+            {
+                "height": 480,
+                "protocol": "https",
+                "url": "https://x/v2.mp4",
+                "acodec": "none",
+            },
         ],
     }
-)
-assert _youtube_needs_dash_window_hls(
-    _dash_only["formats"],
-    {"_preview_audio_format": {"url": "https://x/a.m4a"}},
-    crop_span_sec=30,
-)
-assert _youtube_needs_dash_window_hls(
-    _dash_only["formats"],
-    {"_preview_audio_format": {"url": "https://x/a.m4a"}},
-    crop_span_sec=120,
-)
-assert not _youtube_needs_dash_window_hls(_dash_only["formats"], {})
-_window_sess = PreviewSession(
-    session_id="x",
-    vod_url="https://www.youtube.com/watch?v=x",
-    platform="YouTube",
-    master_url="",
-    entry_url="https://example.com/v",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=25,
-    dash_window_hls=True,
-)
-_pl = _build_youtube_window_hls_master(_window_sess)
-assert _pl.startswith("#EXTM3U") and "window-playlist" in _pl
-assert _pl.splitlines()[3].startswith("#EXT-X-STREAM-INF:")
-assert "resource?id=window-playlist" in _pl
-assert _window_pl_sess.dash_window_hls is True
-assert session_trim_timeline(_window_sess) is True
-_explore_sess = PreviewSession(
-    session_id="y",
-    vod_url="https://www.youtube.com/watch?v=y",
-    platform="YouTube",
-    master_url="",
-    entry_url="https://example.com/v",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=7200,
-    dash_window_hls=True,
-)
-assert session_trim_timeline(_explore_sess) is False
-assert _window_hls_dir(_window_sess).name == "window_hls"
-assert _window_hls_playlist_path(_window_sess).name == "window.m3u8"
-assert _window_hls_segment_path(_window_sess, 0).name == "seg_000.ts"
-assert _window_hls_segment_path(_window_sess, 7).name == "seg_007.ts"
-assert not _window_hls_seg0_ready(_window_sess)
-assert not _window_hls_playlist_complete(_window_sess)
-_window_hls_dir(_window_sess).mkdir(parents=True, exist_ok=True)
-(_window_hls_dir(_window_sess) / "seg_000.ts").write_bytes(b"\x47" * 60000)
-assert _window_hls_seg0_ready(_window_sess)
-_stamp_window_hls_mux_start(_window_sess, 0)
-assert _window_hls_seg0_matches_bounds(_window_sess)
-_clear_youtube_window_hls_cache(_window_sess)
-assert not _window_hls_seg0_matches_bounds(_window_sess)
-import shutil as _sh
+    assert _youtube_info_is_dash_only_progressive(_dash_only)
+    assert not _youtube_info_is_dash_only_progressive(
+        {
+            "formats": [
+                {"height": 720, "protocol": "m3u8_native", "url": "https://x/m.m3u8"}
+            ],
+        }
+    )
+    assert _youtube_needs_dash_window_hls(
+        _dash_only["formats"],
+        {"_preview_audio_format": {"url": "https://x/a.m4a"}},
+        crop_span_sec=30,
+    )
+    assert _youtube_needs_dash_window_hls(
+        _dash_only["formats"],
+        {"_preview_audio_format": {"url": "https://x/a.m4a"}},
+        crop_span_sec=120,
+    )
+    assert not _youtube_needs_dash_window_hls(_dash_only["formats"], {})
+    _window_sess = PreviewSession(
+        session_id="x",
+        vod_url="https://www.youtube.com/watch?v=x",
+        platform="YouTube",
+        master_url="",
+        entry_url="https://example.com/v",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=25,
+        dash_window_hls=True,
+    )
+    _pl = _build_youtube_window_hls_master(_window_sess)
+    assert _pl.startswith("#EXTM3U") and "window-playlist" in _pl
+    assert _pl.splitlines()[3].startswith("#EXT-X-STREAM-INF:")
+    assert "resource?id=window-playlist" in _pl
+    assert _window_pl_sess.dash_window_hls is True
+    assert session_trim_timeline(_window_sess) is True
+    _explore_sess = PreviewSession(
+        session_id="y",
+        vod_url="https://www.youtube.com/watch?v=y",
+        platform="YouTube",
+        master_url="",
+        entry_url="https://example.com/v",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=7200,
+        dash_window_hls=True,
+    )
+    assert session_trim_timeline(_explore_sess) is False
+    assert _window_hls_dir(_window_sess).name == "window_hls"
+    assert _window_hls_playlist_path(_window_sess).name == "window.m3u8"
+    assert _window_hls_segment_path(_window_sess, 0).name == "seg_000.ts"
+    assert _window_hls_segment_path(_window_sess, 7).name == "seg_007.ts"
+    assert not _window_hls_seg0_ready(_window_sess)
+    assert not _window_hls_playlist_complete(_window_sess)
+    _window_hls_dir(_window_sess).mkdir(parents=True, exist_ok=True)
+    (_window_hls_dir(_window_sess) / "seg_000.ts").write_bytes(b"\x47" * 60000)
+    assert _window_hls_seg0_ready(_window_sess)
+    _stamp_window_hls_mux_start(_window_sess, 0)
+    assert _window_hls_seg0_matches_bounds(_window_sess)
+    _clear_youtube_window_hls_cache(_window_sess)
+    assert not _window_hls_seg0_matches_bounds(_window_sess)
+    import shutil as _sh
 
-_sh.rmtree(_window_hls_dir(_window_sess), ignore_errors=True)
-# Build a synthetic session for media-playlist builder assertions (no network).
-import tempfile as _tmp
+    _sh.rmtree(_window_hls_dir(_window_sess), ignore_errors=True)
+    # Build a synthetic session for media-playlist builder assertions (no network).
+    import tempfile as _tmp
 
-_with_dir = _tmp.mkdtemp(prefix="dash_window_hls_test_")
-_mp_sess = PreviewSession(
-    session_id="mp",
-    vod_url="https://www.youtube.com/watch?v=x",
-    platform="YouTube",
-    master_url="",
-    entry_url="https://example.com/v",
-    cache_dir=Path(_with_dir),
-    crop_start=0,
-    crop_end=20,
-    dash_window_hls=True,
-)
-(_with_dir_p := Path(_with_dir) / "window_hls").mkdir(parents=True, exist_ok=True)
-(_with_dir_p / "seg_000.ts").write_bytes(b"\x47" * 60000)
-(_with_dir_p / "seg_001.ts").write_bytes(b"\x47" * 50000)
-(_with_dir_p / "window.m3u8").write_text(
-    "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:5\n"
-    "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
-    "#EXTINF:4.000,\nseg_000.ts\n#EXTINF:4.000,\nseg_001.ts\n#EXT-X-ENDLIST\n",
-    encoding="utf-8",
-)
-_mp_body = _build_youtube_window_hls_media_playlist(_mp_sess)
-assert _mp_body.startswith(b"#EXTM3U")
-assert b"window-seg-000" in _mp_body
-assert b"window-seg-001" in _mp_body
-assert b"#EXT-X-ENDLIST" in _mp_body
-assert preview_mux_ready(_mp_sess)
-assert _window_hls_playlist_complete(_mp_sess)
-_register_youtube_window_hls_resources(_mp_sess)
-assert _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE] == f"{WINDOW_HLS_MARKER}playlist"
-_mp_seg_ext = ".m4s" if USE_FMP4 else ".ts"
-assert _mp_sess.resource_map["window-seg-000"] == f"{WINDOW_HLS_MARKER}seg_000{_mp_seg_ext}"
-assert _mp_sess.resource_map["window-seg-001"] == f"{WINDOW_HLS_MARKER}seg_001{_mp_seg_ext}"
-if USE_FMP4:
-    assert _mp_sess.resource_map[WINDOW_HLS_INIT_RESOURCE] == f"{WINDOW_HLS_MARKER}init.mp4"
-    assert b"#EXT-X-PART-INF" in _mp_body
-    assert b"#EXT-X-SERVER-CONTROL" in _mp_body
-    assert b"#EXT-X-MAP:URI=\"" in _mp_body
-    assert b"#EXT-X-PART:DURATION=0.5" in _mp_body
-    assert b"#EXT-X-PRELOAD-HINT" in _mp_body
-    assert _mp_body.splitlines()[1].startswith(b"#EXT-X-VERSION:9")
-assert _is_youtube_window_hls_resource(
-    _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE]
-)
-assert _is_youtube_window_hls_resource("youtube-window-hls:anything")
-assert not _is_youtube_window_hls_resource("https://googlevideo.com/v")
-_sh.rmtree(_with_dir, ignore_errors=True)
-assert _get_resolved_stream_cached("missing:key") is None
-_put_resolved_stream_cache("t:720", ("u", {}, "YouTube", [], "hls", {}))
-assert _get_resolved_stream_cached("t:720")[0] == "u"
-assert int("window-seg-000".rsplit("-", 1)[1]) == 0
-_sess = PreviewSession(
-    session_id="t",
-    vod_url="",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=7200,
-)
-_clamp_session_crop_to_vod_duration(_sess, {"duration": 212})
-assert _sess.crop_end == 212
-assert _sess.vod_duration == 212
-_under = PreviewSession(
-    session_id="u",
-    vod_url="",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=50,
-)
-_clamp_session_crop_to_vod_duration(_under, {"duration": 19})
-assert _under.crop_end == 50 and _under.vod_duration == 50
-_placeholder = PreviewSession(
-    session_id="p",
-    vod_url="https://www.youtube.com/watch?v=x",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=7200,
-)
-_clamp_session_crop_to_vod_duration(_placeholder, {"duration": 19})
-assert _placeholder.crop_end == 19, (
-    "placeholder clamp without extract dur stays at extract dur"
-)
-assert (
-    _youtube_warm_inflight_key("https://www.youtube.com/shorts/dQw4w9WgXcQ")
-    == "dQw4w9WgXcQ"
-)
-assert (
-    _youtube_warm_inflight_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    == "dQw4w9WgXcQ"
-)
-_long = PreviewSession(
-    session_id="long",
-    vod_url="",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=1158,
-    dash_window_hls=True,
-)
-_lo, _hi = _window_hls_mux_bounds(_long)
-assert _hi - _lo <= WINDOW_HLS_INITIAL_CHUNK_SEC + 0.01
-assert _hi == WINDOW_HLS_INITIAL_CHUNK_SEC
-_short = PreviewSession(
-    session_id="short",
-    vod_url="",
-    master_url="",
-    entry_url="",
-    platform="YouTube",
-    cache_dir=Path("/tmp"),
-    crop_start=0,
-    crop_end=30,
-    dash_window_hls=True,
-)
-_slo, _shi = _window_hls_mux_bounds(_short)
-assert _shi == 30 and _slo == 0
-_seek_lo, _seek_hi = _window_hls_mux_bounds(_long, around_sec=868.5)
-assert _seek_lo < 868.5 < _seek_hi
-assert _seek_hi - _seek_lo <= WINDOW_HLS_MUX_CHUNK_SEC + 0.01
-_long.vod_duration = WINDOW_HLS_LONG_VOD_MIN_SEC + 1
-assert _window_hls_seek_chunk_sec(_long) == WINDOW_HLS_MUX_CHUNK_LONG_SEC
+    _with_dir = _tmp.mkdtemp(prefix="dash_window_hls_test_")
+    _mp_sess = PreviewSession(
+        session_id="mp",
+        vod_url="https://www.youtube.com/watch?v=x",
+        platform="YouTube",
+        master_url="",
+        entry_url="https://example.com/v",
+        cache_dir=Path(_with_dir),
+        crop_start=0,
+        crop_end=20,
+        dash_window_hls=True,
+    )
+    (_with_dir_p := Path(_with_dir) / "window_hls").mkdir(parents=True, exist_ok=True)
+    (_with_dir_p / "seg_000.ts").write_bytes(b"\x47" * 60000)
+    (_with_dir_p / "seg_001.ts").write_bytes(b"\x47" * 50000)
+    (_with_dir_p / "window.m3u8").write_text(
+        "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:5\n"
+        "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        "#EXTINF:4.000,\nseg_000.ts\n#EXTINF:4.000,\nseg_001.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    _mp_body = _build_youtube_window_hls_media_playlist(_mp_sess)
+    assert _mp_body.startswith(b"#EXTM3U")
+    assert b"window-seg-000" in _mp_body
+    assert b"window-seg-001" in _mp_body
+    assert b"#EXT-X-ENDLIST" in _mp_body
+    assert preview_mux_ready(_mp_sess)
+    assert _window_hls_playlist_complete(_mp_sess)
+    _register_youtube_window_hls_resources(_mp_sess)
+    assert _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE] == f"{WINDOW_HLS_MARKER}playlist"
+    _mp_seg_ext = ".m4s" if USE_FMP4 else ".ts"
+    assert _mp_sess.resource_map["window-seg-000"] == f"{WINDOW_HLS_MARKER}seg_000{_mp_seg_ext}"
+    assert _mp_sess.resource_map["window-seg-001"] == f"{WINDOW_HLS_MARKER}seg_001{_mp_seg_ext}"
+    if USE_FMP4:
+        assert _mp_sess.resource_map[WINDOW_HLS_INIT_RESOURCE] == f"{WINDOW_HLS_MARKER}init.mp4"
+        assert b"#EXT-X-PART-INF" in _mp_body
+        assert b"#EXT-X-SERVER-CONTROL" in _mp_body
+        assert b"#EXT-X-MAP:URI=\"" in _mp_body
+        assert b"#EXT-X-PART:DURATION=0.5" in _mp_body
+        assert b"#EXT-X-PRELOAD-HINT" in _mp_body
+        assert _mp_body.splitlines()[1].startswith(b"#EXT-X-VERSION:9")
+    assert _is_youtube_window_hls_resource(
+        _mp_sess.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE]
+    )
+    assert _is_youtube_window_hls_resource("youtube-window-hls:anything")
+    assert not _is_youtube_window_hls_resource("https://googlevideo.com/v")
+    _sh.rmtree(_with_dir, ignore_errors=True)
+    assert _get_resolved_stream_cached("missing:key") is None
+    _put_resolved_stream_cache("t:720", ("u", {}, "YouTube", [], "hls", {}))
+    assert _get_resolved_stream_cached("t:720")[0] == "u"
+    assert int("window-seg-000".rsplit("-", 1)[1]) == 0
+    _sess = PreviewSession(
+        session_id="t",
+        vod_url="",
+        master_url="",
+        entry_url="",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=7200,
+    )
+    _clamp_session_crop_to_vod_duration(_sess, {"duration": 212})
+    assert _sess.crop_end == 212
+    assert _sess.vod_duration == 212
+    _under = PreviewSession(
+        session_id="u",
+        vod_url="",
+        master_url="",
+        entry_url="",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=50,
+    )
+    _clamp_session_crop_to_vod_duration(_under, {"duration": 19})
+    assert _under.crop_end == 50 and _under.vod_duration == 50
+    _placeholder = PreviewSession(
+        session_id="p",
+        vod_url="https://www.youtube.com/watch?v=x",
+        master_url="",
+        entry_url="",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=7200,
+    )
+    _clamp_session_crop_to_vod_duration(_placeholder, {"duration": 19})
+    assert _placeholder.crop_end == 19, (
+        "placeholder clamp without extract dur stays at extract dur"
+    )
+    assert (
+        _youtube_warm_inflight_key("https://www.youtube.com/shorts/dQw4w9WgXcQ")
+        == "dQw4w9WgXcQ"
+    )
+    assert (
+        _youtube_warm_inflight_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        == "dQw4w9WgXcQ"
+    )
+    _long = PreviewSession(
+        session_id="long",
+        vod_url="",
+        master_url="",
+        entry_url="",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=1158,
+        dash_window_hls=True,
+    )
+    _lo, _hi = _window_hls_mux_bounds(_long)
+    assert _hi - _lo <= WINDOW_HLS_INITIAL_CHUNK_SEC + 0.01
+    assert _hi == WINDOW_HLS_INITIAL_CHUNK_SEC
+    _short = PreviewSession(
+        session_id="short",
+        vod_url="",
+        master_url="",
+        entry_url="",
+        platform="YouTube",
+        cache_dir=Path("/tmp"),
+        crop_start=0,
+        crop_end=30,
+        dash_window_hls=True,
+    )
+    _slo, _shi = _window_hls_mux_bounds(_short)
+    assert _shi == 30 and _slo == 0
+    _seek_lo, _seek_hi = _window_hls_mux_bounds(_long, around_sec=868.5)
+    assert _seek_lo < 868.5 < _seek_hi
+    assert _seek_hi - _seek_lo <= WINDOW_HLS_MUX_CHUNK_SEC + 0.01
+    _long.vod_duration = WINDOW_HLS_LONG_VOD_MIN_SEC + 1
+    assert _window_hls_seek_chunk_sec(_long) == WINDOW_HLS_MUX_CHUNK_LONG_SEC

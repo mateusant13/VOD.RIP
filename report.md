@@ -596,3 +596,9 @@ However, the codebase is accumulating debt faster than it's being paid down:
 ---
 
 *Audit conducted by Buffy (Codebuff AI agent) on June 15, 2026.*
+
+## 2026-07-27 - preview races + StrictMode twin-delete fix
+- Fallback extract race (ytdlp_hls): slow InnerTube solo 6s gate, yt-dlp x2 joins only if InnerTube has not won; first playable wins, losers cancelled.
+- Anon-360p hedge (preview_service): 1s solo window before full chain starts; late anon win honored on chain failure.
+- FIX: React StrictMode double-fired popup create; backend dedup gave both runs the same session, and the cancelled twin DELETEed it -> backgrounded popups died ~3s in and resume spun forever. ChannelExplorePopup now delays the orphan delete 5s and skips it when the session was applied.
+- Verified live (ungated): cold 9h VOD create 3.2s; 5 concurrent creates 4x200 in 4-16s + 1 dead-video honest fail; 5 rapid popup clicks -> 1 playing, 1 buffered, 3 honest errors, 0 stray deletes; backgrounded popup resumes.

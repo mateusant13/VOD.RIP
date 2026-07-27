@@ -394,17 +394,21 @@ def list_channel_videos_sync(
                 "url": webpage,
                 "channel": e.get("channel") or e.get("uploader") or channel_ref,
                 "content_kind": content_kind,
+                "availability": e.get("availability"),  # e.g. subscriber_only -> members-only
             }
 
-    # Filter by requested playlist type
+    # Filter by requested playlist type. Members-only rows are dropped entirely
+    # (availability=subscriber_only from the flat playlist extract): they can't
+    # be previewed or downloaded, so they only produce guaranteed-failure clicks.
+    members_only = lambda v: v.get("availability") == "subscriber_only"  # noqa: E731
     if playlist == "videos":
-        filtered = [v for v in all_videos.values() if v["content_kind"] == "vod"]
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "vod" and not members_only(v)]
     elif playlist == "shorts":
-        filtered = [v for v in all_videos.values() if v["content_kind"] == "clip"]
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "clip" and not members_only(v)]
     elif playlist == "streams":
-        filtered = [v for v in all_videos.values() if v["content_kind"] == "stream"]
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "stream" and not members_only(v)]
     else:
-        filtered = list(all_videos.values())
+        filtered = [v for v in all_videos.values() if not members_only(v)]
 
     # Sort by date newest first; items without dates preserve playlist order
     filtered.sort(key=lambda v: (_parse_video_ts(v.get("created_at")) or 0, -(v.get("_list_order", 0))), reverse=True)

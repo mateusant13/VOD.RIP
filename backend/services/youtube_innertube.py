@@ -466,6 +466,30 @@ def _streaming_url_formats(streaming: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# Last non-OK playability per video — lets callers turn a generic
+# "all clients exhausted" into the real reason ("This video is unavailable").
+# ponytail: bounded FIFO; only the last ~256 videos tracked. Upgrade path:
+# per-attempt return value plumbing through _race_profiles.
+_LAST_PLAYABILITY: dict[str, tuple[str, str, str]] = {}
+
+
+def _record_playability(
+    video_id: Optional[str], status: Optional[str], reason: Optional[str], kind: str
+) -> None:
+    if not video_id:
+        return
+    if len(_LAST_PLAYABILITY) > 256:
+        _LAST_PLAYABILITY.pop(next(iter(_LAST_PLAYABILITY)), None)
+    _LAST_PLAYABILITY[video_id] = (status or "", reason or "", kind)
+
+
+def innertube_last_playability(video_id: Optional[str]) -> tuple[str, str, str]:
+    """(status, reason, kind) of the last non-OK playability for a video, or blanks."""
+    if not video_id:
+        return ("", "", "")
+    return _LAST_PLAYABILITY.get(video_id) or ("", "", "")
+
+
 def _classify_http(status_code: int) -> FailureKind:
     if status_code in (403, 429, 500, 502, 503, 504):
         return "retry"
@@ -478,6 +502,12 @@ def _classify_playability(status: Optional[str], reason: Optional[str]) -> Failu
     if not status or status == "OK":
         return "ok"
     reason_l = (reason or "").lower()
+    # Permanently gone videos — retrying other clients/yt-dlp just burns 15-30s.
+    if any(
+        k in reason_l
+        for k in ("unavailable", "private", "removed", "deleted", "no longer available")
+    ):
+        return "fatal"
     if status == "LOGIN_REQUIRED" and ("age" in reason_l or "confirm your age" in reason_l):
         return "fatal"
     if status in ("ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"):
@@ -588,6 +618,7 @@ def _player_request(
     play = data.get("playabilityStatus") or {}
     pb_kind = _classify_playability(play.get("status"), play.get("reason"))
     if pb_kind != "ok":
+        _record_playability(video_id, play.get("status"), play.get("reason"), pb_kind)
         logger.debug(
             "InnerTube %s playability %s (%s) for %s",
             profile.name, play.get("status"), play.get("reason"), video_id,
@@ -1170,5 +1201,12 @@ assert _is_sabr_stream_url("https://x.googlevideo.com/videoplayback?sabr=1")
 assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
 assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "fatal"
 assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
+assert _classify_playability("ERROR", "This video is unavailable") == "fatal"
+assert _classify_playability("ERROR", "This video is private.") == "fatal"
+assert _classify_playability("LOGIN_REQUIRED", "Sign in to confirm you're not a bot") == "retry"
+_record_playability("abc12345678", "ERROR", "This video is unavailable", "fatal")
+assert innertube_last_playability("abc12345678") == ("ERROR", "This video is unavailable", "fatal")
+assert innertube_last_playability(None) == ("", "", "")
+assert innertube_last_playability("unknown0000") == ("", "", "")
 assert _profiles_for_session(None)[0].name == "WEB_SAFARI"
 assert "WEB_SAFARI" in _PROFILE_BY_NAME

@@ -148,6 +148,10 @@ _PREVIEW_EXTRACT_FALLBACK_SEC = (
 # cancelled (threads already inside the lock) and a bulk warm queues hundreds
 # of them, stalling the user's preview click for minutes behind the lock.
 _PREVIEW_YTDLP_GATE_SEC = 2.5
+# Solo window for the slow InnerTube merge in the fallback race before the
+# yt-dlp retry chain may join — yt-dlp×2 is the heaviest rate-limit consumer,
+# so it only runs when InnerTube clearly isn't landing (long VODs need ~3-6s).
+_FALLBACK_YTDLP_GATE_SEC = 6.0
 
 # Definitive unplayable markers (yt-dlp DownloadError text) — retrying these
 # just burns the global yt-dlp lock. Fail fast instead of grinding 6+ retries.
@@ -157,11 +161,33 @@ _YT_FATAL_MARKERS = (
     "private video",
     "this video has been removed",
     "this video is not available",
+    "this video is unavailable",
+    "video is unavailable",  # InnerTube playability: deleted/private/geo/members-converted
+    "video unavailable",  # WEB client's terse variant of the above
+    "login with oauth is no longer supported",  # yt-dlp dead auth path — never recovers on retry
 )
 # Negative cache for fatal extracts — a members-only row in a channel list gets
 # warmed, clicked, and re-clicked; don't re-run the whole chain every time.
 _EXTRACT_FATAL_CACHE: dict[str, tuple[float, str]] = {}
 _EXTRACT_FATAL_TTL_SEC = 300
+
+# Soft negative cache for bot-gate exhaustion ("Sign in to confirm you're not a
+# bot" / race exhausted). During an IP-level challenge every fresh extract
+# grinds ~33s and the extra traffic prolongs the gate — fail fast instead.
+# ponytail: keyed like the fatal cache; TTL deliberately short so a lifted gate
+# recovers within 2 min without a process restart.
+_YT_SOFT_NEG_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "preview unavailable for this video",
+)
+_EXTRACT_NEG_CACHE: dict[str, tuple[float, str]] = {}
+_EXTRACT_NEG_TTL_SEC = 120
+
+
+def _youtube_soft_neg_error(exc: BaseException) -> bool:
+    msg = (str(exc) or "").lower()
+    return any(m in msg for m in _YT_SOFT_NEG_MARKERS)
 
 
 def _youtube_fatal_extract_error(exc: BaseException) -> bool:
@@ -792,6 +818,12 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
     """Preview SLA: parallel race, one fresh-session retry, then full extract fallback."""
     t0 = time.monotonic()
     attempts: list[dict] = [opts]
+    from services.youtube_innertube import (
+        extract_video_id as _evid,
+        innertube_last_playability,
+    )
+
+    vid0 = _evid(url)
     if _youtube_manual_auth_configured():
         attempts.append(_merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url))
     elif not _youtube_has_user_auth(opts):
@@ -806,6 +838,11 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
         info = _youtube_extract_pass(url, attempt_opts)
         if info and _youtube_info_playable(info):
             return info
+        # InnerTube says the video is permanently gone (deleted/private/members) —
+        # skip the remaining passes and the 30s yt-dlp fallback grind entirely.
+        _st, _rs, _kd = innertube_last_playability(vid0)
+        if _kd == "fatal":
+            raise RuntimeError(_rs or "This video is unavailable")
         if i + 1 < len(attempts):
             remaining = _PREVIEW_EXTRACT_MAX_WALL_SEC - (time.monotonic() - t0)
             if remaining < 1.0:
@@ -854,24 +891,61 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
                 cached_cookie = find_fresh_cookie_cache()
                 if cached_cookie:
                     slow_opts["cookiefile"] = cached_cookie
-            try:
-                info = _try_innertube_info(
+            # Staggered race: slow InnerTube merge runs solo first; the yt-dlp
+            # retry chain (heaviest on YouTube rate limits) only joins if
+            # InnerTube hasn't won within the gate window. First playable
+            # result wins; the loser is settled/cancelled.
+            from services.youtube_diag import log_extract_ok
+
+            settled = threading.Event()
+
+            def _slow_inn() -> Optional[dict]:
+                return _try_innertube_info(
                     url,
                     session=yt_session,
                     allow_session_refresh=True,
                     preview_fast=False,
                 )
-                if info and _youtube_info_playable(info):
-                    return info
-            except Exception as exc:
-                logger.debug("preview slow innertube %s: %s", url[:60], exc)
-            if time.monotonic() < deadline:
-                try:
-                    info = _youtube_extract_with_retries(url, slow_opts, attempts=2)
-                    if info and _youtube_info_playable(info):
-                        return info
-                except Exception as exc:
-                    logger.debug("preview slow ytdlp %s: %s", url[:60], exc)
+
+            def _slow_ydl() -> Optional[dict]:
+                if settled.wait(_FALLBACK_YTDLP_GATE_SEC):
+                    return None
+                return _youtube_extract_with_retries(url, slow_opts, attempts=2)
+
+            pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-fallback")
+            try:
+                futures = {
+                    pool.submit(_slow_inn): "innertube_slow",
+                    pool.submit(_slow_ydl): "ytdlp_slow",
+                }
+                pending = set(futures.keys())
+                while pending and time.monotonic() < deadline:
+                    done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        try:
+                            info = fut.result()
+                        except Exception as exc:
+                            if _youtube_fatal_extract_error(exc):
+                                raise
+                            logger.debug(
+                                "preview fallback %s %s: %s",
+                                futures[fut],
+                                url[:60],
+                                exc,
+                            )
+                            continue
+                        if info and _youtube_info_playable(info):
+                            log_extract_ok(
+                                extract_video_id(url) or "?",
+                                futures[fut],
+                                info,
+                                yt_session,
+                            )
+                            return info
+            finally:
+                settled.set()
+                with contextlib.suppress(Exception):
+                    pool.shutdown(wait=False, cancel_futures=True)
 
     from services.youtube_diag import log_extract_fail
     from services.youtube_innertube import extract_video_id
@@ -897,6 +971,7 @@ assert (
     is True
 )
 assert _PREVIEW_EXTRACT_RACE_SEC <= _PREVIEW_EXTRACT_MAX_WALL_SEC
+assert _FALLBACK_YTDLP_GATE_SEC >= _PREVIEW_YTDLP_GATE_SEC  # yt-dlp joins slower in the fallback race
 assert _PREVIEW_EXTRACT_FALLBACK_SEC >= _PREVIEW_EXTRACT_WAIT_SEC
 assert preview_fast_only_mode.__name__ == "preview_fast_only_mode"
 assert _youtube_extract_preview_race.__name__ == "_youtube_extract_preview_race"
@@ -930,6 +1005,11 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             raise RuntimeError(fatal_hit[1])
         if fatal_hit:
             _EXTRACT_FATAL_CACHE.pop(key, None)
+        neg_hit = _EXTRACT_NEG_CACHE.get(key)
+        if neg_hit and (now - neg_hit[0]) < _EXTRACT_NEG_TTL_SEC:
+            raise RuntimeError(neg_hit[1])
+        if neg_hit:
+            _EXTRACT_NEG_CACHE.pop(key, None)
         inflight = _EXTRACT_INFLIGHT.get(key)
         if inflight is not None:
             leader = False
@@ -948,8 +1028,15 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         )
         if preview_fast_only_mode():
             wait_sec = min(wait_sec, _PREVIEW_EXTRACT_MAX_WALL_SEC + 2.0)
-        if not event.wait(timeout=wait_sec):
-            raise TimeoutError("YouTube metadata extract timed out")
+        # Wait up to 2 rounds: a slow leader (4h VOD under load) often lands a
+        # few seconds past the first timeout — failing the click then is the
+        # worst outcome. On the second timeout give up for real.
+        for attempt in range(2):
+            if event.wait(timeout=wait_sec):
+                break
+            if attempt == 1:
+                raise TimeoutError("YouTube metadata extract timed out")
+            logger.info("extract inflight wait %ds elapsed for %s — waiting once more", int(wait_sec), url[:60])
         with _EXTRACT_CACHE_LOCK:
             hit = _EXTRACT_INFO_CACHE.get(key)
             if hit and _youtube_cache_ok(url, opts, hit[1]):
@@ -1026,10 +1113,29 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 detail=str(exc)[:200],
             )
         box["error"] = exc
+        if isinstance(exc, Exception) and _youtube_url_from_opts(url, opts):
+            # The chain collapsed into a generic "unavailable" — prefer InnerTube's
+            # real playability reason as the raised message. Fatal reasons (deleted,
+            # private, members-converted) match the fatal markers below (cached, no
+            # 30s re-grind); transient ones (bot-gate LOGIN_REQUIRED) map to the
+            # honest "try again in a moment" user message via youtube_user_message.
+            from services.youtube_innertube import (
+                extract_video_id as _evid,
+                innertube_last_playability,
+            )
+
+            _pb_status, _pb_reason, _pb_kind = innertube_last_playability(_evid(url))
+            if _pb_kind != "ok" and _pb_reason:
+                exc = RuntimeError(_pb_reason)
+                box["error"] = exc
         if isinstance(exc, Exception) and _youtube_fatal_extract_error(exc):
             with _EXTRACT_CACHE_LOCK:
                 _EXTRACT_FATAL_CACHE[key] = (time.time(), str(exc)[:300])
-        raise
+        elif isinstance(exc, Exception) and not opts.get("_warm_light") and _youtube_soft_neg_error(exc):
+            # Don't cache warm_light failures — the click's full chain may still work.
+            with _EXTRACT_CACHE_LOCK:
+                _EXTRACT_NEG_CACHE[key] = (time.time(), str(exc)[:300])
+        raise exc  # not bare `raise` — re-raise the possibly-enriched message
     finally:
         with _EXTRACT_CACHE_LOCK:
             _EXTRACT_INFLIGHT.pop(key, None)

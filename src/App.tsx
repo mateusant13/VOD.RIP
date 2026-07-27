@@ -51,6 +51,7 @@ import {
   applyVideoLocalSeek,
   reloadWindowHlsAtPosition,
   shieldPreviewBuffering,
+  createPreviewSessionWithRetry,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable } from './previewTiming';
@@ -1129,7 +1130,7 @@ export default function App() {
           ? previewSessionPrefetchRef.current.session
           : null;
       if (prefetched) previewSessionPrefetchRef.current = null;
-      const res = prefetched ?? await apiPost<PreviewSessionResponse>('/api/preview/session', {
+      const res = prefetched ?? await createPreviewSessionWithRetry({
         url: trimmedUrl,
         crop_start: start,
         crop_end: end,
@@ -1220,7 +1221,7 @@ export default function App() {
     if (!root) return;
 
     const youtubeUrls = visibleChannelVideos
-      .filter((v) => v.platform === 'youtube')
+      .filter((v) => v.platform === 'youtube' && v.availability !== 'subscriber_only')
       .map((v) => buildVodUrl(v));
     warmYoutubePreviewBatch(youtubeUrls, 3, 120);
 
@@ -5324,6 +5325,7 @@ export default function App() {
                             const subline = channelVodSubline(v);
                             const durSec = channelVideoDurationSec(v);
                             const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
+                            const isMembersOnly = v.availability === 'subscriber_only';
                             const isActiveVod = url.trim() === fullUrl.trim();
                             const rowAccent = platformAccentColor(v.platform);
                             const rowBorder = platformActiveBorder(v.platform);
@@ -5332,7 +5334,7 @@ export default function App() {
                                 key={`${v.platform}-${v.id}-${i}`}
                                 role="button"
                                 tabIndex={0}
-                                data-youtube-warm={v.platform === 'youtube' ? fullUrl : undefined}
+                                data-youtube-warm={v.platform === 'youtube' && !isMembersOnly ? fullUrl : undefined}
                                 onClick={() => selectVod(fullUrl, {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,
@@ -5346,7 +5348,7 @@ export default function App() {
                                   skipNetwork: true,
                                 })}
                                 onMouseEnter={() => {
-                                  if (v.platform === 'youtube') {
+                                  if (v.platform === 'youtube' && !isMembersOnly) {
                                     warmYoutubePreview(fullUrl);
                                     // ponytail: longer-delay full-VOD mux on hover.
                                     // Fires after ~1s of mouse rest so it only runs
@@ -5357,7 +5359,7 @@ export default function App() {
                                   }
                                 }}
                                 onMouseLeave={() => {
-                                  if (v.platform === 'youtube') cancelWarmYoutubePreviewFull(fullUrl);
+                                  if (v.platform === 'youtube' && !isMembersOnly) cancelWarmYoutubePreviewFull(fullUrl);
                                 }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Enter' || e.key === ' ') {
@@ -5417,6 +5419,15 @@ export default function App() {
                                     </span>
                                   )}
                                 </div>
+                                {isMembersOnly ? (
+                                  <span
+                                    title="Members-only video — preview requires channel membership"
+                                    className="shrink-0 border border-amber-900 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-amber-600 flex items-center gap-0.5 cursor-not-allowed"
+                                  >
+                                    <Eye size={10} />
+                                    Members
+                                  </span>
+                                ) : (
                                 <button
                                   type="button"
                                   title={isClipItem ? 'Preview clip' : 'Preview VOD'}
@@ -5435,6 +5446,7 @@ export default function App() {
                                   <Eye size={10} />
                                   Preview
                                 </button>
+                                )}
                                 <button
                                   type="button"
                                   title="Open in browser"

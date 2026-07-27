@@ -57,6 +57,8 @@ export interface ChannelVideo {
   url: string;
   channel: string;
   content_kind?: 'vod' | 'clip' | 'stream';
+  /** yt-dlp availability — 'subscriber_only' marks members-only rows (no preview possible). */
+  availability?: string | null;
 }
 
 export interface ListedChannelVideo extends ChannelVideo {

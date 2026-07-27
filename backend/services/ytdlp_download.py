@@ -852,6 +852,16 @@ def sanitize_download_error(exc: BaseException) -> str:
         return (
             "Preview unavailable for this video — try again in a moment."
         )
+    if "members-only content" in low or "join this channel" in low:
+        return "Members-only video — requires channel membership."
+    if "private video" in low:
+        return "This video is private."
+    if (
+        "video has been removed" in low
+        or "video is not available" in low
+        or "video is unavailable" in low
+    ):
+        return "This video is unavailable."
     if msg.lower().startswith("error:"):
         msg = msg[6:].strip()
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
