@@ -524,11 +524,16 @@ export default function App() {
 
   const allChannelVideos = useMemo(() => {
     if (!selectedChannel) return [];
-    if (channelContentFilter === 'clips') return selectedChannel.clipVideos ?? [];
+    // Members-only rows can linger in cached lists from before the backend
+    // filtered them; they can never be previewed or downloaded, so drop them
+    // at the source for every tab.
+    const visible = (list: ChannelVideo[] | undefined) =>
+      (list ?? []).filter((v) => v.availability !== 'subscriber_only');
+    if (channelContentFilter === 'clips') return visible(selectedChannel.clipVideos);
     if (channelContentFilter === 'streams') {
-      return (selectedChannel.vodVideos ?? []).filter((v) => v.content_kind === 'stream');
+      return visible(selectedChannel.vodVideos).filter((v) => v.content_kind === 'stream');
     }
-    return (selectedChannel.vodVideos ?? []).filter(
+    return visible(selectedChannel.vodVideos).filter(
       (v) => v.content_kind !== 'stream' && v.content_kind !== 'clip',
     );
   }, [selectedChannel, channelContentFilter]);
@@ -3549,6 +3554,11 @@ export default function App() {
     channels.forEach((c) => {
       void refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true });
       void refreshChannelRef.current(c.id, c, 'clips', { silent: true, incremental: true });
+      // Stream VODs need the same incremental sync — without it the VODs tab
+      // goes stale after the first full fetch and never shows new streams.
+      if (c.youtubeSlug?.trim()) {
+        void refreshChannelRef.current(c.id, c, 'streams', { silent: true, incremental: true });
+      }
     });
   }, []);
 
