@@ -670,11 +670,17 @@ export default function ChannelExplorePopup({
       setBuffering(true);
       void apiPost<PreviewSessionResponse>(`/api/preview/session/${sid}/refresh`, {})
         .then((res) => {
+          // The element already played ~0.5s past t while the refresh was in
+          // flight. Resume the handoff from the LIVE position — re-seeking to
+          // the original t would visibly replay the same half second.
+          pendingSeekSecRef.current = video.currentTime;
           if (applySessionRefresh(res)) {
+            finishSeek();
             setBuffering(false);
             return;
           }
-          applyLocal(t);
+          // No handoff: same progressive stream, element is already at/past
+          // the target — do NOT re-seek (that was the seek-repeat glitch).
           waitVideoPlayable(
             video,
             previewTimingRef.current ?? new PreviewTiming(platform ?? 'unknown', 'explore'),
@@ -682,7 +688,6 @@ export default function ChannelExplorePopup({
           finishSeek();
         })
         .catch(() => {
-          applyLocal(t);
           waitVideoPlayable(
             video,
             previewTimingRef.current ?? new PreviewTiming(platform ?? 'unknown', 'explore'),

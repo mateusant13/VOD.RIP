@@ -956,13 +956,18 @@ export default function App() {
       setPreviewBuffering(true);
       void apiPost<PreviewSessionResponse>(`/api/preview/session/${sid}/refresh`, {})
         .then((res) => {
+          // The element already played ~0.5s past t while the refresh was in
+          // flight. Resume the handoff from the LIVE position — re-seeking to
+          // the original t would visibly replay the same half second.
+          const clipRelNow = previewClipRelativeRef.current;
+          previewPendingSeekSecRef.current = clipRelNow ? start + video.currentTime : video.currentTime;
           if (applyPreviewSessionRefresh(res)) {
+            finishSeek();
             setPreviewBuffering(false);
             return;
           }
-          const clipRel = previewClipRelativeRef.current;
-          const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
-          applyLocalTime(videoTime);
+          // No handoff: same progressive stream, element is already at/past
+          // the target — do NOT re-seek (that was the seek-repeat glitch).
           waitVideoPlayable(
             video,
             previewTimingRef.current ?? new PreviewTiming(youtube ? 'youtube' : 'unknown', 'main'),
@@ -970,9 +975,6 @@ export default function App() {
           finishSeek();
         })
         .catch(() => {
-          const clipRel = previewClipRelativeRef.current;
-          const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
-          applyLocalTime(videoTime);
           waitVideoPlayable(
             video,
             previewTimingRef.current ?? new PreviewTiming(youtube ? 'youtube' : 'unknown', 'main'),
