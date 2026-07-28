@@ -37,7 +37,10 @@ from services.ytdlp_hls import _youtube_soft_neg_error
 
 logger = logging.getLogger(__name__)
 
-SESSION_TTL_SEC = 6 * 3600  # ponytail: 6h covers long browsing (channels -> VODs -> preview) without surprise 404 storms after a 30+ min channel browse; get_session() still touches on every proxy call so active playbacks stay alive indefinitely.
+SESSION_TTL_SEC = 1800  # 30 min — long browsing rarely exceeds 30 min; channels page keeps last-touched in localStorage so re-opening is cheap.
+# Hard cap on open (non-deleted) sessions in the dict; closed sessions don't count.
+# Eviction on create when len(open) > limit — LRU by last_access.
+LRU_SIZE_HARD_LIMIT = 12
 # ponytail: a DELETE marks the session closed but keeps the cache_dir on disk
 # for this long so late byte requests from the browser don't 404. After the
 # grace window the cache_dir is wiped.
@@ -434,7 +437,7 @@ _MAX_SESSIONS = 20
 
 
 class PreviewManager:
-    _max_sessions = 20
+    _max_sessions = LRU_SIZE_HARD_LIMIT
 
     """Manages preview session lifecycle — create, get, delete, cleanup."""
 
@@ -576,9 +579,24 @@ class PreviewManager:
         # last-known value but the click may have a different crop window).
         if getattr(session, "explore_yt_info", None):
             _clamp_session_crop_to_vod_duration(session, session.explore_yt_info)
+        self._cleanup_stale_sessions()
         with self._lock:
             self._sessions[session_id] = session
-            session.timing_created_mono = time.monotonic()  # dynamic attr
+            session.timing_created_mono = time.monotonic()
+            if len(self._sessions) > self._max_sessions:
+                stale = sorted(
+                    self._sessions.items(),
+                    key=lambda item: item[1].last_access,
+                )[:len(self._sessions) - self._max_sessions]
+                for popped_sid, popped_session in stale:
+                    del self._sessions[popped_sid]
+                    cache_dir = popped_session.cache_dir
+                    threading.Thread(
+                        target=lambda d=cache_dir: shutil.rmtree(
+                            d, ignore_errors=True,
+                        ),
+                        daemon=True,
+                    ).start()
         return session
 
     def create_session(
@@ -1054,6 +1072,12 @@ def _is_rangeable_cdn_media(url: str) -> bool:
 
 
 _AUTH_ERROR_CODES = frozenset({403, 404, 410})
+# 404/410 from upstream means the resource is genuinely gone, not auth-expired.
+KNOWN_STALE_HTTP = frozenset({404, 410})
+
+
+class UpstreamPreviewUnavailable(RuntimeError):
+    """Upstream responded with a permanent 404/410 — proxy as 503 Retry-After."""
 
 
 class StalePreviewUrls(RuntimeError):
@@ -1178,16 +1202,18 @@ def _open_upstream_stream(
             resp.close()
         except OSError:
             pass
-        if not _retried and session.platform == "YouTube":
-            new_url = _youtube_refresh_and_remap(session, url)
-            if new_url:
-                return _open_upstream_stream(
-                    session,
-                    new_url,
-                    range_header,
-                    _retried=True,
-                )
-        raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
+            if not _retried and session.platform == "YouTube":
+                new_url = _youtube_refresh_and_remap(session, url)
+                if new_url:
+                    return _open_upstream_stream(
+                        session,
+                        new_url,
+                        range_header,
+                        _retried=True,
+                    )
+        raise UpstreamPreviewUnavailable(f"upstream HTTP {resp.status_code} for {url[:80]}") \
+            if resp.status_code in KNOWN_STALE_HTTP else \
+            StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     if resp.status_code == 416 and range_header and not _retried:
         total = _total_from_content_range(resp.headers.get("Content-Range", ""))
         try:

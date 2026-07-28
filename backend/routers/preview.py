@@ -32,6 +32,7 @@ from services.preview_service import (
     proxy_segment,
     refresh_youtube_preview_session,
     resolve_upstream,
+    UpstreamPreviewUnavailable,
     session_active_height,
     session_quality_labels,
     session_trim_timeline,
@@ -418,6 +419,12 @@ async def _preview_master_response(
     try:
         data, ctype, extra_headers, status = await loop.run_in_executor(
             PREVIEW_EXECUTOR, proxy_master, session_id, range_header
+        )
+    except UpstreamPreviewUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+            headers={"Retry-After": "30"},
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
