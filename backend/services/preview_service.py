@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import secrets
 import shutil
@@ -31,6 +32,8 @@ from services.ytdlp_service import (
     detect_platform,
     is_clip_url,
 )
+
+from services.ytdlp_hls import _youtube_soft_neg_error
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +408,7 @@ _DEFAULT_TWITCH_HEADERS: dict = {
 _ALLOWED_HOST_SUFFIXES = (
     "kick.com",
     "clips.kick.com",
+    "playback.live-video.net",  # ponytail: AWS MediaLive fronts Kick live segments — missing = live preview 403s on every resource
     "twitch.tv",
     "ttvnw.net",
     "jtvnw.net",
@@ -420,7 +424,6 @@ _ALLOWED_HOST_SUFFIXES = (
     "youtu.be",
     "ytimg.com",
 )
-
 _URI_IN_TAG = re.compile(r'URI="([^"]+)"')
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
@@ -644,13 +647,23 @@ class PreviewManager:
                     session.session_id[:8], resolved[0][:11], prefer_height,
                 )
                 return _finalize_youtube_session(session, crop_start)
-        raw_entry, headers, platform, variant_formats, kind, yt_info = (
-            resolve_stream_info(
-                url,
-                oauth=oauth,
-                prefer_height=prefer_height,
-            )
-        )
+        # ponytail: retry once with jitter when YouTube bot-gate is transient
+        for _try in range(2):
+            try:
+                raw_entry, headers, platform, variant_formats, kind, yt_info = (
+                    resolve_stream_info(
+                        url,
+                        oauth=oauth,
+                        prefer_height=prefer_height,
+                    )
+                )
+                break
+            except BaseException as exc:
+                if _try == 0 and _youtube_soft_neg_error(exc):
+                    time.sleep(random.uniform(30, 90))
+                    continue
+                raise
+
         preview_audio_url: Optional[str] = None
         variant_muxed: Dict[int, bool] = {}
         if platform == "YouTube" and yt_info:
