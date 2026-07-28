@@ -11,7 +11,7 @@ import {
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
-import { LiveBadge, LiveWatchButton } from './components/LiveBadge';
+import { LiveBadge } from './components/LiveBadge';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
 
@@ -94,6 +94,9 @@ interface ChannelLiveStatus {
     url: string;
     headers: Record<string, string>;
     type: string;
+    thumbnail_url?: string;
+    viewer_count?: number;
+    started_at?: string;
   }>;
 }
 
@@ -505,8 +508,8 @@ export default function App() {
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
   const [channelLiveStatuses, setChannelLiveStatuses] = useState<Record<string, ChannelLiveStatus>>({});
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
-  const [livePreviewPicker, setLivePreviewPicker] = useState<{ channelId: string | null; open: boolean }>({ channelId: null, open: false });
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
+  const [isLive, setIsLive] = useState(false);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
   const channelsSaveTimerRef = useRef<number | null>(null);
@@ -537,6 +540,14 @@ export default function App() {
     () => savedChannels.find((c) => c.id === selectedChannelId) ?? null,
     [savedChannels, selectedChannelId],
   );
+
+  const selectedChannelFirstLiveEntry = useMemo(() => {
+    if (!selectedChannelId) return null;
+    const liveStatus = channelLiveStatuses[selectedChannelId];
+    if (!liveStatus) return null;
+    const live = liveStatus.live.filter((e) => e.is_live === true);
+    return live[0] ?? null;
+  }, [channelLiveStatuses, selectedChannelId]);
 
   const allChannelVideos = useMemo(() => {
     if (!selectedChannel) return [];
@@ -780,6 +791,7 @@ export default function App() {
     destroyPreviewPlayer();
     setPreviewOpen(false);
     setPreviewSessionId(null);
+    setIsLive(false);
     setPreviewPlayback(null);
     setPreviewYoutubeEmbedUrl(null);
     setPreviewVideoLoading(false);
@@ -3982,6 +3994,8 @@ export default function App() {
   const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number]): Promise<void> => {
     if (!entry?.url) return;
     previewGenRef.current += 1;
+    setIsLive(true);
+    setPreviewOpen(true);
     setError(null);
     setPreviewYoutubeEmbedUrl(null);
     const url = entry.url;
@@ -4868,6 +4882,22 @@ export default function App() {
         })}
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
+        {isLive && (
+          <button
+            type="button"
+            onClick={() => {
+              const hls = previewHlsRef.current;
+              if (hls?.media) {
+                const pos = (hls as any).liveSyncPosition ?? (hls as any).liveCurrentPosition ?? hls.media.duration;
+                if (pos > 0) hls.media.currentTime = pos;
+              }
+            }}
+            className={previewCtrlBtn(false, true)}
+            title="Real Time — snap to live edge"
+          >
+            <span className="text-[9px] font-bold tracking-wider">● LIVE</span>
+          </button>
+        )}
         <PreviewQualityMenu
           levels={previewLevels}
           currentLevel={previewQualityLevel}
@@ -4942,12 +4972,18 @@ export default function App() {
                 />
                 <div className="min-w-0">
                   <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                    {previewChannelBadge.isClip ? 'Channel clip preview' : 'Channel VOD preview'}
+                    {previewChannelBadge.isClip ? 'Channel clip preview' : isLive ? 'Live stream' : 'Channel VOD preview'}
                   </span>
-                  {videoInfo?.title && (
+                  {!isLive && videoInfo?.title && (
                     <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
                       {videoInfo.title}
                     </p>
+                  )}
+                  {isLive && (
+                    <span className="inline-flex items-center gap-1 mt-0.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+                      <span className="text-[10px] font-bold text-red-400">LIVE</span>
+                    </span>
                   )}
                 </div>
               </div>
@@ -5299,7 +5335,7 @@ export default function App() {
                         />
                       </div>
                     )}
-                    <LiveBadge entries={liveEntries} />
+                    {liveEntries.length > 0 && <LiveBadge entries={liveEntries} />}
                     {editingChannelId !== ch.id && (
                       <button type="button" title="Rename"
                         onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
@@ -5317,36 +5353,6 @@ export default function App() {
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
                       {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
                     </button>
-                    {liveEntries.length > 0 && (
-                      <div className="relative">
-                        <LiveWatchButton entries={liveEntries} onWatch={(entry) => openLivePreview(entry)} onShowPicker={() => setLivePreviewPicker({ channelId: ch.id, open: true })} />
-                        {liveEntries.length > 1 && livePreviewPicker.open
-                          && livePreviewPicker.channelId === ch.id && (
-                          <div
-                            className="absolute right-0 top-full mt-1 z-30 min-w-[160px] rounded border border-zinc-700 bg-zinc-900 shadow-lg"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {liveEntries.map((entry) => (
-                              <button
-                                key={`${entry.platform}-${entry.url}`}
-                                type="button"
-                                title={`Watch ${entry.platform} live`}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setLivePreviewPicker({ channelId: null, open: false });
-                                  void openLivePreview(entry);
-                                }}
-                                className="w-full px-2 py-1 text-left text-[11px] text-zinc-200 hover:bg-zinc-800 flex items-center gap-1.5"
-                              >
-                                <Eye size={10} />
-                                <span className="font-semibold">{entry.platform}</span>
-                                <span className="text-zinc-500 truncate">{entry.title}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
                     <button type="button" title="Remove"
                       onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
                       className="text-zinc-600 hover:text-red-400 p-0.5">
@@ -5525,6 +5531,23 @@ export default function App() {
                             </div>
                           )}
                           <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
+                          {selectedChannelFirstLiveEntry && (channelContentFilter === 'vods' && !youtubePlatformOnly || channelContentFilter === 'streams' && youtubePlatformOnly) && (
+                            <div
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry)}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
+                              className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
+                            >
+                              <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+                              <span className="text-[9px] font-bold text-red-400 shrink-0">● LIVE</span>
+                              <span className="text-[10px] text-zinc-300 truncate">{selectedChannelFirstLiveEntry.title}</span>
+                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">LIVE</span>
+                              {selectedChannelFirstLiveEntry.viewer_count != null && (
+                                <span className="text-[9px] text-zinc-500 shrink-0">{selectedChannelFirstLiveEntry.viewer_count}w</span>
+                              )}
+                            </div>
+                          )}
                           {visibleChannelVideos.map((v, i) => {
                             const fullUrl = buildVodUrl(v);
                             const subline = channelVodSubline(v);
