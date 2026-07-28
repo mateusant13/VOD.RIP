@@ -1206,6 +1206,11 @@ export default function App() {
     }
   }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo, videoInfo?.qualities, videoInfo?.title]);
 
+  // ─── YouTube preview warm — per-channel VOD limit ────────────────
+  // mergeVodLists sorts vodVideos by created_at desc (newest first; see channelUtils.ts:157-160),
+  // so slice(0, limit) reliably selects the most recent entries.
+  const YOUTUBE_WARM_VOD_LIMIT = 10;
+
   // Warm YouTube extract cache while user reads the page (no UI update until Extract Info).
   useEffect(() => {
     const trimmed = url.trim();
@@ -2300,9 +2305,15 @@ export default function App() {
       views: v.views ?? null,
       duration_string: v.duration_string ?? null,
     };
-    const id = crypto.randomUUID();
-    assignExplorePopupZ(id);
     setExplorePopups((prev) => {
+      // Dedupe: bring existing popup to front instead of opening a duplicate
+      const existing = prev.find((p) => p.vod.url === vod.url);
+      if (existing) {
+        bringExplorePopupToFront(existing.id);
+        return prev;
+      }
+      const id = crypto.randomUUID();
+      assignExplorePopupZ(id);
       const next = [...prev, { id, vod, layoutIndex: prev.length }];
       if (next.length > MAX_EXPLORE_POPUPS) {
         const dropped = next.slice(0, next.length - MAX_EXPLORE_POPUPS);
@@ -2319,7 +2330,7 @@ export default function App() {
       }
       return next;
     });
-  }, [pauseAllExplorePopups, assignExplorePopupZ, channelContentFilter]);
+  }, [pauseAllExplorePopups, assignExplorePopupZ, bringExplorePopupToFront, channelContentFilter]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
