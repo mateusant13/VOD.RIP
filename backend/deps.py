@@ -53,8 +53,8 @@ _shell_com_local = threading.local() if os.name == "nt" else None
 # How many days back the channel browser looks by default.
 CHANNEL_DAYS_DEFAULT = 14
 # Hard ceiling on results per platform.
-CHANNEL_LIMIT_MAX = 100
-CHANNEL_CLIP_LIMIT = 10
+CHANNEL_LIMIT_MAX = 250
+CHANNEL_CLIP_LIMIT = 25
 CHANNEL_CLIP_MAX_DURATION_SEC = 60
 CLIP_FETCH_TIMEOUT_SEC = 35
 CHANNEL_VOD_FETCH_TIMEOUT_SEC = 45

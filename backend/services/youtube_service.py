@@ -90,6 +90,9 @@ def _youtube_row_needs_enrich(row: dict[str, Any]) -> bool:
             return True
     except (TypeError, ValueError):
         return True
+    # Flat extracts never populate availability, so check via innertube player response
+    if not row.get("availability") and not row.get("_availability_checked"):
+        return True
     return False
 
 
@@ -105,42 +108,79 @@ def _apply_youtube_row_metadata(row: dict[str, Any], meta: dict[str, Any]) -> No
                 row["duration_string"] = _duration_string_from_sec(int(meta["duration"]))
             except (TypeError, ValueError):
                 pass
+    # Always propagate availability (empty string = public, "subscriber_only" = restricted)
+    if "availability" in meta:
+        row["_availability_checked"] = True
+        if meta["availability"]:
+            row["availability"] = meta["availability"]
 
 
-_YOUTUBE_ENRICH_MAX = 24  # ponytail: cap — visible rows only; full list on scroll later
+_YOUTUBE_ENRICH_MAX = 50  # ponytail: metadata cap — fill dates for enough rows for initial view
+_YOUTUBE_AVAILABILITY_CHECK_MAX = 250  # availability check covers ALL rows (member-only filtering)
 
 
 def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
-    """Fill missing date/views/duration via lightweight InnerTube (flat playlist is spotty)."""
-    need = [r for r in rows if _youtube_row_needs_enrich(r)][: _YOUTUBE_ENRICH_MAX]
-    if not need:
-        return
+    """Fill missing date/views/duration via lightweight InnerTube + check availability for all rows."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from services.youtube_innertube import innertube_video_row_metadata
     from services.youtube_session import youtube_session_from_settings
 
     session = youtube_session_from_settings()
-    by_id = {r["id"]: r for r in need if r.get("id")}
-    workers = min(6, len(by_id))
 
-    def _fetch(vid: str) -> tuple[str, Optional[dict[str, Any]]]:
-        return vid, innertube_video_row_metadata(vid, session=session)
+    # Pass 1: metadata enrichment (capped — visible rows only need full metadata)
+    need_meta = [r for r in rows if _youtube_row_needs_enrich(r)][: _YOUTUBE_ENRICH_MAX]
+    if need_meta:
+        by_id = {r["id"]: r for r in need_meta if r.get("id")}
+        workers = min(6, len(by_id))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_fetch, vid) for vid in by_id]
+        def _fetch_meta(vid: str) -> tuple[str, Optional[dict[str, Any]]]:
+            return vid, innertube_video_row_metadata(vid, session=session)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_fetch_meta, vid) for vid in by_id]
+            for fut in as_completed(futs):
+                try:
+                    vid, meta = fut.result()
+                except Exception as exc:
+                    logger.debug("youtube row enrich failed: %s", exc)
+                    continue
+                if not meta:
+                    continue
+                row = by_id.get(vid)
+                if not row:
+                    continue
+                _apply_youtube_row_metadata(row, meta)
+
+    # Pass 2: availability-only check for ALL remaining rows (member-only filtering)
+    need_avail = [
+        r for r in rows
+        if not r.get("_availability_checked") and r.get("id")
+    ][: _YOUTUBE_AVAILABILITY_CHECK_MAX]
+    if not need_avail:
+        return
+    from services.youtube_innertube import innertube_availability_check
+
+    by_id_avail = {r["id"]: r for r in need_avail if r.get("id")}
+    workers_avail = min(8, len(by_id_avail))
+
+    def _fetch_avail(vid: str) -> tuple[str, Optional[str]]:
+        return vid, innertube_availability_check(vid, session=session, read_timeout=1.5)
+
+    with ThreadPoolExecutor(max_workers=workers_avail) as pool:
+        futs = [pool.submit(_fetch_avail, vid) for vid in by_id_avail]
         for fut in as_completed(futs):
             try:
-                vid, meta = fut.result()
+                vid, avail = fut.result()
             except Exception as exc:
-                logger.debug("youtube row enrich failed: %s", exc)
+                logger.debug("youtube availability check failed: %s", exc)
                 continue
-            if not meta:
-                continue
-            row = by_id.get(vid)
+            row = by_id_avail.get(vid)
             if not row:
                 continue
-            _apply_youtube_row_metadata(row, meta)
+            row["_availability_checked"] = True
+            if avail == "subscriber_only":
+                row["availability"] = avail
 
 
 def _fetch_youtube_rss_rows(
@@ -229,7 +269,7 @@ def _classify_youtube_video(
     Priority:
     1. URL pattern: /shorts/ in URL -> short
     2. Live status: live/completed -> stream
-    3. Duration: < 60s -> short, > 1 hour -> stream
+    3. Duration: < 60s -> short
     4. Playlist source as fallback
     """
     # 1. URL pattern (strongest signal for shorts)
@@ -244,8 +284,8 @@ def _classify_youtube_video(
     if duration is not None:
         if duration < 60:
             return "clip"  # Under 60s = short
-        if duration > 3600:  # Over 1 hour
-            return "stream"
+        # NOTE: > 1 hour is NOT a stream signal — long VODs (2-8h recorded streams)
+        # stay "vod". live_status is the correct stream indicator.
     
     # 4. Playlist source as final fallback
     if playlist_source == "shorts":
@@ -421,6 +461,10 @@ def list_channel_videos_sync(
     # Innertube enrichment
     if enrich:
         _enrich_youtube_channel_rows(filtered)
+        # Re-filter after enrichment — availability is now populated for all rows.
+        # The pre-enrichment filter above is a no-op because flat extracts never
+        # set availability; this post-filter is what actually drops member-only rows.
+        filtered = [v for v in filtered if not members_only(v)]
 
     return filtered
 
@@ -431,5 +475,6 @@ assert channel_playlist_url("UCxyz1234567890abcdefghijk", "streams").endswith("/
 assert _created_at_from_entry({"upload_date": "20240511"}) is not None
 assert _created_at_from_entry({"timestamp": 1_700_000_000}) is not None
 assert _youtube_row_needs_enrich({"id": "x", "views": 1, "created_at": "2024-01-01"}) is True
-assert _YOUTUBE_ENRICH_MAX == 24
+assert _YOUTUBE_ENRICH_MAX == 50
+assert _YOUTUBE_AVAILABILITY_CHECK_MAX == 250
 assert _duration_string_from_sec(125) == "2:05"

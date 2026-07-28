@@ -390,6 +390,8 @@ def _dedupe_youtube_formats(formats: list[dict[str, Any]]) -> list[dict[str, Any
         )
 
     for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
         url = (fmt.get("url") or "").strip()
         if not url or _is_sabr_stream_url(url):
             continue
@@ -951,6 +953,49 @@ def _collect_merged_innertube_info(
     return info
 
 
+def _set_youtube_availability_from_playability(
+    out: dict[str, Any],
+    data: dict[str, Any],
+) -> None:
+    """Set availability in `out` based on player response playabilityStatus."""
+    ps = data.get("playabilityStatus") or {}
+    if ps.get("status") == "UNPLAYABLE":
+        reason = (ps.get("reason") or "").lower()
+        if "member" in reason or "join" in reason:
+            out["availability"] = "subscriber_only"
+        else:
+            out["availability"] = ""  # non-member unplayable
+    else:
+        out["availability"] = ""  # playable — not restricted
+
+
+def innertube_availability_check(
+    video_id: str,
+    session: Optional["YouTubeSession"] = None,
+    read_timeout: float = 1.5,
+) -> Optional[str]:
+    """Lightweight member-only check via playabilityStatus only (no metadata extraction)."""
+    if session is None:
+        from services.youtube_session import youtube_session_from_settings
+        session = youtube_session_from_settings(video_id=video_id)
+    for name in ("WEB",):
+        profile = _PROFILE_BY_NAME.get(name)
+        if not profile:
+            continue
+        data, _status, kind = _player_request(
+            video_id, profile, read_timeout, session=session,
+        )
+        if kind == "fatal" or not data:
+            continue
+        ps = data.get("playabilityStatus") or {}
+        if ps.get("status") == "UNPLAYABLE":
+            reason = (ps.get("reason") or "").lower()
+            if "member" in reason or "join" in reason:
+                return "subscriber_only"
+        return ""
+    return None
+
+
 def innertube_video_row_metadata(
     video_id: str,
     session: Optional["YouTubeSession"] = None,
@@ -968,13 +1013,17 @@ def innertube_video_row_metadata(
         data, _status, kind = _player_request(
             video_id, profile, read_timeout, session=session,
         )
-        if kind == "fatal" or not data:
+        if not data:
             continue
+        # Extract created_at from ANY response (even fatal/bot-gated) — the
+        # microformat dates are valid metadata regardless of playability.
         details = data.get("videoDetails") or {}
         if not out.get("created_at"):
             created = _created_at_from_player_data(data)
             if created:
                 out["created_at"] = created
+        if kind == "fatal":
+            continue
         if out.get("views") is None:
             views = details.get("viewCount")
             try:
@@ -989,6 +1038,10 @@ def innertube_video_row_metadata(
                     out["duration"] = int(length)
             except (TypeError, ValueError):
                 pass
+        # Detect member-only from playabilityStatus — do this early so it's always populated
+        if "availability" not in out:
+            _set_youtube_availability_from_playability(out, data)
+        # Break only when we have all metadata; availability alone is not enough to stop
         if out.get("created_at") and out.get("views") is not None and out.get("duration"):
             break
     if not out:

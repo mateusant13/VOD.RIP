@@ -25,7 +25,7 @@ export function isClipUrl(u: string): boolean {
   if (l.includes('clips.twitch.tv')) return true;
   if (l.includes('twitch.tv') && l.includes('/clip/')) return true;
   if (l.includes('kick.com') && l.includes('/clips/')) return true;
-  if (l.includes('youtube.com/shorts/') || l.includes('youtu.be/shorts/')) return true;
+  // YouTube shorts are not clips — use /api/info/video, /api/download/video paths
   return false;
 }
 
@@ -851,9 +851,9 @@ export function loadStoredChannelUi(): {
   }
 }
 
-export const CHANNEL_INITIAL_VISIBLE = 5;
+export const CHANNEL_INITIAL_VISIBLE = 50;
 
-export const CHANNEL_EXPAND_STEP = 10;
+export const CHANNEL_EXPAND_STEP = 50;
 
 /** Prefer this window for the first page; Show more pierces into older cached items. */
 export const CHANNEL_RECENT_DAYS = 14;
