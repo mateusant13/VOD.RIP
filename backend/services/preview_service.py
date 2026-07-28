@@ -133,6 +133,14 @@ _PROG_HEAD_DIR = _PREVIEW_ROOT / "prog_head"
 _PROG_HEAD_BYTES = 12 * 1024 * 1024
 _PROG_HEAD_MAX_BYTES = 256 * 1024 * 1024
 _PROG_HEAD_TTL_SEC = 86400
+# ponytail: gracefully skip files newer than this in budget enforcement.
+# Without this grace, a purge triggered by wave completion can unlink a
+# file the moment a user clicks through — the browser's first byte
+# request hits a missing file. 3 min covers 12 MB / 1.2 MB typical
+# progressive bitrate + click-to-play latency. After that window the
+# user has either moved on (no harm) or is past the cached head bytes
+# and streaming live-upstream segments (eviction is safe).
+_PROG_HEAD_MIN_EVICT_AGE_SEC = 180
 
 
 def _prog_head_paths(video_id: str, height: int) -> Tuple[Path, Path]:
@@ -158,11 +166,14 @@ def _prog_head_lookup(video_id: str, height: int) -> Optional[Tuple[Path, int]]:
 
 def _prog_head_enforce_budget() -> None:
     try:
+        cutoff = time.time() - _PROG_HEAD_MIN_EVICT_AGE_SEC
         files = [
             p
             for p in _PROG_HEAD_DIR.glob("*.bin")
-            if p.is_file()
+            if p.is_file() and p.stat().st_mtime <= cutoff
         ]
+        if not files:
+            return
         total = sum(p.stat().st_size for p in files)
         if total <= _PROG_HEAD_MAX_BYTES:
             return
