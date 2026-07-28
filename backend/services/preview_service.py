@@ -194,6 +194,8 @@ def kickoff_youtube_prog_head_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        if time.monotonic() < _warm_bot_gate_pause_until:
+            return
         try:
             _youtube_prog_head_warm(url, vid, oauth=oauth, prefer_height=prefer_height)
         finally:
@@ -215,6 +217,13 @@ def _youtube_prog_head_warm(
             url, oauth=oauth, prefer_height=prefer_height
         )
     except Exception as exc:
+        from services.ytdlp_hls import _youtube_soft_neg_error
+
+        if _youtube_soft_neg_error(exc):
+            global _warm_bot_gate_pause_until
+            if time.monotonic() >= _warm_bot_gate_pause_until:
+                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                logger.warning("YouTube bot-gate detected; warm paused 10min")
         logger.debug("prog head warm resolve failed %s: %s", vid, exc)
         return False
     from services.youtube_innertube import _dedupe_youtube_formats
@@ -3255,6 +3264,8 @@ def kickoff_youtube_batch_warm(
         return
 
     def _run() -> None:
+        if time.monotonic() < _warm_bot_gate_pause_until:
+            return
         # See kickoff_youtube_warm — in-flight registration happens at run start
         # so create_session never waits on a queued (not running) warm.
         with _YOUTUBE_WARM_LOCK:
@@ -4178,6 +4189,8 @@ def kickoff_youtube_warm(
         return
 
     def _run() -> None:
+        if time.monotonic() < _warm_bot_gate_pause_until:
+            return
         # ponytail: register in-flight only once the job actually starts — a
         # queued-but-not-running warm must not make create_session wait for it.
         with _YOUTUBE_WARM_LOCK:
@@ -4241,6 +4254,9 @@ def kickoff_youtube_full_mux_warm(
         return
 
     def _run() -> None:
+        global _warm_bot_gate_pause_until
+        if time.monotonic() < _warm_bot_gate_pause_until:
+            return
         logger.info("YouTube full-mux warm start: %s h=%d", vid, prefer_height)
         with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
             active = _ACTIVE_YOUTUBE_PREVIEW_KEY
@@ -4261,6 +4277,12 @@ def kickoff_youtube_full_mux_warm(
                     resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
                 )
             except Exception as exc:
+                from services.ytdlp_hls import _youtube_soft_neg_error
+
+                if _youtube_soft_neg_error(exc):
+                    if time.monotonic() >= _warm_bot_gate_pause_until:
+                        _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                        logger.warning("YouTube bot-gate detected; warm paused 10min")
                 logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
                 return
             audio_url = _resolve_youtube_preview_audio(yt_info) if yt_info else None
@@ -4350,6 +4372,7 @@ _ANON_PROBE_HEAD_START_SEC = 2.0
 _full_warm_queued: Set[str] = set()
 _full_warm_backoff_until = 0.0
 _FULL_WARM_BACKOFF_SEC = 600.0
+_warm_bot_gate_pause_until = 0.0   # monotonic clock, checked by all warm _run to fast-skip on YouTube bot-gate
 
 
 def _enqueue_full_warm(
@@ -4364,6 +4387,9 @@ def _enqueue_full_warm(
 
     def _run() -> None:
         global _full_warm_backoff_until
+        global _warm_bot_gate_pause_until
+        if time.monotonic() < _warm_bot_gate_pause_until:
+            return
         try:
             warm_youtube_preview_resolve(
                 url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height,
@@ -4374,6 +4400,9 @@ def _enqueue_full_warm(
 
             if _youtube_soft_neg_error(exc):
                 _full_warm_backoff_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                if time.monotonic() >= _warm_bot_gate_pause_until:
+                    _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                    logger.warning("YouTube bot-gate detected; warm paused 10min")
         finally:
             _full_warm_queued.discard(url)
 
@@ -4404,6 +4433,13 @@ def warm_youtube_preview_resolve(
         kickoff_youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
         kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
     except Exception as exc:
+        from services.ytdlp_hls import _youtube_soft_neg_error
+
+        if _youtube_soft_neg_error(exc):
+            global _warm_bot_gate_pause_until
+            if time.monotonic() >= _warm_bot_gate_pause_until:
+                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                logger.warning("YouTube bot-gate detected; warm paused 10min")
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         if reraise:
             raise
@@ -4452,6 +4488,13 @@ def warm_youtube_resolve_only(
         # 90s+ create timeouts during a warm storm), so the full-chain retry
         # runs on a dedicated single worker with a bot-gate backoff instead.
         # Fatal failures (members-only/unavailable) are never re-tried.
+        from services.ytdlp_hls import _youtube_soft_neg_error
+
+        if _youtube_soft_neg_error(exc):
+            global _warm_bot_gate_pause_until
+            if time.monotonic() >= _warm_bot_gate_pause_until:
+                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                logger.warning("YouTube bot-gate detected; warm paused 10min")
         from services.ytdlp_hls import _youtube_fatal_extract_error
 
         if not _youtube_fatal_extract_error(exc):
