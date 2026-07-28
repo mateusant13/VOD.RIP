@@ -1517,7 +1517,21 @@ export default function App() {
 
     if (Hls.isSupported()) {
       attachViaHls = () => {
-      const dashSegTimeline = previewTrimTimelineRef.current;
+        const dashSegTimeline = previewTrimTimelineRef.current;
+      let staleSessionFired = false;
+      const markSessionGone = (reason: string) => {
+        if (staleSessionFired) return;
+        staleSessionFired = true;
+        const msg = 'Preview expired — refresh and try again';
+        console.warn('[VOD.RIP preview] session gone:', reason);
+        setError(msg);
+        setPreviewVideoLoading(false);
+        previewStartedRef.current = false;
+        previewLoadedUrlRef.current = null;
+        try { hls.stopLoad(); hls.destroy(); } catch { /* ignore */ }
+        previewHlsRef.current = null;
+        setHlsRef(null);
+      };
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
@@ -1534,6 +1548,22 @@ export default function App() {
         startPosition: dashSegTimeline
           ? 0
           : (previewPendingSeekSecRef.current ?? previewTrimStartRef.current),
+        // ponytail: peel stale-session 404s out of the HLS retry loop. Without
+        // this, a player that comes back after a backend restart retries the
+        // same dead manifest URLs forever and the user sees only INFO 404 lines.
+        xhrSetup: (xhr) => {
+          xhr.addEventListener('readystatechange', () => {
+            if (xhr.readyState === 4 && (xhr.status === 404 || xhr.status === 410)) {
+              try {
+                const body = xhr.responseText || '';
+                if (body.includes('not found or expired')
+                  || body.includes('Unknown preview resource')) {
+                  markSessionGone(`xhr ${xhr.status}`);
+                }
+              } catch { /* ignore */ }
+            }
+          });
+        },
       });
       previewHlsRef.current = hls;
       setHlsRef(hls);
@@ -1673,6 +1703,7 @@ export default function App() {
       return;
       };
       attachViaHls();
+
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {

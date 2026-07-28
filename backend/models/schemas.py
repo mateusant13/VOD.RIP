@@ -179,6 +179,8 @@ class PreviewTimingRequest(BaseModel):
     session_id: str = ""
     open_ms: float = 0.0
     seek_ms: float = 0.0
+    detail: str = ""
+
 
 
 class LivePreviewRequest(BaseModel):

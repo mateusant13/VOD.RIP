@@ -34,7 +34,7 @@ from services.ytdlp_service import (
 
 logger = logging.getLogger(__name__)
 
-SESSION_TTL_SEC = 30 * 60
+SESSION_TTL_SEC = 6 * 3600  # ponytail: 6h covers long browsing (channels -> VODs -> preview) without surprise 404 storms after a 30+ min channel browse; get_session() still touches on every proxy call so active playbacks stay alive indefinitely.
 # ponytail: a DELETE marks the session closed but keeps the cache_dir on disk
 # for this long so late byte requests from the browser don't 404. After the
 # grace window the cache_dir is wiped.
