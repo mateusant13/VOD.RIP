@@ -6,7 +6,7 @@ import {
   Users, Database, Settings2, Loader2,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical,
+  GripVertical, Radio,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
@@ -83,6 +83,19 @@ import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 
 // ─── TYPES (migrated to src/types.ts) ───────────────
+
+interface ChannelLiveStatus {
+  channel_id: string;
+  live: Array<{
+    platform: string;
+    is_live: boolean;
+    title: string;
+    url: string;
+    headers: Record<string, string>;
+    type: string;
+  }>;
+}
+
 const IS_DEV_UI = import.meta.env.DEV;
 const USE_MSE_DIRECT = import.meta.env.VITE_PREVIEW_MSE_DIRECT === "true";
 // Expose the flag for e2e probes (see e2e/tests/preview-mse-direct.spec.ts).
@@ -489,6 +502,7 @@ export default function App() {
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' | 'YouTube' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
+  const [channelLiveStatuses, setChannelLiveStatuses] = useState<Record<string, ChannelLiveStatus>>({});
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
@@ -1249,6 +1263,33 @@ export default function App() {
       cleanup?.();
     };
   }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url, channelContentFilter]);
+
+  // Poll live status for every saved channel while the Channels tab is open.
+  useEffect(() => {
+    if (tab !== 'channels' || !savedChannels.length) return;
+    let cancelled = false;
+    let timeout: number | null = null;
+    const POLL_MS = 30_000;
+    const fetchOne = async (ch: SavedChannel) => {
+      try {
+        const status = await apiGet<ChannelLiveStatus>(`/api/channels/${ch.id}/live`);
+        if (!cancelled) {
+          setChannelLiveStatuses((prev) => ({ ...prev, [ch.id]: status }));
+        }
+      } catch {
+        // Channel may lack platforms or backend is unreachable; ignore.
+      }
+    };
+    const tick = async () => {
+      await Promise.all(savedChannelsRef.current.map(fetchOne));
+      if (!cancelled) timeout = window.setTimeout(tick, POLL_MS);
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timeout) window.clearTimeout(timeout);
+    };
+  }, [tab, savedChannels.length]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -3900,6 +3941,20 @@ export default function App() {
     });
   }, [selectedChannelId]);
 
+  const startLiveDownload = useCallback(async (ch: SavedChannel, entry: ChannelLiveStatus['live'][0]) => {
+    try {
+      await apiPost<{ download_id: string; status: string }>('/api/download/live', {
+        url: entry.url,
+        platform: entry.platform,
+        title: entry.title,
+        channel: ch.displayName,
+        headers: entry.headers,
+      });
+    } catch (err) {
+      setAddChannelNotice(err instanceof Error ? err.message : 'Live recording failed');
+    }
+  }, [setAddChannelNotice]);
+
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
       const ch = prev.find((c) => c.id === channelId);
@@ -5092,6 +5147,8 @@ export default function App() {
                   const dropBelow = channelDragId != null
                     && channelDropInsertIndex === savedChannels.length
                     && index === savedChannels.length - 1;
+                  const liveStatus = channelLiveStatuses[ch.id];
+                  const liveEntries = liveStatus?.live.filter((e) => e.is_live) ?? [];
                   return (
                   <Fragment key={ch.id}>
                   <div
@@ -5157,6 +5214,15 @@ export default function App() {
                         />
                       </div>
                     )}
+                    {liveEntries.length > 0 && (
+                      <span
+                        title={liveEntries.map((e) => `${e.platform}: ${e.title}`).join('\n')}
+                        className="flex items-center gap-1 rounded bg-red-900/50 px-1 text-[10px] text-red-200 font-bold shrink-0"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+                        LIVE
+                      </span>
+                    )}
                     {editingChannelId !== ch.id && (
                       <button type="button" title="Rename"
                         onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
@@ -5174,6 +5240,19 @@ export default function App() {
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
                       {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
                     </button>
+                    {liveEntries.length > 0 && (
+                      <button
+                        type="button"
+                        title={`Record live: ${liveEntries[0].platform}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void startLiveDownload(ch, liveEntries[0]);
+                        }}
+                        className="text-red-500 hover:text-red-300 p-0.5"
+                      >
+                        <Radio size={11} />
+                      </button>
+                    )}
                     <button type="button" title="Remove"
                       onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
                       className="text-zinc-600 hover:text-red-400 p-0.5">
