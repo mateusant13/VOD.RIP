@@ -1,3 +1,6 @@
+// Real Time button live-edge snap is in App.tsx (not an extracted component),
+// so it's exercised end-to-end via the preview player flow, not unit-tested here.
+
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { LiveBadge, type LiveEntry } from "./components/LiveBadge";

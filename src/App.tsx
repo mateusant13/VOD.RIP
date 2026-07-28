@@ -239,6 +239,7 @@ export default function App() {
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewControlsRef = useRef<HTMLDivElement>(null);
   const previewHlsRef = useRef<Hls | null>(null);
+  const previewIsLiveRef = useRef(false);
   const previewVolumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const previewFsHideTimerRef = useRef<number | null>(null);
   const previewInitialSeekDoneRef = useRef(false);
@@ -792,6 +793,7 @@ export default function App() {
     setPreviewOpen(false);
     setPreviewSessionId(null);
     setIsLive(false);
+    previewIsLiveRef.current = false;
     setPreviewPlayback(null);
     setPreviewYoutubeEmbedUrl(null);
     setPreviewVideoLoading(false);
@@ -1558,6 +1560,12 @@ export default function App() {
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
+        ...(previewIsLiveRef.current ? {
+          liveSyncDuration: 3,
+          liveMaxLatencyDuration: 10,
+          liveDurationInfinity: true,
+          maxLiveSyncPlaybackRate: 1.5,
+        } : {}),
         startPosition: dashSegTimeline
           ? 0
           : (previewPendingSeekSecRef.current ?? previewTrimStartRef.current),
@@ -3995,6 +4003,7 @@ export default function App() {
     if (!entry?.url) return;
     previewGenRef.current += 1;
     setIsLive(true);
+    previewIsLiveRef.current = true;
     setPreviewOpen(true);
     setError(null);
     setPreviewYoutubeEmbedUrl(null);
@@ -4887,10 +4896,18 @@ export default function App() {
             type="button"
             onClick={() => {
               const hls = previewHlsRef.current;
-              if (hls?.media) {
-                const pos = (hls as any).liveSyncPosition ?? (hls as any).liveCurrentPosition ?? hls.media.duration;
-                if (pos > 0) hls.media.currentTime = pos;
+              if (!hls?.media) return;
+              // Belt-and-suspenders: verify the Hls instance is in live mode
+              if (hls.levels[0]?.details?.live !== true) return;
+              if (typeof (hls as any).seekToLiveEdge === 'function') {
+                (hls as any).seekToLiveEdge();
+                return;
               }
+              // Fallback for older HLS.js — prefer liveEdgePosition, else compute
+              if (!(hls as any).liveEdgePosition && !isFinite(hls.media.duration)) return;
+              const syncDur = (hls.config as any).liveSyncDuration ?? 3;
+              const pos = (hls as any).liveEdgePosition ?? hls.media.duration - syncDur;
+              if (pos > 0 && isFinite(pos)) hls.media.currentTime = pos;
             }}
             className={previewCtrlBtn(false, true)}
             title="Real Time — snap to live edge"
