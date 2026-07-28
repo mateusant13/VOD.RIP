@@ -19,6 +19,9 @@ settings_mgr = SettingsManager()
 download_mgr = DownloadManager(max_workers=4)
 download_mgr.apply_settings(settings_mgr)
 
+# ── Preview manager ────────────────────────────────────────────────────
+from services.preview_service import _manager as preview_manager
+
 # Import side-effect: register the download manager so shutdown_util
 # can cancel downloads without a circular import.
 from services._app_state import set_download_manager
