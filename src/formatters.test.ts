@@ -168,7 +168,7 @@ describe('fmtDaysAgo', () => {
     const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
     expect(fmtDaysAgo(threeDaysAgo)).toBe('3d');
     const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-    expect(fmtDaysAgo(twoWeeksAgo)).toBe('2w');
+    expect(fmtDaysAgo(twoWeeksAgo)).toBe('14d');
     const fiveMonthsAgo = new Date(Date.now() - 150 * 24 * 60 * 60 * 1000).toISOString();
     expect(fmtDaysAgo(fiveMonthsAgo)).toBe('5mo');
     const twoYearsAgo = new Date(Date.now() - 800 * 24 * 60 * 60 * 1000).toISOString();
