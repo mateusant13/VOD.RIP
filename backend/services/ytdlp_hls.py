@@ -365,6 +365,15 @@ def youtube_preview_ytdl_opts(
                 auto_auth = True
 
     extractor_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
+    # Preview needs ONE working client fast; downloads keep the full merged
+    # ladder. android_vr/android are least bot-gated (no POT needed) and still
+    # expose a muxed 360p + adaptive ladder; web_safari stays as POT last-resort.
+    # ponytail: yt-dlp queries every listed client sequentially and merges, so a
+    # hard-walled video pays per-client time before failing (5 clients ~= 24s).
+    yt_args = dict((extractor_args.get("youtube") or {}))
+    yt_args["player_client"] = ["android_vr", "android", "web_safari"]
+    extractor_args = dict(extractor_args)
+    extractor_args["youtube"] = yt_args
     if fast_only:
         extractor_args = dict(extractor_args)
         yt_args = dict(extractor_args.get("youtube") or {})

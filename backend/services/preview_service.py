@@ -619,16 +619,19 @@ class PreviewManager:
             # ponytail: neither snapshot nor catchup hit — resolve and cache now
             # through the same helper warm uses, so the NEXT click is fast AND
             # the key shape matches what create_session will look up.
-            snap = _resolve_and_cache_youtube_snapshot(
+            # NOTE: helper returns (vid, height, snapshot_dict) — the reuse path
+            # wants the bare dict (passing the tuple 500'd every cold first click).
+            resolved = _resolve_and_cache_youtube_snapshot(
                 url, oauth=oauth, prefer_height=prefer_height,
             )
-            if snap:
+            if resolved:
+                snap = resolved[2]
                 session = self._reuse_youtube_snapshot(
                     url, crop_start, crop_end, prefer_height, snap
                 )
                 logger.info(
                     "preview session from inline resolve+cache sid=%s vid=%s h=%d",
-                    session.session_id[:8], snap[0][:11], prefer_height,
+                    session.session_id[:8], resolved[0][:11], prefer_height,
                 )
                 return _finalize_youtube_session(session, crop_start)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
@@ -2485,7 +2488,9 @@ def _extract_youtube_preview_info(
     except Exception:
         if anon_fut is not None:
             try:
-                late = anon_fut.result(timeout=0)
+                # Chain failed fast (e.g. yt-dlp lock held by a warm storm) —
+                # give the in-flight anon probe a bounded moment to land.
+                late = anon_fut.result(timeout=2.0)
             except Exception:
                 late = None
             if late and not _youtube_info_is_dash_only_progressive(late):
@@ -4310,8 +4315,9 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 _FULL_WARM_EXECUTOR = _TPE(max_workers=1, thread_name_prefix="yt-full-warm")
 _ANON_PROBE_EXECUTOR = _TPE(max_workers=2, thread_name_prefix="yt-anon")
 # Solo window for the anonymous 360p probe before the full chain hedges in —
-# healthy anon lands in <1s, so the common case never starts the chain at all.
-_ANON_PROBE_HEAD_START_SEC = 1.0
+# healthy anon lands in ~1.3s, so a 2s window lets it win solo without burning
+# chain quota (yt-dlp lock, POT) on every cold click.
+_ANON_PROBE_HEAD_START_SEC = 2.0
 _full_warm_queued: Set[str] = set()
 _full_warm_backoff_until = 0.0
 _FULL_WARM_BACKOFF_SEC = 600.0
