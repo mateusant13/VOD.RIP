@@ -988,6 +988,10 @@ assert _youtube_extract_preview_race.__name__ == "_youtube_extract_preview_race"
 
 def _cache_extract_result(key: str, info: dict) -> None:
     now = time.time()
+    # Degenerate YouTube extracts (bot-wall with ≤1 format) get 60s TTL
+    # so the next attempt re-extracts and recovers the full ladder.
+    if len(info.get("formats", [])) <= 1:
+        now -= (_EXTRACT_CACHE_TTL_SEC - 60.0)
     with _EXTRACT_CACHE_LOCK:
         if len(_EXTRACT_INFO_CACHE) >= _EXTRACT_CACHE_MAX:
             oldest = min(_EXTRACT_INFO_CACHE.items(), key=lambda item: item[1][0])
