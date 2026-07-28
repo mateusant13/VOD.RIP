@@ -1231,7 +1231,7 @@ export default function App() {
       .filter((v) => v.platform === 'youtube' && v.availability !== 'subscriber_only'
         && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
       .map((v) => buildVodUrl(v));
-    warmYoutubePreviewBatch(youtubeUrls, 3, 120);
+    warmYoutubePreviewBatch(youtubeUrls);
 
     let cleanup: (() => void) | undefined;
     const raf = requestAnimationFrame(() => {
@@ -3580,8 +3580,8 @@ export default function App() {
   useEffect(() => {
     const channels = savedChannels;
     if (!channels.length) return;
-    const PER_KIND = 2;
-    const STAGGER_MS = 150;
+    const PER_KIND = 3;
+    const STAGGER_MS = 100;
     const KINDS = ['vods', 'streams'] as const;
     const isYouTubeUrl = (u: string) => /youtube\.com|youtu\.be/.test(u || '');
     const urlsForKind = (ch: typeof channels[number], kind: typeof KINDS[number]): string[] => {
@@ -3627,7 +3627,7 @@ export default function App() {
     // Keeps WARM_EXECUTOR (4 workers) under saturation and leaves room for
     // the user's click path.
     let i = 0;
-    const BATCH = 2;
+    const BATCH = 4;
     const tick = () => {
       const slice = queue.slice(i, i + BATCH);
       i += BATCH;

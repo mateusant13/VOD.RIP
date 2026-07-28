@@ -161,12 +161,13 @@ async def _app_lifespan(_app: FastAPI):
                     break
 
         logger.info(
-            "STARTUP_SYNC_WARM: sequentially resolving %d URLs (takes ~%ds)",
+            "STARTUP_SYNC_WARM: resolving %d URLs in parallel",
             len(first_urls),
-            len(first_urls) * 5,
         )
 
-        for u in first_urls:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _warm_one(u: str) -> None:
             try:
                 t0 = _tm.time()
                 # warm_youtube_resolve_only does InnerTube fast pass + prog head
@@ -184,6 +185,12 @@ async def _app_lifespan(_app: FastAPI):
                 )
             except Exception as exc:
                 logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
+
+        # ponytail: 6 workers, one per first-of-kind URL of a typical channel
+        # list — the sync wave is tiny, so wall time ≈ slowest single resolve
+        # instead of the sum. _lifespan_ready still gates startup on it.
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="yt-sync-warm") as pool:
+            list(pool.map(_warm_one, first_urls))
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
         """Pull YouTube URLs out of the saved channel list (any field that
@@ -207,12 +214,12 @@ async def _app_lifespan(_app: FastAPI):
         return urls
 
     def _startup_wave_warm(saved_channels) -> None:
-        """Wave-based warm sorted by recency, 2-per-channel per wave.
+        """Wave-based warm sorted by recency, 8-per-channel per wave.
 
-        Wave 0 (newest from each channel) fires immediately via full warm
-        (resolve + preflight mux) so the first click is instant.
-        Subsequent waves are resolve-only (lighter, faster) and run in
-        background on the small dedicated WARM_EXECUTOR.
+        The sync wave (first-of-kind per channel) already ran in parallel, so
+        this queues the next ~40 per channel onto WARM_EXECUTOR the moment the
+        server starts. ponytail: 40/channel covers the first screen + scroll
+        depth; the long tail is handled by the frontend per-scroll warm.
         """
         from services.preview_service import (
             _WARMED_URLS,
@@ -247,8 +254,8 @@ async def _app_lifespan(_app: FastAPI):
         if not sorted_channels:
             return
 
-        BATCH = 2
-        MAX_WAVES = 100
+        BATCH = 8
+        MAX_WAVES = 5
         submitted = 0
         wave_count = 0
 

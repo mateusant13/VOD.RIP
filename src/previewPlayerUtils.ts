@@ -133,7 +133,7 @@ export function cancelWarmYoutubePreviewFull(url: string): void {
  *  ponytail: cap at 3 to avoid stampeding INFO_EXECUTOR when many YouTube rows
  *  are visible — the actual preview create needs the executor for its own
  *  yt-dlp probe and would otherwise queue behind the warm jobs. */
-export function warmYoutubePreviewBatch(urls: string[], max = 3, staggerMs = 120): void {
+export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 80): void {
   let n = 0;
   for (const raw of urls) {
     if (n >= max) break;

@@ -33,10 +33,11 @@ CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channe
 # pool so the user's click is never queued behind batch warm tasks.
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
 # Background YouTube warm jobs (startup wave, channel-list, hover/batch).
-# Small dedicated pool: bulk warms must never saturate INFO_EXECUTOR (208+
-# queued startup jobs starved user clicks) and never compete with the
-# user-facing preview path.
-WARM_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="warm")
+# Dedicated pool: bulk warms must never saturate INFO_EXECUTOR (208+ queued
+# startup jobs starved user clicks) and never compete with the user-facing
+# preview path (PREVIEW_EXECUTOR is isolated). 8 workers: authenticated
+# (cookies+POT) resolves land in ~1s, so the startup wave drains in seconds.
+WARM_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="warm")
 # User-intent YouTube warms (hover/scroll/paste) + their spawned head/preflight
 # downloads. Separate pool so a 50+ job startup storm can never make a
 # gesture warm wait minutes (observed: 12 min queue behind the storm, then the
