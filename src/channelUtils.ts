@@ -118,12 +118,16 @@ export function mergeVodLists(
   const map = new Map<string, ChannelVideo>();
   const mappedIncoming = incoming.map(mapApiChannelItem);
   const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
+  // ponytail: a platform with zero incoming videos almost always means a soft
+  // failed/partial fetch (bot-gate, network). Pruning then wipes the cached list.
+  const platformsWithIncoming = new Set(mappedIncoming.map((v) => v.platform));
 
   for (const v of existing) {
     // Always drop cached subscriber-only entries — YouTube API no longer returns them.
     if (v.availability === 'subscriber_only') continue;
     // When a platform was fully refreshed, prune cached entries absent from the fresh list.
-    if (opts?.prunePlatforms?.includes(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
+    // Only prune platforms that actually have fresh data; empty incoming preserves cache.
+    if (opts?.prunePlatforms?.includes(v.platform) && platformsWithIncoming.has(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
     map.set(channelVideoKey(v), v);
   }
   for (const v of mappedIncoming) {
@@ -145,11 +149,13 @@ export function mergeClipLists(
   const map = new Map<string, ChannelVideo>();
   const mappedIncoming = incoming.map(mapApiChannelItem).filter(isLikelyClip);
   const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
+  // Empty incoming for a platform means a soft/partial fetch — don't wipe cache.
+  const platformsWithIncoming = new Set(mappedIncoming.map((v) => v.platform));
 
   for (const v of existing.filter(isLikelyClip)) {
     // Always drop cached subscriber-only entries.
     if (v.availability === 'subscriber_only') continue;
-    if (opts?.prunePlatforms?.includes(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
+    if (opts?.prunePlatforms?.includes(v.platform) && platformsWithIncoming.has(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
     map.set(channelVideoKey(v), v);
   }
   for (const v of mappedIncoming) {

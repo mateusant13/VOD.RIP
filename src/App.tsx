@@ -3392,7 +3392,7 @@ export default function App() {
         }
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
-          !incremental && attempted.YouTube && !errs.YouTube
+          !incremental && attempted.YouTube && !errs.YouTube && incoming.some((v) => v.platform === 'YouTube')
             ? { prunePlatforms: ['YouTube'] } : undefined);
         if (incremental) {
           updateChannel(channelId, {
@@ -3448,7 +3448,7 @@ export default function App() {
         const prunePlatforms: string[] = [];
         if (!incremental) {
           for (const p of ['Kick', 'Twitch', 'YouTube'] as const) {
-            if (attempted[p] && !errs[p]) prunePlatforms.push(p);
+            if (attempted[p] && !errs[p] && incoming.some((v) => v.platform === p)) prunePlatforms.push(p);
           }
         }
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
@@ -3542,6 +3542,7 @@ export default function App() {
     void refreshChannelRef.current(selectedChannelId, undefined, mode, {
       silent: hasCache,
       force: !hasCache,
+      incremental: hasCache,
     });
   }, [channelContentFilter, kickEnabled, twitchEnabled, youtubeEnabled, selectedChannelId]);
 
@@ -5167,7 +5168,7 @@ export default function App() {
                       onClick={(e) => {
                         e.stopPropagation();
                         clearChannelRefreshFlight(ch.id);
-                        void refreshChannel(ch.id, undefined, channelContentFilter, { force: true });
+                        void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
                       }}
                       disabled={ch.loading}
                       className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">

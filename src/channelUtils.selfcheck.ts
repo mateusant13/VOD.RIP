@@ -102,6 +102,15 @@ console.log('=== mergeVodLists ===');
     result.every(r => r.id !== 'sub' && r.id !== 'gone') && result.some(r => r.id === 'stay') && result.some(r => r.id === 'fresh'));
 }
 
+// 7b) empty incoming + prune must NOT wipe cache (regression: soft-failed YouTube fetch returned 0 videos and erased the list)
+{
+  const existing = [v('cached-yt', 'YouTube'), v('cached-twitch', 'Twitch')];
+  const incoming: ChannelVideo[] = [];
+  const result = mergeVodLists(existing, incoming, { prunePlatforms: ['YouTube'] });
+  test('empty incoming + prune preserves cache',
+    result.some(r => r.id === 'cached-yt') && result.some(r => r.id === 'cached-twitch'));
+}
+
 // --- mergeClipLists ---
 
 console.log('=== mergeClipLists ===');
