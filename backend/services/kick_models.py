@@ -30,6 +30,8 @@ class KickChannel:
     followers: Optional[int] = None
     is_live: bool = False
     live_title: Optional[str] = None
+    viewers: Optional[int] = None
+    playback_url: Optional[str] = None
 
 
 def format_duration(seconds: Optional[float]) -> Optional[str]:

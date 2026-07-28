@@ -81,14 +81,15 @@ class DownloadManager:
         duration_string: Optional[str] = None,
         download_id: Optional[str] = None,
         estimated_bytes: Optional[int] = None,
+        platform: Optional[str] = None,
     ) -> str:
         download_id = download_id or f"dl_{uuid.uuid4().hex[:12]}"
-        platform = ytdlp_service.detect_platform(url)
+        resolved_platform = platform or ytdlp_service.detect_platform(url)
         state = DownloadState(
             download_id=download_id,
             url=url,
             type=download_type,
-            platform=platform,
+            platform=resolved_platform,
             status="Starting...",
             output_file=output_file,
             started_at=datetime.now(timezone.utc).isoformat(),
@@ -124,6 +125,7 @@ class DownloadManager:
             "duration": duration,
             "duration_string": duration_string,
             "estimated_bytes": estimated_bytes,
+            "platform": resolved_platform,
         }
 
         with self._lock:

@@ -312,6 +312,8 @@ def get_channel_api(url: str) -> KickChannel:
         followers=data.get("followers_count") or data.get("followersCount"),
         is_live=bool(ls),
         live_title=(ls.get("session_title") if ls else None),
+        viewers=(ls.get("viewer_count") if ls else None),
+        playback_url=data.get("playback_url"),
     )
 
 

@@ -12,9 +12,11 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from models.schemas import DownloadRequest
 
 from deps import download_mgr, settings_mgr, INFO_EXECUTOR
+from services.live_capture import download_live_stream
 from services.size_estimate import estimate_bytes_for_selection
 from services.url_validation import is_sensible_vod_url
 from services.ytdlp_service import detect_platform
@@ -258,6 +260,84 @@ async def download_clip(req: DownloadRequest):
     )
     _log_download_api_ok(download_id, platform, req.url, kind="clip")
     return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
+
+
+class LiveDownloadRequest(BaseModel):
+    url: str
+    platform: str
+    title: str
+    channel: str = ""
+    headers: dict = {}
+
+
+def _build_live_output_path(channel: str, title: str, platform: str) -> str:
+    """Build output filename for a live recording.
+
+    ponytail: reuses UserSettings output dir. Upgrade to a dedicated output dir
+    for DVR recordings when the settings schema supports it.
+    """
+    settings = settings_mgr.get()
+    out_dir = Path(settings.download_folder or str(Path.home() / "Downloads"))
+    safe_ch = re.sub(r"[^\w.-]", "_", (channel or "live").strip())
+    safe_title = re.sub(r"[^\w.-]", "_", (title or "stream").strip())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate = out_dir / f"{safe_ch}_{safe_title}_{platform}.mp4"
+    counter = 1
+    while candidate.exists():
+        candidate = out_dir / f"{safe_ch}_{safe_title}_{platform}_{counter}.mp4"
+        counter += 1
+    return str(candidate)
+
+
+@router.post("/api/download/live")
+async def download_live(req: LiveDownloadRequest):
+    """Start recording a live HLS stream to disk.
+
+    The returned download_id is a regular download job that can be cancelled
+    or monitored via the existing /api/download/{id} endpoints.
+    """
+    output = _build_live_output_path(req.channel, req.title, req.platform)
+    safe_makedirs(Path(output).parent)
+
+    def _live_download_func(
+        url,
+        output_path,
+        cancel_event,
+        progress_hook=None,
+        register_abort=None,
+        register_temp_dir=None,
+        pause_event=None,
+        **kwargs,
+    ):
+        return download_live_stream(
+            url=url,
+            output_path=output_path,
+            headers=req.headers,
+            cancel_event=cancel_event,
+            progress_hook=progress_hook,
+            register_abort=register_abort,
+            register_temp_dir=register_temp_dir,
+            pause_event=pause_event,
+            **kwargs,
+        )
+
+    download_id = download_mgr.start_download(
+        url=req.url,
+        output_file=output,
+        download_type="live",
+        download_func=_live_download_func,
+        settings_mgr=settings_mgr,
+        title=req.title,
+        channel=req.channel,
+        platform=req.platform,
+    )
+    logger.info(
+        "live download API 200 started id=%s platform=%s url=%s",
+        download_id[:12],
+        req.platform,
+        req.url[:100],
+    )
+    return {"download_id": download_id, "status": "started", "platform": req.platform}
 
 
 @router.get("/api/downloads")

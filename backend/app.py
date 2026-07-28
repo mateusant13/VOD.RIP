@@ -24,6 +24,7 @@ from routers import (
     channels,
     downloads,
     info,
+    live,
     preview,
     settings,
     system,
@@ -349,6 +350,7 @@ app.include_router(settings.router)
 app.include_router(preview.router)
 app.include_router(channels.router)
 app.include_router(info.router)
+app.include_router(live.router)
 app.include_router(downloads.router)
 app.include_router(system.router)
 
