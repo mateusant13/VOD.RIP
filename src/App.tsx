@@ -1235,6 +1235,7 @@ export default function App() {
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube' && v.availability !== 'subscriber_only'
         && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
+      .slice(0, YOUTUBE_WARM_VOD_LIMIT)
       .map((v) => buildVodUrl(v));
     warmYoutubePreviewBatch(youtubeUrls);
 
@@ -3597,7 +3598,7 @@ export default function App() {
     const KINDS = ['vods', 'streams'] as const;
     const isYouTubeUrl = (u: string) => /youtube\.com|youtu\.be/.test(u || '');
     const urlsForKind = (ch: typeof channels[number], kind: typeof KINDS[number]): string[] => {
-      const pool = (ch.vodVideos ?? []).filter((v) =>
+      const pool = (ch.vodVideos ?? []).slice(0, YOUTUBE_WARM_VOD_LIMIT).filter((v) =>
         kind === 'streams' ? v.content_kind === 'stream' : v.content_kind !== 'stream' && v.content_kind !== 'clip',
       );
       const out: string[] = [];
