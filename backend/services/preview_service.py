@@ -574,6 +574,10 @@ class PreviewManager:
         prefer_height: int = 720,
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
+        # ponytail: _resolve_and_cache_youtube_snapshot stores at key (vid, int(height or 0)).
+        # The batch warm uses prefer_height=720 too, so normalizing None/0 here ensures
+        # the snapshot lookup key matches the warm's stored key — primary divergence fix.
+        prefer_height = prefer_height or 720
         if detect_platform(url) == "YouTube":
             # Wait briefly for a genuinely in-flight hover/paste warm so
             # create_session reuses the resolved-stream cache (avoids a second
@@ -612,6 +616,21 @@ class PreviewManager:
                         session.session_id[:8], vid[:11], prefer_height,
                     )
                     return _finalize_youtube_session(session, crop_start)
+            # ponytail: neither snapshot nor catchup hit — resolve and cache now
+            # through the same helper warm uses, so the NEXT click is fast AND
+            # the key shape matches what create_session will look up.
+            snap = _resolve_and_cache_youtube_snapshot(
+                url, oauth=oauth, prefer_height=prefer_height,
+            )
+            if snap:
+                session = self._reuse_youtube_snapshot(
+                    url, crop_start, crop_end, prefer_height, snap
+                )
+                logger.info(
+                    "preview session from inline resolve+cache sid=%s vid=%s h=%d",
+                    session.session_id[:8], snap[0][:11], prefer_height,
+                )
+                return _finalize_youtube_session(session, crop_start)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 url,
@@ -4032,6 +4051,51 @@ def invalidate_resolved_stream_cache(
         _RESOLVED_STREAM_CACHE.pop(key, None)
 
 
+def _build_and_cache_youtube_snapshot(
+    url: str,
+    oauth: Optional[str],
+    prefer_height: int,
+    resolve_result,
+) -> Optional[Tuple[str, int, dict]]:
+    """Build and cache a session snapshot from an already-resolved result.
+
+    Called by both warm (which resolves via warm_light) and create_session
+    (via _resolve_and_cache_youtube_snapshot below).  Ensures the snapshot
+    goes under the exact key that create_session will look up:
+    (vid, int(prefer_height or 0)).
+
+    Returns (vid, height, snapshot_dict) for immediate session reuse, or
+    None if snapshot-building fails.
+    """
+    snap = _build_youtube_session_snapshot(
+        url, 0.0, 0.0, prefer_height, oauth, resolve_result,
+    )
+    if snap:
+        _put_session_snapshot(snap[0], snap[1], snap[2])
+    return snap
+
+
+def _resolve_and_cache_youtube_snapshot(
+    url: str,
+    oauth: Optional[str] = None,
+    prefer_height: int = 720,
+    **resolve_kwargs,
+) -> Optional[Tuple[str, int, dict]]:
+    """Resolve + cache — full self-contained path for create_session fallback.
+
+    Calls resolve_stream_info, then _build_and_cache_youtube_snapshot so
+    the snapshot is stored under the exact key create_session looks up.
+    Returns (vid, height, snapshot_dict) or None on failure.
+    """
+    try:
+        resolve_result = resolve_stream_info(
+            url, oauth=oauth, prefer_height=prefer_height, **resolve_kwargs,
+        )
+    except Exception:
+        return None
+    return _build_and_cache_youtube_snapshot(url, oauth, prefer_height, resolve_result)
+
+
 def _invalidate_youtube_resolve_caches(
     url: str,
     prefer_height: int = 720,
@@ -4366,22 +4430,18 @@ def warm_youtube_resolve_only(
         kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
     except Exception as exc:
         logger.debug("YouTube batch warm head skipped for %s: %s", url[:80], exc)
-    # ponytail: build the session shell so the click fast-path applies. Cached
-    # resolve + build once during warm = sub-50ms click instead of ~5s.
-    try:
-        snap = _build_youtube_session_snapshot(
-            url, 0.0, 0.0, prefer_height, oauth, resolve_result
+    # ponytail: build the session shell through the shared _build_and_cache
+    # helper so warm and create_session produce identical keys + payloads.
+    snap = _build_and_cache_youtube_snapshot(
+        url, oauth, prefer_height, resolve_result,
+    )
+    if snap:
+        logger.info(
+            "YouTube session snapshot ready: %s h=%d sid=%s",
+            snap[0][:11], snap[1], snap[2]["session_id"][:8],
         )
-        if snap:
-            _put_session_snapshot(snap[0], snap[1], snap[2])
-            logger.info(
-                "YouTube session snapshot ready: %s h=%d sid=%s",
-                snap[0][:11], snap[1], snap[2]["session_id"][:8],
-            )
-    except Exception as exc:
-        logger.warning(
-            "session snapshot failed for %s: %s", url[:80], exc, exc_info=True
-        )
+    else:
+        logger.debug("session snapshot skipped for %s (unsupported type)", url[:80])
     return True
 
 
