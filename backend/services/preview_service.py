@@ -4093,11 +4093,19 @@ def _resolve_and_cache_youtube_snapshot(
     the snapshot is stored under the exact key create_session looks up.
     Returns (vid, height, snapshot_dict) or None on failure.
     """
+    t0 = time.monotonic()
     try:
         resolve_result = resolve_stream_info(
             url, oauth=oauth, prefer_height=prefer_height, **resolve_kwargs,
         )
-    except Exception:
+    except Exception as exc:
+        # ponytail: this failure used to vanish — a cold click then burned ~27s
+        # in silence before the fallthrough re-raised. One line keeps the
+        # console honest without leaking per-retry noise (those stay debug).
+        logger.warning(
+            "cold preview resolve failed for %s after %.1fs: %s",
+            url[:80], time.monotonic() - t0, exc,
+        )
         return None
     return _build_and_cache_youtube_snapshot(url, oauth, prefer_height, resolve_result)
 

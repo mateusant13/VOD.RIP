@@ -98,14 +98,31 @@ class _YtdlpQuietLogger:
         self.lines.append(str(msg))
 
 
+# fd-2 redirect is process-wide; concurrent extracts (warm storm + fallback
+# race) interleave enter/exit. Without a refcount, a thread that ENTERED while
+# another held the redirect saves devnull as its "original" fd and restores
+# devnull on exit — permanently poisoning stderr for the whole process (every
+# warning/traceback silently vanishes from that point on).
+_SILENCE_LOCK = threading.Lock()
+_SILENCE_DEPTH = 0
+_SILENCE_SAVED_FD: Optional[int] = None
+
+
 @contextlib.contextmanager
 def _silence_stderr():
     """Redirect fd 2 ÔÇö yt-dlp writes ERROR lines past logging hooks."""
+    global _SILENCE_DEPTH, _SILENCE_SAVED_FD
     buf = io.StringIO()
-    saved_fd = os.dup(2)
-    devnull = os.open(os.devnull, os.O_WRONLY)
+    with _SILENCE_LOCK:
+        if _SILENCE_DEPTH == 0:
+            _SILENCE_SAVED_FD = os.dup(2)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, 2)
+            finally:
+                os.close(devnull)
+        _SILENCE_DEPTH += 1
     try:
-        os.dup2(devnull, 2)
         with contextlib.redirect_stderr(buf):
             old_sys = sys.stderr
             sys.stderr = buf
@@ -114,9 +131,12 @@ def _silence_stderr():
             finally:
                 sys.stderr = old_sys
     finally:
-        os.dup2(saved_fd, 2)
-        os.close(saved_fd)
-        os.close(devnull)
+        with _SILENCE_LOCK:
+            _SILENCE_DEPTH -= 1
+            if _SILENCE_DEPTH == 0 and _SILENCE_SAVED_FD is not None:
+                os.dup2(_SILENCE_SAVED_FD, 2)
+                os.close(_SILENCE_SAVED_FD)
+                _SILENCE_SAVED_FD = None
 
 
 SEGMENT_DOWNLOAD_WORKERS = 8
