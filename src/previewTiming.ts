@@ -17,12 +17,21 @@ function emitTiming(payload: TimingPayload): void {
   void apiPost<{ ok: boolean }>('/api/preview/timing', payload).catch(() => {});
 }
 
+/** Gesture start (pointerdown/click) captured before React mount so the
+ *  click→markOpen gap (main-thread stalls, re-render storms) is measurable. */
+let _gestureStartMs = 0;
+
+export function notePreviewGesture(): void {
+  _gestureStartMs = performance.now();
+}
+
 /** Per-preview timing tracker (main panel or channel explore popup). */
 export class PreviewTiming {
   private tOpen = 0;
   private tSeek = 0;
   private sessionId = '';
   private firstPlayableSent = false;
+  private clickToOpenMs = -1;
 
   constructor(
     private readonly platform: string,
@@ -33,12 +42,16 @@ export class PreviewTiming {
     this.tOpen = performance.now();
     this.tSeek = 0;
     this.firstPlayableSent = false;
+    // Consume the gesture timestamp — only trust it when it's fresh (<15s).
+    const gap = _gestureStartMs > 0 ? this.tOpen - _gestureStartMs : -1;
+    this.clickToOpenMs = gap >= 0 && gap < 15_000 ? gap : -1;
+    _gestureStartMs = 0;
     emitTiming({
       platform: this.platform,
       surface: this.surface,
       event: 'preview_open',
       open_ms: 0,
-      detail,
+      detail: `${detail ?? ''} click→open=${this.clickToOpenMs.toFixed(0)}ms`,
     });
   }
 
@@ -72,6 +85,18 @@ export class PreviewTiming {
       session_id: this.sessionId || undefined,
       open_ms: ms,
       detail: detail ?? `open→playable=${ms.toFixed(0)}ms`,
+    });
+    // Full-path summary: the one line that accounts for the whole click.
+    const total = this.clickToOpenMs >= 0 ? this.clickToOpenMs + ms : ms;
+    emitTiming({
+      platform: this.platform,
+      surface: this.surface,
+      event: 'full_path',
+      session_id: this.sessionId || undefined,
+      open_ms: total,
+      detail:
+        `click→open=${this.clickToOpenMs.toFixed(0)} open→playable=${ms.toFixed(0)} ` +
+        `click→playable=${total.toFixed(0)}ms`,
     });
   }
 

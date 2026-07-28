@@ -196,6 +196,19 @@ async def preview_timing_event(req: PreviewTimingRequest):
     return {"ok": True}
 
 
+@router.post("/api/preview/invalidate")
+async def preview_invalidate(req: PreviewWarmRequest):
+    """Cold-reset every in-memory preview cache for one URL (test/debug hook).
+
+    API binds localhost only; this just forces the next session create down
+    the full cold path so timing measurements are comparable across runs.
+    """
+    from services.preview_service import invalidate_youtube_preview_caches
+
+    invalidate_youtube_preview_caches(req.url or "")
+    return {"ok": True}
+
+
 @router.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
     # ponytail: crop_end=0 means "unknown" — let create_session fall back to

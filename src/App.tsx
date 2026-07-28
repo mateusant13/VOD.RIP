@@ -54,7 +54,7 @@ import {
   createPreviewSessionWithRetry,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
-import { PreviewTiming, waitVideoPlayable } from './previewTiming';
+import { PreviewTiming, waitVideoPlayable, notePreviewGesture } from './previewTiming';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
@@ -2280,6 +2280,7 @@ export default function App() {
   }, []);
 
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
+    notePreviewGesture();
     pauseAllExplorePopups();
     const vodUrl = buildVodUrl(v);
     if (v.platform === 'youtube') {

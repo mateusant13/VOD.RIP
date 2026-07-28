@@ -76,7 +76,7 @@ USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 # Signed googlevideo URLs expire in hours, not minutes; a 300s TTL let the warm
 # storm's work evaporate before a user browsed the channel list and clicked.
 # Stale 403s are already handled: the proxy re-resolves on auth errors.
-_RESOLVED_STREAM_TTL_SEC = 900
+_RESOLVED_STREAM_TTL_SEC = 3600
 _RESOLVED_STREAM_MAX = 256
 _RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
 _RESOLVED_STREAM_LOCK = threading.Lock()
@@ -84,7 +84,8 @@ _RESOLVED_STREAM_LOCK = threading.Lock()
 # warm job and consumed by create_session so the click path skips the ~5s
 # extract + variant-build + custom-master work entirely on a warm hit.
 # TTL matches _RESOLVED_STREAM_TTL_SEC: signed googlevideo URLs expire in
-# hours, so a warm window of 15min is plenty to cover a browsing session.
+# hours, and 1h covers a real browsing session (15min did not — users open a
+# channel, browse for a while, THEN click; the warm had already evaporated).
 _SESSION_SNAPSHOT_TTL_SEC = _RESOLVED_STREAM_TTL_SEC
 _SESSION_SNAPSHOT_MAX = 256
 _SESSION_SNAPSHOT: Dict[Tuple[str, int], Tuple[float, dict]] = {}
@@ -4109,6 +4110,26 @@ def _invalidate_youtube_resolve_caches(
 
     invalidate_youtube_extract_cache(url)
     invalidate_resolved_stream_cache(url, prefer_height)
+
+
+def invalidate_youtube_preview_caches(url: str) -> None:
+    """Drop EVERY in-memory preview cache layer for *url* (cold-reset for tests).
+
+    Covers all height-keyed variants, unlike invalidate_resolved_stream_cache
+    which drops a single {vid}:{height}:v2 key. Disk caches (prog head, yt-dlp
+    cachedir) are intentionally kept — they don't affect session-create time.
+    """
+    from services.youtube_innertube import extract_video_id
+    from services.ytdlp_hls import invalidate_youtube_extract_cache
+
+    vid = extract_video_id((url or "").strip())
+    if not vid:
+        return
+    invalidate_youtube_extract_cache(url)
+    invalidate_session_snapshot(vid)
+    with _RESOLVED_STREAM_LOCK:
+        for k in [k for k in _RESOLVED_STREAM_CACHE if k.startswith(f"{vid}:")]:
+            _RESOLVED_STREAM_CACHE.pop(k, None)
 
 
 def _youtube_warm_inflight_key(url: str) -> str:
