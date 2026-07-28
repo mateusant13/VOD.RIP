@@ -262,82 +262,73 @@ def list_channel_videos_sync(
     channel_id: Optional[str] = None
     list_order = 0
 
-    for pl in ("videos", "shorts", "streams"):
-        pl_url = channel_playlist_url(channel_ref, pl)
-        try:
-            with guarded_youtube_dl_channel(base_opts) as ydl:
-                info = ydl.extract_info(pl_url, download=False)
-            if channel_id is None:
-                channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
-        except Exception as exc:
-            logger.debug("youtube playlist %s failed: %s", pl, exc)
+    # Fetch ONLY the requested tab — the router always passes an explicit
+    # playlist kind, and 3 sequential extracts (~8s each) triple both latency
+    # and YouTube request volume (bot-wall risk). ponytail: a was_live entry
+    # that YouTube lists only under /videos (not /streams) no longer appears in
+    # the streams response; upgrade path = fetch both tabs when playlist=streams.
+    pl = playlist if playlist in ("videos", "shorts", "streams") else "videos"
+    pl_url = channel_playlist_url(channel_ref, pl)
+    try:
+        with guarded_youtube_dl_channel(base_opts) as ydl:
+            info = ydl.extract_info(pl_url, download=False)
+        channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
+    except Exception as exc:
+        logger.debug("youtube playlist %s failed: %s", pl, exc)
+        info = None
+
+    entries = (info or {}).get("entries") or []
+    for e in entries:
+        if not e:
+            continue
+        vid = (e.get("id") or "").strip()
+        if not vid or vid in all_videos:
             continue
 
-        entries = (info or {}).get("entries") or []
-        for e in entries:
-            if not e:
-                continue
-            vid = (e.get("id") or "").strip()
-            if not vid:
-                continue
-            # Prefer the entry from the playlist that gives the BEST classification.
-            # /streams = best for long content (has duration), /shorts = best for shorts.
-            # Replace if existing is generic (vod) and new is specific (stream/clip).
-            if vid in all_videos:
-                existing = all_videos[vid]
-                existing_kind = existing.get("content_kind", "")
-                new_kind = content_kind
-                # Upgrade: vod -> stream/clip (streams/shorts win over generic videos)
-                if existing_kind == "vod" and new_kind in ("stream", "clip"):
-                    all_videos[vid] = row
-                elif pl == "streams" and existing_kind == "clip" and new_kind == "stream":
-                    all_videos[vid] = row
-                continue
+        if pl == "shorts":
+            webpage = f"https://www.youtube.com/shorts/{vid}"
+        else:
+            webpage = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
+        if not str(webpage).startswith("http"):
+            webpage = f"https://www.youtube.com/watch?v={vid}"
 
-            if pl == "shorts":
-                webpage = f"https://www.youtube.com/shorts/{vid}"
-            else:
-                webpage = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
-            if not str(webpage).startswith("http"):
-                webpage = f"https://www.youtube.com/watch?v={vid}"
+        created_at = _created_at_from_entry(e)
+        thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+        dur = e.get("duration")
+        dur_str = None
+        duration_sec = None
+        if dur is not None:
+            try:
+                duration_sec = int(float(dur))
+                dur_str = _duration_string_from_sec(duration_sec)
+            except (TypeError, ValueError):
+                pass
 
-            created_at = _created_at_from_entry(e)
-            thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
-            dur = e.get("duration")
-            dur_str = None
-            duration_sec = None
-            if dur is not None:
-                try:
-                    duration_sec = int(float(dur))
-                    dur_str = _duration_string_from_sec(duration_sec)
-                except (TypeError, ValueError):
-                    pass
+        content_kind = _classify_youtube_video(
+            vid=vid,
+            title=e.get("title") or "",
+            url=webpage,
+            duration=duration_sec,
+            live_status=e.get("live_status"),
+            playlist_source=pl,
+        )
 
-            content_kind = _classify_youtube_video(
-                vid=vid,
-                title=e.get("title") or "",
-                url=webpage,
-                duration=duration_sec,
-                live_status=e.get("live_status"),
-                playlist_source=pl,
-            )
-
-            list_order += 1
-            all_videos[vid] = {
-                "_list_order": list_order,
-                "id": vid,
-                "platform": "YouTube",
-                "title": e.get("title") or "Untitled",
-                "duration": duration_sec,
-                "duration_string": dur_str,
-                "created_at": created_at,
-                "views": e.get("view_count"),
-                "thumbnail_url": thumb,
-                "url": webpage,
-                "channel": e.get("channel") or e.get("uploader") or channel_ref,
-                "content_kind": content_kind,
-                "availability": e.get("availability"),  # yt-dlp sets this for member-only
-            }  # end all_videos dict
+        list_order += 1
+        all_videos[vid] = {
+            "_list_order": list_order,
+            "id": vid,
+            "platform": "YouTube",
+            "title": e.get("title") or "Untitled",
+            "duration": duration_sec,
+            "duration_string": dur_str,
+            "created_at": created_at,
+            "views": e.get("view_count"),
+            "thumbnail_url": thumb,
+            "url": webpage,
+            "channel": e.get("channel") or e.get("uploader") or channel_ref,
+            "content_kind": content_kind,
+            "availability": e.get("availability"),  # yt-dlp sets this for member-only
+        }
 
     # Filter by requested playlist type. Drop member-only entries at source.
     _memb_only = lambda v: v.get("availability") == "subscriber_only"  # noqa: E731
