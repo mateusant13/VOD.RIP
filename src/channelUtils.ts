@@ -87,6 +87,24 @@ export function channelVideoKey(v: ChannelVideo): string {
   return `${v.platform}:${v.id}`;
 }
 
+/**
+ * Extract a YouTube video id from a /watch?v=, /shorts/, /embed/, or youtu.be URL.
+ * Returns null for non-YouTube URLs.
+ */
+function youtubeVideoId(url: string): string | null {
+  const l = (url || '').toLowerCase();
+  if (!l.includes('youtube.com') && !l.includes('youtu.be')) return null;
+  const m = l.match(/(?:[?&]v=|\/shorts\/|\/embed\/|youtu\.be\/)([a-z0-9_-]{11})/i);
+  return m ? m[1] : null;
+}
+
+/** Canonical YouTube URL for a video id — prefer /watch?v= for VODs, /shorts/ if explicitly a short. */
+function youtubeCanonicalUrl(id: string, preferShorts: boolean): string {
+  return preferShorts
+    ? `https://www.youtube.com/shorts/${id}`
+    : `https://www.youtube.com/watch?v=${id}`;
+}
+
 export function mapApiChannelItem(v: ChannelVideo & { thumbnail?: string | null }): ChannelVideo {
   return {
     ...v,
@@ -643,6 +661,27 @@ export function formatChannelErrorMessage(
   return null;
 }
 
+/**
+ * Drop vodVideos entries whose YouTube id also lives in clipVideos — YouTube
+ * shorts and full-length VODs share the same 11-char id, so a single video
+ * can land in both lists (shorts tab + /videos tab or /streams tab). The
+ * short listing is the canonical one — force its URL to /shorts/<id> and
+ * strip the duplicate from vodVideos.
+ */
+function dedupeYoutubeAgainstClips(vods: ChannelVideo[], clips: ChannelVideo[]): ChannelVideo[] {
+  const shortIds = new Set<string>();
+  for (const c of clips) {
+    if (c.platform !== 'YouTube') continue;
+    const id = youtubeVideoId(c.url || '') || c.id;
+    if (id) shortIds.add(id);
+  }
+  if (!shortIds.size) return vods;
+  return vods.filter((v) => {
+    if (v.platform !== 'YouTube') return true;
+    const id = youtubeVideoId(v.url || '') || v.id;
+    return !shortIds.has(id);
+  });
+}
 export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
   const { videos: legacy, ...rest } = ch;
   let vodVideos = ch.vodVideos;
@@ -655,8 +694,13 @@ export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
   return {
     ...rest,
     youtubeSlug: ch.youtubeSlug ?? '',
-    vodVideos: vodVideos ?? [],
-    clipVideos: clipVideos ?? [],
+    vodVideos: dedupeYoutubeAgainstClips(vodVideos ?? [], clipVideos ?? []),
+    clipVideos: (clipVideos ?? []).map((c) => {
+      if (c.platform !== 'YouTube') return c;
+      const id = youtubeVideoId(c.url || '');
+      if (!id || /\/shorts\//i.test(c.url || '')) return c;
+      return { ...c, url: youtubeCanonicalUrl(id, true) };
+    }),
     vodErrors: ch.vodErrors ?? legacyErrors,
     clipErrors: ch.clipErrors ?? {},
     clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,

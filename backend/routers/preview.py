@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
+from models.schemas import LivePreviewRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
 from deps import INFO_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
@@ -17,6 +17,7 @@ from services.preview_service import (
     StalePreviewUrls,
     WINDOW_HLS_MARKER,
     create_session,
+    create_live_session,
     delete_session,
     open_progressive_proxy,
     open_segment_proxy,
@@ -262,6 +263,36 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         logger.warning("preview session rejected url=%s status=%d msg=%s", preview_url[:100], status, _preview_user_message(e))
         raise HTTPException(status_code=status, detail=_preview_user_message(e))
 
+
+@router.post("/api/preview/live")
+async def preview_live(req: LivePreviewRequest):
+    """Open a preview session for a currently-live HLS stream.
+
+    The frontend fetches the master playlist + headers via ``/api/live/{platform}``
+    and posts them here — bypasses InnerTube/yt-dlp because live HLS lives on
+    token-protected CDNs (usher.ttvnw.net, manifest.googlevideo.com, etc.) those
+    extractors can't resolve. Trim + download work the same as any VOD session:
+    the live master is registered under the standard preview proxy.
+    """
+    url = (req.url or "").strip()
+    platform = (req.platform or "").strip() or "Unknown"
+    if not url:
+        raise HTTPException(status_code=400, detail="Live preview requires a master.m3u8 url")
+    try:
+        session = await asyncio.get_running_loop().run_in_executor(
+            PREVIEW_EXECUTOR,
+            lambda: create_live_session(url, req.headers or {}, platform),
+        )
+        logger.info(
+            "live preview session created id=%s platform=%s url=%s",
+            session.session_id[:8], platform, url[:100],
+        )
+        return _preview_session_response(session)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("live preview session failed url=%s: %s", url[:100], e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/api/preview/session/{session_id}/status")
 async def preview_session_status(session_id: str):

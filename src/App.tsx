@@ -6,7 +6,7 @@ import {
   Users, Database, Settings2, Loader2,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical, Radio,
+  GripVertical,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
@@ -504,6 +504,7 @@ export default function App() {
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
   const [channelLiveStatuses, setChannelLiveStatuses] = useState<Record<string, ChannelLiveStatus>>({});
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
+  const [livePreviewPicker, setLivePreviewPicker] = useState<{ channelId: string | null; open: boolean }>({ channelId: null, open: false });
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
@@ -3940,20 +3941,72 @@ export default function App() {
       return next;
     });
   }, [selectedChannelId]);
-
-  const startLiveDownload = useCallback(async (ch: SavedChannel, entry: ChannelLiveStatus['live'][0]) => {
+  // ponytail: live preview opens the same player as a VOD but registers the
+  // already-resolved HLS playlist directly. No InnerTube/yt-dlp extraction —
+  // live CDNs (usher.ttvnw.net, googlevideo manifests, etc.) are token-bound
+  // and those extractors can't resolve them. Trim/download still work because
+  // the session is a regular PreviewSession (kind=hls) proxied via the same
+  // /api/preview/hls/{sid}/master.m3u8 endpoint.
+  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number]): Promise<void> => {
+    if (!entry?.url) return;
+    previewGenRef.current += 1;
+    setError(null);
+    setPreviewYoutubeEmbedUrl(null);
+    const url = entry.url;
+    const platformName = entry.platform || 'YouTube';
+    setUrl(url);
+    previewLoadedUrlRef.current = url;
+    trimStartSecRef.current = 0;
+    trimEndSecRef.current = 14400;
+    setTrimStartSec(0);
+    setTrimEndSec(14400);
+    setPreviewMetaDurationSec(14400);
+    previewStartedRef.current = true;
     try {
-      await apiPost<{ download_id: string; status: string }>('/api/download/live', {
-        url: entry.url,
-        platform: entry.platform,
+      const res = await apiPost<{
+        session_id: string;
+        master_url: string;
+        playback_url: string;
+        kind: 'hls' | 'progressive';
+        variant_heights: number[];
+        quality_labels: string[];
+        active_height: number;
+        duration_sec: number;
+      }>('/api/preview/live', {
+        url,
+        platform: platformName,
+        headers: entry.headers ?? {},
         title: entry.title,
-        channel: ch.displayName,
-        headers: entry.headers,
       });
+      previewSessionIdRef.current = res.session_id;
+      setPreviewSessionId(res.session_id);
+      previewTrimTimelineRef.current = false;
+      previewWindowHlsMuxStartRef.current = 0;
+      previewWindowHlsMuxEndRef.current = 0;
+      previewCachedProgressiveRef.current = false;
+      previewSessionMetaRef.current = {
+        variantHeights: res.variant_heights ?? [],
+        qualityLabels: res.quality_labels ?? [],
+        activeHeight: res.active_height ?? 0,
+      };
+      setPreviewPlayback({
+        url: res.playback_url,
+        kind: res.kind ?? 'hls',
+        variantHeights: res.variant_heights ?? [],
+        qualityLabels: res.quality_labels ?? [],
+        activeHeight: res.active_height ?? 0,
+      });
+      setPreviewVideoLoading(false);
+      console.info('[VOD.RIP preview] live session', res.session_id, platformName);
     } catch (err) {
-      setAddChannelNotice(err instanceof Error ? err.message : 'Live recording failed');
+      previewStartedRef.current = false;
+      previewLoadedUrlRef.current = null;
+      const msg = err instanceof Error ? err.message : 'Live preview failed';
+      setError(msg);
+      setPreviewOpen(false);
+      setPreviewVideoLoading(false);
     }
-  }, [setAddChannelNotice]);
+  }, [setUrl, setError]);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
@@ -5241,17 +5294,50 @@ export default function App() {
                       {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
                     </button>
                     {liveEntries.length > 0 && (
-                      <button
-                        type="button"
-                        title={`Record live: ${liveEntries[0].platform}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void startLiveDownload(ch, liveEntries[0]);
-                        }}
-                        className="text-red-500 hover:text-red-300 p-0.5"
-                      >
-                        <Radio size={11} />
-                      </button>
+                      <div className="relative">
+                        <button
+                          type="button"
+                          title={liveEntries.length === 1
+                            ? `Watch live: ${liveEntries[0].platform}`
+                            : 'Watch live (pick platform)'}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (liveEntries.length === 1) {
+                              void openLivePreview(liveEntries[0]);
+                            } else {
+                              setLivePreviewPicker({ channelId: ch.id, open: true });
+                            }
+                          }}
+                          className="text-red-400 hover:text-red-200 p-0.5"
+                        >
+                          <Eye size={11} />
+                        </button>
+                        {liveEntries.length > 1 && livePreviewPicker.open
+                          && livePreviewPicker.channelId === ch.id && (
+                          <div
+                            className="absolute right-0 top-full mt-1 z-30 min-w-[160px] rounded border border-zinc-700 bg-zinc-900 shadow-lg"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {liveEntries.map((entry) => (
+                              <button
+                                key={`${entry.platform}-${entry.url}`}
+                                type="button"
+                                title={`Watch ${entry.platform} live`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLivePreviewPicker({ channelId: null, open: false });
+                                  void openLivePreview(entry);
+                                }}
+                                className="w-full px-2 py-1 text-left text-[11px] text-zinc-200 hover:bg-zinc-800 flex items-center gap-1.5"
+                              >
+                                <Eye size={10} />
+                                <span className="font-semibold">{entry.platform}</span>
+                                <span className="text-zinc-500 truncate">{entry.title}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     )}
                     <button type="button" title="Remove"
                       onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}

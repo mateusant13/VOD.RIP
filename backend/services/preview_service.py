@@ -778,7 +778,62 @@ class PreviewManager:
 
         return _finalize_youtube_session(session, crop_start)
 
-
+    # ponytail: live HLS (Kick/Twitch/YouTube live) — bypass InnerTube/yt-dlp.
+    # The frontend already has the master.m3u8 + headers (live_capture service),
+    # so we just register a session and proxy the playlist like any HLS source.
+    # Live has no fixed duration — cap crop_end at 4h so the trim UI has a
+    # sensible window (trim downloads the actual slice via ffprobe later).
+    def create_live_session(
+        self,
+        url: str,
+        headers: dict,
+        platform: str,
+    ) -> "PreviewSession":
+        self._cleanup_stale_sessions()
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("Live preview requires an http(s) HLS URL")
+        session_id = secrets.token_hex(8)
+        cache_dir = _PREVIEW_ROOT / session_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        session = PreviewSession(
+            session_id=session_id,
+            vod_url=url,
+            master_url=url,
+            entry_url=url,
+            platform=platform or "Unknown",
+            http_headers=dict(headers or {}),
+            allowed_hosts=_hosts_for_url(url),
+            cache_dir=cache_dir,
+            kind="hls",
+            crop_start=0.0,
+            crop_end=4 * 3600.0,
+            vod_duration=4 * 3600.0,
+        )
+        with self._lock:
+            self._sessions[session_id] = session
+            session.timing_created_mono = time.monotonic()
+            if len(self._sessions) > self._max_sessions:
+                stale = sorted(
+                    self._sessions.items(),
+                    key=lambda item: item[1].last_access,
+                )[: len(self._sessions) - self._max_sessions]
+                for popped_sid, popped_session in stale:
+                    del self._sessions[popped_sid]
+                    cache_dir = popped_session.cache_dir
+                    threading.Thread(
+                        target=lambda d=cache_dir: shutil.rmtree(
+                            d, ignore_errors=True,
+                        ),
+                        daemon=True,
+                    ).start()
+        # ponytail: warm the master playlist through the proxy so the first
+        # browser <video src> request gets an instant 200 instead of cold fetch.
+        try:
+            proxy_playlist(session_id, session.master_url)
+        except Exception:
+            pass
+        return session
 @dataclass
 class PreviewSession:
     session_id: str
@@ -5487,8 +5542,8 @@ _cleanup_stale_sessions = _manager._cleanup_stale_sessions
 delete_session = _manager.delete_session
 get_session = _manager.get_session
 create_session = _manager.create_session
-
-if __name__ == "__main__":  # ponytail: self-checks — were module-level, did disk I/O at import (ENOSPC crash)
+create_live_session = _manager.create_live_session
+if __name__ == "__main__":
     assert _formats_are_dash_https([{"protocol": "https", "url": "https://x/v.mp4"}])
     assert not _formats_are_dash_https(
         [{"protocol": "m3u8_native", "url": "https://x/m.m3u8"}]
