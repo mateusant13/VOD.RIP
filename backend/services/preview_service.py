@@ -1019,15 +1019,25 @@ def _hosts_for_url(url: str) -> Set[str]:
     return {host} if host else set()
 
 
-def _host_allowed(host: str, session: PreviewSession) -> bool:
+def is_host_allowed(host: str, session: Optional[PreviewSession] = None) -> bool:
+    """Check if host is allowed for upstream proxying.
+
+    Tier 1: session-scoped whitelist (hosts discovered in playlists).
+    Tier 2: fallback suffix allowlist (for cold fetches / no-session use).
+    """
     if not host:
         return False
-    if host in session.allowed_hosts:
+    if session is not None and host in session.allowed_hosts:
         return True
     return any(
         host == suffix or host.endswith(f".{suffix}")
         for suffix in _ALLOWED_HOST_SUFFIXES
     )
+
+
+def _host_allowed(host: str, session: PreviewSession) -> bool:
+    """Internal wrapper; prefer the public is_host_allowed for external callers."""
+    return is_host_allowed(host, session)
 
 
 def _request_headers(
@@ -5116,11 +5126,17 @@ def _rewrite_playlist_line(
 
             def _sub(m: re.Match) -> str:
                 abs_url = urljoin(playlist_url, m.group(1))
+                host = urlparse(abs_url).hostname
+                if host:
+                    session.allowed_hosts.add(host)
                 return f'URI="{_proxy_url(session, abs_url)}"'
 
             return _URI_IN_TAG.sub(_sub, line)
         return line
     abs_url = urljoin(base, stripped)
+    host = urlparse(abs_url).hostname
+    if host:
+        session.allowed_hosts.add(host)
     return _proxy_url(session, abs_url)
 
 
