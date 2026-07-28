@@ -408,7 +408,7 @@ _DEFAULT_TWITCH_HEADERS: dict = {
 _ALLOWED_HOST_SUFFIXES = (
     "kick.com",
     "clips.kick.com",
-    "playback.live-video.net",  # ponytail: AWS MediaLive fronts Kick live segments — missing = live preview 403s on every resource
+    "live-video.net",  # ponytail: covers playback.live-video.net + any other Kick CDN subdomain — missing = live preview 403s on every resource
     "twitch.tv",
     "ttvnw.net",
     "jtvnw.net",

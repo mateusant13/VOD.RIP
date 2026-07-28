@@ -34,7 +34,7 @@ for host in DENY_HOSTS:
     print(f"  OK _host_allowed('{host}') = False (correctly denied)")
 
 # -- The fix itself --
-assert 'playback.live-video.net' in _ALLOWED_HOST_SUFFIXES, \
-    "playback.live-video.net must be in the suffix list"
+assert 'live-video.net' in _ALLOWED_HOST_SUFFIXES, \
+    "live-video.net must be in the suffix list (covers playback.live-video.net + any other Kick CDN subdomain)"
 
 print("\n✅ All host-allowed checks pass: fix verified")
