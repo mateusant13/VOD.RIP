@@ -597,6 +597,21 @@ class PreviewManager:
                     session.session_id[:8], vid[:11], prefer_height,
                 )
                 return _finalize_youtube_session(session, crop_start)
+            # ponytail: the initial warm wait may have timed out while the
+            # extract was still running. Give it a second chance before paying
+            # the full ~5s resolve cost — a running warm is ~any-ms from done.
+            if vid:
+                _await_youtube_warm_catchup(url, timeout_sec=3.0)
+                snap = _get_session_snapshot(vid, prefer_height)
+                if snap:
+                    session = self._reuse_youtube_snapshot(
+                        url, crop_start, crop_end, prefer_height, snap
+                    )
+                    logger.info(
+                        "preview session reused from warm catchup sid=%s vid=%s h=%d",
+                        session.session_id[:8], vid[:11], prefer_height,
+                    )
+                    return _finalize_youtube_session(session, crop_start)
         raw_entry, headers, platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 url,
@@ -4206,6 +4221,18 @@ def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:
         ev = _YOUTUBE_WARM_INFLIGHT.get(key)
     if ev is not None and not ev.wait(timeout_sec):
         logger.debug("YouTube warm wait timed out for %s", key[:80])
+
+
+def _await_youtube_warm_catchup(url: str, timeout_sec: float = 3.0) -> None:
+    """If the warm is still running after the initial brief wait, give it
+    more time before falling through to a fresh resolve."""
+    key = _youtube_warm_inflight_key(url)
+    if not key:
+        return
+    with _YOUTUBE_WARM_LOCK:
+        ev = _YOUTUBE_WARM_INFLIGHT.get(key)
+    if ev is not None and not ev.wait(timeout_sec):
+        logger.debug("YouTube warm catchup wait timed out for %s", key[:80])
 
 
 # Bounded background full-chain warm for videos the light (InnerTube-only)
