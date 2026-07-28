@@ -147,13 +147,66 @@ function viteHealthy(port) {
   });
 }
 
+function truncateIfLarge(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > 10 * 1024 * 1024) {
+      // ponytail: overwrite truncates; no fd juggling needed
+      fs.writeFileSync(filePath, "");
+    }
+  } catch {
+    // file missing or can't stat — first-run is fine
+  }
+}
+
+function attachChildLogger(label, child) {
+  const logDir = path.join(root, "tmp");
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+  } catch {
+    // fall back to terminal-only
+  }
+  const logPath = path.join(logDir, `vodrip-devall-${label}.log`);
+  truncateIfLarge(logPath);
+  const stream = fs.createWriteStream(logPath, { flags: "a" });
+
+  const tag = () => {
+    const ts = new Date().toISOString().replace(/Z$/, ""); // YYYY-MM-DDTHH:MM:SS.fff
+    return `${ts} [${label}] `;
+  };
+
+  const fwd = (source, dest) => {
+    source.on("data", (data) => {
+      const lines = data.toString().split(/\r?\n/);
+      for (const line of lines) {
+        if (!line) continue;
+        const t = tag();
+        stream.write(t + line + "\n");
+        dest.write(line + "\n");
+      }
+    });
+  };
+
+  fwd(child.stdout, process.stdout);
+  fwd(child.stderr, process.stderr);
+
+  child.on("close", () => {
+    stream.end();
+  });
+}
+
 function start(label, command, args, cwd, extraEnv = {}) {
+  const disableLog = process.env.VODRIP_DEVALL_DISABLE_LOG === "1";
+  const stdio = disableLog ? "inherit" : ["ignore", "pipe", "pipe"];
   const child = spawn(command, args, {
     cwd,
-    stdio: "inherit",
+    stdio,
     shell: false,
     env: { ...process.env, PORT: String(apiPort), ...extraEnv },
   });
+  if (!disableLog) {
+    attachChildLogger(label, child);
+  }
   child.on("exit", (code, signal) => {
     if (signal) return;
     if (code !== 0 && code !== null) {
@@ -185,8 +238,30 @@ function shutdown(code = 0) {
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
+try {
+  // SIGHUP = terminal detached / tmux pane closed; clean up children
+  process.on("SIGHUP", () => shutdown(0));
+} catch {
+  // unsupported on Windows — no-op
+}
 
 async function main() {
+  /** --kill-logs: empty all devall log files and exit (no server start). */
+  if (process.argv.includes("--kill-logs")) {
+    const logDir = path.join(root, "tmp");
+    try {
+      for (const name of fs.readdirSync(logDir)) {
+        if (name.startsWith("vodrip-devall-") && name.endsWith(".log")) {
+          fs.writeFileSync(path.join(logDir, name), "");
+          console.log(`[dev] cleared ${name}`);
+        }
+      }
+    } catch {
+      // directory missing or no files — nothing to clear
+    }
+    process.exit(0);
+  }
+
   await ensurePortFree(apiPort, "API");
 
   if (fastPreview) {
