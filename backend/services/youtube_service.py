@@ -78,6 +78,10 @@ def _duration_string_from_sec(sec: int) -> str:
 
 
 def _youtube_row_needs_enrich(row: dict[str, Any]) -> bool:
+    # Cache signal: if we've already attempted enrichment via InnerTube,
+    # skip re-fetch until the cache TTL expires.
+    if row.get("_enriched"):
+        return False
     if not row.get("created_at"):
         return True
     if row.get("views") is None:
@@ -120,15 +124,24 @@ _YOUTUBE_AVAILABILITY_CHECK_MAX = 250  # availability check covers ALL rows (mem
 
 
 def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
-    """Fill missing date/views/duration via lightweight InnerTube + check availability for all rows."""
+    """Fill missing date/views/duration via lightweight InnerTube + check availability for all rows.
+
+    Uses a persistent per-video JSON cache (see enrichment_cache.py) so repeat fetches
+    only hit the network for NEW or stale video_ids.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    from services.enrichment_cache import apply_to_row, set, set_availability
     from services.youtube_innertube import innertube_video_row_metadata
     from services.youtube_session import youtube_session_from_settings
 
     session = youtube_session_from_settings()
 
-    # Pass 1: metadata enrichment (capped — visible rows only need full metadata)
+    # Apply cached enrichment to all rows — rows that become fully cached drop out
+    for r in rows:
+        apply_to_row(r)
+
+    # Pass 1: metadata enrichment (capped — only REMAINING missing rows hit network)
     need_meta = [r for r in rows if _youtube_row_needs_enrich(r)][: _YOUTUBE_ENRICH_MAX]
     if need_meta:
         by_id = {r["id"]: r for r in need_meta if r.get("id")}
@@ -151,8 +164,15 @@ def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
                 if not row:
                     continue
                 _apply_youtube_row_metadata(row, meta)
+                # Cache the result for next time
+                set(vid, {
+                    "created_at": meta.get("created_at"),
+                    "views": meta.get("views"),
+                    "duration": meta.get("duration"),
+                    "availability": meta.get("availability"),
+                })
 
-    # Pass 2: availability-only check for ALL remaining rows (member-only filtering)
+    # Pass 2: availability-only check for rows still un-checked (cached/fresh rows excluded)
     need_avail = [
         r for r in rows
         if not r.get("_availability_checked") and r.get("id")
@@ -181,6 +201,7 @@ def _enrich_youtube_channel_rows(rows: list[dict[str, Any]]) -> None:
             row["_availability_checked"] = True
             if avail == "subscriber_only":
                 row["availability"] = avail
+            set_availability(vid, avail)
 
 
 def _fetch_youtube_rss_rows(
