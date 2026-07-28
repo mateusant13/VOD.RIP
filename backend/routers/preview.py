@@ -45,7 +45,7 @@ from services.preview_service import (
     _window_hls_seg0_ready,
 )
 
-from services.youtube_diag import youtube_user_message
+from services.youtube_diag import youtube_http_status, youtube_user_message
 from services.preview_timing import log_preview_timing
 
 logger = logging.getLogger(__name__)
@@ -258,9 +258,9 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-    # ponytail: best-effort — network errors only
-        logger.exception("preview session failed url=%s", preview_url[:100])
-        raise HTTPException(status_code=500, detail=_preview_user_message(e))
+        status = youtube_http_status(e)
+        logger.warning("preview session rejected url=%s status=%d msg=%s", preview_url[:100], status, _preview_user_message(e))
+        raise HTTPException(status_code=status, detail=_preview_user_message(e))
 
 
 @router.get("/api/preview/session/{session_id}/status")

@@ -59,6 +59,32 @@ def log_extract_ok(video_id: str, source: str, info: dict, session: Any = None) 
         auth_hint(session),
         format_summary(info),
     )
+def youtube_http_status(exc: BaseException) -> int:
+    """Map a sanitized YouTube error to an HTTP status code.
+
+    Returns 403 for permanent member/permission errors, 404 for unavailable
+    videos, 503 for transient bot/cookie/auth issues, 500 for unknown.
+    """
+    low = str(exc).lower()
+    if (
+        "members-only content" in low
+        or "join this channel" in low
+        or "private video" in low
+    ):
+        return 403
+    if (
+        "video has been removed" in low
+        or "video is not available" in low
+        or "video is unavailable" in low
+        or "video unavailable" in low
+    ):
+        return 404
+    if any(
+        x in low
+        for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in", "oauth")
+    ):
+        return 503
+    return 500
 
 
 def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
