@@ -180,15 +180,23 @@ export function mergeClipLists(
     const k = channelVideoKey(v);
     map.set(k, mergeChannelVideoFields(map.get(k), v));
   }
+  // Clips: newest-first
   return Array.from(map.values()).sort(
-    (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0),
+    (a, b) => parseVideoTs(b.created_at) - parseVideoTs(a.created_at),
   );
 }
 
 export function sortChannelVideosByMode(videos: ChannelVideo[], clips: boolean): ChannelVideo[] {
   return [...videos].sort(
     clips
-      ? (a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)
+      ? (a, b) => {
+          const ta = parseVideoTs(a.created_at);
+          const tb = parseVideoTs(b.created_at);
+          if (ta === 0 && tb === 0) return 0;
+          if (ta === 0) return 1;
+          if (tb === 0) return -1;
+          return tb - ta;
+        }
       : (a, b) => {
           const ta = parseVideoTs(a.created_at);
           const tb = parseVideoTs(b.created_at);

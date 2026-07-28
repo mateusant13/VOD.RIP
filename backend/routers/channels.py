@@ -178,13 +178,9 @@ async def _gather_channel_clips(
         await asyncio.gather(*tasks, return_exceptions=True)
     all_clips = filter_clip_entries(all_clips)
     all_clips, effective_days = filter_videos_recent_or_all_by_platform(all_clips, days)
-    # Kick/Twitch clips rank by views ("top clips"). YouTube shorts arrive
-    # newest-first from the channel's /shorts tab (dated by RSS where recent)
-    # — a views sort would bury the latest shorts under old viral ones.
-    yt_shorts = [c for c in all_clips if c.get("platform") == "YouTube"]
-    other_clips = [c for c in all_clips if c.get("platform") != "YouTube"]
-    other_clips.sort(key=lambda v: -(v.get("views") or 0))
-    all_clips = other_clips + yt_shorts
+    # Sort all clips newest-first by date. Each platform fetcher already returns
+    # date-desc items; this final merge sort guarantees consistent recency order.
+    all_clips.sort(key=lambda v: v.get("created_at") or "", reverse=True)
     for k, v in list(per_platform_errors.items()):
         per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
         if not per_platform_errors[k]:

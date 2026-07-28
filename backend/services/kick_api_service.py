@@ -194,9 +194,7 @@ def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -
         seen.add(clip.id)
         parsed.append(clip)
     parsed.sort(key=lambda c: c.created_at or "", reverse=True)
-    recent = parsed[: max(1, min(int(limit), 10))]
-    recent.sort(key=lambda c: c.views or 0, reverse=True)
-    return recent
+    return parsed[: max(1, min(int(limit), 10))]
 
 
 def list_channel_clips_sync(url: str, limit: int = 10) -> list[dict]:

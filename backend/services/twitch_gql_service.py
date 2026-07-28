@@ -540,9 +540,7 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
         })
 
     parsed.sort(key=lambda v: v.get("created_at") or "", reverse=True)
-    recent = parsed[:limit]
-    recent.sort(key=lambda v: v.get("views") or 0, reverse=True)
-    return recent
+    return parsed[:limit]
 
 
 def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dict, list]:
