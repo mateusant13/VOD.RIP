@@ -11,6 +11,7 @@ import {
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
+import { LiveBadge, LiveWatchButton } from './components/LiveBadge';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
 
@@ -5298,15 +5299,7 @@ export default function App() {
                         />
                       </div>
                     )}
-                    {liveEntries.length > 0 && (
-                      <span
-                        title={liveEntries.map((e) => `${e.platform}: ${e.title}`).join('\n')}
-                        className="flex items-center gap-1 rounded bg-red-900/50 px-1 text-[10px] text-red-200 font-bold shrink-0"
-                      >
-                        <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-                        LIVE
-                      </span>
-                    )}
+                    <LiveBadge entries={liveEntries} />
                     {editingChannelId !== ch.id && (
                       <button type="button" title="Rename"
                         onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
@@ -5326,23 +5319,7 @@ export default function App() {
                     </button>
                     {liveEntries.length > 0 && (
                       <div className="relative">
-                        <button
-                          type="button"
-                          title={liveEntries.length === 1
-                            ? `Watch live: ${liveEntries[0].platform}`
-                            : 'Watch live (pick platform)'}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (liveEntries.length === 1) {
-                              void openLivePreview(liveEntries[0]);
-                            } else {
-                              setLivePreviewPicker({ channelId: ch.id, open: true });
-                            }
-                          }}
-                          className="text-red-400 hover:text-red-200 p-0.5"
-                        >
-                          <Eye size={11} />
-                        </button>
+                        <LiveWatchButton entries={liveEntries} onWatch={(entry) => openLivePreview(entry)} onShowPicker={() => setLivePreviewPicker({ channelId: ch.id, open: true })} />
                         {liveEntries.length > 1 && livePreviewPicker.open
                           && livePreviewPicker.channelId === ch.id && (
                           <div
