@@ -321,11 +321,12 @@ export default function ChannelExplorePopup({
         });
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
         if (cancelled) {
-          // ponytail: StrictMode runs this effect twice — the twin run can
-          // apply the SAME session (backend dedups concurrent same-URL
-          // creates via the warm shell). Deleting here killed the live twin
-          // ~3s later (grace expiry), leaving the popup spinning forever.
-          // Delay and re-check: only delete if no run applied this session.
+          // ponytail: StrictMode runs this effect twice. The in-flight dedup
+          // in createPreviewSessionWithRetry ensures both runs share the SAME
+          // underlying POST and receive the same session_id. The guard below
+          // still correctly identifies orphans: the ref is the session_id
+          // that the effect applied, and if this run was cancelled its session
+          // is the orphan. Remove the guard only if the dedup contract changes.
           const orphanSid = res.session_id;
           setTimeout(() => {
             if (sessionIdRef.current !== orphanSid) {

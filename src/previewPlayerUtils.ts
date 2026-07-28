@@ -19,21 +19,38 @@ export async function createPreviewSessionWithRetry(body: {
   crop_end: number;
   prefer_height: number;
 }): Promise<PreviewSessionResponse> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= _PREVIEW_CREATE_RETRIES; attempt++) {
-    try {
-      return await apiPost<PreviewSessionResponse>('/api/preview/session', body);
-    } catch (err: unknown) {
-      lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (_PREVIEW_CREATE_FATAL_RE.test(msg)) throw err;
-      if (attempt < _PREVIEW_CREATE_RETRIES) {
-        // ponytail: same executor form as useApiClient — tsconfig lib predates ES2024 Promise.withResolvers
-        await new Promise<void>((resolve) => { window.setTimeout(resolve, 1200 * (attempt + 1)); });
+  // In-flight dedup: concurrent calls with the same body share one POST.
+  // Handles React StrictMode double-invoke and user double-clicks.
+  const key = JSON.stringify(body);
+  return _dedupInflight(_sessionCreateInflight, key, async (): Promise<PreviewSessionResponse> => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= _PREVIEW_CREATE_RETRIES; attempt++) {
+      try {
+        return await apiPost<PreviewSessionResponse>('/api/preview/session', body);
+      } catch (err: unknown) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (_PREVIEW_CREATE_FATAL_RE.test(msg)) throw err;
+        if (attempt < _PREVIEW_CREATE_RETRIES) {
+          // ponytail: same executor form as useApiClient — tsconfig lib predates ES2024 Promise.withResolvers
+          await new Promise<void>((resolve) => { window.setTimeout(resolve, 1200 * (attempt + 1)); });
+        }
       }
     }
-  }
-  throw lastErr;
+    throw lastErr;
+  });
+}
+
+const _sessionCreateInflight = new Map<string, Promise<PreviewSessionResponse>>();
+
+/** Run `fn` once per `key` while in flight; concurrent callers share the promise. */
+function _dedupInflight<K, T>(map: Map<K, Promise<T>>, key: K, fn: () => Promise<T>): Promise<T> {
+  const inflight = map.get(key);
+  if (inflight) return inflight;
+  const promise = fn();
+  map.set(key, promise);
+  promise.finally(() => { map.delete(key); });
+  return promise;
 }
 
 const _warmInflight = new Set<string>();
@@ -1642,4 +1659,23 @@ void (() => {
     hlsNeedsApiQualitySwitch(720, 0, 0, false) === true,
     'normal HLS: unknown level height needs API',
   );
+  {
+    // Self-check: in-flight dedup shares one underlying call per key.
+    // Pure (fake factory) — a networked check here would fire a real session
+    // create on every dev app load.
+    const map = new Map<string, Promise<number>>();
+    let calls = 0;
+    const factory = () => new Promise<number>((resolve) => {
+      calls += 1;
+      window.setTimeout(() => resolve(calls), 0);
+    });
+    const p1 = _dedupInflight(map, 'k', factory);
+    console.assert(map.has('k'), 'inflight map tracks concurrent call');
+    const p2 = _dedupInflight(map, 'k', factory);
+    console.assert(p1 === p2, 'concurrent calls share underlying promise');
+    void Promise.allSettled([p1, p2]).then(() => {
+      console.assert(!map.has('k'), 'inflight cleanup after settlement');
+      console.assert(calls === 1, 'factory ran exactly once');
+    });
+  }
 })();
