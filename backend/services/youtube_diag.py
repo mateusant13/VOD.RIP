@@ -95,7 +95,7 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
         for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in", "oauth")
     ):
         return (
-            "Preview unavailable for this video — try again in a moment."
+            "YouTube preview is temporarily restricted. Try again in a few minutes."
             if preview
             else "Could not load this YouTube video — try again in a moment."
         )
@@ -116,7 +116,8 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
     return "Could not load video info — try again."
 
 
-assert "cookie" not in youtube_user_message(RuntimeError("cookie database locked")).lower()
+assert "restricted" in youtube_user_message(RuntimeError("cookie database locked"), preview=True).lower()
+assert "restricted" in youtube_user_message(RuntimeError("Sign in to confirm you're not a bot"), preview=True).lower()
 
 
 def log_extract_fail(

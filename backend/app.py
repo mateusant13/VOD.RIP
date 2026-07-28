@@ -130,6 +130,9 @@ async def _app_lifespan(_app: FastAPI):
         if not sorted_channels:
             return
 
+        # ponytail: warm the 4 most recent saved channels only
+        sorted_channels = sorted_channels[:4]
+
         # ponytail: warm first-per-kind-per-channel so every tab's top row is
         # instant on click — not just the newest 2 of each channel. Matches the
         # frontend's KINDS = ['vods', 'clips', 'streams'] grouping; 'shorts'
@@ -187,10 +190,8 @@ async def _app_lifespan(_app: FastAPI):
             except Exception as exc:
                 logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
 
-        # ponytail: 6 workers, one per first-of-kind URL of a typical channel
-        # list — the sync wave is tiny, so wall time ≈ slowest single resolve
-        # instead of the sum. _lifespan_ready still gates startup on it.
-        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="yt-sync-warm") as pool:
+        # ponytail: 2 workers to avoid tripping YouTube bot-gate on startup
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-sync-warm") as pool:
             list(pool.map(_warm_one, first_urls))
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
@@ -254,6 +255,9 @@ async def _app_lifespan(_app: FastAPI):
 
         if not sorted_channels:
             return
+
+        # ponytail: warm the 4 most recent saved channels only
+        sorted_channels = sorted_channels[:4]
 
         BATCH = 8
         MAX_WAVES = 5
