@@ -61,6 +61,12 @@ export function syncDurationFromPreviewSession(
   return { start, end, duration: dur };
 }
 
+export const isMembersOnlyVideo = (v: Pick<ChannelVideo, 'availability'>): boolean =>
+  v.availability === 'subscriber_only';
+
+export const isPublicVideo = (v: Pick<ChannelVideo, 'availability'>): boolean =>
+  !isMembersOnlyVideo(v);
+
 export function isLikelyClip(v: ChannelVideo): boolean {
   if (v.content_kind === 'clip') {
     if (v.duration != null && v.duration > CLIP_MAX_DURATION_SEC) return false;
@@ -157,7 +163,9 @@ export function mergeVodLists(
   );
 }
 
-/** Merge clip feeds; incoming wins on duplicate ids. Sorted by views desc. */
+/** Merge clip feeds; incoming wins on duplicate ids. Sorted by created_at desc (newest first).
+ * ponytail: previously 'by views' was an artifact; all channel surfaces want newest-first
+ * consistently with mergeVodLists (8dd6481). */
 
 export function mergeClipLists(
   existing: ChannelVideo[],

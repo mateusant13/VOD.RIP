@@ -1,7 +1,7 @@
 // Self-check: mergeVodLists / mergeClipLists subscriber_only filtering and prunePlatforms
 // Run: cd worktree && npx tsx src/channelUtils.selfcheck.ts
 
-import { mergeVodLists, mergeClipLists } from './channelUtils';
+import { mergeVodLists, mergeClipLists, isMembersOnlyVideo, isPublicVideo } from './channelUtils';
 import type { ChannelVideo } from './types';
 
 function test(name: string, ok: boolean) {
@@ -145,6 +145,20 @@ console.log('=== mergeClipLists ===');
   const result = mergeClipLists(existing, incoming, { prunePlatforms: ['YouTube'] });
   test('clip prune removes YouTube, keeps Twitch',
     result.every(r => r.id !== 'ytclip') && result.some(r => r.id === 'twclip') && result.some(r => r.id === 'newclip'));
+}
+
+// 11) isMembersOnlyVideo returns true for subscriber_only
+{
+  const result = isMembersOnlyVideo({ availability: 'subscriber_only' });
+  test('isMembersOnlyVideo(subscriber_only) === true', result === true);
+}
+
+// 12) isPublicVideo returns false for subscriber_only, true for public
+{
+  const r1 = isPublicVideo({ availability: 'subscriber_only' });
+  const r2 = isPublicVideo({ availability: 'public' });
+  test('isPublicVideo(subscriber_only) === false', r1 === false);
+  test('isPublicVideo(public) === true', r2 === true);
 }
 
 console.log('\n✅ All checks passed');
