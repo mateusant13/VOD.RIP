@@ -110,12 +110,23 @@ function mergeChannelVideoFields(prev: ChannelVideo | undefined, incoming: Chann
 
 /** Merge feeds newest-first; incoming wins on duplicate ids (metadata refresh). */
 
-export function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
+export function mergeVodLists(
+  existing: ChannelVideo[],
+  incoming: ChannelVideo[],
+  opts?: { prunePlatforms?: string[] },
+): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
+  const mappedIncoming = incoming.map(mapApiChannelItem);
+  const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
+
   for (const v of existing) {
+    // Always drop cached subscriber-only entries — YouTube API no longer returns them.
+    if (v.availability === 'subscriber_only') continue;
+    // When a platform was fully refreshed, prune cached entries absent from the fresh list.
+    if (opts?.prunePlatforms?.includes(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
     map.set(channelVideoKey(v), v);
   }
-  for (const v of incoming.map(mapApiChannelItem)) {
+  for (const v of mappedIncoming) {
     const k = channelVideoKey(v);
     map.set(k, mergeChannelVideoFields(map.get(k), v));
   }
@@ -126,12 +137,22 @@ export function mergeVodLists(existing: ChannelVideo[], incoming: ChannelVideo[]
 
 /** Merge clip feeds; incoming wins on duplicate ids. Sorted by views desc. */
 
-export function mergeClipLists(existing: ChannelVideo[], incoming: ChannelVideo[]): ChannelVideo[] {
+export function mergeClipLists(
+  existing: ChannelVideo[],
+  incoming: ChannelVideo[],
+  opts?: { prunePlatforms?: string[] },
+): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
+  const mappedIncoming = incoming.map(mapApiChannelItem).filter(isLikelyClip);
+  const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
+
   for (const v of existing.filter(isLikelyClip)) {
+    // Always drop cached subscriber-only entries.
+    if (v.availability === 'subscriber_only') continue;
+    if (opts?.prunePlatforms?.includes(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
     map.set(channelVideoKey(v), v);
   }
-  for (const v of incoming.map(mapApiChannelItem).filter(isLikelyClip)) {
+  for (const v of mappedIncoming) {
     const k = channelVideoKey(v);
     map.set(k, mergeChannelVideoFields(map.get(k), v));
   }

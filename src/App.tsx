@@ -3378,7 +3378,9 @@ export default function App() {
           errs.YouTube = 'YouTube channel is required';
         }
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
-        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
+        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
+          !incremental && attempted.YouTube && !errs.YouTube
+            ? { prunePlatforms: ['YouTube'] } : undefined);
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
@@ -3430,7 +3432,14 @@ export default function App() {
         if (!wantYoutube) delete errs.YouTube;
         await Promise.all(vodTasks);
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
-        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
+        const prunePlatforms: string[] = [];
+        if (!incremental) {
+          for (const p of ['Kick', 'Twitch', 'YouTube'] as const) {
+            if (attempted[p] && !errs[p]) prunePlatforms.push(p);
+          }
+        }
+        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
+          prunePlatforms.length ? { prunePlatforms } : undefined);
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
