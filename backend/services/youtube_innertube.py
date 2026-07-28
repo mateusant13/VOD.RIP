@@ -969,31 +969,6 @@ def _set_youtube_availability_from_playability(
         out["availability"] = ""  # playable — not restricted
 
 
-def innertube_availability_check(
-    video_id: str,
-    session: Optional["YouTubeSession"] = None,
-    read_timeout: float = 1.5,
-) -> Optional[str]:
-    """Lightweight member-only check via playabilityStatus only (no metadata extraction)."""
-    if session is None:
-        from services.youtube_session import youtube_session_from_settings
-        session = youtube_session_from_settings(video_id=video_id)
-    for name in ("WEB",):
-        profile = _PROFILE_BY_NAME.get(name)
-        if not profile:
-            continue
-        data, _status, kind = _player_request(
-            video_id, profile, read_timeout, session=session,
-        )
-        if kind == "fatal" or not data:
-            continue
-        ps = data.get("playabilityStatus") or {}
-        if ps.get("status") == "UNPLAYABLE":
-            reason = (ps.get("reason") or "").lower()
-            if "member" in reason or "join" in reason:
-                return "subscriber_only"
-        return ""
-    return None
 
 
 def innertube_video_row_metadata(
