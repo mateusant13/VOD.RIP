@@ -162,8 +162,8 @@ class TestYouTubePreviewResolve:
             platform="YouTube",
             cache_dir=cache_dir,
             kind="progressive",
-            dash_window_hls=False,
         )
+        session.dash_window_hls = False  # dynamic attr
         with _manager._lock:
             _manager._sessions[sid] = session
 
@@ -202,7 +202,7 @@ class TestYouTubePreviewResolve:
                 refreshed = refresh_youtube_preview_session(sid)
 
         assert refreshed.kind == "progressive", refreshed.kind
-        assert refreshed.dash_window_hls is False
+        assert getattr(refreshed, "dash_window_hls", False) is False
         assert refreshed.entry_url == "https://x/p360.mp4"
 
         with _manager._lock:
@@ -230,8 +230,8 @@ class TestYouTubePreviewResolve:
             platform="YouTube",
             cache_dir=cache_dir,
             kind="progressive",
-            dash_window_hls=False,
         )
+        session.dash_window_hls = False  # dynamic attr
         with _manager._lock:
             _manager._sessions[sid] = session
 
@@ -254,7 +254,7 @@ class TestYouTubePreviewResolve:
                 refreshed = refresh_youtube_preview_session(sid)
 
         assert refreshed.kind == "progressive", refreshed.kind
-        assert refreshed.dash_window_hls is False
+        assert getattr(refreshed, "dash_window_hls", False) is False
         assert refreshed.entry_url == "https://x/p360.mp4"
 
         with _manager._lock:

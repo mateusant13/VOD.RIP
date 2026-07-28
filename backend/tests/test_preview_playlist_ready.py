@@ -24,8 +24,8 @@ def _window_sess() -> PreviewSession:
         cache_dir=Path("/tmp"),
         crop_start=0,
         crop_end=30,
-        dash_window_hls=True,
     )
+    s.dash_window_hls = True  # dynamic attr
     s.custom_master = _build_youtube_window_hls_master(s)
     return s
 
