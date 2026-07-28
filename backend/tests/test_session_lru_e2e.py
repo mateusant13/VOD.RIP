@@ -1,7 +1,15 @@
-"""Test LRU eviction pressure on PreviewManager's session dict."""
+"""Self-check: LRU eviction pressure on PreviewManager's session dict.
 
+Run from anywhere: `python backend/tests/test_session_lru_e2e.py`
+"""
+import os
+import sys
 import time
 from pathlib import Path
+
+# ponytail: tests run from various cwds; anchor to backend/ so
+# `from services.X` resolves identically to how run.py loads it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from services.preview_service import PreviewManager, PreviewSession, LRU_SIZE_HARD_LIMIT
 
 

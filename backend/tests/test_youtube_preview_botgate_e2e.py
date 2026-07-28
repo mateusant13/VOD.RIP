@@ -1,5 +1,15 @@
-"""Self-check: YouTube bot-gate 503 response shape — no mocks, real URL."""
+"""Self-check: YouTube bot-gate 503 response shape — no mocks, real URL.
+
+Run from anywhere: `python backend/tests/test_youtube_preview_botgate_e2e.py`
+"""
 from __future__ import annotations
+
+# ponytail: anchor to backend/ so `from app import app` resolves.
+import os
+import sys
+_backend_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 from fastapi.testclient import TestClient
 from app import app

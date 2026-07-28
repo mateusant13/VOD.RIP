@@ -1,4 +1,14 @@
-"""Test proxy_master returns 503 Retry-After when upstream returns 404/410."""
+"""Self-check: proxy_master returns 503 Retry-After when upstream returns 404/410.
+
+Run from anywhere: `python backend/tests/test_upstream_503_e2e.py`
+(Requires pytest + pytest-asyncio for the async test).
+"""
+import os
+import sys
+
+# ponytail: anchor to backend/ so `from app import app` and `from services.X`
+# resolve identically to `run.py`'s import surface.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import pytest
 from httpx import ASGITransport, AsyncClient
