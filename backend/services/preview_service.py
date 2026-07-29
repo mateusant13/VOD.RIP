@@ -45,7 +45,9 @@ LRU_SIZE_HARD_LIMIT = 12
 # for this long so late byte requests from the browser don't 404. After the
 # grace window the cache_dir is wiped.
 _SESSION_DELETE_GRACE_SEC = 3.0
-PLAYLIST_REWRITE_TTL_SEC = 20 * 60
+# ponytail: 2s for live media playlists (HLS.js re-fetches every ~2-6s);
+# VOD is fetched once so the short TTL adds negligible overhead.
+PLAYLIST_REWRITE_TTL_SEC = 2
 _MAX_PLAYLIST_FETCH_BYTES = (
     512 * 1024
 )  # ponytail: non-streaming fetches only (keys/init)
