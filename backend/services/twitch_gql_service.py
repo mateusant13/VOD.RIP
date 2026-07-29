@@ -487,13 +487,19 @@ CLIP_MAX_DURATION_SEC = 60
 # Fallback to ALL_TIME only if LAST_WEEK returned too few.
 TWITCH_CLIPS_RANGE_FILTER = "ALL_TIME"  # fallback
 
-
-def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]:
+def list_channel_clips_sync(
+    login: str, limit: int = 10,
+    *,
+    range_label: str = "LAST_WEEK",
+    sort: str = "date",
+) -> List[Dict[str, Any]]:
     """Return the *limit* most recent clips (<=60s).
 
-    Fetches clips from LAST_WEEK first (small window so even low-view clips
-    surface after date-sort), with ALL_TIME as fallback. API returns clips
-    sorted by view count within each time window; we re-sort by date.
+    range_label: Twitch GQL ClipsFilter — LAST_DAY/LAST_WEEK/LAST_MONTH/ALL_TIME.
+    For ranges >1mo the GQL window must be ALL_TIME; the caller client-filters
+    the desired window after this call.
+
+    sort: 'date' (newest first) or 'views' (most viewed first).
     """
     login = (login or "").strip().lower()
     if not login:
@@ -556,19 +562,23 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
             cursor = pi.get("endCursor")
         return out
 
-    # Primary: fetch clips from LAST_WEEK — small window, recent low-view clips surface.
-    # (Twitch GQL sorts server results by view count DESC, so a wide window like
-    # LAST_MONTH buries today's 1-view clips under older 100-view clips.)
-    parsed = _fetch("LAST_WEEK")
-    if len(parsed) < limit:
-        old = _fetch("ALL_TIME")
-        seen = {c["id"] for c in parsed}
-        for c in old:
-            if c["id"] not in seen:
-                parsed.append(c)
-                seen.add(c["id"])
+    # Map UI range days to the smallest Twitch GQL window that covers it.
+    # Today/7d/14d/1mo map directly; 6mo/1y/All must use ALL_TIME (no wider GQL
+    # option exists). The caller is responsible for client-side filtering the
+    # exact day count via the `days` parameter in the API layer.
+    if range_label not in {"LAST_DAY", "LAST_WEEK", "LAST_MONTH", "ALL_TIME"}:
+        range_label = "LAST_WEEK"
+    parsed = _fetch(range_label)
+    # If we asked LAST_DAY/WEEK/MONTH and got nothing back (channel with very
+    # few clips), widen to ALL_TIME and merge so the user sees the channel's
+    # most-recent content regardless of bucket.
+    if not parsed and range_label != "ALL_TIME":
+        parsed = _fetch("ALL_TIME")
 
-    parsed.sort(key=lambda v: v.get("created_at") or "", reverse=True)
+    if sort == "views":
+        parsed.sort(key=lambda v: int(v.get("views") or 0), reverse=True)
+    else:
+        parsed.sort(key=lambda v: v.get("created_at") or "", reverse=True)
     return parsed[:limit]
 
 

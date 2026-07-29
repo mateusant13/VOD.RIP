@@ -534,6 +534,9 @@ export default function App() {
   const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips' | 'streams'>(
     initialChannelUi.content,
   );
+  /** Clip listing: time range (server filter) + sort key. */
+  const [clipRangeDays, setClipRangeDays] = useState<number>(7);
+  const [clipSort, setClipSort] = useState<'date' | 'views'>('date');
 
   const youtubePlatformOnly = youtubeEnabled && !kickEnabled && !twitchEnabled;
 
@@ -3398,7 +3401,8 @@ export default function App() {
         const params = new URLSearchParams({
           platforms: clipPlatforms.join(','),
           limit: '10',
-          days: '0',
+          days: String(clipRangeDays),
+          sort: clipSort,
           kick_slug: ch.kickSlug,
           twitch_login: ch.twitchSlug,
           youtube_slug: ch.youtubeSlug,
@@ -3591,7 +3595,7 @@ export default function App() {
       channelRefreshPromisesRef.current.set(flightKey, task);
     }
     return task;
-  }, [updateChannel, channelContentFilter, resetChannelListPaging, clearChannelRefreshFlight]);
+  }, [updateChannel, channelContentFilter, clipRangeDays, clipSort, resetChannelListPaging, clearChannelRefreshFlight]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
@@ -3645,6 +3649,18 @@ export default function App() {
       incremental: hasCache,
     });
   }, [channelContentFilter, kickEnabled, twitchEnabled, youtubeEnabled, selectedChannelId]);
+
+  // Re-fetch when the user picks a new clip range or sort — only on the Clips tab.
+  useEffect(() => {
+    if (channelContentFilter !== 'clips') return;
+    if (!channelUiPersistReadyRef.current || !selectedChannelId) return;
+    const ch = savedChannelsRef.current.find((c) => c.id === selectedChannelId);
+    if (!ch) return;
+    void refreshChannelRef.current(selectedChannelId, undefined, 'clips', {
+      silent: false,
+      force: true,
+    });
+  }, [clipRangeDays, clipSort, channelContentFilter, selectedChannelId]);
 
   // ponytail: prefetch YouTube stream-tab VODs while user is on Videos/Shorts
   useEffect(() => {
@@ -5509,6 +5525,56 @@ export default function App() {
                           </button>
                         )}
                       </div>
+                      {channelContentFilter === 'clips' && !youtubePlatformOnly && (
+                        <div className="flex flex-wrap items-center gap-1 font-mono text-[9px] uppercase w-full min-w-0 pt-0.5">
+                          <span className="text-zinc-500 shrink-0 mr-1">Range:</span>
+                          {([
+                            { label: 'Today', days: 1 },
+                            { label: '7d', days: 7 },
+                            { label: '14d', days: 14 },
+                            { label: '1mo', days: 30 },
+                            { label: '6mo', days: 180 },
+                            { label: '1y', days: 365 },
+                            { label: 'All', days: 0 },
+                          ] as const).map((r) => (
+                            <button
+                              key={r.label}
+                              type="button"
+                              onClick={() => setClipRangeDays(r.days)}
+                              className={`px-1.5 py-0.5 border ${
+                                clipRangeDays === r.days
+                                  ? 'border-white text-white bg-zinc-900'
+                                  : 'border-zinc-700 text-zinc-500 hover:text-white'
+                              }`}
+                            >
+                              {r.label}
+                            </button>
+                          ))}
+                          <span className="text-zinc-500 shrink-0 ml-2 mr-1">Sort:</span>
+                          <button
+                            type="button"
+                            onClick={() => setClipSort('date')}
+                            className={`px-1.5 py-0.5 border ${
+                              clipSort === 'date'
+                                ? 'border-white text-white bg-zinc-900'
+                                : 'border-zinc-700 text-zinc-500 hover:text-white'
+                            }`}
+                          >
+                            Newest
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setClipSort('views')}
+                            className={`px-1.5 py-0.5 border ${
+                              clipSort === 'views'
+                                ? 'border-white text-white bg-zinc-900'
+                                : 'border-zinc-700 text-zinc-500 hover:text-white'
+                            }`}
+                          >
+                            Most Views
+                          </button>
+                        </div>
+                      )}
                       </div>
                         );
                       })()}

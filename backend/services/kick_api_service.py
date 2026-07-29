@@ -197,11 +197,13 @@ def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -
     return parsed[: max(1, min(int(limit), 10))]
 
 
-def list_channel_clips_sync(url: str, limit: int = 10) -> list[dict]:
+def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date") -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
     clips = list_channel_clips_api(slug, limit, verify=False)
+    if sort == "views":
+        clips = sorted(clips, key=lambda c: int(getattr(c, "views", 0) or 0), reverse=True)
     return [
         {
             "id": c.id,

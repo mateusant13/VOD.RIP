@@ -3,6 +3,7 @@ Channel browsing routes — VODs and clips for saved Kick/Twitch channels.
 """
 
 import asyncio
+import functools
 import logging
 from typing import Dict, List, Optional
 from urllib.parse import unquote
@@ -63,6 +64,7 @@ async def _gather_channel_clips(
     youtube_slug: str = "",
     limit: int,
     days: int = CHANNEL_DAYS_DEFAULT,
+    sort: str = "date",
 ) -> tuple[List[dict], Dict[str, str], int]:
     """Fetch clips per platform using platform-specific logins."""
     per_platform_errors: Dict[str, str] = {}
@@ -102,10 +104,27 @@ async def _gather_channel_clips(
         if not twitch_login:
             per_platform_errors["Twitch"] = "Twitch login is required"
             return
+        # Map days → smallest Twitch GQL window that covers it.
+        # 0 (All) and >30d must use ALL_TIME — Twitch GQL has no wider window.
+        if days <= 0 or days > 30:
+            gte = "ALL_TIME"
+        elif days <= 1:
+            gte = "LAST_DAY"
+        elif days <= 7:
+            gte = "LAST_WEEK"
+        else:
+            gte = "LAST_MONTH"
         try:
             vids = await asyncio.wait_for(
                 loop.run_in_executor(
-                    CHANNEL_EXECUTOR, twitch_list_channel_clips_sync, twitch_login, limit
+                    CHANNEL_EXECUTOR,
+                    functools.partial(
+                        twitch_list_channel_clips_sync,
+                        twitch_login,
+                        limit,
+                        range_label=gte,
+                        sort=sort,
+                    ),
                 ),
                 timeout=CLIP_FETCH_TIMEOUT_SEC,
             )
@@ -139,9 +158,12 @@ async def _gather_channel_clips(
             vids = await asyncio.wait_for(
                 loop.run_in_executor(
                     CHANNEL_EXECUTOR,
-                    kick_list_channel_clips_sync,
-                    f"https://kick.com/{kick_slug}/clips",
-                    limit,
+                    functools.partial(
+                        kick_list_channel_clips_sync,
+                        f"https://kick.com/{kick_slug}/clips",
+                        limit,
+                        sort=sort,
+                    ),
                 ),
                 timeout=CLIP_FETCH_TIMEOUT_SEC,
             )
@@ -193,6 +215,7 @@ async def channel_videos(
     url: str,
     limit: int = CHANNEL_LIMIT_MAX,
     days: int = CHANNEL_DAYS_DEFAULT,
+    sort: str = "date",
     platforms: str = "Kick,Twitch,YouTube",
     content: str = "vods",
     kick_slug: Optional[str] = None,
@@ -212,7 +235,7 @@ async def channel_videos(
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT if content_norm == "clips" else CHANNEL_LIMIT_MAX))
         days_norm = max(0, min(int(days), 365))
         cache_key = make_channel_cache_key(
-            "videos", content_norm, kick_ch, twitch_ch, platforms, limit_norm, days_norm,
+            "videos", content_norm, kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
             ",".join(sorted(wanted)), youtube_ch,
         )
         cached = get_cached(cache_key)
@@ -239,6 +262,7 @@ async def channel_videos(
                 youtube_slug=youtube_ch,
                 limit=limit_norm,
                 days=days_norm,
+                sort=sort,
             )
             payload = {
                 "clips": all_clips,
@@ -442,6 +466,7 @@ async def channel_clips(
     platforms: str = "Kick,Twitch",
     limit: int = CHANNEL_CLIP_LIMIT,
     days: int = CHANNEL_DAYS_DEFAULT,
+    sort: str = "date",
     kick_slug: Optional[str] = None,
     twitch_login: Optional[str] = None,
     youtube_slug: Optional[str] = None,
@@ -459,7 +484,7 @@ async def channel_clips(
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
         days_norm = max(0, min(int(days), 365))
         cache_key = make_channel_cache_key(
-            "clips", kick_ch, twitch_ch, platforms, limit_norm, days_norm,
+            "clips", kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
             ",".join(sorted(wanted)), youtube_ch,
         )
         cached = get_cached(cache_key)
@@ -482,6 +507,7 @@ async def channel_clips(
             youtube_slug=youtube_ch,
             limit=limit_norm,
             days=days_norm,
+            sort=sort,
         )
         payload = {
             "clips": all_clips,
