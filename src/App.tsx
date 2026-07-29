@@ -1285,7 +1285,10 @@ export default function App() {
     if (tab !== 'channels' || !savedChannels.length) return;
     let cancelled = false;
     let timeout: number | null = null;
-    const POLL_MS = 30_000;
+    const FAST_POLL_MS = 3_000;
+    const SLOW_POLL_MS = 30_000;
+    const FAST_POLLS = 6;
+    let pollCount = 0;
     const fetchOne = async (ch: SavedChannel) => {
       try {
         const status = await apiGet<ChannelLiveStatus>(`/api/channels/${ch.id}/live`);
@@ -1298,7 +1301,10 @@ export default function App() {
     };
     const tick = async () => {
       await Promise.all(savedChannelsRef.current.map(fetchOne));
-      if (!cancelled) timeout = window.setTimeout(tick, POLL_MS);
+      if (cancelled) return;
+      pollCount++;
+      const ms = pollCount <= FAST_POLLS ? FAST_POLL_MS : SLOW_POLL_MS;
+      timeout = window.setTimeout(tick, ms);
     };
     tick();
     return () => {
@@ -1566,8 +1572,8 @@ export default function App() {
           liveDurationInfinity: true,
           maxLiveSyncPlaybackRate: 1.5,
         } : {}),
-        startPosition: dashSegTimeline
-          ? 0
+        startPosition: previewIsLiveRef.current
+          ? -1
           : (previewPendingSeekSecRef.current ?? previewTrimStartRef.current),
         // ponytail: peel stale-session 404s out of the HLS retry loop. Without
         // this, a player that comes back after a backend restart retries the
