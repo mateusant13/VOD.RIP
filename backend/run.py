@@ -7,7 +7,10 @@ import sys
 import os
 import traceback
 
-# ponytail: YTDLP_NO_PLUGINS removed — getpot_wpc blocked in ytdlp_guard; bgutil allowed
+# ponytail: YTDLP_NO_PLUGINS=1 set in services/ytdlp_env.py — silences the
+# bundled bgutil duplicate-register warning (PoTokenProvider BgUtilHTTP already
+# registered) that fires when yt-dlp 2026.07.04 plugin discovery runs twice.
+# getpot_wpc is still blocked by ytdlp_guard.assert_ytdlp_safe().
 from services import ytdlp_env  # noqa: F401
 from services.ytdlp_guard import assert_ytdlp_safe
 
