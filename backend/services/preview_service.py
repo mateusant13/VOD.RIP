@@ -1057,9 +1057,17 @@ def _host_allowed(host: str, session: PreviewSession) -> bool:
 
 
 def _request_headers(
-    session: PreviewSession, range_header: Optional[str] = None
+    session: PreviewSession,
+    range_header: Optional[str] = None,
+    host: str = "",
 ) -> dict:
     headers = dict(session.http_headers)
+    if host and (host == "ttvnw.net" or host.endswith(".ttvnw.net")):
+        # ponytail: Twitch edge CDNs (playlist/video-edge *.ttvnw.net) return
+        # 403 empty body for ANY request carrying an Origin header (observed
+        # 2026-07). Browser media fetches are same-origin and omit Origin —
+        # strip it to match. Referer is tolerated.
+        headers = {k: v for k, v in headers.items() if k.lower() != "origin"}
     headers.setdefault("User-Agent", _DEFAULT_UA)
     if range_header:
         headers["Range"] = range_header
@@ -1197,7 +1205,7 @@ def _open_upstream_stream(
     host = urlparse(url).hostname or ""
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
-    headers = _request_headers(session, range_header)
+    headers = _request_headers(session, range_header, host=host)
     try:
         from curl_cffi import requests as cffi_requests
 
@@ -2321,7 +2329,7 @@ def _http_get_bytes(
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
 
-    headers = _request_headers(session, range_header)
+    headers = _request_headers(session, range_header, host=host)
     is_playlist = _is_playlist_url(url)
     # ponytail: 512KB was meant for key/init fetches; YouTube master playlists
     # for long VODs can be several MB. Use the rewritten-playlist cap (32MB)

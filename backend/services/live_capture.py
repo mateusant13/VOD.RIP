@@ -119,7 +119,11 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     """
     import yt_dlp
 
-    live_url = f"https://www.youtube.com/@{handle}/live"
+    live_url = (
+        f"https://www.youtube.com/channel/{handle}/live"
+        if handle.startswith("UC")
+        else f"https://www.youtube.com/@{handle.lstrip('@')}/live"
+    )
     # Fetch the /live redirect page to get the actual videoId
     try:
         resp = requests.get(
@@ -146,9 +150,50 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     vid = vid_match.group(1).decode()
     watch_url = f"https://www.youtube.com/watch?v={vid}"
 
-    # Attempt yt-dlp extraction
+    # Primary: app InnerTube — survives bot walls that kill yt-dlp (its
+    # multi-client race + POT carries live HLS manifest in streamingData).
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        from services.youtube_innertube import innertube_extract_info
+
+        info = innertube_extract_info(watch_url, timeout=20.0)
+    except Exception as exc:
+        logger.debug("youtube_live_info(%r) innertube failed: %s", handle, exc)
+        info = None
+    if info:
+        candidates = [
+            f for f in (info.get("formats") or [])
+            if f.get("protocol") in ("m3u8", "m3u8_native")
+        ]
+        best = None
+        for f in candidates:
+            h = int(f.get("height") or 0)
+            if best is None or (h <= 720 and h > int(best.get("height") or 0)):
+                best = f
+        if not best:
+            best = next((f for f in candidates), None)
+        if best:
+            return {
+                "url": best["url"],
+                "headers": dict(info.get("http_headers") or {}),
+                "title": info.get("title") or handle,
+                "viewers": info.get("viewer_count") or 0,
+                "platform": "YouTube",
+            }
+
+    # Fallback: yt-dlp — wire the app's YouTube auth (cookies / PO
+    # token / visitor data) or every live extract dies at the bot wall.
+    from services.youtube_session import (
+        apply_ytdlp_cookie_opts,
+        ytdlp_extractor_args,
+        youtube_session_from_settings,
+    )
+
+    yt_session = youtube_session_from_settings(video_id=vid)
+    opts = {"quiet": True, "no_warnings": True}
+    opts["extractor_args"] = ytdlp_extractor_args(yt_session)
+    apply_ytdlp_cookie_opts(opts, yt_session)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(watch_url, download=False)
     except Exception as exc:
         low = str(exc).lower()
