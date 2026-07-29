@@ -195,14 +195,14 @@ interface ChannelRowProps {
   channelListRef: MutableRefObject<HTMLDivElement | null>;
   toggleChannelSelection: (id: string) => void;
   removeChannel: (id: string) => void;
-  refreshChannel: (id: string, force?: boolean, contentFilter?: string, opts?: { force?: boolean; incremental?: boolean }) => Promise<void>;
-  clearChannelRefreshFlight: (id: string, mode?: string) => void;
+  refreshChannel: (channelId: string, channelOverride?: SavedChannel, contentMode?: 'vods' | 'clips' | 'streams', opts?: { incremental?: boolean; silent?: boolean; force?: boolean }) => Promise<unknown>;
+  clearChannelRefreshFlight: (channelId: string, mode?: 'vods' | 'clips' | 'streams') => void;
   startRenameChannel: (id: string) => void;
   commitRenameChannel: () => void;
   setEditingChannelId: Dispatch<SetStateAction<string | null>>;
   setEditingChannelName: Dispatch<SetStateAction<string>>;
-  removePlatformFromChannel: (id: string, platform: string) => void;
-  channelContentFilter: string;
+  removePlatformFromChannel: (channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => void;
+  channelContentFilter: 'vods' | 'clips' | 'streams';
   setSavedChannels: Dispatch<SetStateAction<SavedChannel[]>>;
   setChannelDragId: Dispatch<SetStateAction<string | null>>;
   setChannelDropInsertIndex: Dispatch<SetStateAction<number | null>>;
