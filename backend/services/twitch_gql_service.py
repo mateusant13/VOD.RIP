@@ -483,61 +483,90 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
 
 
 CLIP_MAX_DURATION_SEC = 60
-# Fetch all clips; UI applies 14-day preference then Show more for older.
-TWITCH_CLIPS_RANGE_FILTER = "ALL_TIME"
+# Primary: clips from the last week (small window so even low-view clips surface).
+# Fallback to ALL_TIME only if LAST_WEEK returned too few.
+TWITCH_CLIPS_RANGE_FILTER = "ALL_TIME"  # fallback
 
 
 def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """Return the *limit* most recent clips (<=60s), ranked by view count (desc).
+    """Return the *limit* most recent clips (<=60s).
 
-    Equivalent to https://www.twitch.tv/{login}/clips (all time; UI filters recent first).
+    Fetches clips from LAST_WEEK first (small window so even low-view clips
+    surface after date-sort), with ALL_TIME as fallback. API returns clips
+    sorted by view count within each time window; we re-sort by date.
     """
     login = (login or "").strip().lower()
     if not login:
         return []
 
     limit = max(1, min(int(limit), 10))
-    fetch_n = max(limit, 100)  # ponytail: Twitch API returns clips sorted by view count, not date. Fetch 100 to find recent clips with fewer views.
-    data = _gql_persisted(
-        "ClipsCards__User",
-        CLIPS_CARDS_USER_HASH,
-        {
-            "login": login,
-            "limit": fetch_n,
-            "criteria": {"filter": TWITCH_CLIPS_RANGE_FILTER},
-        },
-    )
-    user = data.get("user")
-    if not user:
-        raise ValueError(f"Twitch channel not found: {login}")
+    fetch_n = max(limit, 100)
 
-    parsed: List[Dict[str, Any]] = []
-    for edge in (user.get("clips") or {}).get("edges") or []:
-        node = edge.get("node") or {}
-        slug = str(node.get("slug") or "").strip()
-        if not slug:
-            continue
-        duration = node.get("durationSeconds")
-        if duration is not None:
-            try:
-                if float(duration) > CLIP_MAX_DURATION_SEC:
+    def _fetch(filter_label: str = "LAST_WEEK") -> List[Dict[str, Any]]:
+        """Fetch clips from Twitch GQL with the given filter, paginating."""
+        out: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        while len(out) < fetch_n:
+            variables: Dict[str, Any] = {
+                "login": login,
+                "limit": 100,
+                "criteria": {"filter": filter_label},
+            }
+            if cursor:
+                variables["cursor"] = cursor
+            data = _gql_persisted(
+                "ClipsCards__User",
+                CLIPS_CARDS_USER_HASH,
+                variables,
+            )
+            user = data.get("user")
+            if not user:
+                raise ValueError(f"Twitch channel not found: {login}")
+            for edge in (user.get("clips") or {}).get("edges") or []:
+                node = edge.get("node") or {}
+                slug = str(node.get("slug") or "").strip()
+                if not slug:
                     continue
-            except (TypeError, ValueError):
-                pass
-        clip_url = node.get("url") or f"https://clips.twitch.tv/{slug}"
-        parsed.append({
-            "id": str(node.get("id") or slug),
-            "platform": "Twitch",
-            "title": node.get("title") or "Untitled",
-            "duration": duration,
-            "duration_string": _format_duration(duration),
-            "created_at": node.get("createdAt") or None,
-            "views": node.get("viewCount"),
-            "thumbnail_url": node.get("thumbnailURL"),
-            "url": clip_url,
-            "channel": login,
-            "content_kind": "clip",
-        })
+                duration = node.get("durationSeconds")
+                if duration is not None:
+                    try:
+                        if float(duration) > CLIP_MAX_DURATION_SEC:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                clip_url = node.get("url") or f"https://clips.twitch.tv/{slug}"
+                out.append({
+                    "id": str(node.get("id") or slug),
+                    "platform": "Twitch",
+                    "title": node.get("title") or "Untitled",
+                    "duration": duration,
+                    "duration_string": _format_duration(duration),
+                    "created_at": node.get("createdAt") or None,
+                    "views": node.get("viewCount"),
+                    "thumbnail_url": node.get("thumbnailURL"),
+                    "url": clip_url,
+                    "channel": login,
+                    "content_kind": "clip",
+                })
+                if len(out) >= fetch_n:
+                    break
+            pi = (user.get("clips") or {}).get("pageInfo") or {}
+            if not pi.get("hasNextPage") or len(out) >= fetch_n:
+                break
+            cursor = pi.get("endCursor")
+        return out
+
+    # Primary: fetch clips from LAST_WEEK — small window, recent low-view clips surface.
+    # (Twitch GQL sorts server results by view count DESC, so a wide window like
+    # LAST_MONTH buries today's 1-view clips under older 100-view clips.)
+    parsed = _fetch("LAST_WEEK")
+    if len(parsed) < limit:
+        old = _fetch("ALL_TIME")
+        seen = {c["id"] for c in parsed}
+        for c in old:
+            if c["id"] not in seen:
+                parsed.append(c)
+                seen.add(c["id"])
 
     parsed.sort(key=lambda v: v.get("created_at") or "", reverse=True)
     return parsed[:limit]
