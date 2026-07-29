@@ -48,9 +48,6 @@ _SESSION_DELETE_GRACE_SEC = 3.0
 # ponytail: 2s for live media playlists (HLS.js re-fetches every ~2-6s);
 # VOD is fetched once so the short TTL adds negligible overhead.
 PLAYLIST_REWRITE_TTL_SEC = 2
-_MAX_PLAYLIST_FETCH_BYTES = (
-    512 * 1024
-)  # ponytail: non-streaming fetches only (keys/init)
 _MAX_REWRITTEN_PLAYLIST_BYTES = 32 * 1024 * 1024  # long YouTube VOD media playlists
 PREWARM_SEGMENT_COUNT = 5
 # ponytail: window HLS mux — chunk at a time; full crop_end stays for trim UI/download
@@ -2320,10 +2317,13 @@ def _http_get_bytes(
 
     headers = _request_headers(session, range_header)
     is_playlist = _is_playlist_url(url)
+    # ponytail: 512KB was meant for key/init fetches; YouTube master playlists
+    # for long VODs can be several MB. Use the rewritten-playlist cap (32MB)
+    # for playlist fetches instead of the small key-fetch cap.
     max_bytes = (
         MAX_SEGMENT_BYTES
         if range_header
-        else (_MAX_PLAYLIST_FETCH_BYTES if is_playlist else MAX_SEGMENT_BYTES)
+        else (_MAX_REWRITTEN_PLAYLIST_BYTES if is_playlist else MAX_SEGMENT_BYTES)
     )
     try:
         from curl_cffi import requests as cffi_requests
