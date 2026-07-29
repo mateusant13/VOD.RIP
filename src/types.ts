@@ -99,6 +99,7 @@ export interface AppSettings {
   channel_twitch_enabled?: boolean;
   channel_youtube_enabled?: boolean;
   channel_content_filter?: 'vods' | 'clips' | 'streams';
+  skip_youtube_startup_warm?: boolean;
 }
 
 export interface UpdateInfo {

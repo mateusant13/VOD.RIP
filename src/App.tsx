@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
+import { memo, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import {
@@ -178,6 +178,139 @@ function startChannelReorderDrag(
   handle.addEventListener('pointerup', onUp);
   handle.addEventListener('pointercancel', onUp);
 }
+
+// ─── CHANNEL ROW ────────────────────────────────────────────────────────────
+
+interface ChannelRowProps {
+  ch: SavedChannel;
+  index: number;
+  selected: boolean;
+  isEditing: boolean;
+  editingChannelName: string;
+  dragId: string | null;
+  dropInsertIndex: number | null;
+  isLast: boolean;
+  savedChannelsLength: number;
+  liveStatus: ChannelLiveStatus | undefined;
+  channelListRef: MutableRefObject<HTMLDivElement | null>;
+  toggleChannelSelection: (id: string) => void;
+  removeChannel: (id: string) => void;
+  refreshChannel: (id: string, force?: boolean, contentFilter?: string, opts?: { force?: boolean; incremental?: boolean }) => Promise<void>;
+  clearChannelRefreshFlight: (id: string, mode?: string) => void;
+  startRenameChannel: (id: string) => void;
+  commitRenameChannel: () => void;
+  setEditingChannelId: Dispatch<SetStateAction<string | null>>;
+  setEditingChannelName: Dispatch<SetStateAction<string>>;
+  removePlatformFromChannel: (id: string, platform: string) => void;
+  channelContentFilter: string;
+  setSavedChannels: Dispatch<SetStateAction<SavedChannel[]>>;
+  setChannelDragId: Dispatch<SetStateAction<string | null>>;
+  setChannelDropInsertIndex: Dispatch<SetStateAction<number | null>>;
+}
+
+const ChannelRow = memo(function ChannelRow({
+  ch, index, selected, isEditing, editingChannelName,
+  dragId, dropInsertIndex, isLast, savedChannelsLength, liveStatus,
+  channelListRef,
+  toggleChannelSelection, removeChannel, refreshChannel, clearChannelRefreshFlight,
+  startRenameChannel, commitRenameChannel,
+  setEditingChannelId, setEditingChannelName,
+  removePlatformFromChannel, channelContentFilter,
+  setSavedChannels, setChannelDragId, setChannelDropInsertIndex,
+}: ChannelRowProps) {
+  const dropAbove = dragId != null && dropInsertIndex === index;
+  const dropBelow = dragId != null && dropInsertIndex === savedChannelsLength && isLast;
+  const liveEntries = liveStatus?.live.filter((e) => e.is_live) ?? [];
+  return (
+    <div
+      data-channel-row
+      data-channel-id={ch.id}
+      className={`relative flex items-center gap-1 border px-2 py-1 overflow-visible ${
+        selected ? 'border-white bg-zinc-900' : 'border-zinc-800'
+      } ${ch.id === dragId ? 'opacity-45' : ''} ${
+        dropAbove ? 'shadow-[inset_0_2px_0_0_rgba(255,255,255,0.95)]' : ''
+      } ${dropBelow ? 'shadow-[inset_0_-2px_0_0_rgba(255,255,255,0.95)]' : ''}`}
+    >
+      <button
+        type="button"
+        title="Drag to reorder"
+        aria-label={`Reorder ${ch.displayName}`}
+        disabled={isEditing}
+        onPointerDown={(e) => {
+          if (isEditing) return;
+          setChannelDropInsertIndex(index);
+          startChannelReorderDrag(
+            e,
+            ch.id,
+            channelListRef,
+            setSavedChannels,
+            setChannelDragId,
+            setChannelDropInsertIndex,
+          );
+        }}
+        className="shrink-0 text-zinc-600 hover:text-zinc-300 p-0.5 cursor-grab active:cursor-grabbing touch-none disabled:opacity-30 disabled:cursor-not-allowed"
+      >
+        <GripVertical size={12} />
+      </button>
+      {isEditing ? (
+        <input type="text" value={editingChannelName}
+          onChange={(e) => setEditingChannelName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitRenameChannel();
+            if (e.key === 'Escape') setEditingChannelId(null);
+          }}
+          onBlur={commitRenameChannel}
+          autoFocus
+          className="flex-1 min-w-0 bg-zinc-950 text-white font-mono text-xs px-1 py-0.5 focus:outline-none" />
+      ) : (
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => toggleChannelSelection(ch.id)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggleChannelSelection(ch.id);
+            }
+          }}
+          className="flex-1 min-w-0 overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
+        >
+          <ChannelPlatformLabel
+            kickSlug={ch.kickSlug}
+            twitchSlug={ch.twitchSlug}
+            youtubeSlug={ch.youtubeSlug}
+            onRemoveKick={() => removePlatformFromChannel(ch.id, 'Kick')}
+            onRemoveTwitch={() => removePlatformFromChannel(ch.id, 'Twitch')}
+            onRemoveYoutube={() => removePlatformFromChannel(ch.id, 'YouTube')}
+          />
+        </div>
+      )}
+      {liveEntries.length > 0 && <LiveBadge entries={liveEntries} />}
+      {!isEditing && (
+        <button type="button" title="Rename"
+          onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
+          className="text-zinc-600 hover:text-white p-0.5">
+          <Pencil size={11} />
+        </button>
+      )}
+      <button type="button" title="Refresh"
+        onClick={(e) => {
+          e.stopPropagation();
+          clearChannelRefreshFlight(ch.id);
+          void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
+        }}
+        disabled={ch.loading}
+        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
+        {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+      </button>
+      <button type="button" title="Remove"
+        onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
+        className="text-zinc-600 hover:text-red-400 p-0.5">
+        <X size={11} />
+      </button>
+    </div>
+  );
+});
 
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
@@ -5343,102 +5476,35 @@ export default function App() {
             {savedChannels.length > 0 && (
               <div ref={channelListRef} className="flex flex-col gap-1">
                 {savedChannels.map((ch, index) => {
-                  const dropAbove = channelDragId != null
-                    && channelDropInsertIndex === index;
-                  const dropBelow = channelDragId != null
-                    && channelDropInsertIndex === savedChannels.length
-                    && index === savedChannels.length - 1;
                   const liveStatus = channelLiveStatuses[ch.id];
-                  const liveEntries = liveStatus?.live.filter((e) => e.is_live) ?? [];
                   return (
-                  <Fragment key={ch.id}>
-                  <div
-                    data-channel-row
-                    data-channel-id={ch.id}
-                    className={`relative flex items-center gap-1 border px-2 py-1 overflow-visible ${
-                      ch.id === selectedChannelId ? 'border-white bg-zinc-900' : 'border-zinc-800'
-                    } ${ch.id === channelDragId ? 'opacity-45' : ''} ${
-                      dropAbove ? 'shadow-[inset_0_2px_0_0_rgba(255,255,255,0.95)]' : ''
-                    } ${dropBelow ? 'shadow-[inset_0_-2px_0_0_rgba(255,255,255,0.95)]' : ''}`}
-                  >
-                    <button
-                      type="button"
-                      title="Drag to reorder"
-                      aria-label={`Reorder ${ch.displayName}`}
-                      disabled={editingChannelId === ch.id}
-                      onPointerDown={(e) => {
-                        if (editingChannelId === ch.id) return;
-                        setChannelDropInsertIndex(index);
-                        startChannelReorderDrag(
-                          e,
-                          ch.id,
-                          channelListRef,
-                          setSavedChannels,
-                          setChannelDragId,
-                          setChannelDropInsertIndex,
-                        );
-                      }}
-                      className="shrink-0 text-zinc-600 hover:text-zinc-300 p-0.5 cursor-grab active:cursor-grabbing touch-none disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <GripVertical size={12} />
-                    </button>
-                    {editingChannelId === ch.id ? (
-                      <input type="text" value={editingChannelName}
-                        onChange={(e) => setEditingChannelName(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') commitRenameChannel();
-                          if (e.key === 'Escape') setEditingChannelId(null);
-                        }}
-                        onBlur={commitRenameChannel}
-                        autoFocus
-                        className="flex-1 min-w-0 bg-zinc-950 text-white font-mono text-xs px-1 py-0.5 focus:outline-none" />
-                    ) : (
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => toggleChannelSelection(ch.id)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            toggleChannelSelection(ch.id);
-                          }
-                        }}
-                        className="flex-1 min-w-0 overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
-                      >
-                        <ChannelPlatformLabel
-                          kickSlug={ch.kickSlug}
-                          twitchSlug={ch.twitchSlug}
-                          youtubeSlug={ch.youtubeSlug}
-                          onRemoveKick={() => removePlatformFromChannel(ch.id, 'Kick')}
-                          onRemoveTwitch={() => removePlatformFromChannel(ch.id, 'Twitch')}
-                          onRemoveYoutube={() => removePlatformFromChannel(ch.id, 'YouTube')}
-                        />
-                      </div>
-                    )}
-                    {liveEntries.length > 0 && <LiveBadge entries={liveEntries} />}
-                    {editingChannelId !== ch.id && (
-                      <button type="button" title="Rename"
-                        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
-                        className="text-zinc-600 hover:text-white p-0.5">
-                        <Pencil size={11} />
-                      </button>
-                    )}
-                    <button type="button" title="Refresh"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        clearChannelRefreshFlight(ch.id);
-                        void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
-                      }}
-                      disabled={ch.loading}
-                      className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
-                      {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                    </button>
-                    <button type="button" title="Remove"
-                      onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
-                      className="text-zinc-600 hover:text-red-400 p-0.5">
-                      <X size={11} />
-                    </button>
-                  </div>
+                  <>
+                  <ChannelRow
+                    ch={ch}
+                    index={index}
+                    selected={ch.id === selectedChannelId}
+                    isEditing={editingChannelId === ch.id}
+                    editingChannelName={editingChannelName}
+                    dragId={channelDragId}
+                    dropInsertIndex={channelDropInsertIndex}
+                    isLast={index === savedChannels.length - 1}
+                    savedChannelsLength={savedChannels.length}
+                    liveStatus={liveStatus}
+                    channelListRef={channelListRef}
+                    toggleChannelSelection={toggleChannelSelection}
+                    removeChannel={removeChannel}
+                    refreshChannel={refreshChannel}
+                    clearChannelRefreshFlight={clearChannelRefreshFlight}
+                    startRenameChannel={startRenameChannel}
+                    commitRenameChannel={commitRenameChannel}
+                    setEditingChannelId={setEditingChannelId}
+                    setEditingChannelName={setEditingChannelName}
+                    removePlatformFromChannel={removePlatformFromChannel}
+                    channelContentFilter={channelContentFilter}
+                    setSavedChannels={setSavedChannels}
+                    setChannelDragId={setChannelDragId}
+                    setChannelDropInsertIndex={setChannelDropInsertIndex}
+                  />
                   {selectedChannelId === ch.id && (
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1 min-w-0">
                       {(() => {
@@ -5830,7 +5896,7 @@ export default function App() {
                       )}
                     </div>
                   )}
-                  </Fragment>
+                  </>
                   );
                 })}
               </div>
