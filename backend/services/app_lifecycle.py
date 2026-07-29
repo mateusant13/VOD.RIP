@@ -223,8 +223,12 @@ def request_app_exit() -> None:
             except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("destroy window: %s", exc)
 
-        sys.exit(0)
-
+        # sys.exit() in a non-main thread only kills that thread — the main
+        # process keeps running. Use os._exit to actually terminate, since the
+        # caller (SettingsTab "Stop Server" / frozen EXE shutdown) expects
+        # the process to go away.
+        import os as _os
+        _os._exit(0)
     # Run teardown off the WebView closing thread so evaluate_js / destroy do not deadlock.
     # Non-daemon so cleanup (flush state, stop tray, kill downloads) completes before exit.
     t = threading.Thread(target=_do_exit, daemon=False, name="app-exit-cleanup")
