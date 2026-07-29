@@ -104,6 +104,12 @@ _WARMED_URLS_LOCK = threading.Lock()
 # In-flight YouTube warm keyed by canonical URL — create_session awaits paste warm.
 _YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
 _YOUTUBE_WARM_LOCK = threading.Lock()
+# Warm result cache keyed by inflight key — fast lookup without full session snap.
+_YOUTUBE_WARM_CACHE: dict[str, Any] = {}
+_YOUTUBE_WARM_CACHE_LOCK = threading.Lock()
+# Per-channel warm slot tracking (oldest first) — max 10 warmed URLs per channel.
+_CHANNEL_WARM_SLOTS: dict[str, list[str]] = {}
+_CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
 # ponytail: latest URL the user is actively previewing. Warm jobs check this
 # before doing heavy work and bail out cheaply if they're no longer relevant.
 # Without this, parallel warm jobs from the channel list steal INFO_EXECUTOR
@@ -3324,6 +3330,7 @@ def kickoff_youtube_batch_warm(
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
+    channel_key: str = "",
 ) -> None:
     """Lightweight warm for batch (startup) use.
 
@@ -3356,6 +3363,7 @@ def kickoff_youtube_batch_warm(
             # session snapshot. Calling it twice would re-extract + re-build.
             warm_youtube_resolve_only(
                 url, oauth=oauth, prefer_height=prefer_height,
+                channel_key=channel_key,
             )
         finally:
             with _YOUTUBE_WARM_LOCK:
@@ -4544,6 +4552,7 @@ def warm_youtube_resolve_only(
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
+    channel_key: str = "",
 ) -> bool:
     """Populate resolved-stream cache + preflight the head so the click can play
     immediately. Uses the light extract so concurrent warm jobs don't fight for
@@ -4554,6 +4563,9 @@ def warm_youtube_resolve_only(
     extract + variant-build work on a warm hit. Every warm path that lands
     a resolve must produce a snapshot — otherwise the user's first click
     waits the full SLA.
+
+    If channel_key is set, tracks this URL in per-channel warm slots (max 10)
+    and evicts the oldest URL + on-disk prog head segments when the limit is exceeded.
     """
     try:
         resolve_result = resolve_stream_info(
@@ -4596,6 +4608,26 @@ def warm_youtube_resolve_only(
             "YouTube session snapshot ready: %s h=%d sid=%s",
             snap[0][:11], snap[1], snap[2]["session_id"][:8],
         )
+        # Track in warm cache + per-channel slots for eviction
+        key = _youtube_warm_inflight_key(url)
+        with _YOUTUBE_WARM_CACHE_LOCK:
+            _YOUTUBE_WARM_CACHE[key] = (time.time(), snap)
+        if channel_key:
+            with _CHANNEL_WARM_SLOTS_LOCK:
+                slots = _CHANNEL_WARM_SLOTS.setdefault(channel_key, [])
+                slots.append(key)
+                while len(slots) > 10:
+                    evict_key = slots.pop(0)
+                    with _YOUTUBE_WARM_CACHE_LOCK:
+                        _YOUTUBE_WARM_CACHE.pop(evict_key, None)
+                    import shutil
+                    # Delete on-disk prog head segments for the evicted video
+                    for h in (144, 240, 360, 480, 720, 1080):
+                        bin_p, meta_p = _prog_head_paths(evict_key, h)
+                        if bin_p.is_file():
+                            bin_p.unlink(missing_ok=True)
+                        if meta_p.is_file():
+                            meta_p.unlink(missing_ok=True)
     else:
         logger.debug("session snapshot skipped for %s (unsupported type)", url[:80])
     return True
