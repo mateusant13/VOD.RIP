@@ -50,7 +50,9 @@ async def focus_app():
 @router.post("/api/exit")
 async def exit_app():
     """Shut down all processes and kill the server."""
-    logger.info("Exit requested via API — shutting down")
+    logger.warning("Exit requested via API — shutting down (caller traceback follows)")
+    import traceback as _tb
+    logger.warning("".join(_tb.format_stack(limit=8)))
     from services.app_lifecycle import request_app_exit
     request_app_exit()
     return {"ok": True, "message": "Shutting down"}
