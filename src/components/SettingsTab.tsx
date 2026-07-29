@@ -73,6 +73,23 @@ export default function SettingsTab({
         </div>
       </div>
 
+      <div className="flex flex-row items-center gap-2 pt-1">
+        <label className="flex items-center gap-1.5 text-xs text-zinc-300 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={!settings.skip_youtube_startup_warm}
+            onChange={(e) =>
+              setSettings({ ...settings, skip_youtube_startup_warm: !e.target.checked })
+            }
+            className="accent-zinc-300 cursor-pointer"
+          />
+          Warm YouTube at startup
+        </label>
+        <span className="text-[9px] text-zinc-600 font-mono">
+          Pre-loads preview data for faster first play (uses ~500MB download at boot)
+        </span>
+      </div>
+
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pt-1 text-[9px] text-zinc-600 font-mono">
         <span>v{appVersion ?? '…'}</span>
         <span aria-hidden>·</span>
