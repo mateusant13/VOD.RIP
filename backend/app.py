@@ -107,7 +107,7 @@ async def _app_lifespan(_app: FastAPI):
             return
         try:
             from routers.live import warm_all_saved_channel_live_status
-            warm_all_saved_channel_live_status()
+            # warm_all_saved_channel_live_status()  # frontend polls on tab open
         except Exception:
             logger.debug("Live status warm skipped", exc_info=True)
 
@@ -116,6 +116,11 @@ async def _app_lifespan(_app: FastAPI):
     # call it.
     def _warm_first_wave_sync(saved_channels) -> None:
         """Sequential warm of first unique URLs (no thread pool, no double-hop)."""
+        s = settings_mgr.get()
+        if getattr(s, 'skip_youtube_startup_warm', False):
+            logger.info("STARTUP_SYNC_WARM: skipped (skip_youtube_startup_warm setting)")
+            return
+
         from services.preview_service import (
             _WARMED_URLS, _WARMED_URLS_LOCK,
             warm_youtube_resolve_only,
@@ -123,7 +128,7 @@ async def _app_lifespan(_app: FastAPI):
         from services.youtube_innertube import extract_video_id
         import time as _tm
 
-        sorted_channels: list[list[dict]] = []
+        sorted_channels: list[tuple[str, list[dict]]] = []
         for ch in saved_channels or []:
             if not isinstance(ch, dict):
                 continue
@@ -142,7 +147,7 @@ async def _app_lifespan(_app: FastAPI):
                 reverse=True,
             )
             if videos:
-                sorted_channels.append(videos)
+                sorted_channels.append((ch.get("id") or "", videos))
 
         if not sorted_channels:
             return
@@ -155,9 +160,9 @@ async def _app_lifespan(_app: FastAPI):
         # frontend's KINDS = ['vods', 'clips', 'streams'] grouping; 'shorts'
         # live in clipVideos under YouTube-only filter (handled by clips kind).
         KINDS = ("vods", "clips", "streams")
-        first_urls: list[str] = []
+        first_urls: list[tuple[str, str]] = []
         seen_vids: set[str] = set()
-        for ch_videos in sorted_channels:
+        for ch_key, ch_videos in sorted_channels:
             picked: set[str] = set()
             for kind in KINDS:
                 for v in ch_videos:
@@ -177,7 +182,7 @@ async def _app_lifespan(_app: FastAPI):
                         continue
                     if vid:
                         seen_vids.add(vid)
-                    first_urls.append(url)
+                    first_urls.append((url, ch_key))
                     picked.add(url)
                     break
 
@@ -188,7 +193,8 @@ async def _app_lifespan(_app: FastAPI):
 
         from concurrent.futures import ThreadPoolExecutor
 
-        def _warm_one(u: str) -> None:
+        def _warm_one(item: tuple[str, str]) -> None:
+            u, ch_key = item
             try:
                 t0 = _tm.time()
                 # warm_youtube_resolve_only does InnerTube fast pass + prog head
@@ -196,7 +202,7 @@ async def _app_lifespan(_app: FastAPI):
                 # click path skip the ~5s extract + variant-build + master work;
                 # the prog head warm serves the first 12 MB from local disk so
                 # the browser's canplay path doesn't hit googlevideo cold.
-                warm_youtube_resolve_only(u, prefer_height=360)
+                warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
                 with _WARMED_URLS_LOCK:
                     _WARMED_URLS.add(u)
                 logger.info(
@@ -240,6 +246,11 @@ async def _app_lifespan(_app: FastAPI):
         server starts. ponytail: 40/channel covers the first screen + scroll
         depth; the long tail is handled by the frontend per-scroll warm.
         """
+        s = settings_mgr.get()
+        if getattr(s, 'skip_youtube_startup_warm', False):
+            logger.info("STARTUP_WAVE: skipped (skip_youtube_startup_warm setting)")
+            return
+
         from services.preview_service import (
             _WARMED_URLS,
             _WARMED_URLS_LOCK,
@@ -248,7 +259,7 @@ async def _app_lifespan(_app: FastAPI):
         )
 
         # Collect per-channel YouTube video lists, sorted newest-first by date.
-        sorted_channels: list[list[dict]] = []
+        sorted_channels: list[tuple[str, list[dict]]] = []
         for ch in saved_channels or []:
             if not isinstance(ch, dict):
                 continue
@@ -268,7 +279,8 @@ async def _app_lifespan(_app: FastAPI):
                 reverse=True,
             )
             if videos:
-                sorted_channels.append(videos)
+                ch_id = ch.get("id") or ""
+                sorted_channels.append((ch_id, videos))
 
         if not sorted_channels:
             return
@@ -277,21 +289,22 @@ async def _app_lifespan(_app: FastAPI):
         sorted_channels = sorted_channels[:4]
 
         BATCH = 8
-        MAX_WAVES = 5
+        MAX_WAVES = 1
         submitted = 0
         wave_count = 0
 
         for wave_idx in range(MAX_WAVES):
-            wave_urls: list[str] = []
-            for ch_videos in sorted_channels:
+            wave_urls: list[tuple[str, str]] = []
+            for ch_id, ch_videos in sorted_channels:
                 start = wave_idx * BATCH
-                wave_urls.extend(v["url"] for v in ch_videos[start : start + BATCH])
+                for v in ch_videos[start : start + BATCH]:
+                    wave_urls.append((v["url"], ch_id))
             if not wave_urls:
                 break
 
             with _WARMED_URLS_LOCK:
-                fresh = [u for u in wave_urls if u not in _WARMED_URLS]
-                for u in fresh:
+                fresh = [(u, ck) for u, ck in wave_urls if u not in _WARMED_URLS]
+                for u, _ in fresh:
                     _WARMED_URLS.add(u)
 
             if not fresh:
@@ -306,12 +319,12 @@ async def _app_lifespan(_app: FastAPI):
                     len(fresh),
                 )
 
-            for u in fresh:
+            for u, ch_id in fresh:
                 try:
                     # Non-blocking: kickoff self-submits to WARM_EXECUTOR (bulk
                     # warms never touch INFO/PREVIEW pools). 360 matches the
                     # frontend fast-start click so the resolve cache hits.
-                    kickoff_youtube_batch_warm(u, prefer_height=360)
+                    kickoff_youtube_batch_warm(u, prefer_height=360, channel_key=ch_id)
                     submitted += 1
                 except Exception as exc:
                     logger.warning("STARTUP_WAVE: submit failed for %s: %s", u[:60], exc)

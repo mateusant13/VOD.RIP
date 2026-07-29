@@ -92,6 +92,7 @@ class AppSettings(BaseModel):
     channel_twitch_enabled: bool = True
     channel_youtube_enabled: bool = True
     channel_content_filter: str = "vods"
+    skip_youtube_startup_warm: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -121,6 +122,7 @@ class SettingsUpdate(BaseModel):
     channel_youtube_enabled: Optional[bool] = None
     channel_content_filter: Optional[str] = None
     mp4_faststart: Optional[bool] = None
+    skip_youtube_startup_warm: Optional[bool] = None
 
 
 class OpenFolderRequest(BaseModel):

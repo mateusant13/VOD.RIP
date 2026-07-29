@@ -120,6 +120,8 @@ async def update_settings(update: SettingsUpdate):
         current.channel_content_filter = filt if filt in ("clips", "vods", "streams") else "vods"
     if update.mp4_faststart is not None:
         current.mp4_faststart = bool(update.mp4_faststart)
+    if update.skip_youtube_startup_warm is not None:
+        current.skip_youtube_startup_warm = bool(update.skip_youtube_startup_warm)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
