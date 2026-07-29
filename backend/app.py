@@ -57,10 +57,12 @@ async def _app_lifespan(_app: FastAPI):
             logger.info("YouTube warm-up skipped (VODRIP_PREVIEW_FAST_ONLY)")
             _lifespan_ready.set()
             return
+        if _warm_shutdown.is_set():
+            return
         try:
             from deps import settings_mgr as _sm
             _saved = getattr(_sm.get(), "saved_channels", None) or []
-            if _saved:
+            if _saved and not _warm_shutdown.is_set():
                 logger.info(
                     "Daemon warm: sync-first then wave for %d saved channels",
                     len(_saved),
@@ -73,6 +75,8 @@ async def _app_lifespan(_app: FastAPI):
             _lifespan_ready.set()
 
         # Background warm-ups (POT, session, yt-dlp)
+        if _warm_shutdown.is_set():
+            return
         from services.youtube_pot_service import schedule_pot_service_warm
         from services.youtube_ytdlp_update import schedule_ytdlp_update_check
 
@@ -99,6 +103,8 @@ async def _app_lifespan(_app: FastAPI):
         # paying the full 3-5s YouTube/Twitch extract on the critical path.
         # ponytail: a 4-worker pool inside the warm module bounds concurrency
         # so 20 saved channels don't slam YouTube at boot.
+        if _warm_shutdown.is_set():
+            return
         try:
             from routers.live import warm_all_saved_channel_live_status
             warm_all_saved_channel_live_status()
@@ -332,7 +338,17 @@ async def _app_lifespan(_app: FastAPI):
                 pass
 
     _lifespan_ready = threading.Event()
-    threading.Thread(target=_warm_youtube, daemon=True, name="yt-warm").start()
+    _warm_shutdown = threading.Event()
+
+    def _warm_youtube_guarded() -> None:
+        """Wrap _warm_youtube so it checks shutdown before submitting to pools."""
+        try:
+            if not _warm_shutdown.is_set():
+                _warm_youtube()
+        except Exception:
+            logger.exception("warm crashed")
+
+    threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
 
     # Mark startup ready immediately. The YouTube warm continues in the
     # daemon thread; first clicks in the first ~15s may pay the resolve
@@ -341,6 +357,7 @@ async def _app_lifespan(_app: FastAPI):
     _lifespan_ready.set()
 
     yield
+    _warm_shutdown.set()
     try:
         from services.shutdown_util import shutdown_downloads_and_children
 

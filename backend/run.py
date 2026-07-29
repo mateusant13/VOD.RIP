@@ -90,7 +90,27 @@ def main():
     # connections but never responds (Playwright + file-watch reload). Opt in
     # with KICK_RELOAD=1 when you need auto-reload.
     use_reload = os.environ.get("KICK_RELOAD", "").strip() == "1"
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=use_reload)
+
+    # ponytail: Windows TIME_WAIT holds the socket for ~30s after the old
+    # process exits. dev-all kills the old API, but the socket lingers.
+    # Retry bind with backoff instead of crashing.
+    max_bind_attempts = 3
+    for attempt in range(1, max_bind_attempts + 1):
+        try:
+            uvicorn.run("main:app", host="0.0.0.0", port=port, reload=use_reload)
+            break
+        except OSError as exc:
+            if exc.errno == 10048 and attempt < max_bind_attempts:  # WSAEADDRINUSE
+                wait_s = attempt * 2
+                print(
+                    f"Port {port} still in TIME_WAIT (attempt {attempt}/{max_bind_attempts}) — retrying in {wait_s}s",
+                    file=sys.stderr,
+                )
+                import time
+
+                time.sleep(wait_s)
+                continue
+            raise
 
 if __name__ == "__main__":
     main()
