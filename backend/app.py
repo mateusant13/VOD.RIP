@@ -323,12 +323,11 @@ async def _app_lifespan(_app: FastAPI):
     _lifespan_ready = threading.Event()
     threading.Thread(target=_warm_youtube, daemon=True, name="yt-warm").start()
 
-    # Block server startup until the daemon thread's sync warm completes.
-    # This guarantees the first 2 URLs per channel are in cache before any
-    # HTTP request arrives. Timeout after 30s so a stuck YouTube API call
-    # doesn't hang the server forever.
-    if not _lifespan_ready.wait(timeout=30.0):
-        logger.warning("Lifespan warm timed out after 30s — server starting anyway")
+    # Mark startup ready immediately. The YouTube warm continues in the
+    # daemon thread; first clicks in the first ~15s may pay the resolve
+    # cost (3-5s) instead of hitting the warm cache. Strictly better
+    # than blocking the server for 16s on every boot.
+    _lifespan_ready.set()
 
     yield
     try:
