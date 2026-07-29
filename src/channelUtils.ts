@@ -954,6 +954,78 @@ export const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
 
 export const CHANNEL_UI_STORAGE_KEY = 'vodrip_channel_ui';
 
+export const CHANNEL_LIVE_STATUS_STORAGE_KEY = 'vodrip_channel_live_status';
+
+export type StoredLiveEntry = {
+ platform: string;
+ is_live: boolean;
+ title: string;
+ url: string;
+ type: string;
+ viewer_count?: number;
+};
+
+export type StoredChannelLiveStatus = {
+ channel_id: string;
+ live: StoredLiveEntry[];
+ /** Unix ms timestamp when this was fetched. Used to discard stale entries. */
+ fetched_at: number;
+};
+
+const LIVE_STATUS_LOCAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Load last-known live statuses (keyed by channel_id) so the Channels tab
+ * paints the LIVE badge immediately on app open, before the first poll
+ * round-trip completes. Stale entries (>24h) are dropped. */
+export function loadStoredChannelLiveStatuses(): Record<string, StoredChannelLiveStatus> {
+ try {
+ const raw = localStorage.getItem(CHANNEL_LIVE_STATUS_STORAGE_KEY);
+ if (!raw) return {};
+ const parsed = JSON.parse(raw) as Record<string, StoredChannelLiveStatus>;
+ if (!parsed || typeof parsed !== 'object') return {};
+ const now = Date.now();
+ const out: Record<string, StoredChannelLiveStatus> = {};
+ for (const [cid, status] of Object.entries(parsed)) {
+ if (!status || !status.channel_id || !Array.isArray(status.live)) continue;
+ if (now - (status.fetched_at || 0) > LIVE_STATUS_LOCAL_TTL_MS) continue;
+ out[cid] = status;
+ }
+ return out;
+ } catch {
+ return {};
+ }
+}
+
+/** Persist a snapshot of live statuses (typically after a successful poll). */
+export function persistChannelLiveStatuses(
+ statuses: Record<string, StoredChannelLiveStatus>,
+): void {
+ try {
+ const slim: Record<string, StoredChannelLiveStatus> = {};
+ for (const [cid, status] of Object.entries(statuses)) {
+ if (!status || !status.channel_id) continue;
+ slim[cid] = {
+ channel_id: status.channel_id,
+ live: (status.live || []).filter((e) => e && e.is_live).map((e) => ({
+ platform: e.platform,
+ is_live: true,
+ title: e.title || '',
+ url: e.url || '',
+ type: e.type || 'hls',
+ viewer_count: e.viewer_count,
+ })),
+ fetched_at: status.fetched_at || Date.now(),
+ };
+ }
+ localStorage.setItem(
+ CHANNEL_LIVE_STATUS_STORAGE_KEY,
+ JSON.stringify(slim),
+ );
+ } catch {
+ /* quota / disabled — silently ignore */
+ }
+}
+
 export const MAX_SAVED_CHANNELS = 10;
 /** Highest quality from API list, or source when none listed (Kick). */
 

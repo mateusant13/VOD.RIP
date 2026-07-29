@@ -1,23 +1,24 @@
 """Live-stream info and DVR endpoints."""
 
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from services.live_capture import (  
+from deps import settings_mgr
+from services.live_capture import (
     download_live_stream,
     kick_live_info,
     twitch_live_info,
     youtube_live_info,
 )
-from deps import settings_mgr
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api", tags=["live"])
-
 _PLATFORM_LABEL = {"kick": "Kick", "twitch": "Twitch", "youtube": "YouTube"}
 
 
@@ -99,12 +100,150 @@ def check_live_status(
     )
 
 
+# ---------------------------------------------------------------------------
+# Channel-scoped live status (with in-process cache + startup warm)
+# ---------------------------------------------------------------------------
+#
+# Live-status reads must return in <100ms so the Channels tab can paint the
+# "LIVE" badge immediately on app open — but the underlying yt-dlp extract
+# (YouTube/Twitch) takes 3-5s. The cache stores the *response payload* (list
+# of LiveStatus dicts) keyed by channel_id with a 60s TTL; reads return the
+# cached payload instantly and trigger a background refresh if stale. On
+# server startup we pre-warm the cache for every saved channel so the very
+# first user request hits the warm cache.
+#
+# Concurrency: refreshes run on a dedicated 4-worker thread pool. We bound
+# concurrency so a 20-channel saved list does not slam YouTube at boot.
+
+_LIVE_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
+_LIVE_STATUS_TTL_SEC = 60.0
+_LIVE_STATUS_LOCK = threading.Lock()
+_LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
+
+
+def _fetch_channel_live_payload(channel: dict) -> dict:
+    """Build the response payload for a single channel's live status.
+
+    Reads all three platform fetchers (Kick/Twitch/YouTube) sequentially —
+    YouTube is the slowest so it dominates wall time, but the per-channel
+    fetch is parallel across the pool. The returned dict matches the live
+    router response: ``{"live": [...], "channel_id": ...}``.
+    """
+    live: list[dict] = []
+    ks = (channel.get("kickSlug") or "").strip()
+    if ks:
+        info = kick_live_info(ks)
+        if info and info.get("url"):
+            live.append({
+                "is_live": True,
+                "platform": "Kick",
+                "title": info.get("title", ""),
+                "viewers": info.get("viewers", 0),
+                "url": info.get("url", ""),
+                "headers": info.get("headers", {}),
+                "type": "hls",
+            })
+    ts = (channel.get("twitchSlug") or "").strip()
+    if ts:
+        info = twitch_live_info(ts)
+        if info and info.get("url"):
+            live.append({
+                "is_live": True,
+                "platform": "Twitch",
+                "title": info.get("title", ""),
+                "viewers": info.get("viewers", 0),
+                "url": info.get("url", ""),
+                "headers": info.get("headers", {}),
+                "type": "hls",
+            })
+    ys = (channel.get("youtubeSlug") or "").strip()
+    if ys:
+        info = youtube_live_info(ys)
+        if info and isinstance(info, dict) and info.get("url"):
+            live.append({
+                "is_live": True,
+                "platform": "YouTube",
+                "title": info.get("title", ""),
+                "viewers": info.get("viewers", 0),
+                "url": info.get("url", ""),
+                "headers": info.get("headers", {}),
+                "type": "hls",
+            })
+    return {"live": live, "channel_id": str(channel.get("id") or "")}
+
+
+def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
+    """Re-fetch a channel's live status and update the cache. Returns the payload."""
+    try:
+        payload = _fetch_channel_live_payload(channel)
+    except Exception as exc:
+        logger.debug("live_status refresh failed for %s: %s", channel_id, exc)
+        # Keep stale cache rather than wiping it; transient failures shouldn't
+        # erase a confirmed-live state from the UI.
+        with _LIVE_STATUS_LOCK:
+            cached = _LIVE_STATUS_CACHE.get(channel_id)
+        return cached[1] if cached else {"live": [], "channel_id": channel_id}
+    with _LIVE_STATUS_LOCK:
+        _LIVE_STATUS_CACHE[channel_id] = (time.monotonic(), payload)
+    return payload
+
+
+def warm_channel_live_status(channel_id: str) -> None:
+    """Kick a background refresh for one channel. Used by the polling frontend
+    to refresh on every tick without waiting on a synchronous extract."""
+    settings = settings_mgr.get()
+    channel: Optional[dict] = None
+    for ch in (settings.saved_channels or []):
+        if str(ch.get("id")) == str(channel_id):
+            channel = ch
+            break
+    if channel is None:
+        return
+    try:
+        _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, str(channel_id), channel)
+    except Exception:
+        logger.debug("live warm submit failed for %s", channel_id, exc_info=True)
+
+
+def warm_all_saved_channel_live_status() -> None:
+    """Pre-warm the live-status cache for every saved channel at server startup.
+
+    Runs on the daemon warm thread spawned from app.py lifespan — never blocks
+    the API. Each channel's extract happens concurrently across the dedicated
+    pool (4 workers). The /api/channels/{id}/live endpoint becomes O(1) for
+    the first user request after boot.
+    """
+    try:
+        settings = settings_mgr.get()
+    except Exception:
+        logger.debug("live warm: settings unavailable", exc_info=True)
+        return
+    channels = settings.saved_channels or []
+    if not channels:
+        logger.debug("live warm: no saved channels")
+        return
+    count = 0
+    for ch in channels:
+        cid = str(ch.get("id") or "")
+        if not cid:
+            continue
+        try:
+            _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, ch)
+            count += 1
+        except Exception:
+            logger.debug("live warm submit failed for %s", cid, exc_info=True)
+    if count:
+        logger.info("live warm: %d channel(s) queued", count)
+
+
 @router.get("/channels/{channel_id}/live")
 def channel_live_status(channel_id: str) -> dict:
     """Aggregate live status for a saved channel across all platforms.
 
-    Inspects the channel's ``kickSlug``, ``twitchSlug``, and ``youtubeSlug``
-    and returns a list of currently-live streams.
+    Returns the cached payload (warm or last-refreshed) immediately and
+    kicks a background refresh if the entry is older than the TTL. The
+    response shape is unchanged from the prior synchronous version so the
+    existing frontend contract holds: ``{"live": [...], "channel_id": ...}``.
     """
     settings = settings_mgr.get()
     channel: Optional[dict] = None
@@ -116,54 +255,30 @@ def channel_live_status(channel_id: str) -> dict:
     if channel is None:
         raise HTTPException(404, "Channel not found")
 
-    live: list[LiveStatus] = []
+    cid = str(channel_id)
+    now = time.monotonic()
+    stale = True
+    with _LIVE_STATUS_LOCK:
+        cached = _LIVE_STATUS_CACHE.get(cid)
+    if cached:
+        ts, payload = cached
+        stale = (now - ts) >= _LIVE_STATUS_TTL_SEC
+        if not stale:
+            return payload
 
-    # Kick
-    ks = (channel.get("kickSlug") or "").strip()
-    if ks:
-        info = kick_live_info(ks)
-        if info and info.get("url"):
-            live.append(LiveStatus(
-                is_live=True,
-                platform="Kick",
-                title=info.get("title", ""),
-                viewers=info.get("viewers", 0),
-                url=info.get("url", ""),
-                headers=info.get("headers", {}),
-                type="hls",
-            ))
-
-    # Twitch
-    ts = (channel.get("twitchSlug") or "").strip()
-    if ts:
-        info = twitch_live_info(ts)
-        if info and info.get("url"):
-            live.append(LiveStatus(
-                is_live=True,
-                platform="Twitch",
-                title=info.get("title", ""),
-                viewers=info.get("viewers", 0),
-                url=info.get("url", ""),
-                headers=info.get("headers", {}),
-                type="hls",
-            ))
-
-    # YouTube
-    ys = (channel.get("youtubeSlug") or "").strip()
-    if ys:
-        info = youtube_live_info(ys)
-        if info and isinstance(info, dict) and info.get("url"):
-            live.append(LiveStatus(
-                is_live=True,
-                platform="YouTube",
-                title=info.get("title", ""),
-                viewers=info.get("viewers", 0),
-                url=info.get("url", ""),
-                headers=info.get("headers", {}),
-                type="hls",
-            ))
-
-    return {"live": [s.model_dump() for s in live], "channel_id": channel_id}
+    if stale:
+        # Cache miss or stale. If we have *some* cached payload (stale) serve
+        # it now and refresh in the background — best UX: the user always sees
+        # last-known state within milliseconds. If we have nothing cached we
+        # must block on a synchronous fetch (only happens on first ever hit).
+        if cached:
+            try:
+                _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
+            except Exception:
+                logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
+            return cached[1]
+        payload = _refresh_channel_live_cache(cid, channel)
+        return payload
 
 
 # ---------------------------------------------------------------------------

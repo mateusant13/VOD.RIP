@@ -1,7 +1,18 @@
 // Self-check: mergeVodLists / mergeClipLists subscriber_only filtering and prunePlatforms
 // Run: cd worktree && npx tsx src/channelUtils.selfcheck.ts
 
-import { mergeVodLists, mergeClipLists, isMembersOnlyVideo, isPublicVideo } from './channelUtils';
+// localStorage polyfill for `npx tsx` (Node has no localStorage).
+const _ls = new Map<string, string>();
+(globalThis as { localStorage?: Storage }).localStorage = {
+  getItem: (k: string) => _ls.get(k) ?? null,
+  setItem: (k: string, v: string) => { _ls.set(k, v); },
+  removeItem: (k: string) => { _ls.delete(k); },
+  clear: () => _ls.clear(),
+  key: (i: number) => Array.from(_ls.keys())[i] ?? null,
+  get length() { return _ls.size; },
+} as Storage;
+
+import { mergeVodLists, mergeClipLists, isMembersOnlyVideo, isPublicVideo, loadStoredChannelLiveStatuses, persistChannelLiveStatuses } from './channelUtils';
 import type { ChannelVideo } from './types';
 
 function test(name: string, ok: boolean) {
@@ -162,3 +173,37 @@ console.log('=== mergeClipLists ===');
 }
 
 console.log('\n✅ All checks passed');
+
+// --- persistChannelLiveStatuses / loadStoredChannelLiveStatuses ---
+console.log('\n=== live status localStorage cache ===');
+{
+  // Round-trip a non-live status (no live entries) -> empty result on load.
+  const empty = { c1: { channel_id: 'c1', live: [], fetched_at: Date.now() } };
+  persistChannelLiveStatuses(empty);
+  const got = loadStoredChannelLiveStatuses();
+  test('persisted empty status round-trips', got.c1 !== undefined && got.c1.live.length === 0);
+
+  // Round-trip a live status with title/url/viewer_count.
+  const live = {
+    c2: {
+      channel_id: 'c2',
+      live: [{ platform: 'youtube', is_live: true, title: 'L!', url: 'https://x', type: 'live', viewer_count: 5 }],
+      fetched_at: Date.now(),
+    },
+  };
+  persistChannelLiveStatuses(live);
+  const got2 = loadStoredChannelLiveStatuses();
+  test('persisted live status round-trips with title', got2.c2 !== undefined && got2.c2.live[0]?.title === 'L!');
+
+  // Stale entry (>24h) is dropped.
+  const stale = {
+    c3: {
+      channel_id: 'c3',
+      live: [{ platform: 'youtube', is_live: true, title: 'old', url: 'https://x', type: 'live' }],
+      fetched_at: Date.now() - 25 * 60 * 60 * 1000,
+    },
+  };
+  persistChannelLiveStatuses(stale);
+  const got3 = loadStoredChannelLiveStatuses();
+  test('stale entry (>24h) is dropped', got3.c3 === undefined);
+}

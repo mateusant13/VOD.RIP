@@ -62,7 +62,7 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
@@ -507,7 +507,7 @@ export default function App() {
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' | 'YouTube' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
-  const [channelLiveStatuses, setChannelLiveStatuses] = useState<Record<string, ChannelLiveStatus>>({});
+  const [channelLiveStatuses, setChannelLiveStatuses] = useState<Record<string, ChannelLiveStatus>>(() => loadStoredChannelLiveStatuses() as unknown as Record<string, ChannelLiveStatus>);
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const [isLive, setIsLive] = useState(false);
@@ -1284,6 +1284,10 @@ export default function App() {
   }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url, channelContentFilter]);
 
   // Poll live status for every saved channel while the Channels tab is open.
+  // The first poll fires immediately (no setTimeout) so the LIVE badge paints
+  // on the same render the Channels tab opens. Server-side startup warm
+  // (routers.live.warm_all_saved_channel_live_status) ensures the cache
+  // hits in O(1) — first poll typically completes in <50ms.
   useEffect(() => {
     if (tab !== 'channels' || !savedChannels.length) return;
     let cancelled = false;
@@ -1296,7 +1300,19 @@ export default function App() {
       try {
         const status = await apiGet<ChannelLiveStatus>(`/api/channels/${ch.id}/live`);
         if (!cancelled) {
-          setChannelLiveStatuses((prev) => ({ ...prev, [ch.id]: status }));
+          setChannelLiveStatuses((prev) => {
+            const next = { ...prev, [ch.id]: status };
+            // ponytail: write last-known live status to localStorage so the next
+            // app open paints the LIVE badge immediately (before the first poll
+            // round-trip). Server-side warm already keeps the API hot, but
+            // local cache means we never paint an empty list.
+            persistChannelLiveStatuses(
+              Object.fromEntries(
+                Object.entries(next).map(([cid, s]) => [cid, { ...s, fetched_at: Date.now() }]),
+              ) as unknown as Record<string, StoredChannelLiveStatus>,
+            );
+            return next;
+          });
         }
       } catch {
         // Channel may lack platforms or backend is unreachable; ignore.

@@ -94,6 +94,17 @@ async def _app_lifespan(_app: FastAPI):
                 cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
             )
 
+        # Live-status warm — pre-populate the /api/channels/{id}/live cache so
+        # the first user request after server start returns in O(1) instead of
+        # paying the full 3-5s YouTube/Twitch extract on the critical path.
+        # ponytail: a 4-worker pool inside the warm module bounds concurrency
+        # so 20 saved channels don't slam YouTube at boot.
+        try:
+            from routers.live import warm_all_saved_channel_live_status
+            warm_all_saved_channel_live_status()
+        except Exception:
+            logger.debug("Live status warm skipped", exc_info=True)
+
     # _warm_first_wave_sync is defined OUTSIDE _warm_youtube at lifespan
     # scope so both the daemon thread and the blocking lifespan warm can
     # call it.
