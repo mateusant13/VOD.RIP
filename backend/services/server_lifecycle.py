@@ -338,6 +338,36 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
     return False
 
 
+def vodrip_api_healthy(port: int, *, timeout: float = 6.0) -> bool:
+    """True when a healthy VOD.RIP API answers GET /api/info on *port*.
+
+    Returns immediately when nothing is listening. While a listener exists
+    but isn't answering yet (fresh instance mid-import), polls until
+    *timeout* — closes the race where an automatic restart probes before
+    the port owner's app has finished starting.
+    """
+    try:
+        import requests
+    except ImportError:
+        return False
+    from services.single_instance import is_vodrip_api_name
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _port_has_listener(port):
+            return False
+        try:
+            info = requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.5)
+            if info.status_code == 200 and is_vodrip_api_name(info.json().get("name", "")):
+                return True
+        # ponytail: best-effort health probe — any error means not-healthy-yet
+        except (OSError, requests.RequestException, json.JSONDecodeError, KeyError):
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.4)
+
+
 def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 10.0) -> None:
     """Free *port* for a new VOD.RIP instance (graceful first; kill only our PIDs).
 

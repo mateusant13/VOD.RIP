@@ -63,8 +63,19 @@ def main():
 
     # dev-all.mjs releases the port before spawning us; skip duplicate work unless standalone.
     if os.environ.get("VODRIP_SKIP_PORT_RELEASE", "").strip() != "1":
-        from services.server_lifecycle import release_api_port
+        from services.server_lifecycle import release_api_port, vodrip_api_healthy
 
+        # First-wins: a healthy API on the port belongs to another supervisor
+        # (dev-all session, tray app). An automatic restart (hub/watchdog)
+        # must never kill it — that caused a murder loop where a hub-restarted
+        # instance POSTed /api/exit to the dev API 0.5s after it bound.
+        # VODRIP_TAKE_PORT=1 forces the old takeover behavior.
+        if os.environ.get("VODRIP_TAKE_PORT", "").strip() != "1" and vodrip_api_healthy(port):
+            print(
+                f"VOD.RIP API already running on :{port} — exiting "
+                "(set VODRIP_TAKE_PORT=1 to force takeover)"
+            )
+            sys.exit(0)
         release_api_port(port, skip_pid=os.getpid())
 
     # Install deps if needed
@@ -93,22 +104,32 @@ def main():
 
     # ponytail: Windows TIME_WAIT holds the socket for ~30s after the old
     # process exits. dev-all kills the old API, but the socket lingers.
-    # Retry bind with backoff instead of crashing.
+    # Retry bind with backoff instead of crashing. uvicorn reports bind
+    # failure as SystemExit (not OSError), so catch both. If the port was
+    # taken by a healthy VOD.RIP API meanwhile (lost supervisor race),
+    # first-wins: exit 0 instead of retrying a doomed bind.
+    import time as _time
+
     max_bind_attempts = 3
     for attempt in range(1, max_bind_attempts + 1):
         try:
             uvicorn.run("main:app", host="0.0.0.0", port=port, reload=use_reload)
             break
-        except OSError as exc:
-            if exc.errno == 10048 and attempt < max_bind_attempts:  # WSAEADDRINUSE
+        except (OSError, SystemExit) as exc:
+            if isinstance(exc, OSError) and exc.errno != 10048:  # WSAEADDRINUSE
+                raise
+            from services.server_lifecycle import vodrip_api_healthy
+
+            if vodrip_api_healthy(port):
+                print(f"VOD.RIP API won :{port} — exiting")
+                sys.exit(0)
+            if attempt < max_bind_attempts:
                 wait_s = attempt * 2
                 print(
                     f"Port {port} still in TIME_WAIT (attempt {attempt}/{max_bind_attempts}) — retrying in {wait_s}s",
                     file=sys.stderr,
                 )
-                import time
-
-                time.sleep(wait_s)
+                _time.sleep(wait_s)
                 continue
             raise
 
