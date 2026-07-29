@@ -497,7 +497,7 @@ def list_channel_clips_sync(login: str, limit: int = 10) -> List[Dict[str, Any]]
         return []
 
     limit = max(1, min(int(limit), 10))
-    fetch_n = max(limit, 20)
+    fetch_n = max(limit, 100)  # ponytail: Twitch API returns clips sorted by view count, not date. Fetch 100 to find recent clips with fewer views.
     data = _gql_persisted(
         "ClipsCards__User",
         CLIPS_CARDS_USER_HASH,
