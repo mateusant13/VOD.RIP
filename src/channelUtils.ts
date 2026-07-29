@@ -972,11 +972,15 @@ export type StoredChannelLiveStatus = {
  fetched_at: number;
 };
 
-const LIVE_STATUS_LOCAL_TTL_MS = 24 * 60 * 60 * 1000;
+// 24h was way too generous: a "LIVE" badge from yesterday painted on every
+// cold open (kingsman showed online hours after going offline). The badge is
+// only a first-paint hint — the poll corrects it within seconds — so 30min
+// is plenty.
+const LIVE_STATUS_LOCAL_TTL_MS = 30 * 60 * 1000;
 
 /** Load last-known live statuses (keyed by channel_id) so the Channels tab
  * paints the LIVE badge immediately on app open, before the first poll
- * round-trip completes. Stale entries (>24h) are dropped. */
+ * round-trip completes. Stale entries (>30min) are dropped. */
 export function loadStoredChannelLiveStatuses(): Record<string, StoredChannelLiveStatus> {
  try {
  const raw = localStorage.getItem(CHANNEL_LIVE_STATUS_STORAGE_KEY);

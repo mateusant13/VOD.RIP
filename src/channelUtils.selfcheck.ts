@@ -195,7 +195,7 @@ console.log('\n=== live status localStorage cache ===');
   const got2 = loadStoredChannelLiveStatuses();
   test('persisted live status round-trips with title', got2.c2 !== undefined && got2.c2.live[0]?.title === 'L!');
 
-  // Stale entry (>24h) is dropped.
+  // Stale entry (>30min) is dropped.
   const stale = {
     c3: {
       channel_id: 'c3',
@@ -205,5 +205,5 @@ console.log('\n=== live status localStorage cache ===');
   };
   persistChannelLiveStatuses(stale);
   const got3 = loadStoredChannelLiveStatuses();
-  test('stale entry (>24h) is dropped', got3.c3 === undefined);
+  test('stale entry (>30min) is dropped', got3.c3 === undefined);
 }

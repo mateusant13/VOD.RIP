@@ -538,6 +538,14 @@ export default function App() {
   const [clipRangeDays, setClipRangeDays] = useState<number>(7);
   const [clipSort, setClipSort] = useState<'date' | 'views'>('date');
 
+  // Era window: each Range option covers (previous step, selected step] —
+  // e.g. 1mo shows clips 14–30 days old, NOT "up to 1 month old".
+  const clipRangeMinDays = useMemo(() => {
+    const steps = [1, 7, 14, 30, 180, 365];
+    const idx = steps.indexOf(clipRangeDays);
+    return idx > 0 ? steps[idx - 1] : 0;
+  }, [clipRangeDays]);
+
   const youtubePlatformOnly = youtubeEnabled && !kickEnabled && !twitchEnabled;
 
   const selectedChannel = useMemo(
@@ -590,6 +598,12 @@ export default function App() {
 
   const visibleChannelVideos = useMemo(() => {
     const clips = channelContentFilter === 'clips';
+    // Era-window guard: clipVideos is MERGED across range changes, so clips
+    // from a previously-selected era linger in state. Re-apply the current
+    // window client-side so the list only ever shows the selected era.
+    const clipWindow = clips && clipRangeDays > 0
+      ? { minMs: clipRangeMinDays * 86_400_000, maxMs: clipRangeDays * 86_400_000 }
+      : null;
     const items: ChannelVideo[] = [];
     if (kickEnabled && channelHasKick) {
       items.push(...channelPlatformVisibleSlice(
@@ -615,7 +629,15 @@ export default function App() {
         clips,
       ));
     }
-    const sorted = [...items].sort((a, b) => {
+    const windowed = clipWindow
+      ? items.filter((v) => {
+          const ts = parseVideoTs(v.created_at);
+          if (!ts) return true; // keep undated — hiding makes sparse platforms look empty
+          const age = Date.now() - ts;
+          return age >= clipWindow.minMs && age <= clipWindow.maxMs;
+        })
+      : items;
+    const sorted = [...windowed].sort((a, b) => {
       const ta = parseVideoTs(a.created_at);
       const tb = parseVideoTs(b.created_at);
       // Null/empty dates sort to end
@@ -646,6 +668,8 @@ export default function App() {
     twitchVisibleLimit,
     youtubeVisibleLimit,
     channelContentFilter,
+    clipRangeDays,
+    clipRangeMinDays,
     channelHasKick,
     channelHasTwitch,
     channelHasYoutube,
@@ -3418,6 +3442,7 @@ export default function App() {
           platforms: clipPlatforms.join(','),
           limit: '10',
           days: String(clipRangeDays),
+          min_days: String(clipRangeMinDays),
           sort: clipSort,
           kick_slug: ch.kickSlug,
           twitch_login: ch.twitchSlug,
@@ -3611,7 +3636,7 @@ export default function App() {
       channelRefreshPromisesRef.current.set(flightKey, task);
     }
     return task;
-  }, [updateChannel, channelContentFilter, clipRangeDays, clipSort, resetChannelListPaging, clearChannelRefreshFlight]);
+  }, [updateChannel, channelContentFilter, clipRangeDays, clipRangeMinDays, clipSort, resetChannelListPaging, clearChannelRefreshFlight]);
 
   const refreshChannelRef = useRef(refreshChannel);
   refreshChannelRef.current = refreshChannel;
@@ -3676,7 +3701,7 @@ export default function App() {
       silent: false,
       force: true,
     });
-  }, [clipRangeDays, clipSort, channelContentFilter, selectedChannelId]);
+  }, [clipRangeDays, clipRangeMinDays, clipSort, channelContentFilter, selectedChannelId]);
 
   // ponytail: prefetch YouTube stream-tab VODs while user is on Videos/Shorts
   useEffect(() => {
@@ -5546,11 +5571,11 @@ export default function App() {
                           <span className="text-zinc-500 shrink-0 mr-1">Range:</span>
                           {([
                             { label: 'Today', days: 1 },
-                            { label: '7d', days: 7 },
-                            { label: '14d', days: 14 },
-                            { label: '1mo', days: 30 },
-                            { label: '6mo', days: 180 },
-                            { label: '1y', days: 365 },
+                            { label: '1–7d', days: 7 },
+                            { label: '7–14d', days: 14 },
+                            { label: '14d–1mo', days: 30 },
+                            { label: '1–6mo', days: 180 },
+                            { label: '6mo–1y', days: 365 },
                             { label: 'All', days: 0 },
                           ] as const).map((r) => (
                             <button

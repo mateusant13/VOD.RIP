@@ -838,6 +838,38 @@ def filter_videos_recent_or_all(videos: List[dict], days: int) -> tuple[List[dic
     return videos, 0
 
 
+def filter_clips_by_age_window(clips: List[dict], min_days: int, days: int) -> List[dict]:
+    """Keep clips whose age falls inside [min_days, days] — an era window, not "last N days".
+
+    The clips Range UI means "from <previous step> to <selected step> ago"
+    (e.g. 1mo shows clips 14–30 days old). days <= 0 means All (no window).
+    Clips with unparseable dates are kept — hiding them would make sparse
+    platforms look empty.
+    """
+    if days <= 0 or not clips:
+        return clips
+    now = datetime.now(timezone.utc)
+    newest_edge = now - timedelta(days=max(0, min_days))
+    oldest_edge = now - timedelta(days=days)
+    out: List[dict] = []
+    for v in clips:
+        dt = parse_video_date(v.get("created_at"))
+        if dt is None or oldest_edge <= dt <= newest_edge:
+            out.append(v)
+    return out
+
+
+_w10 = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+_w2 = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+_w40 = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+assert len(filter_clips_by_age_window([{"created_at": _w10}], 7, 30)) == 1   # inside [7,30]
+assert len(filter_clips_by_age_window([{"created_at": _w2}], 7, 30)) == 0    # too new
+assert len(filter_clips_by_age_window([{"created_at": _w40}], 7, 30)) == 0   # too old
+assert len(filter_clips_by_age_window([{"created_at": _w2}], 0, 1)) == 0     # Today window excludes 2d-old
+assert len(filter_clips_by_age_window([{"created_at": _w10}], 0, 30)) == 1   # min 0 = up to 30d old
+assert len(filter_clips_by_age_window([{"created_at": _w2}], 0, 0)) == 1     # All = no window
+
+
 def filter_videos_recent_or_all_by_platform(videos: List[dict], days: int) -> tuple[List[dict], int]:
     """Per-platform 14-day filter with unlimited fallback when a platform has no recent items."""
     if days <= 0 or not videos:

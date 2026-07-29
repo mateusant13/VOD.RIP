@@ -117,6 +117,10 @@ def check_live_status(
 
 _LIVE_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _LIVE_STATUS_TTL_SEC = 60.0
+# Serving a "LIVE" badge older than this is a lie: when refreshes keep
+# failing (platform outage, parse breakage) the stale-serve path must stop
+# returning ancient payloads and report unknown (empty) instead.
+_LIVE_STATUS_MAX_STALE_SEC = 600.0
 _LIVE_STATUS_LOCK = threading.Lock()
 _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
 
@@ -179,10 +183,13 @@ def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
     except Exception as exc:
         logger.debug("live_status refresh failed for %s: %s", channel_id, exc)
         # Keep stale cache rather than wiping it; transient failures shouldn't
-        # erase a confirmed-live state from the UI.
+        # erase a confirmed-live state from the UI — but only within the
+        # max-stale bound; older than that, report unknown (empty).
         with _LIVE_STATUS_LOCK:
             cached = _LIVE_STATUS_CACHE.get(channel_id)
-        return cached[1] if cached else {"live": [], "channel_id": channel_id}
+        if cached and (time.monotonic() - cached[0]) < _LIVE_STATUS_MAX_STALE_SEC:
+            return cached[1]
+        return {"live": [], "channel_id": channel_id}
     with _LIVE_STATUS_LOCK:
         _LIVE_STATUS_CACHE[channel_id] = (time.monotonic(), payload)
     return payload
@@ -269,9 +276,10 @@ def channel_live_status(channel_id: str) -> dict:
     if stale:
         # Cache miss or stale. If we have *some* cached payload (stale) serve
         # it now and refresh in the background — best UX: the user always sees
-        # last-known state within milliseconds. If we have nothing cached we
-        # must block on a synchronous fetch (only happens on first ever hit).
-        if cached:
+        # last-known state within milliseconds. Beyond the max-stale bound the
+        # cached state is too old to trust — block on a synchronous refresh
+        # like a true cache miss.
+        if cached and (now - cached[0]) < _LIVE_STATUS_MAX_STALE_SEC:
             try:
                 _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
             except Exception:

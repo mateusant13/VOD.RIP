@@ -32,6 +32,7 @@ from services.twitch_gql_service import (
 from services.youtube_service import list_channel_videos_sync as youtube_list_channel_videos_sync
 from utils import (
     filter_clip_entries,
+    filter_clips_by_age_window,
     filter_videos_recent_or_all_by_platform,
     format_platform_error,
     looks_like_clip_entry,
@@ -64,6 +65,7 @@ async def _gather_channel_clips(
     youtube_slug: str = "",
     limit: int,
     days: int = CHANNEL_DAYS_DEFAULT,
+    min_days: int = 0,
     sort: str = "date",
 ) -> tuple[List[dict], Dict[str, str], int]:
     """Fetch clips per platform using platform-specific logins."""
@@ -104,8 +106,9 @@ async def _gather_channel_clips(
         if not twitch_login:
             per_platform_errors["Twitch"] = "Twitch login is required"
             return
-        # Map days → smallest Twitch GQL window that covers it.
-        # 0 (All) and >30d must use ALL_TIME — Twitch GQL has no wider window.
+        # Map days (window's OLDER edge) → smallest Twitch GQL window that
+        # covers it. 0 (All) and >30d must use ALL_TIME — Twitch GQL has no
+        # wider window.
         if days <= 0 or days > 30:
             gte = "ALL_TIME"
         elif days <= 1:
@@ -124,6 +127,8 @@ async def _gather_channel_clips(
                         limit,
                         range_label=gte,
                         sort=sort,
+                        older_than_days=days,
+                        newer_than_days=min_days,
                     ),
                 ),
                 timeout=CLIP_FETCH_TIMEOUT_SEC,
@@ -199,10 +204,19 @@ async def _gather_channel_clips(
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     all_clips = filter_clip_entries(all_clips)
-    all_clips, effective_days = filter_videos_recent_or_all_by_platform(all_clips, days)
-    # Sort all clips newest-first by date. Each platform fetcher already returns
-    # date-desc items; this final merge sort guarantees consistent recency order.
-    all_clips.sort(key=lambda v: v.get("created_at") or "", reverse=True)
+    # Era window (e.g. 1mo = 14–30 days old) — no "show all when empty"
+    # fallback: an explicit era that comes back empty is the honest answer.
+    all_clips = filter_clips_by_age_window(all_clips, min_days, days)
+    effective_days = days
+    # Final merge sort: date-desc for Newest, views-desc for Most Views —
+    # the per-platform views sort was previously flattened to date order here.
+    if sort == "views":
+        all_clips.sort(key=lambda v: int(v.get("views") or 0), reverse=True)
+    else:
+        all_clips.sort(key=lambda v: v.get("created_at") or "", reverse=True)
+    # Era windows can return hundreds of clips (deep Twitch paging) — cap the
+    # payload; the UI shows 10 and pages client-side.
+    all_clips = all_clips[:200]
     for k, v in list(per_platform_errors.items()):
         per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
         if not per_platform_errors[k]:
@@ -215,6 +229,7 @@ async def channel_videos(
     url: str,
     limit: int = CHANNEL_LIMIT_MAX,
     days: int = CHANNEL_DAYS_DEFAULT,
+    min_days: int = 0,
     sort: str = "date",
     platforms: str = "Kick,Twitch,YouTube",
     content: str = "vods",
@@ -234,9 +249,10 @@ async def channel_videos(
         content_norm = (content or "").strip().lower()
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT if content_norm == "clips" else CHANNEL_LIMIT_MAX))
         days_norm = max(0, min(int(days), 365))
+        min_days_norm = max(0, min(int(min_days), days_norm)) if days_norm > 0 else 0
         cache_key = make_channel_cache_key(
             "videos", content_norm, kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
-            ",".join(sorted(wanted)), youtube_ch,
+            ",".join(sorted(wanted)), youtube_ch, min_days_norm,
         )
         cached = get_cached(cache_key)
         if cached is not None:
@@ -262,6 +278,7 @@ async def channel_videos(
                 youtube_slug=youtube_ch,
                 limit=limit_norm,
                 days=days_norm,
+                min_days=min_days_norm,
                 sort=sort,
             )
             payload = {
@@ -466,6 +483,7 @@ async def channel_clips(
     platforms: str = "Kick,Twitch",
     limit: int = CHANNEL_CLIP_LIMIT,
     days: int = CHANNEL_DAYS_DEFAULT,
+    min_days: int = 0,
     sort: str = "date",
     kick_slug: Optional[str] = None,
     twitch_login: Optional[str] = None,
@@ -483,9 +501,10 @@ async def channel_clips(
         wanted = parse_wanted_platforms(platforms)
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
         days_norm = max(0, min(int(days), 365))
+        min_days_norm = max(0, min(int(min_days), days_norm)) if days_norm > 0 else 0
         cache_key = make_channel_cache_key(
             "clips", kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
-            ",".join(sorted(wanted)), youtube_ch,
+            ",".join(sorted(wanted)), youtube_ch, min_days_norm,
         )
         cached = get_cached(cache_key)
         if cached is not None:
@@ -507,6 +526,7 @@ async def channel_clips(
             youtube_slug=youtube_ch,
             limit=limit_norm,
             days=days_norm,
+            min_days=min_days_norm,
             sort=sort,
         )
         payload = {

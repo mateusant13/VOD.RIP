@@ -95,6 +95,16 @@ def _format_duration(seconds: Optional[float]) -> Optional[str]:
     return f"{m}:{s:02d}"
 
 
+def _iso_ts(value: Any) -> Optional[float]:
+    """Parse an ISO-8601 timestamp to epoch seconds (None on failure)."""
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_clip_slug(url_or_slug: str) -> Optional[str]:
     raw = (url_or_slug or "").strip()
     if not raw:
@@ -266,6 +276,8 @@ def get_clip_signed_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]:
 
 _HLS_STREAM_INF_RE = re.compile(r"#EXT-X-STREAM-INF[\s\S]*?\n([^#\n].*)", re.IGNORECASE)
 _HLS_RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)", re.IGNORECASE)
+_HLS_BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
+_HLS_FRAMERATE_RE = re.compile(r"FRAME-RATE=([\d.]+)", re.IGNORECASE)
 
 
 def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[str, Any]]:
@@ -291,11 +303,18 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
         seen.add(variant_url)
         m = _HLS_RESOLUTION_RE.search(info_line)
         height = int(m.group(2)) if m else 0
+        bw = _HLS_BANDWIDTH_RE.search(info_line)
+        fr = _HLS_FRAMERATE_RE.search(info_line)
         out.append({
             "height": height,
             "url": variant_url,
             "ext": "mp4",
             "protocol": "m3u8_native",
+            # codecs/tbr/fps let size_estimate treat these like yt-dlp formats
+            "vcodec": "h264",
+            "acodec": "mp4a.40.2",
+            "tbr": (int(bw.group(1)) / 1000.0) if bw else None,
+            "fps": float(fr.group(1)) if fr else None,
         })
     out.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
     return out
@@ -492,12 +511,19 @@ def list_channel_clips_sync(
     *,
     range_label: str = "LAST_WEEK",
     sort: str = "date",
+    older_than_days: int = 0,
+    newer_than_days: int = 0,
 ) -> List[Dict[str, Any]]:
     """Return the *limit* most recent clips (<=60s).
 
     range_label: Twitch GQL ClipsFilter — LAST_DAY/LAST_WEEK/LAST_MONTH/ALL_TIME.
     For ranges >1mo the GQL window must be ALL_TIME; the caller client-filters
     the desired window after this call.
+
+    older_than_days/newer_than_days: era-window paging. When older_than_days
+    >0, keep paginating until we have enough clips inside
+    [newer_than_days, older_than_days] or pass its older edge — era callers
+    (e.g. 6mo) need depth, not just the newest page.
 
     sort: 'date' (newest first) or 'views' (most viewed first).
     """
@@ -507,12 +533,34 @@ def list_channel_clips_sync(
 
     limit = max(1, min(int(limit), 10))
     fetch_n = max(limit, 100)
+    older_cutoff: Optional[float] = None
+    newer_cutoff: Optional[float] = None
+    if older_than_days > 0:
+        import time as _time
+
+        older_cutoff = _time.time() - older_than_days * 86400
+        newer_cutoff = _time.time() - max(0, newer_than_days) * 86400
+
+    # Enough in-window clips for the UI (10 shown + show-more headroom).
+    _IN_WINDOW_TARGET = 100
 
     def _fetch(filter_label: str = "LAST_WEEK") -> List[Dict[str, Any]]:
         """Fetch clips from Twitch GQL with the given filter, paginating."""
         out: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
-        while len(out) < fetch_n:
+        # ponytail: page ceilings for deep era windows. ALL_TIME is NOT
+        # date-ordered (popularity order) so early date-stop is unreliable
+        # there — cap it lower and rely on the in-window count instead.
+        # Upgrade path: raise caps or binary-search the cursor by date.
+        if older_cutoff is None:
+            max_pages = 5
+        elif filter_label == "ALL_TIME":
+            max_pages = 3
+        else:
+            max_pages = 10
+        pages = 0
+        in_window = 0
+        while True:
             variables: Dict[str, Any] = {
                 "login": login,
                 "limit": 100,
@@ -554,10 +602,25 @@ def list_channel_clips_sync(
                     "channel": login,
                     "content_kind": "clip",
                 })
-                if len(out) >= fetch_n:
+                if len(out) >= fetch_n and older_cutoff is None:
                     break
+                if older_cutoff is not None:
+                    ts = _iso_ts(node.get("createdAt"))
+                    if ts is not None and ts <= (newer_cutoff or ts) and ts >= older_cutoff:
+                        in_window += 1
+            pages += 1
             pi = (user.get("clips") or {}).get("pageInfo") or {}
-            if not pi.get("hasNextPage") or len(out) >= fetch_n:
+            if not pi.get("hasNextPage") or pages >= max_pages:
+                break
+            if older_cutoff is not None:
+                if in_window >= _IN_WINDOW_TARGET:
+                    break
+                if filter_label != "ALL_TIME" and sort != "views":
+                    # Date-ordered bucket: past the older edge = full window.
+                    last_ts = _iso_ts(out[-1].get("created_at")) if out else None
+                    if last_ts is not None and last_ts <= older_cutoff:
+                        break
+            elif len(out) >= fetch_n:
                 break
             cursor = pi.get("endCursor")
         return out
@@ -579,6 +642,10 @@ def list_channel_clips_sync(
         parsed.sort(key=lambda v: int(v.get("views") or 0), reverse=True)
     else:
         parsed.sort(key=lambda v: v.get("created_at") or "", reverse=True)
+    if older_cutoff is not None:
+        # Era window: the API layer filters the exact age window and the UI
+        # pages client-side — return the whole deep fetch, not the newest 10.
+        return parsed
     return parsed[:limit]
 
 
@@ -670,11 +737,21 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
         "platform": "Twitch",
         "created_at": node.get("createdAt"),
     }
-    m3u8_url, m3u8_headers, formats = _twitch_vod_playback_for_estimate(vid)
+    # Fast path: GQL playback token + usher master (~0.6s) instead of the
+    # yt-dlp probe (~4.7s). Variants carry tbr/fps so enrich_info_dict needs
+    # no further network. Fall back to the yt-dlp probe on any failure.
+    try:
+        m3u8_url, m3u8_headers, formats = get_vod_playback_sync(vid)
+        master_parsed = bool(formats)
+    except Exception as exc:
+        logger.debug("fast VOD playback failed for %s, using yt-dlp probe: %s", vid, exc)
+        m3u8_url, m3u8_headers, formats = _twitch_vod_playback_for_estimate(vid)
+        master_parsed = False
     enrich_info_dict(
         payload,
         formats=formats,
-        m3u8_url=m3u8_url,
+        # Fast path already fetched+parsed the master — don't fetch it again.
+        m3u8_url=None if master_parsed else m3u8_url,
         m3u8_headers=m3u8_headers,
         is_clip=False,
     )
