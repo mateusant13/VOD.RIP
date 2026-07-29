@@ -171,7 +171,11 @@ def _process_image_name(pid: int) -> Optional[str]:
         return None
 
 
-def _request_graceful_shutdown(port: int) -> bool:
+def _request_graceful_shutdown(port: int, *, allowed_pids: Optional[set[int]] = None) -> bool:
+    """Send POST /api/exit to *port*. If *allowed_pids* is given, only proceed when
+    the listener PID is in that set — otherwise a fresh API spawned mid-call would
+    be killed.
+    """
     try:
         import requests
 
@@ -180,6 +184,15 @@ def _request_graceful_shutdown(port: int) -> bool:
 
         if info.status_code != 200 or not is_vodrip_api_name(info.json().get("name", "")):
             return False
+        if allowed_pids is not None:
+            # Find the listener PID; if it's not in our snapshot, abort.
+            current = _pids_listening_on_port(port)
+            if not any(p in allowed_pids for p in current):
+                _logger.info(
+                    "Port %s listener changed mid-call (was %s, now %s) — not shutting down",
+                    port, sorted(allowed_pids), current,
+                )
+                return False
         response = requests.post(f"http://127.0.0.1:{port}/api/exit", timeout=2)
         return response.status_code == 200
     # ponytail: best-effort graceful shutdown — import/requests/json errors handled gracefully
@@ -326,39 +339,46 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
 
 
 def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: float = 10.0) -> None:
-    """Free *port* for a new VOD.RIP instance (graceful first; kill only our PIDs)."""
+    """Free *port* for a new VOD.RIP instance (graceful first; kill only our PIDs).
+
+    Snapshot the listener PIDs at function start so any process that bound *port*
+    AFTER we started (e.g. a freshly-spawned dev API) is not killed by us. This
+    prevents a racing ``release_api_port`` call from one process killing the API
+    just spawned by another.
+    """
     # Fast path: nothing is listening, so we don't even need netstat/tasklist.
     if not _port_has_listener(port):
         return
 
     deadline = time.monotonic() + timeout
+    # Snapshot listeners now — only these PIDs are eligible for kill. Any PID
+    # that appears later (newly spawned by another process) is left alone.
+    snapshot_pids = {
+        p for p in _pids_listening_on_port(port)
+        if skip_pid is None or p != skip_pid
+    }
+    def target_listeners() -> list[int]:
+        return [p for p in snapshot_pids if _pid_is_vodrip_api(port, p)]
 
-    def active_listeners() -> list[int]:
-        raw = [p for p in _pids_listening_on_port(port) if skip_pid is None or p != skip_pid]
-        return [p for p in raw if _pid_is_vodrip_api(port, p)]
-
-    listeners = active_listeners()
+    listeners = target_listeners()
     if not listeners:
-        raw = [
-            p for p in _pids_listening_on_port(port)
-            if skip_pid is None or p != skip_pid
-        ]
-        if raw:
+        if snapshot_pids:
             _logger.warning(
                 "Port %s in use by non-VOD.RIP process(es) %s — not force-killing",
                 port,
-                raw,
+                sorted(snapshot_pids),
             )
         return
 
     _logger.info("Port %s busy — asking existing VOD.RIP API to exit", port)
-    if _request_graceful_shutdown(port):
+    if _request_graceful_shutdown(port, allowed_pids=snapshot_pids):
+        # Only count snapshot PIDs as gone — a new listener is not our target.
         if _wait_for_port_free(port, skip_pid=skip_pid, timeout=min(4.0, timeout)):
             _logger.info("Port %s released after graceful shutdown", port)
             return
 
     while time.monotonic() < deadline:
-        remaining = active_listeners()
+        remaining = target_listeners()
         if not remaining:
             return
 
@@ -372,11 +392,20 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
                     port,
                 )
 
-        if _wait_for_port_free(port, skip_pid=skip_pid, timeout=1.5):
-            _logger.info("Port %s released", port)
-            return
+        # Wait for snapshot PIDs to release; ignore new listeners from elsewhere.
+        deadline2 = time.monotonic() + 1.5
+        while time.monotonic() < deadline2:
+            live_targets = [p for p in snapshot_pids if _process_alive(p)]
+            if not live_targets:
+                break
+            time.sleep(0.15)
+        else:
+            # Snapshot PIDs still alive after 1.5s — keep going in main loop.
+            continue
+        _logger.info("Port %s released", port)
+        return
 
-    still = active_listeners()
+    still = target_listeners()
     if still:
         _logger.error("Port %s still busy after shutdown attempt: %s", port, still)
 

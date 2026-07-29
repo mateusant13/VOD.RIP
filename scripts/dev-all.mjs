@@ -85,16 +85,15 @@ function killWinPid(pid) {
 }
 
 function releasePort(port) {
+  // Force-kill only. We deliberately do NOT call `release_api_port` here —
+  // that helper POSTs `/api/exit` which can race-kill a freshly-spawned VOD.RIP
+  // API if a sibling dev-all session is starting. taskkill on the PIDs we
+  // observed is sufficient for the dev workflow.
   if (process.platform === "win32") {
     for (const pid of getWinPortPids(port)) {
       killWinPid(pid);
     }
   }
-  const pyInline = [pyCmd, ...pyArgsPrefix, "-c"].join(" ");
-  execSync(
-    `${pyInline} "from services.server_lifecycle import release_api_port; release_api_port(${port}, timeout=12)"`,
-    { cwd: pyDir, stdio: "inherit", env: { ...process.env, PORT: String(apiPort) } },
-  );
 }
 
 async function ensurePortFree(port, label) {
