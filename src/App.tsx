@@ -1424,7 +1424,8 @@ export default function App() {
 
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube' && isPublicVideo(v)
-        && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
+        && v.content_kind !== 'clip' && v.content_kind !== 'short'
+        && channelContentFilter !== 'clips')
       .filter((v) => !warmedUrlsRef.current.has(buildVodUrl(v)))
       .slice(0, YOUTUBE_WARM_VOD_LIMIT)
       .map((v) => buildVodUrl(v));
@@ -5752,6 +5753,7 @@ export default function App() {
                             const subline = channelVodSubline(v);
                             const durSec = channelVideoDurationSec(v);
                             const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
+                            const isShortItem = v.content_kind === 'short' || (v.url || '').includes('/shorts/');
                             const isMembersOnly = isMembersOnlyVideo(v);
                             const isActiveVod = url.trim() === fullUrl.trim();
                             const rowAccent = platformAccentColor(v.platform);
@@ -5761,7 +5763,7 @@ export default function App() {
                                 key={`${v.platform}-${v.id}-${i}`}
                                 role="button"
                                 tabIndex={0}
-                                data-youtube-warm={v.platform === 'youtube' && !isMembersOnly && !isClipItem ? fullUrl : undefined}
+                                data-youtube-warm={v.platform === 'youtube' && !isMembersOnly && !isClipItem && !isShortItem ? fullUrl : undefined}
                                 onClick={() => selectVod(fullUrl, {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,

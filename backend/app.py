@@ -137,8 +137,12 @@ async def _app_lifespan(_app: FastAPI):
                     if not isinstance(v, dict):
                         continue
                     url = v.get("url") or ""
-                    if "youtube.com" in url or "youtu.be" in url:
-                        videos.append(v)
+                    if "youtube.com" not in url and "youtu.be" not in url:
+                        continue
+                    ckind = v.get("content_kind") or ""
+                    if ckind == "short" or "/shorts/" in url:
+                        continue  # skip shorts, only warm VODs
+                    videos.append(v)
             videos.sort(
                 key=lambda v: (
                     v.get("created_at") or v.get("published_at") or v.get("upload_date") or ""
@@ -169,7 +173,7 @@ async def _app_lifespan(_app: FastAPI):
                     if not url:
                         continue
                     ckind = v.get("content_kind") or ""
-                    if kind == "vods" and ckind in ("stream", "clip"):
+                    if kind == "vods" and ckind in ("stream", "clip", "short"):
                         continue
                     if kind == "clips" and ckind != "clip":
                         continue
@@ -233,6 +237,9 @@ async def _app_lifespan(_app: FastAPI):
                         continue
                     url = v.get("url") or ""
                     if url and yt_re.search(url) and url not in seen:
+                        ckind = v.get("content_kind") or ""
+                        if ckind == "short" or "/shorts/" in url:
+                            continue
                         seen.add(url)
                         urls.append(url)
         return urls
@@ -268,8 +275,12 @@ async def _app_lifespan(_app: FastAPI):
                     if not isinstance(v, dict):
                         continue
                     url = v.get("url") or ""
-                    if "youtube.com" in url or "youtu.be" in url:
-                        videos.append(v)
+                    if "youtube.com" not in url and "youtu.be" not in url:
+                        continue
+                    ckind = v.get("content_kind") or ""
+                    if ckind == "short" or "/shorts/" in url:
+                        continue  # skip shorts, only warm VODs
+                    videos.append(v)
             # Sort newest-first by date
             videos.sort(
                 key=lambda v: (
