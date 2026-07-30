@@ -9,6 +9,7 @@ import math
 import os
 import random
 import re
+import socket
 import secrets
 import shutil
 import threading
@@ -36,6 +37,48 @@ from services.ytdlp_service import (
 from services.ytdlp_hls import _youtube_soft_neg_error
 
 logger = logging.getLogger(__name__)
+
+# SSRF guard: validate proxied URLs don't point to private/internal hosts.
+def _validate_proxy_url(url: str) -> bool:
+    """Return True if the URL is safe to proxy (public host, not internal)."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host or host in ("localhost", "127.0.0.1", "::1"):
+        return False
+    # Check if private IP (fast fail)
+    try:
+        ip = socket.getaddrinfo(host, 80, socket.AF_INET)[0][4][0]
+        # RFC 1918, RFC 6598, RFC 6890
+        if ip.startswith(
+            (
+                "10.",
+                "172.16.",
+                "172.17.",
+                "172.18.",
+                "172.19.",
+                "172.20.",
+                "172.21.",
+                "172.22.",
+                "172.23.",
+                "172.24.",
+                "172.25.",
+                "172.26.",
+                "172.27.",
+                "172.28.",
+                "172.29.",
+                "172.30.",
+                "172.31.",
+                "192.168.",
+                "127.",
+                "169.254.",
+                "0.",
+            )
+        ):
+            return False
+    except (socket.gaierror, IndexError):
+        return False
+    return True
+
 
 SESSION_TTL_SEC = 1800  # 30 min — long browsing rarely exceeds 30 min; channels page keeps last-touched in localStorage so re-opening is cheap.
 # Hard cap on open (non-deleted) sessions in the dict; closed sessions don't count.
@@ -1246,6 +1289,8 @@ def _open_upstream_stream(
     host = urlparse(url).hostname or ""
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
+    if not _validate_proxy_url(url):
+        raise PermissionError(f"URL resolves to private/internal address: {url[:80]}")
     headers = _request_headers(session, range_header, host=host)
     try:
         from curl_cffi import requests as cffi_requests
@@ -2369,6 +2414,8 @@ def _http_get_bytes(
     host = urlparse(url).hostname or ""
     if not _host_allowed(host, session):
         raise PermissionError(f"URL host not allowed for preview: {host}")
+    if not _validate_proxy_url(url):
+        raise PermissionError(f"URL resolves to private/internal address: {url[:80]}")
 
     headers = _request_headers(session, range_header, host=host)
     is_playlist = _is_playlist_url(url)
