@@ -137,22 +137,35 @@ export function cancelWarmYoutubePreviewFull(url: string): void {
  *  ponytail: cap at 3 to avoid stampeding INFO_EXECUTOR when many YouTube rows
  *  are visible — the actual preview create needs the executor for its own
  *  yt-dlp probe and would otherwise queue behind the warm jobs. */
-export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 80): void {
-  // Skip recently-warmed URLs
+export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 500): void {
   const now = Date.now();
   urls = urls.filter(u => !_warmCache.has(u) || now - _warmCache.get(u)! > _WARM_CACHE_TTL_MS);
   if (urls.length === 0) return;
 
-  let n = 0;
-  for (const raw of urls) {
-    if (n >= max) break;
-    const trimmed = raw.trim();
-    if (!trimmed || detectUrlPlatform(trimmed) !== 'youtube' || isClipUrl(trimmed)) continue;
-    warmYoutubePreview(trimmed, n * staggerMs);
-    n += 1;
+  // Send all uncached URLs as one batch POST (fewer connections, backend handles concurrency)
+  const batch = urls.slice(0, max);
+  const trimmed: string[] = [];
+  for (const raw of batch) {
+    const t = raw.trim();
+    if (t && detectUrlPlatform(t) === 'youtube' && !isClipUrl(t)) trimmed.push(t);
   }
-  // Mark all passed URLs as recently-warmed
-  for (const u of urls) _warmCache.set(u, Date.now());
+  if (trimmed.length === 0) return;
+
+  const body = JSON.stringify({ urls: trimmed, prefer_height: PREVIEW_FAST_START_HEIGHT ?? 360 });
+  const doFetch = () => {
+    fetch('/api/preview/warm/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    }).catch(() => {});
+    trimmed.forEach(u => _warmCache.set(u, Date.now()));
+  };
+
+  if (staggerMs > 0) {
+    setTimeout(doFetch, staggerMs);
+  } else {
+    doFetch();
+  }
   // ponytail: if cache exceeds 1000 entries, clear entirely (worst case: a few redundant POSTs)
   if (_warmCache.size > 1000) _warmCache.clear();
 }
