@@ -814,6 +814,8 @@ class PreviewManager:
         except Exception:
             pass
         return session
+
+@dataclass
 class PreviewSession:
     session_id: str
     vod_url: str
@@ -3318,7 +3320,7 @@ proxy_window_hls_playlist = None  # set by shim below for backward compatibility
 proxy_window_hls_playlist = _legacy_proxy_window_hls_playlist
 
 def _is_playlist_url(url: str) -> bool:
-    # ponytail: endswith only — YouTube videoplayback segments embed index.m3u8 in path
+    # ponytail: endswith only ï¿½ YouTube videoplayback segments embed index.m3u8 in path
     path = urlparse(url).path.lower().rstrip("/")
     return path.endswith(".m3u8")
 
