@@ -107,9 +107,39 @@ _YOUTUBE_WARM_LOCK = threading.Lock()
 # Warm result cache keyed by inflight key — fast lookup without full session snap.
 _YOUTUBE_WARM_CACHE: dict[str, Any] = {}
 _YOUTUBE_WARM_CACHE_LOCK = threading.Lock()
-# Per-channel warm slot tracking (oldest first) — max 10 warmed URLs per channel.
+# Per-channel warm slot tracking (oldest first) — max 5 warmed URLs per channel.
 _CHANNEL_WARM_SLOTS: dict[str, list[str]] = {}
 _CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
+# Rate-limit circuit breaker for YouTube warm requests.
+# After _MAX_WARM_FAILURES consecutive failures, pause all YouTube warm
+# for _WARM_COOLDOWN_SEC to avoid cascading rate limits.
+_YOUTUBE_WARM_COOLDOWN_UNTIL: float = 0  # time.monotonic() threshold
+_YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
+_PRINTED_COOLDOWN = False
+_YOUTUBE_WARM_RATE_LIMIT_LOCK = threading.Lock()
+_MAX_WARM_FAILURES = 3
+_WARM_COOLDOWN_SEC = 120  # 2 minutes
+
+
+def _warm_rate_limit_check() -> bool:
+    """Return True if YouTube warm requests should be skipped (in cooldown)."""
+    return time.monotonic() < _YOUTUBE_WARM_COOLDOWN_UNTIL
+
+
+def _record_warm_failure() -> None:
+    """Record a consecutive warm failure. If threshold reached, start cooldown."""
+    global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN
+    with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
+        _YOUTUBE_WARM_CONSECUTIVE_FAILURES += 1
+        if _YOUTUBE_WARM_CONSECUTIVE_FAILURES >= _MAX_WARM_FAILURES:
+            _YOUTUBE_WARM_COOLDOWN_UNTIL = time.monotonic() + _WARM_COOLDOWN_SEC
+            if not _PRINTED_COOLDOWN:
+                logger.warning(
+                    "YouTube warm rate-limit circuit breaker activated: %d consecutive failures, "
+                    "pausing warm for %ds",
+                    _MAX_WARM_FAILURES, _WARM_COOLDOWN_SEC)
+                _PRINTED_COOLDOWN = True
+            _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
 # ponytail: latest URL the user is actively previewing. Warm jobs check this
 # before doing heavy work and bail out cheaply if they're no longer relevant.
 # Without this, parallel warm jobs from the channel list steal INFO_EXECUTOR
@@ -3359,6 +3389,9 @@ def kickoff_youtube_batch_warm(
     def _run() -> None:
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
+        # Rate-limit circuit breaker: skip if YouTube is rate-limiting us
+        if _warm_rate_limit_check():
+            return
         # See kickoff_youtube_warm — in-flight registration happens at run start
         # so create_session never waits on a queued (not running) warm.
         with _YOUTUBE_WARM_LOCK:
@@ -3373,6 +3406,13 @@ def kickoff_youtube_batch_warm(
                 url, oauth=oauth, prefer_height=prefer_height,
                 channel_key=channel_key,
             )
+            with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
+                _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
+                _PRINTED_COOLDOWN = False
+        except Exception as exc:
+            logger.debug("Warm failed for %s: %s", url, exc)
+            _record_warm_failure()
+            raise
         finally:
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
@@ -4572,8 +4612,10 @@ def warm_youtube_resolve_only(
     a resolve must produce a snapshot — otherwise the user's first click
     waits the full SLA.
 
-    If channel_key is set, tracks this URL in per-channel warm slots (max 10)
-    and evicts the oldest URL + on-disk prog head segments when the limit is exceeded.
+    When ``channel_key`` is set, the warmed URL is tracked in a per-channel
+    slot list. The oldest entry is evicted when the channel exceeds the max
+    of 5 warm slots, so the frontend's YOUTUBE_WARM_VOD_LIMIT is respected
+    on the backend side too.
     """
     try:
         resolve_result = resolve_stream_info(
@@ -4638,6 +4680,24 @@ def warm_youtube_resolve_only(
                             meta_p.unlink(missing_ok=True)
     else:
         logger.debug("session snapshot skipped for %s (unsupported type)", url[:80])
+    # Track in warm cache + per-channel slot eviction so the backend doesn't
+    # hold more warmed entries than the frontend YOUTUBE_WARM_VOD_LIMIT of 5.
+    if snap:
+        from services.youtube_innertube import youtube_watch_url_to_key
+
+        inflight_key = youtube_watch_url_to_key(url)
+        if inflight_key:
+            with _YOUTUBE_WARM_CACHE_LOCK:
+                _YOUTUBE_WARM_CACHE[inflight_key] = snap
+        if channel_key:
+            with _CHANNEL_WARM_SLOTS_LOCK:
+                slots = _CHANNEL_WARM_SLOTS.setdefault(channel_key, [])
+                slots.append(url[:200])
+                while len(slots) > 5:
+                    evicted = slots.pop(0)
+                    evicted_key = youtube_watch_url_to_key(evicted)
+                    if evicted_key:
+                        _YOUTUBE_WARM_CACHE.pop(evicted_key, None)
     return True
 
 

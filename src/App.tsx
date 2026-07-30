@@ -285,7 +285,7 @@ const ChannelRow = memo(function ChannelRow({
           />
         </div>
       )}
-      {liveEntries.length > 0 && <LiveBadge entries={liveEntries} />}
+      <LiveBadge entries={liveEntries} invisible={liveEntries.length === 0} />
       {!isEditing && (
         <button type="button" title="Rename"
           onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
@@ -1399,7 +1399,7 @@ export default function App() {
   // ─── YouTube preview warm — per-channel VOD limit ────────────────
   // mergeVodLists sorts vodVideos by created_at desc (newest first; see channelUtils.ts:157-160),
   // so slice(0, limit) reliably selects the most recent entries.
-  const YOUTUBE_WARM_VOD_LIMIT = 10;
+  const YOUTUBE_WARM_VOD_LIMIT = 5;
 
   // Warm YouTube extract cache while user reads the page (no UI update until Extract Info).
   useEffect(() => {
@@ -1425,6 +1425,7 @@ export default function App() {
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube' && isPublicVideo(v)
         && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
+      .filter((v) => !warmedUrlsRef.current.has(buildVodUrl(v)))
       .slice(0, YOUTUBE_WARM_VOD_LIMIT)
       .map((v) => buildVodUrl(v));
     warmYoutubePreviewBatch(youtubeUrls);
@@ -4213,6 +4214,8 @@ export default function App() {
     setTrimEndSec(14400);
     setPreviewMetaDurationSec(14400);
     previewStartedRef.current = true;
+    destroyPreviewPlayer();
+    setVideoInfo(null);
     try {
       const res = await apiPost<{
         session_id: string;

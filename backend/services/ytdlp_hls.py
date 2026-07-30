@@ -402,6 +402,10 @@ def youtube_preview_ytdl_opts(
 
     opts: dict = {
         "extractor_args": extractor_args,
+        # Sleep between requests to YouTube to avoid burst detection / rate limits.
+        "sleep_interval": 0.5,  # base seconds
+        "sleep_interval_requests": 1,  # sleep every 1 request
+        "extractor_retries": 5,  # retry 5x on extractor errors with backoff
         "cachedir": str(cachedir or _get_cache_dir()),
         "_youtube_session": session,
         "socket_timeout": _YOUTUBE_PREVIEW_SOCKET_SEC,
@@ -1090,8 +1094,6 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     try:
         info = None
         if opts.get("_warm_light") and _youtube_url_from_opts(url, opts):
-            # Bulk warm: InnerTube only — never the process-wide yt-dlp lock,
-            # no retries. A failing video defers to the click's full chain.
             box["warm_light"] = True
             info = _try_innertube_info(
                 url,
@@ -1099,6 +1101,10 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 allow_session_refresh=False,
                 preview_fast=True,
             )
+            # ❌ intentionally no yt-dlp fallback — warm is best-effort
+            # innertube-only to avoid lock contention with user previews.
+            # _YTDLP_LOCK is held 2-3s per extract; 3 warm threads would
+            # serialize for 6-9s, blocking concurrent user clicks.
         elif _youtube_url_from_opts(url, opts):
             if opts.get("_preview_fast"):
                 info = _youtube_extract_preview_with_retries(url, opts)

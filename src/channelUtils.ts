@@ -552,12 +552,12 @@ export function parseChannelInput(raw: string): {
   if (lower.includes('kick.com')) {
     const m = trimmed.match(/kick\.com\/([^/?#]+)/i);
     const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: slug };
+    return { displayName: slug, kickSlug: slug, twitchSlug: '', youtubeSlug: '' };
   }
   if (lower.includes('twitch.tv')) {
     const m = trimmed.match(/twitch\.tv\/([^/?#]+)/i);
     const slug = m?.[1] || trimmed;
-    return { displayName: slug, kickSlug: slug, twitchSlug: slug, youtubeSlug: slug };
+    return { displayName: slug, kickSlug: '', twitchSlug: slug, youtubeSlug: '' };
   }
   if (lower.includes('youtube.com') || lower.includes('youtu.be')) {
     const yt = youtubeSlugFromChannelUrl(trimmed);
