@@ -1101,15 +1101,10 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 allow_session_refresh=False,
                 preview_fast=True,
             )
-            if info is None:
-                # Innertube gated (429/403) — fall through to yt-dlp pipeline.
-                # This gives warm the benefit of yt-dlp's anti-bot (client rotation,
-                # cookie loading, po_token rotation, extractor retries).
-                # The _preview_fast flag is set in youtube_preview_ytdl_opts so
-                # _youtube_extract_preview_with_retries will race innertube + yt-dlp
-                # and use whichever succeeds first.
-                box["warm_light"] = False  # don't loop back to warm-only path
-                info = _youtube_extract_preview_with_retries(url, opts)
+            # ❌ intentionally no yt-dlp fallback — warm is best-effort
+            # innertube-only to avoid lock contention with user previews.
+            # _YTDLP_LOCK is held 2-3s per extract; 3 warm threads would
+            # serialize for 6-9s, blocking concurrent user clicks.
         elif _youtube_url_from_opts(url, opts):
             if opts.get("_preview_fast"):
                 info = _youtube_extract_preview_with_retries(url, opts)

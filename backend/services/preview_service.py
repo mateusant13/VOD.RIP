@@ -116,6 +116,7 @@ _CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
 _YOUTUBE_WARM_COOLDOWN_UNTIL: float = 0  # time.monotonic() threshold
 _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
 _PRINTED_COOLDOWN = False
+_YOUTUBE_WARM_RATE_LIMIT_LOCK = threading.Lock()
 _MAX_WARM_FAILURES = 3
 _WARM_COOLDOWN_SEC = 120  # 2 minutes
 
@@ -128,16 +129,17 @@ def _warm_rate_limit_check() -> bool:
 def _record_warm_failure() -> None:
     """Record a consecutive warm failure. If threshold reached, start cooldown."""
     global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN
-    _YOUTUBE_WARM_CONSECUTIVE_FAILURES += 1
-    if _YOUTUBE_WARM_CONSECUTIVE_FAILURES >= _MAX_WARM_FAILURES:
-        _YOUTUBE_WARM_COOLDOWN_UNTIL = time.monotonic() + _WARM_COOLDOWN_SEC
-        if not _PRINTED_COOLDOWN:
-            logger.warning(
-                "YouTube warm rate-limit circuit breaker activated: %d consecutive failures, "
-                "pausing warm for %ds",
-                _MAX_WARM_FAILURES, _WARM_COOLDOWN_SEC)
-            _PRINTED_COOLDOWN = True
-        _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
+    with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
+        _YOUTUBE_WARM_CONSECUTIVE_FAILURES += 1
+        if _YOUTUBE_WARM_CONSECUTIVE_FAILURES >= _MAX_WARM_FAILURES:
+            _YOUTUBE_WARM_COOLDOWN_UNTIL = time.monotonic() + _WARM_COOLDOWN_SEC
+            if not _PRINTED_COOLDOWN:
+                logger.warning(
+                    "YouTube warm rate-limit circuit breaker activated: %d consecutive failures, "
+                    "pausing warm for %ds",
+                    _MAX_WARM_FAILURES, _WARM_COOLDOWN_SEC)
+                _PRINTED_COOLDOWN = True
+            _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
 
 # ponytail: latest URL the user is actively previewing. Warm jobs check this
 # before doing heavy work and bail out cheaply if they're no longer relevant.
@@ -3397,8 +3399,9 @@ def kickoff_youtube_batch_warm(
                 url, oauth=oauth, prefer_height=prefer_height,
                 channel_key=channel_key,
             )
-            _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0  # reset on success
-            _PRINTED_COOLDOWN = False
+            with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
+                _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
+                _PRINTED_COOLDOWN = False
         except Exception as exc:
             logger.debug("Warm failed for %s: %s", url, exc)
             _record_warm_failure()

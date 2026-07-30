@@ -80,6 +80,7 @@ export function warmYoutubePreview(url: string, delayMs = 0): void {
     if (_warmInflight.has(trimmed)) return;
     _warmInflight.add(trimmed);
     void apiPost<{ warmed?: boolean }>('/api/preview/warm', { url: trimmed })
+      .then(() => { _warmCache.set(trimmed, Date.now()); })
       .catch(() => {})
       .finally(() => { _warmInflight.delete(trimmed); });
   };
@@ -137,7 +138,7 @@ export function cancelWarmYoutubePreviewFull(url: string): void {
  *  ponytail: cap at 3 to avoid stampeding INFO_EXECUTOR when many YouTube rows
  *  are visible — the actual preview create needs the executor for its own
  *  yt-dlp probe and would otherwise queue behind the warm jobs. */
-export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 500): void {
+export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 0): void {
   const now = Date.now();
   urls = urls.filter(u => !_warmCache.has(u) || now - _warmCache.get(u)! > _WARM_CACHE_TTL_MS);
   if (urls.length === 0) return;
