@@ -167,6 +167,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 
         ydl_opts = {
+            "format": "bestvideo+bestaudio/best",
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
@@ -810,7 +811,9 @@ def _build_ydl_opts(
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ]
         opts["postprocessor_args"] = {"ffmpeg": encode_args}
-    # ponytail: YouTube auto/copy — merge_output_format mp4 only (no re-encode pass)
+    # Default format when no explicit quality is set
+    if "format" not in opts:
+        opts["format"] = "bestvideo+bestaudio/best"
 
     if pp_state is not None:
         # Populate the state dict the manager will poll. The total
@@ -1039,6 +1042,7 @@ def download_video_sync(
         else:
             from services.ytdlp_ffmpeg import _ytdlp_engine_opts
             with guarded_youtube_dl({
+                "format": "bestvideo+bestaudio/best",
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,

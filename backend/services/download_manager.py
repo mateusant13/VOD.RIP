@@ -504,7 +504,7 @@ class DownloadManager:
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             # ponytail: bare except for catastrophic shutdown
-            except:
+            except Exception:
                 import sys
                 _exc_type, _exc_val, _exc_tb = sys.exc_info()
                 logger.exception(
