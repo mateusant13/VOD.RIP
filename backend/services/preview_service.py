@@ -494,6 +494,15 @@ class PreviewManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sessions: Dict[str, "PreviewSession"] = {}
+        self._last_cleanup_time = 0.0
+        self._cleanup_interval = 60  # seconds
+
+    def _maybe_cleanup(self) -> None:
+        """Run stale session cleanup at most once per interval."""
+        now = time.monotonic()
+        if now - self._last_cleanup_time >= self._cleanup_interval:
+            self._last_cleanup_time = now
+            self._cleanup_stale_sessions()
 
     def _cleanup_stale_sessions(
         self,
@@ -532,6 +541,7 @@ class PreviewManager:
             pass
 
     def delete_session(self, session_id: str) -> bool:
+        self._maybe_cleanup()
         # ponytail: mark closed + schedule the actual wipe after the grace
         # window so in-flight byte requests from the browser still hit the
         # proxy and don't 404.
@@ -554,6 +564,7 @@ class PreviewManager:
         return True
 
     def get_session(self, session_id: str) -> Optional[PreviewSession]:
+        self._maybe_cleanup()
         with self._lock:
             session = self._sessions.get(session_id)
         if session:
