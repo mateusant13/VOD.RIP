@@ -112,12 +112,15 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
         const video = videoRef.current;
         if (!video) { setLoading(false); return; }
 
-        if (res.playback_url) {
+        const src = res.master_url || res.playback_url;
+        // Live sessions return playback_url == master_url (both .m3u8) — decide by kind, not presence.
+        const isHls = res.kind === 'hls' || !!src && src.includes('.m3u8');
+        if (src && !isHls) {
           // Progressive stream
-          video.src = res.playback_url;
+          video.src = src;
           video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
           video.play().catch(() => {});
-        } else if (res.master_url) {
+        } else if (src) {
           // HLS stream — use hls.js if available, else native HLS
           try {
             const Hls = (await import('hls.js')).default;
@@ -125,7 +128,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
             if (Hls.isSupported()) {
               const hls = new Hls();
               hlsRef.current = hls;
-              hls.loadSource(res.master_url);
+              hls.loadSource(src);
               hls.attachMedia(video);
 
               hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -145,7 +148,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
                 setCurrentLevel(data.level);
               });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-              video.src = res.master_url;
+              video.src = src;
               video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
               video.play().catch(() => {});
             } else {
@@ -155,7 +158,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
           } catch {
             // hls.js failed to load, try native HLS
             if (video.canPlayType('application/vnd.apple.mpegurl')) {
-              video.src = res.master_url!;
+              video.src = src;
               video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
               video.play().catch(() => {});
             } else {
