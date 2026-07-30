@@ -11,6 +11,7 @@ import {
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
+import { LivePlayerPopup } from './components/LivePlayerPopup';
 import { LiveBadge } from './components/LiveBadge';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
@@ -644,6 +645,7 @@ export default function App() {
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const [isLive, setIsLive] = useState(false);
+  const [livePopupEntry, setLivePopupEntry] = useState<{ entry: ChannelLiveStatus['live'][number]; channelName: string } | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
   const channelsSaveTimerRef = useRef<number | null>(null);
@@ -4197,71 +4199,11 @@ export default function App() {
   // and those extractors can't resolve them. Trim/download still work because
   // the session is a regular PreviewSession (kind=hls) proxied via the same
   // /api/preview/hls/{sid}/master.m3u8 endpoint.
-  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number]): Promise<void> => {
+  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], channelName?: string): Promise<void> => {
     if (!entry?.url) return;
-    previewGenRef.current += 1;
-    setIsLive(true);
-    previewIsLiveRef.current = true;
-    setPreviewOpen(true);
-    setError(null);
-    setPreviewYoutubeEmbedUrl(null);
-    const url = entry.url;
-    const platformName = entry.platform || 'YouTube';
-    setUrl(url);
-    previewLoadedUrlRef.current = url;
-    trimStartSecRef.current = 0;
-    trimEndSecRef.current = 14400;
-    setTrimStartSec(0);
-    setTrimEndSec(14400);
-    setPreviewMetaDurationSec(14400);
-    previewStartedRef.current = true;
-    destroyPreviewPlayer();
-    setVideoInfo(null);
-    try {
-      const res = await apiPost<{
-        session_id: string;
-        master_url: string;
-        playback_url: string;
-        kind: 'hls' | 'progressive';
-        variant_heights: number[];
-        quality_labels: string[];
-        active_height: number;
-        duration_sec: number;
-      }>('/api/preview/live', {
-        url,
-        platform: platformName,
-        headers: entry.headers ?? {},
-        title: entry.title,
-      });
-      previewSessionIdRef.current = res.session_id;
-      setPreviewSessionId(res.session_id);
-      previewTrimTimelineRef.current = false;
-      previewWindowHlsMuxStartRef.current = 0;
-      previewWindowHlsMuxEndRef.current = 0;
-      previewCachedProgressiveRef.current = false;
-      previewSessionMetaRef.current = {
-        variantHeights: res.variant_heights ?? [],
-        qualityLabels: res.quality_labels ?? [],
-        activeHeight: res.active_height ?? 0,
-      };
-      setPreviewPlayback({
-        url: res.playback_url,
-        kind: res.kind ?? 'hls',
-        variantHeights: res.variant_heights ?? [],
-        qualityLabels: res.quality_labels ?? [],
-        activeHeight: res.active_height ?? 0,
-      });
-      setPreviewVideoLoading(false);
-      console.info('[VOD.RIP preview] live session', res.session_id, platformName);
-    } catch (err) {
-      previewStartedRef.current = false;
-      previewLoadedUrlRef.current = null;
-      const msg = err instanceof Error ? err.message : 'Live preview failed';
-      setError(msg);
-      setPreviewOpen(false);
-      setPreviewVideoLoading(false);
-    }
-  }, [setUrl, setError]);
+    const name = channelName || entry.platform || 'Live';
+    setLivePopupEntry({ entry, channelName: name });
+  }, []);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
@@ -5735,7 +5677,7 @@ export default function App() {
                             <div
                               role="button"
                               tabIndex={0}
-                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry)}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
@@ -6003,6 +5945,13 @@ export default function App() {
         TWITCH
       </div>
 
+      {livePopupEntry && (
+        <LivePlayerPopup
+          entry={livePopupEntry.entry}
+          channelName={livePopupEntry.channelName}
+          onClose={() => setLivePopupEntry(null)}
+        />
+      )}
       <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
       <DownloadConfirmDialog
         open={downloadConfirmOpen}
