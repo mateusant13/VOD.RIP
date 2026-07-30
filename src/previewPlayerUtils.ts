@@ -7,6 +7,30 @@ import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './typ
 const _warmCache = new Map<string, number>();
 const _WARM_CACHE_TTL_MS = 120_000; // 2 min
 
+// Rehydrate from localStorage so restarts reuse recent warms.
+(function _initWarmCache() {
+  try {
+    const raw = localStorage.getItem('warmCache');
+    if (raw) {
+      const obj = JSON.parse(raw);
+      const now = Date.now();
+      for (const [k, v] of Object.entries(obj)) {
+        if (typeof v === 'number' && now - v < _WARM_CACHE_TTL_MS) {
+          _warmCache.set(k, v);
+        }
+      }
+    }
+  } catch { /* localStorage unavailable or corrupted */ }
+})();
+
+function _persistWarmCache(): void {
+  try {
+    const obj: Record<string, number> = {};
+    _warmCache.forEach((v, k) => { obj[k] = v; });
+    localStorage.setItem('warmCache', JSON.stringify(obj));
+  } catch { /* quota exceeded or blocked */ }
+}
+
 /** Permanent-failure messages — retrying these can never succeed. */
 const _PREVIEW_CREATE_FATAL_RE = /members-only|membership|unavailable|private|removed/i;
 const _PREVIEW_CREATE_RETRIES = 2;
@@ -80,7 +104,7 @@ export function warmYoutubePreview(url: string, delayMs = 0): void {
     if (_warmInflight.has(trimmed)) return;
     _warmInflight.add(trimmed);
     void apiPost<{ warmed?: boolean }>('/api/preview/warm', { url: trimmed })
-      .then(() => { _warmCache.set(trimmed, Date.now()); })
+      .then(() => { _warmCache.set(trimmed, Date.now()); _persistWarmCache(); })
       .catch(() => {})
       .finally(() => { _warmInflight.delete(trimmed); });
   };
@@ -160,6 +184,7 @@ export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 0):
       body,
     }).catch(() => {});
     trimmed.forEach(u => _warmCache.set(u, Date.now()));
+    _persistWarmCache();
   };
 
   if (staggerMs > 0) {
@@ -168,7 +193,7 @@ export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 0):
     doFetch();
   }
   // ponytail: if cache exceeds 1000 entries, clear entirely (worst case: a few redundant POSTs)
-  if (_warmCache.size > 1000) _warmCache.clear();
+  if (_warmCache.size > 1000) { _warmCache.clear(); _persistWarmCache(); }
 }
 
 /** Warm YouTube rows as they scroll into the channel list viewport. */
