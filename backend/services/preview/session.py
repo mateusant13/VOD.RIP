@@ -28,6 +28,7 @@ from services.ytdlp_service import (
 from services.ytdlp_hls import _youtube_soft_neg_error
 # session.py — Preview sessions
 logger = logging.getLogger(__name__)
+
 from services.preview.warm import (
     _warm_rate_limit_check, _record_warm_failure,
     _put_resolved_stream_cache, _get_resolved_stream_cached,
@@ -69,15 +70,34 @@ WINDOW_HLS_PLAYLIST_RESOURCE = "window-playlist"
 WINDOW_HLS_SEGMENT_RESOURCE_PREFIX = "window-seg-"
 WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
-_RESOLVED_STREAM_CACHE: Dict[str, Tuple[float, Tuple]] = {}
-_SESSION_SNAPSHOT: Dict[Tuple[str, int], Tuple[float, dict]] = {}
-_WARMED_URLS: set = set()
-_YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
-_YOUTUBE_WARM_CACHE: dict[str, Any] = {}
-_CHANNEL_WARM_SLOTS: dict[str, list[str]] = {}
-_YOUTUBE_WARM_COOLDOWN_UNTIL: float = 0  # time.monotonic() threshold
-_ACTIVE_YOUTUBE_PREVIEW_KEY: Optional[str] = None
-_PREFLIGHT_MUX_INFLIGHT: Dict[str, threading.Event] = {}
+from services.preview._state import (
+    _ACTIVE_YOUTUBE_PREVIEW_KEY,
+    _CHANNEL_WARM_SLOTS,
+    _PREFLIGHT_MUX_INFLIGHT,
+    _RESOLVED_STREAM_CACHE,
+    _SESSION_SNAPSHOT,
+    _WARMED_URLS,
+    _YOUTUBE_WARM_CACHE,
+    _YOUTUBE_WARM_COOLDOWN_UNTIL,
+    _YOUTUBE_WARM_INFLIGHT,
+    _YOUTUBE_WARM_LOCK,
+)
+# Import shared functions and executors from warm module
+from services.preview.warm import (
+    _ANON_PROBE_EXECUTOR,
+    _ANON_PROBE_HEAD_START_SEC,
+    _await_youtube_warm_catchup,
+    _FULL_WARM_BACKOFF_SEC,
+    _get_resolved_stream_cached,
+    _get_session_snapshot,
+    _invalidate_youtube_resolve_caches,
+    _put_resolved_stream_cache,
+    _resolve_and_cache_youtube_snapshot,
+    _try_adopt_preflight_mux,
+    _warm_bot_gate_pause_until,
+    _youtube_warm_inflight_key,
+    await_youtube_warm_if_pending,
+)
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
 _UPSTREAM_CHUNK_BYTES = 64 * 1024
@@ -3801,6 +3821,7 @@ def _resolve_preview_entry(
     session: PreviewSession, entry_url: str, prefer_height: int = 720
 ) -> str:
     """Follow master playlist to a single media playlist for prewarm."""
+    from services.preview.hls import _http_get_bytes
     if session.variant_entries:
         picked = _pick_variant_by_height(session.variant_entries, prefer_height)
         if picked:
@@ -4019,6 +4040,7 @@ def _warm_and_prewarm_session(session_id: str, crop_start: float) -> None:
         logger.warning("Warm/prewarm failed session=%s: %s", session_id[:8], exc)
 def _prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache rewritten playlist + segments near trim start."""
+    from services.preview.hls import _http_get_bytes
     try:
         session = get_session(session_id)
         if not session or session.custom_master:

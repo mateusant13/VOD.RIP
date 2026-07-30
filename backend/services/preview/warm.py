@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
+logger = logging.getLogger(__name__)
+
 from services.ytdlp_service import (
     MIN_VALID_OUTPUT_BYTES,
     _build_ydl_opts,
@@ -25,21 +27,34 @@ from services.ytdlp_service import (
     is_clip_url,
 )
 from services.ytdlp_hls import _youtube_soft_neg_error
-_RESOLVED_STREAM_TTL_SEC = 3600
-_RESOLVED_STREAM_MAX = 256
-_RESOLVED_STREAM_LOCK = threading.Lock()
-_SESSION_SNAPSHOT_TTL_SEC = _RESOLVED_STREAM_TTL_SEC
-_SESSION_SNAPSHOT_MAX = 256
-_SESSION_SNAPSHOT_LOCK = threading.Lock()
-_WARMED_URLS_LOCK = threading.Lock()
-_YOUTUBE_WARM_LOCK = threading.Lock()
-_YOUTUBE_WARM_CACHE_LOCK = threading.Lock()
-_CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
-_YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
-_PRINTED_COOLDOWN = False
-_YOUTUBE_WARM_RATE_LIMIT_LOCK = threading.Lock()
-_MAX_WARM_FAILURES = 3
-_WARM_COOLDOWN_SEC = 120  # 2 minutes
+
+from services.preview._state import (
+    _ACTIVE_YOUTUBE_PREVIEW_LOCK,
+    _CHANNEL_WARM_SLOTS_LOCK,
+    _MAX_WARM_FAILURES,
+    _PREFLIGHT_MUX_LOCK,
+    _PRINTED_COOLDOWN,
+    _RESOLVED_STREAM_CACHE,
+    _RESOLVED_STREAM_LOCK,
+    _RESOLVED_STREAM_MAX,
+    _RESOLVED_STREAM_TTL_SEC,
+    _SESSION_SNAPSHOT,
+    _SESSION_SNAPSHOT_LOCK,
+    _SESSION_SNAPSHOT_MAX,
+    _SESSION_SNAPSHOT_TTL_SEC,
+    _WARMED_URLS,
+    _WARMED_URLS_LOCK,
+    _WARM_COOLDOWN_SEC,
+    _YOUTUBE_WARM_CACHE,
+    _YOUTUBE_WARM_CACHE_LOCK,
+    _YOUTUBE_WARM_CONSECUTIVE_FAILURES,
+    _YOUTUBE_WARM_COOLDOWN_UNTIL,
+    _YOUTUBE_WARM_INFLIGHT,
+    _YOUTUBE_WARM_LOCK,
+    _YOUTUBE_WARM_RATE_LIMIT_LOCK,
+)
+
+
 def _warm_rate_limit_check() -> bool:
     """Return True if YouTube warm requests should be skipped (in cooldown)."""
     return time.monotonic() < _YOUTUBE_WARM_COOLDOWN_UNTIL
@@ -481,6 +496,7 @@ def _resolve_and_cache_youtube_snapshot(
     the snapshot is stored under the exact key create_session looks up.
     Returns (vid, height, snapshot_dict) or None on failure.
     """
+    from services.preview.session import resolve_stream_info
     t0 = time.monotonic()
     try:
         resolve_result = resolve_stream_info(

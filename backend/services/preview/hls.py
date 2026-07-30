@@ -25,6 +25,28 @@ from services.ytdlp_service import (
     is_clip_url,
 )
 from services.ytdlp_hls import _youtube_soft_neg_error
+
+from services.preview.session import (
+    MAX_SEGMENT_BYTES,
+    PLAYLIST_REWRITE_TTL_SEC,
+    PreviewSession,
+    StalePreviewUrls,
+    _AUTH_ERROR_CODES,
+    _MAX_REWRITTEN_PLAYLIST_BYTES,
+    _UPSTREAM_CHUNK_BYTES,
+    _UPSTREAM_CONNECT_TIMEOUT_SEC,
+    _bytes_response_for_range,
+    _fetch_and_rewrite_playlist_streaming,
+    _guess_content_type,
+    _host_allowed,
+    _is_playlist_url,
+    _playlist_cache,
+    _read_cache,
+    _request_headers,
+    _write_cache,
+    _youtube_refresh_and_remap,
+    get_session,
+)
 def _validate_proxy_url(url: str) -> bool:
     """Return True if the URL is safe to proxy (public host, not internal)."""
     parsed = urlparse(url)
