@@ -73,6 +73,7 @@ USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 from services.preview._state import (
     _ACTIVE_YOUTUBE_PREVIEW_KEY,
     _CHANNEL_WARM_SLOTS,
+    _full_warm_queued,
     _PREFLIGHT_MUX_INFLIGHT,
     _RESOLVED_STREAM_CACHE,
     _SESSION_SNAPSHOT,
@@ -3382,7 +3383,6 @@ def _formats_are_dash_https(formats: List[dict]) -> bool:
     return True
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-_full_warm_queued: Set[str] = set()
 def resolve_stream_info(
     url: str,
     oauth: Optional[str] = None,

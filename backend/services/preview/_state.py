@@ -61,3 +61,6 @@ _CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
 # --- Warm consecutive failure state ---
 _YOUTUBE_WARM_CONSECUTIVE_FAILURES: int = 0
 _PRINTED_COOLDOWN: bool = False
+
+# --- Full warm dedup set ---
+_full_warm_queued: set = set()

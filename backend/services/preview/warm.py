@@ -31,6 +31,7 @@ from services.ytdlp_hls import _youtube_soft_neg_error
 from services.preview._state import (
     _ACTIVE_YOUTUBE_PREVIEW_LOCK,
     _CHANNEL_WARM_SLOTS_LOCK,
+    _full_warm_queued,
     _MAX_WARM_FAILURES,
     _PREFLIGHT_MUX_LOCK,
     _PRINTED_COOLDOWN,
@@ -58,9 +59,43 @@ from services.preview._state import (
 def _warm_rate_limit_check() -> bool:
     """Return True if YouTube warm requests should be skipped (in cooldown)."""
     return time.monotonic() < _YOUTUBE_WARM_COOLDOWN_UNTIL
+
+
+# Track whether POT warm completed (resets circuit breaker)
+_pot_ready: bool = False
+
+
+def _maybe_reset_circuit_breaker() -> None:
+    """Once POT is ready, clear the circuit breaker so warm tries again."""
+    global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN, _pot_ready
+    if _pot_ready or not pot_minting_enabled():
+        return
+    try:
+        from services.youtube_pot_service import pot_service_ping
+        if pot_service_ping():
+            _pot_ready = True
+            with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
+                if _YOUTUBE_WARM_COOLDOWN_UNTIL > 0:
+                    _YOUTUBE_WARM_COOLDOWN_UNTIL = 0.0
+                    _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
+                    logger.info("YouTube warm circuit breaker reset -- POT ready")
+    except Exception:
+        pass
+
+
 def _record_warm_failure() -> None:
-    """Record a consecutive warm failure. If threshold reached, start cooldown."""
+    """Record a consecutive warm failure. If threshold reached, start cooldown.
+
+    Failures before POT ready are NOT counted — startup wave fires before POT
+    warm completes, and bot-gate errors during that window are expected.
+    Circuit breaker resets once POT becomes ready.
+    """
     global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN
+    _maybe_reset_circuit_breaker()
+    if _YOUTUBE_WARM_COOLDOWN_UNTIL > 0:
+        return  # already in cooldown — don't accumulate
+    if _YOUTUBE_WARM_CONSECUTIVE_FAILURES == 0 and not _pot_ready and pot_minting_enabled():
+        return  # POT not ready yet — don't count startup failures
     with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
         _YOUTUBE_WARM_CONSECUTIVE_FAILURES += 1
         if _YOUTUBE_WARM_CONSECUTIVE_FAILURES >= _MAX_WARM_FAILURES:
