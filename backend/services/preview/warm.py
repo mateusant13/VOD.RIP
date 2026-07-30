@@ -34,6 +34,7 @@ from services.preview._state import (
     _CHANNEL_WARM_SLOTS_LOCK,
     _full_warm_queued,
     _MAX_WARM_FAILURES,
+    _PREFLIGHT_MUX_INFLIGHT,
     _PREFLIGHT_MUX_LOCK,
     _PREVIEW_ROOT,
     _PRINTED_COOLDOWN,
@@ -69,8 +70,10 @@ _pot_ready: bool = False
 
 def _maybe_reset_circuit_breaker() -> None:
     """Once POT is ready, clear the circuit breaker so warm tries again."""
+    from services.youtube_auth import pot_minting_enabled as _pot_minting_enabled
+
     global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN, _pot_ready
-    if _pot_ready or not pot_minting_enabled():
+    if _pot_ready or not _pot_minting_enabled():
         return
     try:
         from services.youtube_pot_service import pot_service_ping
@@ -93,10 +96,12 @@ def _record_warm_failure() -> None:
     Circuit breaker resets once POT becomes ready.
     """
     global _YOUTUBE_WARM_CONSECUTIVE_FAILURES, _YOUTUBE_WARM_COOLDOWN_UNTIL, _PRINTED_COOLDOWN
+    from services.youtube_auth import pot_minting_enabled as _pot_minting_enabled
+
     _maybe_reset_circuit_breaker()
     if _YOUTUBE_WARM_COOLDOWN_UNTIL > 0:
         return  # already in cooldown — don't accumulate
-    if _YOUTUBE_WARM_CONSECUTIVE_FAILURES == 0 and not _pot_ready and pot_minting_enabled():
+    if _YOUTUBE_WARM_CONSECUTIVE_FAILURES == 0 and not _pot_ready and _pot_minting_enabled():
         return  # POT not ready yet — don't count startup failures
     with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
         _YOUTUBE_WARM_CONSECUTIVE_FAILURES += 1
@@ -118,6 +123,7 @@ def _preflight_seg0_ready(out_dir: Path) -> bool:
     return seg0.is_file() and seg0.stat().st_size >= MIN_VALID_OUTPUT_BYTES
 def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
     """Reuse paste-warm mux when crop starts at 0 and tier matches."""
+    from services.preview.session import _window_hls_dir, _window_hls_seg0_ready
     from services.youtube_innertube import extract_video_id
 
     if float(getattr(session, "window_hls_mux_start", 0.0)) > 0.01:
@@ -244,6 +250,7 @@ def _youtube_preflight_mux(
     from services.ytdlp_hls import _mux_dash_window_to_hls
     from services.preview.session import resolve_stream_info
     from services.preview.session import _resolve_youtube_preview_audio
+    from services.preview.session import _youtube_needs_dash_window_hls, _pick_variant_by_height, _merge_youtube_session_cookies, WINDOW_HLS_INITIAL_CHUNK_SEC
 
     vid = extract_video_id((url or "").strip())
     if not vid:

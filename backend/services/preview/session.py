@@ -82,6 +82,7 @@ from services.preview._state import (
     _YOUTUBE_WARM_COOLDOWN_UNTIL,
     _YOUTUBE_WARM_INFLIGHT,
     _YOUTUBE_WARM_LOCK,
+    _validate_proxy_url,
 )
 # Import shared functions and executors from warm module
 from services.preview.warm import (
@@ -791,6 +792,8 @@ class PreviewManager:
         platform: str,
     ) -> "PreviewSession":
         self._cleanup_stale_sessions()
+        from services.preview.hls import proxy_playlist
+
         url = (url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("Live preview requires an http(s) HLS URL")
@@ -1721,6 +1724,8 @@ def _finalize_youtube_session(session: PreviewSession, crop_start: float) -> Pre
     background full mux / window-HLS mux, prewarms the first segment,
     and emits the diagnostic log line."""
     session_id = session.session_id
+    from services.preview.hls import proxy_playlist
+
     if _youtube_entry_needs_mux(session):
         cached_full = _try_use_full_mux_cache(session)
         if cached_full:
@@ -4020,6 +4025,8 @@ def _write_cache(session: PreviewSession, url: str, data: bytes) -> None:
 def _warm_and_prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache playlists + segments near trim start (off session-create hot path)."""
     try:
+        from services.preview.hls import proxy_playlist
+
         session = get_session(session_id)
         if not session:
             return
@@ -4040,7 +4047,7 @@ def _warm_and_prewarm_session(session_id: str, crop_start: float) -> None:
         logger.warning("Warm/prewarm failed session=%s: %s", session_id[:8], exc)
 def _prewarm_session(session_id: str, crop_start: float) -> None:
     """Background: cache rewritten playlist + segments near trim start."""
-    from services.preview.hls import _http_get_bytes
+    from services.preview.hls import _http_get_bytes, proxy_segment
     try:
         session = get_session(session_id)
         if not session or session.custom_master:
@@ -4201,6 +4208,8 @@ def get_master_playlist(session_id: str) -> str:
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+    from services.preview.hls import proxy_playlist
+
     if session.custom_master:
         return session.custom_master
     body, _, _, _ = proxy_playlist(session_id, session.master_url)
