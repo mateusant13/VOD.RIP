@@ -1245,6 +1245,50 @@ def _extract_hls_info_quiet(url: str, opts: dict) -> Optional[dict]:
         return None
 
 
+def _try_twitch_subonly_bypass(url: str, opts: dict) -> Optional[dict]:
+    """Try cloudfront CDN bypass for Twitch sub-only VODs.
+
+    yt-dlp's Twitch extractor fails for subscriber-only VODs because the
+    persisted PlaybackAccessToken GQL query returns a null/invalid token.
+    This constructs a synthetic info dict from cloudfront CDN variant URLs
+    discovered via the ``seekPreviewsURL`` metadata trick (same approach as
+    the TwitchNoSub userscript).
+
+    Returns None if ``url`` is not a Twitch VOD or bypass is unnecessary.
+    """
+    m = re.match(r"https?://(?:www\.)?twitch\.tv/videos/(\d+)", url)
+    if not m:
+        return None
+    vod_id = m.group(1)
+    try:
+        from services.twitch_gql_service import get_vod_playback_sync
+
+        _master_url, _headers, variants = get_vod_playback_sync(vod_id)
+        if not variants:
+            return None
+        formats = []
+        for v in variants:
+            fmt = dict(v)
+            fmt["format_id"] = f"{v.get('height','?')}p{v.get('fps',30)}"
+            fmt["http_headers"] = dict(_headers) if _headers else {}
+            fmt["fps"] = v.get("fps", 30)
+            formats.append(fmt)
+        # Build a synthetic info dict matching yt-dlp's output shape
+        return {
+            "id": vod_id,
+            "title": f"Twitch VOD {vod_id}",
+            "formats": formats,
+            "http_headers": dict(_headers) if _headers else {},
+            "duration": None,
+            "extractor": "twitch:vod",
+            "webpage_url": url,
+            "protocol": "m3u8_native",
+        }
+    except Exception as exc:
+        logger.debug("Twitch bypass failed for %s: %s", url, exc)
+        return None
+
+
 def _extract_hls_info(url: str, opts: dict) -> dict:
     """Use yt-dlp to get HLS info without downloading, passing auth etc."""
     from services.ytdlp_ffmpeg import _ytdlp_engine_opts
@@ -1282,6 +1326,13 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         with ctx:
             with guarded_youtube_dl(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
+    except Exception as exc:
+        # Twitch sub-only VODs: yt-dlp can't extract, but our cloudfront CDN
+        # bypass can. Catch the failure and build a synthetic info dict.
+        _twitch_bypass = _try_twitch_subonly_bypass(url, opts)
+        if _twitch_bypass is not None:
+            return _twitch_bypass
+        raise
     finally:
         if not logger.isEnabledFor(logging.DEBUG):
             ytdlp_logger.setLevel(prev_level)

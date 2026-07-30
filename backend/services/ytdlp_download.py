@@ -175,8 +175,19 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             "cachedir": str(cache_dir),
             **_ytdlp_engine_opts(),
         }
-        with guarded_youtube_dl(ydl_opts) as ydl:
-            return ydl.extract_info(full_url, download=False)
+        try:
+            with guarded_youtube_dl(ydl_opts) as ydl:
+                return ydl.extract_info(full_url, download=False)
+        except Exception:
+            # Twitch sub-only VOD: yt-dlp can't extract (persisted GQL denied)
+            if full_url.startswith("https://www.twitch.tv/videos/"):
+                import re
+                from services.ytdlp_hls import _try_twitch_subonly_bypass
+
+                bypass = _try_twitch_subonly_bypass(full_url, ydl_opts)
+                if bypass is not None:
+                    return bypass
+            raise
 
     loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, _extract)

@@ -14,6 +14,22 @@ from urllib.parse import urlencode, urljoin
 logger = logging.getLogger(__name__)
 
 TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+
+_RESOLUTION_CANDIDATES = [
+    ("chunked", 1080, 60, 9_000_000),
+    ("1440p60", 1440, 60, 10_000_000),
+    ("1080p60", 1080, 60, 6_000_000),
+    ("720p60", 720, 60, 3_000_000),
+    ("480p30", 480, 30, 600_000),
+    ("360p30", 360, 30, 400_000),
+    ("160p30", 160, 30, 200_000),
+]
+'''Pre-defined Twitch quality tiers from highest to lowest.  Source-quality
+"chunked" is tried first; only resolutions that respond 200 are included.
+Bandwidth values are sensible estimates; the variant playlist itself carries
+actual BANDWIDTH when fetched.  (ponytail: no realtime m3u8 parse for
+bandwidth — probes are cheap enough.)
+'''
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 
 CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9eba8f91d88"
@@ -77,6 +93,19 @@ query VideoMetadata($id: ID!) {
     }
     owner {
       displayName
+      login
+    }
+  }
+}
+"""
+
+VOD_META_QUERY = """
+query SubOnlyVideoMeta($id: ID!) {
+  video(id: $id) {
+    broadcastType
+    createdAt
+    seekPreviewsURL
+    owner {
       login
     }
   }
@@ -320,6 +349,113 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
     return out
 
 
+def _get_vod_meta_sync(vod_id: str) -> dict:
+    """Fetch video metadata needed for cloudfront CDN bypass.
+
+    Twitch answers this inline (non-persisted) query even for sub-only VODs.
+    Returns the ``video`` dict (or raises).
+    """
+    data = _gql_request(
+        VOD_META_QUERY,
+        {"id": vod_id},
+    )
+    video = (data or {}).get("video") or {}
+    if not video.get("seekPreviewsURL"):
+        raise RuntimeError(f"VOD {vod_id} has no seekPreviewsURL")
+    return video
+
+
+def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str, Any]]:
+    """Probe cloudfront CDN for working VOD variant playlists.
+
+    Mirror of the TwitchNoSub userscript approach — no access token needed.
+    Uses ``seekPreviewsURL`` metadata to reconstruct CDN paths, then probes
+    each quality tier.  Only responsive URLs are returned.
+
+    Returns the same format as ``_parse_hls_master_variants``:
+    ``[{url, height, width, tbr, fps, protocol, vcodec, acodec, ext}, ...]``.
+    """
+    seek_url = video_data.get("seekPreviewsURL", "")
+    m = re.match(r"(https?://[^/]+)/([^/]+)/storyboards/", seek_url)
+    if not m:
+        raise RuntimeError(f"Cannot parse seekPreviewsURL: {seek_url}")
+    domain = m.group(1)
+    vod_special_id = m.group(2)
+    broadcast_type = (video_data.get("broadcastType") or "").upper()
+    owner = video_data.get("owner") or {}
+    channel_login = (owner.get("login") or "").lower()
+    created_at = video_data.get("createdAt") or ""
+
+    is_highlight = broadcast_type == "HIGHLIGHT"
+    is_upload = broadcast_type == "UPLOAD"
+
+    def _variant_url(res_key: str) -> str:
+        if is_highlight:
+            return f"{domain}/{vod_special_id}/{res_key}/highlight-{vod_id}.m3u8"
+        return f"{domain}/{vod_special_id}/{res_key}/index-dvr.m3u8"
+
+    variants: List[Dict[str, Any]] = []
+    for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES:
+        url = _variant_url(res_key)
+        try:
+            req = urllib.request.Request(url, headers={
+                "Referer": "https://www.twitch.tv/",
+                "Origin": "https://www.twitch.tv",
+            })
+            with urllib.request.urlopen(req, timeout=10) as r:
+                body = r.read(65536)
+            if r.status != 200 or not body:
+                continue
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            continue
+
+        variants.append({
+            "url": url,
+            "height": height,
+            "width": int(height * 16 / 9) if height else 0,
+            "tbr": tbr,
+            "fps": fps,
+            "protocol": "m3u8_native",
+            "vcodec": "h264",
+            "acodec": "mp4a.40.2",
+            "ext": "mp4",
+        })
+        # Keep probing — user benefits from quality selection
+
+    if not variants:
+        # Try the upload-non-partner path (needs channel_login + vod_id)
+        if channel_login and not is_highlight:
+            for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES:
+                url = f"{domain}/{channel_login}/{vod_id}/{vod_special_id}/{res_key}/index-dvr.m3u8"
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "Referer": "https://www.twitch.tv/",
+                        "Origin": "https://www.twitch.tv",
+                    })
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        body = r.read(65536)
+                    if r.status != 200 or not body:
+                        continue
+                except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+                    continue
+                variants.append({
+                    "url": url,
+                    "height": height,
+                    "width": int(height * 16 / 9) if height else 0,
+                    "tbr": tbr,
+                    "fps": fps,
+                    "protocol": "m3u8_native",
+                    "vcodec": "h264",
+                    "acodec": "mp4a.40.2",
+                    "ext": "mp4",
+                })
+
+    if not variants:
+        raise RuntimeError(f"No cloudfront variant responded for VOD {vod_id}")
+
+    return variants
+
+
 def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any]]]:
     """Fast Twitch VOD playback URL via GQL + Usher (no yt-dlp).
 
@@ -344,41 +480,50 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
     token_node = data.get("videoPlaybackAccessToken") or data.get("playbackAccessToken") or {}
     sig = token_node.get("signature")
     token = token_node.get("value")
-    if not sig or not token:
-        raise RuntimeError(f"Twitch VOD access token missing: {vid}")
 
-    query = urlencode({
-        "allow_source": "true",
-        "allow_audio_only": "true",
-        "playlist_include_framerate": "true",
-        "supported_codecs": "h264",
-        "platform": "web",
-        "p": str(random.randint(1_000_000, 9_999_999)),
-        "nauth": token,
-        "nauthsig": sig,
-    })
-    master_url = f"https://usher.ttvnw.net/vod/v2/{vid}.m3u8?{query}"
+    if sig and token:
+        query = urlencode({
+            "allow_source": "true",
+            "allow_audio_only": "true",
+            "playlist_include_framerate": "true",
+            "supported_codecs": "h264",
+            "platform": "web",
+            "p": str(random.randint(1_000_000, 9_999_999)),
+            "nauth": token,
+            "nauthsig": sig,
+        })
+        master_url = f"https://usher.ttvnw.net/vod/v2/{vid}.m3u8?{query}"
 
-    headers: dict = {
+        headers: dict = {
+            "Referer": "https://www.twitch.tv/",
+            "Origin": "https://www.twitch.tv",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        try:
+            req = urllib.request.Request(master_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                master_text = resp.read().decode("utf-8", errors="replace")
+            variants = _parse_hls_master_variants(master_url, master_text)
+            return master_url, headers, variants
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            logger.info("Usher fetch failed for %s — trying cloudfront bypass", vid)
+
+    logger.info("Trying cloudfront CDN bypass for VOD %s", vid)
+    video_data = _get_vod_meta_sync(vid)
+    cf_variants = _resolve_cloudfront_variants(vid, video_data)
+    if not cf_variants:
+        raise RuntimeError(f"No playable variants for VOD {vid}")
+    cf_headers: dict = {
         "Referer": "https://www.twitch.tv/",
         "Origin": "https://www.twitch.tv",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
     }
-    req = urllib.request.Request(master_url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            master_text = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:200]
-        raise RuntimeError(f"Twitch VOD master fetch failed: HTTP {e.code}: {detail}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Twitch VOD master fetch failed: {e}") from e
-
-    variants = _parse_hls_master_variants(master_url, master_text)
-    return master_url, headers, variants
+    # Use the highest quality variant as the "master" URL placeholder.
+    # The synthetic master playlist later built by the caller uses
+    # absolute variant URLs, so the base is irrelevant.
+    return cf_variants[0]["url"], cf_headers, cf_variants
 
 
 def _extract_video_id(url_or_id: str) -> Optional[str]:
