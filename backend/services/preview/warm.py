@@ -145,6 +145,7 @@ def kickoff_youtube_preflight_mux(
     prefer_height: int = 720,
 ) -> None:
     """Background mux of the initial window chunk — adopted on create_session."""
+    from services.preview.session import _window_hls_dir, _window_hls_seg0_ready
     from services.youtube_innertube import extract_video_id
 
     vid = extract_video_id((url or "").strip())
@@ -239,6 +240,7 @@ def _youtube_preflight_mux(
     from services.youtube_innertube import extract_video_id
     from services.ytdlp_hls import _mux_dash_window_to_hls
     from services.preview.session import resolve_stream_info
+    from services.preview.session import _resolve_youtube_preview_audio
 
     vid = extract_video_id((url or "").strip())
     if not vid:
@@ -316,6 +318,9 @@ def _build_youtube_session_snapshot(
     Returns ``None`` when the resolve result is unusable (e.g. Twitch clip
     that took a different code path — caller's job to detect via platform).
     """
+    from services.preview.session import _init_window_hls_mux_bounds, _resolve_preview_entry, _stash_youtube_preview_formats, _youtube_muxed_progressive_for_long_explore
+    from services.preview.session import _youtube_needs_dash_window_hls
+    from services.preview.session import _resolve_youtube_preview_audio
     raw_entry, headers, platform, variant_formats, kind, yt_info = resolve_result
     if platform != "YouTube":
         return None
@@ -674,6 +679,7 @@ def kickoff_youtube_full_mux_warm(
         return
 
     def _run() -> None:
+        from services.preview.session import _resolve_youtube_preview_audio
         global _warm_bot_gate_pause_until
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
@@ -824,6 +830,7 @@ def warm_youtube_preview_resolve(
     Also prebuilds the session snapshot so the click path skips the ~5s
     extract + variant-build work on a warm hit.
     """
+    from services.preview.session import kickoff_youtube_prog_head_warm
     from services.preview.session import resolve_stream_info
     try:
         resolve_result = resolve_stream_info(
@@ -881,6 +888,7 @@ def warm_youtube_resolve_only(
     on the backend side too.
     """
     from services.preview.session import resolve_stream_info
+    from services.preview.session import kickoff_youtube_prog_head_warm
     try:
         resolve_result = resolve_stream_info(
             url, oauth=oauth, prefer_height=prefer_height, warm_light=True
