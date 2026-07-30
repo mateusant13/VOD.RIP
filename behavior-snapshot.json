@@ -1,0 +1,18 @@
+{
+  "DELETE /api/download/nonexistent-download-id": "97d7e63ff6bd400a4763b4e7669990d2b908f316a37fced39d6f3738038be840",
+  "DELETE /api/preview/session/nonexistent-session-id": "1cf54d5ad506674963e084161997495b2bdf88d60c5363bd86adf014d2a6b815",
+  "GET /api/app/version": "4a0a28a8b5924d3f43025a1995eb826cfd93c7bc71a4bd8121c2d3a28e5ea6ea",
+  "GET /api/channel/clips": "1328a4ca6efd14752ef7a0540748ff7b1930c17b22be6cf78944345fc96264b9",
+  "GET /api/channels": "f373d98c46509e1e3ab042246dd7dc057d9d7a67cc2797f73e7083c466dfab17",
+  "GET /api/download/nonexistent-download-id": "97d7e63ff6bd400a4763b4e7669990d2b908f316a37fced39d6f3738038be840",
+  "GET /api/downloads": "b86d741e896d9bda6858fb84b2b3760d7a3332e5acf4c25a99b7b9c07042b517",
+  "GET /api/preview/session/nonexistent-session-id/master.m3u8": "f373d98c46509e1e3ab042246dd7dc057d9d7a67cc2797f73e7083c466dfab17",
+  "GET /api/preview/session/nonexistent-session-id/status": "b6135da0362c834dd7b737db980ea11481005332b9a107dbcf0f972257a93c64",
+  "GET /api/preview/session/nonexistent-session-id/stream.mp4": "f373d98c46509e1e3ab042246dd7dc057d9d7a67cc2797f73e7083c466dfab17",
+  "POST /api/preview/invalidate": "69a35cdcf79e40d1bc8f3e6c1f9c00f227ebfd89df95fad7449875ce86f2825e",
+  "POST /api/preview/live": "5da781abdda15f8a006dcebfa7f2c4aacc4989e75428898ab5c284168a839747",
+  "POST /api/preview/session": "780944125b58c7e3e1ab1e47edbe8dbefeaa95f9e19b3aa23d885aad41033fb2",
+  "POST /api/preview/session/nonexistent-session-id/quality": "d8ef3dba5f4cb0e7e9de43348639539d56e334c7e27be10e4a80eb05512f9d8e",
+  "POST /api/preview/warm": "e46b32d9c6dbc2bbf382b322cc90140956f13baaf72815f1be0ed0210c91820b",
+  "POST /api/preview/warm/batch": "b8179950dd8c74a1e09caa8ff4b7d39387c7046e42019ddde0d1cb7b0699b608"
+}
