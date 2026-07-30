@@ -3,6 +3,10 @@ import { apiPost } from './hooks/useApiClient';
 import { detectUrlPlatform, isClipUrl } from './channelUtils';
 import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './types';
 
+/** Warm response cache — skip recently-warmed URLs to avoid redundant POSTs. */
+const _warmCache = new Map<string, number>();
+const _WARM_CACHE_TTL_MS = 120_000; // 2 min
+
 /** Permanent-failure messages — retrying these can never succeed. */
 const _PREVIEW_CREATE_FATAL_RE = /members-only|membership|unavailable|private|removed/i;
 const _PREVIEW_CREATE_RETRIES = 2;
@@ -134,6 +138,11 @@ export function cancelWarmYoutubePreviewFull(url: string): void {
  *  are visible — the actual preview create needs the executor for its own
  *  yt-dlp probe and would otherwise queue behind the warm jobs. */
 export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 80): void {
+  // Skip recently-warmed URLs
+  const now = Date.now();
+  urls = urls.filter(u => !_warmCache.has(u) || now - _warmCache.get(u)! > _WARM_CACHE_TTL_MS);
+  if (urls.length === 0) return;
+
   let n = 0;
   for (const raw of urls) {
     if (n >= max) break;
@@ -142,6 +151,10 @@ export function warmYoutubePreviewBatch(urls: string[], max = 6, staggerMs = 80)
     warmYoutubePreview(trimmed, n * staggerMs);
     n += 1;
   }
+  // Mark all passed URLs as recently-warmed
+  for (const u of urls) _warmCache.set(u, Date.now());
+  // ponytail: if cache exceeds 1000 entries, clear entirely (worst case: a few redundant POSTs)
+  if (_warmCache.size > 1000) _warmCache.clear();
 }
 
 /** Warm YouTube rows as they scroll into the channel list viewport. */

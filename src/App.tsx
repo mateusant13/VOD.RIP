@@ -1266,7 +1266,7 @@ export default function App() {
   // ─── YouTube preview warm — per-channel VOD limit ────────────────
   // mergeVodLists sorts vodVideos by created_at desc (newest first; see channelUtils.ts:157-160),
   // so slice(0, limit) reliably selects the most recent entries.
-  const YOUTUBE_WARM_VOD_LIMIT = 10;
+  const YOUTUBE_WARM_VOD_LIMIT = 5;
 
   // Warm YouTube extract cache while user reads the page (no UI update until Extract Info).
   useEffect(() => {
@@ -1292,6 +1292,7 @@ export default function App() {
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube' && isPublicVideo(v)
         && v.content_kind !== 'clip' && channelContentFilter !== 'clips')
+      .filter((v) => !warmedUrlsRef.current.has(buildVodUrl(v)))
       .slice(0, YOUTUBE_WARM_VOD_LIMIT)
       .map((v) => buildVodUrl(v));
     warmYoutubePreviewBatch(youtubeUrls);
