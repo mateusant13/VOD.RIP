@@ -347,6 +347,8 @@ def _build_youtube_session_snapshot(
     if kind == "progressive":
         proxy_master_url = f"/api/preview/hls/{session_id}/master.m3u8"
 
+    from services.preview.session import PreviewSession
+
     # Build a temporary PreviewSession so the existing helpers (which mutate
     # ``session.*``) can run unchanged. We pull the populated fields back out
     # into a dict at the end.
