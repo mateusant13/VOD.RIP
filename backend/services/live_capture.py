@@ -146,7 +146,75 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     vid = vid_match.group(1).decode()
     watch_url = f"https://www.youtube.com/watch?v={vid}"
 
-    # Attempt yt-dlp extraction
+    # Primary: app InnerTube — survives bot walls that kill yt-dlp
+    try:
+        from services.youtube_innertube import innertube_extract_info
+
+        info = innertube_extract_info(watch_url, timeout=20.0)
+    except Exception as exc:
+        logger.debug("youtube_live_info(%r) innertube failed: %s", handle, exc)
+        info = None
+    if info:
+        candidates = [
+            f for f in (info.get("formats") or [])
+            if f.get("protocol") in ("m3u8", "m3u8_native")
+        ]
+        best = None
+        for f in candidates:
+            h = int(f.get("height") or 0)
+            if best is None or (h <= 720 and h > int(best.get("height") or 0)):
+                best = f
+        if not best:
+            best = next((f for f in candidates), None)
+        if best:
+            return {
+                "url": best["url"],
+                "headers": dict(info.get("http_headers") or {}),
+                "title": info.get("title") or handle,
+                "viewers": info.get("viewer_count") or 0,
+                "platform": "YouTube",
+            }
+
+    # Fallback: yt-dlp — wire the app's YouTube auth
+    from services.youtube_session import (
+        apply_ytdlp_cookie_opts,
+        ytdlp_extractor_args,
+        youtube_session_from_settings,
+    )
+
+    yt_session = youtube_session_from_settings(video_id=vid)
+    opts = {"quiet": True, "no_warnings": True}
+    opts["extractor_args"] = ytdlp_extractor_args(yt_session)
+    apply_ytdlp_cookie_opts(opts, yt_session)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(watch_url, download=False)
+    except Exception as exc:
+        low = str(exc).lower()
+        if "sign in" in low or "cookie" in low or "bot" in low or "unavailable" in low:
+            return {"reason": f"Extraction unavailable (bot wall / auth needed): {exc}"}
+        logger.debug("youtube_live_info(%r) yt-dlp failed: %s", handle, exc)
+        info = None
+    if not info or not info.get("is_live"):
+        return {"reason": "Stream is not live"}
+
+    formats = info.get("formats") or []
+    # Pick best m3u8 at ≤720p
+    candidates = [
+        f for f in formats
+        if f.get("protocol") in ("m3u8", "m3u8_native")
+    ]
+    best = None
+    for f in candidates:
+        h = int(f.get("height") or 0)
+        if best is None or (h <= 720 and h > int(best.get("height") or 0)):
+            best = f
+    if not best:
+        best = next((f for f in candidates), None)
+    if not best:
+        return {"reason": "No suitable HLS format found"}
+
+    # Bare yt-dlp as last fallback (no auth)
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
             info = ydl.extract_info(watch_url, download=False)
@@ -154,7 +222,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
         low = str(exc).lower()
         if "sign in" in low or "cookie" in low or "bot" in low or "unavailable" in low:
             return {"reason": f"Extraction unavailable (bot wall / auth needed): {exc}"}
-        logger.debug("youtube_live_info(%r) extract failed: %s", handle, exc)
+        logger.debug("youtube_live_info(%r) bare yt-dlp failed: %s", handle, exc)
         return {"reason": f"Extraction failed: {exc}"}
 
     if not info or not info.get("is_live"):

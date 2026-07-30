@@ -188,7 +188,10 @@ def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
         with _LIVE_STATUS_LOCK:
             cached = _LIVE_STATUS_CACHE.get(channel_id)
         if cached and (time.monotonic() - cached[0]) < _LIVE_STATUS_MAX_STALE_SEC:
-            return cached[1]
+            # Only stale-serve if channel was known live, never stale "not live"
+            cached_live = cached[1].get("live", [])
+            if cached_live:
+                return cached[1]
         return {"live": [], "channel_id": channel_id}
     with _LIVE_STATUS_LOCK:
         _LIVE_STATUS_CACHE[channel_id] = (time.monotonic(), payload)

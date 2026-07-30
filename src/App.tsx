@@ -4081,6 +4081,8 @@ export default function App() {
     setTrimEndSec(14400);
     setPreviewMetaDurationSec(14400);
     previewStartedRef.current = true;
+    destroyPreviewPlayer();
+    setVideoInfo(null);
     try {
       const res = await apiPost<{
         session_id: string;
@@ -5416,7 +5418,7 @@ export default function App() {
                         />
                       </div>
                     )}
-                    {liveEntries.length > 0 && <LiveBadge entries={liveEntries} />}
+                    <LiveBadge entries={liveEntries} invisible={liveEntries.length === 0} />
                     {editingChannelId !== ch.id && (
                       <button type="button" title="Rename"
                         onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}

@@ -54,8 +54,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
 
 
-def _preview_user_message(exc: BaseException) -> str:
-    return youtube_user_message(exc, preview=True)
+def _preview_user_message(exc: Exception) -> str:
+    msg = str(exc)
+    # Only wrap through YouTube diagnostics if it looks like a YouTube error
+    if any(kw in msg.lower() for kw in ['youtu', 'innertube', 'player response', 'video id', 'sign in', 'age-gate']):
+        return youtube_user_message(exc, preview=True)
+    return msg
 
 
 def _session_extract_source(session) -> str:
