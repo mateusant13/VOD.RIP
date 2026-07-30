@@ -7,6 +7,13 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
+try:
+    from pydantic import BaseModel
+except ImportError:
+    import sys
+    print("kick_models: pydantic not installed. Kick features disabled.", file=sys.stderr)
+    BaseModel = object  # fallback so the module can still be imported
+
 
 @dataclass
 class KickVideo:
