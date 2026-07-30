@@ -237,6 +237,7 @@ def _youtube_preflight_mux(
     """Mux [0, INITIAL_CHUNK) to preflight cache — no session required."""
     from services.youtube_innertube import extract_video_id
     from services.ytdlp_hls import _mux_dash_window_to_hls
+    from services.preview.session import resolve_stream_info
 
     vid = extract_video_id((url or "").strip())
     if not vid:
@@ -822,6 +823,7 @@ def warm_youtube_preview_resolve(
     Also prebuilds the session snapshot so the click path skips the ~5s
     extract + variant-build work on a warm hit.
     """
+    from services.preview.session import resolve_stream_info
     try:
         resolve_result = resolve_stream_info(
             url, oauth=oauth, prefer_height=prefer_height
@@ -877,6 +879,7 @@ def warm_youtube_resolve_only(
     of 5 warm slots, so the frontend's YOUTUBE_WARM_VOD_LIMIT is respected
     on the backend side too.
     """
+    from services.preview.session import resolve_stream_info
     try:
         resolve_result = resolve_stream_info(
             url, oauth=oauth, prefer_height=prefer_height, warm_light=True
