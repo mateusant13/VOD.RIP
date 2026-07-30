@@ -16,14 +16,19 @@ _YTDLP_LOCK = threading.Lock()
 _YTDLP_CHANNEL_LOCK = threading.Lock()
 _FORBIDDEN_PLUGIN_MARKERS = ("getpot_wpc", "getpot-wpc")
 _BLOCKED_YOUTUBE_KEYS = frozenset()
+_YTDLP_FORBIDDEN_PLUGIN_CACHED: bool | None = None
 
 
 def _forbidden_plugin_present() -> bool:
+    global _YTDLP_FORBIDDEN_PLUGIN_CACHED
+    if _YTDLP_FORBIDDEN_PLUGIN_CACHED is not None:
+        return _YTDLP_FORBIDDEN_PLUGIN_CACHED
     try:
         from yt_dlp.plugins import directories as plugin_dirs
 
         roots = plugin_dirs()
     except Exception:
+        _YTDLP_FORBIDDEN_PLUGIN_CACHED = False
         return False
     for root in roots:
         try:
@@ -33,9 +38,11 @@ def _forbidden_plugin_present() -> bool:
             for entry in base.iterdir():
                 name = entry.name.lower()
                 if any(marker in name for marker in _FORBIDDEN_PLUGIN_MARKERS):
+                    _YTDLP_FORBIDDEN_PLUGIN_CACHED = True
                     return True
         except OSError:
             continue
+    _YTDLP_FORBIDDEN_PLUGIN_CACHED = False
     return False
 
 
