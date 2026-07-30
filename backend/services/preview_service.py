@@ -104,6 +104,12 @@ _WARMED_URLS_LOCK = threading.Lock()
 # In-flight YouTube warm keyed by canonical URL — create_session awaits paste warm.
 _YOUTUBE_WARM_INFLIGHT: Dict[str, threading.Event] = {}
 _YOUTUBE_WARM_LOCK = threading.Lock()
+# Warm result cache keyed by inflight key — fast lookup without full session snap.
+_YOUTUBE_WARM_CACHE: dict[str, Any] = {}
+_YOUTUBE_WARM_CACHE_LOCK = threading.Lock()
+# Per-channel warm slot tracking (oldest first) — max 5 warmed URLs per channel.
+_CHANNEL_WARM_SLOTS: dict[str, list[str]] = {}
+_CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
 # ponytail: latest URL the user is actively previewing. Warm jobs check this
 # before doing heavy work and bail out cheaply if they're no longer relevant.
 # Without this, parallel warm jobs from the channel list steal INFO_EXECUTOR
@@ -3324,6 +3330,7 @@ def kickoff_youtube_batch_warm(
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
+    channel_key: str = "",
 ) -> None:
     """Lightweight warm for batch (startup) use.
 
@@ -3356,6 +3363,7 @@ def kickoff_youtube_batch_warm(
             # session snapshot. Calling it twice would re-extract + re-build.
             warm_youtube_resolve_only(
                 url, oauth=oauth, prefer_height=prefer_height,
+                channel_key=channel_key,
             )
         finally:
             with _YOUTUBE_WARM_LOCK:
@@ -4544,6 +4552,7 @@ def warm_youtube_resolve_only(
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
+    channel_key: str = "",
 ) -> bool:
     """Populate resolved-stream cache + preflight the head so the click can play
     immediately. Uses the light extract so concurrent warm jobs don't fight for
@@ -4554,6 +4563,11 @@ def warm_youtube_resolve_only(
     extract + variant-build work on a warm hit. Every warm path that lands
     a resolve must produce a snapshot — otherwise the user's first click
     waits the full SLA.
+
+    When ``channel_key`` is set, the warmed URL is tracked in a per-channel
+    slot list. The oldest entry is evicted when the channel exceeds the max
+    of 5 warm slots, so the frontend's YOUTUBE_WARM_VOD_LIMIT is respected
+    on the backend side too.
     """
     try:
         resolve_result = resolve_stream_info(
@@ -4598,6 +4612,24 @@ def warm_youtube_resolve_only(
         )
     else:
         logger.debug("session snapshot skipped for %s (unsupported type)", url[:80])
+    # Track in warm cache + per-channel slot eviction so the backend doesn't
+    # hold more warmed entries than the frontend YOUTUBE_WARM_VOD_LIMIT of 5.
+    if snap:
+        from services.youtube_innertube import youtube_watch_url_to_key
+
+        inflight_key = youtube_watch_url_to_key(url)
+        if inflight_key:
+            with _YOUTUBE_WARM_CACHE_LOCK:
+                _YOUTUBE_WARM_CACHE[inflight_key] = snap
+        if channel_key:
+            with _CHANNEL_WARM_SLOTS_LOCK:
+                slots = _CHANNEL_WARM_SLOTS.setdefault(channel_key, [])
+                slots.append(url[:200])
+                while len(slots) > 5:
+                    evicted = slots.pop(0)
+                    evicted_key = youtube_watch_url_to_key(evicted)
+                    if evicted_key:
+                        _YOUTUBE_WARM_CACHE.pop(evicted_key, None)
     return True
 
 
