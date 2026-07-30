@@ -391,9 +391,15 @@ def _pid_looks_like_ffmpeg(pid: int) -> bool:
         out = _run_text(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"])
         return "ffmpeg" in out.lower()
     try:
+        # Linux
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
         return "ffmpeg" in cmdline.lower()
-    except OSError:
+    except (OSError, FileNotFoundError):
+        pass
+    try:
+        out = _run_text(["ps", "-o", "comm=", "-p", str(pid)])
+        return "ffmpeg" in out.lower()
+    except (OSError, subprocess.CalledProcessError):
         return False
 
 
