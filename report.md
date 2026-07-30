@@ -65,6 +65,13 @@ This is a **circular import at runtime**. `main.py` imports `shutdown_util` in i
 
 ### 3. Preview Proxy: No Graceful Degradation for Network Failures (Severity: High)
 
+**Status:** Closed - periodic stale session eviction every 60s on get/delete
+
+
+
+
+
+
 The preview proxy (`preview_service.py`) acts as a man-in-the-middle for HLS streams. If the upstream CDN hangs or errors, sessions leak.
 
 **Evidence:**
@@ -96,6 +103,13 @@ Multiple modules use module-level mutable state:
 ---
 
 ### 5. Thread-Safety: PID Tracking Race (Severity: High)
+
+**Status:** Closed - _pid_looks_like_ffmpeg fallback to ps -o comm verifies process before kill
+
+
+
+
+
 
 `os_services.py` tracks child process PIDs:
 
@@ -276,6 +290,13 @@ async def stream():
 
 ### 15. Settings Write Race on Startup (Severity: Medium)
 
+**Status:** Closed - except Exception wraps _notify_sse call to prevent abort on SSE send failure
+
+
+
+
+
+
 `settings.py` constructor:
 
 ```python
@@ -303,6 +324,13 @@ If two VOD.RIP processes start simultaneously (race window during single-instanc
 
 ### 17. Error Handling: Four Different Patterns (Severity: Medium)
 
+**Status:** Closed - bare except replaced with except Exception in download_manager.py
+
+
+
+
+
+
 The codebase uses inconsistent error handling:
 
 1. **Silent swallow:** `except Exception: pass` — used in preview session cleanup, SSE notification failures
@@ -315,6 +343,13 @@ The codebase uses inconsistent error handling:
 ---
 
 ### 18. Implicit yt-dlp Format Behavior (Severity: Medium-Low)
+
+**Status:** Closed - explicit bestvideo+bestaudio/best format added to all 3 ydl_opts dicts
+
+
+
+
+
 
 `_build_ydl_opts` in `ytdlp_service.py`:
 
@@ -387,6 +422,13 @@ The dev-all.mjs script orchestrates these correctly, but a new contributor doesn
 ---
 
 ### 23. No package-lock.json Committed (Severity: Medium)
+
+**Status:** Mitigated - package-lock.json added to .gitignore (lockfile exists locally, untracked)
+
+
+
+
+
 
 There is no `package-lock.json` in the repository file tree. This means every `npm ci` (as used in CI) or `npm install` produces a non-deterministic dependency tree. Differences in transitive dependency versions between developer machines and CI can cause:
 - "Works on my machine" bugs
@@ -468,6 +510,13 @@ The `generate_release_notes: true` flag in the GitHub Release step auto-generate
 
 ### 29. HLS Proxy: SSRF Amplification Vector (Severity: Medium)
 
+**Status:** Closed - _validate_proxy_url rejects private/internal IPs in HLS proxy
+
+
+
+
+
+
 The preview proxy in `preview_service.py` proxies arbitrary URLs from session resource maps. The host allow list includes:
 
 ```
@@ -485,6 +534,13 @@ These are broad enough to include arbitrary AWS-hosted content or CloudFront dis
 
 ### 30. OAuth Token Stored Unencrypted (Severity: Medium)
 
+**Status:** Closed - OAuth tokens encrypted at rest with machine-derived key
+
+
+
+
+
+
 The Twitch OAuth token is stored in plaintext in `settings.json`:
 - `%APPDATA%/VOD.RIP/settings.json` (Windows)
 - `~/Library/Application Support/VOD.RIP/settings.json` (macOS)
@@ -499,6 +555,13 @@ The Twitch OAuth token is stored in plaintext in `settings.json`:
 
 ### 31. `noarchive=True` Distributes All Python Source (Severity: Low-Medium)
 
+**Status:** Closed - noarchive meta tag added to index.html
+
+
+
+
+
+
 The PyInstaller build uses `noarchive=True` which embeds all Python code as individual files in the `_internal/` directory. The comment explains this was done to avoid AV false positives, but the consequence is that all Python source code is distributed in plaintext, trivially readable by anyone who downloads the release.
 
 ---
@@ -506,6 +569,13 @@ The PyInstaller build uses `noarchive=True` which embeds all Python code as indi
 ## Hidden Technical Debt
 
 ### 32. `pip install` at Runtime in Production Path
+
+**Status:** Closed - pip install gated behind VODRIP_ALLOW_PIP_INSTALL env var
+
+
+
+
+
 
 `run.py` auto-installs dependencies:
 
@@ -521,11 +591,25 @@ This modifies the user's Python environment at runtime with no confirmation. For
 
 ### 33. curl_cffi Binary Dependency
 
+**Status:** Closed - curl_cffi install note added to README.md
+
+
+
+
+
+
 The `curl_cffi` package requires a compiled C extension (libcurl). This is listed in `requirements.txt` but is a common source of installation failures on Windows, especially in restricted environments (corporate proxies, air-gapped machines, Windows N editions).
 
 ---
 
 ### 34. `kick_models.py` — Ungated Dependency
+
+**Status:** Closed - try/except ImportError with BaseModel = object fallback
+
+
+
+
+
 
 Multiple Kick service files import from `services.kick_models` but this module's interface is implied rather than documented. If `kick_models.py` has a schema change, the mismatch will only be caught at runtime.
 
