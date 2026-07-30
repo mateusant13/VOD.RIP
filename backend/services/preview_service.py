@@ -1,40 +1,14 @@
 """Legacy compat — prefer ``from services.preview import ...``.
 
-This module re-exports everything from the ``services.preview`` package.
+Re-exports every name from the ``services.preview`` package so all
+existing importers keep working without code changes.
 """
-# Standard imports (no __all__ filter)
-from services.preview import (
-    PreviewManager,
-    PreviewSession,
-    MuxJob,
-    UpstreamPreviewUnavailable,
-    StalePreviewUrls,
-    PreviewMuxPending,
-    create_session,
-    create_live_session,
-    get_session,
-    delete_session,
-    proxy_master,
-    proxy_playlist,
-    proxy_segment,
-    kickoff_youtube_batch_warm,
-    warm_youtube_preview_resolve,
-    warm_youtube_resolve_only,
-    invalidate_youtube_preview_caches,
-    set_active_youtube_preview,
-    is_host_allowed,
-    _host_allowed,
-    _is_playlist_url,
-    _RESOLVED_STREAM_CACHE,
-    resolve_stream_info,
-    _manager,
-    LRU_SIZE_HARD_LIMIT,
-    _ALLOWED_HOST_SUFFIXES,
-    WINDOW_HLS_SEGMENT_SEC,
-    _youtube_warm_inflight_key,
-    _deduped_progressive_variants,
-    _is_muxed_format,
-    await_youtube_warm_if_pending,
-    _WARMED_URLS,
-    _WARMED_URLS_LOCK,
-)
+from services import preview  # noqa: E402
+
+# Copy all public attributes from the preview package into this module
+# so ``from services.preview_service import X`` and
+# ``from services import preview_service as ps; ps.X`` both work.
+for _attr in dir(preview):
+    if _attr.startswith("__"):
+        continue
+    globals()[_attr] = getattr(preview, _attr)
