@@ -84,8 +84,11 @@ def main():
         import fastapi  # noqa: F401
         import yt_dlp  # noqa: F401
     except ImportError:
-        print("Installing dependencies...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        if os.environ.get("VODRIP_ALLOW_PIP_INSTALL") == "1":
+            print("Installing dependencies...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        else:
+            print("WARNING: Missing dependencies. Set VODRIP_ALLOW_PIP_INSTALL=1 to auto-install.")
     
     ui_url = os.environ.get("KICK_UI_URL", "http://localhost:5173")
     print("================================================")
