@@ -1426,7 +1426,7 @@ export default function App() {
 
     const youtubeUrls = visibleChannelVideos
       .filter((v) => v.platform === 'youtube' && isPublicVideo(v)
-        && v.content_kind !== 'clip' && v.content_kind !== 'short'
+        && v.content_kind !== 'clip' && !(v.url || '').includes('/shorts/')
         && channelContentFilter !== 'clips')
       .filter((v) => !warmedUrlsRef.current.has(buildVodUrl(v)))
       .slice(0, YOUTUBE_WARM_VOD_LIMIT)
@@ -5695,7 +5695,7 @@ export default function App() {
                             const subline = channelVodSubline(v);
                             const durSec = channelVideoDurationSec(v);
                             const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
-                            const isShortItem = v.content_kind === 'short' || (v.url || '').includes('/shorts/');
+                            const isShortItem = (v.url || '').includes('/shorts/');
                             const isMembersOnly = isMembersOnlyVideo(v);
                             const isActiveVod = url.trim() === fullUrl.trim();
                             const rowAccent = platformAccentColor(v.platform);

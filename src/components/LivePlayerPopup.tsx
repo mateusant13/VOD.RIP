@@ -43,7 +43,6 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
   const [levels, setLevels] = useState<LevelInfo[]>([]);
   const [currentLevel, setCurrentLevel] = useState(-1);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
-  const [masterUrl, setMasterUrl] = useState<string | null>(null);
   const [abortRef] = useState(() => new AbortController());
 
   // Handle level selection
@@ -103,12 +102,11 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
         if (entry.headers) body.headers = entry.headers;
         if (entry.platform) body.platform = entry.platform;
 
-        const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body, abortRef.signal);
+        const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body);
         if (cancelled) return;
         if (!res) { setError('No response from server'); setLoading(false); return; }
 
         sessionIdRef.current = res.session_id;
-        setMasterUrl(res.master_url || null);
 
         // Attach player to video element
         const video = videoRef.current;
