@@ -206,6 +206,11 @@ def canonical_youtube_watch_url(url: str) -> Optional[str]:
     return f"https://www.youtube.com/watch?v={vid}"
 
 
+def youtube_watch_url_to_key(url: str) -> Optional[str]:
+    """Return a canonical cache key for a YouTube URL, or None for non-video URLs."""
+    return extract_video_id(url)
+
+
 def _parse_hls_variants(master_text: str, master_url: str) -> list[dict[str, Any]]:
     """Turn an HLS master playlist into yt-dlp-shaped format entries."""
     formats: list[dict[str, Any]] = []
