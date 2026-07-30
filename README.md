@@ -80,6 +80,8 @@ npm run dev
 
 Then open `http://localhost:5173`.
 
+> **Windows users**: `curl_cffi` requires [Visual C++ Redistributable](https://aka.ms/vcruntime) and may need the [latest pip](https://pip.pypa.io/en/stable/installation/) version for binary wheel installation. If installation fails, try `pip install --upgrade pip` then `pip install curl-cffi==0.7.4`.
+
 ## Windows SmartScreen warning
 
 The first time you run VOD.RIP, Windows may show **"Windows protected your PC"**.
