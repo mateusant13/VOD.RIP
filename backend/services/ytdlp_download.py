@@ -744,6 +744,21 @@ def _build_ydl_opts(
         opts["username"] = "oauth_token"
         opts["password"] = oauth
 
+    # Auto-inject YouTube cookies (auto-extracted from browser at startup)
+    if not opts.get("cookies") and "youtube" in url.lower():
+        from services.youtube_auth import find_fresh_cookie_cache
+
+        cookie_path = find_fresh_cookie_cache()
+        if cookie_path:
+            opts["cookies"] = cookie_path
+
+    # Enable POT (Proof of Origin Token) as anti-bot measure for YouTube
+    if "youtube" in url.lower() and not opts.get("cookies"):
+        opts["po_token"] = ["web+default", "android+default"]
+        opts["extractor_args"] = opts.get("extractor_args", {})
+        opts["extractor_args"].setdefault("youtube", {})
+        opts["extractor_args"]["youtube"]["player_client"] = ["android", "web"]
+
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
 

@@ -137,8 +137,8 @@ def refresh_youtube_cookie_cache(
 
 
 def pot_minting_enabled() -> bool:
-    """WPC/Chrome PO mint removed — InnerTube + cookie file is enough."""
-    return False
+    """Enable POT (Proof of Origin Token) as fallback when browser cookies unavailable."""
+    return True
 
 
 def infer_default_browser() -> Optional[str]:
@@ -365,11 +365,11 @@ def auth_status(auto_auth: bool, cookies_from_browser: str = "") -> dict:
     return {
         "auto_auth": auto_auth,
         "browser": browser,
-        "pot_providers": [],
-        "pot_auto_available": False,
+        "pot_providers": ["default"],
+        "pot_auto_available": True,
     }
 
 
 assert resolve_youtube_browser("chrome", True) == "chrome"
-assert pot_minting_enabled() is False
+assert pot_minting_enabled() is True
 assert find_fresh_cookie_cache() is None or Path(find_fresh_cookie_cache() or "").is_file()

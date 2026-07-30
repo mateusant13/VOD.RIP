@@ -90,13 +90,12 @@ async def _app_lifespan(_app: FastAPI):
             (getattr(s, "youtube_cookies_file", "") or "").strip()
             or (getattr(s, "youtube_cookies_browser", "") or "").strip()
         )
-        if manual:
-            from services.youtube_auth import refresh_youtube_cookie_cache
+        from services.youtube_auth import refresh_youtube_cookie_cache
 
-            refresh_youtube_cookie_cache(
-                auto_auth=False,
-                cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
-            )
+        refresh_youtube_cookie_cache(
+            auto_auth=not manual,
+            cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
+        )
 
         # Live-status warm — pre-populate the /api/channels/{id}/live cache so
         # the first user request after server start returns in O(1) instead of
