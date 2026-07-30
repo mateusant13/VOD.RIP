@@ -103,9 +103,9 @@ MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
 _UPSTREAM_CHUNK_BYTES = 64 * 1024
 _UPSTREAM_CONNECT_TIMEOUT_SEC = 15
-_PREVIEW_ROOT = (
-    Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
-)
+
+from services.preview._state import _PREVIEW_ROOT
+
 _FULL_MUX_CACHE_DIR = _PREVIEW_ROOT / "full_mux_cache"
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
 _PROG_HEAD_DIR = _PREVIEW_ROOT / "prog_head"

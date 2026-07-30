@@ -34,6 +34,7 @@ from services.preview._state import (
     _full_warm_queued,
     _MAX_WARM_FAILURES,
     _PREFLIGHT_MUX_LOCK,
+    _PREVIEW_ROOT,
     _PRINTED_COOLDOWN,
     _RESOLVED_STREAM_CACHE,
     _RESOLVED_STREAM_LOCK,

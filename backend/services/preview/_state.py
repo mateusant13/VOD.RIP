@@ -8,8 +8,14 @@ they import the names directly from the preview package.
 
 from __future__ import annotations
 
+import os
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# --- Preview root directory ---
+_PREVIEW_ROOT: Path = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
 
 
 # --- Resolved stream cache ---
