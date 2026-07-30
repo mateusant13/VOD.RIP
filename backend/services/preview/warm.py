@@ -30,6 +30,7 @@ from services.ytdlp_hls import _youtube_soft_neg_error
 
 from services.preview._state import (
     _ACTIVE_YOUTUBE_PREVIEW_LOCK,
+    _CHANNEL_WARM_SLOTS,
     _CHANNEL_WARM_SLOTS_LOCK,
     _full_warm_queued,
     _MAX_WARM_FAILURES,
@@ -162,6 +163,7 @@ def kickoff_youtube_preflight_mux(
         _PREFLIGHT_MUX_INFLIGHT[key] = done
 
     def _run() -> None:
+        from services.preview.session import MuxJob
         try:
             _youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
         finally:
@@ -187,6 +189,7 @@ def kickoff_youtube_batch_warm(
     - Populates only the resolve cache (no preflight mux) so concurrent
       batch warm jobs don't fight over _PREFLIGHT_MUX_INFLIGHT.
     """
+    from services.preview.session import create_session
     from services.ytdlp_hls import preview_fast_only_mode
 
     if preview_fast_only_mode():
@@ -318,6 +321,8 @@ def _build_youtube_session_snapshot(
     Returns ``None`` when the resolve result is unusable (e.g. Twitch clip
     that took a different code path — caller's job to detect via platform).
     """
+    from services.preview.session import WINDOW_HLS_INITIAL_CHUNK_SEC, _merge_youtube_session_cookies
+    from services.preview.session import _apply_muxed_progressive_session, _apply_youtube_custom_master, _build_synthetic_master_playlist, _clamp_session_crop_to_vod_duration, _hosts_for_url, _pick_variant_by_height, create_session
     from services.preview.session import _init_window_hls_mux_bounds, _resolve_preview_entry, _stash_youtube_preview_formats, _youtube_muxed_progressive_for_long_explore
     from services.preview.session import _youtube_needs_dash_window_hls
     from services.preview.session import _resolve_youtube_preview_audio
@@ -522,6 +527,7 @@ def _build_and_cache_youtube_snapshot(
     Returns (vid, height, snapshot_dict) for immediate session reuse, or
     None if snapshot-building fails.
     """
+    from services.preview.session import create_session
     snap = _build_youtube_session_snapshot(
         url, 0.0, 0.0, prefer_height, oauth, resolve_result,
     )
@@ -540,6 +546,7 @@ def _resolve_and_cache_youtube_snapshot(
     the snapshot is stored under the exact key create_session looks up.
     Returns (vid, height, snapshot_dict) or None on failure.
     """
+    from services.preview.session import create_session
     from services.preview.session import resolve_stream_info
     t0 = time.monotonic()
     try:
@@ -609,6 +616,7 @@ def kickoff_youtube_warm(
     warm on startup so preloading doesn't get cancelled the moment the
     user clicks their first video.
     """
+    from services.preview.session import create_session
     from services.ytdlp_hls import preview_fast_only_mode
 
     if preview_fast_only_mode():
@@ -668,6 +676,7 @@ def kickoff_youtube_full_mux_warm(
     Respects the active-preview marker so we don't steal workers when the user
     has already opened a different VOD.
     """
+    from services.preview.session import _full_mux_cache_path
     from services.youtube_innertube import extract_video_id
 
     vid = extract_video_id(url or "")
@@ -832,6 +841,7 @@ def warm_youtube_preview_resolve(
     Also prebuilds the session snapshot so the click path skips the ~5s
     extract + variant-build work on a warm hit.
     """
+    from services.preview.session import create_session
     from services.preview.session import kickoff_youtube_prog_head_warm
     from services.preview.session import resolve_stream_info
     try:
@@ -889,6 +899,7 @@ def warm_youtube_resolve_only(
     of 5 warm slots, so the frontend's YOUTUBE_WARM_VOD_LIMIT is respected
     on the backend side too.
     """
+    from services.preview.session import _prog_head_paths
     from services.preview.session import resolve_stream_info
     from services.preview.session import kickoff_youtube_prog_head_warm
     try:
