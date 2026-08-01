@@ -1,0 +1,10 @@
+state: {"url":null,"hasWatch":false,"previewOpen":false}
+[console.error] Each child in a list should have a unique "key" prop.%s%s See https://react.dev/link/warning-keys for more information. 
+
+Check the render method of `App`. 
+BEFORE drag: {"panel":{"x":47,"y":63,"w":948,"h":760},"videoHost":{"w":910,"h":682},"aspectCss":"1.33333 / 1"}
+AFTER drag: {"panel":{"x":47,"y":-3,"w":1208,"h":955},"videoHost":{"w":1170,"h":877},"aspectCss":"1.33333 / 1"}
+AFTER refresh: {"panel":{"x":47,"y":-3,"w":1208,"h":955},"videoHost":{"w":1170,"h":877},"aspectCss":"1.33333 / 1"}
+h/w before drag : 0.802
+h/w after drag  : 0.791
+h/w after refresh: 0.791
