@@ -4278,6 +4278,17 @@ export default function App() {
     setLivePopupEntry({ entry, channelName: name });
   }, []);
 
+  // TEMP-VERIFY: auto-open live popup for UI verification (revert before commit)
+  useEffect(() => {
+    const t = setTimeout(() => {
+      openLivePreview(
+        { platform: 'twitch', is_live: true, title: 'UX verify stream', url: 'https://www.twitch.tv/surtepi', headers: {}, type: 'channel' },
+        'surtepi',
+      );
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [openLivePreview]);
+
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
       const ch = prev.find((c) => c.id === channelId);
