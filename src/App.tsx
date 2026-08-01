@@ -3543,6 +3543,9 @@ export default function App() {
     const mode = contentMode ?? channelContentFilter;
     const incremental = opts?.incremental ?? false;
     const silent = opts?.silent ?? false;
+    // Only bust the cache on explicit forced refresh — non-forced refreshes
+    // must hit the backend's 90s in-memory channel cache.
+    const cacheBust = opts?.force ? `&_t=${Date.now()}` : '';
     const flightKey = `${channelId}:${mode}`;
 
     if (opts?.force) {
@@ -3589,14 +3592,14 @@ export default function App() {
         try {
           let data: ChannelClipsResponse;
           try {
-            data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${params}&_t=${Date.now()}`);
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/clips?${params}${cacheBust}`);
           } catch (clipErr: unknown) {
             const msg = clipErr instanceof Error ? clipErr.message : '';
             if (!msg.includes('Clips API not on server') && !msg.includes('Clips API unavailable')) {
               throw clipErr;
             }
             params.set('content', 'clips');
-            data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
+            data = await apiGet<ChannelClipsResponse>(`/api/channel/videos?${params}${cacheBust}`);
           }
           if (data.content && data.content !== 'clips') {
             errs.Kick = IS_DEV_UI
@@ -3659,7 +3662,7 @@ export default function App() {
             twitch_login: ch.twitchSlug,
           });
           try {
-            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}${cacheBust}`);
             attempted.YouTube = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs.YouTube;
@@ -3707,7 +3710,7 @@ export default function App() {
             youtube_slug: ch.youtubeSlug,
           });
           try {
-            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}&_t=${Date.now()}`);
+            const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}${cacheBust}`);
             attempted[platform] = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];

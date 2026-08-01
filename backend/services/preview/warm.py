@@ -131,7 +131,7 @@ def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
     vid = extract_video_id(session.vod_url or "")
     if not vid:
         return False
-    height = int(session.prefer_height or 720)
+    height = int(session.prefer_height or 360)
     src = _preflight_mux_dir(vid, height)
     if not _preflight_seg0_ready(src):
         return False
@@ -149,7 +149,7 @@ def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
 def kickoff_youtube_preflight_mux(
     url: str,
     oauth: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
 ) -> None:
     """Background mux of the initial window chunk — adopted on create_session."""
     from services.preview.session import _window_hls_dir, _window_hls_seg0_ready
@@ -184,7 +184,7 @@ def kickoff_youtube_batch_warm(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
     channel_key: str = "",
 ) -> None:
     """Lightweight warm for batch (startup) use.
@@ -203,21 +203,22 @@ def kickoff_youtube_batch_warm(
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
+    # Register in-flight at ENQUEUE time (not run start) so create_session's
+    # 1.5s + 3.0s wait can join a queued-but-not-running warm (startup storm
+    # warms land within the wait window). Mirror kickoff_youtube_warm.
+    with _YOUTUBE_WARM_LOCK:
+        if key in _YOUTUBE_WARM_INFLIGHT:
+            return
+        done = threading.Event()
+        _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
-        if time.monotonic() < _warm_bot_gate_pause_until:
-            return
-        # Rate-limit circuit breaker: skip if YouTube is rate-limiting us
-        if _warm_rate_limit_check():
-            return
-        # See kickoff_youtube_warm — in-flight registration happens at run start
-        # so create_session never waits on a queued (not running) warm.
-        with _YOUTUBE_WARM_LOCK:
-            if key in _YOUTUBE_WARM_INFLIGHT:
-                return
-            done = threading.Event()
-            _YOUTUBE_WARM_INFLIGHT[key] = done
         try:
+            if time.monotonic() < _warm_bot_gate_pause_until:
+                return
+            # Rate-limit circuit breaker: skip if YouTube is rate-limiting us
+            if _warm_rate_limit_check():
+                return
             # ponytail: warm_youtube_resolve_only itself builds + stashes the
             # session snapshot. Calling it twice would re-extract + re-build.
             warm_youtube_resolve_only(
@@ -243,7 +244,7 @@ def kickoff_youtube_batch_warm(
 def _youtube_preflight_mux(
     url: str,
     oauth: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
 ) -> bool:
     """Mux [0, INITIAL_CHUNK) to preflight cache — no session required."""
     from services.youtube_innertube import extract_video_id
@@ -507,7 +508,7 @@ def invalidate_session_snapshot(vid: str, height: Optional[int] = None) -> None:
             _SESSION_SNAPSHOT.pop((vid, int(height)), None)
 def invalidate_resolved_stream_cache(
     url: str,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
 ) -> None:
     """Drop cached resolve for *url* — refresh must not recycle expired googlevideo URLs."""
     from services.youtube_innertube import extract_video_id
@@ -544,7 +545,7 @@ def _build_and_cache_youtube_snapshot(
 def _resolve_and_cache_youtube_snapshot(
     url: str,
     oauth: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
     **resolve_kwargs,
 ) -> Optional[Tuple[str, int, dict]]:
     """Resolve + cache — full self-contained path for create_session fallback.
@@ -572,7 +573,7 @@ def _resolve_and_cache_youtube_snapshot(
     return _build_and_cache_youtube_snapshot(url, oauth, prefer_height, resolve_result)
 def _invalidate_youtube_resolve_caches(
     url: str,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
 ) -> None:
     from services.ytdlp_hls import invalidate_youtube_extract_cache
 
@@ -631,18 +632,19 @@ def kickoff_youtube_warm(
     key = _youtube_warm_inflight_key(url)
     if not key:
         return
+    # Register in-flight at ENQUEUE time (not run start) so create_session's
+    # 1.5s + 3.0s wait can join a warm that is queued but not yet running
+    # (hover warm fired within the wait window). Mirror kickoff_youtube_preflight_mux.
+    with _YOUTUBE_WARM_LOCK:
+        if key in _YOUTUBE_WARM_INFLIGHT:
+            return
+        done = threading.Event()
+        _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
-        if time.monotonic() < _warm_bot_gate_pause_until:
-            return
-        # ponytail: register in-flight only once the job actually starts — a
-        # queued-but-not-running warm must not make create_session wait for it.
-        with _YOUTUBE_WARM_LOCK:
-            if key in _YOUTUBE_WARM_INFLIGHT:
-                return
-            done = threading.Event()
-            _YOUTUBE_WARM_INFLIGHT[key] = done
         try:
+            if time.monotonic() < _warm_bot_gate_pause_until:
+                return
             if not force:
                 # Bail out cheaply if the user has moved on to a different VOD.
                 # This keeps stale warm jobs from hogging INFO_EXECUTOR workers.
@@ -835,7 +837,7 @@ def warm_youtube_preview_resolve(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
     *,
     reraise: bool = False,
 ) -> bool:
@@ -888,7 +890,7 @@ def warm_youtube_resolve_only(
     url: str,
     oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
-    prefer_height: int = 720,
+    prefer_height: int = 360,
     channel_key: str = "",
 ) -> bool:
     """Populate resolved-stream cache + preflight the head so the click can play

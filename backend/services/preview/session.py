@@ -573,13 +573,13 @@ class PreviewManager:
         crop_start: float = 0.0,
         crop_end: float = 0.0,
         oauth: Optional[str] = None,
-        prefer_height: int = 720,
+        prefer_height: int = 360,
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
         # ponytail: _resolve_and_cache_youtube_snapshot stores at key (vid, int(height or 0)).
-        # The batch warm uses prefer_height=720 too, so normalizing None/0 here ensures
+        # The batch warm defaults to prefer_height=360 too, so normalizing None/0 here ensures
         # the snapshot lookup key matches the warm's stored key — primary divergence fix.
-        prefer_height = prefer_height or 720
+        prefer_height = prefer_height or 360
         if detect_platform(url) == "YouTube":
             # Wait briefly for a genuinely in-flight hover/paste warm so
             # create_session reuses the resolved-stream cache (avoids a second

@@ -172,7 +172,7 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
                 await loop.run_in_executor(
                     INFO_EXECUTOR,
                     lambda u=url: kickoff_youtube_batch_warm(
-                        u, prefer_height=req.prefer_height or 720,
+                        u, prefer_height=req.prefer_height or 360,
                     ),
                 )
             except Exception:
@@ -183,7 +183,7 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
     log_total = len(urls)
     # Fire-and-forget: jobs are queued on WARM_EXECUTOR, resolves happen later.
     # Logging "warmed" here claimed success before any extract actually ran.
-    logger.info("Batch warm queued: %d URLs (h=%d)", log_total, req.prefer_height or 720)
+    logger.info("Batch warm queued: %d URLs (h=%d)", log_total, req.prefer_height or 360)
     return {"warmed": log_total}
 
 

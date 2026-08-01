@@ -355,7 +355,7 @@ async def _app_lifespan(_app: FastAPI):
                 CHANNEL_EXECUTOR.submit(
                     kickoff_youtube_batch_warm,
                     u,
-                    prefer_height=720,
+                    prefer_height=360,
                 )
             except Exception:
                 pass
