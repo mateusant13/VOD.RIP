@@ -67,7 +67,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelWidthAtSiblingMins, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, clampStoredPanelSize, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, URL_ASIDE_PANEL_DEFAULT, MAIN_PANEL_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -5171,10 +5171,10 @@ export default function App() {
         style={rowEdgeInsets ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth } : undefined}
       >
       {previewOpen && (
-          style={{ width: effectivePreviewPanelWidth }}
+        <div
           ref={previewPanelRef}
           className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(layoutPlatform, true)}`}
-          style={{ width: previewPanelWidth }}
+          style={{ width: effectivePreviewPanelWidth }}
         >
           <div className="flex items-start justify-between gap-2 shrink-0">
             {previewChannelBadge ? (
@@ -5330,10 +5330,10 @@ export default function App() {
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
-        style={{ width: effectiveLayout.urlAside.w, height: effectiveLayout.urlAside.h }}
+        <div
           ref={urlAsidePanelRef}
           className={`group relative shrink-0 overflow-hidden bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
-          style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
+          style={{ width: effectiveLayout.urlAside.w, height: effectiveLayout.urlAside.h }}
         >
           {showUrlInSidebar && (
             <div className="flex items-center justify-between shrink-0">
@@ -5368,11 +5368,10 @@ export default function App() {
       <div
         ref={mainPanelRef}
         style={{ width: effectiveLayout.main.w, height: effectiveLayout.main.h }}
+        className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col ${
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
         } ${platformCardShadow(layoutPlatform)}`}
-        style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
       >
-
         {/* ── HEADER ── */}
         <div className="flex justify-between items-start shrink-0 min-w-0 gap-2">
           <div className="flex flex-col min-w-0">

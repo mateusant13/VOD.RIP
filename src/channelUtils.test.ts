@@ -159,12 +159,14 @@ describe('mergeClipLists', () => {
     expect(result[0].id).toBe('c1');
   });
 
-  it('sorts by views descending', () => {
-    const popular = makeClip({ id: 'c1', views: 1000 });
-    const lessPop = makeClip({ id: 'c2', views: 100 });
-    const result = mergeClipLists([lessPop], [popular]);
-    expect(result[0].id).toBe('c1');
-    expect(result[1].id).toBe('c2');
+  it('returns clips sorted newest-first by created_at', () => {
+    // mergeClipLists is the merge primitive — UI re-sorts by views when the user
+    // picks "Most Views". Here we only assert the default newest-first order.
+    const older = makeClip({ id: 'c1', views: 500, created_at: '2024-01-01T00:00:00Z' });
+    const newer = makeClip({ id: 'c2', views: 100, created_at: '2024-06-01T00:00:00Z' });
+    const result = mergeClipLists([older], [newer]);
+    expect(result[0].id).toBe('c2');
+    expect(result[1].id).toBe('c1');
   });
 });
 
