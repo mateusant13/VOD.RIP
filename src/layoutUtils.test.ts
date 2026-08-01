@@ -65,4 +65,47 @@ describe('layoutUtils resize budget', () => {
     const previewMax = layoutMaxPanelWidthAtSiblingMins('preview', layout);
     expect(previewMax + PANEL_MIN.w + PANEL_MIN.w).toBe(budget);
   });
+
+  it('restores sibling widths when the drag reverses (preferred widths)', () => {
+    const layout = tripleLayout();
+    const budget = layoutRowWidthBudget(layout);
+    const preferred = { urlAside: layout.urlAside.w, main: layout.main.w };
+    const startW = layout.preview.w;
+
+    // Drag preview wider: siblings shrink below their start widths.
+    const grown = resizeLayoutGivingWidthTo(layout, 'preview', startW + 400, preferred);
+    expect(grown.preview.w).toBeGreaterThan(startW);
+    expect(grown.urlAside.w + grown.main.w).toBeLessThan(layout.urlAside.w + layout.main.w);
+    expect(grown.preview.w + grown.urlAside.w + grown.main.w).toBeLessThanOrEqual(budget);
+
+    // Drag back to the start width: siblings return to their exact start widths.
+    // Chained from `grown` — a restore computed from the fresh fixture would
+    // pass even without the `preferred` logic (old code: no-op early return).
+    // resizeLayoutGivingWidthTo drops the visibility flags in its return, so
+    // re-add them (production handlers pass the drag-start snapshot instead).
+    const chained = { ...grown, previewOpen: true, urlPanelAside: true };
+    const restored = resizeLayoutGivingWidthTo(chained, 'preview', startW, preferred);
+    expect(restored.preview.w).toBe(startW);
+    expect(restored.urlAside.w).toBe(layout.urlAside.w);
+    expect(restored.main.w).toBe(layout.main.w);
+
+    // Drag narrower than start: siblings stay at preferred (never exceed start).
+    const shrunk = resizeLayoutGivingWidthTo(chained, 'preview', startW - 120, preferred);
+    expect(shrunk.urlAside.w).toBe(layout.urlAside.w);
+    expect(shrunk.main.w).toBe(layout.main.w);
+  });
+
+  it('still clamps siblings to mins when the target takes the whole budget', () => {
+    const layout = tripleLayout();
+    const budget = layoutRowWidthBudget(layout);
+    const preferred = { urlAside: layout.urlAside.w, main: layout.main.w };
+    const previewMax = layoutMaxPanelWidthAtSiblingMins('preview', layout);
+    const fitted = resizeLayoutGivingWidthTo(layout, 'preview', previewMax + 500, preferred);
+    // Exact values: the target clamps to max-at-mins and both siblings hit min.
+    // Inequality assertions pass on the old ratchet code too ({996, 214, 269}).
+    expect(fitted.preview.w).toBe(previewMax);
+    expect(fitted.urlAside.w).toBe(PANEL_MIN.w);
+    expect(fitted.main.w).toBe(PANEL_MIN.w);
+    expect(fitted.preview.w + fitted.urlAside.w + fitted.main.w).toBeLessThanOrEqual(budget);
+  });
 });

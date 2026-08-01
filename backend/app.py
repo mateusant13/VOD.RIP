@@ -203,7 +203,7 @@ async def _app_lifespan(_app: FastAPI):
                 # warm_youtube_resolve_only does InnerTube fast pass + prog head
                 # warm + session snapshot build. The snapshot is what makes the
                 # click path skip the ~5s extract + variant-build + master work;
-                # the prog head warm serves the first 12 MB from local disk so
+                # the prog head warm serves the first 2 MiB from local disk so
                 # the browser's canplay path doesn't hit googlevideo cold.
                 warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
                 with _WARMED_URLS_LOCK:
@@ -245,12 +245,12 @@ async def _app_lifespan(_app: FastAPI):
         return urls
 
     def _startup_wave_warm(saved_channels) -> None:
-        """Wave-based warm sorted by recency, 8-per-channel per wave.
+        """Wave-based warm sorted by recency, 5-per-channel per wave.
 
         The sync wave (first-of-kind per channel) already ran in parallel, so
-        this queues the next ~40 per channel onto WARM_EXECUTOR the moment the
-        server starts. ponytail: 40/channel covers the first screen + scroll
-        depth; the long tail is handled by the frontend per-scroll warm.
+        this queues the next 5 per channel onto WARM_EXECUTOR the moment the
+        server starts. ponytail: 5/channel covers the first screen; the long
+        tail is handled by the frontend per-scroll warm.
         """
         s = settings_mgr.get()
         if getattr(s, 'skip_youtube_startup_warm', False):
@@ -298,7 +298,9 @@ async def _app_lifespan(_app: FastAPI):
         # ponytail: warm the 4 most recent saved channels only
         sorted_channels = sorted_channels[:4]
 
-        BATCH = 8
+        # ponytail: 5/channel matches YOUTUBE_WARM_VOD_LIMIT; deeper scroll
+        # triggers the frontend per-scroll batch warm.
+        BATCH = 5
         MAX_WAVES = 1
         submitted = 0
         wave_count = 0

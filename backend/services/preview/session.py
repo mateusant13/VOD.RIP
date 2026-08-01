@@ -110,7 +110,12 @@ from services.preview._state import _PREVIEW_ROOT
 _FULL_MUX_CACHE_DIR = _PREVIEW_ROOT / "full_mux_cache"
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
 _PROG_HEAD_DIR = _PREVIEW_ROOT / "prog_head"
-_PROG_HEAD_BYTES = 12 * 1024 * 1024
+# ponytail: 2MiB head ≈ 20-35s of 360p — enough for instant start + early
+# playback; was 12MiB (~2-3min, ~40 VODs = ~480MB per startup wave).
+_PROG_HEAD_BYTES = 2 * 1024 * 1024
+# Below this the head is useless for instant start; derived so a future
+# _PROG_HEAD_BYTES reduction can't silently self-delete every warm.
+_PROG_HEAD_MIN_BYTES = _PROG_HEAD_BYTES // 4
 _PROG_HEAD_MAX_BYTES = 256 * 1024 * 1024
 _PROG_HEAD_TTL_SEC = 86400
 _PROG_HEAD_MIN_EVICT_AGE_SEC = 180
@@ -126,7 +131,7 @@ def _prog_head_lookup(video_id: str, height: int) -> Optional[Tuple[Path, int]]:
             return None
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         total = int(meta.get("total") or 0)
-        if total <= 0 or bin_path.stat().st_size < 1024 * 1024:
+        if total <= 0 or bin_path.stat().st_size < _PROG_HEAD_MIN_BYTES:
             return None
         return bin_path, total
     except Exception:
@@ -264,7 +269,7 @@ def _youtube_prog_head_warm(
                 resp.close()
             except OSError:
                 pass
-        if written < 1024 * 1024 or not total:
+        if written < _PROG_HEAD_MIN_BYTES or not total:
             tmp.unlink(missing_ok=True)
             return False
         os.replace(tmp, bin_path)

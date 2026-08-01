@@ -96,6 +96,7 @@ export function resizeLayoutGivingWidthTo(
   layout: LayoutPanelBoundsInput,
   target: LayoutPanelKey,
   desiredW: number,
+  preferred?: Partial<Record<LayoutPanelKey, number>>,
 ): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
   let preview = { ...layout.preview };
   let urlAside = { ...layout.urlAside };
@@ -119,10 +120,11 @@ export function resizeLayoutGivingWidthTo(
   const maxAtMins = layoutMaxPanelWidthAtSiblingMins(target, layout);
   setW(target, Math.min(maxAtMins, Math.max(minWFor(target), desiredW)));
 
-  type Slot = { get: () => number; set: (w: number) => void; minW: number };
+  type Slot = { key: LayoutPanelKey; get: () => number; set: (w: number) => void; minW: number };
   const siblingSlots: Slot[] = [];
   if (layout.previewOpen && target !== 'preview') {
     siblingSlots.push({
+      key: 'preview',
       get: () => preview.w,
       set: (w) => { preview = { ...preview, w }; },
       minW: PREVIEW_PANEL_MIN_W,
@@ -130,6 +132,7 @@ export function resizeLayoutGivingWidthTo(
   }
   if (layout.urlPanelAside && target !== 'urlAside') {
     siblingSlots.push({
+      key: 'urlAside',
       get: () => urlAside.w,
       set: (w) => { urlAside = { ...urlAside, w }; },
       minW: PANEL_MIN.w,
@@ -137,6 +140,7 @@ export function resizeLayoutGivingWidthTo(
   }
   if (target !== 'main') {
     siblingSlots.push({
+      key: 'main',
       get: () => main.w,
       set: (w) => { main = { ...main, w }; },
       minW: PANEL_MIN.w,
@@ -144,6 +148,51 @@ export function resizeLayoutGivingWidthTo(
   }
 
   const budget = layoutRowWidthBudget(layout);
+
+  // ponytail: `preferred` = sibling widths captured at drag start. Makes the
+  // drag reversible — shrinking the target back grows siblings toward their
+  // pre-drag widths instead of leaving the one-way ratchet in place.
+  if (preferred) {
+    const prefW = (slot: Slot) => {
+      const p = preferred[slot.key];
+      return typeof p === 'number' && Number.isFinite(p)
+        ? Math.max(slot.minW, p)
+        : slot.get();
+    };
+    const remaining = budget - getW(target);
+    const minTotal = siblingSlots.reduce((sum, slot) => sum + slot.minW, 0);
+    if (remaining <= minTotal) {
+      for (const slot of siblingSlots) slot.set(slot.minW);
+    } else {
+      const prefTotal = siblingSlots.reduce((sum, slot) => sum + prefW(slot), 0);
+      if (prefTotal <= remaining) {
+        for (const slot of siblingSlots) slot.set(prefW(slot));
+      } else {
+        const scale = remaining / prefTotal;
+        for (const slot of siblingSlots) {
+          slot.set(Math.max(slot.minW, Math.floor(prefW(slot) * scale)));
+        }
+        // Min-clamping a sibling past its proportional share can overshoot
+        // `remaining`; shave the overflow off siblings with headroom so the
+        // dragged panel keeps the pointer's width (the fit pass below would
+        // otherwise shrink the target too).
+        let sibTotal = siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
+        let overflow = sibTotal - remaining;
+        if (overflow > 0) {
+          const flexTotal = siblingSlots.reduce((sum, slot) => sum + (slot.get() - slot.minW), 0);
+          if (flexTotal > 0) {
+            for (const slot of siblingSlots) {
+              const excess = slot.get() - slot.minW;
+              const shave = Math.min(excess, Math.ceil(overflow * (excess / flexTotal)));
+              slot.set(slot.get() - shave);
+            }
+          }
+        }
+      }
+    }
+    return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
+  }
+
   let total = getW(target) + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
   if (total <= budget) {
     return { preview, urlAside, main };
@@ -241,6 +290,67 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
     console.assert(rowTotal <= budget, 'shrinkLayoutPanelsToFit overflow');
   }
   return result;
+}
+
+export interface EffectivePanelLayout {
+  preview: PanelSize;
+  urlAside: PanelSize;
+  main: PanelSize;
+}
+
+/**
+ * Derive runtime (effective) panel widths from the user's preferred (dragged) widths.
+ * Preferred is NEVER mutated. The runtime layer may clamp to viewport bounds; the
+ * persisted preferred widths survive across refetches, reloads, and viewport changes.
+ */
+export function effectiveLayoutFromPreferred(
+  preferred: PersistedPanelLayout,
+  viewport: { previewOpen: boolean; urlPanelAside: boolean; chromeH?: number; aspect?: number },
+): EffectivePanelLayout {
+  const preferredSnapshot = {
+    previewPanelWidth: preferred.previewPanelWidth,
+    urlAside: { ...preferred.urlAside },
+    main: { ...preferred.main },
+  };
+  const input: LayoutPanelBoundsInput = {
+    previewOpen: viewport.previewOpen,
+    urlPanelAside: viewport.urlPanelAside,
+    preview: { w: preferredSnapshot.previewPanelWidth, h: 0 },
+    urlAside: preferredSnapshot.urlAside,
+    main: preferredSnapshot.main,
+  };
+  const clamped = clampAllLayoutPanels(input);
+  const effective: EffectivePanelLayout = {
+    preview: clamped.preview,
+    urlAside: clamped.urlAside,
+    main: clamped.main,
+  };
+  if (viewport.previewOpen) {
+    effective.preview = {
+      w: clampPreviewPanelWidth(
+        clamped.preview.w,
+        viewport.chromeH ?? PREVIEW_PANEL_CHROME_H_EST,
+        viewport.aspect ?? PREVIEW_VIDEO_ASPECT_DEFAULT,
+        input,
+      ),
+      h: clamped.preview.h,
+    };
+  }
+  // ponytail: assert-based self-check — preferred must never be read or written here.
+  console.assert(
+    preferredSnapshot.previewPanelWidth === preferred.previewPanelWidth,
+    'effectiveLayoutFromPreferred must not mutate preferred.previewPanelWidth',
+  );
+  console.assert(
+    preferredSnapshot.urlAside.w === preferred.urlAside.w &&
+      preferredSnapshot.urlAside.h === preferred.urlAside.h,
+    'effectiveLayoutFromPreferred must not mutate preferred.urlAside',
+  );
+  console.assert(
+    preferredSnapshot.main.w === preferred.main.w && preferredSnapshot.main.h === preferred.main.h,
+    'effectiveLayoutFromPreferred must not mutate preferred.main',
+  );
+  return effective;
 }
 
 export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
@@ -571,17 +681,11 @@ export function loadPanelLayout(): PersistedPanelLayout {
       previewPanelWidth: clampLayoutNumber(
         parsed.previewPanelWidth,
         PREVIEW_PANEL_MIN_W,
-        layoutMaxPanelWidthAtSiblingMins('preview', {
-          previewOpen: true,
-          urlPanelAside: true,
-          preview: { w: fallback.previewPanelWidth, h: 0 },
-          urlAside: fallback.urlAside,
-          main: fallback.main,
-        }),
+        panelMaxW(),
         fallback.previewPanelWidth,
       ),
-      urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
-      main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
+      urlAside: sanitizeStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
+      main: sanitizeStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
     };
   } catch {
     return fallback;
@@ -609,6 +713,23 @@ export function clampStoredPanelSize(value: unknown, fallback: PanelSize): Panel
     h: clampLayoutNumber(o.h, PANEL_MIN.h, maxH, fallback.h),
   };
 }
+/**
+ * Viewport-INDEPENDENT prefer-preserving sanitize for stored panel sizes.
+ * Clamps to hard caps that survive small viewports; the runtime layer
+ * (`effectiveLayoutFromPreferred`) handles per-render viewport clamping.
+ * ponytail: a UI-driven "max panel size" upgrade could replace PANEL_MAX_H_HARD
+ * with a scaled max without changing the public contract.
+ */
+export function sanitizeStoredPanelSize(value: unknown, fallback: PanelSize): PanelSize {
+  if (!value || typeof value !== 'object') return { ...fallback };
+  const o = value as { w?: unknown; h?: unknown };
+  const maxW = panelMaxW();
+  return {
+    w: clampLayoutNumber(o.w, PANEL_MIN.w, maxW, fallback.w),
+    h: clampLayoutNumber(o.h, PANEL_MIN.h, PANEL_MAX_H_HARD, fallback.h),
+  };
+}
+
 export const PREVIEW_KEY_SKIP_SEC = 5;
 export const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
 export const PREVIEW_DEFAULT_VOLUME = 0.1;
@@ -622,6 +743,8 @@ export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
 export const URL_ASIDE_TRIM_MIN_H = 414;
 export const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
 export const PANEL_MIN: PanelSize = { w: 200, h: 180 };
+/** Hard upper bound for stored panel height (viewport-independent). */
+export const PANEL_MAX_H_HARD = 3000;
 export const VIEWPORT_EDGE_LOCK = 40;
 export const EXPLORE_POPUP_Z = 9999;
 export const MAX_EXPLORE_POPUPS = 5;

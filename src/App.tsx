@@ -533,28 +533,24 @@ export default function App() {
   const panelLayoutSaveTimerRef = useRef<number | null>(null);
 
   const restorePanelLayout = useCallback((pl: PersistedPanelLayout) => {
-    const clampedUrl = clampStoredPanelSize(pl.urlAside, URL_ASIDE_PANEL_DEFAULT);
-    const clampedMain = clampStoredPanelSize(pl.main, MAIN_PANEL_DEFAULT);
-    const layout = layoutBoundsInput();
+    const fallback = defaultPanelLayout();
+    const clampedUrl = sanitizeStoredPanelSize(pl.urlAside, fallback.urlAside);
+    const clampedMain = sanitizeStoredPanelSize(pl.main, fallback.main);
     const clampedPreviewW = clampLayoutNumber(
       pl.previewPanelWidth,
       PREVIEW_PANEL_MIN_W,
-      layout.previewOpen
-        ? layoutMaxPanelWidthAtSiblingMins('preview', layout)
-        : panelMaxW(),
-      defaultPanelLayout().previewPanelWidth,
+      panelMaxW(),
+      fallback.previewPanelWidth,
     );
+    // Preferred (dragged) widths are restored from storage as-is, within hard caps.
+    // Runtime viewport clamps happen via effectiveLayoutFromPreferred each render.
+    // No localStorage write here — the user's stored preferred widths must survive.
     previewPanelWidthRef.current = clampedPreviewW;
     urlAsidePanelSizeRef.current = clampedUrl;
     mainPanelSizeRef.current = clampedMain;
     setPreviewPanelWidth(clampedPreviewW);
     setUrlAsidePanelSize(clampedUrl);
     setMainPanelSize(clampedMain);
-    persistPanelLayout({
-      previewPanelWidth: clampedPreviewW,
-      urlAside: clampedUrl,
-      main: clampedMain,
-    });
   }, []);
 
   const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => ({
@@ -601,14 +597,17 @@ export default function App() {
   }, [flushPanelLayoutToBackend, readCurrentPanelLayout]);
 
   // Persist main layout panels (preview / URL aside / main card) — not channel explore popups.
+  // localStorage write is gated by panelLayoutPersistReadyRef so the mount/restore path
+  // (which setState'd from loadPanelLayout) does NOT immediately overwrite the stored
+  // preferred widths.
   useEffect(() => {
+    if (!panelLayoutPersistReadyRef.current) return;
     const layout = {
       previewPanelWidth,
       urlAside: urlAsidePanelSize,
       main: mainPanelSize,
     };
     persistPanelLayout(layout);
-    if (!panelLayoutPersistReadyRef.current) return;
     if (panelLayoutSaveTimerRef.current) {
       window.clearTimeout(panelLayoutSaveTimerRef.current);
     }
@@ -773,6 +772,9 @@ export default function App() {
         })
       : items;
     const sorted = [...windowed].sort((a, b) => {
+      // Clips "Most Views": keep the server's views ordering — re-sorting by
+      // date here silently undoes the sort=views fetch.
+      if (clips && clipSort === 'views') return (b.views ?? 0) - (a.views ?? 0);
       const ta = parseVideoTs(a.created_at);
       const tb = parseVideoTs(b.created_at);
       // Null/empty dates sort to end
@@ -805,6 +807,7 @@ export default function App() {
     channelContentFilter,
     clipRangeDays,
     clipRangeMinDays,
+    clipSort,
     channelHasKick,
     channelHasTwitch,
     channelHasYoutube,
@@ -1284,7 +1287,8 @@ export default function App() {
     const initialAspect = clipPreview ? 9 / 16 : PREVIEW_VIDEO_ASPECT_DEFAULT;
     previewVideoAspectRef.current = initialAspect;
     setPreviewVideoAspect(initialAspect);
-    const clampedPreviewW = clampPreviewPanelWidth(
+    // Preferred width is unchanged; the render-time effective layout honors the aspect.
+    const _clampedPreviewW = clampPreviewPanelWidth(
       previewPanelWidthRef.current,
       previewChromeHRef.current,
       initialAspect,
@@ -1296,8 +1300,7 @@ export default function App() {
         main: mainPanelSizeRef.current,
       },
     );
-    previewPanelWidthRef.current = clampedPreviewW;
-    setPreviewPanelWidth(clampedPreviewW);
+    void _clampedPreviewW;
     setPreviewOpen(true);
     setPreviewPlayback(null);
     setPreviewVideoLoading(true);
@@ -2491,7 +2494,6 @@ export default function App() {
     previewOpen,
     previewVideoReady,
     previewFullscreen,
-    previewPanelWidth,
     previewVideoAspect,
     previewPlayback?.kind,
     syncPreviewPlaybackToViewport,
@@ -2623,6 +2625,35 @@ export default function App() {
       main: mainPanelSizeRef.current,
     };
   }, [previewOpen, channelVodPanelOpen]);
+  // Render-time effective layout: enforces viewport bounds on the preferred widths.
+  // This is the SOLE source of truth for panel widths in JSX. State holds preferred;
+  // the effective layout is re-derived each render from preferred + viewport.
+  const effectiveLayout = useMemo<EffectivePanelLayout>(
+    () =>
+      effectiveLayoutFromPreferred(
+        {
+          previewPanelWidth,
+          urlAside: urlAsidePanelSize,
+          main: mainPanelSize,
+        },
+        {
+          previewOpen,
+          urlPanelAside: previewOpen || channelVodPanelOpen,
+          chromeH: previewChromeHRef.current,
+          aspect: previewVideoAspect,
+        },
+      ),
+    [
+      previewPanelWidth,
+      urlAsidePanelSize,
+      mainPanelSize,
+      previewOpen,
+      channelVodPanelOpen,
+      previewVideoAspect,
+    ],
+  );
+  const effectivePreviewPanelWidth = effectiveLayout.preview.w;
+
 
   const handlePreviewLoadedMetadata = useCallback(() => {
     const video = previewVideoRef.current;
@@ -2630,56 +2661,61 @@ export default function App() {
     const aspect = video.videoWidth / video.videoHeight;
     previewVideoAspectRef.current = aspect;
     setPreviewVideoAspect(aspect);
-    const layout = layoutBoundsInput();
-    const clampedW = clampPreviewPanelWidth(
-      previewPanelWidthRef.current,
-      previewChromeHRef.current,
-      aspect,
-      { ...layout, previewOpen: true },
-    );
+    // Aspect change re-derives the effective layout via the render-time useMemo;
+    // we apply the DOM here so the user sees the (possibly clamped) width immediately.
     if (document.fullscreenElement !== previewContainerRef.current) {
-      previewPanelWidthRef.current = clampedW;
-      setPreviewPanelWidth(clampedW);
-      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, clampedW);
+      const effective = effectiveLayoutFromPreferred(
+        {
+          previewPanelWidth: previewPanelWidthRef.current,
+          urlAside: urlAsidePanelSizeRef.current,
+          main: mainPanelSizeRef.current,
+        },
+        {
+          previewOpen: true,
+          urlPanelAside: previewOpen || channelVodPanelOpen,
+          chromeH: previewChromeHRef.current,
+          aspect,
+        },
+      );
+      const w = effective.preview.w;
+      previewPanelWidthRef.current = w;
+      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
     }
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, previewOpen, channelVodPanelOpen]);
 
+  /**
+   * Sync DOM panel sizes from the runtime-clamped effective layout.
+   * NEVER writes to React state — preferred widths (state) must not be mutated by
+   * info refetch, viewport resize, or any non-user action. Render-time clamping
+   * produces effective widths; this function only paints the DOM.
+   */
   const applyLayoutPanelClamps = useCallback(() => {
     const layout = layoutBoundsInput();
     const clamped = clampAllLayoutPanels(layout);
-    const nextLayout: LayoutPanelBoundsInput = {
-      ...layout,
-      preview: clamped.preview,
-      urlAside: clamped.urlAside,
-      main: clamped.main,
-    };
     if (layout.previewOpen) {
       const w = clampPreviewPanelWidth(
         clamped.preview.w,
         previewChromeHRef.current,
         previewVideoAspectRef.current,
-        nextLayout,
+        { ...layout, preview: clamped.preview, urlAside: clamped.urlAside, main: clamped.main },
       );
       previewPanelWidthRef.current = w;
-      setPreviewPanelWidth(w);
       if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
     }
     if (layout.urlPanelAside) {
       urlAsidePanelSizeRef.current = clamped.urlAside;
-      setUrlAsidePanelSize(clamped.urlAside);
       if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, clamped.urlAside);
     }
     mainPanelSizeRef.current = clamped.main;
-    setMainPanelSize(clamped.main);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clamped.main);
-  }, [layoutBoundsInput, videoInfo]);
+  }, [layoutBoundsInput]);
 
   useEffect(() => {
     applyLayoutPanelClamps();
     const onResize = () => applyLayoutPanelClamps();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen, videoInfo]);
+  }, [applyLayoutPanelClamps, previewOpen, channelVodPanelOpen]);
 
   const layoutRowHasMultiplePanels = useCallback(() => {
     return layoutHasMultiplePanels(layoutBoundsInput());
@@ -2726,20 +2762,26 @@ export default function App() {
     const chromeH = previewChromeHRef.current;
     const aspect = previewVideoAspectRef.current;
     const coupled = layoutRowHasMultiplePanels();
+    // Snapshot at drag start so sibling widths restore when the drag reverses.
+    const dragLayout = layoutBoundsInput();
+    const preferred = {
+      preview: dragLayout.preview.w,
+      urlAside: dragLayout.urlAside.w,
+      main: dragLayout.main.w,
+    };
 
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
       aspect,
       clampWidth: (w) => {
-        const layout = layoutBoundsInput();
         if (coupled) {
-          return resizeLayoutGivingWidthTo(layout, 'preview', w).preview.w;
+          return resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred).preview.w;
         }
-        return clampPreviewPanelWidth(w, chromeH, aspect, layout);
+        return clampPreviewPanelWidth(w, chromeH, aspect, dragLayout);
       },
       onResizeMove: coupled
         ? (w) => {
-            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'preview', w);
+            const fitted = resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred);
             applyLayoutRowSizes(fitted);
           }
         : undefined,
@@ -2751,20 +2793,25 @@ export default function App() {
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
+    const dragLayout = layoutBoundsInput();
+    const preferred = {
+      preview: dragLayout.preview.w,
+      urlAside: dragLayout.urlAside.w,
+      main: dragLayout.main.w,
+    };
     startPanelResizeDrag(e, edge, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
       panelEl: urlAsidePanelRef.current,
-      maxW: layoutMaxPanelWidth('urlAside', layoutBoundsInput()),
+      maxW: layoutMaxPanelWidth('urlAside', dragLayout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => {
-        const layout = layoutBoundsInput();
-        const base = clampPanelSizeForLayout('urlAside', s, layout);
+        const base = clampPanelSizeForLayout('urlAside', s, dragLayout);
         if (!coupled) return base;
-        const fitted = resizeLayoutGivingWidthTo(layout, 'urlAside', base.w);
+        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', base.w, preferred);
         return { w: fitted.urlAside.w, h: base.h };
       },
       onResizeMove: coupled
         ? (next) => {
-            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'urlAside', next.w);
+            const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', next.w, preferred);
             applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } });
           }
         : undefined,
@@ -2774,20 +2821,25 @@ export default function App() {
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
+    const dragLayout = layoutBoundsInput();
+    const preferred = {
+      preview: dragLayout.preview.w,
+      urlAside: dragLayout.urlAside.w,
+      main: dragLayout.main.w,
+    };
     startPanelResizeDrag(e, edge, mainPanelSizeRef, setMainPanelSize, {
       panelEl: mainPanelRef.current,
-      maxW: layoutMaxPanelWidth('main', layoutBoundsInput()),
+      maxW: layoutMaxPanelWidth('main', dragLayout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => {
-        const layout = layoutBoundsInput();
-        const base = clampPanelSizeForLayout('main', s, layout);
+        const base = clampPanelSizeForLayout('main', s, dragLayout);
         if (!coupled) return base;
-        const fitted = resizeLayoutGivingWidthTo(layout, 'main', base.w);
+        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', base.w, preferred);
         return { w: fitted.main.w, h: base.h };
       },
       onResizeMove: coupled
         ? (next) => {
-            const fitted = resizeLayoutGivingWidthTo(layoutBoundsInput(), 'main', next.w);
+            const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', next.w, preferred);
             applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } });
           }
         : undefined,
@@ -2801,7 +2853,7 @@ export default function App() {
     if (chromeH > 0) {
       previewChromeHRef.current = chromeH;
     }
-  }, [previewOpen, previewFullscreen, previewPanelWidth, previewVideoAspect, previewVideoReady]);
+  }, [previewOpen, previewFullscreen, previewVideoAspect, previewVideoReady]);
 
   // ── Fetch video info ──
 
@@ -5116,7 +5168,7 @@ export default function App() {
         style={rowEdgeInsets ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth } : undefined}
       >
       {previewOpen && (
-        <div
+          style={{ width: effectivePreviewPanelWidth }}
           ref={previewPanelRef}
           className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white p-4 flex flex-col gap-3 min-h-0 min-w-0 ${platformCardShadow(layoutPlatform, true)}`}
           style={{ width: previewPanelWidth }}
@@ -5275,7 +5327,7 @@ export default function App() {
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
-        <div
+        style={{ width: effectiveLayout.urlAside.w, height: effectiveLayout.urlAside.h }}
           ref={urlAsidePanelRef}
           className={`group relative shrink-0 overflow-hidden bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
           style={{ width: urlAsidePanelSize.w, height: urlAsidePanelSize.h }}
@@ -5312,7 +5364,7 @@ export default function App() {
       )}
       <div
         ref={mainPanelRef}
-        className={`group relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col min-h-0 ${
+        style={{ width: effectiveLayout.main.w, height: effectiveLayout.main.h }}
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
         } ${platformCardShadow(layoutPlatform)}`}
         style={{ width: mainPanelSize.w, height: mainPanelSize.h }}
@@ -5455,6 +5507,14 @@ export default function App() {
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1 min-w-0">
                       {(() => {
                         const platformFiltersOn = Number(kickEnabled) + Number(twitchEnabled) + Number(youtubeEnabled);
+                        // Per-channel lock: a channel whose only platform is enabled must keep it on,
+                        // otherwise the chip toggle (which is global) empties this channel's view.
+                        const channelPlatformsOn = (['Kick', 'Twitch', 'YouTube'] as const).filter((p) => {
+                          const s = p === 'Kick' ? ch.kickSlug : p === 'Twitch' ? ch.twitchSlug : ch.youtubeSlug;
+                          const on = p === 'Kick' ? kickEnabled : p === 'Twitch' ? twitchEnabled : youtubeEnabled;
+                          return Boolean(s?.trim()) && on;
+                        }).length;
+                        const chipLocked = (enabled: boolean) => enabled && (platformFiltersOn <= 1 || channelPlatformsOn <= 1);
                         return (
                       <div className="flex flex-col gap-1.5 min-w-0 w-full">
                       <div className="flex flex-wrap items-center gap-1.5 min-w-0">
@@ -5500,17 +5560,17 @@ export default function App() {
                                   role="button"
                                   tabIndex={0}
                                   onClick={() => {
-                                    if (enabled && platformFiltersOn <= 1) return;
+                                    if (chipLocked(enabled)) return;
                                     setEnabled((v) => !v);
                                   }}
                                   onKeyDown={(e) => {
                                     if (e.key === 'Enter' || e.key === ' ') {
                                       e.preventDefault();
-                                      if (enabled && platformFiltersOn <= 1) return;
+                                      if (chipLocked(enabled)) return;
                                       setEnabled((v) => !v);
                                     }
                                   }}
-                                  title={enabled && platformFiltersOn <= 1 ? 'At least one platform filter must stay on' : undefined}
+                                  title={chipLocked(enabled) ? 'At least one platform filter must stay on' : undefined}
                                   className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold cursor-pointer select-none ${
                                     enabled ? '' : 'opacity-40'
                                   }`}
