@@ -524,6 +524,13 @@ export default function App() {
   const previewPanelWidthRef = useRef(initialPanelLayout.previewPanelWidth);
   const previewVideoAspectRef = useRef(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const previewChromeHRef = useRef(PREVIEW_PANEL_CHROME_H_EST);
+  // ponytail: lock the preview container height across refetch/aspect changes.
+  // The CSS `aspect-ratio` would re-derive the height from the new video aspect
+  // on every metadata load, collapsing a 16:9 panel to a square when the next
+  // video is 1:1. Storing the last rendered height in a ref and using it as
+  // explicit `height` keeps the panel size the user picked. Upgrade: persist
+  // this to loadPanelLayout so the height survives reloads.
+  const previewPanelHeightRef = useRef(0);
   const urlAsidePanelSizeRef = useRef(initialPanelLayout.urlAside);
   const mainPanelSizeRef = useRef(initialPanelLayout.main);
   const previewPanelRef = useRef<HTMLDivElement>(null);
@@ -2872,6 +2879,11 @@ export default function App() {
       previewChromeHRef.current = chromeH;
     }
   }, [previewOpen, previewFullscreen, previewVideoAspect, previewVideoReady]);
+  useEffect(() => {
+    if (!previewOpen || previewFullscreen || !previewContainerRef.current) return;
+    const h = previewContainerRef.current.offsetHeight;
+    if (h > 0) previewPanelHeightRef.current = h;
+  });
 
   // ── Fetch video info ──
 
@@ -5251,7 +5263,8 @@ export default function App() {
                   ? 'relative border-0'
                   : 'relative w-full shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { aspectRatio: previewVideoAspect, maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
+              style={!previewFullscreen ? { height: previewPanelHeightRef.current || Math.round(effectivePreviewPanelWidth / Math.max(0.01, previewVideoAspect)), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
+
             >
               <div
                 className="relative bg-black overflow-hidden cursor-pointer absolute inset-0 z-0"
