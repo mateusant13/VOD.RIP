@@ -453,6 +453,26 @@ export function edgeAffectsWest(edge: ResizeEdge): boolean {
 export function edgeAffectsNorth(edge: ResizeEdge): boolean {
   return edge === 'n' || edge === 'ne' || edge === 'nw';
 }
+// New position for a floating popup after resizing to `nextSize` from `startSize`
+// at `startPos`: west/north edges keep their outer edge fixed, then the result is
+// clamped to stay `margin` px inside `viewport`. Used by the live player popup.
+export function panelPosAfterResize(
+  edge: ResizeEdge,
+  startPos: PanelPos,
+  startSize: PanelSize,
+  nextSize: PanelSize,
+  viewport: { w: number; h: number },
+  margin = 8,
+): PanelPos {
+  let x = startPos.x;
+  let y = startPos.y;
+  if (edgeAffectsWest(edge)) x = startPos.x + (startSize.w - nextSize.w);
+  if (edgeAffectsNorth(edge)) y = startPos.y + (startSize.h - nextSize.h);
+  return {
+    x: Math.max(margin, Math.min(viewport.w - nextSize.w - margin, x)),
+    y: Math.max(margin, Math.min(viewport.h - nextSize.h - margin, y)),
+  };
+}
 export function calcPanelSizeFromEdge(
   edge: ResizeEdge,
   startW: number,

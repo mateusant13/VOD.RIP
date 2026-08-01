@@ -4,6 +4,7 @@ import {
   layoutMaxPanelWidthAtSiblingMins,
   resizeLayoutGivingWidthTo,
   shrinkLayoutPanelsToFit,
+  panelPosAfterResize,
   PREVIEW_PANEL_MIN_W,
   PANEL_MIN,
 } from './layoutUtils';
@@ -159,5 +160,39 @@ describe('layoutUtils resize budget', () => {
     );
     const total2 = afterMain.live!.w + afterMain.urlAside.w + afterMain.main.w;
     expect(total2).toBeLessThanOrEqual(budget);
+  });
+});
+
+describe('panelPosAfterResize (live popup west/north edges)', () => {
+  const viewport = { w: 1920, h: 1080 };
+
+  it('keeps the west edge fixed when growing to the east', () => {
+    const p = panelPosAfterResize('e', { x: 100, y: 50 }, { w: 480, h: 320 }, { w: 640, h: 320 }, viewport);
+    expect(p).toEqual({ x: 100, y: 50 });
+  });
+
+  it('moves the popup left when growing from the west edge (west edge fixed)', () => {
+    const p = panelPosAfterResize('w', { x: 400, y: 50 }, { w: 480, h: 320 }, { w: 640, h: 320 }, viewport);
+    expect(p).toEqual({ x: 240, y: 50 }); // 400 + (480-640): right edge stays at 880
+  });
+
+  it('moves the popup up when growing from the north edge (north edge fixed)', () => {
+    const p = panelPosAfterResize('n', { x: 100, y: 300 }, { w: 480, h: 320 }, { w: 480, h: 420 }, viewport);
+    expect(p).toEqual({ x: 100, y: 200 }); // 300 + (320-420): bottom edge stays at 620
+  });
+
+  it('moves the popup right when shrinking from the west edge (right edge fixed)', () => {
+    const p = panelPosAfterResize('w', { x: 8, y: 50 }, { w: 480, h: 320 }, { w: 320, h: 320 }, viewport);
+    expect(p.x).toBe(168); // 8 + (480-320): right edge stays at 488
+  });
+
+  it('clamps when growing from the west edge past the on-screen margin', () => {
+    const p = panelPosAfterResize('w', { x: 8, y: 50 }, { w: 480, h: 320 }, { w: 640, h: 320 }, viewport);
+    expect(p.x).toBe(8); // -60 would leave the screen; stays at the margin
+  });
+
+  it('clamps x when the viewport is too small to fit the size at the start pos', () => {
+    const p = panelPosAfterResize('e', { x: 1900, y: 50 }, { w: 480, h: 320 }, { w: 480, h: 320 }, viewport);
+    expect(p.x).toBe(1920 - 480 - 8);
   });
 });
