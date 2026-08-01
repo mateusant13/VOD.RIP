@@ -989,7 +989,14 @@ export default function App() {
     const end = previewTrimEndRef.current;
     const t = Math.max(start, Math.min(sec, end));
     if (previewYoutubeEmbedUrl) {
-      if (!previewVideoReady) return;
+      // ponytail: if the iframe API hasn't bound yet, the seekTo command is
+      // dropped silently and the user thinks the seek is broken. Queue the
+      // target — the effect below replays it the moment previewVideoReady
+      // flips, and the slider stays in sync (optimistic UI was already set).
+      if (!previewVideoReady) {
+        previewPendingSeekSecRef.current = t;
+        return;
+      }
       // Keep this target until YouTube reports the new position. The iframe
       // emits its old time briefly after seekTo; accepting it makes the
       // controlled scrubber jump backwards.
@@ -999,6 +1006,17 @@ export default function App() {
       postYoutubePreviewCommand('seekTo', [t, true]);
       return;
     }
+  // Replay a queued iframe seek when the YouTube embed API finally binds.
+  useEffect(() => {
+    if (!previewVideoReady || !previewYoutubeEmbedUrl) return;
+    const pending = previewPendingSeekSecRef.current;
+    if (pending == null) return;
+    previewPendingSeekSecRef.current = null;
+    previewSeekTargetRef.current = pending;
+    previewTimingRef.current?.markSeekStart(pending);
+    syncPreviewTimeUi(pending, true);
+    postYoutubePreviewCommand('seekTo', [pending, true]);
+  }, [previewVideoReady, previewYoutubeEmbedUrl, syncPreviewTimeUi, postYoutubePreviewCommand]);
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
     previewSeekTargetRef.current = t;
