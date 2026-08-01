@@ -202,12 +202,29 @@ _YT_SOFT_NEG_MARKERS = (
     "preview unavailable for this video",
 )
 _EXTRACT_NEG_CACHE: dict[str, tuple[float, str]] = {}
-_EXTRACT_NEG_TTL_SEC = 120
+# Short TTL: transient YouTube bot-gates/rate-limits clear in seconds, but a 120s
+# negative hit made healthy videos return instant 404s for two minutes.
+_EXTRACT_NEG_TTL_SEC = 30
 
 
 def _youtube_soft_neg_error(exc: BaseException) -> bool:
     msg = (str(exc) or "").lower()
     return any(m in msg for m in _YT_SOFT_NEG_MARKERS)
+
+
+def _should_neg_cache_youtube(exc: BaseException, opts: dict, pb_kind: str) -> bool:
+    """Soft-negative cache only for genuinely blocked videos.
+
+    ``pb_kind == "ok"`` means InnerTube's last player probe played the video, so
+    the chain collapse was transient (network / IP rate-limit / bot-gate on
+    non-InnerTube clients) — stamping "unavailable" would serve 404s for a
+    healthy video until the TTL expires.
+    """
+    return (
+        not opts.get("_warm_light")
+        and pb_kind != "ok"
+        and _youtube_soft_neg_error(exc)
+    )
 
 
 def _youtube_fatal_extract_error(exc: BaseException) -> bool:
@@ -1152,6 +1169,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
                 detail=str(exc)[:200],
             )
         box["error"] = exc
+        _pb_kind = ""
         if isinstance(exc, Exception) and _youtube_url_from_opts(url, opts):
             # The chain collapsed into a generic "unavailable" — prefer InnerTube's
             # real playability reason as the raised message. Fatal reasons (deleted,
@@ -1170,8 +1188,10 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         if isinstance(exc, Exception) and _youtube_fatal_extract_error(exc):
             with _EXTRACT_CACHE_LOCK:
                 _EXTRACT_FATAL_CACHE[key] = (time.time(), str(exc)[:300])
-        elif isinstance(exc, Exception) and not opts.get("_warm_light") and _youtube_soft_neg_error(exc):
+        elif isinstance(exc, Exception) and _should_neg_cache_youtube(exc, opts, _pb_kind):
             # Don't cache warm_light failures — the click's full chain may still work.
+            # Don't cache when InnerTube last probed the video OK — the collapse is
+            # transient (network/bot-gate elsewhere), not a dead video.
             with _EXTRACT_CACHE_LOCK:
                 _EXTRACT_NEG_CACHE[key] = (time.time(), str(exc)[:300])
         raise exc  # not bare `raise` — re-raise the possibly-enriched message
