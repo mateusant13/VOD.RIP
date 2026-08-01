@@ -3,11 +3,13 @@
 import json
 import logging
 import os
+import random
 import re
 import subprocess as sp
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -57,12 +59,103 @@ def kick_live_info(slug: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _twitch_helix_live_info(login: str) -> Optional[dict]:
+    """Fast live-status check via Helix (client creds from env).
+
+    Returns the live metadata dict, or None when the channel is offline.
+    Raises on any API failure so the caller can fall back to a page scrape.
+    """
+    client_id = os.environ.get("TWITCH_CLIENT_ID")
+    client_secret = os.environ.get("TWITCH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise RuntimeError("TWITCH_CLIENT_ID/SECRET not configured")
+
+    token_resp = requests.post(
+        "https://id.twitch.tv/oauth2/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        },
+        timeout=10,
+    )
+    token_resp.raise_for_status()
+    access_token = (token_resp.json() or {}).get("access_token")
+    if not access_token:
+        raise RuntimeError("Helix token missing")
+
+    resp = requests.get(
+        "https://api.twitch.tv/helix/streams",
+        params={"user_login": login.lower()},
+        headers={"Client-Id": client_id, "Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = (resp.json() or {}).get("data") or []
+    if not data:
+        return None  # offline — fast path, no page scrape
+
+    stream = data[0]
+    # Playback token via GQL (same persisted query as VOD, isLive=True) + Usher.
+    from services.twitch_gql_service import VOD_PLAYBACK_TOKEN_HASH, _gql_persisted
+
+    gql_data = _gql_persisted(
+        "PlaybackAccessToken",
+        VOD_PLAYBACK_TOKEN_HASH,
+        {
+            "isLive": True,
+            "login": login.lower(),
+            "isVod": False,
+            "vodID": "",
+            "playerType": "embed",
+            "platform": "site",
+        },
+    )
+    token_node = gql_data.get("streamPlaybackAccessToken") or gql_data.get("playbackAccessToken") or {}
+    sig = token_node.get("signature")
+    token = token_node.get("value")
+    if not sig or not token:
+        raise RuntimeError("no live playback token from GQL")
+
+    query = urlencode({
+        "allow_source": "true",
+        "allow_audio_only": "true",
+        "playlist_include_framerate": "true",
+        "supported_codecs": "h264",
+        "platform": "web",
+        "p": str(random.randint(1_000_000, 9_999_999)),
+        "nauth": token,
+        "nauthsig": sig,
+    })
+    master_url = f"https://usher.ttvnw.net/api/channel/hls/{login.lower()}.m3u8?{query}"
+
+    return {
+        "url": master_url,
+        "headers": {
+            "Referer": "https://www.twitch.tv/",
+            "Origin": "https://www.twitch.tv/",
+        },
+        "title": stream.get("title") or login,
+        "viewers": stream.get("viewer_count") or 0,
+        "platform": "Twitch",
+    }
+
+
 def twitch_live_info(login: str) -> Optional[dict]:
     """Return live-stream metadata dict or None if offline.
 
-    Uses yt-dlp to scrape the channel page, picks the best m3u8 format
-    with height ≤ 720.
+    Uses the Helix API when TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET are set
+    (fast offline detection, no yt-dlp), and falls back to a yt-dlp page
+    scrape otherwise or on any Helix failure.
     """
+    if os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"):
+        try:
+            return _twitch_helix_live_info(login)
+        except Exception as exc:
+            logger.debug(
+                "twitch_live_info(%r): Helix failed — falling back to page scrape: %s", login, exc
+            )
+
     import yt_dlp
 
     url = f"https://www.twitch.tv/{login}"
