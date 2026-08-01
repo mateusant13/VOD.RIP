@@ -2752,26 +2752,29 @@ export default function App() {
     // captures the original siblings as `preferred` and a reverse drag
     // restores them instead of latching the shrunk widths forever.
     const layout = layoutBoundsInput();
+    // ponytail: only the *state* for the dragged panel is set here. The DOM
+    // style is applied by startPanelResizeDrag.onMove (sync, via panelEl),
+    // and the render-time sibling-widths block below handles the rest of the
+    // row. Stamping the target's DOM a second time here used to fight the
+    // drag's own applyPanelSize and cause a flicker on every pointermove.
     if (layout.previewOpen && targetKey === 'preview') {
       previewPanelWidthRef.current = fitted.preview.w;
       setPreviewPanelWidth(fitted.preview.w);
-      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
     }
     if (targetKey === 'urlAside') {
       urlAsidePanelSizeRef.current = fitted.urlAside;
       setUrlAsidePanelSize(fitted.urlAside);
-      if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
     }
     if (targetKey === 'main') {
       mainPanelSizeRef.current = fitted.main;
       setMainPanelSize(fitted.main);
-      if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
     }
     // Render-time sibling widths still need to match the dragged layout so
-    // the row fits the budget while the pointer is down.
-    if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
-    if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
-    if (layout.previewOpen && previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
+    // the row fits the budget while the pointer is down. Skip the dragged
+    // panel — its DOM was already updated by startPanelResizeDrag.onMove.
+    if (targetKey !== 'urlAside' && urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
+    if (targetKey !== 'main' && mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
+    if (layout.previewOpen && targetKey !== 'preview' && previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
     syncRowHeightsToPreview();
   }, [layoutBoundsInput, syncRowHeightsToPreview]);
 
