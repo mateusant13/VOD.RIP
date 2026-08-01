@@ -65,4 +65,56 @@ describe('layoutUtils resize budget', () => {
     const previewMax = layoutMaxPanelWidthAtSiblingMins('preview', layout);
     expect(previewMax + PANEL_MIN.w + PANEL_MIN.w).toBe(budget);
   });
+
+  it('clamps live panel width to min 320 / default 480 at sibling mins', () => {
+    const layout: LayoutPanelBoundsInput = {
+      ...tripleLayout(),
+      previewOpen: true,
+      liveOpen: true,
+      preview: { w: 480, h: 0 },
+      live: { w: 480, h: 0 },
+    };
+    const budget = layoutRowWidthBudget(layout);
+
+    const liveMax = layoutMaxPanelWidthAtSiblingMins('live', layout);
+    expect(liveMax).toBe(budget - PANEL_MIN.w - PANEL_MIN.w);
+
+    // Too narrow → clamped up to 320.
+    const tiny = resizeLayoutGivingWidthTo(layout, 'live', 100);
+    expect(tiny.live?.w).toBe(320);
+    // Too wide → clamped down to max at sibling mins, row stays in budget.
+    const wide = resizeLayoutGivingWidthTo(layout, 'live', 10_000);
+    const total = wide.live!.w + wide.urlAside.w + wide.main.w;
+    expect(total).toBeLessThanOrEqual(budget);
+    expect(wide.live?.w).toBe(liveMax);
+    expect(wide.urlAside.w).toBe(PANEL_MIN.w);
+    expect(wide.main.w).toBe(PANEL_MIN.w);
+  });
+
+  it('restores live width after a drag without letting preview mirror drift', () => {
+    const layout: LayoutPanelBoundsInput = {
+      ...tripleLayout(),
+      previewOpen: true,
+      liveOpen: true,
+      preview: { w: 480, h: 0 },
+      live: { w: 480, h: 0 },
+    };
+    const budget = layoutRowWidthBudget(layout);
+
+    // Drag the live panel toward the urlAside edge.
+    const fitted = resizeLayoutGivingWidthTo(layout, 'live', 560);
+    expect(fitted.live?.w).toBe(560);
+    expect(fitted.preview.w).toBe(560); // preview mirrors the live slot
+    const total = fitted.live!.w + fitted.urlAside.w + fitted.main.w;
+    expect(total).toBeLessThanOrEqual(budget);
+
+    // Shrink the main panel afterwards still fits the row.
+    const afterMain = resizeLayoutGivingWidthTo(
+      { ...layout, preview: { w: fitted.live!.w, h: 0 }, live: { w: fitted.live!.w, h: 0 } },
+      'main',
+      700,
+    );
+    const total2 = afterMain.live!.w + afterMain.urlAside.w + afterMain.main.w;
+    expect(total2).toBeLessThanOrEqual(budget);
+  });
 });

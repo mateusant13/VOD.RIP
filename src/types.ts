@@ -174,11 +174,13 @@ export interface PersistedPanelLayout {
   previewPanelWidth: number;
   urlAside: { w: number; h: number };
   main: { w: number; h: number };
+  /** Width of the live player panel (live replaces the preview slot while open). */
+  livePanelWidth?: number;
 }
 
 export type PanelSize = { w: number; h: number };
 export type PanelPos = { x: number; y: number };
-export type LayoutPanelKey = 'preview' | 'urlAside' | 'main';
+export type LayoutPanelKey = 'preview' | 'urlAside' | 'main' | 'live';
 
 export interface LayoutPanelBoundsInput {
   previewOpen: boolean;
@@ -186,4 +188,7 @@ export interface LayoutPanelBoundsInput {
   preview: PanelSize;
   urlAside: PanelSize;
   main: PanelSize;
+  /** Live player panel; replaces the preview slot while open (never coexists with preview). */
+  liveOpen?: boolean;
+  live?: PanelSize;
 }

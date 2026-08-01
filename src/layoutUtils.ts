@@ -48,10 +48,12 @@ export function layoutMaxPanelWidthAtSiblingMins(
 ): number {
   const budget = layoutRowWidthBudget(layout);
   let minOthers = 0;
-  if (layout.previewOpen && target !== 'preview') minOthers += PREVIEW_PANEL_MIN_W;
+  if (layout.previewOpen && target !== 'preview' && target !== 'live') {
+    minOthers += layout.liveOpen ? LIVE_PANEL_MIN_W : PREVIEW_PANEL_MIN_W;
+  }
   if (layout.urlPanelAside && target !== 'urlAside') minOthers += PANEL_MIN.w;
   if (target !== 'main') minOthers += PANEL_MIN.w;
-  const minTarget = target === 'preview' ? PREVIEW_PANEL_MIN_W : PANEL_MIN.w;
+  const minTarget = target === 'preview' ? PREVIEW_PANEL_MIN_W : target === 'live' ? LIVE_PANEL_MIN_W : PANEL_MIN.w;
   return Math.max(minTarget, budget - minOthers);
 }
 export function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelBoundsInput): number {
@@ -60,7 +62,10 @@ export function layoutMaxPanelWidth(target: LayoutPanelKey, layout: LayoutPanelB
   const gapTotal = Math.max(0, count - 1) * layoutRowGap(layout.previewOpen, layout.urlPanelAside);
 
   let othersW = 0;
-  if (layout.previewOpen && target !== 'preview') othersW += layout.preview.w;
+  const slotIsLive = !!layout.liveOpen;
+  if (layout.previewOpen && target !== 'preview' && target !== 'live') {
+    othersW += slotIsLive ? (layout.live?.w ?? 0) : layout.preview.w;
+  }
   if (layout.urlPanelAside && target !== 'urlAside') othersW += layout.urlAside.w;
   if (target !== 'main') othersW += layout.main.w;
 
@@ -79,8 +84,9 @@ export function clampPanelSizeForLayout(
 ): PanelSize {
   const maxW = layoutMaxPanelWidth(target, layout);
   const maxH = layoutMaxPanelHeight();
+  const minW = target === 'live' ? LIVE_PANEL_MIN_W : PANEL_MIN.w;
   return {
-    w: Math.min(maxW, Math.max(PANEL_MIN.w, size.w)),
+    w: Math.min(maxW, Math.max(minW, size.w)),
     h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
   };
 }
@@ -96,23 +102,32 @@ export function resizeLayoutGivingWidthTo(
   layout: LayoutPanelBoundsInput,
   target: LayoutPanelKey,
   desiredW: number,
-): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
+): { preview: PanelSize; urlAside: PanelSize; main: PanelSize; live?: PanelSize } {
   let preview = { ...layout.preview };
   let urlAside = { ...layout.urlAside };
   let main = { ...layout.main };
+  // Live replaces the preview slot; both stay mirrored while live is open.
+  let live = { ...(layout.live ?? layout.preview) };
 
+  const slotMinW = () => (layout.liveOpen ? LIVE_PANEL_MIN_W : PREVIEW_PANEL_MIN_W);
   const minWFor = (key: LayoutPanelKey) =>
-    key === 'preview' ? PREVIEW_PANEL_MIN_W : PANEL_MIN.w;
+    key === 'preview' || key === 'live' ? slotMinW() : PANEL_MIN.w;
 
   const getW = (key: LayoutPanelKey) => {
-    if (key === 'preview') return preview.w;
+    if (key === 'preview' || key === 'live') return layout.liveOpen ? live.w : preview.w;
     if (key === 'urlAside') return urlAside.w;
     return main.w;
   };
 
   const setW = (key: LayoutPanelKey, w: number) => {
-    if (key === 'preview') preview = { ...preview, w };
-    else if (key === 'urlAside') urlAside = { ...urlAside, w };
+    if (key === 'preview' || key === 'live') {
+      if (layout.liveOpen) {
+        live = { ...live, w };
+        preview = { ...preview, w };
+      } else {
+        preview = { ...preview, w };
+      }
+    } else if (key === 'urlAside') urlAside = { ...urlAside, w };
     else main = { ...main, w };
   };
 
@@ -121,11 +136,11 @@ export function resizeLayoutGivingWidthTo(
 
   type Slot = { get: () => number; set: (w: number) => void; minW: number };
   const siblingSlots: Slot[] = [];
-  if (layout.previewOpen && target !== 'preview') {
+  if (layout.previewOpen && target !== 'preview' && target !== 'live') {
     siblingSlots.push({
-      get: () => preview.w,
-      set: (w) => { preview = { ...preview, w }; },
-      minW: PREVIEW_PANEL_MIN_W,
+      get: () => (layout.liveOpen ? live.w : preview.w),
+      set: (w) => { if (layout.liveOpen) { live = { ...live, w }; preview = { ...preview, w }; } else preview = { ...preview, w }; },
+      minW: slotMinW(),
     });
   }
   if (layout.urlPanelAside && target !== 'urlAside') {
@@ -146,7 +161,7 @@ export function resizeLayoutGivingWidthTo(
   const budget = layoutRowWidthBudget(layout);
   let total = getW(target) + siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
   if (total <= budget) {
-    return { preview, urlAside, main };
+    return layout.liveOpen ? { preview, urlAside, main, live } : { preview, urlAside, main };
   }
 
   let overflow = total - budget;
@@ -159,7 +174,7 @@ export function resizeLayoutGivingWidthTo(
     }
   }
 
-  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
+  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main, live });
 }
 
 /** Shrink siblings when preview grows so the row stays within the viewport budget. */
@@ -175,10 +190,12 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
   urlAside: PanelSize;
   main: PanelSize;
+  live?: PanelSize;
 } {
   let preview = { ...layout.preview };
   let urlAside = { ...layout.urlAside };
   let main = { ...layout.main };
+  let live = { ...(layout.live ?? layout.preview) };
 
   type Slot = {
     get: () => number;
@@ -188,9 +205,9 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
   const slots: Slot[] = [];
   if (layout.previewOpen) {
     slots.push({
-      get: () => preview.w,
-      set: (w) => { preview = { ...preview, w }; },
-      minW: PREVIEW_PANEL_MIN_W,
+      get: () => (layout.liveOpen ? live.w : preview.w),
+      set: (w) => { if (layout.liveOpen) { live = { ...live, w }; preview = { ...preview, w }; } else preview = { ...preview, w }; },
+      minW: layout.liveOpen ? LIVE_PANEL_MIN_W : PREVIEW_PANEL_MIN_W,
     });
   }
   if (layout.urlPanelAside) {
@@ -208,7 +225,9 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
 
   const available = layoutRowWidthBudget(layout);
   let total = slots.reduce((sum, slot) => sum + slot.get(), 0);
-  if (total <= available) return { preview, urlAside, main };
+  if (total <= available) {
+    return layout.liveOpen ? { preview, urlAside, main, live } : { preview, urlAside, main };
+  }
 
   const scale = available / total;
   for (const slot of slots) {
@@ -231,7 +250,7 @@ export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
     total = slots.reduce((sum, slot) => sum + slot.get(), 0);
   }
 
-  const result = { preview, urlAside, main };
+  const result = layout.liveOpen ? { preview, urlAside, main, live } : { preview, urlAside, main };
   if (typeof window !== 'undefined') {
     let rowTotal = 0;
     if (layout.previewOpen) rowTotal += result.preview.w;
@@ -247,33 +266,43 @@ export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
   urlAside: PanelSize;
   main: PanelSize;
+  live?: PanelSize;
 } {
   const maxH = layoutMaxPanelHeight();
   let preview = { ...layout.preview };
   let urlAside = { ...layout.urlAside };
   let main = { ...layout.main };
+  let live = { ...(layout.live ?? layout.preview) };
   const snapshot = (): LayoutPanelBoundsInput => ({
     ...layout,
     preview,
     urlAside,
     main,
+    live,
   });
 
   if (layout.previewOpen) {
-    const w = clampPreviewPanelWidth(
-      preview.w,
-      PREVIEW_PANEL_CHROME_H_EST,
-      PREVIEW_VIDEO_ASPECT_DEFAULT,
-      snapshot(),
-    );
-    preview = { w, h: preview.h };
+    if (layout.liveOpen) {
+      const clamped = clampPanelSizeForLayout('live', { ...live, h: Math.min(live.h, maxH) }, snapshot());
+      live = clamped;
+      preview = { ...preview, w: clamped.w };
+    } else {
+      const w = clampPreviewPanelWidth(
+        preview.w,
+        PREVIEW_PANEL_CHROME_H_EST,
+        PREVIEW_VIDEO_ASPECT_DEFAULT,
+        snapshot(),
+      );
+      preview = { w, h: preview.h };
+    }
   }
   if (layout.urlPanelAside) {
     urlAside = clampPanelSizeForLayout('urlAside', { ...urlAside, h: Math.min(urlAside.h, maxH) }, snapshot());
   }
   main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
 
-  return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
+  const fitted = shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main, live });
+  return fitted;
 }
 export function maxPreviewPanelWidth(
   chromeH: number,
@@ -559,6 +588,7 @@ export function defaultPanelLayout(): PersistedPanelLayout {
       w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
       h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
     },
+    livePanelWidth: Math.round(LIVE_PANEL_DEFAULT_W * scale),
   };
 }
 export function loadPanelLayout(): PersistedPanelLayout {
@@ -582,6 +612,18 @@ export function loadPanelLayout(): PersistedPanelLayout {
       ),
       urlAside: clampStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
       main: clampStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
+      livePanelWidth: clampLayoutNumber(
+        parsed.livePanelWidth,
+        LIVE_PANEL_MIN_W,
+        layoutMaxPanelWidthAtSiblingMins('live', {
+          previewOpen: true,
+          urlPanelAside: true,
+          preview: { w: fallback.previewPanelWidth, h: 0 },
+          urlAside: fallback.urlAside,
+          main: fallback.main,
+        }),
+        fallback.livePanelWidth ?? LIVE_PANEL_DEFAULT_W,
+      ),
     };
   } catch {
     return fallback;
@@ -616,6 +658,8 @@ export const PREVIEW_PANEL_DEFAULT_W = 640;
 export const PREVIEW_PANEL_MIN_W = 280;
 export const PREVIEW_PANEL_CHROME_H_EST = 120;
 export const PREVIEW_PANEL_PAD_H = 32;
+export const LIVE_PANEL_DEFAULT_W = 480;
+export const LIVE_PANEL_MIN_W = 320;
 export const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
 export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
 /** Min height when trim UI + action buttons must stay visible. */

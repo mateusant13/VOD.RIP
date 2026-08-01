@@ -5636,13 +5636,32 @@ export default function App() {
                           <Loader2 size={18} className="animate-spin" />
                         </div>
                       ) : visibleChannelVideos.length === 0 ? (
-                        <p className="text-center text-zinc-600 font-mono text-[10px] py-3">
-                          {channelContentFilter === 'clips'
-                            ? (youtubePlatformOnly ? 'No shorts' : 'No clips')
-                            : channelContentFilter === 'streams'
-                              ? 'No VODs'
-                              : (youtubePlatformOnly ? 'No videos' : 'No VODs')}
-                        </p>
+                        <>
+                          {selectedChannelFirstLiveEntry && (channelContentFilter === 'vods' && !youtubePlatformOnly || channelContentFilter === 'streams' && youtubePlatformOnly) && (
+                            <div
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName)}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
+                              className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
+                            >
+                              <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+                              <span className="text-[9px] font-bold text-red-400 shrink-0">● LIVE</span>
+                              <span className="text-[10px] text-zinc-300 truncate">{selectedChannelFirstLiveEntry.title}</span>
+                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">LIVE</span>
+                              {selectedChannelFirstLiveEntry.viewer_count != null && (
+                                <span className="text-[9px] text-zinc-500 shrink-0">{selectedChannelFirstLiveEntry.viewer_count}w</span>
+                              )}
+                            </div>
+                          )}
+                          <p className="text-center text-zinc-600 font-mono text-[10px] py-3">
+                            {channelContentFilter === 'clips'
+                              ? (youtubePlatformOnly ? 'No shorts' : 'No clips')
+                              : channelContentFilter === 'streams'
+                                ? 'No VODs'
+                                : (youtubePlatformOnly ? 'No videos' : 'No VODs')}
+                          </p>
+                        </>
                       ) : (
                         <div className="flex flex-col gap-1">
                           {selectedChannelVodUrls.size > 0 && (
