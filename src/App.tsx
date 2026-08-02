@@ -630,25 +630,27 @@ export default function App() {
   // preferred widths.
   useEffect(() => {
     if (!panelLayoutPersistReadyRef.current) return;
-    const layout = {
+    persistPanelLayout({
       previewPanelWidth,
       urlAside: urlAsidePanelSize,
       main: mainPanelSize,
       owned: { ...preferredDragRef.current },
-    };
-    persistPanelLayout(layout);
+    });
     if (panelLayoutSaveTimerRef.current) {
       window.clearTimeout(panelLayoutSaveTimerRef.current);
     }
+    // Debounced reconciler for state-driven changes; serializes the latest
+    // refs (incl. `owned`) via the keepalive flush so an in-flight POST
+    // survives navigation. Drag-end calls flushPanelLayoutToBackend() directly.
     panelLayoutSaveTimerRef.current = window.setTimeout(() => {
-      apiPost('/api/settings', { panel_layout: layout }).catch(() => {});
+      flushPanelLayoutToBackend();
     }, 400);
     return () => {
       if (panelLayoutSaveTimerRef.current) {
         window.clearTimeout(panelLayoutSaveTimerRef.current);
       }
     };
-  }, [previewPanelWidth, urlAsidePanelSize, mainPanelSize]);
+  }, [previewPanelWidth, urlAsidePanelSize, mainPanelSize, flushPanelLayoutToBackend]);
 
   // Queue
   const [queueDownloads, setQueueDownloads] = useState<DownloadState[]>([]);
@@ -2840,9 +2842,12 @@ export default function App() {
       onResizeEnd: () => {
         preferredDragRef.current.preview = previewPanelWidthRef.current;
         applyLayoutPanelClamps();
+        // Persist right away (localStorage + keepalive POST): waiting for the
+        // debounced effect would lose the fresh `owned` on a fast reload.
+        flushPanelLayoutToBackend();
       },
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes, flushPanelLayoutToBackend]);
 
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
@@ -2867,9 +2872,10 @@ export default function App() {
       onResizeEnd: () => {
         preferredDragRef.current.urlAside = urlAsidePanelSizeRef.current.w;
         applyLayoutPanelClamps();
+        flushPanelLayoutToBackend();
       },
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes, flushPanelLayoutToBackend]);
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
@@ -2893,9 +2899,10 @@ export default function App() {
       onResizeEnd: () => {
         preferredDragRef.current.main = mainPanelSizeRef.current.w;
         applyLayoutPanelClamps();
+        flushPanelLayoutToBackend();
       },
     });
-  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
+  }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes, flushPanelLayoutToBackend]);
 
   useEffect(() => {
     if (!previewOpen || previewFullscreen || !previewPanelRef.current || !previewContainerRef.current) return;

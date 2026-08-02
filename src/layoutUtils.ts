@@ -741,21 +741,27 @@ export function userOwnedWidthsFrom(layout: PersistedPanelLayout): {
   };
 }
 /**
- * Migration heal for layouts persisted by the pre-owned resize bug: a panel
- * parked at its minimum width in BOTH the visual layout and the owned/fallback
- * restore target is a squeeze artifact, not a user choice. Reset its owned
- * width to the default shape (so a reverse drag grows it back) and grow the
- * visual width now while the row has slack (so a reload doesn't show the
- * thin rectangle at all). No-op for panels above min — those may be deliberate.
+ * Migration heal for layouts persisted by the pre-owned resize bug: legacy
+ * data has no `owned` field, so a min-parked panel's restore target falls back
+ * to its own (thin) visual width — the one-way-ratchet that never restored
+ * squares. For those layouts, reset the min-parked owned width to the default
+ * shape (so a reverse drag grows it back) and grow the visual width now while
+ * the row has slack. Layouts WITH `owned` are untouched: owned is the user's
+ * restore target, and a deliberate drag to the minimum writes owned == min.
  * ponytail: a stronger heuristic (e.g. resetting any sub-default width from
  * legacy data) could restore legacy proportional leftovers, but would also
- * fight deliberate small sizes; exact-min only for now.
+ * fight deliberate small sizes; exact-min only, and only for owned-less data.
  */
 export function healSqueezedPanelLayout(
   layout: PersistedPanelLayout,
 ): PersistedPanelLayout & { owned: { preview: number; urlAside: number; main: number } } {
-  const defaults = defaultPanelLayout();
   const owned = userOwnedWidthsFrom(layout);
+  const legacy = !layout.owned || typeof layout.owned !== 'object';
+  if (!legacy) {
+    return { ...layout, owned };
+  }
+
+  const defaults = defaultPanelLayout();
 
   const healedOwned = {
     preview: owned.preview <= PREVIEW_PANEL_MIN_W + 1 ? defaults.previewPanelWidth : owned.preview,

@@ -212,6 +212,22 @@ describe('layoutUtils resize budget', () => {
     expect(healed.owned.urlAside).toBeGreaterThan(PANEL_MIN.w);
     expect(healed.owned.main).toBeGreaterThan(PANEL_MIN.w);
   });
+
+  it('preserves deliberate exact-min drags when owned exists', () => {
+    // New-code data: the user dragged the preview to its minimum on purpose —
+    // drag-end wrote owned == min. The heal must NOT reset it on reload.
+    const layout = {
+      previewPanelWidth: PREVIEW_PANEL_MIN_W,
+      urlAside: { w: PANEL_MIN.w, h: 437 },
+      main: { w: PANEL_MIN.w, h: 437 },
+      owned: { preview: PREVIEW_PANEL_MIN_W, urlAside: PANEL_MIN.w, main: PANEL_MIN.w },
+    };
+    const healed = healSqueezedPanelLayout(layout);
+    expect(healed.previewPanelWidth).toBe(PREVIEW_PANEL_MIN_W);
+    expect(healed.urlAside.w).toBe(PANEL_MIN.w);
+    expect(healed.owned.preview).toBe(PREVIEW_PANEL_MIN_W);
+    expect(healed.owned.main).toBe(PANEL_MIN.w);
+  });
 });
 
 describe('panelPosAfterResize (live popup west/north edges)', () => {
