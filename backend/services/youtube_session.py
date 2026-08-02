@@ -24,6 +24,12 @@ _VISITOR_ID_URL = f"https://www.youtube.com/youtubei/v1/visitor_id?key={_INNERTU
 _YT_UA = YT_USER_AGENT
 _CONNECT_TIMEOUT_SEC = 0.9
 _READ_TIMEOUT_SEC = 6.0
+# POT availability probe: the bgutil server is localhost, so a 0.3s ping is
+# plenty; when it is down, a 5s negative cache stops every call from burning
+# the full ping timeout. Purely additive — never reorders the fallback chain.
+_POT_FAST_PING_TIMEOUT_S = 0.3
+_POT_DOWN_WINDOW_S = 5.0
+_POT_DOWN_UNTIL = 0.0  # monotonic deadline while the server is believed down
 _ANON_LOCK = threading.Lock()
 _ANON_TTL_SEC = 2 * 3600
 _ANON_BOOT_EVENT: Optional[threading.Event] = None
@@ -450,6 +456,26 @@ def youtube_session_from_settings(
     )
 
 
+def _pot_server_available() -> bool:
+    """Fast POT-server ping with a 5s negative cache.
+
+    When the server is up this is a plain (fast) ping; when it is down we pay
+    0.3s once per window instead of the full 1.5s ping on every call.
+    """
+    global _POT_DOWN_UNTIL
+    now = time.monotonic()
+    if now < _POT_DOWN_UNTIL:
+        return False
+    try:
+        from services.youtube_pot_service import pot_service_ping
+
+        ok = pot_service_ping(timeout=_POT_FAST_PING_TIMEOUT_S)
+    except Exception:
+        ok = False
+    _POT_DOWN_UNTIL = now + _POT_DOWN_WINDOW_S if not ok else 0.0
+    return ok
+
+
 def resolve_video_po_token(
     video_id: Optional[str],
     settings_po: Optional[str] = None,
@@ -462,9 +488,9 @@ def resolve_video_po_token(
     if not vid:
         return None
     try:
-        from services.youtube_pot_service import fetch_video_po_token, pot_service_ping
+        from services.youtube_pot_service import fetch_video_po_token
 
-        if not pot_service_ping():
+        if not _pot_server_available():
             return None
         return fetch_video_po_token(vid)
     except Exception:
@@ -477,9 +503,7 @@ def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = T
         "player_client": ["web_safari", "ios", "android", "mweb", "tv"],
     }
     try:
-        from services.youtube_pot_service import pot_service_ping
-
-        args["fetch_pot"] = ["auto"] if pot_service_ping() else ["never"]
+        args["fetch_pot"] = ["auto"] if _pot_server_available() else ["never"]
     except Exception:
         args["fetch_pot"] = ["never"]
     if session.visitor_data:
@@ -538,6 +562,21 @@ def apply_ytdlp_cookie_opts(
     if browser:
         opts["cookiesfrombrowser"] = (browser,)
 
+
+# Negative cache: a failing fast ping must be remembered (no repeat probes
+# within the window), and a fresh window must probe again.
+import services.youtube_pot_service as _pot_mod
+
+_orig_pot_ping = _pot_mod.pot_service_ping
+_pot_mod.pot_service_ping = lambda *a, **k: False
+_POT_DOWN_UNTIL = 0.0
+assert _pot_server_available() is False
+assert _POT_DOWN_UNTIL > time.monotonic(), "failed ping must arm the negative cache"
+_pot_mod.pot_service_ping = lambda *a, **k: True
+_POT_DOWN_UNTIL = 0.0
+assert _pot_server_available() is True
+_POT_DOWN_UNTIL = 0.0
+_pot_mod.pot_service_ping = _orig_pot_ping
 
 assert youtube_session_from_values(visitor_data="abc", auto_auth=False).visitor_data == "abc"
 _anon_vd, _anon_ch, _anon_cf, _anon_http = bootstrap_anonymous_session(force=True)
