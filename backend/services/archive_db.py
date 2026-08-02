@@ -128,7 +128,11 @@ def get_conn() -> sqlite3.Connection:
         if _conn is None:
             path = _db_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(path), timeout=10.0)
+            # check_same_thread=False: workers (archive_transcribe, chat
+            # backfill) call into this module from pool threads; the module
+            # RLock serializes every access, so the C-level safety check is
+            # redundant paranoia here.
+            conn = sqlite3.connect(str(path), timeout=10.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
