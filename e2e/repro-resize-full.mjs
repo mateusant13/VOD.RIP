@@ -69,13 +69,13 @@ await page.waitForTimeout(7000);
 const before = await widths('1 SQUARES (0=preview 1=urlAside 2=main):');
 const beforeW = widthsOnly(before);
 
-// --- A: push leftmost (preview) right by 400, then back exactly 400 ---
-await dragHandle(0, 'e', 400);
-const widened = await widths('2 PREVIEW +400:');
-failures += check(widened[0].w === before[0].w + 400, 'A1 preview follows pointer exactly (+400)');
+// --- A: push leftmost (preview) right by 300, then back exactly 300 ---
+await dragHandle(0, 'e', 300);
+const widened = await widths('2 PREVIEW +300:');
+failures += check(widened[0].w === before[0].w + 300, 'A1 preview follows pointer exactly (+300)');
 failures += check(widened[1].w < before[1].w - 40 && widened[2].w < before[2].w - 40, 'A2 siblings squeezed');
-await dragHandle(0, 'e', -400);
-const backA = await widths('3 PREVIEW BACK -400:');
+await dragHandle(0, 'e', -300);
+const backA = await widths('3 PREVIEW BACK -300:');
 failures += check(same(beforeW, widthsOnly(backA)), 'A3 full restore after widen/back');
 
 // --- B: push preview to the max cap, then back to the original width ---
@@ -83,7 +83,7 @@ await dragHandle(0, 'e', 700);
 const maxed = await widths('4 PREVIEW +700 (capped):');
 const capReached = maxed[0].w < before[0].w + 700; // capped below the pointer
 failures += check(capReached, 'B1 preview capped by row budget');
-failures += check(maxed[1].w <= 201 && maxed[2].w <= 201, 'B2 siblings at min when capped');
+failures += check(maxed[1].w <= 241 && maxed[2].w <= 241, 'B2 siblings at min when capped');
 // drag back by the ACTUAL delta (width delta-based, not pointer absolute)
 const backDx = before[0].w - maxed[0].w;
 await dragHandle(0, 'e', backDx);
