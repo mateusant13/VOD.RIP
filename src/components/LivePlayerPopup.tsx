@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Minimize2, Pause, Play, Volume2, VolumeX } from 'lucide-react';
+import { Maximize2, Minimize2, Pause, Play, Volume2, VolumeX, RefreshCw } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import type { PanelSize, PreviewSessionResponse } from '../types';
 import {
@@ -15,6 +15,7 @@ import {
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
+import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
 
 interface LiveEntry {
   url: string;
@@ -59,6 +60,22 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
   const [size, setSize] = useState<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Per-media retry state — the live pipeline is a single stage (session
+  // create + attach happen together), so every retry re-runs it end-to-end.
+  const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
+  const previewRetryRef = useRef<PreviewRetryState | null>(null);
+  const previewRetryingRef = useRef(false);
+  const [retryTick, setRetryTick] = useState(0);
+  const clearRetry = useCallback(() => {
+    previewRetryingRef.current = false;
+    previewRetryRef.current = null;
+    setPreviewRetry(null);
+  }, []);
+  const markPreviewError = useCallback(() => {
+    const wasRetry = previewRetryingRef.current;
+    previewRetryingRef.current = false;
+    setPreviewRetry(previewRetryAfterError(previewRetryRef.current, entry.url, 'session', wasRetry));
+  }, [entry.url]);
   const [drag, setDrag] = useState<DragState>(null);
 
   // Transport state
@@ -124,6 +141,21 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
     onClose();
   }, [cleanup, onClose]);
 
+  /** RETRY this live stream only — delete any stale session and re-run the
+   *  mount effect end-to-end (live has a single stage: create + attach). */
+  const retryPreview = useCallback(() => {
+    const ctx = previewRetryRef.current;
+    if (!ctx) return;
+    setError(null);
+    previewRetryingRef.current = true;
+    const sid = sessionIdRef.current;
+    if (sid) {
+      void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
+      sessionIdRef.current = null;
+    }
+    setRetryTick((t) => t + 1);
+  }, []);
+
   // Create preview session on mount
   useEffect(() => {
     let cancelled = false;
@@ -138,7 +170,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
 
         const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body);
         if (cancelled) return;
-        if (!res) { setError('No response from server'); setLoading(false); return; }
+        if (!res) { setError('No response from server'); setLoading(false); markPreviewError(); return; }
 
         sessionIdRef.current = res.session_id;
 
@@ -152,7 +184,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
         if (src && !isHls) {
           // Progressive stream
           video.src = src;
-          video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
+          video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
           video.play().catch(() => {});
         } else if (src) {
           // HLS stream — use hls.js if available, else native HLS
@@ -168,6 +200,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
               hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 if (cancelled) return;
                 setLoading(false);
+                clearRetry();
                 // Populate quality levels
                 const lvls: LevelInfo[] = hls.levels.map((l: any, i: number) => ({
                   index: i,
@@ -181,23 +214,36 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
               hls.on(Hls.Events.LEVEL_SWITCHED, (_e: any, data: any) => {
                 setCurrentLevel(data.level);
               });
+
+              // Surface fatal playback failures so the RETRY button can appear
+              // instead of an eternal spinner.
+              hls.on(Hls.Events.ERROR, (_e: unknown, data: any) => {
+                if (!data?.fatal) return;
+                setError('Live playback failed — try again');
+                setLoading(false);
+                try { hls.destroy(); } catch { /* ignore */ }
+                hlsRef.current = null;
+                markPreviewError();
+              });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
               video.src = src;
-              video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
+              video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
               video.play().catch(() => {});
             } else {
               setError('HLS not supported in this browser');
               setLoading(false);
+              markPreviewError();
             }
           } catch {
             // hls.js failed to load, try native HLS
             if (video.canPlayType('application/vnd.apple.mpegurl')) {
               video.src = src;
-              video.addEventListener('loadedmetadata', () => setLoading(false), { once: true });
+              video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
               video.play().catch(() => {});
             } else {
               setError('HLS not supported');
               setLoading(false);
+              markPreviewError();
             }
           }
         } else {
@@ -209,12 +255,21 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
         if (!cancelled) {
           setError(err?.message || 'Failed to start live stream');
           setLoading(false);
+          markPreviewError();
         }
       }
     })();
 
-    return () => { cancelled = true; };
-  }, [entry.url, entry.headers, entry.platform, abortRef]);
+    return () => {
+      cancelled = true;
+      // A retry re-runs this effect — destroy the previous hls instance so
+      // two players never fight over the same <video> element.
+      if (hlsRef.current) {
+        try { hlsRef.current.destroy(); } catch { /* ignore */ }
+        hlsRef.current = null;
+      }
+    };
+  }, [entry.url, entry.headers, entry.platform, abortRef, retryTick, markPreviewError, clearRetry]);
 
   // Sync transport state from the video element
   useEffect(() => {
@@ -429,12 +484,29 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
         {error && (
           <div
             style={{
-              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
-              justifyContent: 'center', background: 'rgba(0,0,0,0.7)', color: '#e06c75', fontSize: 13,
+              position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 10,
+              background: 'rgba(0,0,0,0.7)', color: '#e06c75', fontSize: 13,
               padding: 16, textAlign: 'center',
             }}
           >
-            {error}
+            <div>{error}</div>
+            {previewRetry && (
+              <button
+                type="button"
+                onClick={retryPreview}
+                title="Retry this live stream"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, fontSize: 11,
+                  fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+                  color: '#e06c75', border: '1px solid rgba(224,108,117,0.5)',
+                  background: 'rgba(224,108,117,0.08)', padding: '4px 10px', cursor: 'pointer',
+                }}
+              >
+                <RefreshCw size={12} />
+                Retry
+              </button>
+            )}
           </div>
         )}
 

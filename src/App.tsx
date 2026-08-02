@@ -84,6 +84,7 @@ import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
+import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 
 // ─── TYPES (migrated to src/types.ts) ───────────────
 
@@ -328,6 +329,26 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [videoInfoThumbFailed, setVideoInfoThumbFailed] = useState(false);
 
+  // Per-media preview retry: which single media failed + how many retries
+  // already failed, so the error banner's RETRY button escalates stage → full.
+  const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
+  const previewRetryRef = useRef<PreviewRetryState | null>(null);
+  const previewRetryingRef = useRef(false);
+  // Bumping this re-runs the playback-attach effect (stage retry for the same session).
+  const [previewRetryTick, setPreviewRetryTick] = useState(0);
+  const setPreviewRetryBoth = useCallback((s: PreviewRetryState | null) => {
+    previewRetryRef.current = s;
+    setPreviewRetry(s);
+  }, []);
+
+  /** Record which single media failed and at which stage. Keeps the per-media
+   *  retry count so the NEXT RETRY click escalates stage retry → full pipeline. */
+  const markPreviewError = useCallback((mediaUrl: string, stage: PreviewRetryStage) => {
+    const wasRetry = previewRetryingRef.current;
+    previewRetryingRef.current = false;
+    setPreviewRetryBoth(previewRetryAfterError(previewRetryRef.current, mediaUrl, stage, wasRetry));
+  }, [setPreviewRetryBoth]);
+
   // Download options
   const [quality, setQuality] = useState('source');
   const [downloadAsAudio, setDownloadAsAudio] = useState(false);
@@ -452,7 +473,10 @@ export default function App() {
     trimStart: previewTrimStartRef.current,
     trimTimelineRef: previewTrimTimelineRef,
     onPreviewError: (msg: string) => {
-      if (msg) setError(msg);
+      if (msg) {
+        setError(msg);
+        markPreviewError(url.trim(), 'playback');
+      }
     },
   });
 
@@ -985,6 +1009,8 @@ export default function App() {
     previewGenRef.current += 1; // cancel any in-flight openPreview
     previewStartedRef.current = false;
     previewLoadedUrlRef.current = null;
+    previewRetryingRef.current = false;
+    setPreviewRetryBoth(null);
     const sid = previewSessionId;
     destroyPreviewPlayer();
     setPreviewOpen(false);
@@ -1271,9 +1297,9 @@ export default function App() {
     }, PREVIEW_SEEK_DEBOUNCE_MS);
   }, [seekPreviewVideoImmediate]);
 
-  const openPreview = useCallback(async () => {
-    if (!url.trim()) return;
-    if (trimEndSec <= trimStartSec) return;
+  const openPreview = useCallback(async (): Promise<boolean> => {
+    if (!url.trim()) return false;
+    if (trimEndSec <= trimStartSec) return false;
     const trimmedUrl = url.trim();
     // Already showing this URL — no-op unless playback failed and user is retrying
     if (
@@ -1281,7 +1307,12 @@ export default function App() {
       && previewLoadedUrlRef.current === trimmedUrl
       && previewOpenRef.current
       && (previewVideoReadyRef.current || previewVideoLoadingRef.current)
-    ) return;
+    ) return true;
+    // A manual open starts a fresh retry budget; a RETRY-triggered open keeps it
+    // so a repeated failure escalates to the full pipeline.
+    if (!previewRetryingRef.current) {
+      setPreviewRetryBoth(null);
+    }
     previewStartedRef.current = true;
     youtubePrefetchGenRef.current += 1;
     const pagePlatform = detectUrlPlatform(trimmedUrl) ?? 'unknown';
@@ -1388,7 +1419,7 @@ export default function App() {
         crop_end: end,
         prefer_height: previewPreferHeight,
       });
-      if (bailIfSuperseded()) return;
+      if (bailIfSuperseded()) return false;
       timing.setSessionId(res.session_id);
       timing.mark('session_ready', `kind=${res.kind} trim=${res.trim_timeline === true}`);
       previewExtractSourceRef.current = res.extract_source ?? '';
@@ -1398,7 +1429,7 @@ export default function App() {
       const clipInfo = clipPreview && !qualityLabels?.length
         ? await apiGet<VideoInfo>(`/api/info/clip?id=${encodeURIComponent(trimmedUrl)}`).catch(() => null)
         : null;
-      if (bailIfSuperseded()) return;
+      if (bailIfSuperseded()) return false;
       if (clipInfo?.qualities?.length) {
         qualityLabels = clipInfo.qualities;
       }
@@ -1442,14 +1473,58 @@ export default function App() {
         activeHeight,
       });
       previewLoadedUrlRef.current = trimmedUrl;
+      return true;
     } catch (err: any) {
       previewStartedRef.current = false;
       previewLoadedUrlRef.current = null;
       setError(err.message || 'Preview failed');
+      markPreviewError(trimmedUrl, 'session');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
+      return false;
     }
   }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo, videoInfo?.qualities, videoInfo?.title]);
+
+  /**
+   * RETRY button for the failing media only. First click re-runs just the
+   * failed stage; after a failed retry the next click runs the full pipeline
+   * end-to-end for that media (drop stale session + force fresh backend
+   * extract — never touches other media/channels).
+   */
+  const retryPreview = useCallback(async () => {
+    const ctx = previewRetryRef.current;
+    if (!ctx) return;
+    setError(null);
+    previewRetryingRef.current = true;
+    try {
+      if (previewRetryMode(ctx) === 'full') {
+        // Escalation: end-to-end for THIS media only. Delete any stale session
+        // and clear the backend's per-URL caches (fatal/negative extract caches
+        // live 30-300s) so the fresh POST re-extracts instead of re-raising.
+        const sid = previewSessionIdRef.current;
+        if (sid) {
+          try { await apiDelete(`/api/preview/session/${sid}`); } catch { /* ignore */ }
+        }
+        try { await apiPost('/api/preview/invalidate', { url: ctx.url }); } catch { /* ignore */ }
+      }
+      if (ctx.stage === 'playback' && previewRetryMode(ctx) === 'stage') {
+        // Stage retry: re-attach playback to the SAME session. The attach
+        // effect reports success (canplay clears the context) or failure
+        // (markPreviewError escalates attempts). No new session, no refresh.
+        setPreviewRetryTick((t) => t + 1);
+        return;
+      }
+      // Session-stage retry and full retries both re-run create + attach.
+      const ok = await openPreview();
+      if (ok) {
+        previewRetryingRef.current = false;
+        setPreviewRetryBoth(null);
+      }
+    } catch (err: unknown) {
+      previewRetryingRef.current = false;
+      setError(err instanceof Error ? err.message : 'Preview failed');
+    }
+  }, [openPreview, setPreviewRetryBoth]);
 
   // ─── YouTube preview warm — per-channel VOD limit ────────────────
   // mergeVodLists sorts vodVideos by created_at desc (newest first; see channelUtils.ts:157-160),
@@ -1595,6 +1670,9 @@ export default function App() {
     };
 
     const onCanPlay = () => {
+      // Playback genuinely started — any in-flight retry succeeded.
+      previewRetryingRef.current = false;
+      setPreviewRetryBoth(null);
       setPreviewVideoReady(true);
       setPreviewBuffering(false);
       setPreviewVideoLoading(false);
@@ -1701,6 +1779,7 @@ export default function App() {
         onFatal: () => {
           setError('Preview interrupted — try again');
           setPreviewVideoLoading(false);
+          markPreviewError(previewPageUrl, 'playback');
         },
         onSessionRefresh: (res) => {
           previewPendingSeekSecRef.current = previewSeekTargetRef.current ?? video.currentTime;
@@ -1735,12 +1814,14 @@ export default function App() {
       if (!sid) {
         setError("Preview session missing");
         setPreviewVideoLoading(false);
+        markPreviewError(previewPageUrl, 'session');
         return;
       }
       const mse = msePlayerRef.current;
       if (!mse) {
         setError("MSE player unavailable");
         setPreviewVideoLoading(false);
+        markPreviewError(previewPageUrl, 'playback');
         return;
       }
       mse.attach(sid)
@@ -1782,6 +1863,7 @@ export default function App() {
         setPreviewVideoLoading(false);
         previewStartedRef.current = false;
         previewLoadedUrlRef.current = null;
+        markPreviewError(previewPageUrl, 'session');
         try { hls.stopLoad(); hls.destroy(); } catch { /* ignore */ }
         previewHlsRef.current = null;
         setHlsRef(null);
@@ -1909,7 +1991,13 @@ export default function App() {
             if (networkRetries < 2) {
               networkRetries += 1;
               window.setTimeout(() => {
-                if (!cancelled) hls.startLoad();
+                if (!cancelled) {
+                  // startLoad() alone is a no-op after a fatal manifest error
+                  // (levels empty → StreamController returns immediately);
+                  // re-loadSource forces a fresh manifest fetch.
+                  hls.loadSource(playbackUrl);
+                  hls.startLoad();
+                }
               }, networkRetries * 500);
               break;
             }
@@ -1926,6 +2014,7 @@ export default function App() {
                   setError('Preview playback failed — try again');
                   setPreviewVideoLoading(false);
                   previewStartedRef.current = false;
+                  markPreviewError(previewPageUrl, 'playback');
                   hls.destroy();
                   previewHlsRef.current = null;
                 });
@@ -1934,6 +2023,7 @@ export default function App() {
             setError('Preview playback failed — try again');
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
+            markPreviewError(previewPageUrl, 'playback');
             hls.destroy();
             previewHlsRef.current = null;
             break;
@@ -1944,6 +2034,7 @@ export default function App() {
             setError('Preview playback failed — try again');
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
+            markPreviewError(previewPageUrl, 'playback');
             hls.destroy();
             previewHlsRef.current = null;
             break;
@@ -1964,6 +2055,7 @@ export default function App() {
       return;
       };
       attachViaHls();
+      return; // hls.js owns this session — do not fall through to native/unsupported
 
     }
 
@@ -1981,6 +2073,7 @@ export default function App() {
 
     setError('HLS playback is not supported in this browser');
     setPreviewVideoLoading(false);
+    markPreviewError(previewPageUrl, 'playback');
     };
 
     setup();
@@ -1990,7 +2083,7 @@ export default function App() {
       detachBuffering?.();
       cleanup?.();
     };
-  }, [previewOpen, previewPlayback, previewSessionId]);
+  }, [previewOpen, previewPlayback, previewSessionId, previewRetryTick]);
 
   useEffect(() => {
     if (!previewYoutubeEmbedUrl) return;
@@ -5490,9 +5583,20 @@ export default function App() {
         {/* ── ERROR ── */}
         {error && (
           <div className="border-2 border-red-500/75 bg-red-500/15 p-3 text-red-300 text-xs font-mono flex items-center gap-2 shrink-0">
-            <AlertCircle size={14} />
-            {error}
-            <button onClick={() => setError(null)} className="ml-auto text-red-400/60 hover:text-red-400">
+            <AlertCircle size={14} className="shrink-0" />
+            <span className="min-w-0">{error}</span>
+            {previewRetry && (
+              <button
+                type="button"
+                onClick={() => void retryPreview()}
+                title="Retry this preview only"
+                className="ml-auto shrink-0 flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-2 py-1 text-[10px] font-bold uppercase tracking-wider"
+              >
+                <RefreshCw size={12} />
+                Retry
+              </button>
+            )}
+            <button onClick={() => { setError(null); previewRetryingRef.current = false; setPreviewRetryBoth(null); }} className={`${previewRetry ? '' : 'ml-auto '}text-red-400/60 hover:text-red-400 shrink-0`}>
               <X size={14} />
             </button>
           </div>
