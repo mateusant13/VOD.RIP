@@ -4,12 +4,14 @@ import Hls from 'hls.js';
 import { twitchAdBlockHlsConfig } from './twitchAdBlock';
 import {
   Download, Info, Play, Pause, Link2, X, Clock,
-  Users, Database, Settings2, Loader2,
+  Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
+import ArchiveSearchPopup from './components/ArchiveSearchPopup';
+import { buildArchiveVodUrl, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
@@ -552,6 +554,7 @@ export default function App() {
   // Channel explore players (up to 5 floating popups)
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
   const [localFilePopups, setLocalFilePopups] = useState<LocalFilePopupItem[]>([]);
+  const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
   const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
   const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
@@ -2782,6 +2785,50 @@ export default function App() {
       return next;
     });
   }, [pauseAllExplorePopups, assignExplorePopupZ, bringExplorePopupToFront, channelContentFilter]);
+
+  /**
+   * Archive search → open the hit in the explore-player flow at its offset.
+   * A re-click on the same video drops the old popup and opens a fresh
+   * session so the new initialTimeSec actually lands (dedupe would only
+   * bring the stale one to front).
+   */
+  const openArchiveHit = useCallback((hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => {
+    notePreviewGesture();
+    pauseAllExplorePopups();
+    const vodUrl = buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel);
+    if (hit.platform === 'youtube') {
+      warmYoutubePreview(vodUrl);
+    }
+    const vod: ExplorePopupVod = {
+      url: vodUrl,
+      title: video?.title?.trim() || hit.video_id,
+      platform: hit.platform,
+      durationSec: video?.duration_sec ?? 0,
+      platformListIndex: 0,
+      isClip: false,
+      initialTimeSec: hit.offset_sec,
+    };
+    setExplorePopups((prev) => {
+      const next = prev.filter((p) => p.vod.url !== vodUrl);
+      const id = crypto.randomUUID();
+      assignExplorePopupZ(id);
+      const after = [...next, { id, vod, layoutIndex: next.length }];
+      if (after.length > MAX_EXPLORE_POPUPS) {
+        const dropped = after.slice(0, after.length - MAX_EXPLORE_POPUPS);
+        dropped.forEach((entry) => {
+          explorePauseMapRef.current.delete(entry.id);
+          exploreVolumeMenusRef.current.delete(entry.id);
+        });
+        setExploreZOrder((zPrev) => {
+          const zNext = { ...zPrev };
+          for (const entry of dropped) delete zNext[entry.id];
+          return zNext;
+        });
+        return after.slice(-MAX_EXPLORE_POPUPS);
+      }
+      return after;
+    });
+  }, [pauseAllExplorePopups, assignExplorePopupZ]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -5574,6 +5621,20 @@ export default function App() {
             )}
           </div>
           <div className={`flex gap-1 shrink-0 ${mainCardHeaderCompact ? 'mt-1' : 'mt-2'}`}>
+            <button
+              type="button"
+              onClick={() => setArchiveSearchOpen((o) => !o)}
+              title="Search the local archive (transcripts + chat)"
+              aria-pressed={archiveSearchOpen}
+              className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                archiveSearchOpen
+                  ? 'bg-white text-black border-white'
+                  : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+              }`}
+            >
+              <Search size={10} className="shrink-0" />
+              Archive
+            </button>
             <div className="w-2 h-2 bg-[#53fc18] rounded-full animate-pulse" />
             <div className="w-2 h-2 bg-[#9146FF] rounded-full animate-pulse" style={{ animationDelay: '0.5s' }} />
             <div className="w-2 h-2 bg-[#F03030] rounded-full animate-pulse" style={{ animationDelay: '1s' }} />
@@ -6242,6 +6303,13 @@ export default function App() {
         );
       })()}
       <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
+      {archiveSearchOpen && (
+        <ArchiveSearchPopup
+          zIndex={EXPLORE_POPUP_Z - 100}
+          onClose={() => setArchiveSearchOpen(false)}
+          onOpenHit={openArchiveHit}
+        />
+      )}
       <DownloadConfirmDialog
         open={downloadConfirmOpen}
         title={downloadConfirmCopy.title}

@@ -93,6 +93,8 @@ export interface ExplorePopupVod {
   created_at?: string | null;
   views?: number | null;
   duration_string?: string | null;
+  /** Open the player already positioned at this VOD time (archive search seek-to-moment). */
+  initialTimeSec?: number;
 }
 
 interface ChannelExplorePopupProps {
@@ -217,6 +219,8 @@ export default function ChannelExplorePopup({
   const seekDebounceRef = useRef<number | null>(null);
   const playbackKindRef = useRef<'hls' | 'progressive'>('progressive');
   const pendingSeekSecRef = useRef<number | null>(null);
+  /** One-shot seek-on-open (archive search): target + whether it was applied. */
+  const initialSeekRef = useRef<{ target: number; consumed: boolean } | null>(null);
   const seekTargetRef = useRef<number | null>(null);
   const cachedProgressiveRef = useRef(false);
   const previewTimingRef = useRef<PreviewTiming | null>(null);
@@ -318,6 +322,14 @@ export default function ChannelExplorePopup({
     setBuffering(false);
     setReady(false);
     setError(null);
+    // Archive search seek-to-moment: position the fresh session at the hit
+    // offset. HLS/progressive consume this via pendingSeekSecRef when the
+    // media attaches; window-HLS (YouTube trim timeline) skips that and the
+    // ready-fallback below re-seeks through the full remux path.
+    initialSeekRef.current = vod.initialTimeSec != null && vod.initialTimeSec > 0
+      ? { target: vod.initialTimeSec, consumed: false }
+      : null;
+    pendingSeekSecRef.current = vod.initialTimeSec ?? null;
     // A manual open (or new media) starts a fresh retry budget; a
     // RETRY-triggered run keeps it so a repeated failure escalates.
     if (!previewRetryingRef.current) {
@@ -1071,6 +1083,17 @@ export default function ChannelExplorePopup({
             vod.durationSec,
           );
         }
+        // Archive seek-to-moment: progressive streams have no startPosition,
+        // so land the initial offset on first metadata instead.
+        const pending = pendingSeekSecRef.current;
+        if (pending != null && pending > 0) {
+          pendingSeekSecRef.current = null;
+          seekTargetRef.current = pending;
+          setCurrentTime(pending);
+          video.currentTime = pending;
+          const init = initialSeekRef.current;
+          if (init) init.consumed = true;
+        }
       };
       attachProgressivePreview(video, playbackUrl);
       const cleanupRecovery = bindProgressivePreviewRecovery({
@@ -1170,6 +1193,8 @@ export default function ChannelExplorePopup({
           seekTargetRef.current = null;
           setCurrentTime(pending);
           hls.startLoad(pending);
+          const init = initialSeekRef.current;
+          if (init) init.consumed = true;
         }
         if (!trimTimelineRef.current && Number.isFinite(video.duration) && video.duration > 0) {
           setMediaDurationSec(Math.round(video.duration));
@@ -1244,9 +1269,19 @@ export default function ChannelExplorePopup({
 
   useEffect(() => {
     if (!ready) return;
+    // Archive seek-to-moment fallback: window-HLS (YouTube trim timeline)
+    // skips the pending-start fast path, so re-seek through the full
+    // machinery once playback is genuinely ready (remuxes when the hit is
+    // outside the current mux window). Guarded so the fast path is not
+    // re-applied on top of itself.
+    const init = initialSeekRef.current;
+    if (init && !init.consumed) {
+      init.consumed = true;
+      seekVideo(init.target);
+    }
     const t = window.setTimeout(() => focusPlayer(), 0);
     return () => window.clearTimeout(t);
-  }, [ready, focusPlayer]);
+  }, [ready, focusPlayer, seekVideo]);
 
   const ctrlBtn = (fs: boolean) => platformPreviewCtrlBtn(platform, fs);
 
