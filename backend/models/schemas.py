@@ -94,6 +94,7 @@ class AppSettings(BaseModel):
     channel_content_filter: str = "vods"
     skip_youtube_startup_warm: bool = False
     cookie_bridge_token: str = ""
+    cookie_bridge_enabled: bool = True
 
 
 class SettingsUpdate(BaseModel):
@@ -125,6 +126,7 @@ class SettingsUpdate(BaseModel):
     mp4_faststart: Optional[bool] = None
     skip_youtube_startup_warm: Optional[bool] = None
     cookie_bridge_token: Optional[str] = None
+    cookie_bridge_enabled: Optional[bool] = None
 
 
 class OpenFolderRequest(BaseModel):

@@ -122,6 +122,8 @@ async def update_settings(update: SettingsUpdate):
         current.mp4_faststart = bool(update.mp4_faststart)
     if update.skip_youtube_startup_warm is not None:
         current.skip_youtube_startup_warm = bool(update.skip_youtube_startup_warm)
+    if update.cookie_bridge_enabled is not None:
+        current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
