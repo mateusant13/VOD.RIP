@@ -52,7 +52,6 @@ const page = await ctx.newPage();
 const requested = { ts: [], m3u8: [], stitched: 0, prefetch: 0 };
 page.on('request', (r) => {
   const u = r.url();
-  if (u.includes('.m3u8')) { console.log('REQ-m3u8:', u.slice(0, 140)); }
   if (u.includes('stitched')) requested.stitched++;
   if (u.includes('prefetch-live2')) requested.prefetch++;
   if (u.includes('.ts')) requested.ts.push(u);
@@ -143,12 +142,9 @@ const popupOpen = await page.locator('div.group:has(video)').count();
 failures += check(popupOpen > 0, '6 live popup still open');
 const popupText = await page.evaluate(() => {
   const groups = Array.from(document.querySelectorAll('div.group'));
-  return groups.map((g) => ({ cls: g.className.slice(0, 60), hasVideo: !!g.querySelector('video'), text: (g.textContent || '').replace(/\s+/g, ' ').slice(0, 120) })).filter((x) => x.hasVideo || x.text);
+  return groups.map((g) => (g.textContent || '').replace(/\s+/g, ' ').slice(0, 120)).filter(Boolean);
 });
-console.log('GROUPS:', JSON.stringify(popupText));
-const liveRowCount = await page.locator('div[role="button"]:has-text("● LIVE")').count();
-console.log('LIVE-ROW-count:', liveRowCount);
-const errorText = (popupText || []).map((g) => g.text).join(' ');
+const errorText = popupText.join(' ');
 failures += check(!errorText.includes('Failed to start live stream') && !errorText.includes('No response'), '7 no session/playback error shown');
 
 console.log(`\nRESULT: ${failures === 0 ? 'ALL PASS' : failures + ' FAILURES'}`);
