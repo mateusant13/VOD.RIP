@@ -14,12 +14,14 @@ from models.schemas import LivePreviewRequest, PreviewQualityUpdateRequest, Prev
 from deps import INFO_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
     PreviewMuxPending,
+    REPLAY_HLS_MARKER,
     StalePreviewUrls,
     WINDOW_HLS_MARKER,
     create_session,
     create_live_session,
     delete_session,
     open_progressive_proxy,
+    open_replay_hls_proxy,
     open_segment_proxy,
     open_youtube_window_hls_proxy,
     preview_mux_ready,
@@ -98,6 +100,10 @@ def _preview_session_response(session) -> PreviewSessionResponse:
             getattr(session, "cached_progressive_path", None)
             and session.kind == "progressive"
         ),
+        is_live=bool(getattr(session, "is_live", False)),
+        growing_vod=bool(getattr(session, "growing_vod", False)),
+        archive_url=getattr(session, "archive_entry_url", None) or "",
+        archive_duration=float(getattr(session, "archive_duration", 0) or 0),
     )
 
 
@@ -286,7 +292,7 @@ async def preview_live(req: LivePreviewRequest):
     try:
         session = await asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
-            lambda: create_live_session(url, req.headers or {}, platform),
+            lambda: create_live_session(url, req.headers or {}, platform, req.vod_url or None),
         )
         logger.info(
             "live preview session created id=%s platform=%s url=%s",
@@ -488,6 +494,22 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
                 PREVIEW_EXECUTOR,
                 lambda: open_youtube_window_hls_proxy(session_id, id, range_header),
+            )
+            response_headers = dict(extra_headers or {})
+            if ctype and ctype != "application/octet-stream":
+                response_headers.setdefault("Content-Type", ctype)
+            return StreamingResponse(
+                generate(),
+                media_type=ctype or "application/octet-stream",
+                status_code=status,
+                headers=response_headers,
+                background=BackgroundTask(cleanup),
+            )
+        if upstream.startswith(REPLAY_HLS_MARKER):
+            # replay-playlist → ENDLIST snapshot of the archive media playlist
+            generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
+                PREVIEW_EXECUTOR,
+                lambda: open_replay_hls_proxy(session_id, id, range_header),
             )
             response_headers = dict(extra_headers or {})
             if ctype and ctype != "application/octet-stream":

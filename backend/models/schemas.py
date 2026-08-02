@@ -168,6 +168,13 @@ class PreviewSessionResponse(BaseModel):
     # ponytail: when the backend is serving a local cached MP4, the browser can
     # do native byte-range seeks without a refresh/mux round-trip.
     cached_progressive: bool = False
+    # Live/DVR session fields: is_live marks a create_live_session session,
+    # growing_vod means the VOD media playlist has no ENDLIST (in-progress
+    # broadcast), archive_url/archive_duration expose the REPLAY snapshot.
+    is_live: bool = False
+    growing_vod: bool = False
+    archive_url: str = ""
+    archive_duration: float = 0.0
 
 
 class PreviewSeekRequest(BaseModel):
@@ -190,6 +197,8 @@ class LivePreviewRequest(BaseModel):
     platform: str
     headers: Dict[str, str] = Field(default_factory=dict)
     title: str = ""
+    # Channel's current (in-progress) VOD URL — REPLAY/DVR archive source.
+    vod_url: str = ""
 
 
 class PreviewSessionStatusResponse(BaseModel):

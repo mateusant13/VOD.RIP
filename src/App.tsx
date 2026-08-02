@@ -1273,7 +1273,9 @@ export default function App() {
 
   const openPreview = useCallback(async () => {
     if (!url.trim()) return;
-    if (trimEndSec <= trimStartSec) return;
+    // Unknown duration (in-progress VOD): both ends are 0 — open anyway so the
+    // growing archive can play; only bail on a known inverted range.
+    if ((trimEndSec !== 0 || trimStartSec !== 0) && trimEndSec <= trimStartSec) return;
     const trimmedUrl = url.trim();
     // Already showing this URL — no-op unless playback failed and user is retrying
     if (
@@ -1431,6 +1433,10 @@ export default function App() {
         setTrimEndSec(end);
         setPreviewMetaDurationSec(synced.duration);
       }
+      // In-progress VOD (growing archive) is a live HLS stream — enable the live
+      // knobs (liveSyncDuration/liveDurationInfinity) or playback stalls at the
+      // playlist edge because duration keeps growing.
+      if (res.growing_vod) previewIsLiveRef.current = true;
       const playback = resolvePreviewPlayback(url.trim(), res);
       if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
         timing.mark('attach_before_segments');
@@ -6094,13 +6100,28 @@ export default function App() {
         TWITCH
       </div>
 
-      {livePopupEntry && (
-        <LivePlayerPopup
-          entry={livePopupEntry.entry}
-          channelName={livePopupEntry.channelName}
-          onClose={() => setLivePopupEntry(null)}
-        />
-      )}
+      {livePopupEntry && (() => {
+        // Open-channel slug + newest public in-progress VOD for the entry's
+        // platform (DVR REPLAY archive source), both resolved from the selected
+        // channel at render time to keep openLivePreview dependency-free.
+        const plat = (livePopupEntry.entry.platform || '').toLowerCase();
+        const slug = plat === 'twitch'
+          ? selectedChannel?.twitchSlug
+          : plat === 'kick' ? selectedChannel?.kickSlug : selectedChannel?.youtubeSlug;
+        const newestVod = [...(selectedChannel?.vodVideos ?? [])]
+          .filter((v) => (v.platform || '').toLowerCase() === plat
+            && v.content_kind !== 'clip' && isPublicVideo(v))
+          .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0];
+        return (
+          <LivePlayerPopup
+            entry={livePopupEntry.entry}
+            channelName={livePopupEntry.channelName}
+            channelSlug={slug}
+            vodUrl={newestVod ? buildVodUrl(newestVod) : undefined}
+            onClose={() => setLivePopupEntry(null)}
+          />
+        );
+      })()}
       <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
       <DownloadConfirmDialog
         open={downloadConfirmOpen}

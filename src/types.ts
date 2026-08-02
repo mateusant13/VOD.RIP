@@ -156,6 +156,14 @@ export interface PreviewSessionResponse {
   window_hls_mux_end?: number;
   /** True when the backend is serving a local cached MP4 (instant byte-range seeks). */
   cached_progressive?: boolean;
+  /** True for create_live_session sessions (live popup). */
+  is_live?: boolean;
+  /** VOD media playlist has no ENDLIST — in-progress broadcast (grows). */
+  growing_vod?: boolean;
+  /** DVR archive media URL — REPLAY mode snapshots this (empty = no archive). */
+  archive_url?: string;
+  /** Archive duration at session creation (grows while the stream runs). */
+  archive_duration?: number;
 }
 
 export interface PreviewSessionStatusResponse {

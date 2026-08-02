@@ -576,11 +576,12 @@ export async function reloadWindowHlsAtPosition(
   sessionId: string,
   video: HTMLVideoElement,
   localTimeSec: number,
+  playlistUrl?: string,
 ): Promise<void> {
   shieldPreviewBuffering(60_000);
   const target = Math.max(0, localTimeSec);
   video.pause();
-  const playlistUrl = windowHlsMediaPlaylistUrl(sessionId);
+  const url = playlistUrl || windowHlsMediaPlaylistUrl(sessionId);
   return new Promise((resolve, reject) => {
     const failTimer = window.setTimeout(() => {
       cleanup();
@@ -633,9 +634,9 @@ export async function reloadWindowHlsAtPosition(
           // Level.url is `readonly string[]` in typings but mutable at runtime.
           const urlArr = levelObj.url;
           if (Array.isArray(urlArr)) {
-            urlArr.splice(0, urlArr.length, playlistUrl);
+            urlArr.splice(0, urlArr.length, url);
           } else {
-            levelObj.url = [playlistUrl];
+            levelObj.url = [url];
           }
           // Drop cached playlist so startLoad refetches the remuxed chunk list.
           levelObj.details = undefined;
@@ -656,7 +657,7 @@ export async function reloadWindowHlsAtPosition(
       // Fallback: no levels parsed yet (very first attach still in flight).
       // Loading the media playlist directly is fine — it is not a master, so
       // MANIFEST_PARSED does not reset the player.
-      hls.loadSource(playlistUrl);
+      hls.loadSource(url);
       hls.startLoad(target);
     }
   });

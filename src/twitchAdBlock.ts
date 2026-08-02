@@ -152,7 +152,40 @@ export class TwitchAdBlockLoader {
   }
 }
 
-/** hls.js config that strips Twitch ad segments from every playlist response. */
-export function twitchAdBlockHlsConfig(): Record<string, unknown> {
-  return { pLoader: TwitchAdBlockLoader };
+export interface TwitchAdBlockHlsOptions {
+  /** Live playback knobs (live popup / in-progress VOD previews). */
+  live?: boolean;
+  // vaft backup-stream rotation knobs (adblock-merge agent) — declared here
+  // so the merge only reconciles the interface name, never the function body.
+  onAdRotation?: (reason: string) => void;
+  rotationThreshold?: number;
+  rotationCooldownMs?: number;
+  maxRotations?: number;
+}
+
+/**
+ * hls.js config that strips Twitch ad segments from every playlist response.
+ *
+ * With `{ live: true }` adds the live knobs used by the live popup and
+ * in-progress VOD previews. liveSyncDuration is seconds (the single knob — it
+ * overrides liveSyncDurationCount) and matches the main player's live config
+ * (App.tsx) so the live popup latency behaviour never drifts from the main
+ * preview. lowLatencyMode defaults to true in hls.js 1.x; set explicitly for
+ * LL-HLS masters (Twitch low_latency=true usher param).
+ */
+export function twitchAdBlockHlsConfig(opts: TwitchAdBlockHlsOptions = {}): Record<string, unknown> {
+  const config: Record<string, unknown> = { pLoader: TwitchAdBlockLoader };
+  if (opts.live) {
+    Object.assign(config, {
+      lowLatencyMode: true,
+      liveSyncDuration: 3,
+      liveMaxLatencyDuration: 10,
+      liveDurationInfinity: true,
+      maxBufferLength: 20,
+      maxMaxBufferLength: 30,
+      backBufferLength: 30,
+      maxLiveSyncPlaybackRate: 1.25,
+    });
+  }
+  return config;
 }
