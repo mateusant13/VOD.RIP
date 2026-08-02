@@ -7,8 +7,9 @@ import random
 import re
 import subprocess as sp
 import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlencode
 
 import requests
@@ -57,6 +58,170 @@ def kick_live_info(slug: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Twitch
 # ---------------------------------------------------------------------------
+#
+# vaft-style stream rotation (pixeltris/TwitchAdSolutions): Twitch decides per
+# ``player_type`` whether to stitch ads into the media playlist, so rotating
+# the usher master across player types — each with a FRESH PlaybackAccessToken
+# — yields an ad-free stream. ``probe_twitch_live_master`` fetches each type's
+# media playlist and returns the first one without 'stitched' segments; when
+# every type carries ads it falls back to the embed master (existing
+# behavior) and the frontend pLoader strips the segments locally. No proxies,
+# no paid services — direct GQL + usher + CDN requests only.
+
+# vaft BackupPlayerTypes order: embed=Source, popout=Source, autoplay=360p.
+_TWITCH_PLAYER_TYPES: tuple = ("embed", "popout", "autoplay")
+# vaft FallbackPlayerType — used when no player type is ad-free.
+_TWITCH_FALLBACK_PLAYER_TYPE = "embed"
+# Per-channel probe cache so the frontend's 3s live-polling loop stays O(1)
+# (a cold probe costs 1 GQL + 1 usher + 1 media fetch per player type).
+_TWITCH_MASTER_TTL_SEC = 60.0
+_TWITCH_MASTER_CACHE: dict = {}
+_TWITCH_MASTER_LOCK = threading.Lock()
+_TWITCH_HEADERS = {"Referer": "https://www.twitch.tv/", "Origin": "https://www.twitch.tv/"}
+
+
+def _twitch_gql_live_token(login: str, player_type: str) -> Optional[tuple]:
+    """Fresh GQL PlaybackAccessToken (sig, token) for one player type."""
+    from services.twitch_gql_service import VOD_PLAYBACK_TOKEN_HASH, _gql_persisted
+
+    gql_data = _gql_persisted(
+        "PlaybackAccessToken",
+        VOD_PLAYBACK_TOKEN_HASH,
+        {
+            "isLive": True,
+            "login": login.lower(),
+            "isVod": False,
+            "vodID": "",
+            "playerType": player_type,
+            "platform": "site",
+        },
+    )
+    token_node = gql_data.get("streamPlaybackAccessToken") or gql_data.get("playbackAccessToken") or {}
+    sig = token_node.get("signature")
+    token = token_node.get("value")
+    if not sig or not token:
+        return None
+    return sig, token
+
+
+def _twitch_usher_master_url(login: str, sig: str, token: str) -> str:
+    query = urlencode({
+        "allow_source": "true",
+        "allow_audio_only": "true",
+        "playlist_include_framerate": "true",
+        "supported_codecs": "h264",
+        "platform": "web",
+        "p": str(random.randint(1_000_000, 9_999_999)),
+        "nauth": token,
+        "nauthsig": sig,
+    })
+    return f"https://usher.ttvnw.net/api/channel/hls/{login.lower()}.m3u8?{query}"
+
+
+def _twitch_master_for_player_type(login: str, player_type: str) -> Optional[dict]:
+    """Build a fresh usher master URL for one player type (no cache)."""
+    token = _twitch_gql_live_token(login, player_type)
+    if not token:
+        return None
+    sig, tok = token
+    return {"url": _twitch_usher_master_url(login, sig, tok), "player_type": player_type}
+
+
+def _twitch_pick_media_variant(master_url: str) -> Optional[str]:
+    """Fetch an usher master and return its first (highest-quality) variant URL."""
+    try:
+        resp = requests.get(master_url, headers=_TWITCH_HEADERS, timeout=8.0)
+        resp.raise_for_status()
+    except (requests.RequestException, OSError, ValueError):
+        logger.debug("usher master fetch failed: %s", master_url)
+        return None
+    from services.twitch_gql_service import _parse_hls_master_variants
+
+    variants = _parse_hls_master_variants(master_url, resp.text)
+    if not variants:
+        return None
+    return variants[0]["url"]
+
+
+def _twitch_media_has_ads(media_url: str) -> Optional[bool]:
+    """True when a media playlist contains 'stitched' ad segments.
+
+    None means the fetch failed — the caller should try the next player type.
+    """
+    try:
+        resp = requests.get(media_url, headers=_TWITCH_HEADERS, timeout=8.0)
+        resp.raise_for_status()
+        return "stitched" in resp.text
+    except (requests.RequestException, OSError, ValueError):
+        logger.debug("media playlist fetch failed: %s", media_url)
+        return None
+
+
+def probe_twitch_live_master(
+    login: str,
+    player_types: Optional[Sequence[str]] = None,
+    skip_cache: bool = False,
+) -> Optional[dict]:
+    """Rotate across player types (vaft order) and return the first ad-free master.
+
+    Returns ``{"url", "headers", "player_type", "ad_free"}`` or None when the
+    channel is unreachable (every player type failed to fetch). When no player
+    type's media playlist is ad-free, falls back to the embed master with
+    ``ad_free=False`` — the frontend pLoader strips stitched segments locally.
+    """
+    login = (login or "").strip().lower()
+    if not login:
+        return None
+    order = tuple(player_types) if player_types else _TWITCH_PLAYER_TYPES
+    if not order:
+        return None
+    if not skip_cache:
+        with _TWITCH_MASTER_LOCK:
+            cached = _TWITCH_MASTER_CACHE.get(login)
+        if cached and time.time() - cached[0] < _TWITCH_MASTER_TTL_SEC:
+            return cached[1]
+
+    # vaft flow: build + probe one player type at a time, stop at the first
+    # clean one (fresh GQL token per type, fetched lazily like vaft).
+    first_built: Optional[dict] = None
+    fallback: Optional[dict] = None  # embed master — vaft FallbackPlayerType
+    result: Optional[dict] = None
+    for pt in order:
+        built = _twitch_master_for_player_type(login, pt)
+        if not built:
+            continue
+        if first_built is None:
+            first_built = built
+        media_url = _twitch_pick_media_variant(built["url"])
+        if media_url is None:
+            continue
+        if _twitch_media_has_ads(media_url) is False:
+            result = {
+                "url": built["url"],
+                "headers": dict(_TWITCH_HEADERS),
+                "player_type": built["player_type"],
+                "ad_free": True,
+            }
+            break
+        if fallback is None and built["player_type"] == _TWITCH_FALLBACK_PLAYER_TYPE:
+            fallback = built
+
+    if result is None and fallback is None and first_built is not None:
+        fallback = first_built
+    if result is None and fallback is not None:
+        # vaft fallback: no player type is ad-free — serve the embed master
+        # anyway and let the frontend strip the stitched segments locally.
+        result = {
+            "url": fallback["url"],
+            "headers": dict(_TWITCH_HEADERS),
+            "player_type": fallback["player_type"],
+            "ad_free": False,
+        }
+
+    if result is not None and not skip_cache:
+        with _TWITCH_MASTER_LOCK:
+            _TWITCH_MASTER_CACHE[login] = (time.time(), result)
+    return result
 
 
 def _twitch_helix_live_info(login: str) -> Optional[dict]:
@@ -96,48 +261,19 @@ def _twitch_helix_live_info(login: str) -> Optional[dict]:
         return None  # offline — fast path, no page scrape
 
     stream = data[0]
-    # Playback token via GQL (same persisted query as VOD, isLive=True) + Usher.
-    from services.twitch_gql_service import VOD_PLAYBACK_TOKEN_HASH, _gql_persisted
-
-    gql_data = _gql_persisted(
-        "PlaybackAccessToken",
-        VOD_PLAYBACK_TOKEN_HASH,
-        {
-            "isLive": True,
-            "login": login.lower(),
-            "isVod": False,
-            "vodID": "",
-            "playerType": "embed",
-            "platform": "site",
-        },
-    )
-    token_node = gql_data.get("streamPlaybackAccessToken") or gql_data.get("playbackAccessToken") or {}
-    sig = token_node.get("signature")
-    token = token_node.get("value")
-    if not sig or not token:
+    # Rotate player types and keep the first ad-free master (probe cached 60s).
+    probed = probe_twitch_live_master(login)
+    if not probed:
         raise RuntimeError("no live playback token from GQL")
 
-    query = urlencode({
-        "allow_source": "true",
-        "allow_audio_only": "true",
-        "playlist_include_framerate": "true",
-        "supported_codecs": "h264",
-        "platform": "web",
-        "p": str(random.randint(1_000_000, 9_999_999)),
-        "nauth": token,
-        "nauthsig": sig,
-    })
-    master_url = f"https://usher.ttvnw.net/api/channel/hls/{login.lower()}.m3u8?{query}"
-
     return {
-        "url": master_url,
-        "headers": {
-            "Referer": "https://www.twitch.tv/",
-            "Origin": "https://www.twitch.tv/",
-        },
+        "url": probed["url"],
+        "headers": probed["headers"],
         "title": stream.get("title") or login,
         "viewers": stream.get("viewer_count") or 0,
         "platform": "Twitch",
+        "player_type": probed["player_type"],
+        "ad_free": probed["ad_free"],
     }
 
 

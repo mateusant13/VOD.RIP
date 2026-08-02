@@ -1,9 +1,9 @@
 import {
-  useState, useEffect, useLayoutEffect, useCallback, useRef,
+  useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef,
   type KeyboardEvent, type PointerEvent as ReactPointerEvent,
 } from 'react';
 import Hls from 'hls.js';
-import { twitchAdBlockHlsConfig } from './twitchAdBlock';
+import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -204,6 +204,21 @@ export default function ChannelExplorePopup({
   useEffect(() => {
     playbackKindRef.current = playback?.kind ?? 'progressive';
   }, [playback?.kind]);
+
+  // vaft midroll rotation — inert unless the player is a Twitch live session
+  // (only Twitch live playlists contain 'stitched' segments). The backend
+  // swaps the session's usher master to the next player type in place and the
+  // same proxied URL serves the rotated stream; failure keeps stripping.
+  const onAdRotation = useMemo(
+    () => createTwitchAdRotationHandler({
+      getSessionId: () => sessionIdRef.current,
+      getHls: () => hlsRef.current,
+      getVideo: () => videoRef.current,
+      requestRotation: (sid) =>
+        apiPost<{ ok?: boolean; master_url?: string }>(`/api/preview/live/rotate/${sid}`, {}),
+    }),
+    [],
+  );
 
   const sessionHandoffRefs = {
     trimTimelineRef,
@@ -1030,7 +1045,7 @@ export default function ChannelExplorePopup({
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
-        ...twitchAdBlockHlsConfig(),
+        ...twitchAdBlockHlsConfig({ onAdRotation }),
         startPosition: trimTimelineRef.current ? 0 : (pendingSeekSecRef.current ?? 0),
       });
       hlsRef.current = hls;
