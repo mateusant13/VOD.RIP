@@ -15,3 +15,15 @@ pywebview>=6.0.0
 # ── Tray icon (fallback when PyWebView unavailable) ────────────────────────
 pystray>=0.19.0
 Pillow>=10.0.0
+
+# ── Archive transcription worker (opt-in: services/archive_transcribe.py) ───
+# torch/torchaudio pinned together — a newer torchaudio DLL fails to load
+# against torch 2.7 (WinError 127 at import).
+# nvidia-*-cu12: ctranslate2 loads cublas64_12.dll at inference; a CUDA-13-era
+# driver alone (no CUDA 12 toolkit) fails without these wheels.
+faster-whisper>=1.2.1
+silero-vad>=6.2.1
+torch==2.7.0
+torchaudio==2.7.0
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12

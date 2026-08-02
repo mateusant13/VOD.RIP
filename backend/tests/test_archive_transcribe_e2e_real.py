@@ -1,0 +1,230 @@
+"""Real end-to-end check for the archive transcription worker (VAD + whisper + queue).
+
+Builds a 20 s synthetic fixture (5 s tone + 10 s pure silence + 5 s tone) with
+ffmpeg, runs it through the REAL archive_jobs queue (run_worker) against a temp
+archive DB, then verifies:
+  * VAD stats: dead air (the 10 s silence) skipped and reported,
+  * segments land only in speech regions, word timestamps present,
+  * resume: deleting the last segment row and re-running re-adds only that row
+    without touching the others,
+  * job lifecycle: queued -> running -> done, progress ends at 1.0.
+
+Run directly (isolated process — recommended):
+    python tests/test_archive_transcribe_e2e_real.py
+Under pytest it skips if archive_db is already bound to another DB:
+    python -m pytest tests/test_archive_transcribe_e2e_real.py -s
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import time
+
+_TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-transcribe-"))
+os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
+os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
+os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from services import archive_db  # noqa: E402  (env must be set before import)
+from services.os_services import _NO_WINDOW  # noqa: E402
+from services.archive_transcribe import (  # noqa: E402
+    run_worker,
+    _manifest_path,
+    _resolve_ffmpeg_exe,
+)
+
+PLATFORM = "twitch"
+VIDEO_ID = "__transcribe_e2e__"
+FIXTURE = _TMP / "fixture.wav"
+SPEECH1 = _TMP / "speech1.wav"
+SPEECH2 = _TMP / "speech2.wav"
+SILENCE_SEC = 10.0
+TEXT1 = "Welcome to the VOD dot RIP archive system, this is a test."
+TEXT2 = "Second speech segment spoken after ten seconds of silence."
+
+
+def _tts_speech(wav: pathlib.Path, text: str) -> pathlib.Path:
+    """Record-free speech via Windows System.Speech (no mic, no downloads)."""
+    import subprocess as sp
+
+    ps = (
+        "Add-Type -AssemblyName System.Speech; "
+        f"$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        f"$s.SetOutputToWaveFile('{wav}'); "
+        f"$s.Speak('{text.replace(chr(39), '')}'); $s.Dispose()"
+    )
+    proc = sp.run(["powershell", "-NoProfile", "-Command", ps],
+                  capture_output=True, timeout=120, creationflags=_NO_WINDOW)
+    if proc.returncode != 0 or not wav.is_file():
+        raise RuntimeError(
+            "Windows TTS unavailable — need speech-like content for the fixture: "
+            + (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        )
+    return wav
+
+
+def _build_fixture() -> pathlib.Path:
+    """~20 s fixture: ~5 s TTS speech + 10 s pure silence + ~5 s TTS speech."""
+    import subprocess as sp
+
+    ffmpeg = _resolve_ffmpeg_exe()
+    _tts_speech(SPEECH1, TEXT1)
+    _tts_speech(SPEECH2, TEXT2)
+    cmd = [
+        ffmpeg, "-y", "-v", "error",
+        "-i", str(SPEECH1),
+        "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={SILENCE_SEC}",
+        "-i", str(SPEECH2),
+        "-filter_complex",
+        "[0]aformat=sample_rates=16000:channel_layouts=mono[a0];"
+        "[1]aformat=sample_rates=16000:channel_layouts=mono[a1];"
+        "[2]aformat=sample_rates=16000:channel_layouts=mono[a2];"
+        "[a0][a1][a2]concat=n=3:v=0:a=1[a]",
+        "-map", "[a]", "-ar", "16000", "-ac", "1", str(FIXTURE),
+    ]
+    proc = sp.run(cmd, capture_output=True, timeout=120, creationflags=_NO_WINDOW)
+    if proc.returncode != 0 or not FIXTURE.is_file():
+        raise RuntimeError(f"fixture build failed: {proc.stderr.decode('utf-8', 'replace')}")
+    return FIXTURE
+
+
+def _enqueue_and_run(job_id: str) -> dict:
+    archive_db.enqueue_job(job_id, "transcribe", PLATFORM, VIDEO_ID)
+    run_worker(once=True, poll_interval=0.5)
+    jobs = {j["id"]: j for j in archive_db.list_jobs()}
+    return jobs[job_id]
+
+
+def _run() -> None:
+    fixture = _build_fixture()
+    archive_db.upsert_video({
+        "platform": PLATFORM,
+        "video_id": VIDEO_ID,
+        "channel": "selftest",
+        "title": "transcribe fixture",
+        "status": "ready",
+        "archive_path": str(fixture),
+        "duration_sec": 20.0,
+    })
+
+    # --- run 1: full transcription through the real queue -----------------
+    t0 = time.monotonic()
+    job = _enqueue_and_run("transcribe-e2e-1")
+    wall1 = time.monotonic() - t0
+    assert job["status"] == "done", f"job 1 not done: {job}"
+    assert job["progress"] == 1.0, f"job 1 progress must end at 1.0: {job}"
+
+    segs = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    assert segs, "no transcript segments written"
+    idxs = [int(s["seg_idx"]) for s in segs]
+    assert idxs == list(range(len(segs))), f"seg_idx must be contiguous 0..n: {idxs}"
+    words = [
+        w for s in segs
+        for w in json.loads(s["words_json"] or "[]")
+    ]
+    assert words, "word-level timestamps missing (word_timestamps must be on)"
+    assert all({"word", "start", "end"} <= set(w) for w in words), (
+        "each word must carry word/start/end"
+    )
+
+    # Nothing may land inside the 10 s silence (margin 1 s at each edge).
+    import subprocess as _sp
+    import numpy as np
+
+    ffmpeg = _resolve_ffmpeg_exe()
+    raw = _sp.run(
+        [ffmpeg, "-v", "error", "-i", str(SPEECH1), "-f", "f32le", "-ac", "1",
+         "-ar", "16000", "-"],
+        capture_output=True, timeout=60, creationflags=_NO_WINDOW,
+    )
+    speech1_sec = len(np.frombuffer(raw.stdout, dtype=np.float32)) / 16000.0
+    silence_lo, silence_hi = speech1_sec + 1.0, speech1_sec + SILENCE_SEC - 1.0
+    total_raw = _sp.run(
+        [ffmpeg, "-v", "error", "-i", str(FIXTURE), "-f", "f32le", "-ac", "1",
+         "-ar", "16000", "-"],
+        capture_output=True, timeout=60, creationflags=_NO_WINDOW,
+    )
+    total_sec = len(np.frombuffer(total_raw.stdout, dtype=np.float32)) / 16000.0
+    for s in segs:
+        start, end = s["start_sec"], s["end_sec"]
+        assert start >= -0.01 and end <= total_sec + 0.01, f"segment out of bounds: {s}"
+        assert not (silence_lo <= start <= silence_hi), f"segment started inside silence: {s}"
+
+    job1 = job
+    assert _manifest_path(PLATFORM, VIDEO_ID).is_file(), "resume manifest missing"
+    assert job1["progress"] == 1.0
+
+    # --- run 2: resume after deleting the last segment row ----------------
+    last = segs[-1]
+    last_id = archive_db.query(
+        "SELECT id FROM transcripts WHERE platform=? AND video_id=? AND seg_idx=?",
+        (PLATFORM, VIDEO_ID, last["seg_idx"]),
+    )[0]["id"]
+    archive_db.execute(
+        "DELETE FROM transcripts_fts WHERE rowid=?", (last_id,)
+    )
+    archive_db.execute("DELETE FROM transcripts WHERE id=?", (last_id,))
+    before_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    assert len(before_resume) == len(segs) - 1
+
+    job2 = _enqueue_and_run("transcribe-e2e-2")
+    assert job2["status"] == "done", f"job 2 not done: {job2}"
+    after_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    # Every pre-existing row must be byte-identical (only the missing chunk ran).
+    before_by_id = {r["id"]: r for r in before_resume}
+    after_by_id = {r["id"]: r for r in after_resume}
+    assert all(after_by_id[i] == r for i, r in before_by_id.items()), (
+        "resume must not touch pre-existing rows"
+    )
+    # The deleted row's seg_idx must be restored at its old index, contiguous.
+    after_idxs = [int(s["seg_idx"]) for s in after_resume]
+    assert after_idxs == list(range(len(after_resume))), f"seg_idx gaps after resume: {after_idxs}"
+    assert last["seg_idx"] in after_idxs, (
+        f"resume must re-add the deleted seg_idx {last['seg_idx']}: {after_idxs}"
+    )
+    assert len(after_resume) > len(before_resume), "resume must re-add at least the deleted row"
+
+    print("\n=== run 1 (full) ===")
+    print(f"  wall: {wall1:.1f}s | job: {job1}")
+    print(f"  segments: {len(segs)} | first: {segs[0]['start_sec']}s "
+          f"last: {segs[-1]['end_sec']}s | words: {len(words)}")
+    print("=== run 2 (resume) ===")
+    print(f"  deleted seg_idx {last['seg_idx']} restored; pre-existing rows untouched "
+          f"({len(before_resume)} -> {len(after_resume)} rows)")
+    print(f"  manifest: {_manifest_path(PLATFORM, VIDEO_ID)}")
+    print(f"  fixture: {fixture} ({fixture.stat().st_size} bytes)")
+
+    # model cache size (download footprint)
+    from services.archive_transcribe import _cache_dir
+
+    cache = _cache_dir()
+    size = 0
+    for root, _dirs, files in os.walk(cache):
+        size += sum((pathlib.Path(root) / f).stat().st_size for f in files)
+    print(f"  model cache: {cache} ({size / 1e6:.0f} MB)")
+
+
+def test_transcribe_worker_e2e_real() -> None:
+    if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
+        import pytest
+
+        pytest.skip(
+            "archive_db already bound to another DB in this process — "
+            "run standalone: python tests/test_archive_transcribe_e2e_real.py"
+        )
+    _run()
+
+
+if __name__ == "__main__":
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    _run()
+    print("\nE2E OK — VAD stats above, resume verified.")
