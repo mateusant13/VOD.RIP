@@ -23,6 +23,7 @@ from deps import settings_mgr, download_mgr
 from routers import (
     archive,
     channels,
+    cookie_bridge,
     downloads,
     info,
     live,
@@ -429,6 +430,7 @@ app.include_router(live.router)
 app.include_router(downloads.router)
 app.include_router(system.router)
 app.include_router(archive.router)
+app.include_router(cookie_bridge.router)
 
 
 def _warm_youtube_session() -> None:
