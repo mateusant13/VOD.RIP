@@ -530,15 +530,37 @@ def ytdlp_extractor_args(
     }
 
 
+_ANON_JAR_PREFIX = "yt_anon_"
+
+
+def _bridge_cookiefile() -> Optional[str]:
+    """YouTube bridge Netscape export, or None. Additive — never raises."""
+    try:
+        from services.cookie_bridge import resolve_cookiefile
+
+        return resolve_cookiefile("youtube")
+    except Exception:
+        return None
+
+
 def resolve_ytdlp_cookiefile(session: YouTubeSession, explicit: Optional[str] = None) -> Optional[str]:
-    """Cookie file for yt-dlp: manual export > anonymous temp jar > none."""
+    """Cookie file for yt-dlp: manual export > bridge > anonymous temp jar > none.
+
+    The bridge export sits between the user's manual file and the anonymous
+    temp jar — additive, never reorders or removes existing paths, manual
+    settings override stays intact. Anonymous jars are the ``yt_anon_``
+    tempfiles written by ``_write_netscape_cookiefile`` (same heuristic as
+    ytdlp_hls' ``_youtube_manual_auth_configured``).
+    """
     if explicit and Path(explicit).is_file():
         return explicit
     if session.cookies_from_browser:
         return None
     if session.cookie_file and Path(session.cookie_file).is_file():
-        return session.cookie_file
-    return None
+        if not Path(session.cookie_file).name.startswith(_ANON_JAR_PREFIX):
+            return session.cookie_file
+        return _bridge_cookiefile() or session.cookie_file
+    return _bridge_cookiefile()
 
 
 def apply_ytdlp_cookie_opts(

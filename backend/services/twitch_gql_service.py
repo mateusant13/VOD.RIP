@@ -538,15 +538,34 @@ def _extract_video_id(url_or_id: str) -> Optional[str]:
     return None
 
 
+def _gql_headers() -> Dict[str, str]:
+    """Base GQL headers plus bridge cookies when present (additive).
+
+    Existing headers are never replaced — the Cookie header is added only
+    when the bridge holds Twitch cookies (auth-token/sp), so requests stay
+    identical when the bridge is disabled or empty (regression bar).
+    """
+    headers = {
+        "Client-Id": TWITCH_GQL_CLIENT_ID,
+        "Content-Type": "application/json",
+    }
+    try:
+        from services.cookie_bridge import cookie_header
+
+        cookie = cookie_header("twitch")
+        if cookie:
+            headers["Cookie"] = cookie
+    except Exception:
+        pass
+    return headers
+
+
 def _gql_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
     payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
     req = urllib.request.Request(
         TWITCH_GQL_URL,
         data=payload,
-        headers={
-            "Client-Id": TWITCH_GQL_CLIENT_ID,
-            "Content-Type": "application/json",
-        },
+        headers=_gql_headers(),
         method="POST",
     )
     try:
@@ -575,10 +594,7 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
     req = urllib.request.Request(
         TWITCH_GQL_URL,
         data=payload,
-        headers={
-            "Client-Id": TWITCH_GQL_CLIENT_ID,
-            "Content-Type": "application/json",
-        },
+        headers=_gql_headers(),
         method="POST",
     )
     try:

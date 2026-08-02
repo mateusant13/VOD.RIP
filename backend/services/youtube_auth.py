@@ -40,28 +40,38 @@ def cookie_cache_path(browser: str) -> "Path":
 
 
 def find_fresh_cookie_cache() -> Optional[str]:
-    """Newest cached Netscape export under appdata (survives locked browser DB)."""
+    """Newest cached Netscape export under appdata (survives locked browser DB).
+
+    Falls back to the bridge export (services.cookie_bridge) when no browser
+    cache is fresh — additive, never reorders the browser-cache scan above it.
+    """
     from pathlib import Path
 
     base = _cookie_cache_dir()
-    if not base.is_dir():
+    if base.is_dir():
+        now = time.time()
+        best_mtime = 0.0
+        best_path: Optional[str] = None
+        for path in base.glob("youtube_cookies_*.txt"):
+            try:
+                if path.stat().st_size < 80:
+                    continue
+                age = now - path.stat().st_mtime
+                if age > _COOKIE_CACHE_TTL_SEC:
+                    continue
+                if path.stat().st_mtime > best_mtime:
+                    best_mtime = path.stat().st_mtime
+                    best_path = str(path)
+            except OSError:
+                pass
+        if best_path:
+            return best_path
+    try:
+        from services.cookie_bridge import resolve_cookiefile
+
+        return resolve_cookiefile("youtube")
+    except Exception:
         return None
-    now = time.time()
-    best_mtime = 0.0
-    best_path: Optional[str] = None
-    for path in base.glob("youtube_cookies_*.txt"):
-        try:
-            if path.stat().st_size < 80:
-                continue
-            age = now - path.stat().st_mtime
-            if age > _COOKIE_CACHE_TTL_SEC:
-                continue
-            if path.stat().st_mtime > best_mtime:
-                best_mtime = path.stat().st_mtime
-                best_path = str(path)
-        except OSError:
-            pass
-    return best_path
 
 
 def _write_netscape_jar(jar, path: "Path") -> bool:
