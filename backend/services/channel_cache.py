@@ -15,7 +15,7 @@ class ChannelCache:
     entries at_max_entries.
     """
 
-    def __init__(self, default_ttl_sec: float = 90.0, max_entries: int = 50) -> None:
+    def __init__(self, default_ttl_sec: float = 300.0, max_entries: int = 200) -> None:
         self._cache: dict[str, tuple[float, Any]] = {}
         self._lock = Lock()
         self._default_ttl_sec = default_ttl_sec
