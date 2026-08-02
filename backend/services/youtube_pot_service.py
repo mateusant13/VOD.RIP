@@ -208,6 +208,11 @@ def pot_service_ping(
     return bool(data.strip())
 
 
+# ponytail: bgutil-ytdlp-pot-provider 1.3.1 (the vendored bundle) exposes
+# no cookie option — no CLI flag (only --port) and no /get_pot body field
+# beyond content_binding (checked src/main.ts + README in the bundle). PO
+# minting stays anonymous until upstream adds cookie support; bridge
+# cookies still reach yt-dlp via the cookiefile path (services/cookie_bridge).
 def fetch_video_po_token(
     video_id: str,
     base: str = POT_DEFAULT_BASE,

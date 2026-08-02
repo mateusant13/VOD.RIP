@@ -34,6 +34,22 @@ def _headers(referer: str) -> Dict[str, str]:
     return {"referer": referer, "origin": _BASE}
 
 
+def _bridge_cookie_jar() -> Optional[Dict[str, str]]:
+    """Bridge auth cookies (auth_token/g_session), or None — additive only.
+
+    None means "send no cookies", so requests stay byte-identical when the
+    bridge is disabled or the store has no Kick cookies (regression bar).
+    Merges with whatever curl_cffi sends for the impersonated browser —
+    never clobbers existing headers.
+    """
+    try:
+        from services.cookie_bridge import cookie_dict
+
+        return cookie_dict("kick")
+    except Exception:
+        return None
+
+
 def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
     from curl_cffi import requests
 
@@ -42,6 +58,7 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
         url,
         impersonate=_IMPERSONATE,
         headers=_headers(referer),
+        cookies=_bridge_cookie_jar(),
         timeout=timeout,
     )
     if resp.status_code == 404:
