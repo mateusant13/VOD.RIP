@@ -111,6 +111,10 @@ def _twitch_usher_master_url(login: str, sig: str, token: str) -> str:
         "playlist_include_framerate": "true",
         "supported_codecs": "h264",
         "platform": "web",
+        # LL-HLS: short segments + PART tags — hls.js 1.6 lowLatencyMode. The
+        # preview session probes the media playlist for #EXT-X-PART-INF at
+        # session creation and falls back to a non-LL master if absent.
+        "low_latency": "true",
         "p": str(random.randint(1_000_000, 9_999_999)),
         "nauth": token,
         "nauthsig": sig,
@@ -266,6 +270,7 @@ def _twitch_helix_live_info(login: str) -> Optional[dict]:
     if not probed:
         raise RuntimeError("no live playback token from GQL")
 
+
     return {
         "url": probed["url"],
         "headers": probed["headers"],
@@ -275,6 +280,57 @@ def _twitch_helix_live_info(login: str) -> Optional[dict]:
         "player_type": probed["player_type"],
         "ad_free": probed["ad_free"],
     }
+
+
+def twitch_archive_info(login: str) -> Optional[dict]:
+    """Resolve the channel's current (likely in-progress) VOD master URL.
+
+    DVR fallback for the live popup when the frontend has no VOD URL to pass:
+    the most recent broadcast from the GQL channel-videos list resolves to a
+    usher vod master via the existing VOD playback-token flow. Returns
+    {url, headers, vod_id, platform} or None (offline/never streamed).
+    """
+    login = (login or "").strip().lower()
+    if not login:
+        return None
+    try:
+        from services.twitch_gql_service import get_vod_playback_sync, list_channel_videos_sync
+
+        vids = list_channel_videos_sync(login, limit=1)
+        if not vids:
+            return None
+        vod_id = str(vids[0].get("id") or "").strip()
+        if not vod_id:
+            return None
+        master_url, headers, _variants = get_vod_playback_sync(vod_id)
+        return {"url": master_url, "headers": headers, "vod_id": vod_id, "platform": "Twitch"}
+    except Exception as exc:
+        logger.debug("twitch_archive_info(%r) failed: %s", login, exc)
+        return None
+
+
+def kick_archive_info(slug: str) -> Optional[dict]:
+    """Resolve the channel's current (likely in-progress) VOD m3u8 URL.
+
+    DVR fallback for the live popup: the most recent channel VOD from the Kick
+    videos API. Returns {url, vod_id, platform} or None.
+    """
+    slug = (slug or "").strip()
+    if not slug:
+        return None
+    try:
+        from services.kick_api_service import list_channel_videos_api
+
+        vids = list_channel_videos_api(slug, limit=1)
+        if not vids:
+            return None
+        m3u8 = (vids[0].m3u8_url or "").strip()
+        if not m3u8:
+            return None
+        return {"url": m3u8, "vod_id": vids[0].id or "", "platform": "Kick"}
+    except Exception as exc:
+        logger.debug("kick_archive_info(%r) failed: %s", slug, exc)
+        return None
 
 
 def twitch_live_info(login: str) -> Optional[dict]:

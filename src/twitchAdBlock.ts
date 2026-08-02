@@ -264,19 +264,46 @@ export class TwitchAdBlockLoader {
   }
 }
 
+export interface TwitchAdBlockHlsOptions extends TwitchAdRotationOptions {
+  /** Live playback knobs (live popup / in-progress VOD previews). */
+  live?: boolean;
+}
+
 /**
  * hls.js config that strips Twitch ad segments from every playlist response
  * and (optionally) rotates to the next vaft player type after repeated ads.
  *
- * ``opts.onAdRotation`` receives ``{ url }`` — the playlist URL that was being
- * loaded when the threshold was hit. The site supplies its own rotation glue
- * (``createTwitchAdRotationHandler``) with its session id + hls instance.
- * Unknown config keys are ignored by hls.js; ``...twitchAdBlockHlsConfig()``
- * stays compatible with all existing call sites.
+ * Rotation knobs (``opts.onAdRotation`` receives ``{ url }`` — the playlist
+ * URL that was being loaded when the threshold was hit) are wired to the
+ * loader via the ``twitchAdRotation`` config key; the site supplies its own
+ * rotation glue (``createTwitchAdRotationHandler``) with its session id +
+ * hls instance. With ``{ live: true }`` also adds the LL-HLS knobs used by
+ * the live popup and in-progress VOD previews (lowLatencyMode, short
+ * liveSyncDuration, deep back buffer, capped max buffer) — kept in one
+ * function so latency behaviour never drifts between players.
+ *
+ * No-arg keeps the strip-only shape ``{ pLoader: TwitchAdBlockLoader,
+ * twitchAdRotation: null }``. Unknown config keys are ignored by hls.js;
+ * ``...twitchAdBlockHlsConfig()`` stays compatible with all existing call
+ * sites.
  */
-export function twitchAdBlockHlsConfig(opts?: TwitchAdRotationOptions): Record<string, unknown> {
-  return {
-    pLoader: TwitchAdBlockLoader,
-    twitchAdRotation: opts ?? null,
-  };
+export function twitchAdBlockHlsConfig(opts: TwitchAdBlockHlsOptions = {}): Record<string, unknown> {
+  const config: Record<string, unknown> = { pLoader: TwitchAdBlockLoader };
+  if (opts.live) {
+    Object.assign(config, {
+      lowLatencyMode: true,
+      liveSyncDuration: 3,
+      liveMaxLatencyDuration: 10,
+      liveDurationInfinity: true,
+      maxBufferLength: 20,
+      maxMaxBufferLength: 30,
+      backBufferLength: 30,
+      maxLiveSyncPlaybackRate: 1.25,
+    });
+  }
+  // vaft midroll rotation wiring — null when no rotation knobs were supplied,
+  // so the no-arg shape stays { pLoader, twitchAdRotation: null }.
+  const { live: _live, ...rotationOpts } = opts;
+  config.twitchAdRotation = Object.keys(rotationOpts).length > 0 ? rotationOpts : null;
+  return config;
 }

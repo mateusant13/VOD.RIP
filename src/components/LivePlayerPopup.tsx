@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Minimize2, Pause, Play, Volume2, VolumeX, RefreshCw } from 'lucide-react';
+import { ExternalLink, Maximize2, Minimize2, Pause, Play, Volume2, VolumeX, RefreshCw } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import type { PanelSize, PreviewSessionResponse } from '../types';
 import {
@@ -15,7 +15,11 @@ import {
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
+import { filterLiveLevels, replaySeekTarget } from '../livePlayerLevels';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
+// hls.js is ~900KB and the original file deliberately code-splits it out of the
+// main bundle; a static import would pull it into the initial chunk.
+import type Hls from 'hls.js';
 
 interface LiveEntry {
   url: string;
@@ -28,6 +32,10 @@ interface LivePlayerPopupProps {
   entry: LiveEntry;
   channelName: string;
   onClose: () => void;
+  /** Platform slug for the open-channel button (twitchSlug/kickSlug/youtubeSlug). */
+  channelSlug?: string;
+  /** Channel's current (in-progress) VOD URL — DVR REPLAY archive source. */
+  vodUrl?: string;
 }
 
 type DragState = {
@@ -48,12 +56,16 @@ const POPUP_WIDTH = 480;
 const POPUP_HEIGHT = 320;
 const POPUP_MIN_H = 200;
 const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while resizing
+/** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
+const REPLAY_RESNAPSHOT_MS = 30_000;
 
-export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl }: LivePlayerPopupProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
-  const hlsRef = useRef<any>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const hlsCtorRef = useRef<typeof Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const sessionRef = useRef<PreviewSessionResponse | null>(null);
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
   const [position, setPosition] = useState({ x: window.innerWidth - POPUP_WIDTH - 24, y: 80 });
   const posRef = useRef(position);
@@ -91,12 +103,37 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [abortRef] = useState(() => new AbortController());
 
+  // DVR state — LIVE (default, live master) vs REPLAY (ENDLIST snapshot of the
+  // channel's in-progress VOD). Mode switches recreate the hls instance so a
+  // seek never breaks the other mode's playback.
+  const [mode, setMode] = useState<'live' | 'replay'>('live');
+  const modeRef = useRef<'live' | 'replay'>('live');
+  const [archiveDuration, setArchiveDuration] = useState(0); // backend-probed, session creation
+  const [snapshotDuration, setSnapshotDuration] = useState(0); // replay: video.duration
+  const [railTime, setRailTime] = useState(0);
+  const replayTimerRef = useRef<number | null>(null);
+
   // Keep refs in sync with state (drag/resize use the latest size without re-subscribing)
   useEffect(() => { sizeRef.current = size; }, [size]);
   useEffect(() => { posRef.current = position; }, [position]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
 
-  // Handle level selection
+  /** Cache-busted archive snapshot URL — each new URL forces a fresh ENDLIST snapshot. */
+  const replaySnapshotUrl = useCallback((sid: string) => {
+    return `/api/preview/hls/${sid}/resource?id=replay-playlist&t=${Date.now()}`;
+  }, []);
+
+  const channelUrl = useMemo(() => {
+    const plat = (entry.platform || '').toLowerCase();
+    if (!channelSlug) return null;
+    if (plat === 'youtube') return `https://www.youtube.com/@${channelSlug}`;
+    if (plat === 'kick') return `https://kick.com/${channelSlug}`;
+    return `https://www.twitch.tv/${channelSlug}`;
+  }, [entry.platform, channelSlug]);
+
+  // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
+    if (modeRef.current === 'replay') return; // snapshot is single-level — no switching
     if (hlsRef.current) {
       hlsRef.current.currentLevel = index;
       setCurrentLevel(index);
@@ -131,23 +168,130 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
     return () => window.removeEventListener('mousedown', handler);
   }, [qualityMenuOpen, volumeMenuOpen]);
 
+  const destroyHls = useCallback(() => {
+    if (replayTimerRef.current != null) {
+      window.clearInterval(replayTimerRef.current);
+      replayTimerRef.current = null;
+    }
+    if (hlsRef.current) {
+      try {
+        hlsRef.current.destroy();
+      } catch {
+        /* ignore */
+      }
+      hlsRef.current = null;
+    }
+  }, []);
+
+  /** Create an hls.js instance for *src*; live mode defaults 480p after parse. */
+  const createHlsPlayer = useCallback(async (src: string, startPos: number): Promise<any | null> => {
+    const video = videoRef.current;
+    if (!video) return null;
+    if (!hlsCtorRef.current) {
+      try {
+        hlsCtorRef.current = (await import('hls.js')).default;
+      } catch {
+        setError('HLS not supported in this browser');
+        setLoading(false);
+        markPreviewError();
+        return null;
+      }
+    }
+    const Hls = hlsCtorRef.current;
+    if (!Hls || !Hls.isSupported()) {
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = src;
+        video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
+        video.play().catch(() => {});
+        return null;
+      }
+      setError('HLS not supported in this browser');
+      setLoading(false);
+      markPreviewError();
+      return null;
+    }
+    destroyHls();
+    const replay = modeRef.current === 'replay';
+    // Replay: autoStartLoad off — the position is applied in MANIFEST_PARSED
+    // (startLoad before the manifest parses is a no-op, which would start the
+    // snapshot at 0 instead of the dragged time).
+    const hls = new Hls({
+      ...twitchAdBlockHlsConfig({ live: true, onAdRotation }),
+      autoStartLoad: !replay,
+    });
+    hlsRef.current = hls;
+    // e2e probe hook (same convention as window.__vodripAdSegmentsStripped).
+    (window as unknown as { __livePopupHls?: Hls }).__livePopupHls = hls;
+    hls.loadSource(src);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (modeRef.current === 'live') {
+        // Quality: keep ORIGINAL hls.levels indices, filter to 360-1080, and
+        // default to the level closest to 480 (main-player convention: set
+        // hls.loadLevel AFTER MANIFEST_PARSED — never startLevel before load).
+        const { levels: filtered, defaultIndex } = filterLiveLevels(
+          hls.levels.map((l, i) => ({
+            index: i,
+            height: l.height || 0,
+            bitrate: l.bitrate || 0,
+          })),
+        );
+        setLevels(filtered.map((l) => ({
+          index: l.index,
+          label: `${l.height}p (${((l.bitrate || 0) / 1000).toFixed(0)}kbps)`,
+          height: l.height,
+          bitrate: l.bitrate || 0,
+        })));
+        if (defaultIndex >= 0 && defaultIndex < hls.levels.length) {
+          hls.loadLevel = defaultIndex;
+          setCurrentLevel(defaultIndex);
+        }
+      } else {
+        // REPLAY: single-level ENDLIST snapshot — hls.js reports the duration.
+        if (Number.isFinite(video.duration)) setSnapshotDuration(video.duration);
+        if (startPos >= 0) {
+          hls.stopLoad();
+          hls.startLoad(startPos);
+        }
+      }
+      setLoading(false);
+      clearRetry();
+    });
+
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+      // Guard -1 (auto): ABR switches report -1 and would highlight nothing.
+      if (modeRef.current === 'replay') return;
+      if (typeof data?.level === 'number' && data.level >= 0) setCurrentLevel(data.level);
+    });
+
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data?.fatal) return;
+      setError('Live playback failed — try again');
+      setLoading(false);
+      markPreviewError();
+    });
+
+    if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
+    else if (modeRef.current !== 'replay') hls.startLoad();
+    return hls;
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError]);
+
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
     abortRef.abort();
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
+    destroyHls();
     const sid = sessionIdRef.current;
     if (sid) {
       apiDelete(`/api/preview/session/${sid}`).catch(() => {});
       sessionIdRef.current = null;
     }
+    sessionRef.current = null;
     if (videoRef.current) {
       videoRef.current.src = '';
       videoRef.current.load();
     }
-  }, [abortRef]);
+  }, [abortRef, destroyHls]);
 
   // Close handler
   const handleClose = useCallback(() => {
@@ -178,15 +322,24 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
       try {
         setLoading(true);
         setError(null);
-        const body: Record<string, any> = { url: entry.url, is_live: true };
+        const body: {
+          url: string;
+          is_live: boolean;
+          headers?: Record<string, string>;
+          platform?: string;
+          vod_url?: string;
+        } = { url: entry.url, is_live: true };
         if (entry.headers) body.headers = entry.headers;
         if (entry.platform) body.platform = entry.platform;
+        if (vodUrl) body.vod_url = vodUrl;
 
         const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body);
         if (cancelled) return;
         if (!res) { setError('No response from server'); setLoading(false); markPreviewError(); return; }
 
         sessionIdRef.current = res.session_id;
+        sessionRef.current = res;
+        setArchiveDuration(res.archive_duration ?? 0);
 
         // Attach player to video element
         const video = videoRef.current;
@@ -201,89 +354,23 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
           video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
           video.play().catch(() => {});
         } else if (src) {
-          // HLS stream — use hls.js if available, else native HLS
-          try {
-            const Hls = (await import('hls.js')).default;
-            if (cancelled) return;
-            if (Hls.isSupported()) {
-              const hls = new Hls(twitchAdBlockHlsConfig({ onAdRotation }));
-              hlsRef.current = hls;
-              hls.loadSource(src);
-              hls.attachMedia(video);
-
-              hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                if (cancelled) return;
-                setLoading(false);
-                clearRetry();
-                // Populate quality levels
-                const lvls: LevelInfo[] = hls.levels.map((l: any, i: number) => ({
-                  index: i,
-                  label: `${l.height}p (${(l.bitrate / 1000).toFixed(0)}kbps)`,
-                  height: l.height,
-                  bitrate: l.bitrate,
-                }));
-                setLevels(lvls);
-              });
-
-              hls.on(Hls.Events.LEVEL_SWITCHED, (_e: any, data: any) => {
-                setCurrentLevel(data.level);
-              });
-
-              // Surface fatal playback failures so the RETRY button can appear
-              // instead of an eternal spinner.
-              hls.on(Hls.Events.ERROR, (_e: unknown, data: any) => {
-                if (!data?.fatal) return;
-                setError('Live playback failed — try again');
-                setLoading(false);
-                try { hls.destroy(); } catch { /* ignore */ }
-                hlsRef.current = null;
-                markPreviewError();
-              });
-            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-              video.src = src;
-              video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
-              video.play().catch(() => {});
-            } else {
-              setError('HLS not supported in this browser');
-              setLoading(false);
-              markPreviewError();
-            }
-          } catch {
-            // hls.js failed to load, try native HLS
-            if (video.canPlayType('application/vnd.apple.mpegurl')) {
-              video.src = src;
-              video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
-              video.play().catch(() => {});
-            } else {
-              setError('HLS not supported');
-              setLoading(false);
-              markPreviewError();
-            }
-          }
+          await createHlsPlayer(src, -1);
         } else {
           setLoading(false);
         }
 
         video.play().catch(() => {});
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (!cancelled) {
-          setError(err?.message || 'Failed to start live stream');
+          setError(err instanceof Error ? err.message : 'Failed to start live stream');
           setLoading(false);
           markPreviewError();
         }
       }
     })();
 
-    return () => {
-      cancelled = true;
-      // A retry re-runs this effect — destroy the previous hls instance so
-      // two players never fight over the same <video> element.
-      if (hlsRef.current) {
-        try { hlsRef.current.destroy(); } catch { /* ignore */ }
-        hlsRef.current = null;
-      }
-    };
-  }, [entry.url, entry.headers, entry.platform, abortRef, retryTick, markPreviewError, clearRetry]);
+    return () => { cancelled = true; destroyHls(); };
+  }, [entry.url, entry.headers, entry.platform, vodUrl, abortRef, createHlsPlayer, destroyHls, retryTick, markPreviewError, clearRetry]);
 
   // Sync transport state from the video element
   useEffect(() => {
@@ -292,13 +379,23 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
     const onPlay = () => setPaused(false);
     const onPause = () => setPaused(true);
     const onVolumeChange = () => { setMuted(video.muted); setVolume(video.volume); };
+    const onTime = () => setRailTime(video.currentTime);
+    const onDuration = () => {
+      if (modeRef.current === 'replay' && Number.isFinite(video.duration)) {
+        setSnapshotDuration(video.duration);
+      }
+    };
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
     video.addEventListener('volumechange', onVolumeChange);
+    video.addEventListener('timeupdate', onTime);
+    video.addEventListener('durationchange', onDuration);
     return () => {
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('volumechange', onVolumeChange);
+      video.removeEventListener('timeupdate', onTime);
+      video.removeEventListener('durationchange', onDuration);
     };
   }, []);
 
@@ -337,12 +434,14 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
 
   const snapToLiveEdge = useCallback(() => {
     const hls = hlsRef.current;
-    if (hls && typeof hls.seekToLiveEdge === 'function') {
-      hls.seekToLiveEdge();
-      return;
-    }
     const video = videoRef.current;
     if (!video) return;
+    // hls.js 1.6.2 exposes the edge as a getter (seekToLiveEdge was removed).
+    const livePos = hls?.liveSyncPosition;
+    if (typeof livePos === 'number' && isFinite(livePos)) {
+      video.currentTime = livePos;
+      return;
+    }
     try {
       const s = video.seekable;
       if (s && s.length > 0) video.currentTime = s.end(s.length - 1);
@@ -350,6 +449,64 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
       // native-HLS live edge can be behind the seekable end on some platforms
     }
   }, []);
+
+  // --- DVR mode switching ---
+  const switchToReplay = useCallback((sec: number) => {
+    const sid = sessionIdRef.current;
+    const video = videoRef.current;
+    const sess = sessionRef.current;
+    if (!sid || !video || !sess?.archive_url) return;
+    setMode('replay');
+    setLoading(true);
+    setError(null);
+    void createHlsPlayer(replaySnapshotUrl(sid), Math.max(0, sec));
+    video.play().catch(() => {});
+    // Re-snapshot while parked so the rail keeps growing with the broadcast.
+    if (replayTimerRef.current != null) window.clearInterval(replayTimerRef.current);
+    replayTimerRef.current = window.setInterval(() => {
+      const v = videoRef.current;
+      if (!v || modeRef.current !== 'replay') return;
+      // ponytail: reloadWindowHlsAtPosition patches the level URL in-place — on
+      // an ended snapshot the buffered timeline is already full, no new frag
+      // buffers, and FRAG_BUFFERED never fires (45s hang). A full re-create
+      // (same path as drag-past-edge) deterministically re-syncs duration.
+      switchToReplay(Math.max(0, v.currentTime));
+    }, REPLAY_RESNAPSHOT_MS);
+  }, [createHlsPlayer, replaySnapshotUrl]);
+
+  const switchToLive = useCallback(() => {
+    const sid = sessionIdRef.current;
+    const video = videoRef.current;
+    const sess = sessionRef.current;
+    if (!sid || !video || !sess) return;
+    setMode('live');
+    setLoading(true);
+    setError(null);
+    const src = sess.master_url || sess.playback_url;
+    if (!src) { setLoading(false); return; }
+    void createHlsPlayer(src, -1).then((hls) => {
+      if (hls && modeRef.current === 'live') {
+        const livePos = hls.liveSyncPosition;
+        if (typeof livePos === 'number' && isFinite(livePos)) video.currentTime = livePos;
+      }
+    });
+    video.play().catch(() => {});
+  }, [createHlsPlayer]);
+
+  const handleRailChange = useCallback((next: number) => {
+    if (mode === 'live') {
+      // Dragging back in LIVE mode switches to REPLAY at the dragged position.
+      switchToReplay(next);
+      return;
+    }
+    const video = videoRef.current;
+    const { inSnapshot } = replaySeekTarget(next, snapshotDuration);
+    if (inSnapshot && video) {
+      video.currentTime = Math.max(0, next);
+    } else {
+      switchToReplay(next); // past the snapshot edge — re-snapshot and land there
+    }
+  }, [mode, snapshotDuration, switchToReplay]);
 
   const toggleFullscreen = useCallback(() => {
     const el = popupRef.current;
@@ -382,7 +539,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
 
   // --- Dragging (header bar only, so transport buttons don't fight the drag) ---
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest('.live-popup-close')) return;
+    if ((e.target as HTMLElement).closest('.live-popup-close') || (e.target as HTMLElement).closest('.live-popup-link')) return;
     setDrag({ startX: e.clientX, startY: e.clientY, offsetX: posRef.current.x, offsetY: posRef.current.y });
   }, []);
 
@@ -406,10 +563,22 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
 
   const transportBtn = 'flex items-center justify-center rounded p-1 text-white/80 hover:bg-white/10 hover:text-white';
 
+  const archiveAvailable = Boolean(sessionRef.current?.archive_url);
+  // Live rail: pinned at the archive edge; dragging back opens REPLAY.
+  // Replay rail: full snapshot duration; max follows hls.js video.duration.
+  const railMax = mode === 'live'
+    ? (archiveDuration > 0 ? archiveDuration : 1)
+    : (snapshotDuration > 0 ? snapshotDuration : 1);
+  const railDisabled = mode === 'live' && !archiveAvailable;
+  const railValue = mode === 'replay'
+    ? Math.min(Math.max(0, railTime), railMax)
+    : railMax;
+
   return createPortal(
     <div
       ref={popupRef}
       className="group"
+      data-live-popup
       style={{
         position: 'fixed',
         left: position.x,
@@ -442,28 +611,51 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
           flexShrink: 0,
         }}
       >
-        <span style={{ fontSize: 12, color: '#e06c75', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: 8 }}>
-          🔴 LIVE — {channelName}{entry.title ? ` — ${entry.title}` : ''}
+        <span style={{ fontSize: 12, color: mode === 'live' ? '#e06c75' : '#61afef', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: 8 }}>
+          {mode === 'live' ? '🔴 LIVE' : '⏪ REPLAY'} — {channelName}{entry.title ? ` — ${entry.title}` : ''}
         </span>
 
-        <button
-          className="live-popup-close"
-          onClick={handleClose}
-          style={{
-            background: 'none',
-            border: 'none',
-            color: '#888',
-            cursor: 'pointer',
-            fontSize: 16,
-            lineHeight: 1,
-            padding: '2px 6px',
-            borderRadius: 4,
-            flexShrink: 0,
-          }}
-          title="Close"
-        >
-          ✕
-        </button>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+          {channelUrl && (
+            <button
+              className="live-popup-link"
+              onClick={() => window.open(channelUrl, '_blank', 'noopener,noreferrer')}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#888',
+                cursor: 'pointer',
+                fontSize: 16,
+                lineHeight: 1,
+                padding: '2px 6px',
+                borderRadius: 4,
+                display: 'flex',
+                alignItems: 'center',
+              }}
+              title="Open channel"
+            >
+              <ExternalLink size={14} />
+            </button>
+          )}
+          <button
+            className="live-popup-close"
+            onClick={handleClose}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: '#888',
+              cursor: 'pointer',
+              fontSize: 16,
+              lineHeight: 1,
+              padding: '2px 6px',
+              borderRadius: 4,
+              flexShrink: 0,
+            }}
+            title="Close"
+          >
+            ✕
+          </button>
+        </span>
       </div>
 
       {/* Video area */}
@@ -491,7 +683,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
               justifyContent: 'center', background: 'rgba(0,0,0,0.6)', color: '#aaa', fontSize: 13,
             }}
           >
-            Loading live stream…
+            {mode === 'replay' ? 'Loading replay…' : 'Loading live stream…'}
           </div>
         )}
 
@@ -524,7 +716,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
           </div>
         )}
 
-        {/* Transport controls (live: seek disabled, LIVE snap-to-edge button) */}
+        {/* Transport controls */}
         {!loading && !error && (
           <div
             data-live-transport
@@ -589,18 +781,21 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
               <input
                 type="range"
                 min={0}
-                max={1}
-                step={0.01}
-                value={1}
-                disabled
-                className="h-1 flex-1 accent-red-500 opacity-60"
-                aria-label="Seeking disabled on live stream"
-                title="Seeking is disabled on live streams"
+                max={railMax}
+                step={0.5}
+                value={railValue}
+                disabled={railDisabled}
+                onChange={(e) => handleRailChange(parseFloat(e.target.value))}
+                className={`h-1 flex-1 ${mode === 'replay' ? 'accent-blue-400' : 'accent-red-500'} ${railDisabled ? 'opacity-60' : ''}`}
+                aria-label={mode === 'replay' ? 'Seek within replay' : 'Seek back into the broadcast (replay)'}
+                title={mode === 'replay'
+                  ? 'Replay of the current broadcast — drag to seek'
+                  : (railDisabled ? 'Replay unavailable for this channel' : 'Drag back to watch the past part of the stream')}
               />
               <button
                 type="button"
-                onClick={snapToLiveEdge}
-                title="Snap to live edge"
+                onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
+                title={mode === 'replay' ? 'Return to live' : 'Snap to live edge'}
                 className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide text-red-500 hover:bg-white/10"
               >
                 <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
@@ -614,7 +809,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
               menuOpen={qualityMenuOpen}
               setMenuOpen={setQualityMenuOpen}
               onSelect={handleQualitySelect}
-              disabled={!levels.length}
+              disabled={!levels.length || mode === 'replay'}
               buttonClassName={transportBtn}
             />
 

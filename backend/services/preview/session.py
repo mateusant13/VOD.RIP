@@ -50,6 +50,10 @@ SESSION_TTL_SEC = 1800  # 30 min — long browsing rarely exceeds 30 min; channe
 LRU_SIZE_HARD_LIMIT = 12
 _SESSION_DELETE_GRACE_SEC = 3.0
 PLAYLIST_REWRITE_TTL_SEC = 2
+# Live sessions refetch media playlists far more often than VODs — a 2s cache
+# adds ~2s of latency to an already ~3-5s live pipeline. Media playlists get
+# this short TTL; the master keeps PLAYLIST_REWRITE_TTL_SEC (see proxy_playlist).
+LIVE_MEDIA_PLAYLIST_TTL_SEC = 0.5
 _MAX_REWRITTEN_PLAYLIST_BYTES = 32 * 1024 * 1024  # long YouTube VOD media playlists
 PREWARM_SEGMENT_COUNT = 5
 WINDOW_HLS_SEGMENT_SEC = (
@@ -70,6 +74,11 @@ WINDOW_HLS_PLAYLIST_RESOURCE = "window-playlist"
 WINDOW_HLS_SEGMENT_RESOURCE_PREFIX = "window-seg-"
 WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
+# REPLAY (DVR) — the live popup plays the channel's in-progress VOD via an
+# ENDLIST snapshot of the archive media playlist. Same resource pattern as
+# window-playlist: a marker URL in resource_map + a dedicated open_*_proxy.
+REPLAY_HLS_MARKER = "replay-hls:"  # resource_map marker for replay resources
+REPLAY_PLAYLIST_RESOURCE = "replay-playlist"  # archive snapshot media playlist
 from services.preview._state import (
     _ACTIVE_YOUTUBE_PREVIEW_KEY,
     _CHANNEL_WARM_SLOTS,
@@ -755,6 +764,11 @@ class PreviewManager:
             )
             session.allowed_hosts.update(_hosts_for_url(session.entry_url))
 
+        # In-progress Twitch/Kick VODs have no ENDLIST and a growing duration
+        # that metadata under-reports — probe the media playlist so the preview
+        # rail is alive and hls.js gets live knobs (growing_vod flag).
+        _apply_growing_vod_duration(session)
+
         if platform == "YouTube" and variant_formats:
             _stash_youtube_preview_formats(
                 session,
@@ -795,6 +809,7 @@ class PreviewManager:
         url: str,
         headers: dict,
         platform: str,
+        vod_url: Optional[str] = None,
     ) -> "PreviewSession":
         self._cleanup_stale_sessions()
         from services.preview.hls import proxy_playlist
@@ -818,6 +833,8 @@ class PreviewManager:
             crop_start=0.0,
             crop_end=4 * 3600.0,
             vod_duration=4 * 3600.0,
+            is_live=True,
+            playlist_ttl_sec=LIVE_MEDIA_PLAYLIST_TTL_SEC,
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -842,7 +859,87 @@ class PreviewManager:
             proxy_playlist(session_id, session.master_url)
         except Exception:
             pass
+        # Resolve one media playlist (prewarm) and probe LL-HLS support. Twitch
+        # LL masters advertise #EXT-X-PART-INF on their media playlists; if the
+        # low_latency=true master yields none, fall back to the plain master.
+        try:
+            session.entry_url = _resolve_preview_entry(session, url)
+            session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+            if "low_latency=" in url and not _media_playlist_is_ll(session):
+                logger.info(
+                    "live session %s: LL master has no PART-INF — falling back to non-LL",
+                    session_id[:8],
+                )
+                non_ll = _strip_low_latency_param(url)
+                if non_ll and non_ll != url:
+                    session.master_url = non_ll
+                    session.entry_url = _resolve_preview_entry(session, non_ll)
+                    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+                    try:
+                        proxy_playlist(session_id, session.master_url)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
+        # DVR archive: frontend-passed vod_url first, then backend fallback via
+        # the channel's most recent VOD. Failures degrade gracefully (rail off).
+        try:
+            archive = self._resolve_live_archive(session, vod_url)
+            if archive:
+                session.archive_url, session.archive_entry_url = archive
+                session.allowed_hosts.update(_hosts_for_url(session.archive_url or ""))
+                session.allowed_hosts.update(_hosts_for_url(session.archive_entry_url or ""))
+                session.resource_map[REPLAY_PLAYLIST_RESOURCE] = (
+                    f"{REPLAY_HLS_MARKER}playlist"
+                )
+        except Exception as exc:
+            logger.debug("live session %s archive resolve failed: %s", session_id[:8], exc)
         return session
+
+    def _resolve_live_archive(
+        self,
+        session: "PreviewSession",
+        vod_url: Optional[str],
+    ) -> Optional[Tuple[Optional[str], Optional[str]]]:
+        """Resolve the channel's current in-progress VOD to (master, media).
+
+        Primary: the frontend passes the VOD URL it already lists for the
+        channel. Fallback: resolve the most recent VOD per platform (Twitch
+        GQL lastBroadcast via channel videos, Kick channel videos API).
+        """
+        platform = (session.platform or "").lower()
+        master: Optional[str] = None
+        if platform == "twitch":
+            if vod_url:
+                from services.twitch_gql_service import get_vod_playback_sync
+
+                master, _hdrs, _variants = get_vod_playback_sync(vod_url)
+            else:
+                from services.live_capture import twitch_archive_info
+
+                info = twitch_archive_info(_twitch_login_from_master(session.master_url))
+                master = (info or {}).get("url")
+        elif platform == "kick":
+            if vod_url:
+                from services.kick_api_service import resolve_kick_stream_api
+
+                info = resolve_kick_stream_api(vod_url)
+                master = info.m3u8_url
+            else:
+                from services.live_capture import kick_archive_info
+
+                info = kick_archive_info(_kick_slug_from_master(session.master_url))
+                master = (info or {}).get("url")
+        elif platform == "youtube":
+            # YouTube live has no DVR archive in this app — rail stays disabled.
+            return None
+        if not master:
+            return None
+        try:
+            media = _resolve_preview_entry(session, master)
+        except Exception:
+            media = master
+        return master, media
 
 @dataclass
 class PreviewSession:
@@ -872,6 +969,19 @@ class PreviewSession:
     cache_bytes: int = 0
     last_access: float = field(default_factory=time.time)
     cache_dir: Path = field(default_factory=Path)
+    # Live sessions (create_live_session): proxy_playlist uses this TTL for
+    # media playlists (0 = module default). Master keeps the longer default.
+    is_live: bool = False
+    playlist_ttl_sec: float = 0.0
+    # True when the VOD media playlist has no #EXT-X-ENDLIST (in-progress
+    # broadcast) — hls.js must run it with live knobs, not a dead VOD timeline.
+    growing_vod: bool = False
+    # DVR archive (REPLAY mode): archive_url is the archive master, the
+    # archive_entry_url is the resolved media playlist the snapshot is taken
+    # from, archive_duration is its current totalduration (grows over time).
+    archive_url: Optional[str] = None
+    archive_entry_url: Optional[str] = None
+    archive_duration: float = 0.0
     # ponytail: when True, DELETE has been called but the session is kept in
     # the dict for _SESSION_DELETE_GRACE_SEC so in-flight byte requests from
     # the browser don't 404. Late GETs still hit the proxy, just won't be
@@ -3310,6 +3420,41 @@ def open_youtube_window_hls_proxy(
             f"window HLS segment seg_{idx:03d}{'.m4s' if USE_FMP4 else '.ts'} not ready"
         )
     return _open_local_file_proxy(path, range_header)
+def open_replay_hls_proxy(
+    session_id: str,
+    resource_id: str,
+    range_header: Optional[str] = None,
+) -> Tuple[Callable[[], object], str, dict, int, Callable[[], None]]:
+    """Serve a VOD-typed snapshot of the live session's archive media playlist.
+
+    The archive playlist of an in-progress VOD has no #EXT-X-ENDLIST, so
+    hls.js would run it in LIVE mode (duration=Infinity, live-sync yank). Each
+    request re-fetches the archive media playlist upstream, rewrites segment
+    URIs through the session proxy, and appends #EXT-X-ENDLIST — hls.js treats
+    the snapshot as a finished VOD and can seek anywhere in it. The frontend
+    re-snapshots on demand with a cache-busted URL while parked in REPLAY.
+    """
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if resource_id != REPLAY_PLAYLIST_RESOURCE:
+        raise ValueError("Invalid replay resource id")
+    if not session.archive_entry_url:
+        raise ValueError("No archive for this preview session")
+    from services.preview.hls import _http_get_bytes
+
+    data, _, _, _ = _http_get_bytes(session, session.archive_entry_url)
+    text = data.decode("utf-8", errors="replace")
+    total = _playlist_total_duration(text)
+    if total > 0:
+        session.archive_duration = total
+    rewritten = _rewrite_playlist(text, session, session.archive_entry_url)
+    if "#EXT-X-ENDLIST" not in rewritten:
+        rewritten = rewritten.rstrip() + "\n#EXT-X-ENDLIST\n"
+    body = rewritten.encode("utf-8")
+    return _open_memory_bytes_proxy(body, "application/vnd.apple.mpegurl", range_header)
+
+
 def _legacy_proxy_window_hls_playlist(session_id: str) -> Tuple[bytes, str, dict, int]:
     """Dispatch window.m3u8 requests to the new resource-based path."""
     session = get_session(session_id)
@@ -3902,6 +4047,110 @@ def _segment_index_for_time(text: str, target_sec: float) -> int:
             index += 1
             pending_duration = None
     return max(0, index - 1)
+def _playlist_total_duration(text: str) -> float:
+    """Sum EXTINF durations — the current playable length of a media playlist.
+
+    Works for both live (no ENDLIST, grows) and completed VOD playlists.
+    """
+    total = 0.0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#EXTINF:") and "," in stripped:
+            try:
+                total += float(stripped.split(":", 1)[1].split(",", 1)[0])
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def _media_playlist_is_ll(session: PreviewSession) -> bool:
+    """True when the session's resolved media playlist is Twitch LL-HLS.
+
+    LL masters advertise #EXT-X-PART-INF on their media playlists; a plain
+    master's media playlists never carry it. #EXT-X-TWITCH-PREFETCH lines are
+    not checked — they pass through _rewrite_playlist_line unrewritten and are
+    inert for hls.js (ponytail: if Twitch ever makes PART tags optional, probe
+    for #EXT-X-PART instead).
+    """
+    if not session.entry_url or session.entry_url == session.master_url:
+        return False
+    try:
+        from services.preview.hls import _http_get_bytes
+
+        data, _, _, _ = _http_get_bytes(session, session.entry_url)
+    except Exception:
+        return False
+    return b"#EXT-X-PART-INF" in data
+
+
+def _strip_low_latency_param(url: str) -> Optional[str]:
+    """Rebuild a usher URL without low_latency — the non-LL fallback master.
+
+    The token params (nauth/nauthsig) stay valid; only the playlist shape
+    requested from usher changes.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "low_latency"]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
+
+
+def _twitch_login_from_master(master_url: str) -> Optional[str]:
+    """Extract the channel login from a usher live master URL."""
+    m = re.search(r"/api/channel/hls/([^/?]+)\.m3u8", master_url or "")
+    return m.group(1) if m else None
+
+
+def _kick_slug_from_master(master_url: str) -> Optional[str]:
+    """Best-effort channel slug from a Kick URL.
+
+    Handles kick.com/{slug}/... channel pages and kick.com/hls/{slug}/...
+    playback URLs; non-kick CDN hosts (playback.live-video.net) yield None.
+    """
+    m = re.search(r"kick\.com/(?:hls/)?([^/?#]+)", master_url or "")
+    if not m:
+        return None
+    slug = m.group(1)
+    if slug.lower() in ("videos", "clips", "api"):
+        return None
+    return slug
+
+
+def _apply_growing_vod_duration(session: PreviewSession) -> None:
+    """Probe the resolved media playlist for Twitch/Kick VODs without yt_info.
+
+    In-progress VODs have no #EXT-X-ENDLIST and a duration that grows while
+    the broadcast runs; yt-dlp/GQL metadata is absent or a 3600 placeholder,
+    so _clamp_session_crop_to_vod_duration leaves vod_duration=0 (dead rail
+    on the frontend). Summing EXTINF gives the real current length. Completed
+    VODs are unaffected — the probe only fills in what metadata missed.
+    """
+    if session.kind != "hls" or (session.platform or "") == "YouTube":
+        return
+    if getattr(session, "dash_window_hls", False) or not session.entry_url:
+        return
+    try:
+        from services.preview.hls import _http_get_bytes
+
+        data, _, _, _ = _http_get_bytes(session, session.entry_url)
+    except Exception:
+        return
+    text = data.decode("utf-8", errors="replace")
+    total = _playlist_total_duration(text)
+    session.growing_vod = "#EXT-X-ENDLIST" not in text
+    if total <= 0:
+        return
+    session.vod_duration = total
+    client_end = float(session.crop_end or 0)
+    # 3600/7200 are frontend placeholders for "unknown length" — replace with
+    # the probed length; keep a real client-supplied end when it is sane.
+    if client_end <= 0 or client_end >= 3600:
+        session.crop_end = total
+        if session.crop_start >= session.crop_end:
+            session.crop_start = max(0.0, session.crop_end - 0.5)
+
+
 def _rewrite_playlist_line(
     line: str,
     session: PreviewSession,

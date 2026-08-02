@@ -196,7 +196,12 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
     now = time.time()
     cache = _playlist_cache(session)
     cached = cache.get(upstream_url)
-    if cached and now - cached[1] < PLAYLIST_REWRITE_TTL_SEC:
+    # Live sessions: media playlists refresh at 0.5s (lower latency); the
+    # master keeps the module default so it is not re-fetched on every loop.
+    ttl = PLAYLIST_REWRITE_TTL_SEC
+    if session.playlist_ttl_sec > 0 and upstream_url != session.master_url:
+        ttl = session.playlist_ttl_sec
+    if cached and now - cached[1] < ttl:
         return (
             cached[0],
             "application/vnd.apple.mpegurl",
