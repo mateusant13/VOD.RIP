@@ -8,7 +8,7 @@ import type { AppSettings, UpdateInfo } from '../types';
 
 type Props = {
   settings: AppSettings;
-  setSettings: Dispatch<SetStateAction<AppSettings | null>>;
+  setSettings: Dispatch<SetStateAction<AppSettings>>;
   appVersion: string | null;
   updateInfo: UpdateInfo | null;
   updateChecking: boolean;
