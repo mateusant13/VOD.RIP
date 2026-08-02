@@ -14,6 +14,7 @@ import {
   startPanelResizeDrag,
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
+import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
 
 interface LiveEntry {
   url: string;
@@ -159,7 +160,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
             const Hls = (await import('hls.js')).default;
             if (cancelled) return;
             if (Hls.isSupported()) {
-              const hls = new Hls();
+              const hls = new Hls(twitchAdBlockHlsConfig());
               hlsRef.current = hls;
               hls.loadSource(src);
               hls.attachMedia(video);

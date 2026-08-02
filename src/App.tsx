@@ -1,6 +1,7 @@
 import { memo, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
+import { twitchAdBlockHlsConfig } from './twitchAdBlock';
 import {
   Download, Info, Play, Pause, Link2, X, Clock,
   Users, Database, Settings2, Loader2,
@@ -1798,6 +1799,7 @@ export default function App() {
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
+        ...twitchAdBlockHlsConfig(),
         ...(previewIsLiveRef.current ? {
           liveSyncDuration: 3,
           liveMaxLatencyDuration: 10,

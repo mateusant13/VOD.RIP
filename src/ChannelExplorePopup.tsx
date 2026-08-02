@@ -3,6 +3,7 @@ import {
   type KeyboardEvent, type PointerEvent as ReactPointerEvent,
 } from 'react';
 import Hls from 'hls.js';
+import { twitchAdBlockHlsConfig } from './twitchAdBlock';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -1029,6 +1030,7 @@ export default function ChannelExplorePopup({
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
+        ...twitchAdBlockHlsConfig(),
         startPosition: trimTimelineRef.current ? 0 : (pendingSeekSecRef.current ?? 0),
       });
       hlsRef.current = hls;
