@@ -275,7 +275,7 @@ const ChannelRow = memo(function ChannelRow({
               toggleChannelSelection(ch.id);
             }
           }}
-          className="flex-1 min-w-0 overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
+          className="flex-1 min-w-0 whitespace-nowrap overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
         >
           <ChannelPlatformLabel
             kickSlug={ch.kickSlug}
@@ -5436,7 +5436,9 @@ export default function App() {
       <div
         ref={mainPanelRef}
         style={{ width: effectiveLayout.main.w, height: effectiveLayout.main.h }}
-        className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col ${
+        // @container: VOD-row chrome (thumbnail, index badge, open-in-browser)
+        // hides below 320px so the title keeps a real share and stays single-line.
+        className={`relative shrink-0 overflow-visible bg-zinc-950 border-2 border-white flex flex-col @container ${
           triplePanelLayout ? 'p-4 gap-3' : urlMainCompact ? 'p-4 gap-2' : 'p-6 gap-4'
         } ${platformCardShadow(layoutPlatform)}`}
       >
@@ -5472,17 +5474,17 @@ export default function App() {
             <button
               key={t}
               onClick={() => setTab(t)}
-              className={`flex-1 text-center transition-all flex items-center justify-center gap-2 ${
+              className={`flex-1 min-w-0 text-center transition-all flex items-center justify-center gap-2 ${
                 mainCardHeaderCompact ? 'py-2' : 'py-3'
               } ${
                 tab === t ? 'bg-white text-black' : 'bg-transparent text-zinc-500 hover:text-white'
               }`}
             >
-              {t === 'url' && <Link2 size={14} />}
-              {t === 'channels' && <Users size={14} />}
-              {t === 'queue' && <Download size={14} />}
-              {t === 'settings' && <Settings2 size={14} />}
-              {t === 'url' ? 'URL' : t === 'channels' ? 'CHANNELS' : t === 'queue' ? 'QUEUE' : 'SETTINGS'}
+              {t === 'url' && <Link2 size={14} className="shrink-0" />}
+              {t === 'channels' && <Users size={14} className="shrink-0" />}
+              {t === 'queue' && <Download size={14} className="shrink-0" />}
+              {t === 'settings' && <Settings2 size={14} className="shrink-0" />}
+              <span className="truncate">{t === 'url' ? 'URL' : t === 'channels' ? 'CHANNELS' : t === 'queue' ? 'QUEUE' : 'SETTINGS'}</span>
             </button>
           ))}
         </div>
@@ -5898,7 +5900,7 @@ export default function App() {
                                     });
                                   }
                                 }}
-                                className={`flex items-center gap-1.5 border bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group ${
+                                className={`flex items-center gap-1 border bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group ${
                                   isActiveVod ? `${rowBorder} bg-zinc-900` : 'border-zinc-800'
                                 }`}
                               >
@@ -5919,8 +5921,8 @@ export default function App() {
                                     style={vodCheckboxStyle(rowAccent)}
                                   />
                                 </label>
-                                <ChannelClipThumb video={v} />
-                                <ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} />
+                                <span className="@max-xs:hidden shrink-0"><ChannelClipThumb video={v} /></span>
+                                <span className="@max-xs:hidden shrink-0"><ChannelListIndexBadge platform={v.platform} index={v.platformListIndex} /></span>
                                 <div className="flex-1 min-w-0 text-left text-[11px] font-mono text-zinc-300 group-hover:text-white">
                                   <span className="truncate flex items-center gap-1">
                                     <PlatformVodIcon platform={v.platform} />
@@ -5961,7 +5963,7 @@ export default function App() {
                                     e.stopPropagation();
                                     void openExplorePlayer(v);
                                   }}
-                                  className="shrink-0 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-400 hover:border-white hover:text-white flex items-center gap-0.5"
+                                  className="shrink-0 border border-zinc-700 px-1 py-0.5 text-[8px] font-bold uppercase text-zinc-400 hover:border-white hover:text-white flex items-center gap-0.5"
                                 >
                                   <Eye size={10} />
                                   Preview
@@ -5974,7 +5976,7 @@ export default function App() {
                                     e.stopPropagation();
                                     window.open(fullUrl, '_blank', 'noopener,noreferrer');
                                   }}
-                                  className="text-zinc-600 hover:text-white p-1 shrink-0"
+                                  className="text-zinc-600 hover:text-white p-1 shrink-0 @max-xs:hidden"
                                 >
                                   <ExternalLink size={11} />
                                 </button>

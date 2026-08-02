@@ -890,7 +890,12 @@ export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
 /** Min height when trim UI + action buttons must stay visible. */
 export const URL_ASIDE_TRIM_MIN_H = 414;
 export const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
-export const PANEL_MIN: PanelSize = { w: 200, h: 180 };
+/**
+ * Minimum width for urlAside/main panels. 240 keeps every panel's text on one
+ * line (channel rows, VOD rows, trim UI, action bars all fit with truncation);
+ * below it the fixed-content flex rows collapse their text children to 0.
+ */
+export const PANEL_MIN: PanelSize = { w: 240, h: 180 };
 /** Hard upper bound for stored panel height (viewport-independent). */
 export const PANEL_MAX_H_HARD = 3000;
 export const VIEWPORT_EDGE_LOCK = 40;

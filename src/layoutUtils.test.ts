@@ -4,9 +4,12 @@ import {
   layoutMaxPanelWidthAtSiblingMins,
   resizeLayoutGivingWidthTo,
   shrinkLayoutPanelsToFit,
+  clampPanelSizeForLayout,
+  effectiveLayoutFromPreferred,
   panelPosAfterResize,
   healSqueezedPanelLayout,
   PREVIEW_PANEL_MIN_W,
+  LIVE_PANEL_MIN_W,
   PANEL_MIN,
 } from './layoutUtils';
 import type { LayoutPanelBoundsInput } from './types';
@@ -189,19 +192,19 @@ describe('layoutUtils resize budget', () => {
   it('does not heal deliberate narrow panels above min', () => {
     const layout = {
       previewPanelWidth: 640,
-      urlAside: { w: 240, h: 414 }, // narrow but above min — user's own choice
+      urlAside: { w: 250, h: 414 }, // narrow but above min — user's own choice
       main: { w: 448, h: 448 },
-      owned: { preview: 640, urlAside: 240, main: 448 },
+      owned: { preview: 640, urlAside: 250, main: 448 },
     };
     const healed = healSqueezedPanelLayout(layout);
-    expect(healed.owned.urlAside).toBe(240);
-    expect(healed.urlAside.w).toBe(240);
+    expect(healed.owned.urlAside).toBe(250);
+    expect(healed.urlAside.w).toBe(250);
   });
 
   it('keeps a genuinely full row squeezed visually but resets the owned restore target', () => {
     // Preview maxed at sibling mins: row has zero slack — the squeeze is real.
     const layout = {
-      previewPanelWidth: 1096,
+      previewPanelWidth: 1000, // budget(1480) - 240 - 240 at the new mins
       urlAside: { w: PANEL_MIN.w, h: 620 },
       main: { w: PANEL_MIN.w, h: 620 },
     };
@@ -227,6 +230,73 @@ describe('layoutUtils resize budget', () => {
     expect(healed.urlAside.w).toBe(PANEL_MIN.w);
     expect(healed.owned.preview).toBe(PREVIEW_PANEL_MIN_W);
     expect(healed.owned.main).toBe(PANEL_MIN.w);
+  });
+
+  it('enforces raised minimum widths on every clamp path', () => {
+    // The whole point of the panel-min feature: urlAside/main never below 240,
+    // preview never below 280, live never below 320. These exact values are
+    // mirrored by e2e/repro-resize-full.mjs (main agent updates it on merge).
+    expect(PANEL_MIN.w).toBe(240);
+    expect(PREVIEW_PANEL_MIN_W).toBe(280);
+    expect(LIVE_PANEL_MIN_W).toBe(320);
+    // Triple layout at 1600x900: 280 + 240 + 240 fits the row budget easily.
+    expect(PREVIEW_PANEL_MIN_W + PANEL_MIN.w + PANEL_MIN.w).toBeLessThanOrEqual(layoutRowWidthBudget(tripleLayout()));
+  });
+
+  it('never lets urlAside/main drop below the min during a drag', () => {
+    const layout = tripleLayout();
+    expect(resizeLayoutGivingWidthTo(layout, 'main', 1).main.w).toBe(PANEL_MIN.w);
+    expect(resizeLayoutGivingWidthTo(layout, 'main', 1).urlAside.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
+    expect(resizeLayoutGivingWidthTo(layout, 'urlAside', 1).urlAside.w).toBe(PANEL_MIN.w);
+    expect(resizeLayoutGivingWidthTo(layout, 'preview', 1).preview.w).toBe(PREVIEW_PANEL_MIN_W);
+    // Drag the target past the pointer (desiredW huge) still floors siblings at min.
+    const maxed = resizeLayoutGivingWidthTo(layout, 'main', 10_000);
+    expect(maxed.main.w).toBe(layoutMaxPanelWidthAtSiblingMins('main', layout));
+    expect(maxed.urlAside.w).toBe(PANEL_MIN.w);
+    expect(maxed.preview.w).toBe(PREVIEW_PANEL_MIN_W);
+  });
+
+  it('shrinkLayoutPanelsToFit never renders a panel below its min', () => {
+    // A row blown way past the budget floors every panel at its own min.
+    const blown = {
+      ...tripleLayout(),
+      preview: { w: 4000, h: 0 },
+      urlAside: { w: 4000, h: 414 },
+      main: { w: 4000, h: 448 },
+    };
+    const fitted = shrinkLayoutPanelsToFit(blown);
+    expect(fitted.preview.w).toBeGreaterThanOrEqual(PREVIEW_PANEL_MIN_W);
+    expect(fitted.urlAside.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
+    expect(fitted.main.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
+    expect(fitted.preview.w + fitted.urlAside.w + fitted.main.w).toBeLessThanOrEqual(layoutRowWidthBudget(blown));
+  });
+
+  it('clampPanelSizeForLayout floors width at the panel min', () => {
+    const layout = tripleLayout();
+    const main = clampPanelSizeForLayout('main', { w: 30, h: 40 }, layout);
+    expect(main.w).toBe(PANEL_MIN.w);
+    expect(main.h).toBe(PANEL_MIN.h);
+    const urlAside = clampPanelSizeForLayout('urlAside', { w: 0, h: 0 }, layout);
+    expect(urlAside.w).toBe(PANEL_MIN.w);
+    expect(urlAside.h).toBe(PANEL_MIN.h);
+  });
+
+  it('effective layout never renders a panel below its min width', () => {
+    const preferred = {
+      previewPanelWidth: 100,
+      urlAside: { w: 50, h: 100 },
+      main: { w: 60, h: 100 },
+      livePanelWidth: 480,
+    };
+    const effective = effectiveLayoutFromPreferred(
+      preferred,
+      { previewOpen: true, urlPanelAside: true },
+    );
+    expect(effective.preview.w).toBeGreaterThanOrEqual(PREVIEW_PANEL_MIN_W);
+    expect(effective.urlAside.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
+    expect(effective.main.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
+    // Preferred inputs stay untouched (persistence contract).
+    expect(preferred.urlAside.w).toBe(50);
   });
 });
 
