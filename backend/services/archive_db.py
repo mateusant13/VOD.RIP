@@ -1,0 +1,459 @@
+"""Local archive store — SQLite WAL + FTS5 for chat, transcripts, and video index.
+
+The "local Google" contract every ingestion/chat/transcription/search slice
+builds against. Single-writer design: the app is a desktop process, so one
+module-level connection guarded by a lock is sufficient.
+
+Storage layout (all offsets are seconds into the stream, monotonic):
+  videos        — one row per (platform, video_id); canonical_key dedupes
+                  the same live/VOD simulcast across platforms
+  messages      — chat rows, append-only; FTS5 contentless index
+  transcripts   — word-timestamped segments; FTS5 contentless index
+  video_aliases — manual canonical_key overrides for cross-platform dedupe
+  archive_jobs  — ingest / chat_backfill / transcribe queue
+
+DB location: %APPDATA%/VOD.RIP/archive.db (same dir as settings.json);
+override with env VODRIP_ARCHIVE_DB (used by tests).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+from services.settings import _get_appdata_dir
+
+logger = logging.getLogger(__name__)
+
+PLATFORMS = ("youtube", "twitch", "kick")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS videos (
+  platform      TEXT NOT NULL CHECK (platform IN ('youtube','twitch','kick')),
+  video_id      TEXT NOT NULL,
+  channel       TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  started_at    TEXT,
+  ended_at      TEXT,
+  duration_sec  REAL,
+  archive_path  TEXT,
+  canonical_key TEXT,
+  status        TEXT NOT NULL DEFAULT 'known'
+                CHECK (status IN ('known','downloading','ready','failed')),
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (platform, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_videos_channel  ON videos(channel);
+CREATE INDEX IF NOT EXISTS idx_videos_canonical ON videos(canonical_key);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  offset_sec REAL NOT NULL,
+  user_id    TEXT,
+  username   TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  badges     TEXT NOT NULL DEFAULT '[]',
+  emotes     TEXT NOT NULL DEFAULT '[]',
+  ts         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_messages_video ON messages(platform, video_id, offset_sec);
+
+-- Regular FTS5 (not contentless): BM25-rankable, rowid joins to messages,
+-- and rows can be deleted (self-check scrub / retention pruning).
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  seg_idx    INTEGER NOT NULL,
+  start_sec  REAL NOT NULL,
+  end_sec    REAL NOT NULL,
+  text       TEXT NOT NULL,
+  words_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_id, start_sec);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(text);
+
+CREATE TABLE IF NOT EXISTS video_aliases (
+  platform      TEXT NOT NULL,
+  video_id      TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  note          TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (platform, video_id)
+);
+
+CREATE TABLE IF NOT EXISTS archive_jobs (
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe')),
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'queued'
+             CHECK (status IN ('queued','running','done','failed')),
+  progress   REAL NOT NULL DEFAULT 0,
+  error      TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON archive_jobs(status, created_at);
+"""
+
+
+def _db_path() -> Path:
+    override = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
+    if override:
+        return Path(override)
+    return _get_appdata_dir() / "archive.db"
+
+
+# RLock: query()/execute() hold the lock while calling get_conn(), which
+# re-acquires it — a plain Lock would self-deadlock on first read.
+_lock = threading.RLock()
+_conn: Optional[sqlite3.Connection] = None
+_schema_ready = False
+
+
+def get_conn() -> sqlite3.Connection:
+    """Return the shared WAL connection, initializing schema on first use."""
+    global _conn, _schema_ready
+    with _lock:
+        if _conn is None:
+            path = _db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(SCHEMA)
+            conn.commit()
+            _conn = conn
+        if not _schema_ready:
+            _conn.executescript(SCHEMA)
+            _conn.commit()
+            _schema_ready = True
+        return _conn
+
+
+# ponytail: single global lock + connection; upgrade path is per-thread
+# connections (threading.local) or aiosqlite if the app ever goes async.
+def _bind(params: Any) -> Any:
+    # Named :placeholders need the dict itself — tuple() on a dict would bind
+    # its KEYS as positional values and silently corrupt every row.
+    return params if isinstance(params, dict) else tuple(params)
+
+
+def execute(sql: str, params: Any = ()) -> sqlite3.Cursor:
+    with _lock:
+        cur = get_conn().execute(sql, _bind(params))
+        get_conn().commit()
+        return cur
+
+
+def query(sql: str, params: Any = ()) -> list[sqlite3.Row]:
+    with _lock:
+        return get_conn().execute(sql, _bind(params)).fetchall()
+
+
+# --- videos ---------------------------------------------------------------
+
+def upsert_video(video: dict) -> None:
+    now = _now_iso()
+    row = {
+        "platform": video["platform"],
+        "video_id": video["video_id"],
+        "channel": video.get("channel", ""),
+        "title": video.get("title", ""),
+        "started_at": video.get("started_at"),
+        "ended_at": video.get("ended_at"),
+        "duration_sec": video.get("duration_sec"),
+        "archive_path": video.get("archive_path"),
+        "canonical_key": video.get("canonical_key"),
+        "status": video.get("status", "known"),
+        "updated_at": now,
+    }
+    execute(
+        """INSERT INTO videos (platform, video_id, channel, title, started_at,
+           ended_at, duration_sec, archive_path, canonical_key, status,
+           created_at, updated_at)
+           VALUES (:platform, :video_id, :channel, :title, :started_at,
+           :ended_at, :duration_sec, :archive_path, :canonical_key, :status,
+           :created_at, :updated_at)
+           ON CONFLICT(platform, video_id) DO UPDATE SET
+             channel=excluded.channel, title=excluded.title,
+             started_at=excluded.started_at, ended_at=excluded.ended_at,
+             duration_sec=excluded.duration_sec,
+             archive_path=excluded.archive_path,
+             canonical_key=excluded.canonical_key,
+             status=excluded.status, updated_at=excluded.updated_at""",
+        {**row, "created_at": now},
+    )
+
+
+def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -> list[dict]:
+    sql = "SELECT * FROM videos WHERE 1=1"
+    params: list[Any] = []
+    if platform:
+        sql += " AND platform = ?"
+        params.append(platform)
+    if channel:
+        sql += " AND channel = ?"
+        params.append(channel)
+    sql += " ORDER BY started_at DESC"
+    return [dict(r) for r in query(sql, params)]
+
+
+# --- messages -------------------------------------------------------------
+
+def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
+    """Batch insert chat rows; each row: offset_sec, user_id, username, text,
+    badges (list), emotes (list), ts (optional ISO). Returns count inserted."""
+    conn = get_conn()
+    count = 0
+    with _lock:
+        with conn:  # transaction
+            for r in rows:
+                cur = conn.execute(
+                    """INSERT INTO messages (platform, video_id, offset_sec,
+                       user_id, username, text, badges, emotes, ts)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        platform,
+                        video_id,
+                        float(r["offset_sec"]),
+                        r.get("user_id"),
+                        r.get("username", ""),
+                        r["text"],
+                        json.dumps(r.get("badges", []), ensure_ascii=False),
+                        json.dumps(r.get("emotes", []), ensure_ascii=False),
+                        r.get("ts"),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO messages_fts (rowid, text) VALUES (?, ?)",
+                    (cur.lastrowid, r["text"]),
+                )
+                count += 1
+    return count
+
+
+def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 30.0) -> list[dict]:
+    rows = query(
+        """SELECT * FROM messages
+           WHERE platform = ? AND video_id = ?
+             AND offset_sec BETWEEN ? AND ?
+           ORDER BY offset_sec LIMIT 200""",
+        (platform, video_id, offset_sec - half, offset_sec + half),
+    )
+    return [dict(r) for r in rows]
+
+
+# --- transcripts ----------------------------------------------------------
+
+def insert_transcript(platform: str, video_id: str, segments: Iterable[dict]) -> int:
+    """Segments: seg_idx, start_sec, end_sec, text, words (list of
+    {word, start, end}). Returns count inserted."""
+    conn = get_conn()
+    count = 0
+    with _lock:
+        with conn:
+            for seg in segments:
+                cur = conn.execute(
+                    """INSERT INTO transcripts (platform, video_id, seg_idx,
+                       start_sec, end_sec, text, words_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        platform,
+                        video_id,
+                        int(seg["seg_idx"]),
+                        float(seg["start_sec"]),
+                        float(seg["end_sec"]),
+                        seg["text"],
+                        json.dumps(seg.get("words", []), ensure_ascii=False),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO transcripts_fts (rowid, text) VALUES (?, ?)",
+                    (cur.lastrowid, seg["text"]),
+                )
+                count += 1
+    return count
+
+
+def transcript_for(platform: str, video_id: str) -> list[dict]:
+    rows = query(
+        "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
+        (platform, video_id),
+    )
+    return [dict(r) for r in rows]
+
+
+# --- dedupe ---------------------------------------------------------------
+
+def set_alias(platform: str, video_id: str, canonical_key: str, note: str = "") -> None:
+    execute(
+        """INSERT INTO video_aliases (platform, video_id, canonical_key, note)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(platform, video_id) DO UPDATE SET
+             canonical_key=excluded.canonical_key, note=excluded.note""",
+        (platform, video_id, canonical_key, note),
+    )
+
+
+def dedupe_view() -> list[dict]:
+    """Videos grouped by canonical_key with per-platform members, so callers
+    can skip a platform when the same live/VOD exists on a higher-priority one."""
+    rows = query(
+        """SELECT v.platform, v.video_id, v.channel, v.title,
+                  COALESCE(a.canonical_key, v.canonical_key) AS key
+           FROM videos v
+           LEFT JOIN video_aliases a USING (platform, video_id)
+           WHERE COALESCE(a.canonical_key, v.canonical_key) IS NOT NULL
+           ORDER BY key, v.platform"""
+    )
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r["key"], []).append(dict(r))
+    return [{"canonical_key": k, "videos": v} for k, v in groups.items()]
+
+
+# --- jobs -----------------------------------------------------------------
+
+def enqueue_job(job_id: str, kind: str, platform: str, video_id: str) -> None:
+    now = _now_iso()
+    execute(
+        """INSERT INTO archive_jobs (id, kind, platform, video_id, status,
+           created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)""",
+        (job_id, kind, platform, video_id, now, now),
+    )
+
+
+def update_job(job_id: str, *, status: Optional[str] = None,
+               progress: Optional[float] = None, error: Optional[str] = None) -> None:
+    sets = ["updated_at = ?"]
+    params: list[Any] = [_now_iso()]
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    if progress is not None:
+        sets.append("progress = ?")
+        params.append(progress)
+    if error is not None:
+        sets.append("error = ?")
+        params.append(error)
+    params.append(job_id)
+    execute(f"UPDATE archive_jobs SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def list_jobs(limit: int = 50) -> list[dict]:
+    rows = query("SELECT * FROM archive_jobs ORDER BY created_at DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]
+
+
+# --- search ---------------------------------------------------------------
+
+def search(q: str, *, platform: Optional[str] = None, limit: int = 20) -> list[dict]:
+    """BM25 across transcripts + messages. Returns unified hits ordered by
+    score; each hit carries enough to seek: platform, video_id, offset_sec."""
+    if not q.strip():
+        return []
+    pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
+    hits: list[dict] = []
+    for kind, fts, src, offcol in (
+        ("transcript", "transcripts_fts", "transcripts", "t.start_sec"),
+        ("message", "messages_fts", "messages", "t.offset_sec"),
+    ):
+        sql = (
+            f"SELECT t.rowid, bm25({fts}) AS score, "
+            f"t.platform, t.video_id, {offcol} AS offset_sec, t.text "
+            f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
+            f"WHERE {fts} MATCH ?"
+        )
+        params: list[Any] = [pattern]
+        if platform:
+            sql += " AND t.platform = ?"
+            params.append(platform)
+        sql += f" ORDER BY score LIMIT {int(limit)}"
+        for r in query(sql, params):
+            hits.append({
+                "kind": kind,
+                "platform": r["platform"],
+                "video_id": r["video_id"],
+                "offset_sec": r["offset_sec"],
+                "text": r["text"],
+                "score": r["score"],
+            })
+    hits.sort(key=lambda h: h["score"])
+    return hits[:limit]
+
+
+# --- helpers --------------------------------------------------------------
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Module-level self-check: contract invariants must hold on import.
+# Idempotent: scrub leftovers first so re-import (tests, reloads) never trips.
+_conn_selfcheck = get_conn()
+_selfcheck_platform = "twitch"
+_selfcheck_video = "__archive_selfcheck__"
+with _lock:
+    _sc_conn = get_conn()
+    with _sc_conn:
+        _sc_conn.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE video_id=?)", (_selfcheck_video,))
+        _sc_conn.execute("DELETE FROM transcripts_fts WHERE rowid IN (SELECT id FROM transcripts WHERE video_id=?)", (_selfcheck_video,))
+        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
+        _sc_conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
+        _sc_conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
+        _sc_conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
+insert_messages(
+    _selfcheck_platform,
+    _selfcheck_video,
+    [{"offset_sec": 1.0, "username": "checker", "text": "arquivo local google teste"}],
+)
+_hits = search("local")
+assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in _hits), (
+    "FTS5 search must find inserted chat rows"
+)
+assert len(chat_window(_selfcheck_platform, _selfcheck_video, 1.0)) == 1
+insert_transcript(
+    _selfcheck_platform,
+    _selfcheck_video,
+    [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste"}],
+)
+assert any(
+    h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
+    for h in search("transcrição")
+), "FTS5 must find transcript segments (unicode61 tokenizer)"
+upsert_video({
+    "platform": _selfcheck_platform,
+    "video_id": _selfcheck_video,
+    "channel": "selfcheck",
+    "title": "selfcheck",
+    "canonical_key": "selfcheck-key",
+})
+set_alias(_selfcheck_platform, _selfcheck_video, "selfcheck-key")
+assert any(
+    g["canonical_key"] == "selfcheck-key" for g in dedupe_view()
+), "dedupe view must surface aliased videos"
+# cleanup selfcheck rows
+with _lock:
+    conn = get_conn()
+    with conn:
+        conn.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE video_id=?)", (_selfcheck_video,))
+        conn.execute("DELETE FROM transcripts_fts WHERE rowid IN (SELECT id FROM transcripts WHERE video_id=?)", (_selfcheck_video,))
+        conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
+        conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
+        conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
+        conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
