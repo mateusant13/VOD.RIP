@@ -12,7 +12,7 @@ const drive = async (n) => {
   await page.waitForTimeout(800);
   await page.click('text=lubu');
   await page.waitForTimeout(3000);
-  await page.click('text=ÚLTIMO DIA DO MUNDIAL', { timeout: 20000 });
+  await page.click('text=/[ÚU]LTIMO DIA DO MUNDIAL/i', { timeout: 20000 });
   await page.waitForTimeout(4000);
   await page.locator('button:has-text("PREVIEW")').first().click({ timeout: 20000 });
   await page.waitForTimeout(7000);

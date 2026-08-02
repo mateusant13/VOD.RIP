@@ -61,7 +61,7 @@ await page.click('text=CHANNELS');
 await page.waitForTimeout(800);
 await page.click('text=lubu');
 await page.waitForTimeout(3000);
-await page.click('text=ÚLTIMO DIA DO MUNDIAL');
+await page.click('text=/[ÚU]LTIMO DIA DO MUNDIAL/i');
 await page.waitForTimeout(4000);
 await page.locator('button:has-text("PREVIEW")').first().click();
 await page.waitForTimeout(7000);
