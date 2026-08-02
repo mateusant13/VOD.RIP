@@ -124,12 +124,18 @@ function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: nu
 export function PanelResizeHandles({
   onPointerDown,
   insetPx,
+  insetShift = 0,
 }: {
   onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => void;
   insetPx: number;
+  /** Shift handles inward by this many px. Needed when the host panel clips
+   *  overflow (handles outside the padding box would be un-hittable). */
+  insetShift?: number;
 }) {
   const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
   const edgePad = 12;
+  const off = insetPx + 3 - insetShift;
+  const cornerOff = insetPx - insetShift;
 
   const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string, sizeClass = '') => ({
     'data-panel-resize': true as const,
@@ -141,14 +147,14 @@ export function PanelResizeHandles({
 
   return (
     <>
-      <div {...edgeProps('n', { top: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -insetPx - 3, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('w', { left: -insetPx - 3, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('nw', { top: -insetPx, left: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
-      <div {...edgeProps('ne', { top: -insetPx, right: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('sw', { bottom: -insetPx, left: -insetPx }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('se', { bottom: -insetPx, right: -insetPx }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('n', { top: -off, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
+      <div {...edgeProps('s', { bottom: -off, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -off, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
+      <div {...edgeProps('w', { left: -off, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
+      <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
     </>
   );
 }

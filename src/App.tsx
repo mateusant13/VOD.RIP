@@ -62,12 +62,12 @@ import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
-import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, LayoutPanelKey, PersistedPanelLayout, PreviewSessionResponse } from './types';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelWidth, layoutMaxPanelHeight, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -533,6 +533,15 @@ export default function App() {
   const previewPanelHeightRef = useRef(0);
   const urlAsidePanelSizeRef = useRef(initialPanelLayout.urlAside);
   const mainPanelSizeRef = useRef(initialPanelLayout.main);
+  /**
+   * User-owned widths: the width each panel last had when the user dragged IT.
+   * Sibling squeezes never write here, so the next drag restores the row to the
+   * user's shapes instead of latching the squeezed (thin) widths forever.
+   * Persisted via `owned` so the restore target survives reloads.
+   */
+  const preferredDragRef = useRef<{ preview: number; urlAside: number; main: number }>(
+    userOwnedWidthsFrom(initialPanelLayout),
+  );
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
@@ -549,21 +558,33 @@ export default function App() {
       panelMaxW(),
       fallback.previewPanelWidth,
     );
+    // Heal layouts corrupted by the pre-owned resize bug (panels parked at
+    // their minimum are squeeze artifacts): owned widths reset to the default
+    // shape, and min-parked visual widths grow back when the row has slack.
+    const healed = healSqueezedPanelLayout({
+      previewPanelWidth: clampedPreviewW,
+      urlAside: clampedUrl,
+      main: clampedMain,
+      livePanelWidth: pl.livePanelWidth ?? fallback.livePanelWidth,
+      owned: pl.owned,
+    });
     // Preferred (dragged) widths are restored from storage as-is, within hard caps.
     // Runtime viewport clamps happen via effectiveLayoutFromPreferred each render.
     // No localStorage write here — the user's stored preferred widths must survive.
-    previewPanelWidthRef.current = clampedPreviewW;
-    urlAsidePanelSizeRef.current = clampedUrl;
-    mainPanelSizeRef.current = clampedMain;
-    setPreviewPanelWidth(clampedPreviewW);
-    setUrlAsidePanelSize(clampedUrl);
-    setMainPanelSize(clampedMain);
+    previewPanelWidthRef.current = healed.previewPanelWidth;
+    urlAsidePanelSizeRef.current = healed.urlAside;
+    mainPanelSizeRef.current = healed.main;
+    setPreviewPanelWidth(healed.previewPanelWidth);
+    setUrlAsidePanelSize(healed.urlAside);
+    setMainPanelSize(healed.main);
+    preferredDragRef.current = { ...healed.owned };
   }, []);
 
   const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => ({
     previewPanelWidth: previewPanelWidthRef.current,
     urlAside: { ...urlAsidePanelSizeRef.current },
     main: { ...mainPanelSizeRef.current },
+    owned: { ...preferredDragRef.current },
   }), []);
 
   const flushPanelLayoutToBackend = useCallback(() => {
@@ -613,6 +634,7 @@ export default function App() {
       previewPanelWidth,
       urlAside: urlAsidePanelSize,
       main: mainPanelSize,
+      owned: { ...preferredDragRef.current },
     };
     persistPanelLayout(layout);
     if (panelLayoutSaveTimerRef.current) {
@@ -2763,43 +2785,32 @@ export default function App() {
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, mainPanelSizeRef.current);
   }, [layoutBoundsInput]);
 
-  const applyLayoutRowSizes = useCallback((
-    fitted: {
-      preview: { w: number; h: number };
-      urlAside: { w: number; h: number };
-      main: { w: number; h: number };
-    },
-    targetKey: LayoutPanelKey,
-  ) => {
-    // ponytail: only persist the DRAGGED panel's width. Sibling widths are
-    // rendered at the shrunk width during the drag (via DOM), but the stored
-    // sibling widths stay at their pre-drag values. That way the next drag
-    // captures the original siblings as `preferred` and a reverse drag
-    // restores them instead of latching the shrunk widths forever.
+  const applyLayoutRowSizes = useCallback((fitted: {
+    preview: { w: number; h: number };
+    urlAside: { w: number; h: number };
+    main: { w: number; h: number };
+  }) => {
+    // Commit the FULL fitted row (dragged panel + siblings) to state, refs, and
+    // DOM on every move. State is what the render derives effective widths
+    // from; committing the siblings too keeps that derivation identical to the
+    // live drag — no proportional re-split, no release-time yank, no flicker.
+    // The restore target for a reverse drag is `preferredDragRef` (user-owned
+    // widths), which this function never touches: siblings squeezed by another
+    // panel's drag keep their owned width and grow back when the drag reverses.
     const layout = layoutBoundsInput();
-    // ponytail: only the *state* for the dragged panel is set here. The DOM
-    // style is applied by startPanelResizeDrag.onMove (sync, via panelEl),
-    // and the render-time sibling-widths block below handles the rest of the
-    // row. Stamping the target's DOM a second time here used to fight the
-    // drag's own applyPanelSize and cause a flicker on every pointermove.
-    if (layout.previewOpen && targetKey === 'preview') {
-      previewPanelWidthRef.current = fitted.preview.w;
+    previewPanelWidthRef.current = fitted.preview.w;
+    urlAsidePanelSizeRef.current = fitted.urlAside;
+    mainPanelSizeRef.current = fitted.main;
+    if (layout.previewOpen) {
       setPreviewPanelWidth(fitted.preview.w);
+      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
     }
-    if (targetKey === 'urlAside') {
-      urlAsidePanelSizeRef.current = fitted.urlAside;
+    if (layout.urlPanelAside) {
       setUrlAsidePanelSize(fitted.urlAside);
+      if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
     }
-    if (targetKey === 'main') {
-      mainPanelSizeRef.current = fitted.main;
-      setMainPanelSize(fitted.main);
-    }
-    // Render-time sibling widths still need to match the dragged layout so
-    // the row fits the budget while the pointer is down. Skip the dragged
-    // panel — its DOM was already updated by startPanelResizeDrag.onMove.
-    if (targetKey !== 'urlAside' && urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
-    if (targetKey !== 'main' && mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
-    if (layout.previewOpen && targetKey !== 'preview' && previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
+    setMainPanelSize(fitted.main);
+    if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
     syncRowHeightsToPreview();
   }, [layoutBoundsInput, syncRowHeightsToPreview]);
 
@@ -2807,13 +2818,10 @@ export default function App() {
     const chromeH = previewChromeHRef.current;
     const aspect = previewVideoAspectRef.current;
     const coupled = layoutRowHasMultiplePanels();
-    // Snapshot at drag start so sibling widths restore when the drag reverses.
+    // Snapshot the row at drag start; sibling restore targets come from the
+    // user-owned widths (survive squeezes across drags, unlike a live snapshot).
     const dragLayout = layoutBoundsInput();
-    const preferred = {
-      preview: dragLayout.preview.w,
-      urlAside: dragLayout.urlAside.w,
-      main: dragLayout.main.w,
-    };
+    const preferred = preferredDragRef.current;
 
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
@@ -2826,11 +2834,11 @@ export default function App() {
       },
       onResizeMove: coupled
         ? (w) => {
-            const fitted = resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred);
-            applyLayoutRowSizes(fitted, 'preview');
+            applyLayoutRowSizes(resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred));
           }
         : undefined,
       onResizeEnd: () => {
+        preferredDragRef.current.preview = previewPanelWidthRef.current;
         applyLayoutPanelClamps();
       },
     });
@@ -2839,57 +2847,53 @@ export default function App() {
   const onUrlAsidePanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
     const dragLayout = layoutBoundsInput();
-    const preferred = {
-      preview: dragLayout.preview.w,
-      urlAside: dragLayout.urlAside.w,
-      main: dragLayout.main.w,
-    };
+    const preferred = preferredDragRef.current;
 
     startPanelResizeDrag(e, edge, urlAsidePanelSizeRef, setUrlAsidePanelSize, {
       panelEl: urlAsidePanelRef.current,
-      maxW: layoutMaxPanelWidth('urlAside', dragLayout),
+      maxW: layoutMaxPanelWidthAtSiblingMins('urlAside', dragLayout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => {
-        const base = clampPanelSizeForLayout('urlAside', s, dragLayout);
-        if (!coupled) return base;
-        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', base.w, preferred);
-        return { w: fitted.urlAside.w, h: base.h };
+        if (!coupled) return clampPanelSizeForLayout('urlAside', s, dragLayout);
+        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', s.w, preferred);
+        return { w: fitted.urlAside.w, h: s.h };
       },
       onResizeMove: coupled
         ? (next) => {
             const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', next.w, preferred);
-            applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } }, 'urlAside');
+            applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } });
           }
         : undefined,
-      onResizeEnd: () => applyLayoutPanelClamps(),
+      onResizeEnd: () => {
+        preferredDragRef.current.urlAside = urlAsidePanelSizeRef.current.w;
+        applyLayoutPanelClamps();
+      },
     });
   }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
 
   const onMainPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const coupled = layoutRowHasMultiplePanels();
     const dragLayout = layoutBoundsInput();
-    const preferred = {
-      preview: dragLayout.preview.w,
-      urlAside: dragLayout.urlAside.w,
-      main: dragLayout.main.w,
-    };
+    const preferred = preferredDragRef.current;
     startPanelResizeDrag(e, edge, mainPanelSizeRef, setMainPanelSize, {
       panelEl: mainPanelRef.current,
-      maxW: layoutMaxPanelWidth('main', dragLayout),
+      maxW: layoutMaxPanelWidthAtSiblingMins('main', dragLayout),
       maxH: layoutMaxPanelHeight(),
       clampSize: (s) => {
-        const base = clampPanelSizeForLayout('main', s, dragLayout);
-        if (!coupled) return base;
-        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', base.w, preferred);
-        return { w: fitted.main.w, h: base.h };
+        if (!coupled) return clampPanelSizeForLayout('main', s, dragLayout);
+        const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', s.w, preferred);
+        return { w: fitted.main.w, h: s.h };
       },
       onResizeMove: coupled
         ? (next) => {
             const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', next.w, preferred);
-            applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } }, 'main');
+            applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } });
           }
         : undefined,
-      onResizeEnd: () => applyLayoutPanelClamps(),
+      onResizeEnd: () => {
+        preferredDragRef.current.main = mainPanelSizeRef.current.w;
+        applyLayoutPanelClamps();
+      },
     });
   }, [layoutBoundsInput, applyLayoutPanelClamps, layoutRowHasMultiplePanels, applyLayoutRowSizes]);
 
@@ -4311,17 +4315,6 @@ export default function App() {
     setLivePopupEntry({ entry, channelName: name });
   }, []);
 
-  // TEMP-VERIFY: auto-open live popup for UI verification (revert before commit)
-  useEffect(() => {
-    const t = setTimeout(() => {
-      openLivePreview(
-        { platform: 'twitch', is_live: true, title: 'UX verify stream', url: 'https://www.twitch.tv/surtepi', headers: {}, type: 'channel' },
-        'surtepi',
-      );
-    }, 1200);
-    return () => clearTimeout(t);
-  }, [openLivePreview]);
-
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
       const ch = prev.find((c) => c.id === channelId);
@@ -5425,7 +5418,10 @@ export default function App() {
             {urlTabContent}
           </div>
           {urlAsideActionBar}
-          <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} />
+          {/* urlAside clips overflow, so its handles must sit inside the panel
+              edge or they'd be un-hittable; the seams stay owned by the
+              neighboring panels' outside handles. */}
+          <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} insetShift={12} />
         </div>
       )}
       <div

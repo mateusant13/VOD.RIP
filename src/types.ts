@@ -176,6 +176,13 @@ export interface PersistedPanelLayout {
   main: { w: number; h: number };
   /** Width of the live player panel (live replaces the preview slot while open). */
   livePanelWidth?: number;
+  /**
+   * User-owned widths — the widths each panel last had when the user dragged IT.
+   * Sibling squeezes never write here, so a reverse drag restores the row to the
+   * user's shapes instead of latching the squeezed (thin) widths forever.
+   * Optional for back-compat with layouts persisted before this field existed.
+   */
+  owned?: { preview: number; urlAside: number; main: number };
 }
 
 export type PanelSize = { w: number; h: number };

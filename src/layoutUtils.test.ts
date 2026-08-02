@@ -5,6 +5,7 @@ import {
   resizeLayoutGivingWidthTo,
   shrinkLayoutPanelsToFit,
   panelPosAfterResize,
+  healSqueezedPanelLayout,
   PREVIEW_PANEL_MIN_W,
   PANEL_MIN,
 } from './layoutUtils';
@@ -160,6 +161,56 @@ describe('layoutUtils resize budget', () => {
     );
     const total2 = afterMain.live!.w + afterMain.urlAside.w + afterMain.main.w;
     expect(total2).toBeLessThanOrEqual(budget);
+  });
+
+  it('heals min-parked panels from the pre-owned resize bug (visual + owned)', () => {
+    // Legacy polluted layout: urlAside parked at min while the row has slack.
+    const polluted = {
+      previewPanelWidth: 680,
+      urlAside: { w: PANEL_MIN.w, h: 620 },
+      main: { w: 468, h: 620 },
+    };
+    const healed = healSqueezedPanelLayout(polluted);
+    // Owned resets to the default shape so a reverse drag restores it.
+    expect(healed.owned.urlAside).toBeGreaterThan(PANEL_MIN.w);
+    // Visual grows back now because the row has slack.
+    expect(healed.urlAside.w).toBeGreaterThan(PANEL_MIN.w);
+    // Total still fits the budget.
+    const budget = layoutRowWidthBudget({
+      previewOpen: true,
+      urlPanelAside: true,
+      preview: { w: healed.previewPanelWidth, h: 0 },
+      urlAside: healed.urlAside,
+      main: healed.main,
+    });
+    expect(healed.previewPanelWidth + healed.urlAside.w + healed.main.w).toBeLessThanOrEqual(budget);
+  });
+
+  it('does not heal deliberate narrow panels above min', () => {
+    const layout = {
+      previewPanelWidth: 640,
+      urlAside: { w: 240, h: 414 }, // narrow but above min — user's own choice
+      main: { w: 448, h: 448 },
+      owned: { preview: 640, urlAside: 240, main: 448 },
+    };
+    const healed = healSqueezedPanelLayout(layout);
+    expect(healed.owned.urlAside).toBe(240);
+    expect(healed.urlAside.w).toBe(240);
+  });
+
+  it('keeps a genuinely full row squeezed visually but resets the owned restore target', () => {
+    // Preview maxed at sibling mins: row has zero slack — the squeeze is real.
+    const layout = {
+      previewPanelWidth: 1096,
+      urlAside: { w: PANEL_MIN.w, h: 620 },
+      main: { w: PANEL_MIN.w, h: 620 },
+    };
+    const healed = healSqueezedPanelLayout(layout);
+    // Visual stays squeezed (no slack), owned resets so a reverse drag restores.
+    expect(healed.urlAside.w).toBe(PANEL_MIN.w);
+    expect(healed.main.w).toBe(PANEL_MIN.w);
+    expect(healed.owned.urlAside).toBeGreaterThan(PANEL_MIN.w);
+    expect(healed.owned.main).toBeGreaterThan(PANEL_MIN.w);
   });
 });
 

@@ -226,14 +226,6 @@ export function resizeLayoutGivingWidthTo(
   return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main, live });
 }
 
-/** Shrink siblings when preview grows so the row stays within the viewport budget. */
-export function resizeLayoutWithPreviewWidth(
-  layout: LayoutPanelBoundsInput,
-  desiredPreviewW: number,
-): { preview: PanelSize; urlAside: PanelSize; main: PanelSize } {
-  return resizeLayoutGivingWidthTo(layout, 'preview', desiredPreviewW);
-}
-
 /** Shrink visible panel widths proportionally when the row exceeds the viewport. */
 export function shrinkLayoutPanelsToFit(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
@@ -708,17 +700,103 @@ export function startPanelWidthResize(
 }
 export function defaultPanelLayout(): PersistedPanelLayout {
   const scale = readUiScale();
+  const urlAside = {
+    w: Math.round(URL_ASIDE_PANEL_DEFAULT.w * scale),
+    h: Math.round(URL_ASIDE_PANEL_DEFAULT.h * scale),
+  };
+  const main = {
+    w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
+    h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
+  };
+  const previewPanelWidth = Math.round(PREVIEW_PANEL_DEFAULT_W * scale);
   return {
-    previewPanelWidth: Math.round(PREVIEW_PANEL_DEFAULT_W * scale),
-    urlAside: {
-      w: Math.round(URL_ASIDE_PANEL_DEFAULT.w * scale),
-      h: Math.round(URL_ASIDE_PANEL_DEFAULT.h * scale),
-    },
-    main: {
-      w: Math.round(MAIN_PANEL_DEFAULT.w * scale),
-      h: Math.round(MAIN_PANEL_DEFAULT.h * scale),
-    },
+    previewPanelWidth,
+    urlAside,
+    main,
     livePanelWidth: Math.round(LIVE_PANEL_DEFAULT_W * scale),
+    owned: { preview: previewPanelWidth, urlAside: urlAside.w, main: main.w },
+  };
+}
+/**
+ * User-owned (restore-target) widths from a persisted layout. Falls back to the
+ * stored visual widths for layouts saved before the `owned` field existed.
+ */
+export function userOwnedWidthsFrom(layout: PersistedPanelLayout): {
+  preview: number;
+  urlAside: number;
+  main: number;
+} {
+  const fallback = {
+    preview: layout.previewPanelWidth,
+    urlAside: layout.urlAside.w,
+    main: layout.main.w,
+  };
+  if (!layout.owned || typeof layout.owned !== 'object') return fallback;
+  const o = layout.owned as { preview?: unknown; urlAside?: unknown; main?: unknown };
+  const maxW = panelMaxW();
+  return {
+    preview: clampLayoutNumber(o.preview, PREVIEW_PANEL_MIN_W, maxW, fallback.preview),
+    urlAside: clampLayoutNumber(o.urlAside, PANEL_MIN.w, maxW, fallback.urlAside),
+    main: clampLayoutNumber(o.main, PANEL_MIN.w, maxW, fallback.main),
+  };
+}
+/**
+ * Migration heal for layouts persisted by the pre-owned resize bug: a panel
+ * parked at its minimum width in BOTH the visual layout and the owned/fallback
+ * restore target is a squeeze artifact, not a user choice. Reset its owned
+ * width to the default shape (so a reverse drag grows it back) and grow the
+ * visual width now while the row has slack (so a reload doesn't show the
+ * thin rectangle at all). No-op for panels above min — those may be deliberate.
+ * ponytail: a stronger heuristic (e.g. resetting any sub-default width from
+ * legacy data) could restore legacy proportional leftovers, but would also
+ * fight deliberate small sizes; exact-min only for now.
+ */
+export function healSqueezedPanelLayout(
+  layout: PersistedPanelLayout,
+): PersistedPanelLayout & { owned: { preview: number; urlAside: number; main: number } } {
+  const defaults = defaultPanelLayout();
+  const owned = userOwnedWidthsFrom(layout);
+
+  const healedOwned = {
+    preview: owned.preview <= PREVIEW_PANEL_MIN_W + 1 ? defaults.previewPanelWidth : owned.preview,
+    urlAside: owned.urlAside <= PANEL_MIN.w + 1 ? defaults.urlAside.w : owned.urlAside,
+    main: owned.main <= PANEL_MIN.w + 1 ? defaults.main.w : owned.main,
+  };
+
+  let previewW = layout.previewPanelWidth;
+  let urlAsideW = layout.urlAside.w;
+  let mainW = layout.main.w;
+  // All-three-visible budget is the conservative (tightest) row budget, so
+  // healing never overflows the row no matter which panels actually render.
+  const budget =
+    typeof window === 'undefined'
+      ? 0
+      : layoutRowWidthBudget({
+          previewOpen: true,
+          urlPanelAside: true,
+          preview: { w: previewW, h: 0 },
+          urlAside: layout.urlAside,
+          main: layout.main,
+        });
+  let slack = Math.max(0, budget - previewW - urlAsideW - mainW);
+  if (slack > 0) {
+    const grow = (atMin: boolean, current: number, target: number) => {
+      if (!atMin) return current;
+      const next = Math.min(target, current + slack);
+      slack -= next - current;
+      return next;
+    };
+    urlAsideW = grow(urlAsideW <= PANEL_MIN.w + 1, urlAsideW, healedOwned.urlAside);
+    mainW = grow(mainW <= PANEL_MIN.w + 1, mainW, healedOwned.main);
+    previewW = grow(previewW <= PREVIEW_PANEL_MIN_W + 1, previewW, healedOwned.preview);
+  }
+
+  return {
+    ...layout,
+    previewPanelWidth: previewW,
+    urlAside: { ...layout.urlAside, w: urlAsideW },
+    main: { ...layout.main, w: mainW },
+    owned: healedOwned,
   };
 }
 export function loadPanelLayout(): PersistedPanelLayout {
@@ -727,15 +805,18 @@ export function loadPanelLayout(): PersistedPanelLayout {
     const raw = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
     if (!raw) return fallback;
     const parsed = JSON.parse(raw) as Partial<PersistedPanelLayout>;
-    return {
-      previewPanelWidth: clampLayoutNumber(
-        parsed.previewPanelWidth,
-        PREVIEW_PANEL_MIN_W,
-        panelMaxW(),
-        fallback.previewPanelWidth,
-      ),
-      urlAside: sanitizeStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT),
-      main: sanitizeStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT),
+    const urlAside = sanitizeStoredPanelSize(parsed.urlAside, URL_ASIDE_PANEL_DEFAULT);
+    const main = sanitizeStoredPanelSize(parsed.main, MAIN_PANEL_DEFAULT);
+    const previewPanelWidth = clampLayoutNumber(
+      parsed.previewPanelWidth,
+      PREVIEW_PANEL_MIN_W,
+      panelMaxW(),
+      fallback.previewPanelWidth,
+    );
+    const base: PersistedPanelLayout = {
+      previewPanelWidth,
+      urlAside,
+      main,
       livePanelWidth: parsed.livePanelWidth !== undefined
         ? clampLayoutNumber(
             parsed.livePanelWidth,
@@ -745,6 +826,7 @@ export function loadPanelLayout(): PersistedPanelLayout {
           )
         : fallback.livePanelWidth,
     };
+    return healSqueezedPanelLayout({ ...base, owned: parsed.owned });
   } catch {
     return fallback;
   }
