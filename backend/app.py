@@ -382,8 +382,26 @@ async def _app_lifespan(_app: FastAPI):
     # than blocking the server for 16s on every boot.
     _lifespan_ready.set()
 
+    # Archive chat watchdog — captures live chat into the local archive
+    # while saved channels are live (polls the same live-status source as
+    # the live router, starts/stops the platform chat sinks, writes rows
+    # through archive_db).
+    try:
+        from services.archive_watchdog import start_archive_watchdog
+
+        start_archive_watchdog()
+        logger.info("Archive chat watchdog started")
+    except Exception:
+        logger.debug("Archive chat watchdog start skipped", exc_info=True)
+
     yield
     _warm_shutdown.set()
+    try:
+        from services.archive_watchdog import stop_archive_watchdog
+
+        stop_archive_watchdog(timeout=6.0)
+    except Exception:
+        logger.debug("Archive chat watchdog stop failed", exc_info=True)
     try:
         from services.shutdown_util import shutdown_downloads_and_children
 

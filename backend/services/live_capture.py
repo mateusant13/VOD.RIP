@@ -279,6 +279,9 @@ def _twitch_helix_live_info(login: str) -> Optional[dict]:
         "platform": "Twitch",
         "player_type": probed["player_type"],
         "ad_free": probed["ad_free"],
+        # ISO-8601 stream start — the archive chat sink anchors message
+        # offsets to it (tmi-sent-ts − started_at).
+        "started_at": stream.get("started_at"),
     }
 
 
@@ -387,6 +390,8 @@ def twitch_live_info(login: str) -> Optional[dict]:
         "title": info.get("title") or login,
         "viewers": info.get("viewer_count") or 0,
         "platform": "Twitch",
+        # unix-epoch stream start (yt-dlp) — archive chat sink anchor.
+        "started_at": info.get("start_time"),
     }
 
 

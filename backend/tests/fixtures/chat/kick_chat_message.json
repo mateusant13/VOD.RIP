@@ -1,0 +1,4 @@
+{
+  "event": "App\\Events\\ChatMessageEvent",
+  "data": "{\"id\":\"5f2f9c3e-7c2e-4f6d-8a1b-000000000001\",\"chatroom_id\":4895051,\"content\":\"LET'S GOOO\",\"type\":\"message\",\"created_at\":\"2026-08-01T22:30:05.000000Z\",\"sender\":{\"id\":987654321,\"username\":\"someviewer\",\"slug\":\"someviewer\",\"identity\":{\"color\":\"#FF4500\",\"badges\":[{\"type\":\"broadcaster\",\"text\":\"Broadcaster\"}]}},\"metadata\":{\"original_message\":null,\"original_sender\":null},\"is_emote_only\":false}"
+}

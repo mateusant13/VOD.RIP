@@ -162,6 +162,9 @@ def _fetch_channel_live_payload(channel: dict) -> dict:
                 # vaft rotation extras — frontend ignores unknown keys.
                 "player_type": info.get("player_type", "embed"),
                 "ad_free": bool(info.get("ad_free")),
+                # ISO/epoch stream start — archive chat watchdog anchors
+                # message offsets to it. Frontend ignores unknown keys.
+                "started_at": info.get("started_at"),
             })
     ys = (channel.get("youtubeSlug") or "").strip()
     if ys:
