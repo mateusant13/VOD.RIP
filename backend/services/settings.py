@@ -25,7 +25,7 @@ class SettingsManager:
     def __init__(self):
         self._settings_dir = _get_appdata_dir()
         self._settings_file = self._settings_dir / "settings.json"
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # get() → _autofill_ffmpeg_if_needed → save() re-enters
         self._settings = self._load()
         # Auto-create file with defaults if it doesn't exist
         if not self._settings_file.exists():
