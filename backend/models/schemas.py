@@ -192,6 +192,12 @@ class LivePreviewRequest(BaseModel):
     title: str = ""
 
 
+class LiveRotateRequest(BaseModel):
+    # Optional explicit next player type (default: advance in vaft order
+    # embed -> popout -> autoplay). Unknown values are rejected by the route.
+    player_type: Optional[str] = None
+
+
 class PreviewSessionStatusResponse(BaseModel):
     mux_ready: bool
     playlist_ready: bool = True

@@ -14,7 +14,7 @@ import {
   startPanelResizeDrag,
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
-import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
+import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 
 interface LiveEntry {
   url: string;
@@ -86,6 +86,20 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
     }
     setQualityMenuOpen(false);
   }, []);
+
+  // vaft midroll rotation: after repeated stitched segments the backend swaps
+  // this session's usher master to the next player type in place — reloading
+  // the same proxied URL serves the rotated stream. Failure = keep stripping.
+  const onAdRotation = React.useMemo(
+    () => createTwitchAdRotationHandler({
+      getSessionId: () => sessionIdRef.current,
+      getHls: () => hlsRef.current,
+      getVideo: () => videoRef.current,
+      requestRotation: (sid) =>
+        apiPost<{ ok?: boolean; master_url?: string }>(`/api/preview/live/rotate/${sid}`, {}),
+    }),
+    [],
+  );
 
   // Close menus on outside click
   useEffect(() => {
@@ -160,7 +174,7 @@ export function LivePlayerPopup({ entry, channelName, onClose }: LivePlayerPopup
             const Hls = (await import('hls.js')).default;
             if (cancelled) return;
             if (Hls.isSupported()) {
-              const hls = new Hls(twitchAdBlockHlsConfig());
+              const hls = new Hls(twitchAdBlockHlsConfig({ onAdRotation }));
               hlsRef.current = hls;
               hls.loadSource(src);
               hls.attachMedia(video);

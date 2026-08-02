@@ -159,6 +159,9 @@ def _fetch_channel_live_payload(channel: dict) -> dict:
                 "url": info.get("url", ""),
                 "headers": info.get("headers", {}),
                 "type": "hls",
+                # vaft rotation extras — frontend ignores unknown keys.
+                "player_type": info.get("player_type", "embed"),
+                "ad_free": bool(info.get("ad_free")),
             })
     ys = (channel.get("youtubeSlug") or "").strip()
     if ys:

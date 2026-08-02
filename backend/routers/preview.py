@@ -4,12 +4,13 @@ Preview routes — preview sessions for HLS/MP4 playback.
 
 import asyncio
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from models.schemas import LivePreviewRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
+from models.schemas import LivePreviewRequest, LiveRotateRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
 from deps import INFO_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
@@ -298,6 +299,93 @@ async def preview_live(req: LivePreviewRequest):
     except Exception as e:
         logger.warning("live preview session failed url=%s: %s", url[:100], e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# vaft-style midroll rotation — see services/live_capture.probe_twitch_live_master.
+_USHER_CHANNEL_RE = re.compile(r"/api/channel/hls/([A-Za-z0-9_]+)\.m3u8")
+
+
+def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> dict:
+    """Swap a live Twitch session to the next vaft player type, in place.
+
+    The proxied master URL (``/api/preview/hls/{sid}/master.m3u8``) is left
+    unchanged — only the upstream ``session.master_url`` is replaced, so the
+    frontend reloads the same proxy path and gets the new stream. Every player
+    type is probed with a fresh GQL token; if none is ad-free the embed master
+    is returned with ``ad_free=False`` and the frontend pLoader strips locally.
+    """
+    from services.live_capture import (
+        _TWITCH_FALLBACK_PLAYER_TYPE,
+        _TWITCH_PLAYER_TYPES,
+        probe_twitch_live_master,
+    )
+    from services.preview.session import _hosts_for_url
+
+    session = get_session(session_id)
+    if not session:
+        raise ValueError("Preview session not found or expired")
+    if (session.platform or "").lower() != "twitch":
+        raise ValueError("Rotation is only supported for Twitch live sessions")
+    match = _USHER_CHANNEL_RE.search(session.master_url or "")
+    if not match:
+        raise ValueError("Session master is not a Twitch usher URL")
+    login = match.group(1)
+
+    if player_type:
+        if player_type not in _TWITCH_PLAYER_TYPES:
+            raise ValueError(f"Unknown player type: {player_type}")
+        order = (player_type,) + tuple(p for p in _TWITCH_PLAYER_TYPES if p != player_type)
+    else:
+        current = getattr(session, "twitch_player_type", None) or _TWITCH_FALLBACK_PLAYER_TYPE
+        try:
+            idx = _TWITCH_PLAYER_TYPES.index(current)
+        except ValueError:
+            idx = 0
+        nxt = _TWITCH_PLAYER_TYPES[(idx + 1) % len(_TWITCH_PLAYER_TYPES)]
+        order = (nxt,) + tuple(p for p in _TWITCH_PLAYER_TYPES if p != nxt)
+
+    # Fresh tokens per player type (skip_cache) — vaft rotates with a new token.
+    probed = probe_twitch_live_master(login, player_types=order, skip_cache=True)
+    if not probed:
+        raise RuntimeError(f"No usher master reachable for {login}")
+
+    session.master_url = probed["url"]
+    session.entry_url = probed["url"]
+    session.allowed_hosts = _hosts_for_url(probed["url"])
+    session.twitch_player_type = probed["player_type"]
+    # The rewritten-playlist cache is keyed by upstream URL, so old entries
+    # become unreachable after the swap — no explicit purge needed.
+    return {
+        "ok": True,
+        "player_type": probed["player_type"],
+        "ad_free": probed["ad_free"],
+        "url": probed["url"],
+        "master_url": f"/api/preview/hls/{session_id}/master.m3u8",
+        "headers": probed["headers"],
+    }
+
+
+@router.post("/api/preview/live/rotate/{session_id}")
+async def preview_live_rotate(session_id: str, req: LiveRotateRequest):
+    """Rotate a live Twitch session to the next vaft player type (midroll defense).
+
+    Response: ``{ok, player_type, ad_free, url, master_url, headers}``. The
+    proxied ``master_url`` already serves the rotated upstream — reload it in
+    the player. Fails 404 when the session is not a Twitch live usher session
+    (e.g. YouTube or the e2e synthetic master) — the frontend then keeps
+    stripping, so playback never stalls.
+    """
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            PREVIEW_EXECUTOR,
+            lambda: _rotate_live_twitch_session(session_id, req.player_type),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.warning("live rotate failed session=%s: %s", session_id[:8], e)
+        raise HTTPException(status_code=502, detail=str(e))
+
 
 @router.get("/api/preview/session/{session_id}/status")
 async def preview_session_status(session_id: str):
