@@ -4,7 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2 } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
@@ -68,6 +68,7 @@ import { resolveVideoThumbnail } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
+import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 
 function explorePlatformKey(raw: string): PlatformStyleKey {
   const p = raw.toLowerCase();
@@ -162,6 +163,26 @@ export default function ChannelExplorePopup({
   const [fullscreen, setFullscreen] = useState(false);
   const [fsControlsVisible, setFsControlsVisible] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Per-media preview retry: which single media failed + how many retries
+  // already failed, so the overlay's RETRY button escalates stage → full.
+  const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
+  const previewRetryRef = useRef<PreviewRetryState | null>(null);
+  const previewRetryingRef = useRef(false);
+  // Bumping these re-runs the session-create / playback-attach effects.
+  const [sessionRetryTick, setSessionRetryTick] = useState(0);
+  const [attachRetryTick, setAttachRetryTick] = useState(0);
+  const setPreviewRetryBoth = useCallback((s: PreviewRetryState | null) => {
+    previewRetryRef.current = s;
+    setPreviewRetry(s);
+  }, []);
+
+  /** Record which stage failed for this popup's media, keeping the per-media
+   *  retry count so the NEXT RETRY click escalates stage retry → full pipeline. */
+  const markPreviewError = useCallback((stage: PreviewRetryStage) => {
+    const wasRetry = previewRetryingRef.current;
+    previewRetryingRef.current = false;
+    setPreviewRetryBoth(previewRetryAfterError(previewRetryRef.current, vod.url, stage, wasRetry));
+  }, [vod.url, setPreviewRetryBoth]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -257,7 +278,12 @@ export default function ChannelExplorePopup({
     isYoutubePreview: platform === 'youtube',
     containerRef,
     trimTimelineRef: trimTimelineRef,
-    onPreviewError: (msg) => setError(msg),
+    onPreviewError: (msg) => {
+      if (msg) {
+        setError(msg);
+        markPreviewError('playback');
+      }
+    },
   });
 
 
@@ -292,6 +318,11 @@ export default function ChannelExplorePopup({
     setBuffering(false);
     setReady(false);
     setError(null);
+    // A manual open (or new media) starts a fresh retry budget; a
+    // RETRY-triggered run keeps it so a repeated failure escalates.
+    if (!previewRetryingRef.current) {
+      setPreviewRetryBoth(null);
+    }
     setMediaDurationSec(0);
     setSessionDurationSec(0);
     setWindowHlsMuxEndSec(0);
@@ -388,6 +419,7 @@ export default function ChannelExplorePopup({
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Could not start player');
           setLoading(false);
+          markPreviewError('session');
         }
       }
     })();
@@ -430,7 +462,43 @@ export default function ChannelExplorePopup({
         void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
       }
     };
-  }, [vod.url, vod.durationSec]);
+  }, [vod.url, vod.durationSec, sessionRetryTick]);
+
+  /**
+   * RETRY button for THIS popup's media only. First click re-runs just the
+   * failed stage; after a failed retry the next click runs the full pipeline
+   * end-to-end for this media (drop stale session + force fresh backend
+   * extract — never touches other popups or channel rows).
+   */
+  const retryPreview = useCallback(() => {
+    const ctx = previewRetryRef.current;
+    if (!ctx) return;
+    setError(null);
+    previewRetryingRef.current = true;
+    const mode = previewRetryMode(ctx);
+    void (async () => {
+      try {
+        if (mode === 'full') {
+          const sid = sessionIdRef.current;
+          if (sid) {
+            try { await apiDelete(`/api/preview/session/${sid}`); } catch { /* ignore */ }
+          }
+          // Clear the backend's per-URL caches (fatal/negative extract caches
+          // live 30-300s) so the fresh POST re-extracts instead of re-raising.
+          try { await apiPost('/api/preview/invalidate', { url: ctx.url }); } catch { /* ignore */ }
+        }
+        if (mode === 'stage' && ctx.stage === 'playback') {
+          // Stage retry: re-attach playback to the SAME session — the attach
+          // effect reports success (canplay clears the context) or failure
+          // (markPreviewError escalates attempts). No new session.
+          setAttachRetryTick((t) => t + 1);
+          return;
+        }
+        // Session-stage retry and full retries both re-run create + attach.
+        setSessionRetryTick((t) => t + 1);
+      } catch { /* no-op */ }
+    })();
+  }, []);
 
 
 
@@ -917,6 +985,9 @@ export default function ChannelExplorePopup({
     setReady(false);
 
     const onCanPlay = () => {
+      // Playback genuinely started — any in-flight retry succeeded.
+      previewRetryingRef.current = false;
+      setPreviewRetryBoth(null);
       setReady(true);
       setBuffering(false);
       setLoading(false);
@@ -988,6 +1059,7 @@ export default function ChannelExplorePopup({
       const onVideoError = () => {
         setError('Preview interrupted — try again');
         setLoading(false);
+        markPreviewError('playback');
       };
       appliedHeightRef.current = activeH;
       const onLoadedMeta = () => {
@@ -1111,6 +1183,9 @@ export default function ChannelExplorePopup({
         if (!data.fatal) return;
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
+            // startLoad() alone is a no-op after a fatal manifest error (levels
+            // empty) — re-loadSource forces a fresh manifest fetch.
+            hls.loadSource(playbackUrl);
             hls.startLoad();
             break;
           case Hls.ErrorTypes.MEDIA_ERROR:
@@ -1119,6 +1194,7 @@ export default function ChannelExplorePopup({
           default:
             setError('Playback failed — try again');
             setLoading(false);
+            markPreviewError('playback');
             hls.destroy();
             hlsRef.current = null;
             break;
@@ -1138,6 +1214,7 @@ export default function ChannelExplorePopup({
       if (!isValidPreviewUrl(playbackUrl)) {
         setError('Invalid playback URL');
         setLoading(false);
+        markPreviewError('playback');
         return;
       }
       video.src = playbackUrl;
@@ -1153,6 +1230,7 @@ export default function ChannelExplorePopup({
 
     setError('HLS playback is not supported in this browser');
     setLoading(false);
+    markPreviewError('playback');
     };
 
     setup();
@@ -1162,7 +1240,7 @@ export default function ChannelExplorePopup({
       detachBuffering?.();
       cleanup?.();
     };
-  }, [playback, vod.isClip]);
+  }, [playback, vod.isClip, attachRetryTick]);
 
   useEffect(() => {
     if (!ready) return;
@@ -1431,8 +1509,19 @@ export default function ChannelExplorePopup({
             </div>
           )}
           {error && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-20 p-3">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80 z-20 p-3">
               <p className="text-red-400 text-[10px] font-mono text-center">{error}</p>
+              {previewRetry && (
+                <button
+                  type="button"
+                  onClick={retryPreview}
+                  title="Retry this preview only"
+                  className="flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-red-300"
+                >
+                  <RefreshCw size={12} />
+                  Retry
+                </button>
+              )}
             </div>
           )}
           {fullscreen && (
