@@ -6,8 +6,9 @@ and the search UI.
 
 import logging
 import sqlite3
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from services import archive_db
 
@@ -37,19 +38,26 @@ async def archive_videos_upsert(video: dict):
 
 
 @router.post("/api/archive/messages")
-async def archive_messages(platform: str, video_id: str, messages: list[dict]):
+async def archive_messages(platform: str, video_id: str, body: Any = Body(...)):
     _require_platform(platform)
     if not video_id:
         raise HTTPException(status_code=400, detail="video_id required")
+    # Accept both raw array (legacy) and {messages: [...]} (documented contract).
+    messages = body.get("messages") if isinstance(body, dict) and "messages" in body else body
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="body must be a list or {messages: [...]}")
     count = archive_db.insert_messages(platform, video_id, messages)
     return {"ok": True, "inserted": count}
 
 
 @router.post("/api/archive/transcripts")
-async def archive_transcripts(platform: str, video_id: str, segments: list[dict]):
+async def archive_transcripts(platform: str, video_id: str, body: Any = Body(...)):
     _require_platform(platform)
     if not video_id:
         raise HTTPException(status_code=400, detail="video_id required")
+    segments = body.get("segments") if isinstance(body, dict) and "segments" in body else body
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="body must be a list or {segments: [...]}")
     count = archive_db.insert_transcript(platform, video_id, segments)
     return {"ok": True, "inserted": count}
 
