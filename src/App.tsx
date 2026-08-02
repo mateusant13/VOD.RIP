@@ -317,6 +317,23 @@ const ChannelRow = memo(function ChannelRow({
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
+// Defaults mirror backend models/schemas.py AppSettings so the Settings tab
+// renders real content before the first GET /api/settings resolves.
+const DEFAULT_SETTINGS: AppSettings = {
+  download_folder: '',
+  download_threads: 8,
+  max_cache_mb: 512,
+  throttle_kib: -1,
+  ffmpeg_path: '',
+  temp_folder: '',
+  oauth: '',
+  quality: '1080p',
+  channel_kick_enabled: true,
+  channel_twitch_enabled: true,
+  channel_youtube_enabled: true,
+  channel_content_filter: 'vods',
+};
+
 export default function App() {
   const viewportTier = useViewportTier();
   const [tab, setTab] = useState<Tab>('url');
@@ -884,8 +901,9 @@ export default function App() {
     resetChannelListPaging();
   }, [selectedChannelId, channelContentFilter, resetChannelListPaging]);
 
-  // Settings
-  const [settings, setSettings] = useState<AppSettings | null>(null);
+  // Settings — initialized with defaults so the Settings tab renders immediately;
+  // the mount loadSettings() below replaces them with the server values.
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -3974,19 +3992,15 @@ export default function App() {
     }
   }, [channelContentFilter, youtubePlatformOnly]);
 
-  // On page load: cheap incremental VOD sync for every saved channel
-  // (merge new ids only — the full refresh is triggered by the filter
-  // useEffect above when a user actually selects a channel). This
-  // used to live in a separate useEffect gated by a ref so it would
-  // fire exactly once per page load; we keep the same shape so the
-  // behaviour survives the consolidation.
-  // On page load: show cached channel data immediately, then silently
-  // refetch every channel in the background (both VODs and clips).
-  // The merge functions (mergeVodLists/mergeClipLists) do incoming-wins
-  // merge, so the cached data stays visible until fresh data arrives.
+  // Deferred incremental VOD sync — fires once, on the first Channels tab
+  // open (not at app startup, so entering the app stays network-quiet).
+  // Shows cached channel data immediately, then silently refetches every
+  // channel (both VODs and clips); the merge functions
+  // (mergeVodLists/mergeClipLists) do incoming-wins merge, so the cached
+  // data stays visible until fresh data arrives.
   const incrementalSyncDoneRef = useRef(false);
   useEffect(() => {
-    if (incrementalSyncDoneRef.current) return;
+    if (tab !== 'channels' || incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
     const channels = loadSavedChannels();
     channels.forEach((c) => {
@@ -3998,13 +4012,16 @@ export default function App() {
         void refreshChannelRef.current(c.id, c, 'streams', { silent: true, incremental: true });
       }
     });
-  }, []);
+  }, [tab]);
 
   // Warm YouTube preview cache for the top N long-form URLs of every channel
   // (VODs + stream VODs only — shorts/clips are cheap to extract on click and
-  // don't justify background warm traffic).
+  // don't justify background warm traffic). Runs while the Channels tab is
+  // open so app startup stays quiet — the cache is only needed once the user
+  // starts browsing channels.
   const warmedUrlsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
+    if (tab !== 'channels') return;
     const channels = savedChannels;
     if (!channels.length) return;
     const PER_KIND = 3;
@@ -4063,7 +4080,7 @@ export default function App() {
       if (i < queue.length) setTimeout(tick, STAGGER_MS);
     };
     tick();
-  }, [savedChannels]);
+  }, [savedChannels, tab]);
 
   const addChannelFromSlugs = useCallback(async (
     kickSlug: string,
@@ -4412,10 +4429,6 @@ export default function App() {
   useEffect(() => {
     loadSettings();
   }, [loadSettings]);
-
-  useEffect(() => {
-    if (tab === 'settings') loadSettings();
-  }, [tab, loadSettings]);
 
   const loadUpdateStatus = useCallback(async (force = false) => {
     try {
@@ -6026,7 +6039,7 @@ export default function App() {
           />
         )}
 
-        {tab === 'settings' && settings && (
+        {tab === 'settings' && (
           <SettingsTab
             settings={settings}
             setSettings={setSettings}
