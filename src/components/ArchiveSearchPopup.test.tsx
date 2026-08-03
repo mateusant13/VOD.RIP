@@ -451,7 +451,7 @@ describe('ArchiveSearchPopup', () => {
     );
   });
 
-  it('channel_hint chip: auto-scoped channel sent as param, ✕ removes it', async () => {
+  it('channel_hint chip: renders from response, ✕ dismisses via hint=0, no re-fire loop', async () => {
     let hint: string | undefined = 'srdogg';
     const fetchMock = mockFetch([], {});
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -473,20 +473,27 @@ describe('ArchiveSearchPopup', () => {
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
-    await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&channel=srdogg')).toBeTruthy(),
-    );
     const chip = await screen.findByLabelText('Channel scope hint');
     expect(chip.textContent).toContain('scoped to srdogg');
 
-    // ✕ clears the hint: next request drops the channel param.
+    // The hint is an implicit backend scope: the request must NOT echo it
+    // as an explicit channel (that suppressed the hint and re-fired the
+    // search forever in a request loop).
+    const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+    expect(urls[urls.length - 1]).not.toContain('channel=');
+
+    // ✕ dismisses: the next request opts out via hint=0 and the chip stays
+    // gone — and no further requests fire (response carries no hint again).
     hint = undefined;
     fireEvent.click(screen.getByLabelText('Remove channel scope'));
     await waitFor(() => {
-      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
-      expect(urls[urls.length - 1]).not.toContain('channel=');
+      const u = searchUrls(fetchMock).filter((x) => x.includes('q=zebra'));
+      expect(u[u.length - 1]).toContain('hint=0');
     });
     expect(screen.queryByLabelText('Channel scope hint')).toBeNull();
+    const count = searchUrls(fetchMock).filter((x) => x.includes('q=zebra')).length;
+    await new Promise((r) => setTimeout(r, 150));
+    expect(searchUrls(fetchMock).filter((x) => x.includes('q=zebra')).length).toBe(count);
   });
 
   it('spam_count badge: ×N on collapsed rows, absent for single messages', async () => {

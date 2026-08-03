@@ -139,6 +139,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [enriching, setEnriching] = useState<ArchiveEnrichEntry[]>([]);
   /** Channel the backend auto-scoped this query to (first token matched a slug). */
   const [channelHint, setChannelHint] = useState<string | null>(null);
+  /** User dismissed the hint chip — next request opts out (hint=0). */
+  const [hintDisabled, setHintDisabled] = useState(false);
   const mountedRef = useRef(true);
   const searchGenRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
@@ -341,6 +343,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     };
   }, [inputQuery]);
 
+  // A new query (or an explicit dropdown channel) resets the dismissed
+  // hint so the backend may hint again. Must run BEFORE the search effect
+  // so the same commit's request never sees a stale hintDisabled.
+  useEffect(() => {
+    setChannelHint(null);
+    setHintDisabled(false);
+  }, [query, channelFilter]);
+
   useEffect(() => {
     if (!query) {
       searchGenRef.current += 1;
@@ -358,7 +368,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     // channel_hint applies only while no explicit dropdown channel is set.
     const url = buildSearchUrl({
       query,
-      channel: scope ? null : (channelFilter || channelHint || null),
+      // The hint is an implicit backend scope — echoing it here as an
+      // explicit channel param suppresses the hint and re-fires the search
+      // forever. The API applies the scope itself; only an explicit
+      // dropdown channel (or the ✕ dismissal via hint=0) goes on the wire.
+      channel: scope ? null : channelFilter,
       platforms: scope ? null : platformFilter,
       kinds: kindFilter,
       source: sourceFilter,
@@ -367,6 +381,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       dateTo: !everyDay && isValidDateParam(dateTo) ? dateTo : null,
       lang: langFilter || null,
       limit: SEARCH_LIMIT,
+      hint: hintDisabled ? false : undefined,
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -382,7 +397,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, channelHint, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
@@ -494,7 +509,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
 
       {/* Auto-scope chip (backend channel_hint) + background-indexing status line. */}
       <div className="flex flex-col gap-1 shrink-0">
-        {channelHint && !channelFilter && (
+        {channelHint && !channelFilter && !hintDisabled && (
           <div
             className="flex items-center gap-1.5 text-[8px] font-mono uppercase tracking-widest text-yellow-200/90 border border-yellow-300/40 bg-yellow-300/10 px-1.5 py-0.5 self-start"
             aria-label="Channel scope hint"
@@ -502,7 +517,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             <span className="font-bold">scoped to {channelHint}</span>
             <button
               type="button"
-              onClick={() => setChannelHint(null)}
+              onClick={() => {
+                setChannelHint(null);
+                setHintDisabled(true);
+              }}
               title="Remove channel scope"
               aria-label="Remove channel scope"
               className="text-yellow-200/90 hover:text-white p-0.5 -m-0.5"

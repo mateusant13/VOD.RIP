@@ -838,9 +838,10 @@ def search(
     Query understanding: when no explicit channel is given and the query has
     ≥2 tokens whose FIRST token case-insensitively matches a known
     videos.channel slug, the channel filter is applied implicitly and that
-    token is stripped from the query. The matched slug (as stored in the
-    DB) is appended to _channel_hint_out when a list is passed — the search
-    router surfaces it as the channel_hint response field.
+    token is stripped from the query. The whole pass only runs when a
+    _channel_hint_out list is passed (None = feature off, e.g. a UI that
+    dismissed the hint); the matched slug (as stored in the DB) is appended
+    to the box and the search router surfaces it as channel_hint.
 
     Filters: platform exact; channel exact or comma-separated slug list
     ("a,b" → IN clause, empty segments dropped, case-insensitive); kind is a
@@ -861,13 +862,12 @@ def search(
     if not q.strip():
         return []
     raw_q = q.strip()
-    if channel is None:
+    if channel is None and _channel_hint_out is not None:
         hint = _channel_hint_for(raw_q)
         if hint is not None:
             channel = hint
             q = " ".join(q.split()[1:]) or q
-            if _channel_hint_out is not None:
-                _channel_hint_out.append(hint)
+            _channel_hint_out.append(hint)
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
     platforms = (
         [p for p in (p.strip().lower() for p in platform.split(",")) if p in PLATFORMS]

@@ -96,6 +96,8 @@ export interface ArchiveSearchFilterParams {
   /** Transcript language filter ('pt' | 'en'); omitted when unset. */
   lang?: string | null;
   limit?: number;
+  /** Explicitly opt OUT of the backend's auto channel-scope (hint=0). */
+  hint?: boolean;
 }
 
 /** Query-string for GET /api/archive/search — omits unset filters. */
@@ -114,6 +116,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (dateFrom) params.set('date_from', dateFrom);
   if (dateTo) params.set('date_to', dateTo);
   if (p.lang) params.set('lang', p.lang);
+  if (p.hint === false) params.set('hint', '0');
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }

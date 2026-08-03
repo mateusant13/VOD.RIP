@@ -191,6 +191,39 @@ def test_channel_hint_explicit_param_wins():
         archive_db.execute("DELETE FROM videos WHERE video_id='hint-other'")
 
 
+async def test_endpoint_hint_false_disables_auto_scope():
+    """hint=0 (UI dismissed the chip) must disable the implicit channel
+    scope entirely: no channel_hint field and hits from other channels."""
+    _upsert("youtube", "hint-vid", channel="TiTiltei", title="beta")
+    _upsert("youtube", "other-vid", channel="other", title="beta")
+    archive_db.insert_messages(
+        "youtube", "hint-vid",
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra stripe"}],
+    )
+    archive_db.insert_messages(
+        "youtube", "other-vid",
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra stripe"}],
+    )
+    try:
+        with patch("deps.settings_mgr") as fake_mgr:
+            fake_mgr.get.return_value = SimpleNamespace(archive_smart_enrich=False)
+            resp = await archive_search(q="titiltei zebra", source="chat", limit=10)
+        assert resp["channel_hint"] == "TiTiltei"
+        assert {h["video_id"] for h in resp["hits"]} == {"hint-vid"}
+        with patch("deps.settings_mgr") as fake_mgr:
+            fake_mgr.get.return_value = SimpleNamespace(archive_smart_enrich=False)
+            resp2 = await archive_search(
+                q="titiltei zebra", source="chat", limit=10, hint=False)
+        assert "channel_hint" not in resp2, "hint=0 must suppress the hint field"
+        assert {h["video_id"] for h in resp2["hits"]} == {"hint-vid", "other-vid"}, (
+            "hint=0 must drop the implicit scope, not just the field"
+        )
+    finally:
+        archive_db.execute(
+            "DELETE FROM messages WHERE video_id IN ('hint-vid','other-vid')")
+        archive_db.execute("DELETE FROM videos WHERE video_id IN ('hint-vid','other-vid')")
+
+
 # --- (c) transcribe enqueue gated on worker_live ----------------------------
 
 

@@ -374,6 +374,7 @@ async def archive_search(
     video_id: str | None = None,
     lang: str | None = None,
     limit: int = Query(20, ge=1, le=100),
+    hint: bool = Query(True),
 ):
     # platform/kind accept comma-separated lists ("twitch,kick").
     for p in (platform or "").split(","):
@@ -400,6 +401,8 @@ async def archive_search(
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
     # channel_hint: search() understands a leading channel-slug token (see
     # archive_db.search) and reports the matched slug through the out-param.
+    # hint=False (UI dismissed the chip) disables the whole implicit-scope
+    # pass — pass no out-param so search() never applies it.
     hint_box: list[str] = []
     hits = archive_db.search(
         q,
@@ -412,7 +415,7 @@ async def archive_search(
         video_id=video_id or None,
         lang=lang or None,
         limit=limit,
-        _channel_hint_out=hint_box,
+        _channel_hint_out=hint_box if hint else None,
     )
     channel_hint = hint_box[0] if hint_box else None
     # Targeted enrichment: lazily kick chat backfill / enqueue transcribe
