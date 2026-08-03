@@ -4,7 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
@@ -95,6 +95,9 @@ export interface ExplorePopupVod {
   duration_string?: string | null;
   /** Open the player already positioned at this VOD time (archive search seek-to-moment). */
   initialTimeSec?: number;
+  /** Native archive video id (same value as archive DB videos.video_id) —
+   *  enables the header's SEARCH THIS VIDEO button; absent → button hidden. */
+  videoId?: string;
 }
 
 interface ChannelExplorePopupProps {
@@ -109,6 +112,8 @@ interface ChannelExplorePopupProps {
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
   onBringToFront: () => void;
+  /** Open archive search restricted to this video (App owns the popup). */
+  onSearchVideo?: (videoId: string, title: string) => void;
 }
 
 
@@ -137,6 +142,7 @@ export default function ChannelExplorePopup({
   onUnregisterPause,
   onVolumeMenuOpen,
   onBringToFront,
+  onSearchVideo,
 }: ChannelExplorePopupProps) {
   const [playback, setPlayback] = useState<{
     url: string;
@@ -1432,14 +1438,27 @@ export default function ChannelExplorePopup({
                 )}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => onClose()}
-              className="text-zinc-500 hover:text-white p-0.5 shrink-0"
-              title="Close player"
-            >
-              <X size={14} />
-            </button>
+            <div className="flex items-center gap-1 shrink-0">
+              {vod.videoId && onSearchVideo && (
+                <button
+                  type="button"
+                  onClick={() => onSearchVideo(vod.videoId!, vod.title)}
+                  title="Search the local archive for this video only"
+                  className="flex items-center gap-1 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold text-zinc-400 hover:text-white hover:border-white"
+                >
+                  <Search size={10} className="shrink-0" />
+                  Search this video
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => onClose()}
+                className="text-zinc-500 hover:text-white p-0.5 shrink-0"
+                title="Close player"
+              >
+                <X size={14} />
+              </button>
+            </div>
           </div>
         )}
         <div

@@ -12,6 +12,7 @@ import {
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import { buildArchiveVodUrl, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
+import { archiveVideoIdFromUrl, isNativeArchiveVideoId } from './archiveScope';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
@@ -555,6 +556,8 @@ export default function App() {
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
   const [localFilePopups, setLocalFilePopups] = useState<LocalFilePopupItem[]>([]);
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
+  /** Per-video scope for the archive search popup (SEARCH THIS VIDEO). */
+  const [archiveSearchScope, setArchiveSearchScope] = useState<{ videoId: string; title: string } | null>(null);
   const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
   const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
   const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
@@ -2769,6 +2772,9 @@ export default function App() {
       created_at: v.created_at ?? null,
       views: v.views ?? null,
       duration_string: v.duration_string ?? null,
+      // Native id, same format as the archive DB videos.video_id (Twitch ids
+      // come 'v'-prefixed from the API; the archive stores the bare digits).
+      videoId: v.platform === 'Twitch' && v.id.startsWith('v') ? v.id.slice(1) : v.id,
     };
     setExplorePopups((prev) => {
       // Dedupe: bring existing popup to front instead of opening a duplicate
@@ -2818,6 +2824,7 @@ export default function App() {
       platformListIndex: 0,
       isClip: false,
       initialTimeSec: hit.offset_sec,
+      videoId: hit.video_id,
     };
     setExplorePopups((prev) => {
       const next = prev.filter((p) => p.vod.url !== vodUrl);
@@ -2840,6 +2847,12 @@ export default function App() {
       return after;
     });
   }, [pauseAllExplorePopups, assignExplorePopupZ]);
+
+  /** Open the archive search restricted to one video (SEARCH THIS VIDEO). */
+  const openScopedSearch = useCallback((videoId: string, title: string) => {
+    setArchiveSearchScope({ videoId, title });
+    setArchiveSearchOpen(true);
+  }, []);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -3102,6 +3115,8 @@ export default function App() {
     thumbnailUrl?: string | null;
     createdAt?: string | null;
     views?: number | null;
+    /** Native archive video id (same value as archive DB videos.video_id). */
+    videoId?: string;
     /** Skip the /api/info/video round-trip when the caller already has enough metadata
      *  (e.g. from the channel list). The VOD · Trim panel renders immediately from the
      *  hint; explicit Extract Info can still refresh later. */
@@ -3155,7 +3170,7 @@ export default function App() {
       if (end > 0) applyVideoInfoTrim(trimmed, end);
       const platform = detectUrlPlatform(trimmed);
       const synthetic: VideoInfo = {
-        id: trimmed,
+        id: hint.videoId ?? trimmed,
         title: hintTitle,
         duration: end,
         duration_string: end > 0 ? fmtDuration(end) : null,
@@ -3183,7 +3198,7 @@ export default function App() {
       applyVideoInfoTrim(trimmed, end);
       const platform = detectUrlPlatform(trimmed);
       const synthetic: VideoInfo = {
-        id: trimmed,
+        id: hint.videoId ?? trimmed,
         title: hintTitle,
         duration: end,
         duration_string: fmtDuration(end),
@@ -4699,6 +4714,7 @@ export default function App() {
       thumbnailUrl: vod.thumbnailUrl ?? undefined,
       createdAt: vod.created_at ?? null,
       views: vod.views ?? null,
+      videoId: vod.videoId,
       skipNetwork: true,
     });
   }, [selectVod]);
@@ -4727,6 +4743,16 @@ export default function App() {
     return urlPlatform || platformStyleKey(activePlatform ?? '') || null;
   }, [previewChannelBadge, urlPlatform, activePlatform]);
   const urlActionPlatform = layoutPlatform;
+
+  /**
+   * Native archive video id for the current main-preview entry, when known.
+   * Prefer the /api/info id (native); fall back to parsing the URL only when
+   * unambiguous. Null → hide the SEARCH THIS VIDEO button.
+   */
+  const previewArchiveVideoId = useMemo(() => {
+    if (isNativeArchiveVideoId(videoInfo?.id)) return videoInfo.id;
+    return archiveVideoIdFromUrl(url);
+  }, [videoInfo?.id, url]);
 
   const estBytes = estimateDownloadBytes(
     videoInfo,
@@ -5440,9 +5466,22 @@ export default function App() {
                 Preview
               </span>
             )}
-            <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
-              <X size={18} />
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {previewArchiveVideoId && (
+                <button
+                  type="button"
+                  onClick={() => openScopedSearch(previewArchiveVideoId, videoInfo?.title ?? '')}
+                  title="Search the local archive for this video only"
+                  className="flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white"
+                >
+                  <Search size={10} className="shrink-0" />
+                  SEARCH THIS VIDEO
+                </button>
+              )}
+              <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
+                <X size={18} />
+              </button>
+            </div>
           </div>
           <div className="flex flex-col gap-2 w-full" data-preview-panel>
             <div
@@ -5634,7 +5673,7 @@ export default function App() {
           <div className={`flex gap-1 shrink-0 ${mainCardHeaderCompact ? 'mt-1' : 'mt-2'}`}>
             <button
               type="button"
-              onClick={() => setArchiveSearchOpen((o) => !o)}
+              onClick={() => { setArchiveSearchScope(null); setArchiveSearchOpen((o) => !o); }}
               title="Search the local archive (transcripts + chat)"
               aria-pressed={archiveSearchOpen}
               className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
@@ -6267,6 +6306,7 @@ export default function App() {
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
               onBringToFront={() => bringExplorePopupToFront(entry.id)}
+              onSearchVideo={openScopedSearch}
             />
           ))}
         </>,
@@ -6317,8 +6357,10 @@ export default function App() {
       {archiveSearchOpen && (
         <ArchiveSearchPopup
           zIndex={EXPLORE_POPUP_Z - 100}
-          onClose={() => setArchiveSearchOpen(false)}
+          onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); }}
           onOpenHit={openArchiveHit}
+          scope={archiveSearchScope ?? undefined}
+          savedChannels={savedChannels}
         />
       )}
       <DownloadConfirmDialog
