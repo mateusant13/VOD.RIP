@@ -158,6 +158,9 @@ def _maybe_auto_backfill(
         "SELECT v.video_id, v.channel, v.title, v.started_at FROM videos v "
         "WHERE v.platform='twitch' AND NOT EXISTS ("
         "  SELECT 1 FROM messages m WHERE m.platform='twitch' AND m.video_id=v.video_id)"
+        # Watchdog rows are synthetic ('twitch-live-<channel>-<ts>'): backfill
+        # needs a numeric VOD id (same gate as the manual endpoint).
+        " AND v.video_id GLOB '[0-9]*'"
     )
     params: list[Any] = []
     if channel:
