@@ -392,8 +392,12 @@ def _transcribe_chunk(
     chunk_start: float,
     chunk_end: float,
     language: Optional[str],
-) -> list[dict]:
-    """Transcribe audio[chunk_start:chunk_end] into absolute-time segments."""
+) -> tuple[list[dict], Optional[str]]:
+    """Transcribe audio[chunk_start:chunk_end] into absolute-time segments.
+
+    Returns (segments, detected_language): the language faster-whisper
+    reported on the transcribe info (None when the caller forced a language
+    or the model did not report one)."""
     import numpy as np
 
     global _word_ts_ok, _device_override
@@ -409,7 +413,8 @@ def _transcribe_chunk(
         kwargs["word_timestamps"] = True
     with _infer_lock:
         try:
-            raw = list(model.transcribe(chunk_audio, **kwargs)[0])
+            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+            raw = list(seg_iter)
         except ValueError as exc:
             if not _word_ts_ok:
                 raise
@@ -417,7 +422,8 @@ def _transcribe_chunk(
             logger.info("Word timestamps unsupported (%s) — falling back", exc)
             _word_ts_ok = False
             kwargs.pop("word_timestamps", None)
-            raw = list(model.transcribe(chunk_audio, **kwargs)[0])
+            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+            raw = list(seg_iter)
         except RuntimeError as exc:
             if _effective_device()[0] != "cuda" or _device_override is not None:
                 raise
@@ -428,7 +434,9 @@ def _transcribe_chunk(
             model = _get_model()  # reload on CPU
             if not _word_ts_ok:
                 kwargs.pop("word_timestamps", None)
-            raw = list(model.transcribe(chunk_audio, **kwargs)[0])
+            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+            raw = list(seg_iter)
+    detected_lang = getattr(info, "language", None) or None
     out: list[dict] = []
     for seg in raw:
         words = [
@@ -445,7 +453,7 @@ def _transcribe_chunk(
             "text": (seg.text or "").strip(),
             "words": words,
         })
-    return out
+    return out, detected_lang
 
 
 def transcribe_video(
@@ -503,11 +511,15 @@ def transcribe_video(
     segments = 0
     words = 0
     speech_done = 0.0
+    detected_lang: Optional[str] = None
     for ci, (cs, ce) in enumerate(chunks):
         if ci not in missing:
             speech_done += ce - cs
             continue
-        chunk_segs = _transcribe_chunk(model, audio, cs, ce, language)
+        chunk_segs, detected = _transcribe_chunk(model, audio, cs, ce, language)
+        if detected_lang is None and detected:
+            detected_lang = detected  # first chunk's detection wins
+        lang = language or detected_lang  # env wins; else detected; else None
         # Per-segment insert: a crash loses at most the in-flight segment.
         first_idx = seg_idx
         for seg in chunk_segs:
@@ -521,7 +533,7 @@ def transcribe_video(
                 "text": seg["text"],
                 "words": seg["words"],
             }
-            archive_db.insert_transcript(platform, video_id, [row])
+            archive_db.insert_transcript(platform, video_id, [row], lang=lang)
             segments += 1
             words += len(seg["words"])
             seg_idx += 1

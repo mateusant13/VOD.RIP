@@ -8,7 +8,8 @@ Storage layout (all offsets are seconds into the stream, monotonic):
   videos        — one row per (platform, video_id); canonical_key dedupes
                   the same live/VOD simulcast across platforms
   messages      — chat rows, append-only; FTS5 contentless index
-  transcripts   — word-timestamped segments; FTS5 contentless index
+  transcripts   — word-timestamped segments (optional lang tag); FTS5
+                  contentless index
   video_aliases — manual canonical_key overrides for cross-platform dedupe
   archive_jobs  — ingest / chat_backfill / transcribe queue
 
@@ -22,6 +23,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -84,7 +86,8 @@ CREATE TABLE IF NOT EXISTS transcripts (
   start_sec  REAL NOT NULL,
   end_sec    REAL NOT NULL,
   text       TEXT NOT NULL,
-  words_json TEXT NOT NULL DEFAULT '[]'
+  words_json TEXT NOT NULL DEFAULT '[]',
+  lang       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_id, start_sec);
 
@@ -195,6 +198,7 @@ def get_conn() -> sqlite3.Connection:
             _conn.executescript(SCHEMA)
             _ensure_kind_column(_conn)
             _ensure_channel_columns(_conn)
+            _ensure_lang_column(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -238,6 +242,19 @@ def _ensure_channel_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE videos ADD COLUMN views INTEGER")
     if "thumbnail_url" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN thumbnail_url TEXT")
+
+
+def _ensure_lang_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add transcripts.lang (subtitle/whisper language).
+
+    YT captions and whisper rows carry an optional ISO-ish language tag
+    ('pt', 'en', or raw codes); search() filters on it. Additive only; NULL
+    means "unknown — treated as PT content" (whisper rows without a
+    detected language are Portuguese). PRAGMA table_info guard makes
+    repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(transcripts)")}
+    if "lang" not in cols:
+        conn.execute("ALTER TABLE transcripts ADD COLUMN lang TEXT")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -491,18 +508,36 @@ def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 3
 
 # --- transcripts ----------------------------------------------------------
 
-def insert_transcript(platform: str, video_id: str, segments: Iterable[dict]) -> int:
+def _normalize_lang(lang: Any) -> Optional[str]:
+    """Normalize a caption/whisper language tag for transcripts.lang.
+
+    pt / pt-br / pt-pt -> 'pt'; en / en-* -> 'en'; anything else keeps the
+    raw code lowercased; empty -> None (untagged = PT content for search)."""
+    if not lang:
+        return None
+    text = str(lang).strip().lower()
+    base = text.split("-")[0]
+    if base in ("pt", "en"):
+        return base
+    return text or None
+
+
+def insert_transcript(
+    platform: str, video_id: str, segments: Iterable[dict], *, lang: Optional[str] = None
+) -> int:
     """Segments: seg_idx, start_sec, end_sec, text, words (list of
-    {word, start, end}). Returns count inserted."""
+    {word, start, end}). lang: optional ISO-ish language tag, normalized
+    (pt-br -> pt, en-US -> en, raw codes kept). Returns count inserted."""
     conn = get_conn()
     count = 0
+    lang_norm = _normalize_lang(lang)
     with _lock:
         with conn:
             for seg in segments:
                 conn.execute(
                     """INSERT INTO transcripts (platform, video_id, seg_idx,
-                       start_sec, end_sec, text, words_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       start_sec, end_sec, text, words_json, lang)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         platform,
                         video_id,
@@ -511,6 +546,7 @@ def insert_transcript(platform: str, video_id: str, segments: Iterable[dict]) ->
                         float(seg["end_sec"]),
                         seg["text"],
                         json.dumps(seg.get("words", []), ensure_ascii=False),
+                        lang_norm,
                     ),
                 )
                 # FTS index entry is written by the transcripts_ai trigger.
@@ -600,20 +636,30 @@ def search(
     kind: Optional[str] = None,
     source: str = "both",
     video_id: Optional[str] = None,
+    lang: Optional[str] = None,
     limit: int = 20,
 ) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
     score; each hit carries enough to seek: platform, video_id, offset_sec,
-    plus the owning video's channel/title/started_at (date) and video_kind.
+    plus the owning video's channel/title/started_at (date), video_kind and
+    lang (transcripts: transcripts.lang; messages: None).
 
     Filters: platform exact; channel exact or comma-separated slug list
-    ("a,b" → IN clause, empty segments dropped); kind is a comma-separated
-    list ("vod,clip" → IN clause, unknown values dropped); date_from/date_to
-    are inclusive YYYY-MM-DD bounds on the video's started_at date part;
-    source narrows to one content kind ("chat" → messages only,
-    "transcript" → transcripts only, "both" default); video_id scopes to a
-    single archived video. The videos join is LEFT so rows whose video was
-    never indexed still surface when no video-backed filter is active."""
+    ("a,b" → IN clause, empty segments dropped, case-insensitive); kind is a
+    comma-separated list ("vod,clip" → IN clause, unknown values dropped);
+    date_from/date_to are inclusive YYYY-MM-DD bounds on the video's
+    started_at date part; source narrows to one content kind ("chat" →
+    messages only, "transcript" → transcripts only, "both" default);
+    video_id scopes to a single archived video; lang filters transcripts
+    only ('pt' → lang IS NULL OR LIKE 'pt%' — untagged whisper rows are PT
+    content; 'en' → lang = 'en'; other values ignored). The videos join is
+    LEFT so rows whose video was never indexed still surface when no
+    video-backed filter is active.
+
+    Query tokens are fuzzy-expanded from the FTS5 vocab (exact + close
+    Levenshtein matches, length-filtered, capped per token and in total);
+    the expansion falls back to the exact tokens when the vocab is
+    unavailable or the query is huge."""
     if not q.strip():
         return []
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
@@ -622,20 +668,23 @@ def search(
         if platform
         else []
     )
-    pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
-    hits: list[dict] = []
     loops = (
-        ("transcript", "transcripts_fts", "transcripts", "t.start_sec"),
-        ("message", "messages_fts", "messages", "t.offset_sec"),
+        ("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"),
+        ("message", "messages_fts", "messages", "t.offset_sec", "NULL"),
     )
     if source == "chat":
         loops = loops[1:]
     elif source == "transcript":
         loops = loops[:1]
-    for hit_kind, fts, src, offcol in loops:
+    pattern = _fuzzy_pattern(q, [t[2] for t in loops])
+    if pattern is None:
+        pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
+    hits: list[dict] = []
+    for hit_kind, fts, src, offcol, langcol in loops:
         sql = (
             f"SELECT t.rowid, bm25({fts}) AS score, "
             f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
+            f"{langcol} AS lang, "
             "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
             f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
             "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
@@ -651,8 +700,8 @@ def search(
         if channel:
             slugs = [c.strip() for c in channel.split(",") if c.strip()]
             if slugs:
-                sql += f" AND v.channel IN ({','.join('?' * len(slugs))})"
-                params.extend(slugs)
+                sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
+                params.extend(s.lower() for s in slugs)
         if kinds:
             sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
             params.extend(kinds)
@@ -662,6 +711,13 @@ def search(
         if date_to:
             sql += " AND date(v.started_at) <= date(?)"
             params.append(date_to)
+        if hit_kind == "transcript" and lang:
+            lng = lang.strip().lower()
+            if lng == "pt":
+                # Untagged rows (whisper without detected language) are PT content.
+                sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
+            elif lng == "en":
+                sql += " AND t.lang = 'en'"
         sql += f" ORDER BY score LIMIT {int(limit)}"
         for r in query(sql, params):
             hits.append({
@@ -671,6 +727,7 @@ def search(
                 "offset_sec": r["offset_sec"],
                 "text": r["text"],
                 "score": r["score"],
+                "lang": r["lang"],
                 "channel": r["channel"],
                 "title": r["title"],
                 "date": r["date"],
@@ -678,6 +735,147 @@ def search(
             })
     hits.sort(key=lambda h: h["score"])
     return hits[:limit]
+
+
+# --- fuzzy expansion (FTS5 vocab) -------------------------------------------
+# Query tokens are expanded with close vocabulary matches so typos still hit
+# ("arthur" finds "artur"). The vocab is read once per table via fts5vocab
+# (works on external-content tables — verified) and cached in memory for
+# _VOCAB_TTL_S; per-token expansions are cached the same way. Everything
+# degrades to the exact token pattern on failure.
+
+_VOCAB_MAX_TOKENS = 25_000
+_VOCAB_TTL_S = 300.0
+_TOKEN_EXPAND_CAP = 8
+_MAX_EXPANDED_TERMS = 64
+
+_vocab_lock = threading.Lock()
+# content table -> (loaded_at_monotonic, {token_len: [(term, freq), ...]})
+_vocab_cache: dict[str, tuple[float, dict[int, list[tuple[str, int]]]]] = {}
+# query token -> (expanded_at_monotonic, [terms, ...])
+_token_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
+    """Top-N FTS5 tokens for one content table, bucketed by length.
+
+    Reads the index vocabulary through an fts5vocab virtual table (verified
+    to work on these external-content indexes) and keeps the ~25k most
+    frequent tokens in memory for _VOCAB_TTL_S. Returns None when the vocab
+    is unavailable so callers fall back to exact matching."""
+    now = time.monotonic()
+    with _vocab_lock:
+        hit = _vocab_cache.get(table)
+        if hit and now - hit[0] < _VOCAB_TTL_S:
+            return hit[1]
+    get_conn().execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
+        f"USING fts5vocab({table}_fts, 'row')"
+    )
+    rows = query(
+        f"SELECT term, SUM(cnt) AS n FROM {table}_vocab "
+        "GROUP BY term ORDER BY n DESC LIMIT ?",
+        (_VOCAB_MAX_TOKENS,),
+    )
+    by_len: dict[int, list[tuple[str, int]]] = {}
+    for r in rows:
+        term = r["term"]
+        by_len.setdefault(len(term), []).append((term, int(r["n"])))
+    with _vocab_lock:
+        _vocab_cache[table] = (now, by_len)
+    return by_len
+
+
+def _levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
+    """Levenshtein distance with an early bail when it exceeds max_dist."""
+    if abs(len(a) - len(b)) > max_dist:
+        return None
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        row_min = i
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            if cur[j] < row_min:
+                row_min = cur[j]
+        if row_min > max_dist:
+            return None
+        prev = cur
+    dist = prev[-1]
+    return dist if dist <= max_dist else None
+
+
+def _token_expansions(
+    token: str,
+    vocabs: list[Optional[dict[int, list[tuple[str, int]]]]],
+) -> list[str]:
+    """Exact + fuzzy candidates for one query token, best ~8 by
+    (distance, frequency). Tokens shorter than 3 chars are never expanded.
+    Falls back to the bare token when nothing matches."""
+    if len(token) < 3:
+        return [token]
+    now = time.monotonic()
+    with _vocab_lock:
+        hit = _token_cache.get(token)
+        if hit and now - hit[0] < _VOCAB_TTL_S:
+            return hit[1]
+    best: dict[str, tuple[int, int]] = {}  # term -> (dist, -freq)
+    max_dist = max(1, len(token) // 5)
+    for vocab in vocabs:
+        if not vocab:
+            continue
+        for n in range(max(1, len(token) - 2), len(token) + 3):
+            for term, freq in vocab.get(n, ()):
+                d = _levenshtein(token, term, max_dist)
+                if d is None:
+                    continue
+                cur = best.get(term)
+                if cur is None or (d, -freq) < cur:
+                    best[term] = (d, -freq)
+    if not best:
+        return [token]
+    ranked = sorted(best.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
+    out = [term for term, _ in ranked[:_TOKEN_EXPAND_CAP]]
+    with _vocab_lock:
+        # Unbounded user input -> bounded cache; a clear is cheaper than LRU.
+        if len(_token_cache) > 4096:
+            _token_cache.clear()
+        _token_cache[token] = (now, out)
+    return out
+
+
+def _expand_query(q: str, vocabs: list[Optional[dict[int, list[tuple[str, int]]]]]) -> list[str]:
+    """Flatten every query token's expansion into one deduped term list."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for w in q.split():
+        if not w:
+            continue
+        for t in _token_expansions(w, vocabs):
+            if t not in seen:
+                seen.add(t)
+                terms.append(t)
+    return terms
+
+
+def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[str]:
+    """OR-joined quoted-phrase MATCH pattern from the fuzzy expansion.
+
+    Returns None to fall back to the exact token pattern: no expandable
+    token, vocab unavailable, or the expansion exceeding the term cap."""
+    if not any(len(w) >= 3 for w in q.split()):
+        return None
+    try:
+        vocabs = [v for v in (_load_vocab(t) for t in tables) if v is not None]
+        if not vocabs:
+            return None
+        terms = _expand_query(q, vocabs)
+        if not terms or len(terms) > _MAX_EXPANDED_TERMS:
+            return None
+        return " OR ".join(f'"{t}"' for t in terms)
+    except sqlite3.Error:
+        logger.warning("fuzzy expansion failed — falling back to exact pattern")
+        return None
 
 
 # --- helpers --------------------------------------------------------------
@@ -716,11 +914,31 @@ insert_transcript(
     _selfcheck_platform,
     _selfcheck_video,
     [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste"}],
+    lang="pt-br",
 )
 assert any(
     h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
     for h in search("transcrição")
 ), "FTS5 must find transcript segments (unicode61 tokenizer)"
+# lang contract: message hits carry lang=None; 'pt-br' normalizes to 'pt';
+# the pt filter matches tagged AND untagged (whisper) rows.
+_sc_msg_hit = next(
+    h for h in _hits
+    if h["video_id"] == _selfcheck_video and h["kind"] == "message"
+)
+assert _sc_msg_hit["lang"] is None, "message hits must carry lang=None"
+assert query(
+    "SELECT lang FROM transcripts WHERE platform=? AND video_id=?",
+    (_selfcheck_platform, _selfcheck_video),
+)[0]["lang"] == "pt", "pt-br must normalize to pt in transcripts.lang"
+assert any(
+    h["video_id"] == _selfcheck_video
+    for h in search("transcrição", lang="pt")
+), "lang='pt' must match tagged and untagged transcript rows"
+# fuzzy expansion: a misspelled token still finds the row via the FTS5 vocab.
+assert any(
+    h["video_id"] == _selfcheck_video for h in search("googl")
+), "fuzzy expansion must match 'google' from 'googl'"
 upsert_video({
     "platform": _selfcheck_platform,
     "video_id": _selfcheck_video,
