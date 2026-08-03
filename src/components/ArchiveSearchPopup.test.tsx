@@ -22,11 +22,11 @@ const SAVED: SavedChannel = {
   updatedAt: '2026-08-01T00:00:00Z',
 };
 
-function mockFetch(hits: unknown[] = []) {
+function mockFetch(hits: unknown[] = [], extra: Record<string, unknown> = {}) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes('/api/archive/search')) {
-      return new Response(JSON.stringify({ hits }), {
+      return new Response(JSON.stringify({ hits, ...extra }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -412,5 +412,120 @@ describe('ArchiveSearchPopup', () => {
         String(c[0]).includes('/api/archive/videos/youtube/youtube-live-lubumr-1785714293393/chat'),
       ),
     ).toBe(true);
+  });
+
+  it('enriching status line shows when the backend kicked background work, clears when idle', async () => {
+    const enrich = [
+      { platform: 'twitch', video_id: 'v2', kind: 'chat_backfill', channel: 'srdogg', title: 'VOD B' },
+    ];
+    let current = enrich;
+    const fetchMock = mockFetch([], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [], enriching: current }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() =>
+      expect(screen.getByText(/Indexing 1 video.*chat backfill/i)).toBeInTheDocument(),
+    );
+    // Next response idle → the line clears.
+    current = [];
+    fireEvent.change(input, { target: { value: 'zebra2' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra2')).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.queryByText(/Indexing 1 video/i)).toBeNull(),
+    );
+  });
+
+  it('channel_hint chip: auto-scoped channel sent as param, ✕ removes it', async () => {
+    let hint: string | undefined = 'srdogg';
+    const fetchMock = mockFetch([], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [], enriching: [], channel_hint: hint }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&channel=srdogg')).toBeTruthy(),
+    );
+    const chip = await screen.findByLabelText('Channel scope hint');
+    expect(chip.textContent).toContain('scoped to srdogg');
+
+    // ✕ clears the hint: next request drops the channel param.
+    hint = undefined;
+    fireEvent.click(screen.getByLabelText('Remove channel scope'));
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).not.toContain('channel=');
+    });
+    expect(screen.queryByLabelText('Channel scope hint')).toBeNull();
+  });
+
+  it('spam_count badge: ×N on collapsed rows, absent for single messages', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { platform: 'twitch', video_id: 'v1', offset_sec: 40, username: 'bob', text: 'KEKW', spam_count: 5 },
+              { platform: 'twitch', video_id: 'v1', offset_sec: 44, username: 'bob', text: 'unique thought', spam_count: 1 },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    fireEvent.click(row);
+    await waitFor(() => expect(screen.getByText(/KEKW/)).toBeInTheDocument());
+    expect(screen.getByText('×5')).toBeInTheDocument();
+    expect(screen.queryByText('×1')).toBeNull();
   });
 });

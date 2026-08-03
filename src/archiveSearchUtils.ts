@@ -128,6 +128,25 @@ export interface ArchiveChatMessage {
   badges?: string | null;
   emotes?: string | null;
   ts?: string | null;
+  /** Collapsed duplicate run length (1 = a single message, N = N identical). */
+  spam_count?: number;
+}
+
+/** Background indexing work kicked by a search (backend fires it lazily). */
+export interface ArchiveEnrichEntry {
+  platform: string;
+  video_id: string;
+  kind: 'transcript' | 'chat_backfill';
+  channel?: string;
+  title?: string;
+}
+
+/** GET /api/archive/search response (enriching/channel_hint always present). */
+export interface ArchiveSearchResponse {
+  hits: ArchiveSearchHit[];
+  enriching: ArchiveEnrichEntry[];
+  /** Set when the first query token auto-scoped the search to a channel. */
+  channel_hint?: string;
 }
 
 /** Seconds → mm:ss (h:mm:ss past an hour). Negative/NaN clamp to 00:00. */
