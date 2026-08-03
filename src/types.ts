@@ -107,6 +107,9 @@ export interface AppSettings {
    * older backends -> default large-v3-turbo + %APPDATA%/VOD.RIP/whisper-models). */
   whisper_model?: string;
   whisper_model_cache?: string | null;
+  /** Captions-first: skip whisper for YouTube videos that already have
+   * auto-caption rows at ingest (absent on older backends -> default true). */
+  yt_subtitles_first?: boolean;
 }
 
 export interface DiskUsage {

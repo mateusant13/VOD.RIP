@@ -21,6 +21,7 @@ import re
 import tempfile
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,12 @@ logger = logging.getLogger(__name__)
 PLATFORM = "youtube"
 # Priority rule: YouTube > Twitch > Kick (lower number wins).
 _CAPTION_LANG_PREF = ("pt", "pt-br", "en", "en-orig")
+# Payload fallback order: VTT (word timestamps) -> json3 -> srv3 (XML). The
+# timedtext API has been observed to rate-limit the VTT endpoint (HTTP 429)
+# while json3/srv3 still serve.
+_CAPTION_FMTS = ("vtt", "json3", "srv3")
+_CAPTION_RETRIES = 2
+_CAPTION_BACKOFF_S = 1.0
 
 _TS_RE = re.compile(r"^(\d{8})$")
 _CUE_RE = re.compile(
@@ -149,6 +156,126 @@ def _vtt_words(raw: str, cue_end: float) -> list[dict]:
     return out
 
 
+def _parse_json3(text: str) -> list[dict]:
+    """Convert a json3 caption document (timedtext ?fmt=json3) to segments.
+
+    Same shape as _parse_vtt: {seg_idx, start_sec, end_sec, text, words}.
+    Events carry absolute tStartMs/dDurationMs (observed: same timeline as
+    srv3's <p t=...>); per-segment tOffsetMs become word timestamps. Events
+    without a duration run to the next event's start (+2s fallback).
+    """
+    try:
+        doc = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    events = doc.get("events") or [] if isinstance(doc, dict) else []
+    starts = []
+    for ev in events:
+        t = ev.get("tStartMs")
+        starts.append(float(t) / 1000.0 if t is not None else None)
+    segments: list[dict] = []
+    idx = 0
+    for i, ev in enumerate(events):
+        start = starts[i]
+        if start is None:
+            continue
+        dur = ev.get("dDurationMs")
+        if dur is not None:
+            end = start + float(dur) / 1000.0
+        else:
+            end = next((s for s in starts[i + 1:] if s is not None), start + 2.0)
+        segs = ev.get("segs") or []
+        text = "".join(str(s.get("utf8", "")) for s in segs).strip()
+        if not text:
+            continue
+        words = []
+        for s in segs:
+            off = s.get("tOffsetMs")
+            if off is None:
+                continue
+            w = str(s.get("utf8", "")).strip()
+            if not w:
+                continue
+            words.append({
+                "word": w,
+                "start": round(start + float(off) / 1000.0, 3),
+                "end": round(end, 3),
+            })
+        for j in range(len(words) - 1, 0, -1):
+            words[j - 1]["end"] = words[j]["start"]
+        segments.append({
+            "seg_idx": idx,
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+            "text": text,
+            "words": words,
+        })
+        idx += 1
+    return segments
+
+
+def _parse_srv3(text: str) -> list[dict]:
+    """Convert a srv3 (timedtext XML) caption document to segments.
+
+    <p t=... d=...> paragraphs with optional <s t=...> word spans. Observed
+    on real tracks: t is absolute milliseconds on the same timeline as
+    json3's tStartMs (verified against a live pt auto-caption track), and
+    the a="1" attribute marks karaoke continuation paragraphs (empty filler)
+    rather than a different clock. ponytail: if a track ever carries true
+    relative offsets, the upgrade is cumulative accumulation — none of the
+    formats we see today need it.
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+    segments: list[dict] = []
+    idx = 0
+    for p in root.iter("p"):
+        t = p.get("t")
+        if t is None:
+            continue
+        start = float(t) / 1000.0
+        d = p.get("d")
+        end = start + (float(d) / 1000.0 if d else 0.0)
+        text = "".join(p.itertext()).strip()
+        if not text:
+            continue
+        words = []
+        for s in p.iter("s"):
+            off = s.get("t")
+            if off is None:
+                continue
+            w = "".join(s.itertext()).strip()
+            if not w:
+                continue
+            words.append({
+                "word": w,
+                "start": round(start + float(off) / 1000.0, 3),
+                "end": round(end, 3),
+            })
+        for j in range(len(words) - 1, 0, -1):
+            words[j - 1]["end"] = words[j]["start"]
+        segments.append({
+            "seg_idx": idx,
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+            "text": text,
+            "words": words,
+        })
+        idx += 1
+    return segments
+
+
+def _parse_caption(fmt: str, data: str) -> list[dict]:
+    """Dispatch a caption payload to its parser (vtt is the default)."""
+    if fmt == "json3":
+        return _parse_json3(data)
+    if fmt == "srv3":
+        return _parse_srv3(data)
+    return _parse_vtt(data)
+
+
 def _iso_from_usec(usec: Any) -> Optional[str]:
     if not usec:
         return None
@@ -245,8 +372,8 @@ def _yt_opts(outdir: Path) -> dict:
     }
 
 
-def _pick_caption(info: dict) -> tuple[Optional[str], Optional[str]]:
-    """Choose the best auto-caption track: pt > en > first with a vtt URL."""
+def _pick_caption_for(info: dict, fmt: str) -> tuple[Optional[str], Optional[str]]:
+    """Best auto-caption track for one format: pt > pt-br > en > first."""
     ac = info.get("automatic_captions") or {}
     subs = info.get("subtitles") or {}
     merged = dict(ac)
@@ -254,15 +381,44 @@ def _pick_caption(info: dict) -> tuple[Optional[str], Optional[str]]:
         merged.setdefault(k, v)
     for lang in _CAPTION_LANG_PREF:
         for entry in merged.get(lang) or []:
-            if entry.get("ext") == "vtt" and entry.get("url"):
+            if entry.get("ext") == fmt and entry.get("url"):
                 return lang, entry["url"]
     for lang, entries in merged.items():
         if lang == "live_chat":
             continue
         for entry in entries:
-            if entry.get("ext") == "vtt" and entry.get("url"):
+            if entry.get("ext") == fmt and entry.get("url"):
                 return lang, entry["url"]
     return None, None
+
+
+def _fetch_caption(ydl: Any, info: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Fetch the best caption track with format fallback (vtt -> json3 -> srv3).
+
+    Each format gets up to _CAPTION_RETRIES attempts with a 1s backoff on
+    HTTP 429 (rate limiting); any failure falls through to the next format.
+    Returns (lang, fmt, payload) or (None, None, None) when nothing served.
+    ponytail: a real retry policy (exponential backoff + jitter, per-format)
+    belongs in a shared HTTP client, not in this adapter.
+    """
+    for fmt in _CAPTION_FMTS:
+        lang, url = _pick_caption_for(info, fmt)
+        if not url:
+            continue
+        for attempt in range(_CAPTION_RETRIES):
+            try:
+                data = ydl.urlopen(url).read().decode("utf-8", "replace")
+                return lang, fmt, data
+            except Exception as exc:
+                if getattr(exc, "code", None) == 429 and attempt < _CAPTION_RETRIES - 1:
+                    time.sleep(_CAPTION_BACKOFF_S)
+                    continue
+                logger.warning(
+                    "caption fetch %s (%s) failed for %s: %s",
+                    fmt, lang, info.get("id"), exc,
+                )
+                break  # next format
+    return None, None, None
 
 
 def _video_url(id_or_url: str) -> str:
@@ -368,13 +524,13 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
                     report["chat"] = "error"
                     report["chat_error"] = str(exc)
 
-            # Auto captions -> transcript segments.
+            # Auto captions -> transcript segments (vtt -> json3 -> srv3
+            # fallback; failures stay non-fatal, reported as caption_error).
             try:
-                lang, vtt_url = _pick_caption(info)
+                lang, fmt, data = _fetch_caption(ydl, info)
                 report["caption_lang"] = lang
-                if vtt_url:
-                    data = ydl.urlopen(vtt_url).read().decode("utf-8", "replace")
-                    segments = _parse_vtt(data)
+                if data:
+                    segments = _parse_caption(fmt, data)
                     if segments:
                         _db_write(archive_db.insert_transcript, PLATFORM, video_id, segments)
                         report["transcript_segments"] = len(segments)
@@ -551,3 +707,45 @@ assert _rows[0]["text"] == "oi titi"
 assert _rows[0]["badges"] == ["Owner"]
 assert _rows[0]["emotes"] == [{"id": "x1", "text": ":titi:"}]
 assert _rows[0]["ts"] == "2026-07-30T23:22:17+00:00"
+
+_json3_sample = (
+    '{"events": ['
+    '{"tStartMs": 0, "dDurationMs": 211879, "segs": [{"utf8": ""}]},'
+    '{"tStartMs": 18800, "dDurationMs": 7160, "segs": ['
+    '{"utf8": "Não ", "tOffsetMs": 0},'
+    '{"utf8": "somos ", "tOffsetMs": 346},'
+    '{"utf8": "estranhos", "tOffsetMs": 692}]},'
+    '{"tStartMs": 25960, "dDurationMs": 3000, "segs": [{"utf8": " "}]}'
+    ']}'
+)
+_j3 = _parse_json3(_json3_sample)
+assert len(_j3) == 1, f"empty/filler events must be dropped, got {len(_j3)}"
+assert _j3[0]["start_sec"] == 18.8 and _j3[0]["end_sec"] == 25.96
+assert _j3[0]["text"] == "Não somos estranhos"
+assert _j3[0]["words"] == [
+    {"word": "Não", "start": 18.8, "end": 19.146},
+    {"word": "somos", "start": 19.146, "end": 19.492},
+    {"word": "estranhos", "start": 19.492, "end": 25.96},
+]
+assert _parse_json3("not json") == []
+assert _parse_json3("42") == []
+
+_srv3_sample = (
+    '<?xml version="1.0" encoding="utf-8" ?>'
+    '<timedtext format="3"><body>'
+    '<p t="18800" d="7160"><s ac="0">Não </s><s t="346" ac="0">somos </s>'
+    '<s t="692" ac="0">estranhos</s></p>'
+    '<p t="25960" w="1" a="1">\n</p>'
+    '<p t="25960" d="3000">Ih.</p>'
+    '</body></timedtext>'
+)
+_s3 = _parse_srv3(_srv3_sample)
+assert len(_s3) == 2, f"empty continuation paragraphs must be dropped, got {len(_s3)}"
+assert _s3[0]["start_sec"] == 18.8 and _s3[0]["end_sec"] == 25.96
+assert _s3[0]["text"] == "Não somos estranhos"
+assert _s3[0]["words"][0] == {"word": "somos", "start": 19.146, "end": 19.492}
+assert _s3[1]["text"] == "Ih." and _s3[1]["start_sec"] == 25.96
+assert _parse_srv3("<broken") == []
+assert _parse_caption("json3", _json3_sample) == _j3
+assert _parse_caption("srv3", _srv3_sample) == _s3
+assert _parse_caption("vtt", _vtt_sample) == _segs

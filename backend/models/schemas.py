@@ -103,6 +103,9 @@ class AppSettings(BaseModel):
     # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
     whisper_model: str = "large-v3-turbo"
     whisper_model_cache: Optional[str] = None
+    # Captions-first: when a YouTube video already has auto-caption rows at
+    # ingest, whisper transcription skips it (default on; toggle in Disk UI).
+    yt_subtitles_first: bool = True
 
 
 class SettingsUpdate(BaseModel):
@@ -138,6 +141,7 @@ class SettingsUpdate(BaseModel):
     archive_vod_keep_count: Optional[int] = None
     whisper_model: Optional[str] = None
     whisper_model_cache: Optional[str] = None
+    yt_subtitles_first: Optional[bool] = None
 
 
 class OpenFolderRequest(BaseModel):

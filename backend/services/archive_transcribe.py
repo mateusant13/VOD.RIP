@@ -607,12 +607,40 @@ def _claim_next_job() -> Optional[dict]:
     return None
 
 
+def _captions_first_skip(platform: str, video_id: str) -> bool:
+    """True when YouTube captions already cover the video and the user opted
+    into captions-first (settings.yt_subtitles_first, default True).
+
+    Whisper still runs when the toggle is off, the platform isn't YouTube,
+    or no caption rows exist. ponytail: there is no force-transcribe path
+    (archive_jobs has no force flag) — add one there if a job ever needs to
+    bypass this.
+    """
+    if platform != "youtube":
+        return False
+    from deps import settings_mgr  # lazy: archive_transcribe is opt-in by design
+
+    if not getattr(settings_mgr.get(), "yt_subtitles_first", True):
+        return False
+    return bool(archive_db.transcript_for(platform, video_id))
+
+
 def _process_job(job: dict) -> dict:
     """Run one claimed job; never raises — failures land in archive_jobs.error."""
     job_id = job["id"]
     platform, video_id = job["platform"], job["video_id"]
     try:
         archive_db.update_job(job_id, status="running", progress=0.0)
+
+        if _captions_first_skip(platform, video_id):
+            logger.info("captions already present for %s/%s — skipping whisper", platform, video_id)
+            archive_db.update_job(job_id, status="done", progress=1.0)
+            return {
+                "job_id": job_id,
+                "platform": platform,
+                "video_id": video_id,
+                "skipped": "captions-first",
+            }
 
         def _progress(done: float, total: float, _ci: int, _n: int) -> None:
             if total > 0:

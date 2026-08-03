@@ -112,6 +112,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
       const updated = await apiPost<AppSettings>('/api/settings', {
         whisper_model: (settings.whisper_model ?? '').trim() || undefined,
         whisper_model_cache: (settings.whisper_model_cache ?? '').trim() || null,
+        yt_subtitles_first: settings.yt_subtitles_first ?? true,
       });
       setSettings(updated);
       setWhisperMsg('saved');
@@ -120,7 +121,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
     } finally {
       setWhisperSaving(false);
     }
-  }, [settings.whisper_model, settings.whisper_model_cache, setSettings]);
+  }, [settings.whisper_model, settings.whisper_model_cache, settings.yt_subtitles_first, setSettings]);
 
   return (
     <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-3">
@@ -200,6 +201,16 @@ export default function DiskSection({ settings, setSettings }: Props) {
           aria-label="whisper model cache directory"
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1 px-2 focus:outline-none focus:border-white text-xs"
         />
+        <label className="flex items-center gap-1.5">
+          <input
+            type="checkbox"
+            checked={settings.yt_subtitles_first ?? true}
+            onChange={(e) => setSettings({ ...settings, yt_subtitles_first: e.target.checked })}
+            aria-label="use youtube subtitles first"
+            className="accent-zinc-400 size-3.5"
+          />
+          <span className="text-[9px] text-zinc-600 font-mono">Use YouTube subtitles first (fallback: whisper)</span>
+        </label>
         <div className="flex items-center gap-1.5">
           <button
             type="button"
