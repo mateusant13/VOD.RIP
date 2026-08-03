@@ -10,6 +10,9 @@ export const EXPLORE_PANEL_CHROME_H_EST = 156;
 export const EXPLORE_PANEL_PAD_V = 24;
 export const EXPLORE_PANEL_PAD_H = 24;
 export const EXPLORE_VIDEO_ASPECT_DEFAULT = 16 / 9;
+/** Free-form (non-aspect-locked) panel bounds — search popup window chrome. */
+export const EXPLORE_PANEL_BOX_MIN_W = 320;
+export const EXPLORE_PANEL_BOX_MIN_H = 280;
 const CARD_BORDER_PX = 2;
 
 export type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
@@ -57,6 +60,20 @@ function maxExplorePanelWidth(chromeH: number, aspect: number): number {
 export function clampExplorePanelWidth(width: number, chromeH: number, aspect: number): number {
   const maxW = maxExplorePanelWidth(chromeH, aspect);
   return Math.min(maxW, Math.max(EXPLORE_PANEL_MIN_W, width));
+}
+
+/** Clamp a free-form panel size to [min, viewport] — width and height independently.
+ *  When the viewport is smaller than the minimum, the minimum wins (panel may
+ *  overflow a degenerate viewport rather than become unusable). */
+export function clampExplorePanelBox(
+  size: { w: number; h: number },
+  viewport: { w: number; h: number },
+  min: { w: number; h: number },
+): { w: number; h: number } {
+  return {
+    w: Math.min(Math.max(min.w, size.w), Math.max(min.w, viewport.w)),
+    h: Math.min(Math.max(min.h, size.h), Math.max(min.h, viewport.h)),
+  };
 }
 
 export function defaultExplorePopupPosition(panelW: number, panelH: number, stackIndex = 0): PanelPos {
@@ -269,6 +286,154 @@ export function startExplorePanelWidthResize(
     const finalW = clamp(widthRef.current);
     applyWidthAndPos(finalW);
     setWidth(finalW);
+    if (opts.setPos && opts.posRef?.current) {
+      opts.setPos({ ...opts.posRef.current });
+    }
+  };
+
+  handle.addEventListener('pointermove', onMove);
+  handle.addEventListener('pointerup', onUp);
+  handle.addEventListener('pointercancel', onUp);
+}
+
+/** Free-form panel resize: width AND height move independently (no aspect
+ *  lock). West/north edges shift the panel so the opposite edge stays put.
+ *  Size clamps to [min, viewport-margins]; west/north over-drags shrink the
+ *  panel back inside the viewport instead of pushing it off-screen. */
+export function startExplorePanelBoxResize(
+  e: ReactPointerEvent<HTMLDivElement>,
+  edge: ResizeEdge,
+  sizeRef: MutableRefObject<{ w: number; h: number }>,
+  setSize: (next: { w: number; h: number }) => void,
+  opts: {
+    panelEl: HTMLElement | null;
+    min?: { w: number; h: number };
+    posRef?: MutableRefObject<PanelPos | null>;
+    setPos?: Dispatch<SetStateAction<PanelPos | null>>;
+  },
+) {
+  e.preventDefault();
+  e.stopPropagation();
+  const handle = e.currentTarget;
+  handle.setPointerCapture(e.pointerId);
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const start = { ...sizeRef.current };
+  const min = opts.min ?? { w: EXPLORE_PANEL_BOX_MIN_W, h: EXPLORE_PANEL_BOX_MIN_H };
+  const startPos = opts.posRef?.current ? { ...opts.posRef.current } : null;
+  const panelEl = opts.panelEl;
+
+  if (panelEl) {
+    panelEl.style.willChange = 'width, height';
+  }
+  const prevUserSelect = document.body.style.userSelect;
+  const prevCursor = document.body.style.cursor;
+  document.body.style.userSelect = 'none';
+  document.body.style.cursor = RESIZE_EDGE_CURSORS[edge];
+
+  const viewportBox = (): { w: number; h: number } => {
+    const margin = VIEWPORT_EDGE_LOCK + panelResizeHandleInset(true);
+    return {
+      w: Math.max(min.w, window.innerWidth - margin * 2),
+      h: Math.max(min.h, window.innerHeight - margin * 2),
+    };
+  };
+
+  const applySizeAndPos = (rawNext: { w: number; h: number }) => {
+    let next = clampExplorePanelBox(rawNext, viewportBox(), min);
+    if (panelEl) {
+      panelEl.style.width = `${next.w}px`;
+      panelEl.style.height = `${next.h}px`;
+    }
+    if (startPos && opts.posRef && panelEl) {
+      const margin = VIEWPORT_EDGE_LOCK + panelResizeHandleInset(true);
+      let x = startPos.x;
+      let y = startPos.y;
+      if (edgeAffectsWest(edge)) x = startPos.x + start.w - next.w;
+      if (edgeAffectsNorth(edge)) y = startPos.y + start.h - next.h;
+
+      const minX = margin;
+      const minY = margin;
+      if (edgeAffectsWest(edge)) {
+        if (x < minX) {
+          x = minX;
+          next = clampExplorePanelBox(
+            { w: startPos.x + start.w - x, h: next.h },
+            viewportBox(),
+            min,
+          );
+          x = startPos.x + start.w - next.w;
+        }
+      } else {
+        x = Math.max(minX, Math.min(x, window.innerWidth - margin - next.w));
+        if (x + next.w > window.innerWidth - margin) {
+          next = clampExplorePanelBox(
+            { w: window.innerWidth - margin - x, h: next.h },
+            viewportBox(),
+            min,
+          );
+        }
+      }
+      if (edgeAffectsNorth(edge)) {
+        if (y < minY) {
+          y = minY;
+          next = clampExplorePanelBox(
+            { w: next.w, h: startPos.y + start.h - y },
+            viewportBox(),
+            min,
+          );
+          y = startPos.y + start.h - next.h;
+        }
+      } else {
+        y = Math.max(minY, Math.min(y, window.innerHeight - margin - next.h));
+        if (y + next.h > window.innerHeight - margin) {
+          next = clampExplorePanelBox(
+            { w: next.w, h: window.innerHeight - margin - y },
+            viewportBox(),
+            min,
+          );
+        }
+      }
+
+      sizeRef.current = { ...next };
+      if (panelEl) {
+        panelEl.style.width = `${next.w}px`;
+        panelEl.style.height = `${next.h}px`;
+      }
+      const pos = { x, y };
+      opts.posRef.current = pos;
+      applyExplorePopupWindowPosition(panelEl, pos);
+    } else {
+      sizeRef.current = { ...next };
+    }
+  };
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    const dw = edge === 'e' || edge === 'ne' || edge === 'se' ? dx
+      : edge === 'w' || edge === 'nw' || edge === 'sw' ? -dx : 0;
+    const dh = edge === 's' || edge === 'se' || edge === 'sw' ? dy
+      : edge === 'n' || edge === 'ne' || edge === 'nw' ? -dy : 0;
+    applySizeAndPos({ w: start.w + dw, h: start.h + dh });
+  };
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    handle.releasePointerCapture(e.pointerId);
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    handle.removeEventListener('pointercancel', onUp);
+    document.body.style.userSelect = prevUserSelect;
+    document.body.style.cursor = prevCursor;
+    if (panelEl) {
+      panelEl.style.willChange = '';
+    }
+    const finalSize = clampExplorePanelBox(sizeRef.current, viewportBox(), min);
+    applySizeAndPos(finalSize);
+    setSize({ ...finalSize });
     if (opts.setPos && opts.posRef?.current) {
       opts.setPos({ ...opts.posRef.current });
     }

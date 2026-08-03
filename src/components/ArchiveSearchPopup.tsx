@@ -9,9 +9,21 @@
  * Pure text helpers (offset format, highlight spans, chat grouping) live in
  * archiveSearchUtils.ts and are covered by vitest — no network in there.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FileText, Loader2, MessageSquare, RefreshCw, Search, X } from 'lucide-react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { ExternalLink, FileText, Loader2, MessageSquare, RefreshCw, Search, X } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
+import {
+  EXPLORE_PANEL_BOX_MIN_H,
+  EXPLORE_PANEL_BOX_MIN_W,
+  VIEWPORT_EDGE_LOCK,
+  PanelResizeHandles,
+  applyExplorePopupWindowPosition,
+  panelResizeHandleInset,
+  startExplorePanelBoxResize,
+  startFloatingPanelDrag,
+  type PanelPos,
+  type ResizeEdge,
+} from '../explorePopupUtils';
 import {
   ARCHIVE_KIND_LABELS,
   ARCHIVE_KINDS,
@@ -40,6 +52,13 @@ interface ArchiveSearchPopupProps {
   onClose: () => void;
   /** Open the hit in the explore-player flow (App owns the popup stack). */
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** When provided, clicking a hit row seeks instead of opening: the row
+   *  click calls onSeekHit(hit) and a small per-row 'open' affordance still
+   *  calls onOpenHit. Absent → current behavior (row click opens). */
+  onSeekHit?: (hit: ArchiveSearchHit) => void;
+  /** Render as a plain flex container filling its parent — no floating
+   *  positioning, no drag/resize chrome, no zIndex (player-embedded use). */
+  embedded?: boolean;
   /** Optional per-video scope: search only this archived video; channel + platform are implied. */
   scope?: { videoId: string; title: string };
   /** Optional saved channels (App state) — unioned into the channel dropdown. */
@@ -52,6 +71,9 @@ const POPUP_WIDTH = 460;
 const SEARCH_DEBOUNCE_MS = 250;
 const SEARCH_LIMIT = 30;
 const CHAT_HALF_SEC = 30;
+/** Floating-mode seed position — the pre-chrome location (top 80, right 24). */
+const SEED_Y = 80;
+const SEED_RIGHT = 24;
 
 const platformAccent: Record<string, string> = {
   twitch: 'text-[#9146FF]',
@@ -71,7 +93,12 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedChannels }: ArchiveSearchPopupProps) {
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels }: ArchiveSearchPopupProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const posRef = useRef<PanelPos | null>(null);
+  const sizeRef = useRef<{ w: number; h: number } | null>(null);
+  const [, setPos] = useState<PanelPos | null>(null);
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
   const [inputQuery, setInputQuery] = useState('');
   const [query, setQuery] = useState('');
   // Filters — empty values mean "all".
@@ -104,6 +131,85 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
       chatGenRef.current += 1;
     };
   }, []);
+
+  /** Floating-mode geometry — position + size are in-memory (no persistence). */
+  const seedPos = useCallback((w: number): PanelPos => ({
+    x: Math.max(8, window.innerWidth - SEED_RIGHT - w),
+    y: SEED_Y,
+  }), []);
+
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (embedded || !el) return;
+    if (!posRef.current) {
+      posRef.current = seedPos(sizeRef.current?.w ?? POPUP_WIDTH);
+      setPos(posRef.current);
+    }
+    const sized = sizeRef.current;
+    el.style.width = sized ? `${sized.w}px` : `${POPUP_WIDTH}px`;
+    el.style.height = sized ? `${sized.h}px` : '';
+    el.style.maxHeight = sized ? '' : '75vh';
+    applyExplorePopupWindowPosition(el, posRef.current);
+  }, [embedded, size, seedPos]);
+
+  // Keep the floating panel on-screen when the viewport shrinks.
+  useEffect(() => {
+    if (embedded) return;
+    const fit = () => {
+      const el = containerRef.current;
+      if (!el || !posRef.current) return;
+      const margin = VIEWPORT_EDGE_LOCK + panelResizeHandleInset(true);
+      const p = {
+        x: Math.max(margin, Math.min(posRef.current.x, window.innerWidth - margin - el.offsetWidth)),
+        y: Math.max(margin, Math.min(posRef.current.y, window.innerHeight - margin - el.offsetHeight)),
+      };
+      posRef.current = p;
+      applyExplorePopupWindowPosition(el, p);
+      setPos(p);
+    };
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, [embedded]);
+
+  /** Lazy floating-chrome bootstrap: seed pos + adopt the measured size
+   *  (the initial render is auto-height) before a drag/resize gesture. */
+  const ensureFloatingChrome = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return null;
+    if (!posRef.current) {
+      posRef.current = seedPos(sizeRef.current?.w ?? POPUP_WIDTH);
+      setPos(posRef.current);
+    }
+    if (!sizeRef.current) {
+      sizeRef.current = { w: el.offsetWidth || POPUP_WIDTH, h: el.offsetHeight || 480 };
+      setSize(sizeRef.current);
+    }
+    el.style.maxHeight = '';
+    return posRef.current;
+  }, [seedPos]);
+
+  const onDragStart = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const el = containerRef.current;
+    if (!el || !ensureFloatingChrome()) return;
+    startFloatingPanelDrag(e, posRef, setPos, el);
+  }, [ensureFloatingChrome]);
+
+  const onResizeStart = useCallback((e: React.PointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    const el = containerRef.current;
+    if (!el || !ensureFloatingChrome()) return;
+    startExplorePanelBoxResize(
+      e,
+      edge,
+      sizeRef as React.MutableRefObject<{ w: number; h: number }>,
+      setSize,
+      {
+        panelEl: el,
+        min: { w: EXPLORE_PANEL_BOX_MIN_W, h: EXPLORE_PANEL_BOX_MIN_H },
+        posRef,
+        setPos,
+      },
+    );
+  }, [ensureFloatingChrome]);
 
   // Video title map — fetched once; hits reference it for channel/title.
   useEffect(() => {
@@ -217,11 +323,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
     const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
     setSelected({ hit, video });
     // Watchdog synthetic rows (youtube-live-…) have no watchable URL — still
-    // show nearby chat, but never hand the hit to the preview flow.
-    if (buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel)) {
+    // show nearby chat, but never hand the hit to the preview flow (open or seek).
+    if (!buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel)) return;
+    if (onSeekHit) {
+      onSeekHit(hit);
+    } else {
       onOpenHit(hit, video);
     }
-  }, [videos, onOpenHit]);
+  }, [videos, onOpenHit, onSeekHit]);
 
   useEffect(() => {
     if (!selected) {
@@ -262,13 +371,21 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
 
   return (
     <div
+      ref={containerRef}
       role="dialog"
       aria-label="Archive search"
       onKeyDown={handleKeyDown}
-      className="fixed flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl"
-      style={{ zIndex, width: POPUP_WIDTH, top: 80, right: 24, maxHeight: '75vh' }}
+      className={
+        embedded
+          ? 'flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl w-full h-full min-h-0'
+          : 'fixed flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl'
+      }
+      style={embedded ? undefined : { zIndex }}
     >
-      <div className="flex items-center justify-between gap-2 shrink-0">
+      <div
+        className={`flex items-center justify-between gap-2 shrink-0 ${embedded ? '' : 'cursor-grab active:cursor-grabbing'}`}
+        onPointerDown={embedded ? undefined : onDragStart}
+      >
         <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
           Archive search
         </span>
@@ -465,16 +582,16 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
             if (cursor < snippet.length) nodes.push(snippet.slice(cursor));
             const isSelected = selected?.hit === hit;
             return (
-              <button
-                key={`${hit.kind}:${hit.platform}:${hit.video_id}:${hit.offset_sec}`}
-                type="button"
-                onClick={() => selectHit(hit)}
-                className={`text-left border-2 p-1.5 flex flex-col gap-1 transition-colors ${
-                  isSelected
-                    ? 'border-white bg-zinc-900'
-                    : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-500'
-                }`}
-              >
+              <div key={`${hit.kind}:${hit.platform}:${hit.video_id}:${hit.offset_sec}`} className="flex items-stretch gap-1">
+                <button
+                  type="button"
+                  onClick={() => selectHit(hit)}
+                  className={`text-left border-2 p-1.5 flex flex-col gap-1 flex-1 min-w-0 transition-colors ${
+                    isSelected
+                      ? 'border-white bg-zinc-900'
+                      : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-500'
+                  }`}
+                >
                 <span className="flex items-center gap-1.5 min-w-0">
                   {hit.kind === 'transcript'
                     ? <FileText size={10} className="text-zinc-400 shrink-0" />
@@ -503,7 +620,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
                   ) : null}
                   {nodes}
                 </span>
-              </button>
+                </button>
+                {onSeekHit && buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel) && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenHit(hit, video)}
+                    title="Open in player"
+                    aria-label={`Open ${videoTitle(video, hit)} in player`}
+                    className="border-2 border-zinc-800 bg-zinc-900/60 hover:border-white text-zinc-400 hover:text-white px-1.5 flex items-center shrink-0"
+                  >
+                    <ExternalLink size={10} />
+                  </button>
+                )}
+              </div>
             );
           })}
         </div>
@@ -568,6 +697,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedCha
             </div>
           )}
         </div>
+      )}
+      {!embedded && (
+        <PanelResizeHandles onPointerDown={onResizeStart} insetPx={panelResizeHandleInset(true)} />
       )}
     </div>
   );
