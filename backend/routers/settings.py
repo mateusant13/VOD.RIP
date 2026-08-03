@@ -124,6 +124,8 @@ async def update_settings(update: SettingsUpdate):
         current.skip_youtube_startup_warm = bool(update.skip_youtube_startup_warm)
     if update.cookie_bridge_enabled is not None:
         current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
+    if update.archive_vod_keep_count is not None:
+        current.archive_vod_keep_count = max(1, min(50, update.archive_vod_keep_count))
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

@@ -50,6 +50,23 @@ _PRIORITY = {"youtube": 0, "twitch": 1, "kick": 2}
 _DEFAULT_BUDGET_SEC = 300.0  # user rule: never burn more than 5 min per video
 
 
+def _enforce_retention() -> None:
+    """Apply archive VOD retention after a kick file lands — a 6th VOD
+    immediately evicts the oldest file. Best-effort, never fatal."""
+    try:
+        from services.archive_retention import enforce_archive_vod_retention
+
+        stats = enforce_archive_vod_retention()
+        if stats["deleted_files"]:
+            logger.info(
+                "archive_kick: retention removed %d file(s), cleared %d row(s)",
+                stats["deleted_files"],
+                stats["cleared_rows"],
+            )
+    except Exception:
+        logger.debug("archive_kick: retention skipped", exc_info=True)
+
+
 def _canonical_key(title: Optional[str], started_at: Optional[str]) -> Optional[str]:
     """Cross-platform dedupe key — Main-mandated format (identical in all
     platform adapters): NFKD-normalize, drop combining marks (so 'Último'
@@ -181,6 +198,7 @@ def _ingest_one(
         path = existing[0]["archive_path"]
         if path and Path(path).is_file():
             archive_db.upsert_video({**base, "status": "ready", "archive_path": path})
+            _enforce_retention()
             return {**base, "action": "already_ready", "status": "ready",
                     "archive_path": path, "seconds_spent": 0.0}
 
@@ -213,6 +231,7 @@ def _ingest_one(
         archive_db.upsert_video({**base, "status": "ready", "archive_path": str(out_path)})
         archive_db.update_job(job_id, status="done")
         logger.info("archive_kick: %s DOWNLOADED (%ds): %s", v.id, int(spent), v.title)
+        _enforce_retention()
         return {**base, "action": "downloaded", "status": "ready", "archive_path": str(out_path),
                 "seconds_spent": round(spent, 1)}
 
