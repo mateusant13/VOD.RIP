@@ -116,8 +116,11 @@ def _twitch_usher_master_url(login: str, sig: str, token: str) -> str:
         # session creation and falls back to a non-LL master if absent.
         "low_latency": "true",
         "p": str(random.randint(1_000_000, 9_999_999)),
-        "nauth": token,
-        "nauthsig": sig,
+        # Twitch usher currently rejects the legacy nauth/nauthsig pair with
+        # HTTP 403 but accepts sig/token (the form vaft uses) — verified live
+        # 2026-08-02: nauth 403, sig/token 200 for the same GQL token.
+        "sig": sig,
+        "token": token,
     })
     return f"https://usher.ttvnw.net/api/channel/hls/{login.lower()}.m3u8?{query}"
 
@@ -341,58 +344,77 @@ def twitch_live_info(login: str) -> Optional[dict]:
 
     Uses the Helix API when TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET are set
     (fast offline detection, no yt-dlp), and falls back to a yt-dlp page
-    scrape otherwise or on any Helix failure.
+    scrape otherwise or on any Helix failure. Whichever path produced the
+    info, the playback URL is upgraded to a fresh usher master from
+    ``probe_twitch_live_master`` so the live popup can rotate player types
+    (the rotate endpoint rejects non-usher masters, and yt-dlp's CDN URL is
+    not rotation-capable). The probe is cached 60s per channel.
     """
+    info: Optional[dict] = None
     if os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"):
         try:
-            return _twitch_helix_live_info(login)
+            info = _twitch_helix_live_info(login)
         except Exception as exc:
             logger.debug(
                 "twitch_live_info(%r): Helix failed — falling back to page scrape: %s", login, exc
             )
 
-    import yt_dlp
+    if info is None:
+        import yt_dlp
 
-    url = f"https://www.twitch.tv/{login}"
+        url = f"https://www.twitch.tv/{login}"
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            logger.debug("twitch_live_info(%r) failed: %s", login, exc)
+            return None
+
+        if not info or not info.get("is_live"):
+            return None
+
+        formats = info.get("formats") or []
+        # Pick the best m3u8 format at ≤720p
+        candidates = [
+            f for f in formats
+            if f.get("protocol") in ("m3u8", "m3u8_native") and f.get("vcodec") != "none"
+        ]
+        best = None
+        for f in candidates:
+            h = int(f.get("height") or 0)
+            if best is None or (h <= 720 and h > int(best.get("height") or 0)):
+                best = f
+        if not best:
+            # fallback: first m3u8
+            best = next((f for f in candidates), None)
+        if not best:
+            return None
+
+        info = {
+            "url": best["url"],
+            "headers": {
+                "Referer": "https://www.twitch.tv/",
+                "Origin": "https://www.twitch.tv/",
+            },
+            "title": info.get("title") or login,
+            "viewers": info.get("viewer_count") or 0,
+            "platform": "Twitch",
+            # unix-epoch stream start (yt-dlp) — archive chat sink anchor.
+            "started_at": info.get("start_time"),
+        }
+
+    # Upgrade to a rotation-capable usher master (vaft extras for the live
+    # popup's rotation wiring). Probe failure keeps the existing URL.
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
+        probed = probe_twitch_live_master(login)
+        if probed and probed.get("url"):
+            info["url"] = probed["url"]
+            info["headers"] = dict(probed.get("headers") or {})
+            info["player_type"] = probed.get("player_type")
+            info["ad_free"] = bool(probed.get("ad_free"))
     except Exception as exc:
-        logger.debug("twitch_live_info(%r) failed: %s", login, exc)
-        return None
-
-    if not info or not info.get("is_live"):
-        return None
-
-    formats = info.get("formats") or []
-    # Pick the best m3u8 format at ≤720p
-    candidates = [
-        f for f in formats
-        if f.get("protocol") in ("m3u8", "m3u8_native") and f.get("vcodec") != "none"
-    ]
-    best = None
-    for f in candidates:
-        h = int(f.get("height") or 0)
-        if best is None or (h <= 720 and h > int(best.get("height") or 0)):
-            best = f
-    if not best:
-        # fallback: first m3u8
-        best = next((f for f in candidates), None)
-    if not best:
-        return None
-
-    return {
-        "url": best["url"],
-        "headers": {
-            "Referer": "https://www.twitch.tv/",
-            "Origin": "https://www.twitch.tv/",
-        },
-        "title": info.get("title") or login,
-        "viewers": info.get("viewer_count") or 0,
-        "platform": "Twitch",
-        # unix-epoch stream start (yt-dlp) — archive chat sink anchor.
-        "started_at": info.get("start_time"),
-    }
+        logger.debug("twitch_live_info(%r): usher probe failed — keeping existing URL: %s", login, exc)
+    return info
 
 
 # ---------------------------------------------------------------------------

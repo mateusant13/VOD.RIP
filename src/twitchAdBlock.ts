@@ -9,13 +9,14 @@
  *   3. strips the ad segments / cleans the playlist served to the player.
  *
  * The app plays Twitch streams with raw hls.js (no Twitch player page), so
- * this module provides (3) — a custom pLoader that rewrites every playlist
- * response before hls.js parses it — plus (2): when stitched segments keep
- * showing up mid-playback, the loader asks the site to rotate the session to
- * the next player type via POST /api/preview/live/rotate/{session_id} (the
- * backend swaps the session's usher master in place and the site reloads the
- * same proxied URL). Non-Twitch playlists never contain 'stitched' segments,
- * so both paths are inert there — applied by default to all hls.js players.
+ * this module provides (2)+(3) — a custom pLoader that rewrites every
+ * playlist response before hls.js parses it: when stitched segments keep
+ * showing up mid-playback it asks the site to rotate the session to the
+ * next player type via POST /api/preview/live/rotate/{session_id} (the
+ * backend swaps the session's usher master in place and the site reloads
+ * the same proxied URL). Non-Twitch playlists never contain 'stitched'
+ * segments, so both paths are inert there — applied by default to all
+ * hls.js players.
  */
 
 /** vaft's ad signifier: Twitch ad segments carry this in their URL. */
@@ -41,20 +42,49 @@ export interface TwitchAdRotationOptions {
   rotationCooldownMs?: number;
   /** Hard cap on rotations per player session (default 4). */
   maxRotations?: number;
+  /**
+   * Rotation state, lazily attached by the pLoader and shared by every
+   * loader instance of one player. hls.js constructs a fresh pLoader for
+   * each playlist load, so tracker state cannot live on the loader — it is
+   * parked on this per-player config object instead.
+   * @internal
+   */
+  tracker?: TwitchAdRotationTracker | null;
+  /**
+   * Last media playlist containing playable live segments — held during full
+   * ad takeovers. Same lifetime requirement as ``tracker`` (per-player).
+   * @internal
+   */
+  lastClean?: string | null;
 }
 
 /**
  * Rewrite an m3u8 playlist: neutralize Twitch ad tracking URLs, drop
- * low-latency prefetch lines, and remove ad segments (EXTINF + URI pairs
- * whose segment URL contains the ad signifier). Returns the input unchanged
- * when there is nothing to strip, and when EVERY segment would be removed
- * (full ad takeover) — stripping everything would break the player.
+ * low-latency prefetch lines, and remove ad segments.
+ *
+ * Ad segments are identified two ways:
+ *   1. the classic vaft signifier — the segment URI contains 'stitched'
+ *      (raw upstream playlists), and
+ *   2. the app's proxied/rewritten form: the backend rewrites every segment
+ *      URI to an opaque ``/api/preview/hls/{sid}/resource?id=...`` URL, so
+ *      the ONLY remaining ad marker is the ``#EXT-X-DATERANGE`` tag with
+ *      ``CLASS="twitch-stitched-ad"`` (the loader treats any playlist
+ *      containing 'stitched' as ad-tainted and drives rotation from it).
+ *
+ * Segment lines are ONLY removed in the direct form (1). The proxied form
+ * must not be deleted: hls.js stalls when fragments vanish from a live
+ * window mid-playback (empty playlist = fatal levelEmptyError), so live ads
+ * are dodged by rotating to an ad-free player type instead of by rewriting
+ * the playlist — this matches vaft, which also never deletes segment lines.
+ *
+ * Returns the input unchanged when there is nothing to strip, and when EVERY
+ * segment would be removed (full ad takeover) — stripping everything would
+ * break the player (original vaft guard).
  */
 export function stripTwitchAdSegments(text: string): string {
   if (!text.includes('#EXT')) return text;
   const hadAds = text.includes(AD_SIGNIFIER);
   const lines = text.replace(/\r/g, '').split('\n');
-  const segCount = () => lines.filter((l) => l.startsWith('#EXTINF')).length;
 
   // Neutralize ad tracking URLs which appear in the overlay UI (vaft).
   for (let i = 0; i < lines.length; i++) {
@@ -64,27 +94,40 @@ export function stripTwitchAdSegments(text: string): string {
   }
   if (!hadAds) return lines.join('\n'); // no ad segments — only URL cleanup
 
-  // Remove EXTINF + URI pairs whose segment URL is an ad.
-  const totalSegs = segCount();
+  // Remove EXTINF + URI pairs whose segment URL is an ad (direct/raw
+  // playlists). The proxied form must NOT be deleted — see the doc comment.
   let adPairs = 0;
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (lines[i].startsWith('#EXTINF') && lines[i + 1].includes(AD_SIGNIFIER)) {
-      lines[i] = '';
-      lines[i + 1] = '';
-      adPairs++;
-      i++; // skip the URI line
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('#EXTINF') && i + 1 < lines.length) {
+      const uri = lines[i + 1];
+      if (uri.includes(AD_SIGNIFIER)) {
+        adPairs++; // drop the EXTINF + URI pair
+        i++;
+        continue;
+      }
+      out.push(line, uri);
+      i++;
+      continue;
     }
+    out.push(line);
   }
   // No low latency during ads — prefetching would fetch ad segments (vaft).
-  if (adPairs > 0) {
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].startsWith('#EXT-X-TWITCH-PREFETCH:')) lines[i] = '';
+  // Blank whenever ads are detected (not only when pairs were removed): the
+  // proxied form has no stitched URIs to remove but the prefetch lines carry
+  // RAW upstream URLs that would leak ad segments via LL-HLS prefetch.
+  if (hadAds) {
+    for (let i = 0; i < out.length; i++) {
+      if (out[i].startsWith('#EXT-X-TWITCH-PREFETCH:')) out[i] = '';
     }
   }
   // Full ad takeover: removing everything would stall the player — let the
-  // (short) ad play rather than break playback.
-  if (adPairs === 0 || (totalSegs > 0 && segCount() === 0)) return text;
-  return lines.filter((l) => l !== '').join('\n');
+  // (short) ad play rather than break playback (original vaft guard).
+  if (adPairs === 0) return out.filter((l) => l !== '').join('\n');
+  const kept = out.filter((l) => l !== '');
+  if (!kept.some((l) => l.startsWith('#EXTINF'))) return text;
+  return kept.join('\n');
 }
 
 export function bumpAdStripCounter(): void {
@@ -180,19 +223,26 @@ export class TwitchAdBlockLoader {
   private controller: AbortController | null = null;
   private readonly tracker: TwitchAdRotationTracker | null = null;
   private readonly onAdRotation: ((info: { url: string }) => void) | null = null;
+  private readonly opts: TwitchAdRotationOptions | null;
 
   /** hls.js constructs the pLoader with the full Hls config — read the custom key. */
   constructor(config?: Record<string, unknown>) {
-    const opts = ((config as { twitchAdRotation?: TwitchAdRotationOptions | null } | undefined)
+    this.opts = ((config as { twitchAdRotation?: TwitchAdRotationOptions | null } | undefined)
       ?.twitchAdRotation) ?? null;
+    const opts = this.opts;
     if (opts?.onAdRotation) {
       this.onAdRotation = opts.onAdRotation;
-      this.tracker = new TwitchAdRotationTracker({
+      // hls.js instantiates a fresh pLoader per playlist load (the loader is
+      // reset after every successful load), so consecutive ad-tainted
+      // refreshes must accumulate on the per-player config — not here.
+      opts.tracker = opts.tracker ?? new TwitchAdRotationTracker({
         rotationThreshold: Math.max(1, opts.rotationThreshold ?? 2),
         rotationCooldownMs: Math.max(0, opts.rotationCooldownMs ?? 60_000),
         maxRotations: Math.max(1, opts.maxRotations ?? 4),
       });
+      this.tracker = opts.tracker ?? null;
     }
+    if (opts && opts.lastClean === undefined) opts.lastClean = null;
   }
 
   load(context: { url: string; type?: string }, _config: Record<string, unknown>, callbacks: HlsLoaderCallbacks): void {
@@ -210,13 +260,29 @@ export class TwitchAdBlockLoader {
       })
       .then((data) => {
         window.clearTimeout(timer);
-        const stripped = stripTwitchAdSegments(data);
-        if (stripped !== data) {
-          bumpAdStripCounter();
-          if (this.tracker?.onAds() && this.onAdRotation) {
-            this.onAdRotation({ url: context.url });
-          }
-        } else {
+        const hadAds = data.includes(AD_SIGNIFIER);
+        let served = stripTwitchAdSegments(data);
+        // Full ad takeover: the window contains ONLY ad segments (no ',live'
+        // EXTINF survives). Serving it plays the ad; deleting it stalls hls.js
+        // (levelEmptyError / bufferStalledError — empirically disproven). Hold
+        // the last known-good playlist instead: hls.js keeps playing real
+        // stream segments a few seconds behind live and snaps forward when the
+        // takeover ends and the next fetch is clean again. First fetch has
+        // nothing to hold — play the short ad rather than a black screen.
+        const fullTakeover = hadAds && !/#EXTINF:[^\n]*,\s*live/.test(served);
+        if (fullTakeover) {
+          // Held content lives on the per-player config: this loader instance
+          // is discarded after every load, so per-instance state would never
+          // accumulate a known-good playlist.
+          if (this.opts?.lastClean) served = this.opts.lastClean;
+        } else if (/#EXTINF/.test(served) && this.opts) {
+          this.opts.lastClean = served;
+        }
+        const changed = served !== data;
+        if (changed) bumpAdStripCounter();
+        if (hadAds && this.tracker?.onAds() && this.onAdRotation) {
+          this.onAdRotation({ url: context.url });
+        } else if (!hadAds) {
           this.tracker?.onCleanPlaylist();
         }
         // hls.js >=1.0 LoaderStats shape — playlist-loader writes stats.parsing
@@ -225,16 +291,16 @@ export class TwitchAdBlockLoader {
         const now = performance.now();
         const stats = {
           aborted: false,
-          loaded: stripped.length,
+          loaded: served.length,
           retry: 0,
-          total: stripped.length,
+          total: served.length,
           chunkCount: 0,
           bwEstimate: 0,
           loading: { start: now, first: now, end: now },
           parsing: { start: 0, end: 0 },
           buffering: { start: 0, first: 0, end: 0 },
         };
-        callbacks.onSuccess({ url, data: stripped }, stats, context, null);
+        callbacks.onSuccess({ url, data: served }, stats, context, null);
       })
       .catch((err: unknown) => {
         window.clearTimeout(timer);
