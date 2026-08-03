@@ -72,6 +72,9 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const hlsCtorRef = useRef<typeof Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const sessionRef = useRef<PreviewSessionResponse | null>(null);
+  /** Quality policy: platform drives the live level ladder (youtube →
+   *  360/720/1080 or 360-anon; twitch/kick → up to source). */
+  const sessionPlatformRef = useRef((entry.platform || '').toLowerCase());
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
   const [position, setPosition] = useState({ x: window.innerWidth - POPUP_WIDTH - 24, y: 80 });
   const posRef = useRef(position);
@@ -288,15 +291,22 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (modeRef.current === 'live') {
-        // Quality: keep ORIGINAL hls.levels indices, filter to 360-1080, and
-        // default to the level closest to 360 (main-player convention: set
+        // Quality: keep ORIGINAL hls.levels indices. Twitch/Kick live go up
+        // to source (highest manifest level — may exceed 1080p); YouTube live
+        // offers exactly the policy ladder 360/720/1080, or 360-only when the
+        // session is anonymous (no user cookies).
+        // Default stays the level closest to 360 (main-player convention: set
         // hls.loadLevel AFTER MANIFEST_PARSED — never startLevel before load).
+        const isYoutube = sessionPlatformRef.current === 'youtube';
         const { levels: filtered, defaultIndex } = filterLiveLevels(
           hls.levels.map((l, i) => ({
             index: i,
             height: l.height || 0,
             bitrate: l.bitrate || 0,
           })),
+          isYoutube
+            ? { allowHeights: sessionRef.current?.anonymous ? [360] : [360, 720, 1080] }
+            : undefined,
         );
         setLevels(filtered.map((l) => ({
           index: l.index,
@@ -428,6 +438,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
         sessionIdRef.current = res.session_id;
         sessionRef.current = res;
+        sessionPlatformRef.current = (entry.platform || '').toLowerCase();
         setArchiveDuration(res.archive_duration ?? 0);
 
         // Warm the LIVE rail: the backend probes archive_duration only when

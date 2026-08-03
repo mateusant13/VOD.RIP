@@ -5,10 +5,10 @@ describe('filterLiveLevels', () => {
   const full = (heights: number[], bitrates = heights.map((h) => h * 1000)) =>
     heights.map((height, i) => ({ index: i, height, bitrate: bitrates[i] }));
 
-  it('keeps only 360-1080 with original indices', () => {
+  it('keeps every level ≥360 up to source (no 1080 cap, twitch/kick live)', () => {
     const { levels } = filterLiveLevels(full([160, 360, 480, 720, 1080, 2160]));
-    expect(levels.map((l) => l.height)).toEqual([360, 480, 720, 1080]);
-    expect(levels.map((l) => l.index)).toEqual([1, 2, 3, 4]);
+    expect(levels.map((l) => l.height)).toEqual([360, 480, 720, 1080, 2160]);
+    expect(levels.map((l) => l.index)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it('defaults to the level closest to 360', () => {
@@ -26,11 +26,11 @@ describe('filterLiveLevels', () => {
     expect(defaultIndex).toBe(0); // 480 (dist 120) < 720 (dist 360)
   });
 
-  it('falls back to closest in-range levels when none are in 360-1080', () => {
-    // 160 + 1440: nothing in range → full list, closest to 360 wins (160)
+  it('drops sub-360 levels even when no other level exists', () => {
+    // 160 + 1440: 1440 (source) stays, 160 is below the 360 floor.
     const { levels, defaultIndex } = filterLiveLevels(full([160, 1440]));
-    expect(levels.map((l) => l.height)).toEqual([160, 1440]);
-    expect(defaultIndex).toBe(0);
+    expect(levels.map((l) => l.height)).toEqual([1440]);
+    expect(defaultIndex).toBe(1);
   });
 
   it('never shows an empty menu', () => {
@@ -47,6 +47,53 @@ describe('filterLiveLevels', () => {
     const { levels } = filterLiveLevels(full([480, 1080], [2_500_000, 6_000_000]));
     expect(levels[0].bitrate).toBe(2_500_000);
     expect(levels[1].bitrate).toBe(6_000_000);
+  });
+
+  it('no allowHeights keeps source levels above 1080 (twitch/kick live)', () => {
+    const { levels } = filterLiveLevels(full([360, 720, 1080, 1440, 2160]));
+    expect(levels.map((l) => l.height)).toEqual([360, 720, 1080, 1440, 2160]);
+    expect(levels.map((l) => l.index)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('allowHeights=[360] caps the menu to 360p (youtube live anonymous)', () => {
+    const { levels, defaultIndex } = filterLiveLevels(full([360, 720, 1080]), { allowHeights: [360] });
+    expect(levels.map((l) => l.height)).toEqual([360]);
+    expect(levels.map((l) => l.index)).toEqual([0]);
+    expect(defaultIndex).toBe(0);
+  });
+
+  it('allowHeights=[360,720,1080] drops in-between tiers like 480 (youtube live + cookies)', () => {
+    const { levels, defaultIndex } = filterLiveLevels(
+      full([360, 480, 720, 1080, 1440]),
+      { allowHeights: [360, 720, 1080] },
+    );
+    expect(levels.map((l) => l.height)).toEqual([360, 720, 1080]);
+    expect(levels.map((l) => l.index)).toEqual([0, 2, 3]);
+    expect(defaultIndex).toBe(0);
+  });
+
+  it('allowHeights with no matching level falls back to the lowest in-range level (never empty, never over-policy)', () => {
+    const { levels } = filterLiveLevels(full([480, 720]), { allowHeights: [360] });
+    expect(levels.map((l) => l.height)).toEqual([480]);
+  });
+
+  it('allowHeights ignores sub-360 levels even when in the list', () => {
+    const { levels } = filterLiveLevels(full([144, 360, 720]), { allowHeights: [144, 360] });
+    expect(levels.map((l) => l.height)).toEqual([360]);
+  });
+
+  it('defaults to the level closest to 360 within the allowed set', () => {
+    const { levels, defaultIndex } = filterLiveLevels(
+      full([360, 480, 720, 1080]),
+      { allowHeights: [360, 720, 1080] },
+    );
+    expect(levels.map((l) => l.height)).toEqual([360, 720, 1080]);
+    expect(defaultIndex).toBe(0);
+  });
+
+  it('no allowHeights and no level ≥360 falls back to the full list (never empty)', () => {
+    const { levels } = filterLiveLevels(full([160, 144]));
+    expect(levels.map((l) => l.height)).toEqual([160, 144]);
   });
 });
 

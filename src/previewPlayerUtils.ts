@@ -236,8 +236,29 @@ export function isYouTubePreviewPlatform(platform: string | null | undefined): b
   return (platform || '').toLowerCase() === 'youtube';
 }
 
-/** YouTube progressive preview offers these switchable tiers (re-muxed on demand). */
-export const YOUTUBE_PREVIEW_ALLOW_HEIGHTS = [360, 720, 1080];
+/** YouTube preview tiers allowed under the quality policy: VOD (and any
+ *  anonymous session — no user cookies) stays 360p-only; live sessions with
+ *  user auth may raise to 1080p. */
+export function youtubePreviewAllowHeights(opts: {
+  isLive: boolean;
+  anonymous: boolean;
+}): number[] {
+  return opts.isLive && !opts.anonymous ? [360, 720, 1080] : [360];
+}
+
+/** Filter a sorted height list to the policy-allowed set (union semantics
+ *  removed: allowHeights now CAPS the menu). Falls back to the lowest tier
+ *  when nothing matches so the menu never lies with an empty list — the
+ *  backend clamp still caps the served stream. */
+export function applyPolicyHeights(
+  heights: number[],
+  allowHeights: number[] | undefined,
+): number[] {
+  if (!allowHeights?.length) return heights;
+  const allowed = new Set(allowHeights);
+  const kept = heights.filter((h) => allowed.has(h));
+  return kept.length ? kept : heights.slice(0, 1);
+}
 
 /** Validate URL protocol — only https, http, blob:, and relative proxy paths are allowed. */
 export function isValidPreviewUrl(u: string): boolean {
@@ -1364,8 +1385,31 @@ function mapInferredHlsLevels(
 /**
  * Build the preview quality menu for HLS. Menu tiers come from the manifest and/or
  * API variant_heights — never from the player-size cap alone (that only picks initial playback).
+ * `allowHeights` (when set) caps the menu to the policy-allowed tiers, preserving
+ * ORIGINAL hls.levels indices.
  */
 export function resolveHlsPreviewLevels(
+  hlsLevels: HlsLevelLike[],
+  opts: { initialHeight: number; fallbackHeights?: number[]; allowHeights?: number[] },
+): { mapped: PreviewLevelOption[]; defaultIndex: number } {
+  const { mapped, defaultIndex } = resolveHlsPreviewLevelsUnfiltered(hlsLevels, opts);
+  const allow = opts.allowHeights?.length ? new Set(opts.allowHeights) : null;
+  if (!allow) return { mapped, defaultIndex };
+  const kept = mapped.filter((m) => allow.has(m.height));
+  if (!kept.length) {
+    // Policy filter matches nothing — offer only the lowest tier (closest to
+    // the policy ceiling); the backend clamp still caps the served stream.
+    // mapped is sorted ascending, so index 0 is the lowest.
+    const lowest = mapped.length ? mapped[0] : null;
+    return lowest ? { mapped: [lowest], defaultIndex: 0 } : { mapped, defaultIndex };
+  }
+  return {
+    mapped: kept,
+    defaultIndex: levelIndexForHeight(kept, opts.initialHeight),
+  };
+}
+
+function resolveHlsPreviewLevelsUnfiltered(
   hlsLevels: HlsLevelLike[],
   opts: { initialHeight: number; fallbackHeights?: number[] },
 ): { mapped: PreviewLevelOption[]; defaultIndex: number } {
@@ -1447,14 +1491,17 @@ export function resolveProgressivePreviewLevels(
     variantHeights?: number[];
     qualityLabels?: string[];
     initialHeight: number;
-    /** Extra tiers to offer even if not yet downloaded (e.g. 360/720/1080 for YouTube). */
+    /** Policy cap — only these tiers may be offered (e.g. YouTube VOD → [360]). */
     allowHeights?: number[];
   },
 ): { mapped: PreviewLevelOption[]; defaultIndex: number } {
-  const heights = mergeVariantHeights(
-    opts.variantHeights,
-    parseQualityHeights(opts.qualityLabels ?? []),
-    opts.allowHeights ?? [],
+  const heights = applyPolicyHeights(
+    mergeVariantHeights(
+      opts.variantHeights,
+      parseQualityHeights(opts.qualityLabels ?? []),
+      opts.allowHeights ?? [],
+    ),
+    opts.allowHeights,
   );
   const mapped = mapHeightsToPreviewLevels(heights);
   if (!mapped.length) {

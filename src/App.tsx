@@ -49,7 +49,7 @@ import {
   bindYoutubeChannelScrollWarm,
   clampPreviewTimeToVodTrim,
   PREVIEW_SEEK_DEBOUNCE_MS,
-  YOUTUBE_PREVIEW_ALLOW_HEIGHTS,
+  youtubePreviewAllowHeights,
   seekYoutubeWindowHls,
   windowHlsVideoTimeSec,
   isPositionInWindowHlsMux,
@@ -456,6 +456,10 @@ export default function App() {
     variantHeights: number[];
     qualityLabels?: string[];
     activeHeight: number;
+    /** Quality policy: YouTube session resolved without user auth — 360p only. */
+    anonymous?: boolean;
+    /** True for create_live_session sessions (live popup) — YouTube live tiers allowed. */
+    isLive?: boolean;
   } | null>(null);
   /** Menu selection — may exceed on-screen playback height until fullscreen. */
   const previewRequestedHeightRef = useRef(0);
@@ -1472,6 +1476,8 @@ export default function App() {
         variantHeights: res.variant_heights ?? [],
         qualityLabels: mergedQualityLabels,
         activeHeight,
+        anonymous: res.anonymous === true,
+        isLive: res.is_live === true,
       };
       previewSessionIdRef.current = res.session_id;
       setPreviewSessionId(res.session_id);
@@ -1496,7 +1502,7 @@ export default function App() {
       // In-progress VOD (growing archive) is a live HLS stream — enable the live
       // knobs (liveSyncDuration/liveDurationInfinity) or playback stalls at the
       // playlist edge because duration keeps growing.
-      if (res.growing_vod) previewIsLiveRef.current = true;
+      if (res.growing_vod || res.is_live) previewIsLiveRef.current = true;
       const playback = resolvePreviewPlayback(url.trim(), res);
       if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
         timing.mark('attach_before_segments');
@@ -1763,7 +1769,12 @@ export default function App() {
           ?? previewPlayback.qualityLabels
           ?? videoInfo?.qualities,
         initialHeight: activeH,
-        allowHeights: detectUrlPlatform(previewPageUrl) === 'youtube' ? YOUTUBE_PREVIEW_ALLOW_HEIGHTS : undefined,
+        allowHeights: detectUrlPlatform(previewPageUrl) === 'youtube'
+          ? youtubePreviewAllowHeights({
+            isLive: meta?.isLive ?? previewIsLiveRef.current,
+            anonymous: meta?.anonymous ?? false,
+          })
+          : undefined,
       };
       const immediate = resolveProgressivePreviewLevels(levelOpts);
       syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
@@ -1985,10 +1996,19 @@ export default function App() {
           activeHeight: meta?.activeHeight ?? previewPlayback.activeHeight,
         },
       );
+      // Quality policy: YouTube VOD/anonymous previews cap the menu at 360p;
+      // live sessions with user cookies may raise to 1080p.
+      const allowHeights = youtubePreview
+        ? youtubePreviewAllowHeights({
+          isLive: meta?.isLive ?? previewIsLiveRef.current,
+          anonymous: meta?.anonymous ?? false,
+        })
+        : undefined;
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
         const { mapped, defaultIndex } = resolveHlsPreviewLevels(levels, {
           initialHeight: initialHlsHeight,
           fallbackHeights,
+          allowHeights,
         });
         if (!mapped.length) return;
         const maxH = Math.max(0, ...mapped.map((m) => m.height));
