@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -23,7 +24,23 @@ _TMP = Path(tempfile.mkdtemp(prefix="vodrip-tests-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
 os.environ["VODRIP_COOKIE_DB"] = str(_TMP / "cookies.db")
 
-__all__ = ["purge_download_manager"]
+# Snapshot of the REAL %APPDATA% archive.db taken here, before any test
+# module import can run the archive/cookie-store self-checks. The cookie
+# store's real file is the same archive.db (VODRIP_COOKIE_DB unset →
+# appdata/archive.db), so one hash covers both stores. test_cookie_bridge.py
+# asserts the file is still byte-identical at the end of a merged run.
+def _sha256_or_none(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+REAL_APPDATA_DB_SHA256 = _sha256_or_none(
+    Path(os.environ.get("APPDATA", "")) / "VOD.RIP" / "archive.db"
+)
+
+__all__ = ["purge_download_manager", "REAL_APPDATA_DB_SHA256"]
 
 
 @pytest.fixture(autouse=True)
