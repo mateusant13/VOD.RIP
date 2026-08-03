@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -203,16 +204,86 @@ def clear(platform: Optional[str] = None) -> None:
         _execute("DELETE FROM session_cookies")
 
 
+# --- expiry ----------------------------------------------------------------
+
+_last_purge_mono = 0.0
+# Lazy purge throttle: cookie expiry is a slow process (session cookies never
+# expire; SID lives for ~2 years), so one DELETE per minute per process is far
+# more than enough. Reads additionally filter expired rows in SQL, so the
+# throttle window never serves a stale cookie.
+_PURGE_INTERVAL_S = 60.0
+
+
+def purge_expired() -> int:
+    """Delete rows whose expirationDate has passed; returns rows removed."""
+    with _lock:
+        cur = get_conn().execute(
+            "DELETE FROM session_cookies WHERE expires IS NOT NULL AND expires <= ?",
+            (time.time(),),
+        )
+        get_conn().commit()
+        return cur.rowcount
+
+
+def _purge_expired_lazy() -> None:
+    """Throttled purge — runs at most once per _PURGE_INTERVAL_S per process."""
+    global _last_purge_mono
+    with _lock:
+        if time.monotonic() - _last_purge_mono < _PURGE_INTERVAL_S:
+            return
+        _last_purge_mono = time.monotonic()
+    purge_expired()
+
+
 def counts() -> dict[str, int]:
-    rows = _query("SELECT platform, COUNT(*) AS n FROM session_cookies GROUP BY platform")
+    """Live (non-expired) cookie counts per platform."""
+    _purge_expired_lazy()
+    rows = _query(
+        "SELECT platform, COUNT(*) AS n FROM session_cookies "
+        "WHERE expires IS NULL OR expires > ? GROUP BY platform",
+        (time.time(),),
+    )
     return {r["platform"]: r["n"] for r in rows}
 
 
-def list_cookies(platform: str) -> list[dict]:
-    """Keep-listed rows for one platform with values decrypted."""
+def status() -> dict[str, dict[str, object]]:
+    """Per-platform {count, lastGrabAt, expiredCount} for the /status endpoint.
+
+    ``count`` counts live rows (expired rows are never served), ``expiredCount``
+    reports how many rows are past their expirationDate (extension push may
+    still be on the way), ``lastGrabAt`` is the newest updated_at (UTC ISO).
+    """
+    _purge_expired_lazy()
+    now = time.time()
     rows = _query(
-        "SELECT * FROM session_cookies WHERE platform = ? ORDER BY name, domain",
-        (platform,),
+        """SELECT platform,
+                   SUM(CASE WHEN expires IS NOT NULL AND expires <= ? THEN 0 ELSE 1 END) AS live,
+                   SUM(CASE WHEN expires IS NOT NULL AND expires <= ? THEN 1 ELSE 0 END) AS expired,
+                   MAX(updated_at) AS last_grab
+            FROM session_cookies GROUP BY platform""",
+        (now, now),
+    )
+    out: dict[str, dict[str, object]] = {}
+    for r in rows:
+        out[r["platform"]] = {
+            "count": int(r["live"] or 0),
+            "lastGrabAt": r["last_grab"],
+            "expiredCount": int(r["expired"] or 0),
+        }
+    return out
+
+
+def list_cookies(platform: str) -> list[dict]:
+    """Keep-listed rows for one platform with values decrypted.
+
+    Expired rows are skipped (and lazily purged) — a stale SID must never
+    reach a consumer.
+    """
+    _purge_expired_lazy()
+    rows = _query(
+        "SELECT * FROM session_cookies WHERE platform = ? "
+        "AND (expires IS NULL OR expires > ?) ORDER BY name, domain",
+        (platform, time.time()),
     )
     out = []
     for r in rows:

@@ -64,6 +64,51 @@ def _bridge_text(bridge_settings, path):
     return Path(path).read_text(encoding="utf-8")
 
 
+# --- expiry ----------------------------------------------------------------
+
+def test_expired_rows_purged_and_hidden_on_read(bridge_db):
+    from services import cookie_store as cs
+    from services.cookie_store import counts, list_cookies, purge_expired, status
+
+    _seed(bridge_db, "youtube", "SID", "live-sid")
+    accepted, dropped = bridge_db.upsert_cookies([{
+        "name": "APISID",
+        "domain": ".youtube.com",
+        "path": "/",
+        "secure": True,
+        "value": "stale",
+        "expirationDate": time.time() - 60,  # already expired
+    }])
+    assert accepted == 1 and dropped == 0
+
+    # Throttle the lazy purge so this test asserts the SQL-level read filter
+    # on its own: reads must never serve the expired row.
+    cs._last_purge_mono = time.monotonic()
+    assert counts()["youtube"] == 1
+    assert [c["name"] for c in list_cookies("youtube")] == ["SID"]
+    st = status()["youtube"]
+    assert st["count"] == 1 and st["expiredCount"] == 1
+    assert st["lastGrabAt"], "lastGrabAt must reflect the newest live row"
+
+    # physical purge catches up and the aggregate reports zero expired
+    cs._last_purge_mono = 0.0
+    assert purge_expired() == 1
+    st = status()["youtube"]
+    assert st["count"] == 1 and st["expiredCount"] == 0
+
+
+def test_status_shape_per_platform(bridge_db):
+    from services.cookie_store import status
+
+    _seed(bridge_db, "youtube", "SID", "s")
+    _seed(bridge_db, "kick", "auth_token", "t")
+    st = status()
+    assert set(st) == {"youtube", "kick"}
+    assert st["youtube"] == {"count": 1, "expiredCount": 0, "lastGrabAt": st["youtube"]["lastGrabAt"]}
+    assert st["kick"]["count"] == 1
+    assert "twitch" not in st, "platforms without rows must be absent"
+
+
 # --- gate logic -------------------------------------------------------------
 
 def test_flag_defaults_and_disable():
@@ -116,6 +161,33 @@ def test_disable_flag_skips_bridge(bridge_db, bridge_settings):
 
 
 # --- YouTube / yt-dlp -------------------------------------------------------
+
+def test_youtube_session_from_values_uses_bridge_cookies(bridge_db, bridge_settings):
+    """InnerTube session: bridge cookies beat the anonymous cold visit; an
+    empty store leaves the anonymous path untouched (the regression bar)."""
+    from services import youtube_session as ys
+
+    _seed(bridge_db, "youtube", "SID", "bridge-sid", http_only=True)
+
+    def _boom(*a, **k):
+        raise AssertionError("anonymous bootstrap must not run when bridge has cookies")
+
+    with patch.object(ys, "bootstrap_anonymous_session", side_effect=_boom):
+        sess = ys.youtube_session_from_values(visitor_data="vd-test", auto_auth=False)
+    assert sess.cookie_header == "SID=bridge-sid"
+    assert sess.cookie_file and Path(sess.cookie_file).name == "youtube.txt"
+    assert sess.anonymous is False, "bridge cookies are a real session, not anonymous"
+
+    # empty store → anonymous bootstrap unchanged
+    bridge_db.clear()
+    with patch.object(
+        ys, "bootstrap_anonymous_session",
+        return_value=("anon-vd", "YSC=anon-cookie", None, None),
+    ):
+        sess = ys.youtube_session_from_values(visitor_data="vd-test", auto_auth=False)
+    assert sess.cookie_header == "YSC=anon-cookie"
+    assert sess.anonymous is True
+
 
 def test_resolve_ytdlp_cookiefile_chain(bridge_db, bridge_settings, tmp_path):
     from services.youtube_session import YouTubeSession, resolve_ytdlp_cookiefile
@@ -490,6 +562,24 @@ async def test_status_shape(client):
     assert body["paired"] is False
     assert body["enabled"] is True
     assert body["platforms"] == {}
+
+
+async def test_status_shape_with_stored_cookies(client):
+    resp = await client.post("/api/session/cookies", json={
+        "token": "tok-1", "cookies": [{
+            "name": "auth_token", "value": "v", "domain": "kick.com",
+            "path": "/", "secure": True, "httpOnly": True,
+        }],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] == 1
+    body = (await client.get("/api/session/cookies/status")).json()
+    assert body["paired"] is True
+    assert set(body["platforms"]) == {"kick"}
+    kick = body["platforms"]["kick"]
+    assert kick["count"] == 1
+    assert kick["expiredCount"] == 0
+    assert kick["lastGrabAt"], "lastGrabAt must be present after a grab"
 
 
 def test_real_appdata_db_untouched():

@@ -347,6 +347,26 @@ def _load_tokens_file(path: str) -> tuple[Optional[str], Optional[str]]:
     )
 
 
+def _bridge_youtube_session() -> Optional[tuple[str, Optional[str], Any]]:
+    """(cookie_header, cookie_file, http_session) from the local bridge store.
+
+    Returns None when the bridge is disabled or the store holds no youtube
+    rows — callers then fall through to the anonymous path unchanged, so the
+    regression bar (anonymous InnerTube still works) is structural.
+    """
+    try:
+        from services.cookie_bridge import cookie_header, resolve_cookiefile
+
+        header = cookie_header("youtube")
+        if not header:
+            return None
+        http = http_session_for(None)
+        http.headers["Cookie"] = header
+        return header, resolve_cookiefile("youtube"), http
+    except Exception:
+        return None
+
+
 def youtube_session_from_values(
     *,
     visitor_data: Optional[str] = None,
@@ -385,16 +405,24 @@ def youtube_session_from_values(
         )
 
     if not cookie_header:
-        anon_vd, anon_cookie, anon_file, anon_http = bootstrap_anonymous_session(
-            video_id=video_id,
-        )
-        vd = vd or anon_vd
-        cookie_header = anon_cookie
-        cookie_file = anon_file
-        http_session = anon_http
-        anonymous = bool(anon_cookie)
-        if video_id and anon_cookie:
-            _touch_video_page(video_id, anon_cookie, http=anon_http)
+        # Bridge cookies (extension keep-list) beat the anonymous cold visit:
+        # a real SID survives the bot wall that gates anonymous InnerTube.
+        # _bridge_youtube_session() returns None when disabled/empty, so the
+        # anonymous path below is byte-identical when nothing is stored.
+        bridge = _bridge_youtube_session()
+        if bridge is not None:
+            cookie_header, cookie_file, http_session = bridge
+        else:
+            anon_vd, anon_cookie, anon_file, anon_http = bootstrap_anonymous_session(
+                video_id=video_id,
+            )
+            vd = vd or anon_vd
+            cookie_header = anon_cookie
+            cookie_file = anon_file
+            http_session = anon_http
+            anonymous = bool(anon_cookie)
+            if video_id and anon_cookie:
+                _touch_video_page(video_id, anon_cookie, http=anon_http)
     elif not vd:
         vd = fetch_visitor_data()
 
