@@ -6,9 +6,12 @@ and the search UI.
 
 import asyncio
 import logging
+import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -39,6 +42,17 @@ _AUTO_KICK_LIMIT = 2                  # newest chat-less videos per search
 _backfill_attempted_at: dict[str, float] = {}
 _BACKFILL_COOLDOWN_S = 600.0
 
+# Transcript enrichment (search-v2): same global-throttle + per-video
+# cooldown shape as chat backfill, on its OWN clock so the two halves never
+# starve each other. Enqueue is gated on worker_live() — see _transcribe_candidates.
+_last_transcribe_kick = 0.0
+_TRANSCRIBE_MIN_GAP_S = 30.0
+_transcribe_attempted_at: dict[str, float] = {}
+_TRANSCRIBE_COOLDOWN_S = 600.0
+_TRANSCRIBE_FAILED_FRESH_S = 3600.0
+_TRANSCRIBE_LIMIT = 1
+_transcribe_lock = threading.Lock()
+
 
 async def _run_backfill(video_id: str, channel: str) -> None:
     """Background task: run backfill_chat in a worker thread; drop the
@@ -55,6 +69,12 @@ async def _run_backfill(video_id: str, channel: str) -> None:
         with _backfill_lock:
             _backfill_inflight.discard(video_id)
             _backfill_attempted_at[video_id] = time.monotonic()
+        # Bulk chat inserts leave the FTS index fragmented; merge after every
+        # completed backfill (manual or auto) so searches stay fast.
+        try:
+            archive_db.optimize_fts()
+        except Exception:
+            logger.exception("fts optimize failed after backfill")
 
 
 def _kick_backfill(video_id: str, channel: str) -> str:
@@ -84,27 +104,58 @@ def _kick_backfill(video_id: str, channel: str) -> str:
         return "failed"
 
 
-def _maybe_auto_backfill(*, platform: Optional[str], channel: Optional[str], source: str) -> None:
-    """Lazily kick chat backfill for the newest chat-less Twitch VODs in scope.
+def _tokenize(text: str) -> list[str]:
+    """Lowercase, non-alphanumeric split (matches the search tokenizer)."""
+    return [t for t in re.split(r"[^0-9a-z]+", (text or "").lower()) if t]
 
-    Runs inside the search response (create_task, never awaited): when the
-    search covers chat and Twitch, the 2 newest videos with zero chat rows
-    (matching the channel filter, if any) get a background backfill.
-    Throttled to one burst per _AUTO_KICK_MIN_GAP_S; in-flight and
-    recently-attempted videos are skipped."""
+
+def _title_relevance(q: str, title: str) -> int:
+    """Count of query tokens present in the title, fuzzy-tolerant.
+
+    A q token counts when it equals a title token or sits within a cheap
+    Levenshtein distance (≤ max(1, len//5)) of one — "twitch" matches
+    "twitc", "gaming" matches "gamin". Reuses archive_db._levenshtein."""
+    q_tokens = _tokenize(q)
+    title_tokens = _tokenize(title)
+    if not q_tokens or not title_tokens:
+        return 0
+    score = 0
+    for qt in q_tokens:
+        for tt in title_tokens:
+            if tt == qt:
+                score += 1
+                break
+            if archive_db._levenshtein(qt, tt, max(1, len(qt) // 5)) is not None:
+                score += 1
+                break
+    return score
+
+
+def _maybe_auto_backfill(
+    *, platform: Optional[str], channel: Optional[str], source: str, q: str = ""
+) -> list[dict]:
+    """Chat half of _maybe_enrich: lazily kick chat backfill for chat-less
+    Twitch VODs in scope.
+
+    Candidates are ranked by title-token relevance to q (ties → newest
+    started_at first) and the top _AUTO_KICK_LIMIT are kicked. Throttled to
+    one burst per _AUTO_KICK_MIN_GAP_S; in-flight and recently-attempted
+    videos are skipped. Returns the kicked rows (video_id/channel/title) so
+    the search response can show an honest 'Indexing…' line; the pre-v2
+    caller contract (return None, chat-only) is preserved for tests."""
     global _last_auto_kick
     if source not in ("both", "chat"):
-        return
+        return []
     if platform and "twitch" not in [
         p.strip().lower() for p in platform.split(",") if p.strip()
     ]:
-        return
+        return []
     now = time.monotonic()
     with _backfill_lock:
         if now - _last_auto_kick < _AUTO_KICK_MIN_GAP_S:
-            return
+            return []
     sql = (
-        "SELECT v.video_id, v.channel FROM videos v "
+        "SELECT v.video_id, v.channel, v.title, v.started_at FROM videos v "
         "WHERE v.platform='twitch' AND NOT EXISTS ("
         "  SELECT 1 FROM messages m WHERE m.platform='twitch' AND m.video_id=v.video_id)"
     )
@@ -114,11 +165,14 @@ def _maybe_auto_backfill(*, platform: Optional[str], channel: Optional[str], sou
         if slugs:
             sql += " AND lower(v.channel) IN (" + ",".join("?" * len(slugs)) + ")"
             params.extend(s.lower() for s in slugs)
-    sql += " ORDER BY v.started_at DESC LIMIT ?"
-    params.append(_AUTO_KICK_LIMIT)
-    rows = archive_db.query(sql, params)
-    kicked = False
-    for r in rows:
+    # Relevance is computed in Python (SQL can't score titles); the cap only
+    # bounds the scan, never the final ranking.
+    sql += " ORDER BY v.started_at DESC LIMIT 100"
+    rows = list(archive_db.query(sql, params))
+    rows.sort(key=lambda r: r["started_at"] or "", reverse=True)
+    rows.sort(key=lambda r: -_title_relevance(q, r["title"] or ""))  # stable: keeps newest-first
+    kicked: list[dict] = []
+    for r in rows[:_AUTO_KICK_LIMIT]:
         vid = r["video_id"]
         if not (r["channel"] or "").strip():
             continue  # nothing to backfill against without a channel
@@ -128,11 +182,118 @@ def _maybe_auto_backfill(*, platform: Optional[str], channel: Optional[str], sou
             if now - _backfill_attempted_at.get(vid, 0.0) < _BACKFILL_COOLDOWN_S:
                 continue
             _backfill_inflight.add(vid)
-            kicked = True
+            kicked.append(r)
         asyncio.get_running_loop().create_task(_run_backfill(vid, r["channel"] or ""))
     if kicked:
         with _backfill_lock:
             _last_auto_kick = now
+    return kicked
+
+
+def _transcribe_candidates(
+    *, platform: Optional[str], channel: Optional[str], q: str
+) -> list[dict]:
+    """YouTube 'ready' videos in scope without transcripts, ranked by title
+    relevance then duration (shortest first — fast feedback), top-1.
+
+    Gates: global 30s throttle (own clock), per-video 600s cooldown, file
+    still on disk, not covered by captions, no queued/running transcribe
+    job, latest job not failed-within-1h, and a live worker — without a
+    worker the jobs would sit queued forever for users who never opted in."""
+    if platform and "youtube" not in [
+        p.strip().lower() for p in platform.split(",") if p.strip()
+    ]:
+        return []
+    now = time.monotonic()
+    with _transcribe_lock:
+        if now - _last_transcribe_kick < _TRANSCRIBE_MIN_GAP_S:
+            return []
+    if not archive_db.worker_live():
+        return []
+    sql = (
+        "SELECT v.platform, v.video_id, v.channel, v.title, v.duration_sec, v.archive_path "
+        "FROM videos v WHERE v.platform='youtube' AND v.status='ready' "
+        "AND v.archive_path IS NOT NULL AND v.archive_path != '' "
+        "AND NOT EXISTS (SELECT 1 FROM transcripts t "
+        "  WHERE t.platform=v.platform AND t.video_id=v.video_id)"
+    )
+    params: list[Any] = []
+    if channel:
+        slugs = [c.strip() for c in channel.split(",") if c.strip()]
+        if slugs:
+            sql += " AND lower(v.channel) IN (" + ",".join("?" * len(slugs)) + ")"
+            params.extend(s.lower() for s in slugs)
+    # Shortest-first SQL scan; final rank re-sorts by relevance in Python.
+    sql += " ORDER BY v.duration_sec ASC LIMIT 50"
+    rows = list(archive_db.query(sql, params))
+    fresh_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_TRANSCRIBE_FAILED_FRESH_S)
+    out: list[dict] = []
+    for r in rows:
+        vid = r["video_id"]
+        if now - _transcribe_attempted_at.get(vid, 0.0) < _TRANSCRIBE_COOLDOWN_S:
+            continue
+        if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
+            continue  # file gone — whisper would fail immediately
+        if archive_db.captions_cover("youtube", vid):
+            continue
+        latest = archive_db.latest_job("youtube", vid, kind="transcribe")
+        if latest and latest["status"] in ("queued", "running"):
+            continue
+        if latest and latest["status"] == "failed":
+            try:
+                fresh = datetime.fromisoformat(latest["updated_at"]) > fresh_cutoff
+            except (TypeError, ValueError):
+                fresh = True  # unparseable timestamp — treat as fresh failure
+            if fresh:
+                continue  # failed < 1h ago — do not re-enqueue forever
+        out.append(r)
+    out.sort(key=lambda r: r["duration_sec"] or 0.0)  # stable: duration tiebreak
+    out.sort(key=lambda r: -_title_relevance(q, r["title"] or ""))  # relevance first
+    return out[:_TRANSCRIBE_LIMIT]
+
+
+def _maybe_enrich(
+    *, platform: Optional[str], channel: Optional[str], source: str, q: str
+) -> list[dict]:
+    """Targeted background enrichment for the search scope.
+
+    Chat half: kick chat backfill for chat-less Twitch VODs (existing
+    behavior + title-relevance ordering). Transcript half: enqueue ONE
+    transcribe job for the best eligible YouTube video. Runs inline (a few
+    indexed SELECTs, at most one INSERT, one create_task) — never awaited,
+    never blocks the search response. Returns what was actually kicked as
+    the response's 'enriching' list ({platform, video_id, kind, channel,
+    title}); empty when idle."""
+    enriching: list[dict] = []
+    if source in ("both", "chat"):
+        for r in _maybe_auto_backfill(
+            platform=platform, channel=channel, source=source, q=q
+        ):
+            enriching.append({
+                "platform": "twitch",
+                "video_id": r["video_id"],
+                "kind": "chat_backfill",
+                "channel": r["channel"] or "",
+                "title": r["title"] or "",
+            })
+    if source in ("both", "transcript"):
+        for r in _transcribe_candidates(platform=platform, channel=channel, q=q):
+            job_id = f"transcribe-{r['platform']}-{r['video_id']}"
+            try:
+                archive_db.enqueue_job(job_id, "transcribe", r["platform"], r["video_id"])
+            except sqlite3.IntegrityError:
+                continue  # already queued by a previous search — nothing new
+            with _transcribe_lock:
+                _last_transcribe_kick = time.monotonic()
+                _transcribe_attempted_at[r["video_id"]] = time.monotonic()
+            enriching.append({
+                "platform": r["platform"],
+                "video_id": r["video_id"],
+                "kind": "transcribe",
+                "channel": r["channel"] or "",
+                "title": r["title"] or "",
+            })
+    return enriching
 
 
 def _require_platform(platform: str) -> str:
@@ -234,6 +395,9 @@ async def archive_search(
         )
     if channel and any(not s.strip() for s in channel.split(",")):
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
+    # channel_hint: search() understands a leading channel-slug token (see
+    # archive_db.search) and reports the matched slug through the out-param.
+    hint_box: list[str] = []
     hits = archive_db.search(
         q,
         platform=platform or None,
@@ -245,11 +409,31 @@ async def archive_search(
         video_id=video_id or None,
         lang=lang or None,
         limit=limit,
+        _channel_hint_out=hint_box,
     )
-    # Lazily kick chat backfill for chat-less Twitch VODs in scope (fires a
-    # background task; never blocks or alters the response).
-    _maybe_auto_backfill(platform=platform or None, channel=channel or None, source=source)
-    return {"hits": hits}
+    channel_hint = hint_box[0] if hint_box else None
+    # Targeted enrichment: lazily kick chat backfill / enqueue transcribe
+    # jobs for videos in scope. Runs inline but only fires background tasks;
+    # the 'enriching' list reports what was actually kicked. The explicit
+    # channel param wins over the hint for scoping.
+    enriching: list[dict] = []
+    try:
+        from deps import settings_mgr  # lazy: keeps routers.archive import-light
+
+        smart_enrich = bool(getattr(settings_mgr.get(), "archive_smart_enrich", True))
+    except Exception:
+        smart_enrich = True
+    if smart_enrich:
+        enriching = _maybe_enrich(
+            platform=platform or None,
+            channel=channel or channel_hint,
+            source=source,
+            q=q,
+        )
+    resp: dict[str, Any] = {"hits": hits, "enriching": enriching}
+    if channel_hint:
+        resp["channel_hint"] = channel_hint
+    return resp
 
 
 @router.get("/api/archive/videos/{platform}/{video_id}/chat")

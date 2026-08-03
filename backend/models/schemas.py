@@ -106,6 +106,10 @@ class AppSettings(BaseModel):
     # Captions-first: when a YouTube video already has auto-caption rows at
     # ingest, whisper transcription skips it (default on; toggle in Disk UI).
     yt_subtitles_first: bool = True
+    # Targeted search enrichment: lazily backfill chat / enqueue transcribe
+    # jobs for videos matching the search scope (default on). Off disables
+    # the whole enrichment pass — hits-only responses.
+    archive_smart_enrich: bool = True
 
 
 class SettingsUpdate(BaseModel):
@@ -142,6 +146,7 @@ class SettingsUpdate(BaseModel):
     whisper_model: Optional[str] = None
     whisper_model_cache: Optional[str] = None
     yt_subtitles_first: Optional[bool] = None
+    archive_smart_enrich: Optional[bool] = None
 
 
 class OpenFolderRequest(BaseModel):

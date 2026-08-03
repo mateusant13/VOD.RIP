@@ -133,6 +133,8 @@ async def update_settings(update: SettingsUpdate):
         current.whisper_model_cache = val or None
     if update.yt_subtitles_first is not None:
         current.yt_subtitles_first = bool(update.yt_subtitles_first)
+    if update.archive_smart_enrich is not None:
+        current.archive_smart_enrich = bool(update.archive_smart_enrich)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

@@ -125,6 +125,14 @@ CREATE TABLE IF NOT EXISTS channel_snapshots (
   fetched_at  TEXT NOT NULL,
   PRIMARY KEY (platform, channel_key)
 );
+
+-- Worker liveness: the transcribe worker stamps a heartbeat every poll
+-- iteration; search enrichment checks worker_live() before enqueueing jobs
+-- so the honest 'Indexing…' line never sits on a queue nobody consumes.
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+  tag TEXT PRIMARY KEY,
+  at  TEXT NOT NULL
+);
 """
 
 
@@ -624,7 +632,90 @@ def list_jobs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def latest_job(platform: str, video_id: str, kind: Optional[str] = None) -> Optional[dict]:
+    """Newest archive_jobs row for a video (optionally restricted to one
+    kind), or None when no job was ever enqueued. Search enrichment uses it
+    to skip videos with queued/running work and recently-failed jobs."""
+    sql = "SELECT * FROM archive_jobs WHERE platform = ? AND video_id = ?"
+    params: list[Any] = [platform, video_id]
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY created_at DESC LIMIT 1"
+    rows = query(sql, params)
+    return dict(rows[0]) if rows else None
+
+
+def worker_heartbeat(tag: str) -> None:
+    """Stamp a worker liveness row (upsert); workers call this every poll
+    iteration so search enrichment can tell an honest 'Indexing…' line from
+    a queue nobody consumes."""
+    execute(
+        "INSERT INTO worker_heartbeats (tag, at) VALUES (?, ?) "
+        "ON CONFLICT(tag) DO UPDATE SET at = excluded.at",
+        (tag, _now_iso()),
+    )
+
+
+def worker_live(age_s: int = 30) -> bool:
+    """True when the transcribe worker heartbeat is younger than age_s.
+
+    Both sides of the comparison are _now_iso() output (UTC, fixed width), so
+    a lexicographic compare is a valid time compare. Missing table (pre-v2
+    DB) or any SQL error means no worker has ever pinged → False."""
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
+            timespec="seconds"
+        )
+        return bool(
+            query(
+                "SELECT 1 FROM worker_heartbeats WHERE tag = 'transcribe' AND at >= ?",
+                (cutoff,),
+            )
+        )
+    except sqlite3.Error:
+        return False
+
+
+def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:
+    """True when YouTube captions already cover the video (captions-first on).
+
+    Mirrors archive_transcribe._captions_first_skip: yt_subtitles_first
+    (default True) AND transcript rows exist. The subtitles_first override
+    lets tests probe the helper without the settings singleton."""
+    if platform != "youtube":
+        return False
+    if subtitles_first is None:
+        try:
+            from deps import settings_mgr  # lazy: same pattern as archive_transcribe
+
+            subtitles_first = bool(getattr(settings_mgr.get(), "yt_subtitles_first", True))
+        except Exception:
+            subtitles_first = True
+    if not subtitles_first:
+        return False
+    return bool(transcript_for(platform, video_id))
+
+
+def optimize_fts() -> None:
+    """Run FTS5 optimize on both indexes (merge b-trees after bulk writes).
+
+    Called after a transcribe job finishes and after a chat backfill; cheap
+    no-op on quiet indexes, wrapped in try/except per index."""
+    for fts in ("transcripts_fts", "messages_fts"):
+        try:
+            execute(f"INSERT INTO {fts}({fts}) VALUES('optimize')")
+        except sqlite3.Error:
+            logger.warning("fts optimize failed for %s", fts)
+
+
 # --- search ---------------------------------------------------------------
+
+_HITS_PER_VIDEO_CAP = 3  # dedupe ceiling: never let one video flood a result page
+_PHRASE_BOOST = 1.5      # exact-phrase matches get +50% before the cross-table merge
+
 
 def search(
     q: str,
@@ -638,11 +729,27 @@ def search(
     video_id: Optional[str] = None,
     lang: Optional[str] = None,
     limit: int = 20,
+    _channel_hint_out: Optional[list] = None,
 ) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
     score; each hit carries enough to seek: platform, video_id, offset_sec,
     plus the owning video's channel/title/started_at (date), video_kind and
     lang (transcripts: transcripts.lang; messages: None).
+
+    Merge semantics: each table is fetched ~3x limit (no per-table cap below
+    that), scores are normalized per table (divided by the batch max, so the
+    best hit of a table scores 1.0 — BM25 scales are not comparable across
+    tables), and hits are deduped by (platform, video_id) with a ~3-hit cap
+    per video. When the raw query as a quoted FTS5 phrase MATCHes, those
+    hits get a +50% score boost before the cross-table merge (phrase pass
+    runs first, then the fuzzy OR pass, unioned by rowid — phrase wins).
+
+    Query understanding: when no explicit channel is given and the query has
+    ≥2 tokens whose FIRST token case-insensitively matches a known
+    videos.channel slug, the channel filter is applied implicitly and that
+    token is stripped from the query. The matched slug (as stored in the
+    DB) is appended to _channel_hint_out when a list is passed — the search
+    router surfaces it as the channel_hint response field.
 
     Filters: platform exact; channel exact or comma-separated slug list
     ("a,b" → IN clause, empty segments dropped, case-insensitive); kind is a
@@ -662,6 +769,14 @@ def search(
     unavailable or the query is huge."""
     if not q.strip():
         return []
+    raw_q = q.strip()
+    if channel is None:
+        hint = _channel_hint_for(raw_q)
+        if hint is not None:
+            channel = hint
+            q = " ".join(q.split()[1:]) or q
+            if _channel_hint_out is not None:
+                _channel_hint_out.append(hint)
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
     platforms = (
         [p for p in (p.strip().lower() for p in platform.split(",")) if p in PLATFORMS]
@@ -679,62 +794,166 @@ def search(
     pattern = _fuzzy_pattern(q, [t[2] for t in loops])
     if pattern is None:
         pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
-    hits: list[dict] = []
+    phrase_pattern = None
+    if raw_q:
+        # "raw query" quoted as one FTS5 phrase; embedded quotes are escaped.
+        phrase_pattern = '"' + raw_q.replace('"', '""') + '"'
+    fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
+    merged: list[dict] = []
     for hit_kind, fts, src, offcol, langcol in loops:
-        sql = (
-            f"SELECT t.rowid, bm25({fts}) AS score, "
-            f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
-            f"{langcol} AS lang, "
-            "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
-            f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
-            "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
-            f"WHERE {fts} MATCH ?"
+        base = dict(
+            hit_kind=hit_kind, fts=fts, src=src, offcol=offcol, langcol=langcol,
+            platforms=platforms, video_id=video_id, channel=channel, kinds=kinds,
+            date_from=date_from, date_to=date_to, lang=lang,
         )
-        params: list[Any] = [pattern]
-        if platforms:
-            sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
-            params.extend(platforms)
-        if video_id:
-            sql += " AND t.video_id = ?"
-            params.append(video_id)
-        if channel:
-            slugs = [c.strip() for c in channel.split(",") if c.strip()]
-            if slugs:
-                sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
-                params.extend(s.lower() for s in slugs)
-        if kinds:
-            sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
-            params.extend(kinds)
-        if date_from:
-            sql += " AND date(v.started_at) >= date(?)"
-            params.append(date_from)
-        if date_to:
-            sql += " AND date(v.started_at) <= date(?)"
-            params.append(date_to)
-        if hit_kind == "transcript" and lang:
-            lng = lang.strip().lower()
-            if lng == "pt":
-                # Untagged rows (whisper without detected language) are PT content.
-                sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
-            elif lng == "en":
-                sql += " AND t.lang = 'en'"
-        sql += f" ORDER BY score LIMIT {int(limit)}"
-        for r in query(sql, params):
-            hits.append({
-                "kind": hit_kind,
-                "platform": r["platform"],
-                "video_id": r["video_id"],
-                "offset_sec": r["offset_sec"],
-                "text": r["text"],
-                "score": r["score"],
-                "lang": r["lang"],
-                "channel": r["channel"],
-                "title": r["title"],
-                "date": r["date"],
-                "video_kind": r["video_kind"],
-            })
-    hits.sort(key=lambda h: h["score"])
-    return hits[:limit]
+        rows = _table_search(pattern, fetch, **base)
+        phrase_rows: dict[int, dict] = {}
+        if phrase_pattern:
+            try:
+                for r in _table_search(phrase_pattern, fetch, **base):
+                    r["_phrase"] = True  # exact-phrase hit: +50% before merging
+                    phrase_rows[r["_rowid"]] = r
+            except sqlite3.Error:
+                phrase_rows = {}  # phrase not parseable — degrade to fuzzy-only
+        # Union by rowid; a phrase-marked row replaces its fuzzy twin.
+        by_row: dict[int, dict] = {}
+        for r in rows:
+            by_row[r["_rowid"]] = r
+        for rid, r in phrase_rows.items():
+            by_row[rid] = r
+        table_rows = list(by_row.values())
+        if not table_rows:
+            continue
+        max_score = max(h["score"] for h in table_rows)
+        for h in table_rows:
+            if max_score > 0:  # guard div-by-zero: keep raw scores if batch max is 0
+                h["score"] = h["score"] / max_score
+            if h.pop("_phrase", False):
+                h["score"] = h["score"] * _PHRASE_BOOST
+            merged.append(h)
+    # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
+    # Normalization collapses each table's best to exactly 1.0, so two
+    # tables' best hits can TIE at 1.5 after the phrase boost; the raw
+    # pre-normalization score breaks such ties by relevance magnitude.
+    per_video: dict[tuple[str, str], int] = {}
+    out: list[dict] = []
+    for h in sorted(merged, key=lambda h: (h["score"], h.pop("_raw", 0.0)), reverse=True):
+        key = (h["platform"], h["video_id"])
+        if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
+            continue
+        per_video[key] = per_video.get(key, 0) + 1
+        h.pop("_rowid", None)
+        out.append(h)
+    return out[:limit]
+
+
+def _table_search(
+    pattern: str,
+    fetch: int,
+    *,
+    hit_kind: str,
+    fts: str,
+    src: str,
+    offcol: str,
+    langcol: str,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    lang: Optional[str],
+) -> list[dict]:
+    """One MATCH pass over one FTS table with the shared filter set.
+
+    score is -bm25 (positive, higher = better); hits carry a private _rowid
+    key so the phrase/fuzzy union can dedupe by row identity, and a _phrase
+    flag set by callers that need the exact-phrase boost."""
+    sql = (
+        f"SELECT t.rowid AS _rowid, -bm25({fts}) AS score, "
+        f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
+        f"{langcol} AS lang, "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
+        "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
+        f"WHERE {fts} MATCH ?"
+    )
+    params: list[Any] = [pattern]
+    if platforms:
+        sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
+        params.extend(platforms)
+    if video_id:
+        sql += " AND t.video_id = ?"
+        params.append(video_id)
+    if channel:
+        slugs = [c.strip() for c in channel.split(",") if c.strip()]
+        if slugs:
+            sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
+            params.extend(s.lower() for s in slugs)
+    if kinds:
+        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
+        params.extend(kinds)
+    if date_from:
+        sql += " AND date(v.started_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(v.started_at) <= date(?)"
+        params.append(date_to)
+    if hit_kind == "transcript" and lang:
+        lng = lang.strip().lower()
+        if lng == "pt":
+            # Untagged rows (whisper without detected language) are PT content.
+            sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
+        elif lng == "en":
+            sql += " AND t.lang = 'en'"
+    sql += f" ORDER BY score DESC LIMIT {int(fetch)}"
+    return [
+        {
+            "kind": hit_kind,
+            "platform": r["platform"],
+            "video_id": r["video_id"],
+            "offset_sec": r["offset_sec"],
+            "text": r["text"],
+            "score": r["score"],
+            "lang": r["lang"],
+            "channel": r["channel"],
+            "title": r["title"],
+            "date": r["date"],
+            "video_kind": r["video_kind"],
+            "_rowid": r["_rowid"],
+            "_raw": r["score"],  # pre-normalization -bm25; tie-breaker only
+        }
+        for r in query(sql, params)
+    ]
+
+
+# Channel-slug cache for the channel_hint query understanding: (loaded_at,
+# {lower_slug: stored_slug}); TTL 300s mirrors the vocab cache.
+_CHANNEL_SLUG_TTL_S = 300.0
+_channel_slug_lock = threading.Lock()
+_channel_slug_cache: tuple[float, dict[str, str]] = (0.0, {})
+
+
+def _channel_hint_for(q: str) -> Optional[str]:
+    """First-token channel slug match, or None.
+
+    Fires only for queries with ≥2 tokens (a bare channel query would strip
+    itself to nothing). Returns the slug exactly as stored in videos.channel
+    so the UI can render a canonical chip."""
+    tokens = q.split()
+    if len(tokens) < 2:
+        return None
+    first = tokens[0].lower()
+    global _channel_slug_cache
+    with _channel_slug_lock:
+        now = time.monotonic()
+        loaded_at, slugs = _channel_slug_cache
+        if now - loaded_at >= _CHANNEL_SLUG_TTL_S:
+            slugs = {}
+            for r in query("SELECT DISTINCT lower(channel) AS slug, channel FROM videos"):
+                slugs.setdefault(r["slug"], r["channel"])
+            _channel_slug_cache = (now, slugs)
+    return slugs.get(first)
 
 
 # --- fuzzy expansion (FTS5 vocab) -------------------------------------------
@@ -750,8 +969,8 @@ _TOKEN_EXPAND_CAP = 8
 _MAX_EXPANDED_TERMS = 64
 
 _vocab_lock = threading.Lock()
-# content table -> (loaded_at_monotonic, {token_len: [(term, freq), ...]})
-_vocab_cache: dict[str, tuple[float, dict[int, list[tuple[str, int]]]]] = {}
+# content table -> (loaded_at_monotonic, {token_len: [(term, freq), ...]}, row_count)
+_vocab_cache: dict[str, tuple[float, dict[int, list[tuple[str, int]]], int]] = {}
 # query token -> (expanded_at_monotonic, [terms, ...])
 _token_cache: dict[str, tuple[float, list[str]]] = {}
 
@@ -761,13 +980,19 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
 
     Reads the index vocabulary through an fts5vocab virtual table (verified
     to work on these external-content indexes) and keeps the ~25k most
-    frequent tokens in memory for _VOCAB_TTL_S. Returns None when the vocab
-    is unavailable so callers fall back to exact matching."""
+    frequent tokens in memory for _VOCAB_TTL_S. The cache reloads when the
+    content table's row count changed since last load — chat spam arriving
+    between searches would otherwise skew the top-25k ranking and push
+    content words out of the expansion vocabulary. Returns None when the
+    vocab is unavailable so callers fall back to exact matching."""
     now = time.monotonic()
     with _vocab_lock:
         hit = _vocab_cache.get(table)
         if hit and now - hit[0] < _VOCAB_TTL_S:
-            return hit[1]
+            cur = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+            if cur == hit[2]:
+                return hit[1]
+            hit = None  # rows changed since load — rebuild the vocab
     get_conn().execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
         f"USING fts5vocab({table}_fts, 'row')"
@@ -781,8 +1006,9 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
     for r in rows:
         term = r["term"]
         by_len.setdefault(len(term), []).append((term, int(r["n"])))
+    row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
     with _vocab_lock:
-        _vocab_cache[table] = (now, by_len)
+        _vocab_cache[table] = (now, by_len, row_count)
     return by_len
 
 
@@ -826,6 +1052,10 @@ def _token_expansions(
             continue
         for n in range(max(1, len(token) - 2), len(token) + 3):
             for term, freq in vocab.get(n, ()):
+                # Chat-spam noise ("kk", "c++", emoji runs) skews the top-N
+                # vocab; never offer it as an expansion candidate.
+                if len(term) < 3 or not term.isalnum():
+                    continue
                 d = _levenshtein(token, term, max_dist)
                 if d is None:
                     continue
