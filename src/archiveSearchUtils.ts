@@ -10,6 +10,11 @@ export interface ArchiveSearchHit {
   offset_sec: number;
   text: string;
   score: number;
+  /** Extras from the owning videos row (null when no video row exists). */
+  channel?: string | null;
+  title?: string | null;
+  date?: string | null;
+  video_kind?: string | null;
 }
 
 export interface ArchiveVideoRow {
@@ -23,6 +28,64 @@ export interface ArchiveVideoRow {
   archive_path?: string | null;
   canonical_key?: string | null;
   status?: string | null;
+  kind?: string | null;
+}
+
+export const ARCHIVE_PLATFORMS = ['youtube', 'twitch', 'kick'] as const;
+export const ARCHIVE_KINDS = ['vod', 'clip', 'short', 'live'] as const;
+export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
+
+export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
+  vod: 'VOD',
+  clip: 'CLIP',
+  short: 'SHORT',
+  live: 'LIVE',
+};
+
+/** Upper-case label for a kind value; unknown/empty stays as-is. */
+export function kindLabel(kind: string | null | undefined): string {
+  if (!kind) return '';
+  const label = ARCHIVE_KIND_LABELS[kind as ArchiveKind];
+  return label ?? String(kind);
+}
+
+/** True for a real calendar date in YYYY-MM-DD (2026-02-30 is invalid). */
+export function isValidDateParam(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [y, m, d] = value.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+export interface ArchiveSearchFilterParams {
+  query: string;
+  /** Empty/omitted = all channels. */
+  channel?: string | null;
+  /** Empty = all platforms; multiple join as comma-separated. */
+  platforms?: readonly string[] | null;
+  /** Empty = all kinds; multiple join as comma-separated. */
+  kinds?: readonly string[] | null;
+  /** YYYY-MM-DD inclusive bounds on started_at; empty = unset. */
+  dateFrom?: string | null;
+  dateTo?: string | null;
+  limit?: number;
+}
+
+/** Query-string for GET /api/archive/search — omits unset filters. */
+export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
+  const params = new URLSearchParams();
+  params.set('q', p.query.trim());
+  if (p.channel) params.set('channel', p.channel);
+  const platforms = (p.platforms ?? []).filter(Boolean);
+  if (platforms.length > 0) params.set('platform', platforms.join(','));
+  const kinds = (p.kinds ?? []).filter(Boolean);
+  if (kinds.length > 0) params.set('kind', kinds.join(','));
+  const dateFrom = p.dateFrom && isValidDateParam(p.dateFrom) ? p.dateFrom : null;
+  const dateTo = p.dateTo && isValidDateParam(p.dateTo) ? p.dateTo : null;
+  if (dateFrom) params.set('date_from', dateFrom);
+  if (dateTo) params.set('date_to', dateTo);
+  params.set('limit', String(p.limit ?? 30));
+  return `/api/archive/search?${params.toString()}`;
 }
 
 export interface ArchiveChatMessage {

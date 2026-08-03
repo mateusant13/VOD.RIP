@@ -5629,11 +5629,11 @@ export default function App() {
               className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
                 archiveSearchOpen
                   ? 'bg-white text-black border-white'
-                  : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                  : 'border-zinc-700 border-b-yellow-300/60 bg-zinc-800/60 text-yellow-100/90 hover:border-white hover:text-white'
               }`}
             >
               <Search size={10} className="shrink-0" />
-              Archive
+              SEARCH CHAT
             </button>
             <div className="w-2 h-2 bg-[#53fc18] rounded-full animate-pulse" />
             <div className="w-2 h-2 bg-[#9146FF] rounded-full animate-pulse" style={{ animationDelay: '0.5s' }} />
