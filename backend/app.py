@@ -10,13 +10,14 @@ from services.ytdlp_guard import assert_ytdlp_safe
 
 import logging
 import os
+import hashlib
 import threading
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from deps import settings_mgr, download_mgr
@@ -483,7 +484,7 @@ threading.Thread(
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
     """Serve bundled UI when KICK_SERVE_UI=1; otherwise redirect to Vite (dev)."""
     serve_ui = os.environ.get("KICK_SERVE_UI", "").strip() == "1"
     ui_url = os.environ.get("KICK_UI_URL", "http://localhost:5173").strip()
@@ -503,7 +504,12 @@ Run <code>npm run dev</code> for API + UI, or set <code>KICK_SERVE_UI=1</code> a
     index_file = static_dir / "index.html"
     if index_file.exists():
         content = index_file.read_text(encoding="utf-8")
-        return HTMLResponse(content, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+        # no-cache + ETag: browser keeps the 1MB single-file bundle, revalidates
+        # with a cheap 304 instead of re-downloading it on every cold open.
+        etag = '"%s"' % hashlib.sha1(content.encode("utf-8")).hexdigest()
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"Cache-Control": "no-cache", "ETag": etag})
+        return HTMLResponse(content, headers={"Cache-Control": "no-cache", "ETag": etag})
     return HTMLResponse(
         "<h1>Kick & Twitch Downloader</h1>"
         "<p>Frontend not found. Run <code>npm run build-copy</code> then set <code>KICK_SERVE_UI=1</code>, "

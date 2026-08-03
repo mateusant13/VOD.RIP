@@ -1,23 +1,22 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import PlatformVodIcon from "./PlatformVodIcon";
 
-vi.mock("@/assets/platforms/kick.ico", () => ({ default: "kick.ico" }));
-vi.mock("@/assets/platforms/twitch.png", () => ({ default: "twitch.png" }));
-
 describe("PlatformVodIcon", () => {
-  it("renders Twitch icon for Twitch platform", () => {
-    render(<PlatformVodIcon platform="Twitch" />);
-    const img = screen.getByAltText("Twitch");
-    expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute("src", "twitch.png");
+  it("renders Twitch as inline SVG (no img)", () => {
+    const { container } = render(<PlatformVodIcon platform="Twitch" />);
+    const svg = screen.getByLabelText("Twitch");
+    expect(svg.tagName).toBe("svg");
+    expect(svg.querySelector("path")).not.toBeNull();
+    expect(container.querySelector("img")).toBeNull();
   });
 
-  it("renders Kick icon for Kick platform", () => {
-    render(<PlatformVodIcon platform="Kick" />);
-    const img = screen.getByAltText("Kick");
-    expect(img).toBeInTheDocument();
-    expect(img).toHaveAttribute("src", "kick.ico");
+  it("renders Kick as inline SVG (no img)", () => {
+    const { container } = render(<PlatformVodIcon platform="Kick" />);
+    const svg = screen.getByLabelText("Kick");
+    expect(svg.tagName).toBe("svg");
+    expect(svg.querySelector("path")).not.toBeNull();
+    expect(container.querySelector("img")).toBeNull();
   });
 
   it("renders YouTube icon for YouTube platform", () => {

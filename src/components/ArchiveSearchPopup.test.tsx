@@ -3,9 +3,6 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
 import type { SavedChannel } from '../types';
 
-vi.mock('@/assets/platforms/kick.ico', () => ({ default: 'kick.ico' }));
-vi.mock('@/assets/platforms/twitch.png', () => ({ default: 'twitch.png' }));
-
 const ARCHIVE_VIDEOS = {
   videos: [
     { platform: 'twitch', video_id: 'v1', channel: 'srdogg', title: 'VOD A' },
@@ -175,8 +172,8 @@ describe('ArchiveSearchPopup', () => {
   it('renders platform logos on the filter chips', () => {
     mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    expect(screen.getByAltText('Twitch')).toBeInTheDocument();
-    expect(screen.getByAltText('Kick')).toBeInTheDocument();
+    expect(screen.getByLabelText('Twitch')).toBeInTheDocument();
+    expect(screen.getByLabelText('Kick')).toBeInTheDocument();
     expect(screen.getByLabelText('YouTube')).toBeInTheDocument();
   });
 
