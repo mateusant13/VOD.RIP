@@ -10,7 +10,10 @@ archive DB, then verifies:
     at its old index without touching the others,
   * manifest lifecycle: a completed job deletes its resume manifest; a
     simulated crash state keeps it until the job completes,
-  * job lifecycle: queued -> running -> done, progress ends at 1.0.
+  * job lifecycle: queued -> running -> done, progress ends at 1.0,
+  * no-speech skip: a pure-silence fixture (< 3 s planned speech) completes
+    as done with skipped='no-speech' and the whisper model is NEVER loaded
+    (_get_model/_thread_model are patched to raise).
 
 Run directly (isolated process — recommended):
     python tests/test_archive_transcribe_e2e_real.py
@@ -33,7 +36,7 @@ os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from services import archive_db  # noqa: E402  (env must be set before import)
+from services import archive_db, archive_transcribe  # noqa: E402  (env must be set before import)
 from services.os_services import _NO_WINDOW  # noqa: E402
 from services.archive_transcribe import (  # noqa: E402
     run_worker,
@@ -49,6 +52,7 @@ from services.archive_transcribe import (  # noqa: E402
 
 PLATFORM = "twitch"
 VIDEO_ID = "__transcribe_e2e__"
+SILENT_VIDEO = "__transcribe_e2e_silent__"
 FIXTURE = _TMP / "fixture.wav"
 SPEECH1 = _TMP / "speech1.wav"
 SPEECH2 = _TMP / "speech2.wav"
@@ -107,6 +111,55 @@ def _enqueue_and_run(job_id: str) -> dict:
     run_worker(once=True, poll_interval=0.5)
     jobs = {j["id"]: j for j in archive_db.list_jobs()}
     return jobs[job_id]
+
+
+def _run_no_speech() -> None:
+    """A pure-silence fixture (< 3 s planned speech) must complete with
+    skipped='no-speech' WITHOUT loading the whisper model: _get_model and
+    _thread_model are patched to raise, so any model load fails the job."""
+    import subprocess as sp
+    from unittest.mock import patch
+
+    silent = _TMP / "silent.wav"
+    ffmpeg = _resolve_ffmpeg_exe()
+    proc = sp.run(
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi",
+         "-i", "anullsrc=r=16000:cl=mono:d=8", str(silent)],
+        capture_output=True, timeout=60, creationflags=_NO_WINDOW,
+    )
+    assert proc.returncode == 0 and silent.is_file(), (
+        proc.stderr.decode("utf-8", "replace")
+    )
+    archive_db.upsert_video({
+        "platform": PLATFORM,
+        "video_id": SILENT_VIDEO,
+        "channel": "selftest",
+        "title": "silence fixture",
+        "status": "ready",
+        "archive_path": str(silent),
+        "duration_sec": 8.0,
+    })
+    archive_db.enqueue_job("transcribe-e2e-silent", "transcribe", PLATFORM, SILENT_VIDEO)
+    # max_workers=1 -> single-global-model path, so a model load would go
+    # through _get_model; _thread_model is patched too (belt & braces for
+    # multi-copy mode). Either being called means the skip did not fire.
+    with patch.object(archive_transcribe, "_get_model",
+                      side_effect=AssertionError("no-speech skip must not load a model")), \
+         patch.object(archive_transcribe, "_thread_model",
+                      side_effect=AssertionError("no-speech skip must not load a model")):
+        t0 = time.monotonic()
+        run_worker(once=True, poll_interval=0.5, max_workers=1)
+        wall = time.monotonic() - t0
+    job = {j["id"]: j for j in archive_db.list_jobs()}["transcribe-e2e-silent"]
+    assert job["status"] == "done", f"no-speech job must finish done: {job}"
+    assert job["progress"] == 1.0, f"no-speech job progress must end at 1.0: {job}"
+    assert archive_db.transcript_for(PLATFORM, SILENT_VIDEO) == [], (
+        "no-speech skip must write no transcript rows"
+    )
+    assert wall < 30, f"no-speech skip must not load the model ({wall:.1f}s wall)"
+    print("=== run 3 (no-speech skip) ===")
+    print(f"  job: {job}")
+    print(f"  wall: {wall:.2f}s | model load: never (patched _get_model/_thread_model)")
 
 
 def _run() -> None:
@@ -224,6 +277,8 @@ def _run() -> None:
           f"({len(before_resume)} -> {len(after_resume)} rows)")
     print(f"  manifest: {_manifest_path(PLATFORM, VIDEO_ID)}")
     print(f"  fixture: {fixture} ({fixture.stat().st_size} bytes)")
+
+    _run_no_speech()
 
     # model cache size (download footprint)
     from services.archive_transcribe import _cache_dir
