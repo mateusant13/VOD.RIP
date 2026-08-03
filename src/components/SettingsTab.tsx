@@ -4,6 +4,7 @@ import {
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
 import CookieBridgeSection from './CookieBridgeSection';
+import DiskSection from './DiskSection';
 import { apiPost } from '../hooks/useApiClient';
 import type { AppSettings, UpdateInfo } from '../types';
 
@@ -136,6 +137,8 @@ export default function SettingsTab({
       </div>
 
       <CookieBridgeSection />
+
+      <DiskSection settings={settings} setSettings={setSettings} />
 
       <button onClick={onSave}
         className="w-full bg-zinc-900 text-zinc-200 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white transition-colors">

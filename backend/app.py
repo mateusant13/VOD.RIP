@@ -24,6 +24,7 @@ from routers import (
     archive,
     channels,
     cookie_bridge,
+    disk,
     downloads,
     info,
     live,
@@ -440,6 +441,7 @@ app.include_router(downloads.router)
 app.include_router(system.router)
 app.include_router(archive.router)
 app.include_router(cookie_bridge.router)
+app.include_router(disk.router)
 
 
 def _warm_youtube_session() -> None:
