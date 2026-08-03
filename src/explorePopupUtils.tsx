@@ -132,6 +132,8 @@ export function PanelResizeHandles({
    *  overflow (handles outside the padding box would be un-hittable). */
   insetShift?: number;
 }) {
+  // Cursor is applied directly per edge (not group-hover): the handle is always
+  // inside its own panel, so no .group ancestor is required — fixes main panel.
   const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
   const edgePad = 12;
   const off = insetPx + 3 - insetShift;
@@ -142,19 +144,19 @@ export function PanelResizeHandles({
     'aria-hidden': true as const,
     onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => onPointerDown(e, edge),
     style: { ...style, touchAction: 'none' },
-    className: `${hit} cursor-default ${hoverCursorClass} ${sizeClass}`.trim(),
+    className: `${hit} ${hoverCursorClass} ${sizeClass}`.trim(),
   });
 
   return (
     <>
-      <div {...edgeProps('n', { top: -off, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -off, left: edgePad, right: edgePad, height: 6 }, 'group-hover:cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -off, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('w', { left: -off, top: edgePad, bottom: edgePad, width: 6 }, 'group-hover:cursor-ew-resize')} />
-      <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
-      <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff }, 'group-hover:cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff }, 'group-hover:cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('n', { top: -off, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('s', { bottom: -off, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -off, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      <div {...edgeProps('w', { left: -off, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
+      <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
     </>
   );
 }
