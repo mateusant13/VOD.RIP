@@ -127,6 +127,23 @@ def _pot_server_dir() -> Path:
     return Path(tmp) / "VOD.RIP" / "bgutil-pot"
 
 
+_POT_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _maybe_rotate_pot_log(log_path: Path, max_bytes: int = _POT_LOG_MAX_BYTES) -> None:
+    """Roll an oversized pot-server.log aside (one backup) and start fresh.
+
+    Best-effort: renaming fails if another process holds the file open, in
+    which case the caller just keeps appending. Keeps the log bounded at
+    ~2x max_bytes (current + one rotated backup).
+    """
+    try:
+        if log_path.exists() and log_path.stat().st_size > max_bytes:
+            log_path.replace(log_path.with_name("pot-server.log.1"))
+    except OSError:
+        pass
+
+
 def _pot_main_js() -> Optional[Path]:
     """Path to a usable bgutil ``build/main.js`` if one exists on disk.
 
@@ -343,6 +360,7 @@ def _spawn_pot_server() -> Optional[subprocess.Popen]:
     log_file = None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        _maybe_rotate_pot_log(log_path)
         log_file = open(log_path, "ab", buffering=0)
     # ponytail: best-effort log open — fall through to DEVNULL
     except OSError as exc:

@@ -328,6 +328,13 @@ class UpdateChecker:
             os.startfile(str(installer))
         else:
             subprocess.Popen([str(installer)], close_fds=True)
+        # Disk hygiene: the installer ran — drop it from %TEMP%. Best-effort:
+        # a still-running installer may lock the file (Windows can't unlink a
+        # mapped image); the next update then replaces it anyway.
+        try:
+            installer.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Installer cleanup deferred (file in use): %s", installer)
         _terminate_for_update("launching Windows installer; letting installer take over")
         return UpdateApplyResult(True, "Installer launched")
 
@@ -378,12 +385,12 @@ class UpdateChecker:
             _safe_extractall(archive, extract_dir)
 
         if sys.platform == "darwin":
-            return self._apply_macos_zip(extract_dir, install_dir)
+            return self._apply_macos_zip(extract_dir, install_dir, zip_path)
         if sys.platform == "win32":
             return False
-        return self._apply_linux_zip(extract_dir, install_dir)
+        return self._apply_linux_zip(extract_dir, install_dir, zip_path)
 
-    def _apply_linux_zip(self, extract_dir: Path, install_dir: Path) -> bool:
+    def _apply_linux_zip(self, extract_dir: Path, install_dir: Path, zip_path: Path) -> bool:
         source = extract_dir
         if not (extract_dir / "VOD-RIP").is_file() and not (extract_dir / "_internal").is_dir():
             for child in extract_dir.iterdir():
@@ -409,10 +416,18 @@ class UpdateChecker:
         )
         script.chmod(0o755)
         subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
+        # Disk hygiene: the update actually ran (script spawned) — the zip has
+        # served its purpose; drop it from %TEMP%. Best-effort, non-fatal. The
+        # extract dir must stay: the detached script reads from it after its
+        # startup sleep.
+        try:
+            zip_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Update zip cleanup failed: %s", zip_path)
         _terminate_for_update("Linux rsync/cp updater script spawned; releasing file locks")
         return True
 
-    def _apply_macos_zip(self, extract_dir: Path, install_dir: Path) -> bool:
+    def _apply_macos_zip(self, extract_dir: Path, install_dir: Path, zip_path: Path) -> bool:
         app_bundle = next(extract_dir.rglob("VOD.RIP.app"), None)
         if app_bundle is None:
             logger.error("macOS update zip missing VOD.RIP.app")
@@ -433,6 +448,11 @@ class UpdateChecker:
         )
         script.chmod(0o755)
         subprocess.Popen(["/bin/sh", str(script)], close_fds=True)
+        # Disk hygiene: the update actually ran (script spawned) — drop the zip.
+        try:
+            zip_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Update zip cleanup failed: %s", zip_path)
         _terminate_for_update("macOS ditto updater script spawned; releasing file locks")
         return True
 

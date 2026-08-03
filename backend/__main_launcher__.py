@@ -16,6 +16,7 @@ Responsibilities
 """
 
 import logging
+import logging.handlers
 import multiprocessing
 import os
 import subprocess
@@ -111,7 +112,9 @@ def _setup_logging() -> Path:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler(str(log_path), encoding="utf-8"),
+            logging.handlers.RotatingFileHandler(
+                str(log_path), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            ),
         ],
     )
 

@@ -42,6 +42,15 @@ except ImportError:
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
+    # Startup disk hygiene — sweep orphaned temp/preview/selfcheck files
+    # before any session or settings work starts (best-effort, never fatal).
+    try:
+        from services.disk_hygiene import run_startup_hygiene
+
+        run_startup_hygiene()
+    except Exception:
+        logger.debug("startup disk hygiene skipped", exc_info=True)
+
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
         s = settings_mgr.get()

@@ -142,6 +142,25 @@ def get_conn() -> sqlite3.Connection:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(SCHEMA)
             conn.commit()
+            # Disk hygiene (fresh open only): checkpoint a stale -wal left by
+            # a killed process, then VACUUM when the freelist outgrows 10% of
+            # the file (heavy insert/delete churn). Both are best-effort — a
+            # busy/locked DB fails and is retried next start.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            try:
+                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+                freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                if page_count > 0 and freelist > page_count // 10:
+                    conn.execute("VACUUM")
+                    # In WAL mode VACUUM rewrites through the -wal, so the
+                    # main file only shrinks once the new frames are
+                    # checkpointed back in.
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
             _conn = conn
         if not _schema_ready:
             _conn.executescript(SCHEMA)
