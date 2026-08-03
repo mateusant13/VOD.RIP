@@ -15,7 +15,8 @@ import {
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
-import { filterLiveLevels, replaySeekTarget } from '../livePlayerLevels';
+import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
+import { fmtDuration } from '../formatters';
 // hls.js is ~900KB and the original file deliberately code-splits it out of the
 // main bundle; a static import would pull it into the initial chunk.
 import type Hls from 'hls.js';
@@ -48,7 +49,6 @@ interface LevelInfo {
   index: number;
   label: string;
   height: number;
-  bitrate: number;
 }
 
 const POPUP_WIDTH = 480;
@@ -85,6 +85,14 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const [currentLevel, setCurrentLevel] = useState(-1);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [abortRef] = useState(() => new AbortController());
+
+  // Buffering UX (mirrors the mini preview player's waiting→spinner debounce)
+  const [buffering, setBuffering] = useState(false);
+  const bufferingTimerRef = useRef<number | null>(null);
+  const pendingReplaySeekRef = useRef<number | null>(null);
+  // True when the user paused (togglePlay) — unexpected pauses (e.g. the
+  // play() promise aborting on a live-sync seek) auto-resume instead.
+  const userPausedRef = useRef(false);
 
   // DVR state — LIVE (default, live master) vs REPLAY (ENDLIST snapshot of the
   // channel's in-progress VOD). Mode switches recreate the hls instance so a
@@ -142,6 +150,15 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
       window.clearInterval(replayTimerRef.current);
       replayTimerRef.current = null;
     }
+    if (pendingReplaySeekRef.current != null) {
+      window.clearTimeout(pendingReplaySeekRef.current);
+      pendingReplaySeekRef.current = null;
+    }
+    if (bufferingTimerRef.current != null) {
+      window.clearTimeout(bufferingTimerRef.current);
+      bufferingTimerRef.current = null;
+      setBuffering(false);
+    }
     if (hlsRef.current) {
       try {
         hlsRef.current.destroy();
@@ -152,7 +169,23 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     }
   }, []);
 
-  /** Create an hls.js instance for *src*; live mode defaults 480p after parse. */
+  // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
+  const showBuffering = useCallback(() => {
+    if (bufferingTimerRef.current != null) return;
+    bufferingTimerRef.current = window.setTimeout(() => {
+      bufferingTimerRef.current = null;
+      setBuffering(true);
+    }, 150);
+  }, []);
+  const clearBuffering = useCallback(() => {
+    if (bufferingTimerRef.current != null) {
+      window.clearTimeout(bufferingTimerRef.current);
+      bufferingTimerRef.current = null;
+    }
+    setBuffering(false);
+  }, []);
+
+  /** Create an hls.js instance for *src*; live mode defaults 360p after parse. */
   const createHlsPlayer = useCallback(async (src: string, startPos: number): Promise<any | null> => {
     const video = videoRef.current;
     if (!video) return null;
@@ -182,8 +215,27 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     // Replay: autoStartLoad off — the position is applied in MANIFEST_PARSED
     // (startLoad before the manifest parses is a no-op, which would start the
     // snapshot at 0 instead of the dragged time).
+    // hls.js surface mirrors the mini preview player exactly (App.tsx):
+    // enableWorker, lowLatencyMode off, small buffers, long timeouts, the
+    // adblock pLoader, and the live sync knobs. capLevelToPlayerSize is
+    // DELIBERATELY absent — the mini preview caps to its panel size, the
+    // live popup must keep the stream's source resolution.
     const hls = new Hls({
       ...twitchAdBlockHlsConfig({ live: true }),
+      enableWorker: true,
+      lowLatencyMode: false,
+      maxBufferLength: 6,
+      maxMaxBufferLength: 12,
+      backBufferLength: 12,
+      startFragPrefetch: true,
+      fragLoadingTimeOut: 20000,
+      manifestLoadingTimeOut: 10000,
+      testBandwidth: false,
+      liveSyncDuration: 3,
+      liveMaxLatencyDuration: 10,
+      liveDurationInfinity: true,
+      maxLiveSyncPlaybackRate: 1.5,
+      startPosition: -1,
       autoStartLoad: !replay,
     });
     hlsRef.current = hls;
@@ -191,11 +243,12 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     (window as unknown as { __livePopupHls?: Hls }).__livePopupHls = hls;
     hls.loadSource(src);
     hls.attachMedia(video);
+    let networkRetries = 0;
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (modeRef.current === 'live') {
         // Quality: keep ORIGINAL hls.levels indices, filter to 360-1080, and
-        // default to the level closest to 480 (main-player convention: set
+        // default to the level closest to 360 (main-player convention: set
         // hls.loadLevel AFTER MANIFEST_PARSED — never startLevel before load).
         const { levels: filtered, defaultIndex } = filterLiveLevels(
           hls.levels.map((l, i) => ({
@@ -206,9 +259,11 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         );
         setLevels(filtered.map((l) => ({
           index: l.index,
-          label: `${l.height}p (${((l.bitrate || 0) / 1000).toFixed(0)}kbps)`,
+          // height 0 = the lone source-level media playlist (Twitch usher
+          // media playlists carry no RESOLUTION) — label it Auto like the
+          // mini preview's previewLevelLabel rather than "0p".
+          label: l.height > 0 ? `${l.height}p` : 'Auto',
           height: l.height,
-          bitrate: l.bitrate || 0,
         })));
         if (defaultIndex >= 0 && defaultIndex < hls.levels.length) {
           hls.loadLevel = defaultIndex;
@@ -216,7 +271,12 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         }
       } else {
         // REPLAY: single-level ENDLIST snapshot — hls.js reports the duration.
-        if (Number.isFinite(video.duration)) setSnapshotDuration(video.duration);
+        if (Number.isFinite(video.duration)) {
+          setSnapshotDuration(video.duration);
+          // Keep the LIVE-mode rail length fresh (the archive grows while the
+          // broadcast runs) — same value the backend sums server-side.
+          if (video.duration > 0) setArchiveDuration(video.duration);
+        }
         if (startPos >= 0) {
           hls.stopLoad();
           hls.startLoad(startPos);
@@ -233,8 +293,30 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
       if (!data?.fatal) return;
-      setError('Live playback failed — try again');
-      setLoading(false);
+      // Same retry wiring as the mini preview player: bounded network retries
+      // (resume near the current position), media error recovery, then error.
+      switch (data.type) {
+        case Hls.ErrorTypes.NETWORK_ERROR:
+          if (networkRetries < 2) {
+            networkRetries += 1;
+            window.setTimeout(() => {
+              if (hlsRef.current !== hls) return;
+              const t = videoRef.current?.currentTime;
+              hls.startLoad(t && t > 0 ? t : -1);
+            }, networkRetries * 500);
+            break;
+          }
+          setError('Live playback failed — try again');
+          setLoading(false);
+          break;
+        case Hls.ErrorTypes.MEDIA_ERROR:
+          hls.recoverMediaError();
+          break;
+        default:
+          setError('Live playback failed — try again');
+          setLoading(false);
+          break;
+      }
     });
 
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
@@ -291,6 +373,20 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         sessionRef.current = res;
         setArchiveDuration(res.archive_duration ?? 0);
 
+        // Warm the LIVE rail: the backend probes archive_duration only when
+        // the replay playlist is fetched, so fetch the snapshot once and sum
+        // its EXTINF durations — the rail then spans the whole broadcast from
+        // the start instead of sitting at 1s until the first REPLAY switch.
+        if (res.archive_url) {
+          fetch(replaySnapshotUrl(res.session_id))
+            .then((r) => (r.ok ? r.text() : ''))
+            .then((text) => {
+              const total = parsePlaylistTotalSec(text);
+              if (total > 0) setArchiveDuration(total);
+            })
+            .catch(() => {});
+        }
+
         // Attach player to video element
         const video = videoRef.current;
         if (!video) { setLoading(false); return; }
@@ -325,8 +421,25 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    const onPlay = () => setPaused(false);
-    const onPause = () => setPaused(true);
+    const onPlay = () => { setPaused(false); userPausedRef.current = false; };
+    const onPause = () => {
+      setPaused(true);
+      // Not user-initiated (live-sync seek interrupted an autoplay promise
+      // while buffering, e.g. in a background tab) — resume once data is
+      // available, bounded retries.
+      if (!userPausedRef.current && hlsRef.current && !video.ended) {
+        const resume = (attempt: number) => {
+          const v = videoRef.current;
+          if (!v || !hlsRef.current || v.ended || userPausedRef.current) return;
+          if (v.paused) {
+            void v.play().catch(() => {
+              if (attempt < 2) window.setTimeout(() => resume(attempt + 1), 400);
+            });
+          }
+        };
+        window.setTimeout(() => resume(0), 250);
+      }
+    };
     const onVolumeChange = () => { setMuted(video.muted); setVolume(video.volume); };
     const onTime = () => setRailTime(video.currentTime);
     const onDuration = () => {
@@ -339,14 +452,20 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     video.addEventListener('volumechange', onVolumeChange);
     video.addEventListener('timeupdate', onTime);
     video.addEventListener('durationchange', onDuration);
+    video.addEventListener('waiting', showBuffering);
+    video.addEventListener('playing', clearBuffering);
+    video.addEventListener('canplay', clearBuffering);
     return () => {
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('volumechange', onVolumeChange);
       video.removeEventListener('timeupdate', onTime);
       video.removeEventListener('durationchange', onDuration);
+      video.removeEventListener('waiting', showBuffering);
+      video.removeEventListener('playing', clearBuffering);
+      video.removeEventListener('canplay', clearBuffering);
     };
-  }, []);
+  }, [showBuffering, clearBuffering]);
 
   // Track fullscreen state
   useEffect(() => {
@@ -359,8 +478,13 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) video.play().catch(() => {});
-    else video.pause();
+    if (video.paused) {
+      userPausedRef.current = false;
+      video.play().catch(() => {});
+    } else {
+      userPausedRef.current = true;
+      video.pause();
+    }
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -401,10 +525,17 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
   // --- DVR mode switching ---
   const switchToReplay = useCallback((sec: number) => {
+    if (pendingReplaySeekRef.current != null) {
+      window.clearTimeout(pendingReplaySeekRef.current);
+      pendingReplaySeekRef.current = null;
+    }
     const sid = sessionIdRef.current;
     const video = videoRef.current;
     const sess = sessionRef.current;
     if (!sid || !video || !sess?.archive_url) return;
+    // Set the ref synchronously — createHlsPlayer reads modeRef.current and
+    // the state effect would not have flushed by the time it runs.
+    modeRef.current = 'replay';
     setMode('replay');
     setLoading(true);
     setError(null);
@@ -415,6 +546,9 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     replayTimerRef.current = window.setInterval(() => {
       const v = videoRef.current;
       if (!v || modeRef.current !== 'replay') return;
+      // A user seek is in flight (250ms debounce) — skip this tick or the
+      // resnapshot recreate would win the race against the seek's instance.
+      if (pendingReplaySeekRef.current != null) return;
       // ponytail: reloadWindowHlsAtPosition patches the level URL in-place — on
       // an ended snapshot the buffered timeline is already full, no new frag
       // buffers, and FRAG_BUFFERED never fires (45s hang). A full re-create
@@ -424,10 +558,15 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   }, [createHlsPlayer, replaySnapshotUrl]);
 
   const switchToLive = useCallback(() => {
+    if (pendingReplaySeekRef.current != null) {
+      window.clearTimeout(pendingReplaySeekRef.current);
+      pendingReplaySeekRef.current = null;
+    }
     const sid = sessionIdRef.current;
     const video = videoRef.current;
     const sess = sessionRef.current;
     if (!sid || !video || !sess) return;
+    modeRef.current = 'live';
     setMode('live');
     setLoading(true);
     setError(null);
@@ -442,10 +581,28 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     video.play().catch(() => {});
   }, [createHlsPlayer]);
 
+  /**
+   * DVR seek (rail drag) into a past part of the stream: debounce so a drag
+   * does not recreate the hls player on every mousemove, then restart the
+   * ENDLIST snapshot load at the target — the smallest robust fast-seek: the
+   * snapshot timeline is VOD, hls.js lands on the fragment containing the
+   * target (Twitch segments start with keyframes) and only a small buffer
+   * (maxBufferLength 6) is fetched before playback resumes.
+   */
+  const scheduleReplaySwitch = useCallback((sec: number) => {
+    if (pendingReplaySeekRef.current != null) {
+      window.clearTimeout(pendingReplaySeekRef.current);
+    }
+    pendingReplaySeekRef.current = window.setTimeout(() => {
+      pendingReplaySeekRef.current = null;
+      switchToReplay(sec);
+    }, 250);
+  }, [switchToReplay]);
+
   const handleRailChange = useCallback((next: number) => {
     if (mode === 'live') {
       // Dragging back in LIVE mode switches to REPLAY at the dragged position.
-      switchToReplay(next);
+      scheduleReplaySwitch(next);
       return;
     }
     const video = videoRef.current;
@@ -453,9 +610,9 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     if (inSnapshot && video) {
       video.currentTime = Math.max(0, next);
     } else {
-      switchToReplay(next); // past the snapshot edge — re-snapshot and land there
+      scheduleReplaySwitch(next); // past the snapshot edge — re-snapshot and land there
     }
-  }, [mode, snapshotDuration, switchToReplay]);
+  }, [mode, snapshotDuration, scheduleReplaySwitch]);
 
   const toggleFullscreen = useCallback(() => {
     const el = popupRef.current;
@@ -523,6 +680,31 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     ? Math.min(Math.max(0, railTime), railMax)
     : railMax;
 
+  // Live edge on the player timeline (liveSyncPosition is real stream time;
+  // add the configured sync lag for the true edge). Falls back to the
+  // seekable end. Used to map currentTime to broadcast-relative seconds.
+  const liveEdgeSec = (() => {
+    const h = hlsRef.current;
+    if (h) {
+      const pos = typeof h.liveSyncPosition === 'number' ? h.liveSyncPosition : Number.NaN;
+      if (Number.isFinite(pos) && pos > 0) return pos + (h.config.liveSyncDuration ?? 3);
+    }
+    const v = videoRef.current;
+    const s = v?.seekable;
+    return s && s.length > 0 ? s.end(s.length - 1) : 0;
+  })();
+  // Timestamps (current / total) — ticking from timeupdate. LIVE totals the
+  // growing archive (broadcast duration); REPLAY totals the snapshot.
+  const totalSec = mode === 'replay'
+    ? (snapshotDuration > 0 ? snapshotDuration : archiveDuration)
+    : (archiveDuration > 0 ? archiveDuration : liveEdgeSec);
+  const currentSec = mode === 'replay'
+    ? railTime
+    : liveBroadcastPositionSec(archiveDuration, liveEdgeSec, railTime);
+  // The live edge lags the playhead between playlist refreshes — never show
+  // a total smaller than the current position.
+  const displayTotal = Math.max(totalSec, currentSec);
+
   return createPortal(
     <div
       ref={popupRef}
@@ -561,7 +743,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         }}
       >
         <span style={{ fontSize: 12, color: mode === 'live' ? '#e06c75' : '#61afef', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: 8 }}>
-          {mode === 'live' ? '🔴 LIVE' : '⏪ REPLAY'} — {channelName}{entry.title ? ` — ${entry.title}` : ''}
+          {mode === 'live' ? '🔴 LIVESTREAM' : '⏪ REPLAY'} — {channelName}{entry.title ? ` — ${entry.title}` : ''}
         </span>
 
         <span style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
@@ -648,11 +830,25 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
           </div>
         )}
 
-        {/* Transport controls */}
+        {!loading && !error && buffering && (
+          <div
+            style={{
+              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
+              justifyContent: 'center', background: 'rgba(0,0,0,0.5)', color: '#aaa', fontSize: 12,
+              pointerEvents: 'none',
+            }}
+          >
+            Buffering…
+          </div>
+        )}
+
+        {/* Transport controls — same layout as the mini preview player: a
+            timeline row (current/total timestamps + rail) above the transport
+            row (play, volume, live-edge, quality, fullscreen). No trim here. */}
         {!loading && !error && (
           <div
             data-live-transport
-            className="flex items-center gap-1.5 px-2 py-1.5"
+            className="px-2 py-1.5"
             style={{
               position: 'absolute',
               insetInline: 0,
@@ -661,55 +857,10 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
               background: 'linear-gradient(to top, rgba(0,0,0,0.85), rgba(0,0,0,0))',
             }}
           >
-            <button
-              type="button"
-              onClick={togglePlay}
-              title={paused ? 'Play' : 'Pause'}
-              className={transportBtn}
-            >
-              {paused ? <Play size={15} /> : <Pause size={15} />}
-            </button>
-
-            <div className="relative" data-player-menu>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setVolumeMenuOpen((o) => !o);
-                }}
-                title="Volume"
-                className={transportBtn}
-              >
-                {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
-              </button>
-              {volumeMenuOpen && (
-                <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-2 shadow-lg">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleMute();
-                    }}
-                    title={muted ? 'Unmute' : 'Mute'}
-                    className={transportBtn}
-                  >
-                    {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
-                  </button>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={muted ? 0 : volume}
-                    onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-                    className="h-1.5 w-24 accent-white"
-                    aria-label="Volume"
-                  />
-                </div>
-              )}
-            </div>
-
-            <div className="flex flex-1 items-center gap-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="w-11 shrink-0 font-mono text-[9px] text-zinc-300">
+                {fmtDuration(currentSec)}
+              </span>
               <input
                 type="range"
                 min={0}
@@ -724,35 +875,90 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
                   ? 'Replay of the current broadcast — drag to seek'
                   : (railDisabled ? 'Replay unavailable for this channel' : 'Drag back to watch the past part of the stream')}
               />
+              <span className="w-11 shrink-0 text-right font-mono text-[9px] text-zinc-400">
+                {fmtDuration(displayTotal)}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
-                title={mode === 'replay' ? 'Return to live' : 'Snap to live edge'}
-                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide text-red-500 hover:bg-white/10"
+                onClick={togglePlay}
+                title={paused ? 'Play' : 'Pause'}
+                className={transportBtn}
               >
-                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
-                LIVE
+                {paused ? <Play size={15} /> : <Pause size={15} />}
               </button>
+
+              <div className="relative" data-player-menu>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setVolumeMenuOpen((o) => !o);
+                  }}
+                  title="Volume"
+                  className={transportBtn}
+                >
+                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                </button>
+                {volumeMenuOpen && (
+                  <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-2 shadow-lg">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleMute();
+                      }}
+                      title={muted ? 'Unmute' : 'Mute'}
+                      className={transportBtn}
+                    >
+                      {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                    </button>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={muted ? 0 : volume}
+                      onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
+                      className="h-1.5 w-24 accent-white"
+                      aria-label="Volume"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="ml-auto flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
+                  title={mode === 'replay' ? 'Return to live' : 'Snap to live edge'}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide text-red-500 hover:bg-white/10"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
+                  LIVE
+                </button>
+
+                <PreviewQualityMenu
+                  levels={levels}
+                  currentLevel={currentLevel}
+                  menuOpen={qualityMenuOpen}
+                  setMenuOpen={setQualityMenuOpen}
+                  onSelect={handleQualitySelect}
+                  disabled={!levels.length || mode === 'replay'}
+                  buttonClassName={transportBtn}
+                />
+
+                <button
+                  type="button"
+                  onClick={toggleFullscreen}
+                  title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                  className={transportBtn}
+                >
+                  {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+                </button>
+              </div>
             </div>
-
-            <PreviewQualityMenu
-              levels={levels}
-              currentLevel={currentLevel}
-              menuOpen={qualityMenuOpen}
-              setMenuOpen={setQualityMenuOpen}
-              onSelect={handleQualitySelect}
-              disabled={!levels.length || mode === 'replay'}
-              buttonClassName={transportBtn}
-            />
-
-            <button
-              type="button"
-              onClick={toggleFullscreen}
-              title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-              className={transportBtn}
-            >
-              {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-            </button>
           </div>
         )}
       </div>
