@@ -98,6 +98,37 @@ def _write_netscape_jar(jar, path: "Path") -> bool:
     return True
 
 
+def _prune_cookie_exports() -> None:
+    """Keep only the newest export per browser prefix (youtube_cookies_*.txt).
+
+    Prefix = the browser token before the first underscore
+    (``youtube_cookies_chrome.txt`` / ``youtube_cookies_chrome_2.txt`` both
+    count as ``chrome``), so duplicate-named exports never accumulate.
+    Best-effort, never raises.
+    """
+    base = _cookie_cache_dir()
+    if not base.is_dir():
+        return
+    try:
+        newest: dict[str, str] = {}
+        for path in base.glob("youtube_cookies_*.txt"):
+            prefix = path.stem[len("youtube_cookies_"):].split("_", 1)[0]
+            try:
+                cur = newest.get(prefix)
+                if cur is None or path.stat().st_mtime > (base / cur).stat().st_mtime:
+                    newest[prefix] = path.name
+            except OSError:
+                pass
+        for path in base.glob("youtube_cookies_*.txt"):
+            if newest.get(path.stem[len("youtube_cookies_"):].split("_", 1)[0]) != path.name:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def export_browser_cookies_to_cache(browser: str) -> Optional[str]:
     """Export YouTube/Google cookies to appdata; None when DB locked or not logged in."""
     from yt_dlp.cookies import extract_cookies_from_browser
@@ -108,6 +139,7 @@ def export_browser_cookies_to_cache(browser: str) -> Optional[str]:
     if not _write_netscape_jar(jar, out):
         return None
     logger.info("YouTube cookies cached from %s (%s)", name, out.name)
+    _prune_cookie_exports()
     return str(out)
 
 

@@ -534,6 +534,14 @@ def transcribe_video(
         if progress_cb:
             progress_cb(speech_done, speech_sec, ci + 1, len(chunks))
 
+    # Disk hygiene: the job finished — the crash-resume manifest has served
+    # its purpose. Best-effort: a failed unlink just leaves it for the next
+    # run (which would resume into an empty plan and rewrite it anyway).
+    try:
+        manifest.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     wall = time.monotonic() - t0
     stats = {
         "platform": platform,

@@ -5,8 +5,11 @@ ffmpeg, runs it through the REAL archive_jobs queue (run_worker) against a temp
 archive DB, then verifies:
   * VAD stats: dead air (the 10 s silence) skipped and reported,
   * segments land only in speech regions, word timestamps present,
-  * resume: deleting the last segment row and re-running re-adds only that row
-    without touching the others,
+  * resume: a crash-state manifest (header + chunk 0 recorded) with the last
+    segment row deleted re-runs only the missing chunk and restores the row
+    at its old index without touching the others,
+  * manifest lifecycle: a completed job deletes its resume manifest; a
+    simulated crash state keeps it until the job completes,
   * job lifecycle: queued -> running -> done, progress ends at 1.0.
 
 Run directly (isolated process — recommended):
@@ -36,6 +39,12 @@ from services.archive_transcribe import (  # noqa: E402
     run_worker,
     _manifest_path,
     _resolve_ffmpeg_exe,
+    decode_audio,
+    vad_speech_seconds,
+    _plan_chunks,
+    _write_manifest_header,
+    _append_manifest_entry,
+    model_name,
 )
 
 PLATFORM = "twitch"
@@ -156,10 +165,26 @@ def _run() -> None:
         assert not (silence_lo <= start <= silence_hi), f"segment started inside silence: {s}"
 
     job1 = job
-    assert _manifest_path(PLATFORM, VIDEO_ID).is_file(), "resume manifest missing"
+    # Disk-hygiene contract: a COMPLETED job deletes its resume manifest.
+    assert not _manifest_path(PLATFORM, VIDEO_ID).exists(), (
+        "completed job must delete its resume manifest"
+    )
     assert job1["progress"] == 1.0
 
-    # --- run 2: resume after deleting the last segment row ----------------
+    # --- run 2: resume after deleting the last segment row ---------------
+    # Simulate a crash mid-job: recreate the resume manifest with chunk 0
+    # recorded (exactly what a job killed after chunk 0 would leave), then
+    # re-run — only the missing chunk may re-run, and the manifest must be
+    # deleted again once the job completes.
+    audio = decode_audio(str(fixture))
+    chunks = _plan_chunks(vad_speech_seconds(audio))
+    chunk0_count = sum(1 for s in segs if s["end_sec"] <= speech1_sec + 0.01)
+    assert chunk0_count > 0 and chunk0_count < len(segs), chunk0_count
+    manifest = _manifest_path(PLATFORM, VIDEO_ID)
+    _write_manifest_header(manifest, chunks)
+    _append_manifest_entry(manifest, 0, int(segs[0]["seg_idx"]), chunk0_count)
+    assert manifest.is_file(), "crash-state manifest must exist before resume run"
+
     last = segs[-1]
     last_id = archive_db.query(
         "SELECT id FROM transcripts WHERE platform=? AND video_id=? AND seg_idx=?",
@@ -188,6 +213,9 @@ def _run() -> None:
         f"resume must re-add the deleted seg_idx {last['seg_idx']}: {after_idxs}"
     )
     assert len(after_resume) > len(before_resume), "resume must re-add at least the deleted row"
+    assert not manifest.exists(), (
+        "completed resume run must delete its manifest again"
+    )
 
     print("\n=== run 1 (full) ===")
     print(f"  wall: {wall1:.1f}s | job: {job1}")
@@ -207,6 +235,12 @@ def _run() -> None:
     for root, _dirs, files in os.walk(cache):
         size += sum((pathlib.Path(root) / f).stat().st_size for f in files)
     print(f"  model cache: {cache} ({size / 1e6:.0f} MB)")
+
+    # Disk hygiene: the test created _TMP — remove it on success. (A crash
+    # mid-run leaves it behind; the startup sweep reclaims those.)
+    import shutil
+
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 def test_transcribe_worker_e2e_real() -> None:

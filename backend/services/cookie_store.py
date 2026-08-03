@@ -272,7 +272,12 @@ def _now_iso() -> str:
 import tempfile  # noqa: E402
 
 _selfcheck_env = os.environ.get("VODRIP_COOKIE_DB")
-_tmp_db = tempfile.mktemp(prefix="vodrip_cookie_selfcheck_", suffix=".db")
+# Disk hygiene: mktemp leaked a .db per import when a process was killed
+# mid-selfcheck (~120 in %TEMP%). A TemporaryDirectory is cleaned on normal
+# exits (finally + GC); kill leftovers share the prefix and are swept by the
+# startup hygiene pass (services/disk_hygiene.py).
+_selfcheck_dir = tempfile.TemporaryDirectory(prefix="vodrip_cookie_selfcheck_")
+_tmp_db = str(Path(_selfcheck_dir.name) / "selfcheck.db")
 os.environ["VODRIP_COOKIE_DB"] = _tmp_db
 try:
     # crypto roundtrip
@@ -312,6 +317,16 @@ try:
     assert platform_for_domain("evil.example") is None
 finally:
     clear()
+    # Close the selfcheck connection BEFORE deleting its DB — on Windows an
+    # open sqlite handle blocks the unlink. (This ordering bug is exactly
+    # what leaked the old mktemp .db files into %TEMP%.)
+    if _conn is not None:
+        try:
+            _conn.close()
+        except sqlite3.Error:
+            pass
+    _conn = None
+    _schema_ready = False
     try:
         os.unlink(_tmp_db)
     except OSError:
@@ -322,5 +337,7 @@ finally:
         os.environ["VODRIP_COOKIE_DB"] = _selfcheck_env
     # Drop the connection that points at the deleted temp DB — the next
     # get_conn() (the real app path) must open a fresh one on the real file.
-    _conn = None
-    _schema_ready = False
+    try:
+        _selfcheck_dir.cleanup()
+    except OSError:
+        pass

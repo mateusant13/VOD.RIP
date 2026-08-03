@@ -22,6 +22,18 @@ def install_crash_handler(app_data_dir: Path):
     crash_dir = app_data_dir / "crash_reports"
     crash_dir.mkdir(parents=True, exist_ok=True)
 
+    # Disk hygiene: keep only the newest 10 crash reports (crash_*.txt only —
+    # never touch faulthandler.log). Best-effort; a locked/racing file is
+    # non-fatal.
+    try:
+        reports = sorted(
+            crash_dir.glob("crash_*.txt"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for stale in reports[10:]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     # Native crash handler (C extensions, segfaults).
     # Windowed builds have sys.stderr=None — write to a file instead.
     if sys.stderr is not None:
