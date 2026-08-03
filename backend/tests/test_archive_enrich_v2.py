@@ -87,6 +87,11 @@ def test_merge_keeps_both_kinds_and_caps_three_per_video():
     # the merged list is ordered best-first.
     assert hits[0]["score"] >= hits[-1]["score"]
     assert {h["kind"] for h in hits[:6]} == {"message", "transcript"}
+    # BM25 is corpus-relative: leftover rows would shift avgdl and flip
+    # cross-table ties in OTHER tests sharing this DB — clean up.
+    archive_db.execute("DELETE FROM messages WHERE video_id='merge-a'")
+    archive_db.execute("DELETE FROM transcripts WHERE video_id='merge-b'")
+    archive_db.execute("DELETE FROM videos WHERE video_id IN ('merge-a','merge-b')")
 
 
 # --- (a) enrichment candidates: title-token relevance -----------------------
@@ -95,15 +100,18 @@ def test_merge_keeps_both_kinds_and_caps_three_per_video():
 async def test_chat_enrichment_picks_relevance_matches(monkeypatch):
     import routers.archive as ar
 
-    for vid in ("rel-1", "rel-2", "rel-3"):
+    for vid in ("1234001", "1234002", "1234003", "twitch-live-fake-999"):
         archive_db.execute("DELETE FROM videos WHERE video_id=?", (vid,))
         archive_db.execute("DELETE FROM messages WHERE video_id=?", (vid,))
-    _upsert("twitch", "rel-1", channel="caedrel", title="gaming review marathon",
+    _upsert("twitch", "1234001", channel="caedrel", title="gaming review marathon",
             started_at="2026-08-01T00:00:00Z")
-    _upsert("twitch", "rel-2", channel="caedrel", title="gaming stream",
+    _upsert("twitch", "1234002", channel="caedrel", title="gaming stream",
             started_at="2026-08-02T00:00:00Z")
-    _upsert("twitch", "rel-3", channel="caedrel", title="cooking show",
+    _upsert("twitch", "1234003", channel="caedrel", title="cooking show",
             started_at="2026-08-03T00:00:00Z")
+    # Watchdog rows are chat-less but not real VODs — must never be kicked.
+    _upsert("twitch", "twitch-live-fake-999", channel="caedrel", title="gaming now",
+            started_at="2026-08-04T00:00:00Z")
     release = threading.Event()
     calls: list[str] = []
 
@@ -118,10 +126,13 @@ async def test_chat_enrichment_picks_relevance_matches(monkeypatch):
         kicked = _maybe_enrich(platform="twitch", channel=None, source="both",
                                q="gaming review")
         await asyncio.sleep(0.05)  # background tasks need a loop tick
-        assert sorted(calls) == ["rel-1", "rel-2"], (
+        assert sorted(calls) == ["1234001", "1234002"], (
             "the two videos whose titles carry the query tokens must be kicked"
         )
-        assert [e["video_id"] for e in kicked] == ["rel-1", "rel-2"]
+        assert "twitch-live-fake-999" not in calls, (
+            "watchdog synthetic rows must be excluded from auto-backfill"
+        )
+        assert [e["video_id"] for e in kicked] == ["1234001", "1234002"]
         assert all(e["kind"] == "chat_backfill" for e in kicked)
         assert kicked[0]["title"] == "gaming review marathon"
     finally:
@@ -132,7 +143,7 @@ async def test_chat_enrichment_picks_relevance_matches(monkeypatch):
                     break
             await asyncio.sleep(0.02)
         _reset_enrichment_state()
-        for vid in ("rel-1", "rel-2", "rel-3"):
+        for vid in ("1234001", "1234002", "1234003", "twitch-live-fake-999"):
             archive_db.execute("DELETE FROM videos WHERE video_id=?", (vid,))
 
 
