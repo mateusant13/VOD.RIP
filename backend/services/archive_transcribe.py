@@ -11,7 +11,8 @@ Design decisions:
     chunk -> seg_idx range; re-runs skip chunks whose range is fully present
     (verified against transcript_for()). A chunk's segments are inserted with
     ONE insert_transcript() batch call, so a crash loses at most the
-    in-flight chunk.
+    in-flight chunk. A FULL re-run (no manifest, rows already present)
+    replaces the old rows instead of appending a duplicate copy.
   * Model cache: one process-global WhisperModel by default (budget 1),
     lazy-loaded on first job, unloaded after VODRIP_WHISPER_IDLE_CLOSE
     seconds (default 600) without use. Multi-copy mode (budget > 1 — CPU
@@ -555,7 +556,8 @@ def _resume_plan(
         next_idx += 1
     if not (header and entries):
         return list(range(len(chunks))), next_idx
-    if header.get("chunks") != chunks or header.get("model") != model_name():
+    # JSON round-trip turns the plan's tuples into lists — compare shapes.
+    if [tuple(c) for c in header.get("chunks", [])] != chunks or header.get("model") != model_name():
         return list(range(len(chunks))), next_idx
     missing: list[int] = []
     for ci in range(len(chunks)):
@@ -780,6 +782,15 @@ def transcribe_video(
     existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id)}
     header, entries = _read_manifest(_manifest_path(platform, video_id))
     missing, seg_idx = _resume_plan(chunks, header, entries, existing)
+    if len(missing) == len(chunks) and existing:
+        # Full re-run of an already-transcribed video: the manifest is gone
+        # (previous run finished and cleaned it), so the old rows are stale
+        # output of an earlier transcription — replace, never append beside.
+        logger.info("Re-transcribe %s/%s: replacing %d existing rows",
+                    platform, video_id, len(existing))
+        archive_db.delete_transcripts(platform, video_id)
+        existing = set()
+        seg_idx = 0
     if missing != list(range(len(chunks))):
         logger.info("Resume: %d/%d chunks already transcribed — skipping",
                     len(chunks) - len(missing), len(chunks))

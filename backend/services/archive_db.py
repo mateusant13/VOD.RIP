@@ -654,6 +654,15 @@ def insert_transcript(
     return count
 
 
+def delete_transcripts(platform: str, video_id: str) -> int:
+    """Remove every transcript row for a video; returns the deleted count.
+
+    Used when a full re-transcribe replaces stale rows instead of appending
+    a duplicate copy beside them."""
+    cur = execute("DELETE FROM transcripts WHERE platform = ? AND video_id = ?", (platform, video_id))
+    return cur.rowcount
+
+
 def transcript_for(platform: str, video_id: str) -> list[dict]:
     rows = query(
         "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
