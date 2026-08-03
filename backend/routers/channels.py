@@ -723,7 +723,12 @@ async def channel_clips(
         raise HTTPException(status_code=400, detail=str(e))
 
 async def _warm_youtube_previews(videos: list[dict]) -> None:
-    """Fire-and-forget: warm YouTube preview caches for all YouTube videos in the list.
+    """Fire-and-forget: warm the 5 most recent YouTube previews in the list.
+
+    Same budget as the startup daemon wave (app.py: 5/channel) — input is
+    recent-first, so the top 5 ARE the first screen. The frontend's
+    scroll/hover warm covers the long tail, so warming 25 rows per fetch was
+    pure duplicate network work.
 
     kickoff_youtube_warm is a non-blocking submit onto the dedicated WARM_EXECUTOR
     (deduped per canonical URL there), so no executor hop or semaphore is needed.
@@ -731,11 +736,15 @@ async def _warm_youtube_previews(videos: list[dict]) -> None:
     from services.preview_service import kickoff_youtube_batch_warm
 
     seen: set[str] = set()
+    warmed = 0
     for v in videos:
         url = v.get("url") or ""
         if v.get("platform") != "YouTube" or not url or url in seen:
             continue
         seen.add(url)
+        if warmed >= 5:
+            break
+        warmed += 1
         try:
             # Resolve-only bulk warm — the frontend's scroll/hover warm adds the
             # heavier preflight/head downloads for rows the user can actually see.
