@@ -1233,8 +1233,8 @@ _BIGRAM_TTL_S = 900.0
 _BIGRAM_EVICT_AT = 150_000
 _BIGRAM_MAX_ROWS = 300_000
 
-# "table1|table2" -> (loaded_at, {folded_pair_key: [(raw_pair, freq), ...]})
-_bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]]]] = {}
+# "table1|table2" -> (loaded_at, {folded_pair_key: [(raw_pair, freq), ...]}, row_counts)
+_bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]], list[int]]] = {}
 _TOKEN_RE = re.compile(r"[^\w]+")
 
 
@@ -1257,7 +1257,12 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
     with _vocab_lock:
         hit = _bigram_cache.get(key)
         if hit and now - hit[0] < _BIGRAM_TTL_S:
-            return hit[1]
+            counts_now = [
+                query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
+            ]
+            if counts_now == hit[2]:
+                return hit[1]
+            hit = None  # rows changed since load — rebuild the index
     counts: dict[tuple[str, str], int] = {}
     for table in tables:
         row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
@@ -1282,8 +1287,11 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
         merged.setdefault(fk, []).append((pair, n))
     for cands in merged.values():
         cands.sort(key=lambda kv: -kv[1])
+    row_counts = [
+        query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
+    ]
     with _vocab_lock:
-        _bigram_cache[key] = (now, merged)
+        _bigram_cache[key] = (now, merged, row_counts)
     return merged or None
 
 
@@ -1330,6 +1338,11 @@ def _token_expansions(
     out: list[tuple[str, int]] = [
         (term, dist) for term, (dist, _) in ranked[:_TOKEN_EXPAND_CAP]
     ]
+    # The user's own token is always distance 0, even when the FTS vocab
+    # lacks it (the corpus may only hold the misheard form) — otherwise the
+    # tier pattern would drop the exact token and never match it.
+    if not any(t == token for t, _ in out):
+        out.insert(0, (token, 0))
     if bigrams:
         for pair, _freq in bigrams.get(fold, ()):
             if not any(t == pair for t, _ in out):
