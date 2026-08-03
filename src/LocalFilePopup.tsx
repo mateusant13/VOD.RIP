@@ -4,7 +4,10 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { X } from 'lucide-react';
+import { Search, X } from 'lucide-react';
+import ArchiveSearchPopup from './components/ArchiveSearchPopup';
+import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
+import type { SavedChannel } from './types';
 import {
   EXPLORE_PANEL_DEFAULT_W,
   EXPLORE_PANEL_CHROME_H_EST,
@@ -36,6 +39,10 @@ type Props = {
   stackIndex: number;
   onClose: () => void;
   onBringToFront: () => void;
+  /** Open an archive hit in the explore-player flow (App owns the popup stack). */
+  onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** Optional saved channels (App state) — unioned into the channel dropdown. */
+  savedChannels?: SavedChannel[];
 };
 
 export default function LocalFilePopup({
@@ -44,10 +51,14 @@ export default function LocalFilePopup({
   stackIndex,
   onClose,
   onBringToFront,
+  onOpenHit,
+  savedChannels,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   const [, setPos] = useState<PanelPos | null>(null);
+  /** Docked archive-search panel (global search — local files have no archive identity). */
+  const [searchOpen, setSearchOpen] = useState(false);
   const platform = platformKey(item.platform);
   const panelWidth = EXPLORE_PANEL_DEFAULT_W;
   const videoH = Math.round((panelWidth - 24) / EXPLORE_VIDEO_ASPECT_DEFAULT);
@@ -86,6 +97,15 @@ export default function LocalFilePopup({
         </span>
         <button
           type="button"
+          title="Search the local archive (transcripts + chat)"
+          onClick={() => setSearchOpen((o) => !o)}
+          aria-pressed={searchOpen}
+          className={`shrink-0 p-0.5 ${searchOpen ? 'text-white' : 'text-zinc-500 hover:text-white'}`}
+        >
+          <Search size={14} />
+        </button>
+        <button
+          type="button"
           title="Close"
           onClick={onClose}
           className="shrink-0 text-zinc-500 hover:text-white p-0.5"
@@ -93,15 +113,27 @@ export default function LocalFilePopup({
           <X size={14} />
         </button>
       </div>
-      <video
-        key={src}
-        src={src}
-        controls
-        autoPlay
-        playsInline
-        className="w-full bg-black border border-zinc-800"
-        style={{ height: videoH, maxHeight: `calc(100vh - ${panelH}px)` }}
-      />
+      <div className="relative" style={{ height: videoH, maxHeight: `calc(100vh - ${panelH}px)` }}>
+        <video
+          key={src}
+          src={src}
+          controls
+          autoPlay
+          playsInline
+          className="w-full h-full bg-black border border-zinc-800"
+        />
+        {searchOpen && (
+          <div className="absolute inset-0 z-10 bg-zinc-950 border border-zinc-800 flex flex-col">
+            <ArchiveSearchPopup
+              embedded
+              zIndex={0}
+              onClose={() => setSearchOpen(false)}
+              onOpenHit={onOpenHit}
+              savedChannels={savedChannels}
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
