@@ -116,6 +116,10 @@ jobs:
         shell: bash
         run: pyinstaller vod-rip.spec --clean --noconfirm
 
+      - name: Stage cookie bridge extension into package
+        shell: bash
+        run: node scripts/stage-cookie-extension.mjs
+
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

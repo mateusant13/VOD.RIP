@@ -1,0 +1,37 @@
+{
+  "name": "Get cookies.txt LOCALLY",
+  "description": "Get cookies.txt, NEVER send information outside with open-source",
+  "version": "0.7.2",
+  "manifest_version": 3,
+  "permissions": ["activeTab", "alarms", "cookies", "downloads", "notifications", "clipboardWrite", "storage"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "https://kick.com/*",
+    "https://*.kick.com/*",
+    "https://youtube.com/*",
+    "https://*.youtube.com/*",
+    "https://twitch.tv/*",
+    "https://*.twitch.tv/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "/images/icon16.png",
+      "32": "/images/icon32.png",
+      "48": "/images/icon48.png",
+      "128": "/images/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "/images/icon16.png",
+    "32": "/images/icon32.png",
+    "48": "/images/icon48.png",
+    "128": "/images/icon128.png"
+  },
+  "incognito": "split",
+  "background": {
+    "service_worker": "background.mjs",
+    "type": "module"
+  }
+}

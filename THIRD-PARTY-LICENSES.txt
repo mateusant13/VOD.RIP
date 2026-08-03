@@ -79,3 +79,13 @@ other open source licenses. See the FFmpeg Legal page for details:
 https://www.ffmpeg.org/legal.html
 
 Note: FFmpeg is not bundled with this application. Users must install FFmpeg separately.
+
+==========
+
+** Get cookies.txt LOCALLY (forked as the VOD.RIP Cookie Bridge extension) - MIT
+   Copyright (c) 2023 kairi
+   https://github.com/kairi003/Get-cookies.txt-LOCALLY
+
+VOD.RIP ships a modified fork of Get cookies.txt LOCALLY under
+vendor/cookie-extension/. The full MIT license text is included at
+vendor/cookie-extension/LICENSE.
