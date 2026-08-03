@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
-import { twitchAdBlockHlsConfig } from './twitchAdBlock';
+import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
 import {
   Download, Info, Play, Pause, Link2, X, Clock,
   Users, Database, Settings2, Loader2, Search,
@@ -1908,7 +1908,18 @@ export default function App() {
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
         manifestLoadingTimeOut: 10000,
         testBandwidth: false,
-        ...twitchAdBlockHlsConfig(),
+        ...twitchAdBlockHlsConfig({
+          // vaft midroll rotation: on repeated ad-tainted refreshes the
+          // backend swaps the live session's usher master in place (404 for
+          // non-Twitch / non-usher sessions — the pLoader keeps stripping).
+          onAdRotation: createTwitchAdRotationHandler({
+            getSessionId: () => previewSessionIdRef.current,
+            getHls: () => previewHlsRef.current,
+            getVideo: () => previewVideoRef.current,
+            requestRotation: (sid) =>
+              apiPost<{ ok?: boolean; master_url?: string }>(`/api/preview/live/rotate/${sid}`, {}),
+          }),
+        }),
         ...(previewIsLiveRef.current ? {
           liveSyncDuration: 3,
           liveMaxLatencyDuration: 10,
