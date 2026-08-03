@@ -490,6 +490,10 @@ def youtube_live_info(handle: str) -> Optional[dict]:
                 "title": info.get("title") or handle,
                 "viewers": info.get("viewer_count") or 0,
                 "platform": "YouTube",
+                # Real videoId from the /live redirect page — the archive
+                # watchdog stores it as video_id so archive rows link to the
+                # actual video instead of a synthetic id.
+                "videoId": vid,
             }
 
     # Fallback: yt-dlp — wire the app's YouTube auth (cookies / PO
@@ -539,6 +543,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
         "title": info.get("title") or handle,
         "viewers": info.get("viewer_count") or 0,
         "platform": "YouTube",
+        "videoId": vid,
     }
 
 

@@ -18,6 +18,7 @@ import {
   channelLinkWillAddSummary,
   parseChannelInput,
   buildVodUrl,
+  isSyntheticArchiveId,
   slugFromVideoUrl,
   youtubeSlugFromChannelUrl,
   isChannelAlreadySaved,
@@ -320,10 +321,35 @@ describe('channelVodsMissing', () => {
   });
 });
 
+describe('isSyntheticArchiveId', () => {
+  it('matches the watchdog synthetic id shape', () => {
+    expect(isSyntheticArchiveId('youtube-live-somechannel-1750000000000')).toBe(true);
+    expect(isSyntheticArchiveId('twitch-live-xqc_1-1750000000000')).toBe(true);
+  });
+
+  it('rejects real ids and other shapes', () => {
+    expect(isSyntheticArchiveId('AbCdEfGhIjK')).toBe(false);
+    expect(isSyntheticArchiveId('youtube-live-abc')).toBe(false);
+    expect(isSyntheticArchiveId('youtube-live-abc-12x')).toBe(false);
+    expect(isSyntheticArchiveId('')).toBe(false);
+    expect(isSyntheticArchiveId(null)).toBe(false);
+  });
+});
+
 describe('buildVodUrl', () => {
   it('uses the existing URL for Twitch VODs', () => {
     const v = makeVod({ url: 'https://twitch.tv/videos/123456' });
     expect(buildVodUrl(v)).toBe('https://twitch.tv/videos/123456');
+  });
+
+  it('builds a watch URL for a real YouTube id', () => {
+    const v = makeVod({ platform: 'YouTube', id: 'AbCdEfGhIjK', url: '' });
+    expect(buildVodUrl(v)).toBe('https://www.youtube.com/watch?v=AbCdEfGhIjK');
+  });
+
+  it('never builds a watch URL for a synthetic watchdog id', () => {
+    const v = makeVod({ platform: 'YouTube', id: 'youtube-live-somechannel-1750000000000', url: '' });
+    expect(buildVodUrl(v)).toBe('');
   });
 
   it('builds Kick clip URL from channel + id', () => {

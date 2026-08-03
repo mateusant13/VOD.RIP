@@ -64,7 +64,7 @@ import {
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
 import type { PreviewSessionResponse } from './types';
-import { resolveVideoThumbnail } from './channelUtils';
+import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
@@ -322,6 +322,16 @@ export default function ChannelExplorePopup({
     setBuffering(false);
     setReady(false);
     setError(null);
+    // Synthetic watchdog ids (chat capture without an extracted videoId) have
+    // no video — show the honest state instead of booting a 404 preview
+    // session (watch?v=<synthetic> does not exist on YouTube).
+    const syntheticVidMatch = /[?&]v=([^&/?#]+)/.exec(vod.url);
+    if (platform === 'youtube' && syntheticVidMatch
+        && isSyntheticArchiveId(decodeURIComponent(syntheticVidMatch[1]))) {
+      setLoading(false);
+      setError('Live chat capture — no video');
+      return;
+    }
     // Archive search seek-to-moment: position the fresh session at the hit
     // offset. HLS/progressive consume this via pendingSeekSecRef when the
     // media attaches; window-HLS (YouTube trim timeline) skips that and the

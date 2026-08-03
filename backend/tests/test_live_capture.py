@@ -253,6 +253,33 @@ def test_rotate_honors_explicit_player_type(monkeypatch) -> None:
     assert calls == [("autoplay", "embed", "popout")]
 
 
+def test_youtube_live_info_returns_video_id(monkeypatch) -> None:
+    """youtube_live_info must surface the real videoId it already extracts
+    from the /live redirect page — the archive watchdog stores it as
+    video_id so rows link to the actual video (mocked fetch: no network)."""
+    from services.live_capture import youtube_live_info
+
+    class FakeResp:
+        content = b'"videoId": "AbCdEfGhIjK"' + b' "videoId":"ZZZZZZZZZZZ"'
+
+    monkeypatch.setattr("services.live_capture.requests.get",
+                        lambda *a, **k: FakeResp())
+    monkeypatch.setattr(
+        "services.youtube_innertube.innertube_extract_info",
+        lambda url, timeout=None: {
+            "title": "Test Live",
+            "viewer_count": 42,
+            "http_headers": {"User-Agent": "x"},
+            "formats": [{"protocol": "m3u8", "height": 720,
+                          "url": "https://cdn.example.com/live.m3u8"}],
+        })
+    out = youtube_live_info("@somechannel")
+    assert out is not None
+    assert out.get("videoId") == "AbCdEfGhIjK"
+    assert out["url"] == "https://cdn.example.com/live.m3u8"
+    assert out["platform"] == "YouTube"
+
+
 if __name__ == "__main__":
     test_progress_hook_shape()
     test_live_router_imports()

@@ -66,7 +66,7 @@ import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
@@ -2750,6 +2750,9 @@ export default function App() {
   }, []);
 
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
+    // Synthetic watchdog ids have no real video — nothing to preview.
+    // (platform arrives capitalized as 'YouTube'; compare case-insensitively.)
+    if ((v.platform || '').toLowerCase() === 'youtube' && isSyntheticArchiveId(v.id)) return;
     notePreviewGesture();
     pauseAllExplorePopups();
     const vodUrl = buildVodUrl(v);
@@ -6043,6 +6046,7 @@ export default function App() {
                             const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
                             const isShortItem = (v.url || '').includes('/shorts/');
                             const isMembersOnly = isMembersOnlyVideo(v);
+                            const isSyntheticYt = (v.platform || '').toLowerCase() === 'youtube' && isSyntheticArchiveId(v.id);
                             const isActiveVod = url.trim() === fullUrl.trim();
                             const rowAccent = platformAccentColor(v.platform);
                             const rowBorder = platformActiveBorder(v.platform);
@@ -6050,9 +6054,13 @@ export default function App() {
                               <div
                                 key={`${v.platform}-${v.id}-${i}`}
                                 role="button"
-                                tabIndex={0}
+                                tabIndex={isSyntheticYt ? -1 : 0}
+                                aria-disabled={isSyntheticYt || undefined}
+                                title={isSyntheticYt ? 'Live chat capture — no video' : undefined}
                                 data-youtube-warm={v.platform === 'youtube' && !isMembersOnly && !isClipItem && !isShortItem ? fullUrl : undefined}
-                                onClick={() => selectVod(fullUrl, {
+                                onClick={() => {
+                                  if (isSyntheticYt) return;
+                                  selectVod(fullUrl, {
                                   platform: v.platform,
                                   platformListIndex: v.platformListIndex,
                                   isClip: isClipItem,
@@ -6063,7 +6071,7 @@ export default function App() {
                                   createdAt: v.created_at ?? null,
                                   views: v.views ?? null,
                                   skipNetwork: true,
-                                })}
+                                })}}
                                 onMouseEnter={() => {
                                   if (v.platform === 'youtube' && !isMembersOnly && !isClipItem) {
                                     warmYoutubePreview(fullUrl);
@@ -6079,6 +6087,7 @@ export default function App() {
                                   if (v.platform === 'youtube' && !isMembersOnly) cancelWarmYoutubePreviewFull(fullUrl);
                                 }}
                                 onKeyDown={(e) => {
+                                  if (isSyntheticYt) return;
                                   if (e.key === 'Enter' || e.key === ' ') {
                                     e.preventDefault();
                                     selectVod(fullUrl, {
@@ -6095,7 +6104,7 @@ export default function App() {
                                     });
                                   }
                                 }}
-                                className={`flex items-center gap-1 border bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white cursor-pointer group ${
+                                className={`flex items-center gap-1 border bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white ${isSyntheticYt ? 'cursor-not-allowed' : 'cursor-pointer group'} ${
                                   isActiveVod ? `${rowBorder} bg-zinc-900` : 'border-zinc-800'
                                 }`}
                               >
@@ -6104,6 +6113,7 @@ export default function App() {
                                   onClick={(e) => {
                                     e.preventDefault();
                                     e.stopPropagation();
+                                    if (isSyntheticYt) return;
                                     toggleChannelVodSelection(fullUrl);
                                   }}
                                 >
@@ -6112,6 +6122,7 @@ export default function App() {
                                     checked={selectedChannelVodUrls.has(fullUrl)}
                                     readOnly
                                     tabIndex={-1}
+                                    disabled={isSyntheticYt}
                                     className="shrink-0 pointer-events-none"
                                     style={vodCheckboxStyle(rowAccent)}
                                   />
@@ -6144,6 +6155,14 @@ export default function App() {
                                     <Eye size={10} />
                                     Members
                                   </span>
+                                ) : isSyntheticYt ? (
+                                  <span
+                                    title="Live chat capture — no video"
+                                    className="shrink-0 border border-zinc-800 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-0.5 cursor-not-allowed"
+                                  >
+                                    <Eye size={10} />
+                                    Chat only
+                                  </span>
                                 ) : (
                                 <button
                                   type="button"
@@ -6166,12 +6185,13 @@ export default function App() {
                                 )}
                                 <button
                                   type="button"
-                                  title="Open in browser"
+                                  title={isSyntheticYt ? 'Live chat capture — no video' : 'Open in browser'}
+                                  disabled={isSyntheticYt}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     window.open(fullUrl, '_blank', 'noopener,noreferrer');
                                   }}
-                                  className="text-zinc-600 hover:text-white p-1 shrink-0 @max-xs:hidden"
+                                  className="text-zinc-600 hover:text-white p-1 shrink-0 @max-xs:hidden disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-zinc-600"
                                 >
                                   <ExternalLink size={11} />
                                 </button>

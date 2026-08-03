@@ -410,6 +410,18 @@ export function findCachedVideoThumbnail(
   return null;
 }
 
+/**
+ * Watchdog chat-capture rows fall back to a synthetic id
+ * (``<platform>-live-<slug>-<epoch-ms>``) when no real YouTube videoId could
+ * be extracted at capture time — there is NO video for that id, so preview /
+ * download affordances must not build a watch URL from it. Real YouTube ids
+ * are 11 chars of [A-Za-z0-9_-]; this shape is unique to the watchdog
+ * fallback (backend/services/archive_watchdog.py `_start_capture`).
+ */
+export function isSyntheticArchiveId(id: string | null | undefined): boolean {
+  return /^[a-z]+-live-[a-z0-9_]+-\d+$/.test(id ?? '');
+}
+
 export function buildVodUrl(v: ChannelVideo): string {
   const isTw = v.platform === 'Twitch';
   const isClip = isLikelyClip(v);
@@ -428,7 +440,11 @@ export function buildVodUrl(v: ChannelVideo): string {
       : `https://www.twitch.tv/videos/${twitchId}`;
   }
   if (v.platform === 'YouTube') {
-    return v.url || `https://www.youtube.com/watch?v=${v.id}`;
+    if (v.url) return v.url;
+    // Synthetic watchdog ids have no real video — never build a watch URL
+    // (callers treat '' as "no URL" and drop preview/warm affordances).
+    if (isSyntheticArchiveId(v.id)) return '';
+    return `https://www.youtube.com/watch?v=${v.id}`;
   }
   return isClip
     ? `https://kick.com/${v.channel || ''}/clips/${v.id}`

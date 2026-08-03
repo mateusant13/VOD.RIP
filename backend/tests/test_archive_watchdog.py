@@ -141,6 +141,70 @@ def test_capture_starts_rows_land_and_stream_end_closes_video():
         wd.stop_archive_watchdog()
 
 
+def test_youtube_real_video_id_used_when_provided():
+    """A YouTube live entry carrying a real videoId stores it as video_id
+    (archive rows must link to the actual video, not a synthetic id)."""
+    wd.stop_archive_watchdog()
+    created, factory = _make_sinks()
+
+    def poll(channel):
+        return [{"platform": "youtube", "title": "YT Live",
+                 "url": "https://www.youtube.com/watch?v=AbCdEfGhIjK",
+                 "videoId": "AbCdEfGhIjK", "started_at": STARTED_AT}]
+
+    try:
+        wd.start_archive_watchdog(
+            poll=poll, sink_factory=factory, channels_provider=lambda: [CHANNEL],
+            poll_interval=0.05, restart_cooldown=0.05)
+        assert _wait_until(lambda: len(wd.active_captures()) == 1), "capture never started"
+        cap = wd.active_captures()[0]
+        assert cap.video_id == "AbCdEfGhIjK"
+        vids = archive_db.query("SELECT * FROM videos WHERE platform='youtube'")
+        assert len(vids) == 1
+        assert vids[0]["video_id"] == "AbCdEfGhIjK"
+    finally:
+        wd.stop_archive_watchdog()
+
+
+def test_youtube_synthetic_id_fallback_when_no_video_id():
+    """Without an extracted videoId the watchdog keeps the synthetic
+    <platform>-live-<slug>-<ms> id — that shape is what the frontend guard
+    (isSyntheticArchiveId) recognises to disable preview affordances."""
+    wd.stop_archive_watchdog()
+    created, factory = _make_sinks()
+
+    def poll(channel):
+        return [{"platform": "youtube", "title": "YT Live",
+                 "url": "https://www.youtube.com/watch?v=AbCdEfGhIjK",
+                 "started_at": STARTED_AT}]
+
+    try:
+        wd.start_archive_watchdog(
+            poll=poll, sink_factory=factory, channels_provider=lambda: [CHANNEL],
+            poll_interval=0.05, restart_cooldown=0.05)
+        assert _wait_until(lambda: len(wd.active_captures()) == 1), "capture never started"
+        cap = wd.active_captures()[0]
+        assert __import__("re").match(r"^youtube-live-[a-z0-9_]+-\d+$", cap.video_id), \
+            f"expected synthetic id, got {cap.video_id!r}"
+    finally:
+        wd.stop_archive_watchdog()
+
+
+def test_poll_live_passthrough_video_id(monkeypatch):
+    """_poll_live must forward the videoId key from the live payload — the
+    watchdog stores it as video_id, so dropping it here would silently
+    regress every capture back to the synthetic id."""
+    from routers import live as live_router
+
+    monkeypatch.setattr(
+        live_router, "_fetch_channel_live_payload",
+        lambda ch: {"live": [{"platform": "YouTube", "title": "T", "url": "u",
+                              "videoId": "AbCdEfGhIjK", "started_at": STARTED_AT}]})
+    entries = wd._poll_live({"id": "ch_test", "youtubeSlug": "@x"})
+    assert entries == [{"platform": "youtube", "title": "T", "url": "u",
+                        "started_at": STARTED_AT, "videoId": "AbCdEfGhIjK"}]
+
+
 def test_dead_sink_is_restarted_while_still_live():
     wd.stop_archive_watchdog()
     created, factory = _make_sinks()

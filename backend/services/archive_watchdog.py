@@ -89,6 +89,9 @@ def _poll_live(channel: dict) -> list:
             "title": ent.get("title") or "",
             "url": ent.get("url") or "",
             "started_at": ent.get("started_at"),
+            # Real YouTube videoId when extraction found one — stored as the
+            # capture's video_id so archive rows link to the actual video.
+            "videoId": ent.get("videoId"),
         })
     return out
 
@@ -214,7 +217,10 @@ def _start_capture(channel: dict, platform: str, entry: dict, sink_factory) -> N
     ch_id = str(channel.get("id") or "")
     slug = _slug_for(channel, platform)
     start_ms = _to_epoch_ms(entry.get("started_at")) or (time.time() * 1000.0)
-    video_id = f"{platform}-live-{slug}-{int(start_ms)}"
+    # Real YouTube videoId when extraction found one (the archive row then
+    # links to the actual video); synthetic fallback keeps the stable
+    # f"{platform}-live-{slug}-{ms}" key shape when no id could be extracted.
+    video_id = entry.get("videoId") or f"{platform}-live-{slug}-{int(start_ms)}"
     title = entry.get("title") or slug
     canonical_key = _SINK_MODULES[platform]._canonical_key(title, entry.get("started_at"))
     sink = sink_factory(platform, channel, entry, video_id, start_ms)

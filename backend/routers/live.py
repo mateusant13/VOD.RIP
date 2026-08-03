@@ -178,6 +178,9 @@ def _fetch_channel_live_payload(channel: dict) -> dict:
                 "url": info.get("url", ""),
                 "headers": info.get("headers", {}),
                 "type": "hls",
+                # Real videoId — archive watchdog anchors chat-capture video
+                # rows to it. Frontend ignores unknown keys.
+                "videoId": info.get("videoId"),
             })
     return {"live": live, "channel_id": str(channel.get("id") or "")}
 
