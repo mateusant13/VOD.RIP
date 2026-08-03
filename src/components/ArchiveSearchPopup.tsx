@@ -41,7 +41,9 @@ import {
   kindLabel,
   snippetAroundMatch,
   type ArchiveChatMessage,
+  type ArchiveEnrichEntry,
   type ArchiveSearchHit,
+  type ArchiveSearchResponse,
   type ArchiveSource,
   type ArchiveVideoRow,
 } from '../archiveSearchUtils';
@@ -133,6 +135,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [chatStatus, setChatStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [chatError, setChatError] = useState<string | null>(null);
   const [retryTick, setRetryTick] = useState(0);
+  /** Background indexing work kicked by the backend on this search ([] idle). */
+  const [enriching, setEnriching] = useState<ArchiveEnrichEntry[]>([]);
+  /** Channel the backend auto-scoped this query to (first token matched a slug). */
+  const [channelHint, setChannelHint] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const searchGenRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
@@ -340,6 +346,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       searchGenRef.current += 1;
       setStatus('idle');
       setHits([]);
+      setEnriching([]);
       setError(null);
       return;
     }
@@ -348,9 +355,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     setError(null);
     // Date inputs can hold partial/typed garbage; invalid values become unset.
     // everyDay=true ignores the stored range (default; a date pick unchecks it).
+    // channel_hint applies only while no explicit dropdown channel is set.
     const url = buildSearchUrl({
       query,
-      channel: scope ? null : (channelFilter || null),
+      channel: scope ? null : (channelFilter || channelHint || null),
       platforms: scope ? null : platformFilter,
       kinds: kindFilter,
       source: sourceFilter,
@@ -360,10 +368,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       lang: langFilter || null,
       limit: SEARCH_LIMIT,
     });
-    void apiGet<{ hits: ArchiveSearchHit[] }>(url)
+    void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
         setHits(res.hits ?? []);
+        setEnriching(res.enriching ?? []);
+        setChannelHint(res.channel_hint ?? null);
         setStatus('done');
       })
       .catch(() => {
@@ -372,7 +382,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter]);
+  }, [query, channelFilter, channelHint, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
@@ -482,6 +492,37 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </div>
       </div>
 
+      {/* Auto-scope chip (backend channel_hint) + background-indexing status line. */}
+      <div className="flex flex-col gap-1 shrink-0">
+        {channelHint && !channelFilter && (
+          <div
+            className="flex items-center gap-1.5 text-[8px] font-mono uppercase tracking-widest text-yellow-200/90 border border-yellow-300/40 bg-yellow-300/10 px-1.5 py-0.5 self-start"
+            aria-label="Channel scope hint"
+          >
+            <span className="font-bold">scoped to {channelHint}</span>
+            <button
+              type="button"
+              onClick={() => setChannelHint(null)}
+              title="Remove channel scope"
+              aria-label="Remove channel scope"
+              className="text-yellow-200/90 hover:text-white p-0.5 -m-0.5"
+            >
+              <X size={10} />
+            </button>
+          </div>
+        )}
+        {enriching.length > 0 && (
+          <div className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500" aria-live="polite">
+            <Loader2 size={10} className="animate-spin shrink-0" />
+            <span>
+              Indexing {enriching.length} video{enriching.length === 1 ? '' : 's'}
+              {' '}({enriching.map((e) => (e.kind === 'transcript' ? 'transcript' : 'chat backfill')).join(', ')})
+              …
+            </span>
+          </div>
+        )}
+      </div>
+
       {/* ── FILTERS — every filter applies live to the same debounced search ── */}
       <div className="flex flex-col gap-1 shrink-0 border border-zinc-800 bg-zinc-900/40 p-1.5">
         {!scope && (
@@ -492,7 +533,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             <select
               id="archive-filter-channel"
               value={channelFilter}
-              onChange={(e) => setChannelFilter(e.target.value)}
+              onChange={(e) => {
+                setChannelFilter(e.target.value);
+                if (e.target.value) setChannelHint(null); // explicit pick wins over the hint
+              }}
               className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
             >
               <option value="">ALL CHANNELS</option>
@@ -761,6 +805,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                 <p key={`b:${m.offset_sec}:${m.username}:${m.text}`} className="text-[10px] leading-snug text-zinc-400 break-words">
                   <span className="text-zinc-600 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                   <span className="text-zinc-200 font-bold">{m.username}:</span> {m.text}
+                  {typeof m.spam_count === 'number' && m.spam_count > 1 && (
+                    <span className="text-[9px] font-mono text-zinc-600 ml-1" title={`${m.spam_count} identical messages collapsed`}>
+                      ×{m.spam_count}
+                    </span>
+                  )}
                 </p>
               ))}
               {groups.before.length + groups.after.length > 0 && (
@@ -776,6 +825,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                 <p key={`a:${m.offset_sec}:${m.username}:${m.text}`} className="text-[10px] leading-snug text-zinc-400 break-words">
                   <span className="text-zinc-600 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                   <span className="text-zinc-200 font-bold">{m.username}:</span> {m.text}
+                  {typeof m.spam_count === 'number' && m.spam_count > 1 && (
+                    <span className="text-[9px] font-mono text-zinc-600 ml-1" title={`${m.spam_count} identical messages collapsed`}>
+                      ×{m.spam_count}
+                    </span>
+                  )}
                 </p>
               ))}
             </div>
