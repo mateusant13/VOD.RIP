@@ -24,13 +24,19 @@ def _require_platform(platform: str) -> str:
 
 
 def _is_iso_date(value: str) -> bool:
-    """True for a real calendar date in YYYY-MM-DD (2026-02-30 is rejected)."""
+    """True for a real calendar date in strict YYYY-MM-DD (2026-02-30 is
+    rejected). The regex gate matters: Python 3.11's date.fromisoformat()
+    also accepts 'YYYYMMDD', which SQLite's date() silently turns into NULL
+    and would make searches return 0 hits instead of a 400."""
+    import re
     from datetime import date
 
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
     try:
-        date.fromisoformat(value)
+        date(int(value[0:4]), int(value[5:7]), int(value[8:10]))
         return True
-    except (TypeError, ValueError):
+    except ValueError:
         return False
 
 
@@ -91,7 +97,8 @@ async def archive_search(
         if value and not _is_iso_date(value):
             raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
     bad_kinds = [
-        k for k in (k.strip() for k in (kind or "").split(",")) if k and k not in archive_db.KINDS
+        k for k in (k.strip().lower() for k in (kind or "").split(","))
+        if k and k not in archive_db.KINDS
     ]
     if bad_kinds:
         raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")

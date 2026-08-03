@@ -18,6 +18,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _TMP = Path(tempfile.mkdtemp(prefix="archive-search-filters-"))
 _DB = _TMP / "archive.db"
 
@@ -52,6 +54,18 @@ _legacy.close()
 os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 from services import archive_db  # noqa: E402  (env must be set first)
+
+# Belt-and-braces for merged runs: an earlier test module (alphabetically
+# first, e.g. test_api_integration.py via `from app import app`) may already
+# have imported services.archive_db and bound the shared connection to the
+# conftest scratch DB. Rebind the global connection to THIS module's legacy
+# scratch DB so the migration + legacy-vid tests stay honest regardless of
+# import order; conftest.py already guarantees the real %APPDATA% archive.db
+# is never the target.
+with archive_db._lock:
+    archive_db._conn = None
+    archive_db._schema_ready = False
+archive_db.get_conn()  # rebind now: legacy ALTER TABLE migration runs here
 
 VIDEO = "filter-video-1"
 
@@ -232,3 +246,45 @@ def test_search_missing_video_rows_still_surface_unfiltered():
 def test_search_empty_kind_is_no_filter():
     _seed_search_fixture()
     assert len(archive_db.search("zebra", kind="")) == 4
+
+
+async def test_search_kind_uppercase_passes_router_validation():
+    # kind=CLIP must pass the router's membership check (search() lowercases
+    # internally); only truly invalid kinds get a 400.
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_search_fixture()
+    resp = await archive_search(q="zebra", kind="CLIP", limit=20)
+    assert _hit_ids(resp["hits"]) == {("message", "filter-t-titiltei")}
+    resp = await archive_search(q="zebra", kind="Vod,LIVE", limit=20)
+    assert _hit_ids(resp["hits"]) == {
+        ("message", "filter-t-lubu"), ("message", "filter-t-yt"),
+        ("transcript", "filter-t-lubu"),
+    }
+    with pytest.raises(HTTPException) as exc:
+        await archive_search(q="zebra", kind="movie", limit=20)
+    assert exc.value.status_code == 400
+
+
+async def test_search_date_requires_strict_iso():
+    # Python 3.11 date.fromisoformat() accepts 'YYYYMMDD' (SQLite date()
+    # turns it into NULL -> silent 0 hits); the router must 400 on it and on
+    # non-calendar dates, and accept a valid strict date.
+    from fastapi import HTTPException
+    from routers.archive import _is_iso_date, archive_search
+
+    assert _is_iso_date("2026-08-01")
+    assert not _is_iso_date("20260802")
+    assert not _is_iso_date("2026-02-30")
+    assert not _is_iso_date("2026-13-01")
+    assert not _is_iso_date("2026-8-1")
+    assert not _is_iso_date("abc")
+    for bad in ("20260802", "2026-02-30", "2026-13-01", "abc"):
+        with pytest.raises(HTTPException) as exc:
+            await archive_search(q="zebra", date_from=bad, limit=20)
+        assert exc.value.status_code == 400
+    # valid strict date passes validation and filters normally
+    _seed_search_fixture()
+    resp = await archive_search(q="zebra", date_from="2026-08-01", limit=20)
+    assert _hit_ids(resp["hits"]) == {("message", "filter-t-yt")}

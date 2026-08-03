@@ -19,14 +19,16 @@ async function get(path) {
   return r.json();
 }
 
-console.log("[1] video index: 3 per platform (youtube TiTiltei, twitch lubu, kick titiltei)");
+console.log("[1] video index: >=3 per platform (youtube TiTiltei, twitch lubu, kick titiltei)");
 const { videos } = await get("/api/archive/videos");
-check("exactly 9 videos", videos.length === 9, `got ${videos.length}`);
+// Archive grows over time (more live/VOD rows per channel) — assert floor +
+// known-good rows, never exact counts.
+check("at least 9 videos", videos.length >= 9, `got ${videos.length}`);
 const byPlatform = { youtube: [], twitch: [], kick: [] };
 for (const v of videos) byPlatform[v.platform]?.push(v);
-check("3 youtube TiTiltei", byPlatform.youtube.length === 3 && byPlatform.youtube.every(v => v.channel === "TiTiltei"));
-check("3 twitch lubu", byPlatform.twitch.length === 3 && byPlatform.twitch.every(v => v.channel === "lubu"));
-check("3 kick titiltei + ready", byPlatform.kick.length === 3 && byPlatform.kick.every(v => v.channel === "titiltei" && v.status === "ready"),
+check(">=3 youtube TiTiltei", byPlatform.youtube.length >= 3 && byPlatform.youtube.every(v => v.channel === "TiTiltei"));
+check(">=3 twitch lubu", byPlatform.twitch.length >= 3 && byPlatform.twitch.every(v => v.channel === "lubu"));
+check(">=3 kick titiltei ready", byPlatform.kick.length >= 3 && byPlatform.kick.filter(v => v.channel === "titiltei" && v.status === "ready").length >= 3,
   JSON.stringify(byPlatform.kick.map(v => [v.status, v.archive_path])));
 const yt = byPlatform.youtube.find(v => v.video_id === "3sCcLEsYw3M");
 check("YT stream LOL CLASSICO CHEGOU HOJE present", !!yt);
@@ -49,7 +51,9 @@ check("chat window returns rows incl. the hit text", win.messages.length >= 1 &&
 
 console.log("[4] dedupe view + aliases");
 const { groups } = await get("/api/archive/dedupe");
-check("9 canonical groups (all videos keyed)", groups.length === 9, `got ${groups.length}`);
+check("at least 9 canonical groups", groups.length >= 9, `got ${groups.length}`);
+check("known canonical key present", groups.some(g => g.canonical_key === "lol-classico-chegou-hoje-pix|2026-07-30"),
+  groups.map(g => g.canonical_key).join(","));
 
 console.log("[5] jobs queue");
 const { jobs } = await get("/api/archive/jobs?limit=50");
