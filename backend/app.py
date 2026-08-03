@@ -51,6 +51,22 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("startup disk hygiene skipped", exc_info=True)
 
+    # Archive VOD retention — evict video files beyond the newest N per
+    # platform (DB rows/transcripts/chat stay forever). Best-effort, never
+    # fatal; runs before any session work so the UI never lists dead files.
+    try:
+        from services.archive_retention import enforce_archive_vod_retention
+
+        _retention_stats = enforce_archive_vod_retention()
+        if _retention_stats["deleted_files"]:
+            logger.info(
+                "startup archive retention: removed %d video file(s), cleared %d row(s)",
+                _retention_stats["deleted_files"],
+                _retention_stats["cleared_rows"],
+            )
+    except Exception:
+        logger.debug("startup archive retention skipped", exc_info=True)
+
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
         s = settings_mgr.get()

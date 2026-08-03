@@ -95,6 +95,9 @@ class AppSettings(BaseModel):
     skip_youtube_startup_warm: bool = False
     cookie_bridge_token: str = ""
     cookie_bridge_enabled: bool = True
+    # Archived VOD retention: keep only the newest N video FILES per platform;
+    # older files are deleted but DB rows/transcripts/chat stay forever.
+    archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
 
 
 class SettingsUpdate(BaseModel):
@@ -127,6 +130,7 @@ class SettingsUpdate(BaseModel):
     skip_youtube_startup_warm: Optional[bool] = None
     cookie_bridge_token: Optional[str] = None
     cookie_bridge_enabled: Optional[bool] = None
+    archive_vod_keep_count: Optional[int] = None
 
 
 class OpenFolderRequest(BaseModel):
