@@ -46,7 +46,19 @@ from services.preview_service import (
 # Leaving them in sys.modules poisons every later test module: collection is
 # alphabetical, so each test_youtube_* module would import the mocks and
 # fail wholesale (assert <MagicMock ...> == ...). Drop them immediately.
-for _poisoned in ("services.youtube_service", "services.youtube_innertube", "models.preview"):
+# The fake yt_dlp (bare ModuleType, __spec__ is None) must go too: transformers
+# calls importlib.util.find_spec("yt_dlp") at import time (reached lazily via
+# faster_whisper -> ctranslate2 -> transformers in the transcribe worker) and
+# raises ValueError on a spec-less sys.modules entry.
+for _poisoned in (
+    "services.youtube_service",
+    "services.youtube_innertube",
+    "models.preview",
+    "yt_dlp",
+    "yt_dlp.utils",
+    "yt_dlp.postprocessor",
+    "yt_dlp.postprocessor.ffmpeg",
+):
     sys.modules.pop(_poisoned, None)
 
 
