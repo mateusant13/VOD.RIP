@@ -182,47 +182,15 @@ def _prune_whisper_models(cache_dir: Path) -> int:
     return freed
 
 
-def _evict_archive_vods(archive_root: Path, keep: int) -> int:
-    """Minimal fallback eviction: newest ``keep`` files per platform subdir
-    survive (archive/<platform>/*.mp4), the rest are deleted.
-
-    ponytail: temporary until the retention slice lands — this branch is
-    removed once services.archive_retention.enforce_archive_vod_retention()
-    is importable (post-merge dedupe).
-    """
-    freed = 0
-    if not archive_root.is_dir():
-        return 0
-    for platform_dir in archive_root.iterdir():
-        if not platform_dir.is_dir():
-            continue
-        files: list[tuple[float, Path]] = []
-        for entry in platform_dir.iterdir():
-            try:
-                if not entry.is_symlink() and entry.is_file():
-                    files.append((entry.stat().st_mtime, entry))
-            except OSError:
-                continue
-        files.sort(reverse=True)  # newest first
-        for _mtime, entry in files[keep:]:
-            freed += _delete_entry(entry)
-    return freed
-
-
 def _cleanup_archive_vods() -> int:
-    """Evict old archive VODs; returns bytes freed (dir-size before/after so
-    the real retention implementation's return type doesn't matter)."""
-    keep = _keep_count()
-    try:
-        from services.archive_retention import enforce_archive_vod_retention  # noqa: F401
-    except Exception:
-        enforce_archive_vod_retention = None  # pre-merge: fall back to local copy
+    """Evict old archive VODs via the shared retention service (DB-driven:
+    files are deleted only when their rows exist and are beyond the keep
+    count); returns bytes freed (dir-size before/after)."""
+    from services.archive_retention import enforce_archive_vod_retention
+
     root = _archive_dir()
     before = _dir_size(root)
-    if enforce_archive_vod_retention is None:
-        _evict_archive_vods(root, keep)
-    else:
-        enforce_archive_vod_retention(keep_count=keep)
+    enforce_archive_vod_retention(keep_count=_keep_count())
     return max(0, before - _dir_size(root))
 
 

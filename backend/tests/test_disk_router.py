@@ -181,14 +181,28 @@ async def test_cleanup_whisper_models_env_active_wins(scratch_env, client, monke
 # --- archive_vods -----------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cleanup_archive_vods_local_fallback_keeps_newest(scratch_env, client, monkeypatch):
+async def test_cleanup_archive_vods_db_driven_keeps_newest(scratch_env, client, monkeypatch):
+    """Real post-merge path: eviction is DB-driven (archive rows beyond the
+    keep count, newest by started_at), not filesystem-mtime based."""
+    from services import archive_db
+
     monkeypatch.setattr(disk, "_keep_count", lambda: 2)
     root = scratch_env.appdata / "archive" / "kick"
-    now = time.time()
+    root.mkdir(parents=True, exist_ok=True)
     sizes = {0: 100, 1: 200, 2: 400, 3: 800}
     for i, size in sizes.items():
         _write(root / f"vod{i}.mp4", size)
-        os.utime(root / f"vod{i}.mp4", (now - 1000 + i, now - 1000 + i))
+        archive_db.upsert_video({
+            "platform": "kick",
+            "video_id": f"vod{i}",
+            "channel": "ch",
+            "title": f"vod {i}",
+            "started_at": f"2026-07-{28 + i:02d}T12:00:00Z",
+            "duration_sec": 100.0,
+            "archive_path": str(root / f"vod{i}.mp4"),
+            "canonical_key": f"vod-{i}",
+            "status": "ready",
+        })
 
     resp = await client.post("/api/disk/cleanup", json={"category": "archive_vods"})
     assert resp.status_code == 200

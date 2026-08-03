@@ -17,9 +17,30 @@ from pathlib import Path
 os.environ["VODRIP_ARCHIVE_DB"] = str(
     Path(tempfile.mkdtemp(prefix="watchdog-test-")) / "archive.db")
 
+import pytest  # noqa: E402
+
 from services import archive_db  # noqa: E402  (env must be set first)
 from services import archive_watchdog as wd  # noqa: E402
 from services.chat_sinks.base import ChatSink  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _watchdog_scratch_db():
+    """Rebind the shared archive conn to THIS module's scratch DB at module
+    start (collection-order independent: later modules clobber the env var at
+    import time), and drop it after so the next module rebinds fresh."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(
+        Path(tempfile.mkdtemp(prefix="watchdog-test-")) / "archive.db")
+    archive_db._conn = None
+    archive_db._schema_ready = False
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    archive_db._conn = None
+    archive_db._schema_ready = False
 
 CHANNEL = {"id": "ch_test", "twitchSlug": "testuser"}
 STARTED_AT = "2026-08-02T10:00:00Z"

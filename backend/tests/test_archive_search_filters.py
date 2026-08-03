@@ -102,17 +102,29 @@ os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 from services import archive_db  # noqa: E402  (env must be set first)
 
-# Belt-and-braces for merged runs: an earlier test module (alphabetically
-# first, e.g. test_api_integration.py via `from app import app`) may already
-# have imported services.archive_db and bound the shared connection to the
-# conftest scratch DB. Rebind the global connection to THIS module's legacy
-# scratch DB so the migration + legacy-vid tests stay honest regardless of
-# import order; conftest.py already guarantees the real %APPDATA% archive.db
-# is never the target.
-with archive_db._lock:
-    archive_db._conn = None
-    archive_db._schema_ready = False
-archive_db.get_conn()  # rebind now: legacy ALTER TABLE migration runs here
+
+@pytest.fixture(scope="module", autouse=True)
+def _search_scratch_db():
+    """Rebind the global connection to THIS module's legacy scratch DB so
+    the migration + legacy-vid tests stay honest regardless of import or
+    collection order (later modules clobber the env var at import time).
+    Runs the real legacy->current migrations (kind column + external-content
+    FTS rebuild) on first connect. conftest.py already guarantees the real
+    %APPDATA% archive.db is never the target."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    archive_db.get_conn()  # rebind now: legacy ALTER TABLE migration runs here
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
 
 VIDEO = "filter-video-1"
 

@@ -126,15 +126,29 @@ def _db_path() -> Path:
 # re-acquires it — a plain Lock would self-deadlock on first read.
 _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
+_conn_path: Optional[str] = None
 _schema_ready = False
 
 
 def get_conn() -> sqlite3.Connection:
-    """Return the shared WAL connection, initializing schema on first use."""
-    global _conn, _schema_ready
+    """Return the shared WAL connection, initializing schema on first use.
+
+    The cache is keyed on the resolved DB path: if VODRIP_ARCHIVE_DB (or the
+    appdata dir) changes at runtime — test modules rebind it per suite — the
+    old connection is dropped and a fresh one for the new path is opened.
+    In production the path never changes, so this is a no-op there."""
+    global _conn, _conn_path, _schema_ready
     with _lock:
+        path = _db_path()
+        if _conn is not None and _conn_path != str(path):
+            try:
+                _conn.close()
+            except sqlite3.Error:
+                pass
+            _conn = None
+            _schema_ready = False
         if _conn is None:
-            path = _db_path()
+            _conn_path = str(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             # check_same_thread=False: workers (archive_transcribe, chat
             # backfill, chat sinks) call into this module from pool threads;

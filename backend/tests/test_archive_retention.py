@@ -23,6 +23,26 @@ from services import archive_db  # noqa: E402
 from services.archive_retention import enforce_archive_vod_retention  # noqa: E402
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _retention_scratch_db():
+    """Rebind the shared archive conn to THIS module's scratch DB at module
+    start (collection-order independent — later modules clobber the env var
+    at import time), and restore the env after so the next module rebinds
+    fresh."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(
+        Path(tempfile.mkdtemp(prefix="retention-test-")) / "archive.db")
+    archive_db._conn = None
+    archive_db._schema_ready = False
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    archive_db._conn = None
+    archive_db._schema_ready = False
+
+
 @pytest.fixture
 def scratch_db(tmp_path, monkeypatch):
     """Fresh archive DB per test; module connection rebound to tmp path."""
