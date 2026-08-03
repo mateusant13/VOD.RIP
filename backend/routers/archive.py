@@ -23,6 +23,17 @@ def _require_platform(platform: str) -> str:
     return p
 
 
+def _is_iso_date(value: str) -> bool:
+    """True for a real calendar date in YYYY-MM-DD (2026-02-30 is rejected)."""
+    from datetime import date
+
+    try:
+        date.fromisoformat(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 @router.get("/api/archive/videos")
 async def archive_videos(platform: str | None = None, channel: str | None = None):
     return {"videos": archive_db.list_videos(platform, channel)}
@@ -66,9 +77,35 @@ async def archive_transcripts(platform: str, video_id: str, body: Any = Body(...
 async def archive_search(
     q: str = Query(..., min_length=1),
     platform: str | None = None,
+    channel: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    kind: str | None = None,
     limit: int = Query(20, ge=1, le=100),
 ):
-    return {"hits": archive_db.search(q, platform=platform, limit=limit)}
+    # platform/kind accept comma-separated lists ("twitch,kick").
+    for p in (platform or "").split(","):
+        if p.strip():
+            _require_platform(p)
+    for label, value in (("date_from", date_from), ("date_to", date_to)):
+        if value and not _is_iso_date(value):
+            raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
+    bad_kinds = [
+        k for k in (k.strip() for k in (kind or "").split(",")) if k and k not in archive_db.KINDS
+    ]
+    if bad_kinds:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")
+    return {
+        "hits": archive_db.search(
+            q,
+            platform=platform or None,
+            channel=channel or None,
+            date_from=date_from,
+            date_to=date_to,
+            kind=kind or None,
+            limit=limit,
+        )
+    }
 
 
 @router.get("/api/archive/videos/{platform}/{video_id}/chat")

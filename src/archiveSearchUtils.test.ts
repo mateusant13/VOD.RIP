@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ARCHIVE_KINDS,
   buildArchiveVodUrl,
+  buildSearchUrl,
   firstMatchIndex,
   formatArchiveOffset,
   groupChatWindow,
   highlightQuerySpans,
+  isValidDateParam,
+  kindLabel,
   snippetAroundMatch,
   type ArchiveChatMessage,
 } from './archiveSearchUtils';
@@ -140,6 +144,74 @@ describe('groupChatWindow', () => {
 
   it('treats the exact boundary as after (marker line sits at the hit)', () => {
     expect(groupChatWindow([msg(30)], 30).after).toEqual([msg(30)]);
+  });
+});
+
+describe('buildSearchUrl', () => {
+  it('sends q and the default limit only', () => {
+    expect(buildSearchUrl({ query: 'shaco' })).toBe('/api/archive/search?q=shaco&limit=30');
+  });
+
+  it('URL-encodes the query and honors a custom limit', () => {
+    expect(buildSearchUrl({ query: 'lol classico', limit: 10 })).toBe(
+      '/api/archive/search?q=lol+classico&limit=10',
+    );
+  });
+
+  it('omits unset filters entirely', () => {
+    expect(
+      buildSearchUrl({ query: 'x', channel: '', platforms: [], kinds: [], dateFrom: '', dateTo: '' }),
+    ).toBe('/api/archive/search?q=x&limit=30');
+  });
+
+  it('adds channel, comma-joined platforms and kinds, and date bounds', () => {
+    const url = buildSearchUrl({
+      query: 'bronzinhos',
+      channel: 'lubu',
+      platforms: ['twitch', 'kick'],
+      kinds: ['vod', 'clip'],
+      dateFrom: '2026-07-30',
+      dateTo: '2026-08-01',
+    });
+    expect(url).toBe(
+      '/api/archive/search?q=bronzinhos&channel=lubu&platform=twitch%2Ckick'
+      + '&kind=vod%2Cclip&date_from=2026-07-30&date_to=2026-08-01&limit=30',
+    );
+  });
+
+  it('drops invalid calendar dates instead of sending them', () => {
+    const url = buildSearchUrl({ query: 'x', dateFrom: '2026-02-30', dateTo: 'not-a-date' });
+    expect(url).toBe('/api/archive/search?q=x&limit=30');
+  });
+});
+
+describe('isValidDateParam', () => {
+  it('accepts real YYYY-MM-DD dates', () => {
+    expect(isValidDateParam('2026-07-30')).toBe(true);
+    expect(isValidDateParam('2024-02-29')).toBe(true); // leap year
+  });
+
+  it('rejects malformed and impossible dates', () => {
+    for (const bad of ['2026-02-30', '2026-13-01', '2026-00-10', '2026-1-1', '30/07/2026', '', '2026-07-30T00:00:00']) {
+      expect(isValidDateParam(bad)).toBe(false);
+    }
+  });
+});
+
+describe('kindLabel', () => {
+  it('maps the four archive kinds to uppercase labels', () => {
+    expect(ARCHIVE_KINDS).toEqual(['vod', 'clip', 'short', 'live']);
+    expect(kindLabel('vod')).toBe('VOD');
+    expect(kindLabel('clip')).toBe('CLIP');
+    expect(kindLabel('short')).toBe('SHORT');
+    expect(kindLabel('live')).toBe('LIVE');
+  });
+
+  it('passes unknown/empty values through harmlessly', () => {
+    expect(kindLabel('movie')).toBe('movie');
+    expect(kindLabel('')).toBe('');
+    expect(kindLabel(null)).toBe('');
+    expect(kindLabel(undefined)).toBe('');
   });
 });
 

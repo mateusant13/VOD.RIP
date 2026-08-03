@@ -30,6 +30,7 @@ from services.settings import _get_appdata_dir
 logger = logging.getLogger(__name__)
 
 PLATFORMS = ("youtube", "twitch", "kick")
+KINDS = ("vod", "clip", "short", "live")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
@@ -44,6 +45,8 @@ CREATE TABLE IF NOT EXISTS videos (
   canonical_key TEXT,
   status        TEXT NOT NULL DEFAULT 'known'
                 CHECK (status IN ('known','downloading','ready','failed')),
+  kind          TEXT NOT NULL DEFAULT 'vod'
+                CHECK (kind IN ('vod','clip','short','live')),
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (platform, video_id)
@@ -142,9 +145,24 @@ def get_conn() -> sqlite3.Connection:
             _conn = conn
         if not _schema_ready:
             _conn.executescript(SCHEMA)
+            _ensure_kind_column(_conn)
             _conn.commit()
             _schema_ready = True
         return _conn
+
+
+def _ensure_kind_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.kind (vod|clip|short|live, 'vod' default).
+
+    Safe on pre-kind DBs: ADD COLUMN with NOT NULL DEFAULT is immediate and
+    backfills existing rows with 'vod'. PRAGMA table_info guard makes repeated
+    calls (re-imports, reloads) no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "kind" not in cols:
+        conn.execute(
+            "ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT 'vod'"
+            " CHECK (kind IN ('vod','clip','short','live'))"
+        )
 
 
 # ponytail: single global lock + connection; upgrade path is per-thread
@@ -169,6 +187,11 @@ def query(sql: str, params: Any = ()) -> list[sqlite3.Row]:
 
 # --- videos ---------------------------------------------------------------
 
+def _normalize_kind(value: Any) -> str:
+    k = str(value or "vod").strip().lower()
+    return k if k in KINDS else "vod"
+
+
 def upsert_video(video: dict) -> None:
     now = _now_iso()
     row = {
@@ -176,6 +199,7 @@ def upsert_video(video: dict) -> None:
         "video_id": video["video_id"],
         "channel": video.get("channel", ""),
         "title": video.get("title", ""),
+        "kind": _normalize_kind(video.get("kind")),
         "started_at": video.get("started_at"),
         "ended_at": video.get("ended_at"),
         "duration_sec": video.get("duration_sec"),
@@ -186,18 +210,19 @@ def upsert_video(video: dict) -> None:
     }
     execute(
         """INSERT INTO videos (platform, video_id, channel, title, started_at,
-           ended_at, duration_sec, archive_path, canonical_key, status,
+           ended_at, duration_sec, archive_path, canonical_key, status, kind,
            created_at, updated_at)
            VALUES (:platform, :video_id, :channel, :title, :started_at,
            :ended_at, :duration_sec, :archive_path, :canonical_key, :status,
-           :created_at, :updated_at)
+           :kind, :created_at, :updated_at)
            ON CONFLICT(platform, video_id) DO UPDATE SET
              channel=excluded.channel, title=excluded.title,
              started_at=excluded.started_at, ended_at=excluded.ended_at,
              duration_sec=excluded.duration_sec,
              archive_path=excluded.archive_path,
              canonical_key=excluded.canonical_key,
-             status=excluded.status, updated_at=excluded.updated_at""",
+             status=excluded.status, kind=excluded.kind,
+             updated_at=excluded.updated_at""",
         {**row, "created_at": now},
     )
 
@@ -364,36 +389,76 @@ def list_jobs(limit: int = 50) -> list[dict]:
 
 # --- search ---------------------------------------------------------------
 
-def search(q: str, *, platform: Optional[str] = None, limit: int = 20) -> list[dict]:
+def search(
+    q: str,
+    *,
+    platform: Optional[str] = None,
+    channel: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 20,
+) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
-    score; each hit carries enough to seek: platform, video_id, offset_sec."""
+    score; each hit carries enough to seek: platform, video_id, offset_sec,
+    plus the owning video's channel/title/started_at (date) and video_kind.
+
+    Filters: platform/channel exact; kind is a comma-separated list
+    ("vod,clip" → IN clause, unknown values dropped); date_from/date_to are
+    inclusive YYYY-MM-DD bounds on the video's started_at date part. The
+    videos join is LEFT so rows whose video was never indexed still surface
+    when no video-backed filter is active."""
     if not q.strip():
         return []
+    kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
+    platforms = (
+        [p for p in (p.strip().lower() for p in platform.split(",")) if p in PLATFORMS]
+        if platform
+        else []
+    )
     pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
     hits: list[dict] = []
-    for kind, fts, src, offcol in (
+    for hit_kind, fts, src, offcol in (
         ("transcript", "transcripts_fts", "transcripts", "t.start_sec"),
         ("message", "messages_fts", "messages", "t.offset_sec"),
     ):
         sql = (
             f"SELECT t.rowid, bm25({fts}) AS score, "
-            f"t.platform, t.video_id, {offcol} AS offset_sec, t.text "
+            f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
+            "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
             f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
+            "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
             f"WHERE {fts} MATCH ?"
         )
         params: list[Any] = [pattern]
-        if platform:
-            sql += " AND t.platform = ?"
-            params.append(platform)
+        if platforms:
+            sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
+            params.extend(platforms)
+        if channel:
+            sql += " AND v.channel = ?"
+            params.append(channel)
+        if kinds:
+            sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
+            params.extend(kinds)
+        if date_from:
+            sql += " AND date(v.started_at) >= date(?)"
+            params.append(date_from)
+        if date_to:
+            sql += " AND date(v.started_at) <= date(?)"
+            params.append(date_to)
         sql += f" ORDER BY score LIMIT {int(limit)}"
         for r in query(sql, params):
             hits.append({
-                "kind": kind,
+                "kind": hit_kind,
                 "platform": r["platform"],
                 "video_id": r["video_id"],
                 "offset_sec": r["offset_sec"],
                 "text": r["text"],
                 "score": r["score"],
+                "channel": r["channel"],
+                "title": r["title"],
+                "date": r["date"],
+                "video_kind": r["video_kind"],
             })
     hits.sort(key=lambda h: h["score"])
     return hits[:limit]

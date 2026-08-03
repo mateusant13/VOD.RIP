@@ -4,8 +4,9 @@
 // backfill, Kick downloads). Re-runnable: only checks known-good rows.
 //
 // Usage: node e2e/repro-archive-live.mjs   (backend must be on :7897)
+// Port override for isolated verification: ARCHIVE_BASE=http://localhost:7900 node e2e/repro-archive-live.mjs
 
-const BASE = "http://localhost:7897";
+const BASE = process.env.ARCHIVE_BASE || "http://localhost:7897";
 let failures = 0;
 const check = (name, cond, extra = "") => {
   if (cond) console.log(`  PASS ${name}`);

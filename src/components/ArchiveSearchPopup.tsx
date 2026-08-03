@@ -9,13 +9,19 @@
  * Pure text helpers (offset format, highlight spans, chat grouping) live in
  * archiveSearchUtils.ts and are covered by vitest — no network in there.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FileText, Loader2, MessageSquare, RefreshCw, Search, X } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
 import {
+  ARCHIVE_KIND_LABELS,
+  ARCHIVE_KINDS,
+  ARCHIVE_PLATFORMS,
+  buildSearchUrl,
   formatArchiveOffset,
   groupChatWindow,
   highlightQuerySpans,
+  isValidDateParam,
+  kindLabel,
   snippetAroundMatch,
   type ArchiveChatMessage,
   type ArchiveSearchHit,
@@ -50,6 +56,12 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
 export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearchPopupProps) {
   const [inputQuery, setInputQuery] = useState('');
   const [query, setQuery] = useState('');
+  // Filters — empty values mean "all".
+  const [channelFilter, setChannelFilter] = useState('');
+  const [platformFilter, setPlatformFilter] = useState<string[]>([]);
+  const [kindFilter, setKindFilter] = useState<string[]>([]);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
@@ -90,6 +102,29 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
     return () => { cancelled = true; };
   }, []);
 
+  // Every distinct channel in the archive, derived from /api/archive/videos.
+  const channels = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of Object.values(videos)) {
+      const c = (v.channel || '').trim();
+      if (c) set.add(c);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [videos]);
+
+  const togglePlatform = useCallback((p: string) => {
+    setPlatformFilter((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
+  }, []);
+
+  const toggleKind = useCallback((k: string) => {
+    setKindFilter((cur) => (cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k]));
+  }, []);
+
+  const resetDays = useCallback(() => {
+    setDateFrom('');
+    setDateTo('');
+  }, []);
+
   // Debounced search against the archive FTS index.
   useEffect(() => {
     if (debounceRef.current != null) window.clearTimeout(debounceRef.current);
@@ -110,9 +145,17 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
     const gen = ++searchGenRef.current;
     setStatus('loading');
     setError(null);
-    void apiGet<{ hits: ArchiveSearchHit[] }>(
-      `/api/archive/search?q=${encodeURIComponent(query)}&limit=${SEARCH_LIMIT}`,
-    )
+    // Date inputs can hold partial/typed garbage; invalid values become unset.
+    const url = buildSearchUrl({
+      query,
+      channel: channelFilter || null,
+      platforms: platformFilter,
+      kinds: kindFilter,
+      dateFrom: isValidDateParam(dateFrom) ? dateFrom : null,
+      dateTo: isValidDateParam(dateTo) ? dateTo : null,
+      limit: SEARCH_LIMIT,
+    });
+    void apiGet<{ hits: ArchiveSearchHit[] }>(url)
       .then((res) => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
         setHits(res.hits ?? []);
@@ -124,7 +167,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, retryTick]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
@@ -207,6 +250,97 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
         </div>
       </div>
 
+      {/* ── FILTERS — every filter applies live to the same debounced search ── */}
+      <div className="flex flex-col gap-1 shrink-0 border border-zinc-800 bg-zinc-900/40 p-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <label htmlFor="archive-filter-channel" className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
+            Channel
+          </label>
+          <select
+            id="archive-filter-channel"
+            value={channelFilter}
+            onChange={(e) => setChannelFilter(e.target.value)}
+            className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
+          >
+            <option value="">ALL CHANNELS</option>
+            {channels.map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
+          <div className="flex gap-1 flex-wrap">
+            {ARCHIVE_PLATFORMS.map((p) => (
+              <button
+                key={p}
+                type="button"
+                aria-pressed={platformFilter.includes(p)}
+                onClick={() => togglePlatform(p)}
+                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                  platformFilter.includes(p)
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Day</span>
+          <input
+            type="date"
+            aria-label="From date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
+          />
+          <span className="text-zinc-600 text-[9px] shrink-0">→</span>
+          <input
+            type="date"
+            aria-label="To date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
+          />
+          <button
+            type="button"
+            onClick={resetDays}
+            disabled={!dateFrom && !dateTo}
+            title="Clear the date range"
+            className={`shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+              dateFrom || dateTo
+                ? 'border-zinc-700 text-yellow-200/90 hover:border-white hover:text-white'
+                : 'border-zinc-800 text-zinc-600 cursor-default'
+            }`}
+          >
+            EVERY DAY
+          </button>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Kind</span>
+          <div className="flex gap-1 flex-wrap">
+            {ARCHIVE_KINDS.map((k) => (
+              <button
+                key={k}
+                type="button"
+                aria-pressed={kindFilter.includes(k)}
+                onClick={() => toggleKind(k)}
+                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                  kindFilter.includes(k)
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                }`}
+              >
+                {ARCHIVE_KIND_LABELS[k as keyof typeof ARCHIVE_KIND_LABELS]}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
       {status === 'error' && (
         <div className="border-2 border-red-500/75 bg-red-500/15 p-2 text-red-300 text-[10px] font-mono flex items-center gap-2 shrink-0">
           <span className="min-w-0 flex-1">{error}</span>
@@ -265,6 +399,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
                   <span className={`text-[9px] font-mono uppercase tracking-widest shrink-0 ${platformAccent[hit.platform] ?? 'text-zinc-400'}`}>
                     {hit.platform}
                   </span>
+                  {hit.video_kind && hit.video_kind !== 'vod' && (
+                    <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-600 border border-zinc-800 px-1 py-px shrink-0">
+                      {kindLabel(hit.video_kind)}
+                    </span>
+                  )}
                   <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
                     {videoTitle(video, hit)}
                   </span>
@@ -273,8 +412,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
                   </span>
                 </span>
                 <span className="text-[10px] leading-snug text-zinc-400 break-words">
-                  {video?.channel ? (
-                    <span className="text-zinc-500 mr-1">@{video.channel}</span>
+                  {(hit.channel ?? video?.channel) ? (
+                    <span className="text-zinc-500 mr-1">@{(hit.channel ?? video?.channel)}</span>
                   ) : null}
                   {nodes}
                 </span>
