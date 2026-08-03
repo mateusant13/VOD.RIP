@@ -103,6 +103,10 @@ export interface AppSettings {
   cookie_bridge_enabled?: boolean;
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
+  /** Local transcription model: faster-whisper id + HF cache dir (absent on
+   * older backends -> default large-v3-turbo + %APPDATA%/VOD.RIP/whisper-models). */
+  whisper_model?: string;
+  whisper_model_cache?: string | null;
 }
 
 export interface DiskUsage {

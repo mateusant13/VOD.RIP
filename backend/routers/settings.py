@@ -126,6 +126,14 @@ async def update_settings(update: SettingsUpdate):
         current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
     if update.archive_vod_keep_count is not None:
         current.archive_vod_keep_count = max(1, min(50, update.archive_vod_keep_count))
+    if update.whisper_model is not None:
+        # Non-empty model id; empty/whitespace falls back to the default.
+        val = update.whisper_model.strip()
+        current.whisper_model = val or "large-v3-turbo"
+    if update.whisper_model_cache is not None:
+        # Any non-empty path, or None to clear back to the default cache.
+        val = update.whisper_model_cache.strip()
+        current.whisper_model_cache = val or None
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

@@ -17,6 +17,11 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from services.disk_hygiene import (
+    active_whisper_model_id,
+    prune_inactive_whisper_models,
+    whisper_cache_dir,
+)
 from services.settings import _get_appdata_dir
 
 router = APIRouter(tags=["disk"])
@@ -41,11 +46,9 @@ def _archive_dir() -> Path:
 
 
 def _whisper_cache_dir() -> Path:
-    # Same knob as services.archive_transcribe._cache_dir (VODRIP_WHISPER_CACHE).
-    override = os.environ.get("VODRIP_WHISPER_CACHE", "").strip()
-    if override:
-        return Path(override)
-    return _get_appdata_dir() / "whisper-models"
+    # Shared resolver (services.disk_hygiene): VODRIP_WHISPER_CACHE env ->
+    # settings.whisper_model_cache -> %APPDATA%/VOD.RIP/whisper-models.
+    return whisper_cache_dir()
 
 
 def _db_path() -> Path:
@@ -150,38 +153,6 @@ def _keep_count() -> int:
         return DEFAULT_KEEP_COUNT
 
 
-def _active_whisper_model_id() -> str:
-    # Same default as services.archive_transcribe (VODRIP_WHISPER_MODEL env).
-    return os.environ.get("VODRIP_WHISPER_MODEL", "").strip() or "large-v3-turbo"
-
-
-def _prune_whisper_models(cache_dir: Path) -> int:
-    """Delete HF-style model dirs that aren't the active model.
-
-    faster-whisper cache dirs are named models--<org>--<model> (e.g.
-    models--Systran--faster-whisper-large-v3-turbo). A dir is kept when the
-    active model id (slashes -> '--') is contained in its name; non-HF-style
-    dirs are left alone.
-    """
-    active = _active_whisper_model_id()
-    needles = [active.replace("/", "--")]
-    last_seg = active.rsplit("/", 1)[-1]
-    if last_seg != active:
-        needles.append(last_seg)
-    freed = 0
-    if not cache_dir.is_dir():
-        return 0
-    for entry in cache_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        if any(n in entry.name for n in needles):
-            continue  # active model — never delete
-        if "--" not in entry.name:
-            continue  # not an HF-style model dir — leave unknown dirs alone
-        freed += _delete_entry(entry)
-    return freed
-
-
 def _cleanup_archive_vods() -> int:
     """Evict old archive VODs via the shared retention service (DB-driven:
     files are deleted only when their rows exist and are beyond the keep
@@ -228,7 +199,9 @@ def disk_cleanup(req: CleanupRequest) -> dict[str, int]:
     if cat == "archive_vods":
         freed = _cleanup_archive_vods()
     elif cat == "whisper_models":
-        freed = _prune_whisper_models(_whisper_cache_dir())
+        freed = prune_inactive_whisper_models(
+            _whisper_cache_dir(), active_whisper_model_id()
+        )
     elif cat == "preview_cache":
         freed = _delete_contents(Path(tempfile.gettempdir()) / "kd_preview")
     elif cat == "update_temps":

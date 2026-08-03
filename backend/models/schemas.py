@@ -98,6 +98,11 @@ class AppSettings(BaseModel):
     # Archived VOD retention: keep only the newest N video FILES per platform;
     # older files are deleted but DB rows/transcripts/chat stay forever.
     archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
+    # Local transcription model: faster-whisper id + HF cache dir (mirrors
+    # the VODRIP_WHISPER_MODEL / VODRIP_WHISPER_CACHE env knobs). A cache
+    # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
+    whisper_model: str = "large-v3-turbo"
+    whisper_model_cache: Optional[str] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -131,6 +136,8 @@ class SettingsUpdate(BaseModel):
     cookie_bridge_token: Optional[str] = None
     cookie_bridge_enabled: Optional[bool] = None
     archive_vod_keep_count: Optional[int] = None
+    whisper_model: Optional[str] = None
+    whisper_model_cache: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):

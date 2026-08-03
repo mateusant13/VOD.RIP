@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services import archive_db
+from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
 from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
@@ -48,9 +49,7 @@ DEFAULT_MODEL = "large-v3-turbo"
 SAMPLE_RATE = 16000
 
 # Env knobs (all optional).
-MODEL_ENV = "VODRIP_WHISPER_MODEL"
 LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
-CACHE_ENV = "VODRIP_WHISPER_CACHE"
 WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 
@@ -87,16 +86,13 @@ def device_settings() -> tuple[str, str]:
 
 
 def model_name() -> str:
-    return os.environ.get(MODEL_ENV, "").strip() or DEFAULT_MODEL
+    # Shared resolver: VODRIP_WHISPER_MODEL env override -> settings.whisper_model -> default.
+    return active_whisper_model_id()
 
 
 def _cache_dir() -> Path:
-    override = os.environ.get(CACHE_ENV, "").strip()
-    if override:
-        return Path(override)
-    from services.settings import _get_appdata_dir
-
-    return _get_appdata_dir() / "whisper-models"
+    # Shared resolver: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache -> appdata.
+    return whisper_cache_dir()
 
 
 # --- model cache ----------------------------------------------------------

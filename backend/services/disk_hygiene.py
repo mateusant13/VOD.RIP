@@ -17,6 +17,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Whisper model settings — same knobs as services.archive_transcribe. The
+# env vars stay per-process overrides (tests/benchmarks pin env-first); the
+# persisted settings fields are the user's choice whenever env is unset.
+DEFAULT_MODEL = "large-v3-turbo"
+MODEL_ENV = "VODRIP_WHISPER_MODEL"
+CACHE_ENV = "VODRIP_WHISPER_CACHE"
+
 # Preview sessions expire after 30 min of inactivity and their dirs are
 # touched on every write, so a kd_preview subdir older than 24 h is either a
 # crash orphan or a stale cache. Same guard for the transcribe e2e temp dirs
@@ -99,9 +106,17 @@ def run_startup_hygiene() -> dict:
         stats = sweep_orphaned_temps(
             Path(tempfile.gettempdir()), _get_appdata_dir()
         )
+        # Whisper model cache — drop HF-style dirs that aren't the active
+        # model (skipped unless the active model's dir exists, so a
+        # not-yet-downloaded model never causes a wipe).
+        pruned = prune_inactive_whisper_models(
+            whisper_cache_dir(), active_whisper_model_id()
+        )
+        if pruned:
+            stats["whisper_models"] = pruned
         total = sum(stats.values())
         if total:
-            logger.info("Disk hygiene: removed %d stale temp items %s", total, stats)
+            logger.info("Disk hygiene: removed %d stale items %s", total, stats)
         return stats
     except Exception as exc:  # ponytail: startup must never die on housekeeping
         logger.debug("Disk hygiene sweep skipped: %s", exc)
@@ -112,6 +127,118 @@ def _get_appdata_dir() -> Path:
     from services.settings import _get_appdata_dir as _real
 
     return _real()
+
+
+# --- whisper model cache ---------------------------------------------------
+
+def active_whisper_model_id() -> str:
+    """Resolve the active faster-whisper model id.
+
+    Precedence: VODRIP_WHISPER_MODEL env (per-process override, legacy knob
+    pinned by test_disk_router) -> settings.whisper_model -> default.
+    """
+    env = os.environ.get(MODEL_ENV, "").strip()
+    if env:
+        return env
+    from deps import settings_mgr
+
+    return (
+        getattr(settings_mgr.get(), "whisper_model", "") or ""
+    ).strip() or DEFAULT_MODEL
+
+
+def whisper_cache_dir() -> Path:
+    """Resolve the whisper model cache dir.
+
+    Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
+    %APPDATA%/VOD.RIP/whisper-models. Pointing it at a shared HF hub dir
+    (e.g. BrandOps' models--Systran--faster-whisper-* checkpoints) lets
+    faster-whisper reuse already-downloaded models without any download.
+    """
+    env = os.environ.get(CACHE_ENV, "").strip()
+    if env:
+        return Path(env)
+    from deps import settings_mgr
+
+    setting = (
+        getattr(settings_mgr.get(), "whisper_model_cache", "") or ""
+    ).strip()
+    if setting:
+        return Path(setting)
+    return _get_appdata_dir() / "whisper-models"
+
+
+def _dir_size(root: Path) -> int:
+    """Recursive file-size sum; errors treated as 0 (mirrors routers.disk)."""
+    total = 0
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        total += _dir_size(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total
+
+
+def _delete_tree(path: Path) -> int:
+    """Delete a dir tree; returns pre-delete byte size (0 if gone/failed)."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            size = _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            return size if not path.exists() else 0
+        if path.is_file():
+            size = path.stat().st_size
+            path.unlink()
+            return size
+    except OSError:
+        pass
+    return 0
+
+
+def prune_inactive_whisper_models(cache_dir: Path, active_id: str) -> int:
+    """Delete HF-style model dirs that aren't the active model.
+
+    faster-whisper cache dirs are named models--<org>--<model> (e.g.
+    models--Systran--faster-whisper-large-v3-turbo). A dir is kept when the
+    active model id (slashes -> '--') is contained in its name; non-HF-style
+    dirs are left alone. Returns bytes freed.
+
+    GUARD: if the active model's own dir is missing from the cache, delete
+    NOTHING — pruning everything else would brick the next transcription.
+    ponytail: an env/settings mismatch (active model not yet downloaded) is
+    the realistic trigger; the manual "Whisper Models" cleanup is the
+    explicit override for a deliberately empty cache.
+    """
+    active = (active_id or "").strip() or DEFAULT_MODEL
+    needles = [active.replace("/", "--")]
+    last_seg = active.rsplit("/", 1)[-1]
+    if last_seg != active:
+        needles.append(last_seg)
+    if not cache_dir.is_dir():
+        return 0
+    active_dir = next(
+        (e for e in cache_dir.iterdir() if e.is_dir() and any(n in e.name for n in needles)),
+        None,
+    )
+    if active_dir is None:
+        return 0  # guard: active model dir missing -> never prune
+    freed = 0
+    for entry in cache_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        if any(n in entry.name for n in needles):
+            continue  # active model — never delete
+        if "--" not in entry.name:
+            continue  # not an HF-style model dir — leave unknown dirs alone
+        freed += _delete_tree(entry)
+    return freed
 
 
 # --- module self-check (env-guarded: creates scratch temp dirs at import) --
