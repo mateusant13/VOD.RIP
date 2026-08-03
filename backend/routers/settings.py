@@ -4,17 +4,14 @@ Settings routes — GET/POST /api/settings, /api/pick-folder, /api/open-folder.
 
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from models.schemas import AppSettings, OpenFolderRequest, SettingsUpdate
 
 from deps import settings_mgr, download_mgr, OS_EXECUTOR
 from utils import (
-    download_dir,
     open_folder_sync,
     pick_folder_sync,
-    safe_makedirs,
     validate_open_folder_path,
 )
 
@@ -134,6 +131,8 @@ async def update_settings(update: SettingsUpdate):
         # Any non-empty path, or None to clear back to the default cache.
         val = update.whisper_model_cache.strip()
         current.whisper_model_cache = val or None
+    if update.yt_subtitles_first is not None:
+        current.yt_subtitles_first = bool(update.yt_subtitles_first)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
