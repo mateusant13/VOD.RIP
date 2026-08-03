@@ -103,6 +103,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         ),
         is_live=bool(getattr(session, "is_live", False)),
         growing_vod=bool(getattr(session, "growing_vod", False)),
+        anonymous=bool(getattr(session, "anonymous", False)),
         archive_url=getattr(session, "archive_entry_url", None) or "",
         archive_duration=float(getattr(session, "archive_duration", 0) or 0),
     )

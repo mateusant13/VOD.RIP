@@ -192,6 +192,9 @@ class PreviewSessionResponse(BaseModel):
     # broadcast), archive_url/archive_duration expose the REPLAY snapshot.
     is_live: bool = False
     growing_vod: bool = False
+    # Quality policy: True for YouTube sessions resolved without user auth —
+    # the frontend must keep such previews at 360p (VOD and live alike).
+    anonymous: bool = False
     archive_url: str = ""
     archive_duration: float = 0.0
 

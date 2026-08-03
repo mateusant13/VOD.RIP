@@ -14,29 +14,54 @@ export interface LiveLevelLike {
 export interface FilteredLiveLevels {
   /** Filtered levels — `index` is the ORIGINAL hls.levels index. */
   levels: LiveLevelLike[];
-  /** Original index of the default (480p-preferred) level, or -1. */
+  /** Original index of the default (360-preferred) level, or -1. */
   defaultIndex: number;
 }
 
+export interface FilterLiveLevelsOpts {
+  /** Policy allow-list — when set, ONLY these heights may be offered
+   *  (e.g. YouTube live: [360] anonymous, [360, 720, 1080] with cookies).
+   *  Twitch/Kick live pass no allowHeights — everything ≥360p up to source
+   *  (the highest manifest level, which may exceed 1080p) stays offered. */
+  allowHeights?: number[];
+}
+
 const LIVE_LEVEL_MIN_HEIGHT = 360;
-const LIVE_LEVEL_MAX_HEIGHT = 1080;
 const LIVE_DEFAULT_HEIGHT = 360;
 
 /**
- * Filter hls.levels to 360p–1080p, keeping ORIGINAL indices so
+ * Filter hls.levels to the policy-allowed set, keeping ORIGINAL indices so
  * hls.currentLevel / hls.loadLevel can be set with them.
  *
- * Fallback ladder: when no level is in range (e.g. only 160p/1080p60/2160p),
- * keep the closest in-range levels rather than showing nothing — never show
- * >1080 or <360 unless NOTHING is in range, in which case the full list is
- * shown so the menu is never empty.
+ * Default (no allowHeights): 360p up to source — the highest manifest level,
+ * which for Twitch/Kick may exceed 1080p.
+ *
+ * With allowHeights: only the listed tiers are offered (YouTube live: 360/720/
+ * 1080, or 360-only when anonymous). When no level matches (manifest lacks the
+ * policy tiers, e.g. only 480p), fall back to the lowest level ≥360 so the
+ * menu is never empty — the backend clamp still caps the served stream for
+ * YouTube sessions.
  */
-export function filterLiveLevels(levels: LiveLevelLike[]): FilteredLiveLevels {
+export function filterLiveLevels(
+  levels: LiveLevelLike[],
+  opts: FilterLiveLevelsOpts = {},
+): FilteredLiveLevels {
   if (!levels.length) return { levels: [], defaultIndex: -1 };
-  const inRange = levels.filter(
-    (l) => l.height >= LIVE_LEVEL_MIN_HEIGHT && l.height <= LIVE_LEVEL_MAX_HEIGHT,
-  );
-  const source = inRange.length > 0 ? inRange : levels;
+  const allow = opts.allowHeights?.length ? new Set(opts.allowHeights) : null;
+  const allowed = allow
+    ? levels.filter((l) => l.height >= LIVE_LEVEL_MIN_HEIGHT && allow.has(l.height))
+    : levels.filter((l) => l.height >= LIVE_LEVEL_MIN_HEIGHT);
+  let source = allowed;
+  if (allow && !allowed.length) {
+    // Policy tiers absent from the manifest — offer the lowest in-range level
+    // (never show anything above the policy set as a fallback).
+    const minOk = levels
+      .filter((l) => l.height >= LIVE_LEVEL_MIN_HEIGHT)
+      .sort((a, b) => a.height - b.height);
+    source = minOk.length ? [minOk[0]] : [levels[0]];
+  } else if (!allowed.length) {
+    source = levels;
+  }
 
   // Default: closest to 360 (exact 360 wins), tie broken by index order.
   let defaultIndex = source[0].index;

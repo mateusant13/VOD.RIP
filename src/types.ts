@@ -187,6 +187,8 @@ export interface PreviewSessionResponse {
   is_live?: boolean;
   /** VOD media playlist has no ENDLIST — in-progress broadcast (grows). */
   growing_vod?: boolean;
+  /** Quality policy: YouTube session resolved without user auth — 360p only. */
+  anonymous?: boolean;
   /** DVR archive media URL — REPLAY mode snapshots this (empty = no archive). */
   archive_url?: string;
   /** Archive duration at session creation (grows while the stream runs). */

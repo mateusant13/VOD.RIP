@@ -33,7 +33,7 @@ import {
   isYoutubeWindowHlsPreview,
   isPositionInWindowHlsMux,
   PREVIEW_SEEK_DEBOUNCE_MS,
-  YOUTUBE_PREVIEW_ALLOW_HEIGHTS,
+  youtubePreviewAllowHeights,
   attachPreviewBufferingListeners,
   applyVideoLocalSeek,
   reloadWindowHlsAtPosition,
@@ -213,6 +213,10 @@ export default function ChannelExplorePopup({
     variantHeights: number[];
     qualityLabels?: string[];
     activeHeight: number;
+    /** Quality policy: YouTube session resolved without user auth — 360p only. */
+    anonymous?: boolean;
+    /** True for create_live_session sessions — YouTube live tiers allowed. */
+    isLive?: boolean;
   } | null>(null);
   const fsHideTimerRef = useRef<number | null>(null);
   const initialPlayDoneRef = useRef(false);
@@ -429,6 +433,8 @@ export default function ChannelExplorePopup({
           variantHeights: res.variant_heights ?? [],
           qualityLabels: mergedQualityLabels,
           activeHeight,
+          anonymous: res.anonymous === true,
+          isLive: res.is_live === true,
         };
         sessionIdRef.current = res.session_id;
         timing.setSessionId(res.session_id);
@@ -1063,7 +1069,12 @@ export default function ChannelExplorePopup({
         variantHeights: meta?.variantHeights ?? playback.variantHeights,
         qualityLabels: meta?.qualityLabels ?? playback.qualityLabels,
         initialHeight: activeH,
-        allowHeights: vod.platform === 'youtube' ? YOUTUBE_PREVIEW_ALLOW_HEIGHTS : undefined,
+        allowHeights: vod.platform === 'youtube'
+          ? youtubePreviewAllowHeights({
+            isLive: meta?.isLive ?? false,
+            anonymous: meta?.anonymous ?? false,
+          })
+          : undefined,
       };
       const immediate = resolveProgressivePreviewLevels(levelOpts);
       syncProgressiveLevels(immediate.mapped, immediate.defaultIndex);
@@ -1177,10 +1188,19 @@ export default function ChannelExplorePopup({
         variantHeights: fallbackHeights,
         activeHeight: meta?.activeHeight ?? playback.activeHeight,
       });
+      // Quality policy: YouTube VOD/anonymous previews cap the menu at 360p;
+      // live sessions with user cookies may raise to 1080p.
+      const allowHeights = platform === 'youtube'
+        ? youtubePreviewAllowHeights({
+          isLive: meta?.isLive ?? false,
+          anonymous: meta?.anonymous ?? false,
+        })
+        : undefined;
       const syncPreviewLevels = (levels = hls.levels, applyDefault = false) => {
         const { mapped, defaultIndex } = resolveHlsPreviewLevels(levels, {
           initialHeight: initialHlsHeight,
           fallbackHeights,
+          allowHeights,
         });
         if (!mapped.length) return;
         const maxH = Math.max(0, ...mapped.map((m) => m.height));

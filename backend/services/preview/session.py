@@ -507,6 +507,7 @@ class PreviewManager:
         crop_end: float,
         prefer_height: int,
         snapshot: dict,
+        anonymous: bool = False,
     ) -> PreviewSession:
         """ponytail: rebuild a PreviewSession from the warm's prebuilt snapshot.
 
@@ -546,6 +547,7 @@ class PreviewManager:
             cached_progressive_path=snapshot.get("cached_progressive_path"),
             mux_status=snapshot.get("mux_status") or "pending",
             prefer_height=prefer_height,
+            anonymous=anonymous,
         )
         # dynamic attrs restored from snapshot
         if snapshot.get("dash_window_hls"):
@@ -594,7 +596,15 @@ class PreviewManager:
         # The batch warm defaults to prefer_height=360 too, so normalizing None/0 here ensures
         # the snapshot lookup key matches the warm's stored key — primary divergence fix.
         prefer_height = prefer_height or 360
+        youtube_anonymous = False
         if detect_platform(url) == "YouTube":
+            # Quality policy: anonymous YouTube (no user cookies) is 360p-only.
+            # Clamp BEFORE the snapshot lookup + resolve so the 360p anonymous
+            # InnerTube fast path stays the one used (never break it with a
+            # 720p request).
+            youtube_anonymous = _youtube_preview_is_anonymous(oauth)
+            if youtube_anonymous:
+                prefer_height = min(prefer_height, 360)
             # Wait briefly for a genuinely in-flight hover/paste warm so
             # create_session reuses the resolved-stream cache (avoids a second
             # ~3s extract). ponytail: capped low — during a startup/channel warm
@@ -610,7 +620,7 @@ class PreviewManager:
             snap = _get_session_snapshot(vid, prefer_height) if vid else None
             if snap:
                 session = self._reuse_youtube_snapshot(
-                    url, crop_start, crop_end, prefer_height, snap
+                    url, crop_start, crop_end, prefer_height, snap, anonymous=youtube_anonymous
                 )
                 logger.info(
                     "preview session reused from snapshot sid=%s vid=%s h=%d",
@@ -625,7 +635,7 @@ class PreviewManager:
                 snap = _get_session_snapshot(vid, prefer_height)
                 if snap:
                     session = self._reuse_youtube_snapshot(
-                        url, crop_start, crop_end, prefer_height, snap
+                        url, crop_start, crop_end, prefer_height, snap, anonymous=youtube_anonymous
                     )
                     logger.info(
                         "preview session reused from warm catchup sid=%s vid=%s h=%d",
@@ -643,7 +653,7 @@ class PreviewManager:
             if resolved:
                 snap = resolved[2]
                 session = self._reuse_youtube_snapshot(
-                    url, crop_start, crop_end, prefer_height, snap
+                    url, crop_start, crop_end, prefer_height, snap, anonymous=youtube_anonymous
                 )
                 logger.info(
                     "preview session from inline resolve+cache sid=%s vid=%s h=%d",
@@ -701,6 +711,7 @@ class PreviewManager:
             preview_audio_url=preview_audio_url,
             variant_muxed=variant_muxed,
             prefer_height=prefer_height,
+            anonymous=youtube_anonymous,
         )
         _clamp_session_crop_to_vod_duration(session, yt_info)
         if preview_audio_url:
@@ -835,6 +846,10 @@ class PreviewManager:
             vod_duration=4 * 3600.0,
             is_live=True,
             playlist_ttl_sec=LIVE_MEDIA_PLAYLIST_TTL_SEC,
+            # Quality policy: YouTube live previews follow the same anonymous
+            # 360p-only rule as VODs (surfaced to the frontend via the
+            # response so the live popup can clamp its quality menu).
+            anonymous=(platform or "").lower() == "youtube" and _youtube_preview_is_anonymous(None),
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -990,6 +1005,9 @@ class PreviewSession:
     mux_status: str = "unnecessary"  # unnecessary | pending | ready | error
     mux_error: Optional[str] = None
     prefer_height: int = 0  # last applied preview tier (0 = unset)
+    # Quality policy: True when a YouTube session was resolved without user
+    # auth (anonymous bootstrap jar only) — previews stay 360p-only.
+    anonymous: bool = False
 
     def touch(self) -> None:
         self.last_access = time.time()
@@ -1502,6 +1520,8 @@ def refresh_youtube_preview_session(
         raise ValueError("Preview session not found or expired")
     if session.platform != "YouTube":
         return session
+    if getattr(session, "anonymous", False):
+        prefer_height = min(prefer_height, 360)
     _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
     return session
 _PREVIEW_MUX_LOCKS: Dict[str, threading.Lock] = {}
@@ -2256,6 +2276,33 @@ def _merge_youtube_session_cookies(headers: dict, vod_url: str) -> dict:
     except Exception:
         pass
     return out
+def _youtube_preview_is_anonymous(oauth: Optional[str]) -> bool:
+    """True when this preview's YouTube resolve runs with NO user auth.
+
+    Mirrors youtube_session_from_values / apply_ytdlp_cookie_opts: user auth
+    = oauth token, manual cookies file, browser cookies (settings or cached
+    auto-auth export), POT/tokens file, or bridge cookies. Anonymous = the
+    bootstrap-only jar. ponytail: conservative direction — if in doubt we
+    call it anonymous, so an authenticated session can only be *under*
+    -allowed (360p), never over-allowed past policy.
+    """
+    if oauth:
+        return False
+    from services.ytdlp_hls import _youtube_manual_auth_configured
+
+    if _youtube_manual_auth_configured():
+        return False
+    try:
+        from services.youtube_auth import find_fresh_cookie_cache
+
+        path = find_fresh_cookie_cache()
+        if path and not Path(path).name.startswith("yt_anon_"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _youtube_info_is_dash_only_progressive(info: dict) -> bool:
     """True when preview would route video-only DASH through mux (fragile path)."""
     from services.youtube_innertube import _dedupe_youtube_formats
@@ -4399,6 +4446,10 @@ def set_session_prefer_height(session_id: str, prefer_height: int) -> PreviewSes
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+    if session.platform == "YouTube" and getattr(session, "anonymous", False):
+        # Quality policy: anonymous YouTube sessions are 360p-only — a tier
+        # change can never raise the served stream above 360p.
+        prefer_height = min(prefer_height, 360)
     if session.prefer_height == prefer_height:
         return session
     session.prefer_height = prefer_height
