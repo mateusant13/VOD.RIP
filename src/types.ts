@@ -101,6 +101,25 @@ export interface AppSettings {
   channel_content_filter?: 'vods' | 'clips' | 'streams';
   skip_youtube_startup_warm?: boolean;
   cookie_bridge_enabled?: boolean;
+  /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
+  archive_vod_keep_count?: number;
+}
+
+export interface DiskUsage {
+  archive_vods: number;
+  whisper_models: number;
+  db: number;
+  logs: number;
+  preview_cache: number;
+  update_temps: number;
+  total: number;
+}
+
+export interface DiskStatus {
+  free_bytes: number;
+  threshold_bytes: number;
+  low: boolean;
+  keep_count: number;
 }
 
 export interface UpdateInfo {
