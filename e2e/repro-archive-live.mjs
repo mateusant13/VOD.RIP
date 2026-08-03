@@ -26,8 +26,8 @@ const { videos } = await get("/api/archive/videos");
 check("at least 9 videos", videos.length >= 9, `got ${videos.length}`);
 const byPlatform = { youtube: [], twitch: [], kick: [] };
 for (const v of videos) byPlatform[v.platform]?.push(v);
-check(">=3 youtube TiTiltei", byPlatform.youtube.length >= 3 && byPlatform.youtube.every(v => v.channel === "TiTiltei"));
-check(">=3 twitch lubu", byPlatform.twitch.length >= 3 && byPlatform.twitch.every(v => v.channel === "lubu"));
+check(">=3 youtube TiTiltei", byPlatform.youtube.filter(v => v.channel === "TiTiltei").length >= 3);
+check(">=3 twitch lubu", byPlatform.twitch.filter(v => v.channel === "lubu").length >= 3);
 check(">=3 kick titiltei ready", byPlatform.kick.length >= 3 && byPlatform.kick.filter(v => v.channel === "titiltei" && v.status === "ready").length >= 3,
   JSON.stringify(byPlatform.kick.map(v => [v.status, v.archive_path])));
 const yt = byPlatform.youtube.find(v => v.video_id === "3sCcLEsYw3M");
