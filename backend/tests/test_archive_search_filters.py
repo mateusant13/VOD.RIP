@@ -559,8 +559,11 @@ def test_fuzzy_expansion_arthur_to_artur():
             archive_db._token_cache.clear()
         vocab = archive_db._load_vocab("messages")
         assert vocab is not None, "fts5vocab must be readable for messages"
-        cands = archive_db._token_expansions("arthur", [vocab])
-        assert "artur" in cands, f"arthur must fuzzy-expand to artur, got {cands}"
+        cands = archive_db._token_expansions(
+            "arthur", [vocab], archive_db._load_bigrams(["messages"])
+        )
+        assert any(t == "artur" for t, _ in cands), \
+            f"arthur must fuzzy-expand to artur, got {cands}"
         hits = archive_db.search("arthur")
         assert any(h["video_id"] == "fuzzy-artur" for h in hits), "search must match via expansion"
     finally:

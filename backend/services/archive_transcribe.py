@@ -57,6 +57,8 @@ LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
 WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
+BEAM_ENV = "VODRIP_WHISPER_BEAM"
+BATCH_ENV = "VODRIP_WHISPER_BATCH"
 
 # --- device / compute -----------------------------------------------------
 
@@ -572,37 +574,66 @@ def _resume_plan(
 _infer_lock = threading.Lock()  # CTranslate2 model instances are not thread-safe
 
 
-def _transcribe_chunk(
+def _beam_size() -> int:
+    """Whisper beam width: VODRIP_WHISPER_BEAM (default 1).
+
+    Measured on PT-BR VOD slices (corpus-anchored word overlap) beam 1 ==
+    beam 5 for this workload, and greedy halves decoder work; raise via env
+    when max quality is wanted."""
+    try:
+        return max(1, int(os.environ.get(BEAM_ENV, "1") or "1"))
+    except ValueError:
+        return 1
+
+
+def _batch_size() -> int:
+    """Clips decoded per batched call: VODRIP_WHISPER_BATCH (CUDA 16, CPU 4).
+
+    CUDA default 16 keeps a 5080-class GPU saturated; CPU (int8) defaults to
+    4 so the batched features stay small. The env cap applies to both."""
+    default = 16 if _effective_device()[0] == "cuda" else 4
+    try:
+        return max(1, int(os.environ.get(BATCH_ENV, str(default)) or str(default)))
+    except ValueError:
+        return default
+
+
+def _transcribe_batch(
     model: Any,
     audio: "Any",
-    chunk_start: float,
-    chunk_end: float,
+    chunks: list[tuple[float, float]],
     language: Optional[str],
-) -> tuple[list[dict], Optional[str]]:
-    """Transcribe audio[chunk_start:chunk_end] into absolute-time segments.
+) -> list[tuple[list[dict], Optional[str]]]:
+    """Batch-decode [start,end] clips via faster-whisper's batched pipeline.
 
-    Returns (segments, detected_language): the language faster-whisper
-    reported on the transcribe info (None when the caller forced a language
-    or the model did not report one)."""
-    import numpy as np
+    BatchedInferencePipeline decodes many 30 s windows in one GPU call, so
+    thousands of VAD clips stop paying per-call launch overhead (measured
+    26.9x -> ~118x realtime on a 5080; 164x with beam 1). Segments carry
+    absolute video timestamps; each clip's segments are returned in input
+    order, so the per-clip insert/manifest/resume contract is unchanged."""
+    from faster_whisper import BatchedInferencePipeline
 
     global _word_ts_ok, _device_override
-    lo, hi = int(chunk_start * SAMPLE_RATE), int(chunk_end * SAMPLE_RATE)
-    chunk_audio = audio[lo:hi] if isinstance(audio, np.ndarray) else audio
+    clips = [{"start": s, "end": e} for s, e in chunks]
     kwargs: dict[str, Any] = dict(
         language=language,
-        beam_size=5,
-        condition_on_previous_text=False,
+        beam_size=_beam_size(),
         vad_filter=False,  # our own VAD pre-pass already gated the audio
+        batch_size=_batch_size(),
+        without_timestamps=False,  # keep timestamp-driven segment splitting
     )
     if _word_ts_ok:
         kwargs["word_timestamps"] = True
+
+    def run(pipe: Any) -> tuple[list[Any], Any]:
+        seg_iter, info = pipe.transcribe(audio, clip_timestamps=clips, **kwargs)
+        return list(seg_iter), info
+
     if _in_multi_mode():
         # Multi-copy mode: the model is THIS thread's own copy — no global
         # lock needed. A CUDA OOM degrades only this thread to CPU.
         try:
-            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-            raw = list(seg_iter)
+            raw, info = run(BatchedInferencePipeline(model))
         except ValueError as exc:
             if not _word_ts_ok:
                 raise
@@ -610,8 +641,7 @@ def _transcribe_chunk(
             logger.info("Word timestamps unsupported (%s) — falling back", exc)
             _word_ts_ok = False
             kwargs.pop("word_timestamps", None)
-            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-            raw = list(seg_iter)
+            raw, info = run(BatchedInferencePipeline(model))
         except RuntimeError as exc:
             if _effective_device()[0] != "cuda" or _thread_cpu_fallback():
                 raise
@@ -619,16 +649,11 @@ def _transcribe_chunk(
             # hiccup): degrade ONLY this thread to CPU and retry once.
             logger.warning("CUDA inference failed (%s) — degrading this thread to CPU", exc)
             _thread_mark_cpu_fallback()
-            model = _thread_model()  # reloads on CPU (flag consulted at load)
-            if not _word_ts_ok:
-                kwargs.pop("word_timestamps", None)
-            seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-            raw = list(seg_iter)
+            raw, info = run(BatchedInferencePipeline(_thread_model()))
     else:
         with _infer_lock:
             try:
-                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-                raw = list(seg_iter)
+                raw, info = run(BatchedInferencePipeline(model))
             except ValueError as exc:
                 if not _word_ts_ok:
                     raise
@@ -636,38 +661,47 @@ def _transcribe_chunk(
                 logger.info("Word timestamps unsupported (%s) — falling back", exc)
                 _word_ts_ok = False
                 kwargs.pop("word_timestamps", None)
-                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-                raw = list(seg_iter)
+                raw, info = run(BatchedInferencePipeline(model))
             except RuntimeError as exc:
                 if _effective_device()[0] != "cuda" or _device_override is not None:
                     raise
                 # GPU present but inference broken (missing cuBLAS, driver hiccup):
-                # drop to CPU for the process lifetime and retry this chunk once.
+                # drop to CPU for the process lifetime and retry this batch once.
                 logger.warning("CUDA inference failed (%s) — falling back to CPU", exc)
                 _device_override = ("cpu", "int8")
-                model = _get_model()  # reload on CPU
-                if not _word_ts_ok:
-                    kwargs.pop("word_timestamps", None)
-                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
-                raw = list(seg_iter)
+                raw, info = run(BatchedInferencePipeline(_get_model()))
+
     detected_lang = getattr(info, "language", None) or None
-    out: list[dict] = []
+    # Attribute each segment to its clip by start time (clips are disjoint
+    # and sorted; the pipeline offsets segments by their clip start).
+    per: list[list[Any]] = [[] for _ in chunks]
+    idx = 0
     for seg in raw:
-        words = [
-            {
-                "word": w.word,
-                "start": round(chunk_start + w.start, 3),
-                "end": round(chunk_start + w.end, 3),
-            }
-            for w in (seg.words or [])
-        ]
-        out.append({
-            "start_sec": round(chunk_start + seg.start, 3),
-            "end_sec": round(chunk_start + seg.end, 3),
-            "text": (seg.text or "").strip(),
-            "words": words,
-        })
-    return out, detected_lang
+        s = float(seg.start)
+        while idx < len(chunks) - 1 and s >= chunks[idx][1]:
+            idx += 1  # advance past clips that ended before this segment
+        per[idx].append(seg)
+    out: list[tuple[list[dict], Optional[str]]] = []
+    for i, segs in enumerate(per):
+        cs, ce = chunks[i]
+        items: list[dict] = []
+        for seg in segs:
+            words = [
+                {
+                    "word": w.word,
+                    "start": round(float(w.start), 3),
+                    "end": round(float(w.end), 3),
+                }
+                for w in (seg.words or [])
+            ]
+            items.append({
+                "start_sec": round(float(seg.start), 3),
+                "end_sec": round(float(seg.end), 3),
+                "text": (seg.text or "").strip(),
+                "words": words,
+            })
+        out.append((items, detected_lang))
+    return out
 
 
 def transcribe_video(
@@ -757,38 +791,50 @@ def transcribe_video(
     words = 0
     speech_done = 0.0
     detected_lang: Optional[str] = None
-    for ci, (cs, ce) in enumerate(chunks):
-        if ci not in missing:
+    missing_set = set(missing)
+    ci = 0
+    n_chunks = len(chunks)
+    while ci < n_chunks:
+        cs, ce = chunks[ci]
+        if ci not in missing_set:
             speech_done += ce - cs
+            ci += 1
             continue
-        chunk_segs, detected = _transcribe_chunk(model, audio, cs, ce, language)
-        if detected_lang is None and detected:
-            detected_lang = detected  # first chunk's detection wins
-        lang = language or detected_lang  # env wins; else detected; else None
-        # Batch insert: one insert_transcript() call per chunk (it accepts a
-        # list); a crash loses at most the in-flight chunk.
-        first_idx = seg_idx
-        batch_rows = []
-        for seg in chunk_segs:
-            if seg_idx in existing:
+        # Batch consecutive missing clips into one GPU call; resume gaps only
+        # shrink the run, never break the per-clip insert/manifest contract.
+        run: list[tuple[int, tuple[float, float]]] = []
+        while ci < n_chunks and ci in missing_set and len(run) < _batch_size():
+            run.append((ci, chunks[ci]))
+            ci += 1
+        batch_out = _transcribe_batch(model, audio, [c for _, c in run], language)
+        for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
+            if detected_lang is None and detected:
+                detected_lang = detected  # first batch's detection wins
+            lang = language or detected_lang  # env wins; else detected; else None
+            # Batch insert: one insert_transcript() call per chunk (it accepts
+            # a list); a crash loses at most the in-flight chunk.
+            first_idx = seg_idx
+            batch_rows = []
+            for seg in chunk_segs:
+                if seg_idx in existing:
+                    seg_idx += 1
+                    continue
+                batch_rows.append({
+                    "seg_idx": seg_idx,
+                    "start_sec": seg["start_sec"],
+                    "end_sec": seg["end_sec"],
+                    "text": seg["text"],
+                    "words": seg["words"],
+                })
+                words += len(seg["words"])
                 seg_idx += 1
-                continue
-            batch_rows.append({
-                "seg_idx": seg_idx,
-                "start_sec": seg["start_sec"],
-                "end_sec": seg["end_sec"],
-                "text": seg["text"],
-                "words": seg["words"],
-            })
-            words += len(seg["words"])
-            seg_idx += 1
-        if batch_rows:
-            archive_db.insert_transcript(platform, video_id, batch_rows, lang=lang)
-        segments += len(batch_rows)
-        _append_manifest_entry(manifest, ci, first_idx, len(chunk_segs))
-        speech_done += ce - cs
-        if progress_cb:
-            progress_cb(speech_done, speech_sec, ci + 1, len(chunks))
+            if batch_rows:
+                archive_db.insert_transcript(platform, video_id, batch_rows, lang=lang)
+            segments += len(batch_rows)
+            _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
+            speech_done += chunks[ci2][1] - chunks[ci2][0]
+            if progress_cb:
+                progress_cb(speech_done, speech_sec, ci2 + 1, n_chunks)
 
     # Disk hygiene: the job finished — the crash-resume manifest has served
     # its purpose. Best-effort: a failed unlink just leaves it for the next
