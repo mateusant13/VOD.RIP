@@ -95,6 +95,21 @@ retry_queue.json
 # Ruff
 .ruff_cache/
 
+# MCP code-intel index cache (regenerate via codeintel_bootstrap)
+.codeintel/
+
+# Playwright failure artifacts
+test-results/
+
+# Dev server logs (node dev-all.mjs)
+tmp/
+
+# One-off repro / probe scripts (keep e2e/tests/*.spec.ts)
+e2e/repro-*
+e2e/probe-*
+e2e/refetch-*
+e2e/.repro-shots-*
+
 # README demo GIF intermediates (keep assets/readme/demo.gif)
 assets/readme/_frames/
 

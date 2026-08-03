@@ -1,8 +1,0 @@
-state: {"url":null,"hasWatch":false,"previewOpen":false}
-[console.error] Each child in a list should have a unique "key" prop.%s%s See https://react.dev/link/warning-keys for more information. 
-
-Check the render method of `App`. 
-BEFORE drag: {"panel":{"x":47,"y":63,"w":688,"h":565},"videoHost":{"w":650,"h":487},"aspectCss":"1.33333 / 1"}
-REPRO FAILED: Error: resize handle not found
-    at dragPreviewHandle (file:///C:/Users/Administrador/Desktop/Nova%20pasta%20(3)/TESTE/VOD.RIP-wt-refetch-glitch/e2e/refetch-glitch-repro.mjs:44:25)
-    at async main (file:///C:/Users/Administrador/Desktop/Nova%20pasta%20(3)/TESTE/VOD.RIP-wt-refetch-glitch/e2e/refetch-glitch-repro.mjs:96:3)
