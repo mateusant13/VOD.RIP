@@ -87,6 +87,8 @@ async def archive_search(
     date_from: str | None = None,
     date_to: str | None = None,
     kind: str | None = None,
+    source: str = "both",
+    video_id: str | None = None,
     limit: int = Query(20, ge=1, le=100),
 ):
     # platform/kind accept comma-separated lists ("twitch,kick").
@@ -102,6 +104,16 @@ async def archive_search(
     ]
     if bad_kinds:
         raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")
+    # source restricts to one content kind; channel accepts comma-separated
+    # slugs ("a,b" → IN match) but never empty segments.
+    source = (source or "both").strip().lower()
+    if source not in ("both", "chat", "transcript"):
+        raise HTTPException(
+            status_code=400,
+            detail="source must be one of both, chat, transcript",
+        )
+    if channel and any(not s.strip() for s in channel.split(",")):
+        raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
     return {
         "hits": archive_db.search(
             q,
@@ -110,6 +122,8 @@ async def archive_search(
             date_from=date_from,
             date_to=date_to,
             kind=kind or None,
+            source=source,
+            video_id=video_id or None,
             limit=limit,
         )
     }

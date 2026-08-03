@@ -183,6 +183,24 @@ describe('buildSearchUrl', () => {
     const url = buildSearchUrl({ query: 'x', dateFrom: '2026-02-30', dateTo: 'not-a-date' });
     expect(url).toBe('/api/archive/search?q=x&limit=30');
   });
+
+  it('emits source only when not both, and videoId when set', () => {
+    expect(buildSearchUrl({ query: 'x', source: 'transcript' })).toBe(
+      '/api/archive/search?q=x&source=transcript&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', source: 'chat' })).toBe(
+      '/api/archive/search?q=x&source=chat&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
+      '/api/archive/search?q=x&video_id=abc123&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', source: 'both', videoId: 'v1' })).toBe(
+      '/api/archive/search?q=x&video_id=v1&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', source: 'both', videoId: '' })).toBe(
+      '/api/archive/search?q=x&limit=30',
+    );
+  });
 });
 
 describe('isValidDateParam', () => {
@@ -234,5 +252,18 @@ describe('buildArchiveVodUrl', () => {
   it('falls back to the slugless kick route when channel is unknown', () => {
     expect(buildArchiveVodUrl('kick', 'abc-123', '')).toBe('https://kick.com/videos/abc-123');
     expect(buildArchiveVodUrl('kick', 'abc-123', null)).toBe('https://kick.com/videos/abc-123');
+  });
+
+  it('returns empty for watchdog synthetic ids (no watchable URL)', () => {
+    expect(buildArchiveVodUrl('youtube', 'youtube-live-lubumr-1785714293393', 'lubumr')).toBe('');
+    expect(buildArchiveVodUrl('twitch', 'twitch-live-x-1234567890')).toBe('');
+    expect(buildArchiveVodUrl('kick', 'youtube-live-someone_else-1', 'someone')).toBe('');
+    // real ids must not be mistaken for synthetic ones
+    expect(buildArchiveVodUrl('youtube', 'dQw4w9WgXcQ')).toBe(
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    );
+    expect(buildArchiveVodUrl('twitch', 'v123456789')).toBe(
+      'https://www.twitch.tv/videos/123456789',
+    );
   });
 });

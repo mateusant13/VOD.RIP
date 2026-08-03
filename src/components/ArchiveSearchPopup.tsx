@@ -16,6 +16,9 @@ import {
   ARCHIVE_KIND_LABELS,
   ARCHIVE_KINDS,
   ARCHIVE_PLATFORMS,
+  ARCHIVE_SOURCES,
+  ARCHIVE_SOURCE_LABELS,
+  buildArchiveVodUrl,
   buildSearchUrl,
   formatArchiveOffset,
   groupChatWindow,
@@ -25,14 +28,22 @@ import {
   snippetAroundMatch,
   type ArchiveChatMessage,
   type ArchiveSearchHit,
+  type ArchiveSource,
   type ArchiveVideoRow,
 } from '../archiveSearchUtils';
+import { deriveChannelDisplayName } from '../channelUtils';
+import type { SavedChannel } from '../types';
+import PlatformVodIcon from './PlatformVodIcon';
 
 interface ArchiveSearchPopupProps {
   zIndex: number;
   onClose: () => void;
   /** Open the hit in the explore-player flow (App owns the popup stack). */
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** Optional per-video scope: search only this archived video; channel + platform are implied. */
+  scope?: { videoId: string; title: string };
+  /** Optional saved channels (App state) — unioned into the channel dropdown. */
+  savedChannels?: SavedChannel[];
 }
 
 type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
@@ -48,18 +59,26 @@ const platformAccent: Record<string, string> = {
   youtube: 'text-[#F03030]',
 };
 
+/** PlatformVodIcon expects capitalized platform names; archive rows are lowercase. */
+const PLATFORM_ICON_NAME: Record<string, string> = {
+  youtube: 'YouTube',
+  twitch: 'Twitch',
+  kick: 'Kick',
+};
+
 function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): string {
   const t = video?.title?.trim();
   return t ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearchPopupProps) {
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, scope, savedChannels }: ArchiveSearchPopupProps) {
   const [inputQuery, setInputQuery] = useState('');
   const [query, setQuery] = useState('');
   // Filters — empty values mean "all".
   const [channelFilter, setChannelFilter] = useState('');
   const [platformFilter, setPlatformFilter] = useState<string[]>([]);
   const [kindFilter, setKindFilter] = useState<string[]>([]);
+  const [sourceFilter, setSourceFilter] = useState<ArchiveSource>('both');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const [status, setStatus] = useState<SearchStatus>('idle');
@@ -103,7 +122,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
   }, []);
 
   // Every distinct channel in the archive, derived from /api/archive/videos.
-  const channels = useMemo(() => {
+  const archivedChannels = useMemo(() => {
     const set = new Set<string>();
     for (const v of Object.values(videos)) {
       const c = (v.channel || '').trim();
@@ -111,6 +130,28 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
     }
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [videos]);
+
+  /**
+   * Dropdown options: archived channels (plain slugs) ∪ saved channels
+   * (display names derived from per-platform slugs). A saved channel's
+   * select value is its comma-joined slugs so the backend matches ANY of
+   * them; archived slugs stay exact-match values. Deduped by label, saved
+   * wins ties (its value is at least as broad).
+   */
+  const channelOptions = useMemo(() => {
+    const options = new Map<string, { label: string; value: string }>();
+    for (const ch of savedChannels ?? []) {
+      // Canonical slug order mirrors deriveChannelDisplayName (twitch first).
+      const slugs = [ch.twitchSlug, ch.kickSlug, ch.youtubeSlug]
+        .map((s) => (s || '').trim())
+        .filter(Boolean);
+      if (slugs.length === 0) continue;
+      const label = deriveChannelDisplayName(ch.kickSlug, ch.twitchSlug, ch.youtubeSlug);
+      options.set(label, { label, value: slugs.join(',') });
+    }
+    for (const c of archivedChannels) options.set(c, { label: c, value: c });
+    return [...options.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }, [savedChannels, archivedChannels]);
 
   const togglePlatform = useCallback((p: string) => {
     setPlatformFilter((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
@@ -148,9 +189,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
     // Date inputs can hold partial/typed garbage; invalid values become unset.
     const url = buildSearchUrl({
       query,
-      channel: channelFilter || null,
-      platforms: platformFilter,
+      channel: scope ? null : (channelFilter || null),
+      platforms: scope ? null : platformFilter,
       kinds: kindFilter,
+      source: sourceFilter,
+      videoId: scope?.videoId ?? null,
       dateFrom: isValidDateParam(dateFrom) ? dateFrom : null,
       dateTo: isValidDateParam(dateTo) ? dateTo : null,
       limit: SEARCH_LIMIT,
@@ -167,13 +210,17 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
     const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
     setSelected({ hit, video });
-    onOpenHit(hit, video);
+    // Watchdog synthetic rows (youtube-live-…) have no watchable URL — still
+    // show nearby chat, but never hand the hit to the preview flow.
+    if (buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel)) {
+      onOpenHit(hit, video);
+    }
   }, [videos, onOpenHit]);
 
   useEffect(() => {
@@ -235,6 +282,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
         </button>
       </div>
 
+      {scope && (
+        <div
+          className="flex items-center gap-1.5 border border-zinc-700 border-b-yellow-300/60 bg-zinc-800/60 text-yellow-100/90 px-1.5 py-1 shrink-0 min-w-0"
+          aria-label="Searching in this video"
+        >
+          <Search size={10} className="shrink-0" />
+          <span className="text-[8px] font-mono uppercase tracking-widest font-bold truncate">
+            Searching in this video: {scope.title || scope.videoId}
+          </span>
+        </div>
+      )}
+
       <div className="flex gap-1 shrink-0">
         <div className="flex flex-1 items-center gap-1.5 bg-zinc-900 border-2 border-zinc-800 focus-within:border-white px-1.5">
           <Search size={12} className="text-zinc-500 shrink-0" />
@@ -243,7 +302,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
             type="text"
             value={inputQuery}
             onChange={(e) => setInputQuery(e.target.value)}
-            placeholder="SEARCH TRANSCRIPTS + CHAT..."
+            placeholder={scope ? 'SEARCH THIS VIDEO...' : 'SEARCH TRANSCRIPTS + CHAT...'}
             className="flex-1 bg-transparent text-white font-mono placeholder:text-zinc-600 text-[11px] py-1 focus:outline-none min-w-0"
           />
           {status === 'loading' && <Loader2 size={12} className="text-zinc-500 animate-spin shrink-0" />}
@@ -252,42 +311,47 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
 
       {/* ── FILTERS — every filter applies live to the same debounced search ── */}
       <div className="flex flex-col gap-1 shrink-0 border border-zinc-800 bg-zinc-900/40 p-1.5">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <label htmlFor="archive-filter-channel" className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
-            Channel
-          </label>
-          <select
-            id="archive-filter-channel"
-            value={channelFilter}
-            onChange={(e) => setChannelFilter(e.target.value)}
-            className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
-          >
-            <option value="">ALL CHANNELS</option>
-            {channels.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
-          <div className="flex gap-1 flex-wrap">
-            {ARCHIVE_PLATFORMS.map((p) => (
-              <button
-                key={p}
-                type="button"
-                aria-pressed={platformFilter.includes(p)}
-                onClick={() => togglePlatform(p)}
-                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
-                  platformFilter.includes(p)
-                    ? 'bg-white text-black border-white'
-                    : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
-                }`}
-              >
-                {p}
-              </button>
-            ))}
+        {!scope && (
+          <div className="flex items-center gap-1.5 min-w-0">
+            <label htmlFor="archive-filter-channel" className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
+              Channel
+            </label>
+            <select
+              id="archive-filter-channel"
+              value={channelFilter}
+              onChange={(e) => setChannelFilter(e.target.value)}
+              className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
+            >
+              <option value="">ALL CHANNELS</option>
+              {channelOptions.map((o) => (
+                <option key={o.label} value={o.value}>{o.label}</option>
+              ))}
+            </select>
           </div>
-        </div>
+        )}
+        {!scope && (
+          <div className="flex items-center gap-1.5">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
+            <div className="flex gap-1 flex-wrap">
+              {ARCHIVE_PLATFORMS.map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  aria-pressed={platformFilter.includes(p)}
+                  onClick={() => togglePlatform(p)}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                    platformFilter.includes(p)
+                      ? 'bg-white text-black border-white'
+                      : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                  }`}
+                >
+                  <PlatformVodIcon platform={PLATFORM_ICON_NAME[p] ?? p} className="w-3 h-3" />
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="flex items-center gap-1.5">
           <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Day</span>
           <input
@@ -335,6 +399,28 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit }: ArchiveSearch
                 }`}
               >
                 {ARCHIVE_KIND_LABELS[k as keyof typeof ARCHIVE_KIND_LABELS]}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Source</span>
+          <div className="flex border-2 border-zinc-700">
+            {ARCHIVE_SOURCES.map((s, i) => (
+              <button
+                key={s}
+                type="button"
+                aria-pressed={sourceFilter === s}
+                onClick={() => setSourceFilter(s)}
+                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                  i > 0 ? 'border-l-2 border-zinc-700' : ''
+                } ${
+                  sourceFilter === s
+                    ? 'bg-white text-black'
+                    : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
+                }`}
+              >
+                {ARCHIVE_SOURCE_LABELS[s]}
               </button>
             ))}
           </div>

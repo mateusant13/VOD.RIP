@@ -502,17 +502,22 @@ def search(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     kind: Optional[str] = None,
+    source: str = "both",
+    video_id: Optional[str] = None,
     limit: int = 20,
 ) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
     score; each hit carries enough to seek: platform, video_id, offset_sec,
     plus the owning video's channel/title/started_at (date) and video_kind.
 
-    Filters: platform/channel exact; kind is a comma-separated list
-    ("vod,clip" → IN clause, unknown values dropped); date_from/date_to are
-    inclusive YYYY-MM-DD bounds on the video's started_at date part. The
-    videos join is LEFT so rows whose video was never indexed still surface
-    when no video-backed filter is active."""
+    Filters: platform exact; channel exact or comma-separated slug list
+    ("a,b" → IN clause, empty segments dropped); kind is a comma-separated
+    list ("vod,clip" → IN clause, unknown values dropped); date_from/date_to
+    are inclusive YYYY-MM-DD bounds on the video's started_at date part;
+    source narrows to one content kind ("chat" → messages only,
+    "transcript" → transcripts only, "both" default); video_id scopes to a
+    single archived video. The videos join is LEFT so rows whose video was
+    never indexed still surface when no video-backed filter is active."""
     if not q.strip():
         return []
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
@@ -523,10 +528,15 @@ def search(
     )
     pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
     hits: list[dict] = []
-    for hit_kind, fts, src, offcol in (
+    loops = (
         ("transcript", "transcripts_fts", "transcripts", "t.start_sec"),
         ("message", "messages_fts", "messages", "t.offset_sec"),
-    ):
+    )
+    if source == "chat":
+        loops = loops[1:]
+    elif source == "transcript":
+        loops = loops[:1]
+    for hit_kind, fts, src, offcol in loops:
         sql = (
             f"SELECT t.rowid, bm25({fts}) AS score, "
             f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
@@ -539,9 +549,14 @@ def search(
         if platforms:
             sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
             params.extend(platforms)
+        if video_id:
+            sql += " AND t.video_id = ?"
+            params.append(video_id)
         if channel:
-            sql += " AND v.channel = ?"
-            params.append(channel)
+            slugs = [c.strip() for c in channel.split(",") if c.strip()]
+            if slugs:
+                sql += f" AND v.channel IN ({','.join('?' * len(slugs))})"
+                params.extend(slugs)
         if kinds:
             sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
             params.extend(kinds)
