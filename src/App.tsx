@@ -7,7 +7,7 @@ import {
   Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical,
+  GripVertical, Radio,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
@@ -198,6 +198,8 @@ interface ChannelRowProps {
   isLast: boolean;
   savedChannelsLength: number;
   liveStatus: ChannelLiveStatus | undefined;
+  openLivePreview: (entry: ChannelLiveStatus['live'][number], channelName?: string) => Promise<void> | void;
+  onOpenChannelSearch: (ch: SavedChannel) => void;
   channelListRef: MutableRefObject<HTMLDivElement | null>;
   toggleChannelSelection: (id: string) => void;
   removeChannel: (id: string) => void;
@@ -217,6 +219,7 @@ interface ChannelRowProps {
 const ChannelRow = memo(function ChannelRow({
   ch, index, selected, isEditing, editingChannelName,
   dragId, dropInsertIndex, isLast, savedChannelsLength, liveStatus,
+  openLivePreview, onOpenChannelSearch,
   channelListRef,
   toggleChannelSelection, removeChannel, refreshChannel, clearChannelRefreshFlight,
   startRenameChannel, commitRenameChannel,
@@ -258,6 +261,44 @@ const ChannelRow = memo(function ChannelRow({
       >
         <GripVertical size={12} />
       </button>
+      <button
+        type="button"
+        title="Live"
+        aria-label={`Live ${ch.displayName}`}
+        disabled={liveEntries.length === 0}
+        onClick={(e) => { e.stopPropagation(); void openLivePreview(liveEntries[0], ch.displayName); }}
+        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40"
+      >
+        <Radio size={11} />
+      </button>
+      <button
+        type="button"
+        title="Search channel"
+        onClick={(e) => { e.stopPropagation(); onOpenChannelSearch(ch); }}
+        className="text-zinc-600 hover:text-white p-0.5"
+      >
+        <Search size={11} />
+      </button>
+      <button type="button" title="Edit"
+        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
+        className="text-zinc-600 hover:text-white p-0.5">
+        <Pencil size={11} />
+      </button>
+      <button type="button" title="Reload"
+        onClick={(e) => {
+          e.stopPropagation();
+          clearChannelRefreshFlight(ch.id);
+          void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
+        }}
+        disabled={ch.loading}
+        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
+        {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+      </button>
+      <button type="button" title="Delete"
+        onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
+        className="text-zinc-600 hover:text-red-400 p-0.5">
+        <X size={11} />
+      </button>
       {isEditing ? (
         <input type="text" value={editingChannelName}
           onChange={(e) => setEditingChannelName(e.target.value)}
@@ -292,28 +333,6 @@ const ChannelRow = memo(function ChannelRow({
         </div>
       )}
       <LiveBadge entries={liveEntries} invisible={liveEntries.length === 0} />
-      {!isEditing && (
-        <button type="button" title="Rename"
-          onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
-          className="text-zinc-600 hover:text-white p-0.5">
-          <Pencil size={11} />
-        </button>
-      )}
-      <button type="button" title="Refresh"
-        onClick={(e) => {
-          e.stopPropagation();
-          clearChannelRefreshFlight(ch.id);
-          void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
-        }}
-        disabled={ch.loading}
-        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
-        {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-      </button>
-      <button type="button" title="Remove"
-        onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
-        className="text-zinc-600 hover:text-red-400 p-0.5">
-        <X size={11} />
-      </button>
     </div>
   );
 });
@@ -562,6 +581,16 @@ export default function App() {
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   /** Per-video scope for the archive search popup (SEARCH THIS VIDEO). */
   const [archiveSearchScope, setArchiveSearchScope] = useState<{ videoId: string; title: string } | null>(null);
+  /** Channel scope (comma-joined slugs) for the archive search popup — set
+   *  by the per-channel Search action in the channel list row. */
+  const [archiveSearchChannel, setArchiveSearchChannel] = useState<string | null>(null);
+  const openChannelSearch = useCallback((ch: SavedChannel) => {
+    const slugs = [ch.twitchSlug, ch.kickSlug, ch.youtubeSlug]
+      .map((s) => (s || '').trim())
+      .filter(Boolean);
+    setArchiveSearchChannel(slugs.join(',') || null);
+    setArchiveSearchOpen(true);
+  }, []);
   /** Floating archive-search popup anchored to the main preview panel
    *  (SEARCH THIS VIDEO / SEARCH ARCHIVE). Floating — never part of the
    *  panel row — so opening it cannot move or resize the panels. */
@@ -5894,6 +5923,8 @@ export default function App() {
                     setSavedChannels={setSavedChannels}
                     setChannelDragId={setChannelDragId}
                     setChannelDropInsertIndex={setChannelDropInsertIndex}
+                    openLivePreview={openLivePreview}
+                    onOpenChannelSearch={openChannelSearch}
                   />
                   {selectedChannelId === ch.id && (
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1 min-w-0">
@@ -6464,10 +6495,11 @@ export default function App() {
       {archiveSearchOpen && (
         <ArchiveSearchPopup
           zIndex={EXPLORE_POPUP_Z - 100}
-          onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); }}
+          onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); setArchiveSearchChannel(null); }}
           onOpenHit={openArchiveHit}
           scope={archiveSearchScope ?? undefined}
           savedChannels={savedChannels}
+          initialChannel={archiveSearchChannel ?? undefined}
         />
       )}
       {previewOpen && previewSearchOpen && (

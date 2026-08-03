@@ -252,6 +252,39 @@ describe('ArchiveSearchPopup', () => {
     );
   });
 
+  it('initialChannel seeds the channel filter; absent keeps the old behavior', async () => {
+    const seeded = mockFetch();
+    const first = render(
+      <ArchiveSearchPopup
+        zIndex={10}
+        initialChannel="titiltei"
+        onClose={() => {}}
+        onOpenHit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(seeded).toHaveBeenCalled());
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(seeded, 'q=zebra&channel=titiltei')).toBeTruthy());
+    first.unmount();
+
+    // Absent prop → no channel param (old behavior).
+    const plain = mockFetch();
+    render(
+      <ArchiveSearchPopup
+        zIndex={10}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+      />,
+    );
+    await waitFor(() => expect(plain).toHaveBeenCalled());
+    const input2 = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input2, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(plain, 'q=zebra')).toBeTruthy());
+    const urls = searchUrls(plain).filter((u) => u.includes('q=zebra'));
+    expect(urls[urls.length - 1]).not.toContain('channel=');
+  });
+
   it('dedups archived channel casing variants into one canonical option', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL) => new Response('{}', { status: 404 }));
     vi.stubGlobal('fetch', fetchMock);

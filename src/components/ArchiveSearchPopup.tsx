@@ -70,6 +70,10 @@ interface ArchiveSearchPopupProps {
   /** Floating-mode seed position (e.g. anchored next to the preview panel);
    *  defaults to the viewport top-right. Ignored in embedded mode. */
   initialPos?: PanelPos;
+  /** Optional seed for the channel dropdown (comma-joined slugs, as the
+   *  dropdown options carry) — the channel-list row Search action passes it
+   *  to scope the popup to one channel. Absent → all channels (unchanged). */
+  initialChannel?: string;
 }
 
 type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
@@ -104,7 +108,7 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels, initialPos }: ArchiveSearchPopupProps) {
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   // Seed exactly once from the caller-supplied anchor (else viewport top-right).
@@ -115,7 +119,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [inputQuery, setInputQuery] = useState('');
   const [query, setQuery] = useState('');
   // Filters — empty values mean "all".
-  const [channelFilter, setChannelFilter] = useState('');
+  const [channelFilter, setChannelFilter] = useState(initialChannel ?? '');
   const [platformFilter, setPlatformFilter] = useState<string[]>([]);
   const [kindFilter, setKindFilter] = useState<string[]>([]);
   const [sourceFilter, setSourceFilter] = useState<ArchiveSource>('both');
