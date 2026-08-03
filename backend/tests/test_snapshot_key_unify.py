@@ -42,6 +42,13 @@ from services.preview_service import (
     _SESSION_SNAPSHOT,
 )
 
+# The MagicMock substitutions above were only needed for that import.
+# Leaving them in sys.modules poisons every later test module: collection is
+# alphabetical, so each test_youtube_* module would import the mocks and
+# fail wholesale (assert <MagicMock ...> == ...). Drop them immediately.
+for _poisoned in ("services.youtube_service", "services.youtube_innertube", "models.preview"):
+    sys.modules.pop(_poisoned, None)
+
 
 def make_snap(sid="snap_001"):
     """Return a minimal snapshot dict with the fields _get_session_snapshot reads."""
