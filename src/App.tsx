@@ -17,6 +17,7 @@ import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
 import { LiveBadge } from './components/LiveBadge';
+import { liveArchiveContext } from './livePlayerLevels';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
 
@@ -198,7 +199,7 @@ interface ChannelRowProps {
   isLast: boolean;
   savedChannelsLength: number;
   liveStatus: ChannelLiveStatus | undefined;
-  openLivePreview: (entry: ChannelLiveStatus['live'][number], channelName?: string) => Promise<void> | void;
+  openLivePreview: (entry: ChannelLiveStatus['live'][number], channelName?: string, channel?: SavedChannel | null) => Promise<void> | void;
   onOpenChannelSearch: (ch: SavedChannel) => void;
   channelListRef: MutableRefObject<HTMLDivElement | null>;
   toggleChannelSelection: (id: string) => void;
@@ -229,7 +230,7 @@ const ChannelRow = memo(function ChannelRow({
 }: ChannelRowProps) {
   const dropAbove = dragId != null && dropInsertIndex === index;
   const dropBelow = dragId != null && dropInsertIndex === savedChannelsLength && isLast;
-  const liveEntries = liveStatus?.live.filter((e) => e.is_live) ?? [];
+  const liveEntries = liveStatus?.live.filter((e) => e.is_live && e.url) ?? [];
   return (
     <div
       data-channel-row
@@ -266,7 +267,7 @@ const ChannelRow = memo(function ChannelRow({
         title="Live"
         aria-label={`Live ${ch.displayName}`}
         disabled={liveEntries.length === 0}
-        onClick={(e) => { e.stopPropagation(); void openLivePreview(liveEntries[0], ch.displayName); }}
+        onClick={(e) => { e.stopPropagation(); void openLivePreview(liveEntries[0], ch.displayName, ch); }}
         className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40"
       >
         <Radio size={11} />
@@ -762,7 +763,7 @@ export default function App() {
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const [isLive, setIsLive] = useState(false);
-  const [livePopupEntry, setLivePopupEntry] = useState<{ entry: ChannelLiveStatus['live'][number]; channelName: string } | null>(null);
+  const [livePopupEntry, setLivePopupEntry] = useState<{ entry: ChannelLiveStatus['live'][number]; channelName: string; channel: SavedChannel | null } | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
   const channelsSaveTimerRef = useRef<number | null>(null);
@@ -4620,10 +4621,10 @@ export default function App() {
   // and those extractors can't resolve them. Trim/download still work because
   // the session is a regular PreviewSession (kind=hls) proxied via the same
   // /api/preview/hls/{sid}/master.m3u8 endpoint.
-  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], channelName?: string): Promise<void> => {
+  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
     if (!entry?.url) return;
     const name = channelName || entry.platform || 'Live';
-    setLivePopupEntry({ entry, channelName: name });
+    setLivePopupEntry({ entry, channelName: name, channel: channel ?? null });
   }, []);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
@@ -6124,7 +6125,7 @@ export default function App() {
                             <div
                               role="button"
                               tabIndex={0}
-                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName)}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName, selectedChannel)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
@@ -6179,7 +6180,7 @@ export default function App() {
                             <div
                               role="button"
                               tabIndex={0}
-                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName)}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName, selectedChannel)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
@@ -6468,23 +6469,19 @@ export default function App() {
       </div>
 
       {livePopupEntry && (() => {
-        // Open-channel slug + newest public in-progress VOD for the entry's
-        // platform (DVR REPLAY archive source), both resolved from the selected
-        // channel at render time to keep openLivePreview dependency-free.
-        const plat = (livePopupEntry.entry.platform || '').toLowerCase();
-        const slug = plat === 'twitch'
-          ? selectedChannel?.twitchSlug
-          : plat === 'kick' ? selectedChannel?.kickSlug : selectedChannel?.youtubeSlug;
-        const newestVod = [...(selectedChannel?.vodVideos ?? [])]
-          .filter((v) => (v.platform || '').toLowerCase() === plat
-            && v.content_kind !== 'clip' && isPublicVideo(v))
-          .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0];
+        // DVR REPLAY archive context (channel slug + newest public in-progress
+        // VOD) resolved from the ENTRY's own channel — the live button on any
+        // row may be clicked, not just the selected channel's.
+        const { channelSlug, vodUrl } = liveArchiveContext(
+          livePopupEntry.channel,
+          livePopupEntry.entry.platform,
+        );
         return (
           <LivePlayerPopup
             entry={livePopupEntry.entry}
             channelName={livePopupEntry.channelName}
-            channelSlug={slug}
-            vodUrl={newestVod ? buildVodUrl(newestVod) : undefined}
+            channelSlug={channelSlug}
+            vodUrl={vodUrl}
             onClose={() => setLivePopupEntry(null)}
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}

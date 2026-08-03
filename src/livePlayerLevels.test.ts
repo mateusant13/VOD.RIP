@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from './livePlayerLevels';
+import { filterLiveLevels, liveArchiveContext, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from './livePlayerLevels';
+import type { SavedChannel } from './types';
 
 describe('filterLiveLevels', () => {
   const full = (heights: number[], bitrates = heights.map((h) => h * 1000)) =>
@@ -151,5 +152,62 @@ describe('liveBroadcastPositionSec', () => {
 
   it('clamps negative results', () => {
     expect(liveBroadcastPositionSec(30, 90, 10)).toBe(0);
+  });
+});
+
+describe('liveArchiveContext', () => {
+  const vod = (platform: string, id: string, createdAt: string, opts: Partial<import('./types').ChannelVideo> = {}): import('./types').ChannelVideo => ({
+    id,
+    platform,
+    title: `VOD ${id}`,
+    duration: 3600,
+    created_at: createdAt,
+    views: 100,
+    thumbnail_url: null,
+    url: `https://example.com/${platform}/${id}`,
+    channel: 'srdogg',
+    content_kind: 'vod',
+    ...opts,
+  });
+
+  const CHANNEL: SavedChannel = {
+    id: 'ch-srdogg',
+    displayName: 'srdogg / srdoglol',
+    kickSlug: 'srdoglol',
+    twitchSlug: 'srdogg',
+    youtubeSlug: 'srdogyt',
+    vodVideos: [
+      // Members-only newest twitch VOD — must NOT be picked as replay source.
+      vod('Twitch', 'v999', '2026-08-03T20:00:00Z', { availability: 'subscriber_only' }),
+      vod('Twitch', 'v123', '2026-08-03T19:00:00Z'),
+      vod('Twitch', 'clip_x', '2026-08-03T18:00:00Z', { content_kind: 'clip', url: 'https://clips.twitch.tv/foo' }),
+      vod('Kick', 'k42', '2026-08-02T10:00:00Z'),
+      vod('YouTube', 'yt1', '2026-08-01T10:00:00Z'),
+    ],
+    clipVideos: [],
+    updatedAt: '2026-08-03T00:00:00Z',
+  };
+
+  it('resolves slug + newest public VOD for the entry platform (not the selected channel)', () => {
+    const { channelSlug, vodUrl } = liveArchiveContext(CHANNEL, 'Twitch');
+    expect(channelSlug).toBe('srdogg');
+    // v999 is members-only and the clip is excluded — v123 wins.
+    expect(vodUrl).toBe('https://example.com/Twitch/v123');
+  });
+
+  it('picks the per-platform slug (kick/youtube)', () => {
+    expect(liveArchiveContext(CHANNEL, 'Kick').channelSlug).toBe('srdoglol');
+    expect(liveArchiveContext(CHANNEL, 'Kick').vodUrl).toBe('https://example.com/Kick/k42');
+    expect(liveArchiveContext(CHANNEL, 'YouTube').channelSlug).toBe('srdogyt');
+    expect(liveArchiveContext(CHANNEL, 'YouTube').vodUrl).toBe('https://example.com/YouTube/yt1');
+  });
+
+  it('keeps the slug but drops vodUrl when the platform has no public VOD', () => {
+    const onlyClips = { ...CHANNEL, vodVideos: [vod('Twitch', 'clip_x', '2026-08-03T18:00:00Z', { content_kind: 'clip', url: 'https://clips.twitch.tv/foo' })] };
+    expect(liveArchiveContext(onlyClips, 'Twitch')).toEqual({ channelSlug: 'srdogg', vodUrl: undefined });
+  });
+
+  it('degrades gracefully without a channel (popup still plays from entry.url)', () => {
+    expect(liveArchiveContext(undefined, 'Twitch')).toEqual({ channelSlug: undefined, vodUrl: undefined });
   });
 });

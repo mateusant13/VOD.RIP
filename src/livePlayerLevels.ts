@@ -1,9 +1,13 @@
 /**
  * Pure helpers for the live player (LivePlayerPopup): quality-level filtering
- * (360p–1080p with original hls.js indices, 360p default) and seek/time
- * decisions. Kept dependency-free so vitest can cover them without mounting
- * hls.js or a video element.
+ * (360p–1080p with original hls.js indices, 360p default), seek/time
+ * decisions, and the DVR REPLAY archive context (entry-channel slug + newest
+ * in-progress VOD). No DOM/hls.js imports so vitest can cover them without
+ * mounting a player.
  */
+
+import { buildVodUrl, isPublicVideo } from './channelUtils';
+import type { SavedChannel } from './types';
 
 export interface LiveLevelLike {
   index: number;
@@ -28,6 +32,28 @@ export interface FilterLiveLevelsOpts {
 
 const LIVE_LEVEL_MIN_HEIGHT = 360;
 const LIVE_DEFAULT_HEIGHT = 360;
+
+/**
+ * DVR REPLAY archive context for the live player popup: the platform slug for
+ * the open-channel link and the channel's newest public in-progress VOD
+ * (replay source). Derived from the ENTRY's own channel — never the selected
+ * channel, since the live button lives on every row and the clicked channel
+ * may not be selected.
+ */
+export function liveArchiveContext(
+  channel: SavedChannel | null | undefined,
+  platform: string | undefined,
+): { channelSlug: string | undefined; vodUrl: string | undefined } {
+  const plat = (platform || '').toLowerCase();
+  const slug = plat === 'twitch'
+    ? channel?.twitchSlug
+    : plat === 'kick' ? channel?.kickSlug : channel?.youtubeSlug;
+  const newestVod = [...(channel?.vodVideos ?? [])]
+    .filter((v) => (v.platform || '').toLowerCase() === plat
+      && v.content_kind !== 'clip' && isPublicVideo(v))
+    .sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0];
+  return { channelSlug: slug, vodUrl: newestVod ? buildVodUrl(newestVod) : undefined };
+}
 
 /**
  * Filter hls.levels to the policy-allowed set, keeping ORIGINAL indices so
