@@ -26,10 +26,10 @@ from services import archive_db as db  # noqa: E402
 
 def test_fold_bridges_phonetic_pairs():
     f = db._phonetic_fold
-    # c/k and ç/ss collapse; the folded pair stays within one Damerau edit
+    # hard c before a/u folds to k; ç/ss collapse; the folded pair is equal
     assert f("katarina") == "katarina"
-    assert f("catarina") == "satarina"
-    assert db._damerau_levenshtein(f("katarina"), f("catarina"), 1) == 1
+    assert f("catarina") == "katarina", "hard c before a folds to k"
+    assert db._damerau_levenshtein(f("katarina"), f("catarina"), 1) == 0
     assert f("ambessa") == f("ambeça") == "ambesa"
     # ph->f, y->i and final unstressed vowels
     assert f("seraphine") == f("serafine") == "serafini"
@@ -43,10 +43,12 @@ def test_fold_bridges_phonetic_pairs():
 def test_fold_keeps_foreign_sh_digraph():
     f = db._phonetic_fold
     # the champion name must NOT collapse onto the common words ('shaco'
-    # and 'caso'/'saco' stay one edit apart, not zero)
+    # stays at least one edit apart from 'caso'/'saco', not zero)
     assert f("shaco") == "shasu"
-    assert f("caso") == f("saco") == "sasu"
-    assert db._damerau_levenshtein(f("shaco"), f("caso"), 1) == 1
+    assert f("caso") == "kasu", "hard c before a folds to k"
+    assert f("saco") == "sasu"
+    assert db._damerau_levenshtein(f("shaco"), f("caso"), 2) == 2, \
+        "hard-c 'caso' stays two edits away from 'shaco'"
     assert f("shen") == "shen"
     # ...while a sibilant ASR artifact after a vowel still folds away
     assert f("nasho") == "nasu"
@@ -121,7 +123,8 @@ def test_expansion_distances(scratch):
     terms = dict(db._expand_query("shaco", ["transcripts"]))
     assert terms["shaco"] == 0
     assert terms["chaco"] == 1
-    assert terms["caso"] == 1, "caso must not fold equal to shaco"
+    assert "caso" not in terms, \
+        "hard-c 'caso' ('kasu') is out of the Damerau budget from 'shaco' ('shasu')"
     # the folded pair index bridges the single query token to the corpus
     # phrase with the same pronunciation
     terms = dict(db._expand_query("yasuo", ["transcripts"]))

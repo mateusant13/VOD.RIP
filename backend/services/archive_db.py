@@ -1075,6 +1075,13 @@ _VOCAB_MAX_TOKENS = 25_000
 _VOCAB_TTL_S = 300.0
 _TOKEN_EXPAND_CAP = 12
 _MAX_EXPANDED_TERMS = 64
+# R3/R2 tuning: dist>=1 expansions above the merged corpus frequency are
+# dropped (chat-spam noise); short rare tokens unlock tier-0 prefix
+# expansion (gate on the token's own merged freq, at most _TOKEN_PREFIX_CAP
+# terms, ranked by frequency).
+_SUPPRESS_DIST1_FREQ = 1000
+_PREFIX_GATE_FREQ = 300
+_TOKEN_PREFIX_CAP = 8
 
 _vocab_lock = threading.Lock()
 # content table -> (loaded_at_monotonic, {token_len: [(term, freq), ...]}, row_count)
@@ -1138,8 +1145,10 @@ def _phonetic_fold(word: str) -> str:
     Reimplements the published Brazilian-Portuguese phonetic rules (Várzea
     Paulista REDECA project, carlosjordao/metaphone-ptbr) minus the vowel
     dropping — dropping vowels is exactly what kills 'yasuo'↔'e aço'. Folds:
-    accents, ç→s, ñ→n, y→i, ph→f, th→t, ch→x, qu→k, c→s before e/i and c→k
-    g→j before e/i, q→k, w→v, silent h dropped, doubled letters
+    accents, ç→s, ñ→n, y→i, ph→f, th→t, ch→x, qu→k, c→s before e/i/o and
+    c→k before a/u/word-end ('cata' -> 'kata' bridges 'kata' while 'aco'
+    from 'aço' still -> 'asu'), g→j before e/i, q→k, w→v, silent h
+    dropped, doubled letters
     collapsed, final unstressed e→i and o→u. h drops word-initially and
     after vowels; the sh digraph is kept when the s starts the word or
     follows a consonant ('shaco' -> 'shasu' must NOT collapse onto
@@ -1163,11 +1172,13 @@ def _phonetic_fold(word: str) -> str:
                 out.append("h")
             continue
         elif c == "c":
-            # c before e/i is s; before other vowels fold to s too so
-            # diacritic-stripped ç tokens bridge ('aco' from 'aço' -> 'asu',
-            # 'nasco' from 'nasço' -> 'nasu'); before consonants keep c
+            # Hard c: s before e/i/o (soft — diacritic-stripped ç tokens
+            # keep bridging: 'aco' from 'aço' -> 'asu', 'nasco' from
+            # 'nasço' -> 'nasu'); k before a/u or word end (hard — 'cata'
+            # -> 'kata' folds equal to 'kata'); c before other consonants
             # ('claro' stays 'claro').
-            c = "s" if i + 1 >= len(w) or w[i + 1] in "aeiou" else "c"
+            nxt = w[i + 1] if i + 1 < len(w) else ""
+            c = "s" if nxt in "eio" else ("k" if nxt in "au" or nxt == "" else "c")
         elif c == "g":
             c = "j" if i + 1 < len(w) and w[i + 1] in "ei" else "g"
         elif c == "q":
@@ -1312,8 +1323,14 @@ def _token_expansions(
     """Exact + fuzzy candidates for one query token as (term, distance)
     pairs, best ~8 by (distance, frequency), plus folded-bigram phrases
     (distance 1 — recall-only, never rank-pattern material). Tokens shorter
-    than 3 chars are never expanded. Falls back to the bare token (distance
-    0) when nothing matches."""
+    than 3 chars are never expanded. Dist>=1 candidates whose MERGED corpus
+    frequency exceeds _SUPPRESS_DIST1_FREQ are dropped ('cara' 3106 is chat
+    spam; the legit fuzzy tail peaks at 'chaco' 570); exact/fold-equal
+    (dist 0) always survive. Short rare tokens (4-6 chars, merged freq
+    <= _PREFIX_GATE_FREQ) also get tier-0 prefix expansions, raw or
+    phonetically folded — 'kata' reaches 'catarina' via fold 'katarina'
+    startswith 'kata' — capped at _TOKEN_PREFIX_CAP. Falls back to the bare
+    token (distance 0) when nothing matches."""
     if len(token) < 3:
         return [(token, 0)]
     now = time.monotonic()
@@ -1325,6 +1342,16 @@ def _token_expansions(
     raw_max = max(1, len(token) // 4)  # Damerau budget on the raw spelling
     fold = _phonetic_fold(token)
     fold_max = max(1, len(fold) // 3)  # Damerau budget on the folded form
+    # Merged corpus frequency per term (summed across the per-table vocabs).
+    # A per-table check would miss real-DB noise: 'cara' alone has freq 755
+    # in messages, 3106 once transcripts join in.
+    merged_freq: dict[str, int] = {}
+    for vocab in vocabs:
+        if not vocab:
+            continue
+        for bucket in vocab.values():
+            for term, freq in bucket:
+                merged_freq[term] = merged_freq.get(term, 0) + freq
     for vocab in vocabs:
         if not vocab:
             continue
@@ -1340,9 +1367,36 @@ def _token_expansions(
                 if d is None and fd is None:
                     continue
                 dist = min(d if d is not None else 99, fd if fd is not None else 99)
+                # R3: drop dist>=1 candidates that are chat-spam common in
+                # the merged corpus ('cara' 3106, 'agora' 1184) — never the
+                # intended fuzzy target; the legit tail peaks at 'chaco'
+                # 570. Exact/fold-equal (dist 0) always survive.
+                if dist >= 1 and merged_freq.get(term, 0) > _SUPPRESS_DIST1_FREQ:
+                    continue
                 cur = best.get(term)
                 if cur is None or (dist, -freq) < cur:
                     best[term] = (dist, -freq)
+    # R2: tier-0 prefix expansion for short rare tokens. Levenshtein cannot
+    # bridge the length gap to 'catarina' from 'kata' (budget 1); the
+    # folded prefix can — fold('catarina') = 'katarina' starts with
+    # fold('kata') = 'kata' (only since R1's hard c). The freq gate keeps
+    # spam tokens from flooding tier 0 ('cara' would pull caralho/caramba/
+    # carrasco into every search).
+    if 4 <= len(token) <= 6 and merged_freq.get(token, 0) <= _PREFIX_GATE_FREQ:
+        pref: dict[str, int] = {}
+        for vocab in vocabs:
+            if not vocab:
+                continue
+            for n in range(len(token) + 1, len(token) + 9):
+                for term, freq in vocab.get(n, ()):
+                    if len(term) < 3 or not term.isalnum():
+                        continue
+                    if term.startswith(token) or _phonetic_fold(term).startswith(fold):
+                        pref[term] = pref.get(term, 0) + freq
+        for term, freq in sorted(pref.items(), key=lambda kv: -kv[1])[:_TOKEN_PREFIX_CAP]:
+            cur = best.get(term)
+            if cur is None or (0, -freq) < cur:
+                best[term] = (0, -freq)  # upgrade an existing dist-1 entry to tier 0
     ranked = sorted(best.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
     out: list[tuple[str, int]] = [
         (term, dist) for term, (dist, _) in ranked[:_TOKEN_EXPAND_CAP]
@@ -1482,8 +1536,9 @@ assert any(
 # the ASR/typo pairs from the failure corpus must fold equal or within the
 # Damerau budget on the folded form.
 assert _phonetic_fold("katarina") == "katarina"
-assert _phonetic_fold("catarina") == "satarina"
-assert _damerau_levenshtein(_phonetic_fold("katarina"), _phonetic_fold("catarina"), 1) == 1
+assert _phonetic_fold("catarina") == "katarina", "hard c before a folds to k"
+assert _phonetic_fold("cata") == _phonetic_fold("kata") == "kata"
+assert _damerau_levenshtein(_phonetic_fold("katarina"), _phonetic_fold("catarina"), 1) == 0
 assert _phonetic_fold("ambessa") == _phonetic_fold("ambeça") == "ambesa"
 assert _phonetic_fold("seraphine") == _phonetic_fold("serafine") == "serafini"
 assert _phonetic_fold("yasuo") == "iasu" and _phonetic_fold("aço") == "asu"
@@ -1495,10 +1550,12 @@ assert _phonetic_fold("shen") == "shen" and _phonetic_fold("suen") == "suen"
 assert _damerau_levenshtein("shen", "suen", 1) == 1, "h/u substitution must fit the budget"
 # The sh digraph survives the fold at word start / after consonants, so the
 # champion 'shaco' does not collapse onto the common words 'caso'/'saco'
-# (dist 1, not 0); after a vowel the sh is a sibilant artifact ('nasho' ->
+# (dist >= 1, not 0); after a vowel the sh is a sibilant artifact ('nasho' ->
 # 'nashu' still bridges 'nasço').
 assert _phonetic_fold("shaco") == "shasu"
-assert _damerau_levenshtein(_phonetic_fold("shaco"), _phonetic_fold("caso"), 1) == 1
+assert _damerau_levenshtein(_phonetic_fold("shaco"), _phonetic_fold("caso"), 2) == 2, (
+    "hard c keeps 'caso' ('kasu') two edits away from 'shaco' ('shasu')"
+)
 assert _phonetic_fold("nasho") == "nasu", "sibilant sh after a vowel still drops"
 assert _damerau_levenshtein("nasus", "nasu", 1) == 1, "nasho still bridges nasço/nasus"
 assert _damerau_levenshtein("asu", "sasu", 1) == 1, "prefix insertion must fit the budget"

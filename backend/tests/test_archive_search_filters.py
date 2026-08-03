@@ -573,6 +573,113 @@ def test_fuzzy_expansion_arthur_to_artur():
             archive_db._token_cache.clear()
 
 
+def test_phonetic_fold_hard_c_contract():
+    # R1: hard c folds to k before a/u or word end; soft c stays s before
+    # e/i/o so diacritic-stripped ç tokens keep bridging.
+    f = archive_db._phonetic_fold
+    assert f("cata") == f("kata") == "kata"
+    assert f("catarina") == "katarina"
+    assert f("aco") == "asu"     # 'aço' stripped by FTS5 unicode61
+    assert f("nasco") == "nasu"  # 'nasço' stripped
+    assert f("shaco") == "shasu"
+
+
+def test_token_expansions_suppress_high_freq_dist1():
+    # R3: a dist>=1 candidate that is corpus-common must not be offered —
+    # 'cara' (freq 2000) is chat noise, never the intended fuzzy target.
+    vocab = {4: [("cata", 5), ("cara", 2000), ("kata", 10)]}
+    with archive_db._vocab_lock:
+        archive_db._token_cache.clear()
+    try:
+        cands = archive_db._token_expansions("cata", [vocab], None)
+        assert not any(t == "cara" for t, _ in cands), \
+            f"'cara' must be suppressed, got {cands}"
+        assert any(t == "cata" for t, _ in cands), "exact token always survives"
+        assert any(t == "kata" for t, _ in cands), "fold-equal survives at dist 0"
+    finally:
+        with archive_db._vocab_lock:
+            archive_db._token_cache.clear()
+
+
+def test_token_expansions_rare_short_pair_survives_suppression():
+    # R3 must not kill legit rare fuzzy pairs: 'shen' -> ('suen', 1).
+    vocab = {4: [("shen", 10), ("suen", 3)]}
+    with archive_db._vocab_lock:
+        archive_db._token_cache.clear()
+    try:
+        cands = archive_db._token_expansions("shen", [vocab], None)
+        assert ("suen", 1) in cands, f"rare dist-1 pair must survive, got {cands}"
+    finally:
+        with archive_db._vocab_lock:
+            archive_db._token_cache.clear()
+
+
+def test_token_expansions_tier0_prefix_raw_and_folded():
+    # R2: 'cata' reaches 'catarina' by raw prefix; 'kata' via the folded
+    # prefix (fold('catarina') == 'katarina' after the hard-c fold).
+    vocab = {4: [("cata", 5), ("kata", 10)], 8: [("catarina", 30)]}
+    for tok in ("cata", "kata"):
+        with archive_db._vocab_lock:
+            archive_db._token_cache.clear()
+        cands = archive_db._token_expansions(tok, [vocab], None)
+        assert ("catarina", 0) in cands, \
+            f"{tok} must reach catarina at tier 0, got {cands}"
+
+
+def test_token_expansions_prefix_gate_blocks_high_freq_token():
+    # R2 gate: 'cara' (merged freq 3106 > 300) must NOT emit prefix terms —
+    # ungated it would flood tier 0 with caralho/caramba/carrasco.
+    vocab = {
+        4: [("cara", 3106)],
+        7: [("caralho", 5), ("caramba", 3), ("carrasco", 2)],
+    }
+    with archive_db._vocab_lock:
+        archive_db._token_cache.clear()
+    try:
+        cands = archive_db._token_expansions("cara", [vocab], None)
+        assert all(t == "cara" for t, _ in cands), \
+            f"high-freq token must not emit prefix terms, got {cands}"
+    finally:
+        with archive_db._vocab_lock:
+            archive_db._token_cache.clear()
+
+
+def test_search_cata_suppresses_cara_noise():
+    # R2+R3 end-to-end: 'cara' is chat-spam common (~1500 corpus rows) and
+    # 'catarina' is the rare intended target; search('cata') / search('kata')
+    # must surface the 'catarina' rows at tier 0 and never the 'cara' rows
+    # ('cara' is dropped from the dist-1 expansions by merged-freq
+    # suppression, and no prefix term leaks it back in).
+    cara_vid, cat_vid = "fuzzy-cara-spam", "fuzzy-catarina"
+    archive_db.insert_messages(
+        "twitch", cara_vid,
+        [{"offset_sec": 1.0 + i * 0.5, "username": "u", "text": f"cara x{i}"}
+         for i in range(1500)],
+    )
+    archive_db.insert_messages(
+        "twitch", cat_vid,
+        [{"offset_sec": 1.0, "username": "u", "text": "catarina joga bem"},
+         {"offset_sec": 2.0, "username": "u", "text": "a catarina ganhou"}],
+    )
+    try:
+        for tok in ("cata", "kata"):
+            with archive_db._vocab_lock:
+                archive_db._vocab_cache.pop("messages", None)
+                archive_db._token_cache.clear()
+            hits = archive_db.search(tok, limit=30)
+            assert any(h["video_id"] == cat_vid for h in hits), \
+                f"'{tok}' must find the catarina rows, hits: {[h['video_id'] for h in hits]}"
+            assert not any(h["video_id"] == cara_vid for h in hits), \
+                f"'{tok}' must not surface the cara-spam rows, hits: {[h['video_id'] for h in hits]}"
+    finally:
+        archive_db.execute(
+            "DELETE FROM messages WHERE video_id IN (?, ?)", (cara_vid, cat_vid)
+        )
+        with archive_db._vocab_lock:
+            archive_db._vocab_cache.pop("messages", None)
+            archive_db._token_cache.clear()
+
+
 def test_search_lang_filter_pt_en_and_hits_carry_lang():
     _seed_search_fixture()
     archive_db.insert_transcript(
