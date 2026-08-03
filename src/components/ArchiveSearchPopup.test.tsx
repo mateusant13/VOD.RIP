@@ -92,6 +92,25 @@ describe('ArchiveSearchPopup', () => {
     expect(embeddedDialog.querySelector('div')!.className).not.toContain('cursor-grab');
   });
 
+  it('floating mode: initialPos seeds the dialog position (default top-right otherwise)', () => {
+    mockFetch();
+    const anchored = render(
+      <ArchiveSearchPopup
+        zIndex={7}
+        initialPos={{ x: 123, y: 45 }}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+      />,
+    );
+    const dialog = anchored.container.querySelector('[role="dialog"]')!;
+    expect(dialog).toHaveStyle({ left: '123px', top: '45px' });
+    anchored.unmount();
+
+    const fallback = render(<ArchiveSearchPopup zIndex={7} onClose={() => {}} onOpenHit={() => {}} />);
+    const fbDialog = fallback.container.querySelector('[role="dialog"]')!;
+    expect(fbDialog).toHaveStyle({ left: `${window.innerWidth - 24 - 460}px`, top: '80px' });
+  });
+
   it('onSeekHit: row click seeks, per-row open affordance still opens', async () => {
     const fetchMock = mockFetch([HIT]);
     const onSeekHit = vi.fn();

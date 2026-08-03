@@ -66,7 +66,7 @@ import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
-import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse } from './types';
+import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, MAX_SAVED_CHANNELS, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
@@ -108,8 +108,6 @@ interface ChannelLiveStatus {
 
 const IS_DEV_UI = import.meta.env.DEV;
 const USE_MSE_DIRECT = import.meta.env.VITE_PREVIEW_MSE_DIRECT === "true";
-/** Docked archive-search panel next to the main preview player (like urlAside). */
-const PREVIEW_SEARCH_DOCK_W = 380;
 // Expose the flag for e2e probes (see e2e/tests/preview-mse-direct.spec.ts).
 (window as unknown as { __VITE_PREVIEW_MSE_DIRECT__?: boolean }).__VITE_PREVIEW_MSE_DIRECT__ = USE_MSE_DIRECT;
 
@@ -564,8 +562,12 @@ export default function App() {
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   /** Per-video scope for the archive search popup (SEARCH THIS VIDEO). */
   const [archiveSearchScope, setArchiveSearchScope] = useState<{ videoId: string; title: string } | null>(null);
-  /** Docked search panel next to the main preview player (SEARCH THIS VIDEO / SEARCH ARCHIVE). */
+  /** Floating archive-search popup anchored to the main preview panel
+   *  (SEARCH THIS VIDEO / SEARCH ARCHIVE). Floating — never part of the
+   *  panel row — so opening it cannot move or resize the panels. */
   const [previewSearchOpen, setPreviewSearchOpen] = useState(false);
+  /** Seed position computed from the preview panel rect at open time. */
+  const previewSearchAnchorRef = useRef<PanelPos | null>(null);
   const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
   const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
   const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
@@ -2605,6 +2607,24 @@ export default function App() {
     }
   }, [previewFullscreen]);
 
+
+  const togglePreviewSearch = useCallback(() => {
+    const next = !previewSearchOpen;
+    if (next) {
+      const rect = previewPanelRef.current?.getBoundingClientRect();
+      if (rect) {
+        // Anchor just right of the preview panel, top-aligned, clamped to the viewport.
+        const popupW = 460;
+        previewSearchAnchorRef.current = {
+          x: Math.max(8, Math.min(rect.right + 8, window.innerWidth - popupW - 8)),
+          y: Math.max(8, rect.top),
+        };
+      } else {
+        previewSearchAnchorRef.current = null;
+      }
+    }
+    setPreviewSearchOpen(next);
+  }, [previewSearchOpen]);
 
   const focusPreviewPlayer = useCallback(() => {
     previewContainerRef.current?.focus();
@@ -5533,7 +5553,7 @@ export default function App() {
             <div className="flex items-center gap-1.5 shrink-0">
               <button
                 type="button"
-                onClick={() => setPreviewSearchOpen((o) => !o)}
+                onClick={togglePreviewSearch}
                 aria-pressed={previewSearchOpen}
                 title="Search the local archive (transcripts + chat)"
                 className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
@@ -5668,22 +5688,6 @@ export default function App() {
           {!previewFullscreen && (
             <PanelResizeHandles onPointerDown={onPreviewPanelResize} />
           )}
-        </div>
-      )}
-      {previewOpen && previewSearchOpen && (
-        <div
-          className="relative shrink-0 self-stretch bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 overflow-hidden"
-          style={{ width: PREVIEW_SEARCH_DOCK_W }}
-        >
-          <ArchiveSearchPopup
-            embedded
-            zIndex={0}
-            onClose={() => setPreviewSearchOpen(false)}
-            onOpenHit={openArchiveHit}
-            onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
-            scope={previewArchiveVideoId ? { videoId: previewArchiveVideoId, title: videoInfo?.title ?? '' } : undefined}
-            savedChannels={savedChannels}
-          />
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
@@ -6463,6 +6467,17 @@ export default function App() {
           onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); }}
           onOpenHit={openArchiveHit}
           scope={archiveSearchScope ?? undefined}
+          savedChannels={savedChannels}
+        />
+      )}
+      {previewOpen && previewSearchOpen && (
+        <ArchiveSearchPopup
+          zIndex={EXPLORE_POPUP_Z - 100}
+          initialPos={previewSearchAnchorRef.current ?? undefined}
+          onClose={() => setPreviewSearchOpen(false)}
+          onOpenHit={openArchiveHit}
+          onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
+          scope={previewArchiveVideoId ? { videoId: previewArchiveVideoId, title: videoInfo?.title ?? '' } : undefined}
           savedChannels={savedChannels}
         />
       )}

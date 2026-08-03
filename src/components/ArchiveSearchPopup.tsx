@@ -65,6 +65,9 @@ interface ArchiveSearchPopupProps {
   scope?: { videoId: string; title: string };
   /** Optional saved channels (App state) — unioned into the channel dropdown. */
   savedChannels?: SavedChannel[];
+  /** Floating-mode seed position (e.g. anchored next to the preview panel);
+   *  defaults to the viewport top-right. Ignored in embedded mode. */
+  initialPos?: PanelPos;
 }
 
 type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
@@ -99,9 +102,11 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels }: ArchiveSearchPopupProps) {
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels, initialPos }: ArchiveSearchPopupProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
+  // Seed exactly once from the caller-supplied anchor (else viewport top-right).
+  const initialPosRef = useRef<PanelPos | null>(initialPos ?? null);
   const sizeRef = useRef<{ w: number; h: number } | null>(null);
   const [, setPos] = useState<PanelPos | null>(null);
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
@@ -153,7 +158,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     const el = containerRef.current;
     if (embedded || !el) return;
     if (!posRef.current) {
-      posRef.current = seedPos(sizeRef.current?.w ?? POPUP_WIDTH);
+      posRef.current = initialPosRef.current ?? seedPos(sizeRef.current?.w ?? POPUP_WIDTH);
       setPos(posRef.current);
     }
     if (!sizeRef.current) sizeRef.current = { w: POPUP_WIDTH, h: defaultPopupHeight() };
