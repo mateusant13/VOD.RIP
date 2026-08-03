@@ -35,11 +35,21 @@ export const ARCHIVE_PLATFORMS = ['youtube', 'twitch', 'kick'] as const;
 export const ARCHIVE_KINDS = ['vod', 'clip', 'short', 'live'] as const;
 export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
 
+export const ARCHIVE_SOURCES = ['both', 'transcript', 'chat'] as const;
+export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
+
 export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
   vod: 'VOD',
   clip: 'CLIP',
   short: 'SHORT',
   live: 'LIVE',
+};
+
+/** UI labels for the source filter — STREAMER is the user-facing word for transcript. */
+export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
+  both: 'BOTH',
+  transcript: 'STREAMER',
+  chat: 'CHAT',
 };
 
 /** Upper-case label for a kind value; unknown/empty stays as-is. */
@@ -59,12 +69,16 @@ export function isValidDateParam(value: string): boolean {
 
 export interface ArchiveSearchFilterParams {
   query: string;
-  /** Empty/omitted = all channels. */
+  /** Empty/omitted = all channels; comma-joined slugs match ANY of them. */
   channel?: string | null;
   /** Empty = all platforms; multiple join as comma-separated. */
   platforms?: readonly string[] | null;
   /** Empty = all kinds; multiple join as comma-separated. */
   kinds?: readonly string[] | null;
+  /** 'both' (default) | 'chat' | 'transcript' — omitted from the URL when 'both'. */
+  source?: ArchiveSource | null;
+  /** Scope the search to a single archived video id; omitted when unset. */
+  videoId?: string | null;
   /** YYYY-MM-DD inclusive bounds on started_at; empty = unset. */
   dateFrom?: string | null;
   dateTo?: string | null;
@@ -80,6 +94,8 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (platforms.length > 0) params.set('platform', platforms.join(','));
   const kinds = (p.kinds ?? []).filter(Boolean);
   if (kinds.length > 0) params.set('kind', kinds.join(','));
+  if (p.source && p.source !== 'both') params.set('source', p.source);
+  if (p.videoId) params.set('video_id', p.videoId);
   const dateFrom = p.dateFrom && isValidDateParam(p.dateFrom) ? p.dateFrom : null;
   const dateTo = p.dateTo && isValidDateParam(p.dateTo) ? p.dateTo : null;
   if (dateFrom) params.set('date_from', dateFrom);
@@ -190,10 +206,16 @@ export function groupChatWindow(
  * Previewable URL for an archived VOD. Mirrors channelUtils.buildVodUrl for
  * the three archive platforms; the kick URL needs the channel slug, so an
  * unknown channel falls back to the plain /videos/ route.
+ *
+ * Returns '' for watchdog synthetic ids (youtube-live-<slug>-<epoch-ms>):
+ * those rows have no real video on the platform (the URL would 404), so
+ * callers skip the preview flow. Type stays string so every existing caller
+ * keeps compiling; guards check falsiness.
  */
 export function buildArchiveVodUrl(platform: string, videoId: string, channel?: string | null): string {
   const p = (platform || '').toLowerCase();
   const id = videoId.trim();
+  if (/^[a-z]+-live-[a-z0-9_]+-\d+$/.test(id)) return '';
   if (p === 'twitch') return `https://www.twitch.tv/videos/${id.replace(/^v/, '')}`;
   if (p === 'youtube') return `https://www.youtube.com/watch?v=${id}`;
   const slug = (channel || '').trim();

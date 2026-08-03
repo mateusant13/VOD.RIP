@@ -408,3 +408,123 @@ async def test_search_date_requires_strict_iso():
     _seed_search_fixture()
     resp = await archive_search(q="zebra", date_from="2026-08-01", limit=20)
     assert _hit_ids(resp["hits"]) == {("message", "filter-t-yt")}
+
+
+# --- source / video_id / comma-channel (search panel v2) ------------------
+
+
+def test_search_source_chat_only_messages():
+    _seed_search_fixture()
+    assert _hit_ids(archive_db.search("zebra", source="chat")) == {
+        ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
+        ("message", "filter-t-yt"),
+    }
+
+
+def test_search_source_transcript_only():
+    _seed_search_fixture()
+    assert _hit_ids(archive_db.search("zebra", source="transcript")) == {
+        ("transcript", "filter-t-lubu"),
+    }
+
+
+def test_search_source_both_is_default():
+    _seed_search_fixture()
+    assert len(archive_db.search("zebra")) == 4
+    assert len(archive_db.search("zebra", source="both")) == 4
+
+
+def test_search_video_id_scopes_to_one_video():
+    _seed_search_fixture()
+    # A louder hit on ANOTHER video would outrank every scoped hit — the
+    # video_id filter must exclude it at SQL level, not by post-filtering.
+    archive_db.insert_messages(
+        "twitch", "filter-t-louder",
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra zebra zebra zebra"}],
+    )
+    try:
+        assert archive_db.search("zebra", limit=1)[0]["video_id"] == "filter-t-louder"
+        hits = archive_db.search("zebra", video_id="filter-t-lubu")
+        assert _hit_ids(hits) == {
+            ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
+        }
+        assert all(h["video_id"] == "filter-t-lubu" for h in hits)
+    finally:
+        archive_db.execute("DELETE FROM messages WHERE video_id='filter-t-louder'")
+
+
+def test_search_video_id_composes_with_source_and_channel():
+    _seed_search_fixture()
+    assert _hit_ids(archive_db.search("zebra", video_id="filter-t-lubu", source="chat")) == {
+        ("message", "filter-t-lubu"),
+    }
+    assert _hit_ids(archive_db.search("zebra", video_id="filter-t-lubu", source="transcript")) == {
+        ("transcript", "filter-t-lubu"),
+    }
+    assert _hit_ids(archive_db.search(
+        "zebra", video_id="filter-t-lubu", channel="titiltei",
+    )) == set()
+
+
+def test_search_channel_comma_list_matches_any_slug():
+    _seed_search_fixture()
+    hits = archive_db.search("zebra", channel="lubu,titiltei")
+    assert _hit_ids(hits) == {
+        ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
+        ("message", "filter-t-titiltei"),
+    }
+    # case-sensitive exact match per slug: "titiltei" ≠ "TiTiltei" (youtube)
+    assert not any(h["video_id"] == "filter-t-yt" for h in hits)
+
+
+def test_search_channel_single_value_keeps_exact_match():
+    _seed_search_fixture()
+    assert _hit_ids(archive_db.search("zebra", channel="lubu")) == {
+        ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
+    }
+    # empty segments are dropped defensively at the db layer
+    assert _hit_ids(archive_db.search("zebra", channel="lubu,")) == {
+        ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
+    }
+
+
+async def test_search_source_router_validation_and_passthrough():
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_search_fixture()
+    resp = await archive_search(q="zebra", source="chat", limit=20)
+    assert _hit_ids(resp["hits"]) == {
+        ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
+        ("message", "filter-t-yt"),
+    }
+    resp = await archive_search(q="zebra", source="TRANSCRIPT", limit=20)
+    assert _hit_ids(resp["hits"]) == {("transcript", "filter-t-lubu")}
+    resp = await archive_search(q="zebra", source="both", limit=20)
+    assert len(resp["hits"]) == 4
+    for bad in ("streamer", "chat,transcript"):
+        with pytest.raises(HTTPException) as exc:
+            await archive_search(q="zebra", source=bad, limit=20)
+        assert exc.value.status_code == 400
+
+
+async def test_search_video_id_router_passthrough():
+    from routers.archive import archive_search
+
+    _seed_search_fixture()
+    resp = await archive_search(q="zebra", video_id="filter-t-lubu", limit=20)
+    assert _hit_ids(resp["hits"]) == {
+        ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
+    }
+
+
+async def test_search_channel_empty_segment_router_400():
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_search_fixture()
+    with pytest.raises(HTTPException) as exc:
+        await archive_search(q="zebra", channel="lubu,", limit=20)
+    assert exc.value.status_code == 400
+    resp = await archive_search(q="zebra", channel="lubu,titiltei", limit=20)
+    assert len(resp["hits"]) == 3
