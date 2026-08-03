@@ -7,7 +7,7 @@ POST /api/session/cookies  {token, cookies:[...]}  — pairing happens on the
     disabled (cookie_bridge_enabled setting).
 GET  /api/session/cookies/pull?platform=  — Netscape cookies.txt (text/plain)
     with only the keep-listed cookie names for that platform.
-GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:count}}
+GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}}}
 GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
 POST /api/session/cookies/enable|disable — kill switch (consent toggle).
 GET  /api/session/cookies/extension/update.xml  — policy-install manifest.
@@ -270,7 +270,7 @@ async def session_cookies_status():
     return {
         "paired": bool(_paired_token()),
         "enabled": bool(settings_mgr.get().cookie_bridge_enabled),
-        "platforms": cookie_store.counts(),
+        "platforms": cookie_store.status(),
     }
 
 

@@ -12,16 +12,29 @@ import { apiGet, apiPost } from '../hooks/useApiClient';
  * while disabled).
  */
 
+interface PlatformBridgeStatus {
+  count: number;
+  lastGrabAt: string | null;
+  expiredCount: number;
+}
+
 interface BridgeStatus {
   paired: boolean;
   enabled: boolean;
-  platforms: Record<string, number>;
+  platforms: Record<string, PlatformBridgeStatus>;
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
   youtube: 'YouTube',
   twitch: 'Twitch',
   kick: 'Kick',
+};
+
+const formatGrabTime = (iso: string | null): string => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
 export default function CookieBridgeSection() {
@@ -119,9 +132,13 @@ export default function CookieBridgeSection() {
           {status?.paired ? '● paired' : '○ not paired'}
         </span>
         {Object.keys(platforms).length > 0 ? (
-          Object.entries(platforms).map(([platform, count]) => (
-            <span key={platform} className="text-zinc-500">
-              {PLATFORM_LABELS[platform] ?? platform}: {count}
+          Object.entries(platforms).map(([platform, st]) => (
+            <span key={platform} className={st.count > 0 ? 'text-zinc-500' : 'text-zinc-700'}>
+              {PLATFORM_LABELS[platform] ?? platform}: {st.count}
+              {st.lastGrabAt ? ` · ${formatGrabTime(st.lastGrabAt)}` : ''}
+              {st.expiredCount > 0 ? (
+                <span className="text-amber-500"> · {st.expiredCount} expired</span>
+              ) : null}
             </span>
           ))
         ) : (
