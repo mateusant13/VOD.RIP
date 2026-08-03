@@ -6,6 +6,7 @@ import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
+import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 import {
@@ -64,6 +65,7 @@ import {
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
 import type { PreviewSessionResponse } from './types';
+import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
@@ -112,8 +114,8 @@ interface ChannelExplorePopupProps {
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
   onBringToFront: () => void;
-  /** Open archive search restricted to this video (App owns the popup). */
-  onSearchVideo?: (videoId: string, title: string) => void;
+  /** Open an archive hit in the explore-player flow (App owns the popup stack). */
+  onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
 }
 
 
@@ -142,7 +144,7 @@ export default function ChannelExplorePopup({
   onUnregisterPause,
   onVolumeMenuOpen,
   onBringToFront,
-  onSearchVideo,
+  onOpenHit,
 }: ChannelExplorePopupProps) {
   const [playback, setPlayback] = useState<{
     url: string;
@@ -171,6 +173,8 @@ export default function ChannelExplorePopup({
   const [fullscreen, setFullscreen] = useState(false);
   const [fsControlsVisible, setFsControlsVisible] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** Docked archive-search panel (SEARCH THIS VIDEO) inside this popup. */
+  const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   // Per-media preview retry: which single media failed + how many retries
   // already failed, so the overlay's RETRY button escalates stage → full.
   const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
@@ -1449,12 +1453,17 @@ export default function ChannelExplorePopup({
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              {vod.videoId && onSearchVideo && (
+              {vod.videoId && (
                 <button
                   type="button"
-                  onClick={() => onSearchVideo(vod.videoId!, vod.title)}
+                  onClick={() => setArchiveSearchOpen((o) => !o)}
+                  aria-pressed={archiveSearchOpen}
                   title="Search the local archive for this video only"
-                  className="flex items-center gap-1 border border-zinc-700 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold text-zinc-400 hover:text-white hover:border-white"
+                  className={`flex items-center gap-1 border px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                    archiveSearchOpen
+                      ? 'bg-white text-black border-white'
+                      : 'border-zinc-700 text-zinc-400 hover:text-white hover:border-white'
+                  }`}
                 >
                   <Search size={10} className="shrink-0" />
                   Search this video
@@ -1599,6 +1608,18 @@ export default function ChannelExplorePopup({
             </button>
           )}
         </div>
+        {!fullscreen && archiveSearchOpen && vod.videoId && (
+          <div className="shrink-0 min-h-0 flex flex-col" style={{ height: '45vh' }}>
+            <ArchiveSearchPopup
+              embedded
+              zIndex={0}
+              onClose={() => setArchiveSearchOpen(false)}
+              onOpenHit={onOpenHit}
+              onSeekHit={(hit) => seekVideo(hit.offset_sec)}
+              scope={{ videoId: vod.videoId, title: vod.title }}
+            />
+          </div>
+        )}
         {fullscreen && (
           <>
             <div

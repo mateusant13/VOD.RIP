@@ -108,6 +108,8 @@ interface ChannelLiveStatus {
 
 const IS_DEV_UI = import.meta.env.DEV;
 const USE_MSE_DIRECT = import.meta.env.VITE_PREVIEW_MSE_DIRECT === "true";
+/** Docked archive-search panel next to the main preview player (like urlAside). */
+const PREVIEW_SEARCH_DOCK_W = 380;
 // Expose the flag for e2e probes (see e2e/tests/preview-mse-direct.spec.ts).
 (window as unknown as { __VITE_PREVIEW_MSE_DIRECT__?: boolean }).__VITE_PREVIEW_MSE_DIRECT__ = USE_MSE_DIRECT;
 
@@ -558,6 +560,8 @@ export default function App() {
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   /** Per-video scope for the archive search popup (SEARCH THIS VIDEO). */
   const [archiveSearchScope, setArchiveSearchScope] = useState<{ videoId: string; title: string } | null>(null);
+  /** Docked search panel next to the main preview player (SEARCH THIS VIDEO / SEARCH ARCHIVE). */
+  const [previewSearchOpen, setPreviewSearchOpen] = useState(false);
   const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
   const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
   const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
@@ -1088,17 +1092,6 @@ export default function App() {
       postYoutubePreviewCommand('seekTo', [t, true]);
       return;
     }
-  // Replay a queued iframe seek when the YouTube embed API finally binds.
-  useEffect(() => {
-    if (!previewVideoReady || !previewYoutubeEmbedUrl) return;
-    const pending = previewPendingSeekSecRef.current;
-    if (pending == null) return;
-    previewPendingSeekSecRef.current = null;
-    previewSeekTargetRef.current = pending;
-    previewTimingRef.current?.markSeekStart(pending);
-    syncPreviewTimeUi(pending, true);
-    postYoutubePreviewCommand('seekTo', [pending, true]);
-  }, [previewVideoReady, previewYoutubeEmbedUrl, syncPreviewTimeUi, postYoutubePreviewCommand]);
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
     previewSeekTargetRef.current = t;
@@ -1290,6 +1283,18 @@ export default function App() {
     );
     finishSeek();
   }, [previewYoutubeEmbedUrl, previewVideoReady, syncPreviewTimeUi, url, applyPreviewSessionRefresh, postYoutubePreviewCommand]);
+
+  // Replay a queued iframe seek when the YouTube embed API finally binds.
+  useEffect(() => {
+    if (!previewVideoReady || !previewYoutubeEmbedUrl) return;
+    const pending = previewPendingSeekSecRef.current;
+    if (pending == null) return;
+    previewPendingSeekSecRef.current = null;
+    previewSeekTargetRef.current = pending;
+    previewTimingRef.current?.markSeekStart(pending);
+    syncPreviewTimeUi(pending, true);
+    postYoutubePreviewCommand('seekTo', [pending, true]);
+  }, [previewVideoReady, previewYoutubeEmbedUrl, syncPreviewTimeUi, postYoutubePreviewCommand]);
 
   const seekPreviewVideo = useCallback((sec: number, force = false) => {
     const start = previewTrimStartRef.current;
@@ -2850,12 +2855,6 @@ export default function App() {
       return after;
     });
   }, [pauseAllExplorePopups, assignExplorePopupZ]);
-
-  /** Open the archive search restricted to one video (SEARCH THIS VIDEO). */
-  const openScopedSearch = useCallback((videoId: string, title: string) => {
-    setArchiveSearchScope({ videoId, title });
-    setArchiveSearchOpen(true);
-  }, []);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -5470,17 +5469,20 @@ export default function App() {
               </span>
             )}
             <div className="flex items-center gap-1.5 shrink-0">
-              {previewArchiveVideoId && (
-                <button
-                  type="button"
-                  onClick={() => openScopedSearch(previewArchiveVideoId, videoInfo?.title ?? '')}
-                  title="Search the local archive for this video only"
-                  className="flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white"
-                >
-                  <Search size={10} className="shrink-0" />
-                  SEARCH THIS VIDEO
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => setPreviewSearchOpen((o) => !o)}
+                aria-pressed={previewSearchOpen}
+                title="Search the local archive (transcripts + chat)"
+                className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                  previewSearchOpen
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+                }`}
+              >
+                <Search size={10} className="shrink-0" />
+                {previewArchiveVideoId ? 'SEARCH THIS VIDEO' : 'SEARCH ARCHIVE'}
+              </button>
               <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
                 <X size={18} />
               </button>
@@ -5604,6 +5606,22 @@ export default function App() {
           {!previewFullscreen && (
             <PanelResizeHandles onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
           )}
+        </div>
+      )}
+      {previewOpen && previewSearchOpen && (
+        <div
+          className="relative shrink-0 self-stretch bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 overflow-hidden"
+          style={{ width: PREVIEW_SEARCH_DOCK_W }}
+        >
+          <ArchiveSearchPopup
+            embedded
+            zIndex={0}
+            onClose={() => setPreviewSearchOpen(false)}
+            onOpenHit={openArchiveHit}
+            onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
+            scope={previewArchiveVideoId ? { videoId: previewArchiveVideoId, title: videoInfo?.title ?? '' } : undefined}
+            savedChannels={savedChannels}
+          />
         </div>
       )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
@@ -6326,7 +6344,7 @@ export default function App() {
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
               onBringToFront={() => bringExplorePopupToFront(entry.id)}
-              onSearchVideo={openScopedSearch}
+              onOpenHit={openArchiveHit}
             />
           ))}
         </>,
@@ -6342,6 +6360,8 @@ export default function App() {
               stackIndex={i}
               onClose={() => closeLocalFilePopup(entry.id)}
               onBringToFront={() => {}}
+              onOpenHit={openArchiveHit}
+              savedChannels={savedChannels}
             />
           ))}
         </>,
@@ -6370,6 +6390,8 @@ export default function App() {
             channelSlug={slug}
             vodUrl={newestVod ? buildVodUrl(newestVod) : undefined}
             onClose={() => setLivePopupEntry(null)}
+            onOpenHit={openArchiveHit}
+            savedChannels={savedChannels}
           />
         );
       })()}

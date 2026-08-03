@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Maximize2, Minimize2, Pause, Play, Volume2, VolumeX, RefreshCw } from 'lucide-react';
+import { ExternalLink, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
-import type { PanelSize, PreviewSessionResponse } from '../types';
+import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
+import ArchiveSearchPopup from './ArchiveSearchPopup';
+import type { ArchiveSearchHit, ArchiveVideoRow } from '../archiveSearchUtils';
 import {
   PanelResizeHandles,
   panelResizeHandleInset,
@@ -37,6 +39,10 @@ interface LivePlayerPopupProps {
   channelSlug?: string;
   /** Channel's current (in-progress) VOD URL — DVR REPLAY archive source. */
   vodUrl?: string;
+  /** Open an archive hit in the explore-player flow (App owns the popup stack). */
+  onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** Optional saved channels (App state) — unioned into the channel dropdown. */
+  savedChannels?: SavedChannel[];
 }
 
 type DragState = {
@@ -59,7 +65,7 @@ const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while res
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
 
-export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels }: LivePlayerPopupProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -96,6 +102,8 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const [volume, setVolume] = useState(1);
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  /** Docked archive-search panel (global search — live has no archive identity). */
+  const [searchOpen, setSearchOpen] = useState(false);
 
   // Quality state
   const [levels, setLevels] = useState<LevelInfo[]>([]);
@@ -695,7 +703,8 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
   // --- Dragging (header bar only, so transport buttons don't fight the drag) ---
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest('.live-popup-close') || (e.target as HTMLElement).closest('.live-popup-link')) return;
+    const t = e.target as HTMLElement;
+    if (t.closest('.live-popup-close') || t.closest('.live-popup-link') || t.closest('.live-popup-search')) return;
     setDrag({ startX: e.clientX, startY: e.clientY, offsetX: posRef.current.x, offsetY: posRef.current.y });
   }, []);
 
@@ -819,6 +828,25 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
             </button>
           )}
           <button
+            className="live-popup-search"
+            onClick={() => setSearchOpen((o) => !o)}
+            style={{
+              background: 'none',
+              border: searchOpen ? '1px solid #fff' : 'none',
+              color: searchOpen ? '#fff' : '#888',
+              cursor: 'pointer',
+              fontSize: 16,
+              lineHeight: 1,
+              padding: '2px 6px',
+              borderRadius: 4,
+              display: 'flex',
+              alignItems: 'center',
+            }}
+            title="Search the local archive (transcripts + chat)"
+          >
+            <Search size={14} />
+          </button>
+          <button
             className="live-popup-close"
             onClick={handleClose}
             style={{
@@ -906,6 +934,24 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
             }}
           >
             Buffering…
+          </div>
+        )}
+
+        {searchOpen && (
+          <div
+            style={{
+              position: 'absolute', inset: 0, zIndex: 20,
+              display: 'flex', flexDirection: 'column',
+              background: '#111', borderRadius: '0 0 8px 8px',
+            }}
+          >
+            <ArchiveSearchPopup
+              embedded
+              zIndex={0}
+              onClose={() => setSearchOpen(false)}
+              onOpenHit={onOpenHit}
+              savedChannels={savedChannels}
+            />
           </div>
         )}
 
