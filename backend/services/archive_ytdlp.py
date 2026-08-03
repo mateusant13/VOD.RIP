@@ -6,7 +6,8 @@ playlist extractor so the whole channel is one lightweight call.
 
 Live chat is best-effort: only streams (live_status == 'was_live') have chat
 replay; VODs yield zero chat rows and report chat: 'none'. Captions come from
-YouTube's auto-generated tracks (pt preferred, then en, then any language).
+YouTube's auto-generated tracks — the primary language (pt preferred, then en,
+then any) plus a secondary of the other family (pt/en) when both exist.
 
 All offsets written to the archive are float seconds into the stream
 (archive contract). Chat offset uses yt-dlp's replay fragment
@@ -372,24 +373,72 @@ def _yt_opts(outdir: Path) -> dict:
     }
 
 
-def _pick_caption_for(info: dict, fmt: str) -> tuple[Optional[str], Optional[str]]:
-    """Best auto-caption track for one format: pt > pt-br > en > first."""
+def _lang_group(lang: str) -> Optional[str]:
+    """Language family of a caption track code: 'pt' | 'en' | None."""
+    base = (lang or "").lower().split("-")[0]
+    return base if base in ("pt", "en") else None
+
+
+def _best_in_group(merged: dict, group: str, fmt: str) -> Optional[tuple[str, str]]:
+    """Best (lang, url) track of one language family for a format, or None."""
+    for lang in _CAPTION_LANG_PREF:
+        if _lang_group(lang) != group:
+            continue
+        for entry in merged.get(lang) or []:
+            if entry.get("ext") == fmt and entry.get("url"):
+                return lang, entry["url"]
+    for lang, entries in merged.items():
+        if _lang_group(lang) != group or lang in _CAPTION_LANG_PREF:
+            continue
+        for entry in entries:
+            if entry.get("ext") == fmt and entry.get("url"):
+                return lang, entry["url"]
+    return None
+
+
+def _pick_captions_for(info: dict, fmt: str) -> list[tuple[str, str]]:
+    """Best auto-caption tracks for one format: [primary, secondary?].
+
+    Primary keeps the old rule (pt > pt-br > en > first). Secondary is the
+    best track of the OTHER language family (pt vs en) when both exist, so a
+    bilingual video stores both transcripts. Single-family videos yield one
+    element; nothing serving this format yields []."""
     ac = info.get("automatic_captions") or {}
     subs = info.get("subtitles") or {}
     merged = dict(ac)
     for k, v in subs.items():
         merged.setdefault(k, v)
+    out: list[tuple[str, str]] = []
     for lang in _CAPTION_LANG_PREF:
         for entry in merged.get(lang) or []:
             if entry.get("ext") == fmt and entry.get("url"):
-                return lang, entry["url"]
-    for lang, entries in merged.items():
-        if lang == "live_chat":
-            continue
-        for entry in entries:
-            if entry.get("ext") == fmt and entry.get("url"):
-                return lang, entry["url"]
-    return None, None
+                out.append((lang, entry["url"]))
+                break
+        if out:
+            break
+    if not out:
+        for lang, entries in merged.items():
+            if lang == "live_chat":
+                continue
+            for entry in entries:
+                if entry.get("ext") == fmt and entry.get("url"):
+                    out.append((lang, entry["url"]))
+                    break
+            if out:
+                break
+    if out:
+        group = _lang_group(out[0][0])
+        if group in ("pt", "en"):
+            second = _best_in_group(merged, "en" if group == "pt" else "pt", fmt)
+            if second and second[0] != out[0][0]:
+                out.append(second)
+    return out
+
+
+def _pick_caption_for(info: dict, fmt: str) -> tuple[Optional[str], Optional[str]]:
+    """Best auto-caption track for one format (primary only)."""
+    picks = _pick_captions_for(info, fmt)
+    return (picks[0][0], picks[0][1]) if picks else (None, None)
 
 
 def _fetch_caption(ydl: Any, info: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -419,6 +468,36 @@ def _fetch_caption(ydl: Any, info: dict) -> tuple[Optional[str], Optional[str], 
                 )
                 break  # next format
     return None, None, None
+
+
+def _fetch_captions(ydl: Any, info: dict) -> list[tuple[str, str, str]]:
+    """Fetch every picked caption track (primary + secondary family).
+
+    Same policy as _fetch_caption (vtt -> json3 -> srv3, 429 retry/backoff)
+    applied per track; one track per language family. Returns
+    [(lang, fmt, payload), ...] — empty when nothing served."""
+    out: list[tuple[str, str, str]] = []
+    for fmt in _CAPTION_FMTS:
+        for lang, url in _pick_captions_for(info, fmt):
+            if any(existing_lang == lang for existing_lang, _, _ in out):
+                continue  # one track per language family is enough
+            for attempt in range(_CAPTION_RETRIES):
+                try:
+                    data = ydl.urlopen(url).read().decode("utf-8", "replace")
+                    out.append((lang, fmt, data))
+                    break
+                except Exception as exc:
+                    if getattr(exc, "code", None) == 429 and attempt < _CAPTION_RETRIES - 1:
+                        time.sleep(_CAPTION_BACKOFF_S)
+                        continue
+                    logger.warning(
+                        "caption fetch %s (%s) failed for %s: %s",
+                        fmt, lang, info.get("id"), exc,
+                    )
+                    break  # next track/format
+        if len(out) >= 2:
+            break
+    return out
 
 
 def _video_url(id_or_url: str) -> str:
@@ -526,14 +605,20 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
 
             # Auto captions -> transcript segments (vtt -> json3 -> srv3
             # fallback; failures stay non-fatal, reported as caption_error).
+            # Both language families (pt + en) are ingested when present.
             try:
-                lang, fmt, data = _fetch_caption(ydl, info)
-                report["caption_lang"] = lang
-                if data:
+                tracks = _fetch_captions(ydl, info)
+                if tracks:
+                    report["caption_lang"] = tracks[0][0]
+                for lang, fmt, data in tracks:
                     segments = _parse_caption(fmt, data)
                     if segments:
-                        _db_write(archive_db.insert_transcript, PLATFORM, video_id, segments)
-                        report["transcript_segments"] = len(segments)
+                        _db_write(
+                            archive_db.insert_transcript,
+                            PLATFORM, video_id, segments,
+                            lang=lang,
+                        )
+                        report["transcript_segments"] += len(segments)
             except Exception as exc:
                 logger.warning("captions failed for %s: %s", video_id, exc)
                 report["caption_error"] = str(exc)
