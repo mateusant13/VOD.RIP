@@ -217,9 +217,9 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const select = screen.getByLabelText('Channel') as HTMLSelectElement;
     const labels = [...select.options].map((o) => o.textContent);
-    expect(labels).toEqual(
-      expect.arrayContaining(['srdogg', 'srdogg / srdoglol', 'srdoglol']),
-    );
+    // Saved channel wins both archived slug groups (srdogg/srdoglol) — one
+    // merged option, no bare duplicates (placeholder aside).
+    expect(labels.slice(1)).toEqual(['srdogg / srdoglol']);
     const savedOpt = [...select.options].find((o) => o.value === 'srdogg,srdoglol');
     expect(savedOpt).toBeTruthy();
 
@@ -231,6 +231,111 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&channel=srdogg%2Csrdoglol')).toBeTruthy(),
     );
+  });
+
+  it('dedups archived channel casing variants into one canonical option', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => new Response('{}', { status: 404 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const videos = {
+      videos: [
+        { platform: 'twitch', video_id: 'v1', channel: 'Titiltei', title: 'A' },
+        { platform: 'kick', video_id: 'k1', channel: 'titiltei', title: 'B' },
+        { platform: 'youtube', video_id: 'yt1', channel: 'TiTiltei', title: 'C' },
+        { platform: 'youtube', video_id: 'yt2', channel: 'lubumr', title: 'D' },
+      ],
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(videos), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const select = screen.getByLabelText('Channel') as HTMLSelectElement;
+    // First option is the ALL CHANNELS placeholder.
+    const labels = [...select.options].map((o) => o.textContent).slice(1);
+    expect(labels).toEqual(['lubumr', 'Titiltei']);
+    const opt = [...select.options].find((o) => o.value.startsWith('Titiltei'));
+    expect(opt?.value).toBe('Titiltei,titiltei,TiTiltei');
+  });
+
+  it('every-day toggle: default on; date pick unchecks; re-check ignores dates; uncheck re-applies', async () => {
+    const fetchMock = mockFetch();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+
+    // Default: EVERY DAY checked, no date params sent.
+    const dayBtn = screen.getByRole('button', { name: 'EVERY DAY' });
+    expect(dayBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('date_from=');
+
+    // Picking a date unchecks it and applies the range.
+    fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
+    );
+    expect(screen.getByRole('button', { name: 'EVERY DAY' })).toHaveAttribute('aria-pressed', 'false');
+
+    // Re-checking keeps the stored value but ignores it.
+    fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).not.toContain('date_from=');
+    });
+    expect((screen.getByLabelText('From date') as HTMLInputElement).value).toBe('2026-07-30');
+
+    // Unchecking re-applies the still-stored date.
+    fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
+    );
+  });
+
+  it('lang chips appear only when both languages exist and send lang param', async () => {
+    const hits = [
+      { kind: 'transcript' as const, platform: 'youtube', video_id: 'yt1', offset_sec: 1, text: 'ola mundo', score: 1, channel: 'titiltei', lang: 'pt' },
+      { kind: 'transcript' as const, platform: 'youtube', video_id: 'yt2', offset_sec: 2, text: 'hello world', score: 1, channel: 'titiltei', lang: 'en' },
+    ];
+    const fetchMock = mockFetch(hits);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+
+    // Both languages present → chips visible.
+    const ptBtn = await screen.findByRole('button', { name: 'PT-BR' });
+    expect(screen.getByRole('button', { name: 'EN' })).toBeInTheDocument();
+
+    fireEvent.click(ptBtn);
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&lang=pt')).toBeTruthy());
+    expect(ptBtn).toHaveAttribute('aria-pressed', 'true');
+
+    // Clicking again clears the filter.
+    fireEvent.click(ptBtn);
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).not.toContain('lang=');
+    });
+  });
+
+  it('lang chips stay hidden when hits carry a single language', async () => {
+    const fetchMock = mockFetch([
+      { kind: 'transcript', platform: 'youtube', video_id: 'yt1', offset_sec: 1, text: 'ola mundo', score: 1, channel: 'titiltei', lang: 'pt' },
+    ]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    await screen.findByRole('button', { name: /ola mundo/i });
+    expect(screen.queryByRole('button', { name: 'PT-BR' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'EN' })).toBeNull();
   });
 
   it('scope: renders the chip, hides channel/platform filters, locks video_id', async () => {
