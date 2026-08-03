@@ -5,9 +5,11 @@ in the pytest session; this module is the only importer, so it is set at
 module top (before `from services import archive_db`), binding the global
 connection to the temp DB.
 
-The DB is pre-created with the LEGACY videos schema (no kind column) and one
-legacy row, so the idempotent ALTER TABLE migration is exercised for real on
-first connect — exactly the upgrade path of an existing user DB.
+The DB is pre-created with the LEGACY videos schema (no kind column) AND
+legacy regular-FTS5 indexes (no content= option), plus one legacy row each,
+so both idempotent migrations (ALTER TABLE kind + external-content FTS
+rebuild) run for real on first connect — exactly the upgrade path of an
+existing user DB.
 
 Run from backend/: python -m pytest tests/test_archive_search_filters.py
 """
@@ -41,12 +43,57 @@ CREATE TABLE videos (
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (platform, video_id)
 );
+CREATE TABLE messages (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  offset_sec REAL NOT NULL,
+  user_id    TEXT,
+  username   TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  badges     TEXT NOT NULL DEFAULT '[]',
+  emotes     TEXT NOT NULL DEFAULT '[]',
+  ts         TEXT
+);
+CREATE TABLE transcripts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  seg_idx    INTEGER NOT NULL,
+  start_sec  REAL NOT NULL,
+  end_sec    REAL NOT NULL,
+  text       TEXT NOT NULL,
+  words_json TEXT NOT NULL DEFAULT '[]'
+);
+-- Legacy regular FTS5 (pre-contentless): text duplicated in the index.
+CREATE VIRTUAL TABLE messages_fts USING fts5(text);
+CREATE VIRTUAL TABLE transcripts_fts USING fts5(text);
 """)
 _legacy.execute(
     """INSERT INTO videos (platform, video_id, channel, title, started_at,
        created_at, updated_at)
        VALUES ('twitch', 'legacy-vid', 'legacychan', 'legacy', '2026-07-30T10:00:00Z',
        '2026-07-30T10:00:00Z', '2026-07-30T10:00:00Z')"""
+)
+# Legacy rows indexed the old way (content + duplicate FTS insert): the
+# rebuild must carry these into the external-content index untouched.
+_legacy.execute(
+    """INSERT INTO messages (platform, video_id, offset_sec, username, text,
+       badges, emotes)
+       VALUES ('twitch', 'legacy-chat', 1.0, 'u', 'legacy shaco chat', '[]', '[]')"""
+)
+_legacy.execute(
+    "INSERT INTO messages_fts (rowid, text) VALUES (?, ?)",
+    (_legacy.execute("SELECT last_insert_rowid()").fetchone()[0], "legacy shaco chat"),
+)
+_legacy.execute(
+    """INSERT INTO transcripts (platform, video_id, seg_idx, start_sec, end_sec,
+       text, words_json)
+       VALUES ('twitch', 'legacy-trans', 0, 0.0, 1.0, 'legacy bronzinhos transcript', '[]')"""
+)
+_legacy.execute(
+    "INSERT INTO transcripts_fts (rowid, text) VALUES (?, ?)",
+    (_legacy.execute("SELECT last_insert_rowid()").fetchone()[0], "legacy bronzinhos transcript"),
 )
 _legacy.commit()
 _legacy.close()
@@ -111,6 +158,74 @@ def test_migration_idempotent_on_second_call():
     archive_db.execute("SELECT kind FROM videos LIMIT 1")
 
 
+def _fts_schema() -> dict[str, str]:
+    rows = archive_db.query(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'"
+    )
+    return {r["name"]: r["sql"] for r in rows}
+
+
+def test_fts_migrated_to_external_content():
+    # Legacy regular-FTS tables must be converted to external-content mode:
+    # text lives once in the content table (no _content shadow), triggers
+    # own the index, and the pre-migration rows are still searchable.
+    sql = _fts_schema()
+    assert "content='messages'" in sql["messages_fts"]
+    assert "content='transcripts'" in sql["transcripts_fts"]
+    for fts, content in (("messages_fts", "messages"), ("transcripts_fts", "transcripts")):
+        shadows = {
+            r[0] for r in archive_db.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                (fts + "%",),
+            )
+        }
+        assert not any(s.endswith("_content") for s in shadows), f"{fts} still stores text"
+        trigs = {
+            r[0] for r in archive_db.query(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE ?",
+                (fts[:-4] + "_%",),
+            )
+        }
+        assert {f"{fts}_ai", f"{fts}_ad", f"{fts}_au"} <= trigs
+        # Rebuilt index is complete: one entry per content row, no dupes.
+        assert archive_db.query(f"SELECT count(*) FROM {fts}")[0][0] == \
+            archive_db.query(f"SELECT count(*) FROM {content}")[0][0]
+    hits = archive_db.search("shaco")
+    assert any(h["kind"] == "message" and h["video_id"] == "legacy-chat" for h in hits)
+    hits = archive_db.search("bronzinhos")
+    assert any(h["kind"] == "transcript" and h["video_id"] == "legacy-trans" for h in hits)
+
+
+def test_fts_migration_idempotent_on_second_call():
+    # Second pass must be a no-op: same DDL, no rebuild, no leftover tables.
+    before = _fts_schema()
+    assert archive_db._migrate_fts_contentless(archive_db.get_conn()) is False
+    assert _fts_schema() == before
+    assert not archive_db.query("SELECT name FROM sqlite_master WHERE name LIKE '%_new'")
+    archive_db.execute("SELECT count(*) FROM messages_fts")
+
+
+def test_fts_delete_cascades_to_index():
+    # The AFTER DELETE triggers own the index: deleting content rows must
+    # remove their entries (self-check scrub relies on this) with no orphans.
+    archive_db.insert_messages(
+        "twitch", "fts-cascade",
+        [{"offset_sec": 1.0, "username": "u", "text": "cascadeprobe chat text"}],
+    )
+    archive_db.insert_transcript(
+        "twitch", "fts-cascade",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "cascadeprobe transcript"}],
+    )
+    assert archive_db.search("cascadeprobe")  # both kinds indexed via triggers
+    archive_db.execute("DELETE FROM messages WHERE video_id='fts-cascade'")
+    archive_db.execute("DELETE FROM transcripts WHERE video_id='fts-cascade'")
+    assert not archive_db.search("cascadeprobe")
+    assert archive_db.query("SELECT count(*) FROM messages_fts")[0][0] == \
+        archive_db.query("SELECT count(*) FROM messages")[0][0]
+    assert archive_db.query("SELECT count(*) FROM transcripts_fts")[0][0] == \
+        archive_db.query("SELECT count(*) FROM transcripts")[0][0]
+
+
 def test_upsert_video_kind_defaults_and_normalizes():
     _insert_video("kind-default")
     _insert_video("kind-clip", kind="CLIP")  # uppercase normalized
@@ -132,14 +247,7 @@ def test_list_videos_returns_kind():
 
 
 def _seed_search_fixture():
-    archive_db.execute(
-        "DELETE FROM messages_fts WHERE rowid IN "
-        "(SELECT id FROM messages WHERE video_id LIKE 'filter-%')"
-    )
-    archive_db.execute(
-        "DELETE FROM transcripts_fts WHERE rowid IN "
-        "(SELECT id FROM transcripts WHERE video_id LIKE 'filter-%')"
-    )
+    # FTS index entries cascade via AFTER DELETE triggers; content deletes only.
     archive_db.execute("DELETE FROM messages WHERE video_id LIKE 'filter-%'")
     archive_db.execute("DELETE FROM transcripts WHERE video_id LIKE 'filter-%'")
     _insert_video("filter-t-lubu", channel="lubu", started_at="2026-07-30T12:00:00Z", kind="vod")

@@ -190,9 +190,7 @@ def _run() -> None:
         "SELECT id FROM transcripts WHERE platform=? AND video_id=? AND seg_idx=?",
         (PLATFORM, VIDEO_ID, last["seg_idx"]),
     )[0]["id"]
-    archive_db.execute(
-        "DELETE FROM transcripts_fts WHERE rowid=?", (last_id,)
-    )
+    # FTS index entry cascades via the AFTER DELETE trigger.
     archive_db.execute("DELETE FROM transcripts WHERE id=?", (last_id,))
     before_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID)
     assert len(before_resume) == len(segs) - 1

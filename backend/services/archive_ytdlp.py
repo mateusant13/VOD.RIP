@@ -461,20 +461,10 @@ def _db_write(fn: Any, *args: Any, **kwargs: Any) -> Any:
 def _clear_video_data(video_id: str) -> None:
     """Drop messages/transcripts/aliases for one video (idempotent re-ingest).
 
-    Keeps FTS5 in sync (regular FTS5 tables do not cascade on base DELETE).
-    """
+    FTS5 index entries cascade via the AFTER DELETE triggers on the content
+    tables (external-content FTS owns no row data)."""
     conn = archive_db.get_conn()
     with conn:
-        conn.execute(
-            "DELETE FROM messages_fts WHERE rowid IN "
-            "(SELECT id FROM messages WHERE platform=? AND video_id=?)",
-            (PLATFORM, video_id),
-        )
-        conn.execute(
-            "DELETE FROM transcripts_fts WHERE rowid IN "
-            "(SELECT id FROM transcripts WHERE platform=? AND video_id=?)",
-            (PLATFORM, video_id),
-        )
         conn.execute("DELETE FROM messages WHERE platform=? AND video_id=?", (PLATFORM, video_id))
         conn.execute("DELETE FROM transcripts WHERE platform=? AND video_id=?", (PLATFORM, video_id))
         conn.execute("DELETE FROM video_aliases WHERE platform=? AND video_id=?", (PLATFORM, video_id))

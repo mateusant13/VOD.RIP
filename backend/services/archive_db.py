@@ -68,9 +68,13 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_video ON messages(platform, video_id, offset_sec);
 
--- Regular FTS5 (not contentless): BM25-rankable, rowid joins to messages,
--- and rows can be deleted (self-check scrub / retention pruning).
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text);
+-- External-content FTS5 (text stored once in the content table; the index
+-- holds token data only). The AFTER INSERT/UPDATE/DELETE triggers created by
+-- _migrate_fts_contentless() own the index — contentless-style tables cannot
+-- be updated directly. Fresh DBs get this DDL; legacy regular-FTS DBs are
+-- converted by the migration on first open.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  text, content='messages', content_rowid='id');
 
 CREATE TABLE IF NOT EXISTS transcripts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +88,8 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_id, start_sec);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(text);
+CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+  text, content='transcripts', content_rowid='id');
 
 CREATE TABLE IF NOT EXISTS video_aliases (
   platform      TEXT NOT NULL,
@@ -165,7 +170,17 @@ def get_conn() -> sqlite3.Connection:
         if not _schema_ready:
             _conn.executescript(SCHEMA)
             _ensure_kind_column(_conn)
+            rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
+            if rebuilt:
+                # Legacy index rebuilds leave the old FTS shadow-table pages
+                # on the freelist; VACUUM + checkpoint so the file actually
+                # shrinks (same pattern as the fresh-open hygiene above).
+                try:
+                    _conn.execute("VACUUM")
+                    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
             _schema_ready = True
         return _conn
 
@@ -182,6 +197,69 @@ def _ensure_kind_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT 'vod'"
             " CHECK (kind IN ('vod','clip','short','live'))"
         )
+
+
+# (fts_table, content_table) pairs kept in sync by FTS triggers.
+_FTS_TABLES = (
+    ("messages_fts", "messages"),
+    ("transcripts_fts", "transcripts"),
+)
+
+# One trigger triple per FTS table. Contentless/external-content indexes
+# cannot be updated in place: the AFTER INSERT/UPDATE/DELETE triggers on the
+# content tables own every index entry. The 'delete' command needs the old
+# row's text, which is why each trigger supplies it explicitly.
+_FTS_TRIGGERS = (
+    """CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {content} BEGIN
+  INSERT INTO {fts}(rowid, text) VALUES (new.id, new.text);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {content} BEGIN
+  INSERT INTO {fts}({fts}, rowid, text) VALUES('delete', old.id, old.text);
+END""",
+    """CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE ON {content} BEGIN
+  INSERT INTO {fts}({fts}, rowid, text) VALUES('delete', old.id, old.text);
+  INSERT INTO {fts}(rowid, text) VALUES (new.id, new.text);
+END""",
+)
+
+
+def _migrate_fts_contentless(conn: sqlite3.Connection) -> bool:
+    """Idempotent migration: convert FTS5 indexes to external-content mode.
+
+    Legacy DBs have `USING fts5(text)` — the index duplicated every
+    message/transcript text. This rebuilds each index as
+    `USING fts5(text, content='<table>', content_rowid='id')` (tokens only;
+    text lives once in the content table) and installs the triggers that own
+    the index from then on. Detects legacy tables by the absence of the
+    content= option in their sqlite_master SQL; PRAGMA table_xinfo cannot
+    tell the modes apart. Runs inside one transaction; returns True when a
+    rebuild happened so the caller can VACUUM the freed pages."""
+    changed = False
+    with conn:
+        for fts, content in _FTS_TABLES:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (fts,)
+            ).fetchone()
+            if row is None or "content=" in (row[0] or ""):
+                continue
+            # Create the new index beside the legacy one, copy the tokens,
+            # then swap names (FTS5 shadow tables follow the rename).
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {fts}_new USING fts5("
+                f"text, content='{content}', content_rowid='id')"
+            )
+            conn.execute(
+                f"INSERT INTO {fts}_new(rowid, text) SELECT id, text FROM {content}"
+            )
+            conn.execute(f"DROP TABLE {fts}")
+            conn.execute(f"ALTER TABLE {fts}_new RENAME TO {fts}")
+            changed = True
+        for fts, content in _FTS_TABLES:
+            # Also covers fresh DBs (SCHEMA creates the external-content
+            # tables; triggers are installed here).
+            for tpl in _FTS_TRIGGERS:
+                conn.execute(tpl.format(fts=fts, content=content))
+    return changed
 
 
 # ponytail: single global lock + connection; upgrade path is per-thread
@@ -269,7 +347,7 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     with _lock:
         with conn:  # transaction
             for r in rows:
-                cur = conn.execute(
+                conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
                        user_id, username, text, badges, emotes, ts)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -285,10 +363,7 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                         r.get("ts"),
                     ),
                 )
-                conn.execute(
-                    "INSERT INTO messages_fts (rowid, text) VALUES (?, ?)",
-                    (cur.lastrowid, r["text"]),
-                )
+                # FTS index entry is written by the messages_ai trigger.
                 count += 1
     return count
 
@@ -314,7 +389,7 @@ def insert_transcript(platform: str, video_id: str, segments: Iterable[dict]) ->
     with _lock:
         with conn:
             for seg in segments:
-                cur = conn.execute(
+                conn.execute(
                     """INSERT INTO transcripts (platform, video_id, seg_idx,
                        start_sec, end_sec, text, words_json)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -328,10 +403,7 @@ def insert_transcript(platform: str, video_id: str, segments: Iterable[dict]) ->
                         json.dumps(seg.get("words", []), ensure_ascii=False),
                     ),
                 )
-                conn.execute(
-                    "INSERT INTO transcripts_fts (rowid, text) VALUES (?, ?)",
-                    (cur.lastrowid, seg["text"]),
-                )
+                # FTS index entry is written by the transcripts_ai trigger.
                 count += 1
     return count
 
@@ -493,14 +565,14 @@ def _now_iso() -> str:
 
 # Module-level self-check: contract invariants must hold on import.
 # Idempotent: scrub leftovers first so re-import (tests, reloads) never trips.
+# FTS index entries cascade via the AFTER DELETE triggers on the content
+# tables — scrub content rows only (external-content FTS owns no row data).
 _conn_selfcheck = get_conn()
 _selfcheck_platform = "twitch"
 _selfcheck_video = "__archive_selfcheck__"
 with _lock:
     _sc_conn = get_conn()
     with _sc_conn:
-        _sc_conn.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE video_id=?)", (_selfcheck_video,))
-        _sc_conn.execute("DELETE FROM transcripts_fts WHERE rowid IN (SELECT id FROM transcripts WHERE video_id=?)", (_selfcheck_video,))
         _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
         _sc_conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
         _sc_conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
@@ -539,8 +611,6 @@ assert any(
 with _lock:
     conn = get_conn()
     with conn:
-        conn.execute("DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE video_id=?)", (_selfcheck_video,))
-        conn.execute("DELETE FROM transcripts_fts WHERE rowid IN (SELECT id FROM transcripts WHERE video_id=?)", (_selfcheck_video,))
         conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
         conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
         conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
