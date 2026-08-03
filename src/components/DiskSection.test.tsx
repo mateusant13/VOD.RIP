@@ -27,7 +27,11 @@ const USAGE = {
 function stubFetch(status: { low: boolean; free_bytes: number; keep_count: number }) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    const body = url.includes("/api/disk/status") ? status : USAGE;
+    const body = url.includes("/api/disk/status")
+      ? status
+      : url.includes("/api/disk/cleanup")
+        ? { freed_bytes: 1024 ** 3 }
+        : USAGE;
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { "Content-Type": "application/json" },
