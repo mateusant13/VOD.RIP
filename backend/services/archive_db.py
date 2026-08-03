@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON archive_jobs(status, created_at);
+
+-- Per-channel/platform last-refresh time for the channel VOD index. The
+-- videos table accumulates fetched channel lists forever (upsert-only);
+-- snapshots decide when a background delta refresh is due.
+CREATE TABLE IF NOT EXISTS channel_snapshots (
+  platform    TEXT NOT NULL CHECK (platform IN ('youtube','twitch','kick')),
+  channel_key TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL,
+  PRIMARY KEY (platform, channel_key)
+);
 """
 
 
@@ -184,6 +194,7 @@ def get_conn() -> sqlite3.Connection:
         if not _schema_ready:
             _conn.executescript(SCHEMA)
             _ensure_kind_column(_conn)
+            _ensure_channel_columns(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -211,6 +222,22 @@ def _ensure_kind_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT 'vod'"
             " CHECK (kind IN ('vod','clip','short','live'))"
         )
+
+
+def _ensure_channel_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add channel-view metadata columns to videos.
+
+    The channel VOD index (upsert_channel_video) stores what the channel
+    list payload needs — duration_string, views, thumbnail_url — so the
+    list can be served straight from the disk index. Additive only; nothing
+    is ever dropped or reset."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "duration_string" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN duration_string TEXT")
+    if "views" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN views INTEGER")
+    if "thumbnail_url" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN thumbnail_url TEXT")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -336,6 +363,75 @@ def upsert_video(video: dict) -> None:
              updated_at=excluded.updated_at""",
         {**row, "created_at": now},
     )
+
+
+def upsert_channel_video(video: dict) -> None:
+    """Upsert a channel-list metadata row WITHOUT touching archive fields.
+
+    The channel view accumulates every VOD it has ever seen for a channel
+    (perma, never pruned). On conflict only list metadata is updated —
+    archive_path, canonical_key, status and ended_at belong to the archive
+    pipeline and must survive intact (a download in flight is never
+    clobbered by a list refresh)."""
+    now = _now_iso()
+    row = {
+        "platform": video["platform"],
+        "video_id": video["video_id"],
+        "channel": video.get("channel", ""),
+        "title": video.get("title", ""),
+        "kind": _normalize_kind(video.get("kind")),
+        "started_at": video.get("started_at"),
+        "duration_sec": video.get("duration_sec"),
+        "duration_string": video.get("duration_string"),
+        "views": video.get("views"),
+        "thumbnail_url": video.get("thumbnail_url"),
+        "updated_at": now,
+    }
+    execute(
+        """INSERT INTO videos (platform, video_id, channel, title, started_at,
+           duration_sec, duration_string, views, thumbnail_url, kind,
+           created_at, updated_at)
+           VALUES (:platform, :video_id, :channel, :title, :started_at,
+           :duration_sec, :duration_string, :views, :thumbnail_url, :kind,
+           :created_at, :updated_at)
+           ON CONFLICT(platform, video_id) DO UPDATE SET
+             channel=excluded.channel, title=excluded.title,
+             started_at=excluded.started_at,
+             duration_sec=excluded.duration_sec,
+             duration_string=excluded.duration_string,
+             views=excluded.views, thumbnail_url=excluded.thumbnail_url,
+             kind=excluded.kind, updated_at=excluded.updated_at""",
+        {**row, "created_at": now},
+    )
+
+
+def touch_channel_snapshot(platform: str, channel_key: str) -> None:
+    """Record that a platform fetch for a channel just succeeded."""
+    execute(
+        """INSERT INTO channel_snapshots (platform, channel_key, fetched_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(platform, channel_key) DO UPDATE SET
+             fetched_at=excluded.fetched_at""",
+        (platform, channel_key, _now_iso()),
+    )
+
+
+def channel_snapshot_age_sec(platform: str, channel_key: str) -> Optional[float]:
+    """Seconds since the last successful fetch, or None when never fetched."""
+    row = query(
+        "SELECT fetched_at FROM channel_snapshots WHERE platform = ? AND channel_key = ?",
+        (platform, channel_key),
+    )
+    if not row:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        fetched = datetime.fromisoformat(row[0]["fetched_at"])
+    except (ValueError, TypeError):
+        return None
+    age = (datetime.now(timezone.utc) - fetched).total_seconds()
+    return max(0.0, age)
 
 
 def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -> list[dict]:

@@ -3770,6 +3770,7 @@ export default function App() {
     content?: 'vods';
     days: number;
     per_platform_errors?: Record<string, string>;
+    refreshing?: boolean;
   };
 
   type ChannelClipsResponse = {
@@ -3850,6 +3851,10 @@ export default function App() {
 
   const channelRefreshInFlightRef = useRef<Set<string>>(new Set());
   const channelRefreshPromisesRef = useRef<Map<string, Promise<void>>>(new Map());
+  // One scheduled silent follow-up per (channel, mode): the backend serves
+  // a stale index instantly and refreshes in the background; this timer
+  // pulls the merged +1 back once the delta lands.
+  const channelFollowupRef = useRef<Set<string>>(new Set());
 
   const clearChannelRefreshFlight = useCallback((channelId: string, mode?: 'vods' | 'clips' | 'streams') => {
     const modes = mode ? [mode] : (['vods', 'clips', 'streams'] as const);
@@ -4036,12 +4041,14 @@ export default function App() {
             kick_slug: ch.kickSlug,
             twitch_login: ch.twitchSlug,
             youtube_slug: ch.youtubeSlug,
+            force: opts?.force ? '1' : '',
           });
           try {
             const data = await apiGet<ChannelVodsResponse>(`/api/channel/videos?${params}${cacheBust}`);
             attempted[platform] = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
+            if (data.refreshing) anyRefreshing = true;
             const pe = data.per_platform_errors?.[platform];
             if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
           } catch (err: unknown) {
@@ -4050,6 +4057,7 @@ export default function App() {
           }
         };
         const vodTasks: Promise<void>[] = [];
+        let anyRefreshing = false;
         if (wantKick) vodTasks.push(fetchVods('Kick', ch.kickSlug));
         if (wantTwitch) vodTasks.push(fetchVods('Twitch', ch.twitchSlug));
         if (wantYoutube) vodTasks.push(fetchVods('YouTube', ch.youtubeSlug));
@@ -4086,6 +4094,19 @@ export default function App() {
             loading: false,
             updatedAt: new Date().toISOString(),
           });
+          // Backend served a stale index and is refreshing in the background:
+          // schedule one silent incremental pull so the merged +1 shows up
+          // without another spinner.
+          if (anyRefreshing) {
+            const followKey = `${channelId}:${mode}`;
+            if (!channelFollowupRef.current.has(followKey)) {
+              channelFollowupRef.current.add(followKey);
+              window.setTimeout(() => {
+                channelFollowupRef.current.delete(followKey);
+                refreshChannel(channelId, ch, mode, { incremental: true, silent: true }).catch(() => {});
+              }, 6000);
+            }
+          }
         }
       }
 

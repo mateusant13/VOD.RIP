@@ -63,3 +63,12 @@ CHANNEL_CLIP_MAX_DURATION_SEC = 60
 CLIP_FETCH_TIMEOUT_SEC = 35
 CHANNEL_VOD_FETCH_TIMEOUT_SEC = 45
 YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 90  # ponytail: yt-dlp cold bootstrap + enrich can exceed 45s
+# Delta refresh: after the disk index is warm, refreshes fetch only the
+# newest N items per platform and merge — never the full list again.
+CHANNEL_DELTA_LIMIT = 25
+# Snapshot freshness windows per platform. YouTube's yt-dlp extract is the
+# expensive one (4-20s, globally serialized) — it runs at most this often
+# per channel in the background.
+KICK_CHANNEL_FRESH_SEC = 600
+TWITCH_CHANNEL_FRESH_SEC = 600
+YOUTUBE_CHANNEL_FRESH_SEC = 1800
