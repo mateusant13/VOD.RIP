@@ -15,6 +15,8 @@ export interface ArchiveSearchHit {
   title?: string | null;
   date?: string | null;
   video_kind?: string | null;
+  /** Transcript language tag ('pt' | 'en' | other code); null for chat rows. */
+  lang?: string | null;
 }
 
 export interface ArchiveVideoRow {
@@ -37,6 +39,15 @@ export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
 
 export const ARCHIVE_SOURCES = ['both', 'transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
+
+/** Transcript language filter values sent to /api/archive/search?lang=… */
+export const ARCHIVE_LANGS = ['pt', 'en'] as const;
+export type ArchiveLang = (typeof ARCHIVE_LANGS)[number];
+
+export const ARCHIVE_LANG_LABELS: Record<string, string> = {
+  pt: 'PT-BR',
+  en: 'EN',
+};
 
 export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
   vod: 'VOD',
@@ -82,6 +93,8 @@ export interface ArchiveSearchFilterParams {
   /** YYYY-MM-DD inclusive bounds on started_at; empty = unset. */
   dateFrom?: string | null;
   dateTo?: string | null;
+  /** Transcript language filter ('pt' | 'en'); omitted when unset. */
+  lang?: string | null;
   limit?: number;
 }
 
@@ -100,6 +113,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   const dateTo = p.dateTo && isValidDateParam(p.dateTo) ? p.dateTo : null;
   if (dateFrom) params.set('date_from', dateFrom);
   if (dateTo) params.set('date_to', dateTo);
+  if (p.lang) params.set('lang', p.lang);
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }

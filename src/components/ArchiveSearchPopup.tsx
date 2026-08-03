@@ -27,6 +27,8 @@ import {
 import {
   ARCHIVE_KIND_LABELS,
   ARCHIVE_KINDS,
+  ARCHIVE_LANG_LABELS,
+  ARCHIVE_LANGS,
   ARCHIVE_PLATFORMS,
   ARCHIVE_SOURCES,
   ARCHIVE_SOURCE_LABELS,
@@ -68,6 +70,10 @@ interface ArchiveSearchPopupProps {
 type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
 
 const POPUP_WIDTH = 460;
+/** Floating-mode seed height — the search panel is tall by default. */
+function defaultPopupHeight(): number {
+  return Math.min(Math.round(window.innerHeight * 0.88), 760);
+}
 const SEARCH_DEBOUNCE_MS = 250;
 const SEARCH_LIMIT = 30;
 const CHAT_HALF_SEC = 30;
@@ -108,6 +114,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [sourceFilter, setSourceFilter] = useState<ArchiveSource>('both');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  /** True = ignore the stored date range (default). A date pick unchecks it;
+   *  re-checking keeps the stored values but search ignores them again. */
+  const [everyDay, setEveryDay] = useState(true);
+  /** '' | 'pt' | 'en' — transcript language filter ('' = all). */
+  const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>('');
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
@@ -145,6 +156,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       posRef.current = seedPos(sizeRef.current?.w ?? POPUP_WIDTH);
       setPos(posRef.current);
     }
+    if (!sizeRef.current) sizeRef.current = { w: POPUP_WIDTH, h: defaultPopupHeight() };
     const sized = sizeRef.current;
     el.style.width = sized ? `${sized.w}px` : `${POPUP_WIDTH}px`;
     el.style.height = sized ? `${sized.h}px` : '';
@@ -181,7 +193,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       setPos(posRef.current);
     }
     if (!sizeRef.current) {
-      sizeRef.current = { w: el.offsetWidth || POPUP_WIDTH, h: el.offsetHeight || 480 };
+      sizeRef.current = { w: el.offsetWidth || POPUP_WIDTH, h: defaultPopupHeight() };
       setSize(sizeRef.current);
     }
     el.style.maxHeight = '';
@@ -227,25 +239,34 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     return () => { cancelled = true; };
   }, []);
 
-  // Every distinct channel in the archive, derived from /api/archive/videos.
-  const archivedChannels = useMemo(() => {
-    const set = new Set<string>();
+  /** Archived channel strings grouped case-insensitively, keeping every
+   *  distinct casing as it appears in the DB. The backend channel filter
+   *  matches v.channel case-insensitively, so option values carry every
+   *  distinct variant. */
+  const archivedChannelGroups = useMemo(() => {
+    const groups = new Map<string, { variants: Map<string, number> }>();
     for (const v of Object.values(videos)) {
       const c = (v.channel || '').trim();
-      if (c) set.add(c);
+      if (!c) continue;
+      const key = c.toLowerCase();
+      const g = groups.get(key) ?? { variants: new Map<string, number>() };
+      g.variants.set(c, (g.variants.get(c) ?? 0) + 1);
+      groups.set(key, g);
     }
-    return [...set].sort((a, b) => a.localeCompare(b));
+    return groups;
   }, [videos]);
 
   /**
-   * Dropdown options: archived channels (plain slugs) ∪ saved channels
-   * (display names derived from per-platform slugs). A saved channel's
-   * select value is its comma-joined slugs so the backend matches ANY of
-   * them; archived slugs stay exact-match values. Deduped by label, saved
-   * wins ties (its value is at least as broad).
+   * Dropdown options: archived channels (grouped case-insensitively) ∪ saved
+   * channels (display names derived from per-platform slugs). A saved
+   * channel's slugs win the group: label = display name, value = saved slugs
+   * ∪ archived variants (so the backend matches ANY of them). Unclaimed
+   * groups get the most-frequent casing as canonical label and every variant
+   * in the value. Deduped by lowercased label.
    */
   const channelOptions = useMemo(() => {
     const options = new Map<string, { label: string; value: string }>();
+    const claimed = new Set<string>();
     for (const ch of savedChannels ?? []) {
       // Canonical slug order mirrors deriveChannelDisplayName (twitch first).
       const slugs = [ch.twitchSlug, ch.kickSlug, ch.youtubeSlug]
@@ -253,11 +274,31 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         .filter(Boolean);
       if (slugs.length === 0) continue;
       const label = deriveChannelDisplayName(ch.kickSlug, ch.twitchSlug, ch.youtubeSlug);
-      options.set(label, { label, value: slugs.join(',') });
+      // Absorb every archived variant whose lower slug matches this channel.
+      const variants = new Set<string>();
+      for (const key of new Set(slugs.map((s) => s.toLowerCase()))) {
+        const g = archivedChannelGroups.get(key);
+        if (g) {
+          claimed.add(key);
+          for (const v of g.variants.keys()) variants.add(v);
+        }
+      }
+      const value = [...new Set([...slugs, ...variants])].join(',');
+      options.set(label.toLowerCase(), { label, value });
     }
-    for (const c of archivedChannels) options.set(c, { label: c, value: c });
+    for (const [key, g] of archivedChannelGroups) {
+      if (claimed.has(key)) continue;
+      // Canonical casing = most frequent in the archive (ties → first seen).
+      let label = key;
+      let best = -1;
+      for (const [variant, count] of g.variants) {
+        if (count > best) { best = count; label = variant; }
+      }
+      if (options.has(label.toLowerCase())) continue; // saved channel owns it
+      options.set(label.toLowerCase(), { label, value: [...g.variants.keys()].join(',') });
+    }
     return [...options.values()].sort((a, b) => a.label.localeCompare(b.label));
-  }, [savedChannels, archivedChannels]);
+  }, [savedChannels, archivedChannelGroups]);
 
   const togglePlatform = useCallback((p: string) => {
     setPlatformFilter((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
@@ -267,10 +308,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     setKindFilter((cur) => (cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k]));
   }, []);
 
-  const resetDays = useCallback(() => {
-    setDateFrom('');
-    setDateTo('');
+  const toggleLang = useCallback((lang: 'pt' | 'en') => {
+    setLangFilter((cur) => (cur === lang ? '' : lang));
   }, []);
+
+  /** Distinct transcript languages among current hits (chips show only when ≥2). */
+  const langsPresent = useMemo(() => {
+    const langs = new Set<string>();
+    for (const h of hits) {
+      if (h.kind === 'transcript' && h.lang) langs.add(h.lang);
+    }
+    return langs;
+  }, [hits]);
 
   // Debounced search against the archive FTS index.
   useEffect(() => {
@@ -293,6 +342,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     setStatus('loading');
     setError(null);
     // Date inputs can hold partial/typed garbage; invalid values become unset.
+    // everyDay=true ignores the stored range (default; a date pick unchecks it).
     const url = buildSearchUrl({
       query,
       channel: scope ? null : (channelFilter || null),
@@ -300,8 +350,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       kinds: kindFilter,
       source: sourceFilter,
       videoId: scope?.videoId ?? null,
-      dateFrom: isValidDateParam(dateFrom) ? dateFrom : null,
-      dateTo: isValidDateParam(dateTo) ? dateTo : null,
+      dateFrom: !everyDay && isValidDateParam(dateFrom) ? dateFrom : null,
+      dateTo: !everyDay && isValidDateParam(dateTo) ? dateTo : null,
+      lang: langFilter || null,
       limit: SEARCH_LIMIT,
     });
     void apiGet<{ hits: ArchiveSearchHit[] }>(url)
@@ -316,7 +367,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
@@ -475,7 +526,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             type="date"
             aria-label="From date"
             value={dateFrom}
-            onChange={(e) => setDateFrom(e.target.value)}
+            onChange={(e) => { setDateFrom(e.target.value); setEveryDay(false); }}
             className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
           />
           <span className="text-zinc-600 text-[9px] shrink-0">→</span>
@@ -483,18 +534,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             type="date"
             aria-label="To date"
             value={dateTo}
-            onChange={(e) => setDateTo(e.target.value)}
+            onChange={(e) => { setDateTo(e.target.value); setEveryDay(false); }}
             className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
           />
           <button
             type="button"
-            onClick={resetDays}
-            disabled={!dateFrom && !dateTo}
-            title="Clear the date range"
+            aria-pressed={everyDay}
+            onClick={() => setEveryDay((v) => !v)}
+            title="Every day: ignore the date range (picking a date unchecks this)"
             className={`shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
-              dateFrom || dateTo
-                ? 'border-zinc-700 text-yellow-200/90 hover:border-white hover:text-white'
-                : 'border-zinc-800 text-zinc-600 cursor-default'
+              everyDay
+                ? 'bg-white text-black border-white'
+                : 'border-zinc-700 text-yellow-200/90 hover:border-white hover:text-white'
             }`}
           >
             EVERY DAY
@@ -542,6 +593,29 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             ))}
           </div>
         </div>
+        {langsPresent.size >= 2 && (
+          <div className="flex items-center gap-1.5">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Lang</span>
+            <div className="flex gap-1 flex-wrap">
+              {ARCHIVE_LANGS.map((l) => (
+                <button
+                  key={l}
+                  type="button"
+                  aria-pressed={langFilter === l}
+                  onClick={() => toggleLang(l)}
+                  title={`Only show ${ARCHIVE_LANG_LABELS[l]} transcript rows`}
+                  className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                    langFilter === l
+                      ? 'bg-white text-black border-white'
+                      : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                  }`}
+                >
+                  {ARCHIVE_LANG_LABELS[l]}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {status === 'error' && (
@@ -599,6 +673,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-300 shrink-0">
                     {hit.kind}
                   </span>
+                  {hit.kind === 'transcript' && hit.lang && (
+                    <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-500 shrink-0">
+                      {ARCHIVE_LANG_LABELS[hit.lang] ?? hit.lang}
+                    </span>
+                  )}
                   <span className={`text-[9px] font-mono uppercase tracking-widest shrink-0 ${platformAccent[hit.platform] ?? 'text-zinc-400'}`}>
                     {hit.platform}
                   </span>

@@ -201,6 +201,18 @@ describe('buildSearchUrl', () => {
       '/api/archive/search?q=x&limit=30',
     );
   });
+
+  it('emits lang only when set, after dates', () => {
+    expect(buildSearchUrl({ query: 'x', lang: 'pt' })).toBe(
+      '/api/archive/search?q=x&lang=pt&limit=30',
+    );
+    expect(
+      buildSearchUrl({ query: 'x', lang: 'en', dateFrom: '2026-07-30' }),
+    ).toBe('/api/archive/search?q=x&date_from=2026-07-30&lang=en&limit=30');
+    expect(buildSearchUrl({ query: 'x', lang: '' })).toBe(
+      '/api/archive/search?q=x&limit=30',
+    );
+  });
 });
 
 describe('isValidDateParam', () => {
