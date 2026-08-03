@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS messages (
   text       TEXT NOT NULL,
   badges     TEXT NOT NULL DEFAULT '[]',
   emotes     TEXT NOT NULL DEFAULT '[]',
-  ts         TEXT
+  ts         TEXT,
+  -- Collapsed-duplicate counter: identical consecutive chat rows within 60 s
+  -- merge into one stored row and this column counts the merged messages.
+  spam_count INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_messages_video ON messages(platform, video_id, offset_sec);
 
@@ -207,6 +210,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_kind_column(_conn)
             _ensure_channel_columns(_conn)
             _ensure_lang_column(_conn)
+            _ensure_spam_column(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -263,6 +267,20 @@ def _ensure_lang_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(transcripts)")}
     if "lang" not in cols:
         conn.execute("ALTER TABLE transcripts ADD COLUMN lang TEXT")
+
+
+def _ensure_spam_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add messages.spam_count (collapsed-dup counter).
+
+    insert_messages merges identical consecutive chat rows within 60 s into
+    one stored row; spam_count counts how many messages that row represents
+    (1 = a plain row, >1 = a collapsed spam burst). Additive only; PRAGMA
+    table_info guard makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "spam_count" not in cols:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN spam_count INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -476,31 +494,104 @@ def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -
 
 def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     """Batch insert chat rows; each row: offset_sec, user_id, username, text,
-    badges (list), emotes (list), ts (optional ISO). Returns count inserted."""
-    conn = get_conn()
+    badges (list), emotes (list), ts (optional ISO).
+
+    Spam collapse: consecutive rows with IDENTICAL username+text whose offset
+    delta is within 60 s merge into a single stored row; the stored row's
+    spam_count counts the merged messages (chat spam floods one row instead
+    of a thousand). Collapse runs within the batch AND across flushes: the
+    batch's first run merges into the LAST stored row for this video when it
+    matches (chat_sinks flush every 5 s / 100 rows, so a burst spans flushes).
+
+    Returns the ACCEPTED count — every row that arrived, collapsed or not
+    (chat_sinks/base.py rows_flushed and the ingest API 'inserted' field
+    build on this). Idempotent: a re-sent row whose offset is <= the stored
+    row's (delta 0) is consumed without bumping spam_count, so replaying a
+    flush never double-counts.
+
+    ponytail: only the batch's FIRST run merges cross-flush (per contract,
+    the last stored row). A burst whose text differs from the last row but
+    matches an earlier one starts a new row; upgrade path is merging against
+    the last row per username+text, or per-message ids."""
+    batch = sorted(
+        (dict(r) for r in rows),
+        key=lambda r: float(r["offset_sec"]),
+    )
+    if not batch:
+        return 0
+
+    # Collapse within the batch first: each run of identical username+text
+    # with 0 < offset delta <= 60 s becomes ONE anchor row carrying the run's
+    # count. A delta <= 0 duplicate (same offset re-send) is consumed without
+    # bumping, keeping replays idempotent.
+    runs: list[tuple[dict, int]] = []
+    anchor: Optional[dict] = None
     count = 0
+    for r in batch:
+        if anchor is None:
+            anchor, count = r, 1
+            continue
+        same = anchor["username"] == r.get("username", "") and anchor["text"] == r["text"]
+        delta = float(r["offset_sec"]) - float(anchor["offset_sec"])
+        if same and 0 < delta <= 60.0:
+            count += 1  # merge into the anchor
+        elif same and delta <= 0:
+            pass  # re-sent duplicate — consumed, no bump
+        else:
+            runs.append((anchor, count))
+            anchor, count = r, 1
+    runs.append((anchor, count))
+
+    conn = get_conn()
+    accepted = len(batch)
     with _lock:
         with conn:  # transaction
-            for r in rows:
+            first_anchor, first_count = runs[0]
+            stored = conn.execute(
+                """SELECT id, offset_sec, username, text, spam_count
+                   FROM messages WHERE platform = ? AND video_id = ?
+                   ORDER BY offset_sec DESC, id DESC LIMIT 1""",
+                (platform, video_id),
+            ).fetchone()
+            if stored is not None:
+                same = (
+                    stored["username"] == first_anchor.get("username", "")
+                    and stored["text"] == first_anchor["text"]
+                )
+                delta = float(first_anchor["offset_sec"]) - float(stored["offset_sec"])
+                if same and 0 < delta <= 60.0:
+                    # Continuation of the previous flush's burst: bump the
+                    # stored row and re-anchor it at the newest offset (a
+                    # re-sent duplicate then lands at delta 0 and is consumed).
+                    conn.execute(
+                        "UPDATE messages SET spam_count = ?, offset_sec = ? WHERE id = ?",
+                        (int(stored["spam_count"]) + first_count,
+                         first_anchor["offset_sec"], stored["id"]),
+                    )
+                    runs = runs[1:]
+                elif same and delta <= 0:
+                    runs = runs[1:]  # re-send of the stored row — already counted
+
+            for anchor, count in runs:
                 conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
-                       user_id, username, text, badges, emotes, ts)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       user_id, username, text, badges, emotes, ts, spam_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         platform,
                         video_id,
-                        float(r["offset_sec"]),
-                        r.get("user_id"),
-                        r.get("username", ""),
-                        r["text"],
-                        json.dumps(r.get("badges", []), ensure_ascii=False),
-                        json.dumps(r.get("emotes", []), ensure_ascii=False),
-                        r.get("ts"),
+                        float(anchor["offset_sec"]),
+                        anchor.get("user_id"),
+                        anchor.get("username", ""),
+                        anchor["text"],
+                        json.dumps(anchor.get("badges", []), ensure_ascii=False),
+                        json.dumps(anchor.get("emotes", []), ensure_ascii=False),
+                        anchor.get("ts"),
+                        count,
                     ),
                 )
                 # FTS index entry is written by the messages_ai trigger.
-                count += 1
-    return count
+    return accepted
 
 
 def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 30.0) -> list[dict]:
@@ -1180,6 +1271,58 @@ set_alias(_selfcheck_platform, _selfcheck_video, "selfcheck-key")
 assert any(
     g["canonical_key"] == "selfcheck-key" for g in dedupe_view()
 ), "dedupe view must surface aliased videos"
+# spam collapse: identical consecutive rows (0 < delta <= 60 s) collapse
+# into one row; a cross-flush continuation bumps the stored row; re-sending
+# the merged row is consumed without double-counting.
+_collapse_video = "__archive_spam_selfcheck__"
+with _lock:
+    _sc_conn = get_conn()
+    with _sc_conn:
+        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
+_n = insert_messages(_selfcheck_platform, _collapse_video, [
+    {"offset_sec": 100.0 + i * 0.5, "username": "spammer", "text": "SPAM SPAM"}
+    for i in range(50)
+])
+assert _n == 50, "accepted count must include collapsed rows"
+_sc_rows = query(
+    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+    (_selfcheck_platform, _collapse_video),
+)
+assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 50, (
+    "50 identical rows must collapse to one stored row with spam_count=50"
+)
+_n = insert_messages(_selfcheck_platform, _collapse_video,
+                     [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
+assert _n == 1, "cross-flush continuation row must be accepted"
+_sc_rows = query(
+    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+    (_selfcheck_platform, _collapse_video),
+)
+assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
+    "cross-flush identical row must merge into the stored row (50 -> 51)"
+)
+_n = insert_messages(_selfcheck_platform, _collapse_video,
+                     [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
+_sc_rows = query(
+    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+    (_selfcheck_platform, _collapse_video),
+)
+assert _n == 1 and len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
+    "re-sending the merged row must not double-merge (idempotent)"
+)
+_n = insert_messages(_selfcheck_platform, _collapse_video,
+                     [{"offset_sec": 126.0, "username": "spammer", "text": "different"}])
+_sc_rows = query(
+    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+    (_selfcheck_platform, _collapse_video),
+)
+assert _n == 1 and len(_sc_rows) == 2, "different text must not collapse"
+with _lock:
+    _sc_conn = get_conn()
+    with _sc_conn:
+        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
+
+
 # cleanup selfcheck rows
 with _lock:
     conn = get_conn()

@@ -9,10 +9,14 @@ Design decisions:
     progress — progress = speech seconds transcribed / total speech seconds.
   * Resume: each run writes a JSONL manifest next to the archive DB mapping
     chunk -> seg_idx range; re-runs skip chunks whose range is fully present
-    (verified against transcript_for()). Segments are inserted one row per
-    insert_transcript() call, so a crash loses at most the in-flight segment.
-  * Model cache: one process-global WhisperModel, lazy-loaded on first job,
-    unloaded after VODRIP_WHISPER_IDLE_CLOSE seconds (default 600) without use.
+    (verified against transcript_for()). A chunk's segments are inserted with
+    ONE insert_transcript() batch call, so a crash loses at most the
+    in-flight chunk.
+  * Model cache: one process-global WhisperModel by default (budget 1),
+    lazy-loaded on first job, unloaded after VODRIP_WHISPER_IDLE_CLOSE
+    seconds (default 600) without use. Multi-copy mode (budget > 1 — CPU
+    workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives each pool thread
+    its own model so inference runs in parallel.
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
     cpu/int8 (honest: this machine has no NVIDIA GPU, so real runs are CPU).
   * Default model 'large-v3-turbo'; override with env VODRIP_WHISPER_MODEL
@@ -52,6 +56,7 @@ SAMPLE_RATE = 16000
 LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
 WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
+GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
 
 # --- device / compute -----------------------------------------------------
 
@@ -93,6 +98,56 @@ def model_name() -> str:
 def _cache_dir() -> Path:
     # Shared resolver: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache -> appdata.
     return whisper_cache_dir()
+
+
+# --- parallelism budget ---------------------------------------------------
+
+def _clamp_cuda_copies(copies: int, free_vram_bytes: int) -> int:
+    """min(copies, max(1, free_vram // 2 GiB)) — the GPU copy budget clamp.
+
+    Pure shape so the module self-check can pin it without a GPU: env 1 -> 1
+    (never probe), env >1 -> VRAM-capped but never below 1 copy."""
+    if copies <= 1:
+        return 1
+    vram_cap = max(1, free_vram_bytes // (2 * 1024 ** 3))
+    return max(1, min(copies, vram_cap))
+
+
+def _worker_budget() -> int:
+    """Max concurrent transcribe jobs: GPU model copies or CPU threads.
+
+    CUDA: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) clamped by free VRAM
+    (probed once via torch.cuda.mem_get_info() — torch is already imported
+    by the VAD path); the clamp degrades gracefully to 1 when the probe
+    fails. CPU: VODRIP_TRANSCRIBE_WORKERS (default 2).
+
+    budget == 1 is the EXACT legacy path: one process-global model,
+    _infer_lock serializing inference. budget > 1 (opt-in GPU copies, or the
+    CPU default) gives each pool thread its own model copy so inference
+    truly runs in parallel."""
+    device, _ = _effective_device()
+    if device == "cpu":
+        try:
+            return max(1, int(os.environ.get(WORKERS_ENV, "2") or "2"))
+        except ValueError:
+            return 2
+    try:
+        copies = int(os.environ.get(GPU_COPIES_ENV, "1") or "1")
+    except ValueError:
+        copies = 1
+    if copies <= 1:
+        return 1
+    free_vram = 0
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free_vram = int(torch.cuda.mem_get_info()[0])
+    except Exception:
+        pass  # probe failed — trust the env cap
+    if free_vram <= 0:
+        return copies
+    return _clamp_cuda_copies(copies, free_vram)
 
 
 # --- model cache ----------------------------------------------------------
@@ -198,19 +253,148 @@ def _close_model_unlocked() -> None:
 
 def close_model() -> None:
     """Unload the cached model, freeing its RAM. Safe mid-transcription: workers
-    hold a local reference, so the object lives until their last use."""
+    hold a local reference, so the object lives until their last use.
+
+    Multi-copy mode: closes every pool thread's model too; threads lazily
+    reload on their next job (the registry is cleared, so a fresh slot is
+    created)."""
+    closed_any = False
     with _model_lock:
         _close_model_unlocked()
+        for slot in _thread_slots.values():
+            model, slot.model = slot.model, None
+            if model is not None:
+                logger.info("Unloading whisper thread model")
+                del model
+                closed_any = True
+        _thread_slots.clear()
+    if closed_any:
+        gc.collect()
 
 
 def _maybe_close_idle_model() -> None:
-    """Close the model after VODRIP_WHISPER_IDLE_CLOSE seconds without use."""
+    """Close the model after VODRIP_WHISPER_IDLE_CLOSE seconds without use.
+
+    Applies to the process-global model only: thread models die with the
+    pool (close_model on worker shutdown)."""
     if _model is None:
         return
     idle = time.monotonic() - _model_last_used
     if idle > _idle_close_seconds():
         logger.info("Model idle for %.0fs — unloading", idle)
         close_model()
+
+
+# --- per-thread model copies (multi-copy mode, budget > 1) ------------------
+# Each pool thread owns one WhisperModel instance so inference runs truly in
+# parallel (no global _infer_lock). The registry is keyed by thread ident —
+# the same per-thread keying CPython's threading.local uses internally.
+# Model CREATION is serialized by _model_lock (shared hub download);
+# inference never takes it. A thread whose CUDA inference OOM'd marks itself
+# cpu_fallback and reloads on CPU — only that thread degrades.
+
+_multi_tls = threading.local()  # per-thread: .active, .cpu_fallback
+
+
+class _ThreadModelSlot:
+    """One pool thread's lazy model state."""
+    __slots__ = ("model", "model_name")
+
+    def __init__(self) -> None:
+        self.model: Any = None
+        self.model_name: Optional[str] = None
+
+
+_thread_slots: dict[int, _ThreadModelSlot] = {}
+
+
+def _in_multi_mode() -> bool:
+    return bool(getattr(_multi_tls, "active", False))
+
+
+def _thread_cpu_fallback() -> bool:
+    return bool(getattr(_multi_tls, "cpu_fallback", False))
+
+
+def _thread_mark_cpu_fallback() -> None:
+    _multi_tls.cpu_fallback = True
+
+
+def _thread_slot() -> _ThreadModelSlot:
+    """The calling thread's model slot, created on first use."""
+    tid = threading.get_ident()
+    slot = _thread_slots.get(tid)
+    if slot is None:
+        with _model_lock:
+            slot = _thread_slots.get(tid)
+            if slot is None:
+                slot = _ThreadModelSlot()
+                _thread_slots[tid] = slot
+    return slot
+
+
+def _thread_model() -> Any:
+    """Lazy per-thread WhisperModel copy (multi-copy mode only).
+
+    Mirrors _get_model's lazy load, keyed to the calling thread; creation is
+    serialized by _model_lock, inference is not. A thread marked cpu_fallback
+    loads on CPU even when CUDA is healthy (its copy OOM'd earlier)."""
+    slot = _thread_slot()
+    name = model_name()
+    if slot.model is not None and slot.model_name == name:
+        return slot.model
+    with _model_lock:
+        if slot.model is not None and slot.model_name == name:
+            return slot.model
+        if slot.model is not None:
+            del slot.model  # stale model env / degraded copy — drop first
+            slot.model = None
+        _ensure_cuda_libs()
+        from faster_whisper import WhisperModel
+
+        device, compute_type = _effective_device()
+        if _thread_cpu_fallback() and device == "cuda":
+            device, compute_type = "cpu", "int8"
+        t0 = time.monotonic()
+        logger.info(
+            "Loading whisper thread model %r (device=%s compute_type=%s)...",
+            name, device, compute_type,
+        )
+        try:
+            slot.model = WhisperModel(
+                name,
+                device=device,
+                compute_type=compute_type,
+                download_root=str(_cache_dir()),
+            )
+        except Exception as exc:
+            if device == "cuda":
+                # This thread's copy cannot load on CUDA (driver hiccup) —
+                # degrade only this thread to CPU, not the whole process.
+                logger.warning(
+                    "thread CUDA model load failed (%s) — thread falls back to CPU", exc
+                )
+                _thread_mark_cpu_fallback()
+                slot.model = WhisperModel(
+                    name,
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(_cache_dir()),
+                )
+            else:
+                raise
+        slot.model_name = name
+        logger.info("Thread whisper model %r loaded in %.1fs", name, time.monotonic() - t0)
+        return slot.model
+
+
+def _current_model() -> Any:
+    """The model for the current context: the calling thread's own copy in
+    multi-copy mode, else the process-global one. Direct callers of
+    transcribe_video()/_get_model() (tests, API) always get the global path."""
+    if _in_multi_mode():
+        return _thread_model()
+    return _get_model()
 
 
 # --- audio decode ---------------------------------------------------------
@@ -257,6 +441,8 @@ def _get_vad() -> Any:
 
 def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     """Return [(start_sec, end_sec), ...] speech regions from Silero VAD."""
+    if audio is None or len(audio) == 0:
+        return []  # empty audio -> no speech
     import torch
     from silero_vad import get_speech_timestamps
 
@@ -411,7 +597,9 @@ def _transcribe_chunk(
     )
     if _word_ts_ok:
         kwargs["word_timestamps"] = True
-    with _infer_lock:
+    if _in_multi_mode():
+        # Multi-copy mode: the model is THIS thread's own copy — no global
+        # lock needed. A CUDA OOM degrades only this thread to CPU.
         try:
             seg_iter, info = model.transcribe(chunk_audio, **kwargs)
             raw = list(seg_iter)
@@ -425,17 +613,43 @@ def _transcribe_chunk(
             seg_iter, info = model.transcribe(chunk_audio, **kwargs)
             raw = list(seg_iter)
         except RuntimeError as exc:
-            if _effective_device()[0] != "cuda" or _device_override is not None:
+            if _effective_device()[0] != "cuda" or _thread_cpu_fallback():
                 raise
-            # GPU present but inference broken (missing cuBLAS, driver hiccup):
-            # drop to CPU for the process lifetime and retry this chunk once.
-            logger.warning("CUDA inference failed (%s) — falling back to CPU", exc)
-            _device_override = ("cpu", "int8")
-            model = _get_model()  # reload on CPU
+            # This thread's copy hit a CUDA inference failure (OOM, driver
+            # hiccup): degrade ONLY this thread to CPU and retry once.
+            logger.warning("CUDA inference failed (%s) — degrading this thread to CPU", exc)
+            _thread_mark_cpu_fallback()
+            model = _thread_model()  # reloads on CPU (flag consulted at load)
             if not _word_ts_ok:
                 kwargs.pop("word_timestamps", None)
             seg_iter, info = model.transcribe(chunk_audio, **kwargs)
             raw = list(seg_iter)
+    else:
+        with _infer_lock:
+            try:
+                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+                raw = list(seg_iter)
+            except ValueError as exc:
+                if not _word_ts_ok:
+                    raise
+                # distil models lack alignment heads — fall back to plain segments.
+                logger.info("Word timestamps unsupported (%s) — falling back", exc)
+                _word_ts_ok = False
+                kwargs.pop("word_timestamps", None)
+                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+                raw = list(seg_iter)
+            except RuntimeError as exc:
+                if _effective_device()[0] != "cuda" or _device_override is not None:
+                    raise
+                # GPU present but inference broken (missing cuBLAS, driver hiccup):
+                # drop to CPU for the process lifetime and retry this chunk once.
+                logger.warning("CUDA inference failed (%s) — falling back to CPU", exc)
+                _device_override = ("cpu", "int8")
+                model = _get_model()  # reload on CPU
+                if not _word_ts_ok:
+                    kwargs.pop("word_timestamps", None)
+                seg_iter, info = model.transcribe(chunk_audio, **kwargs)
+                raw = list(seg_iter)
     detected_lang = getattr(info, "language", None) or None
     out: list[dict] = []
     for seg in raw:
@@ -482,7 +696,6 @@ def transcribe_video(
     if language is None:
         language = os.environ.get(LANG_ENV, "").strip() or None
 
-    model = _get_model()
     t0 = time.monotonic()
     audio = decode_audio(path)
     total_sec = audio.size / SAMPLE_RATE
@@ -498,6 +711,38 @@ def transcribe_video(
         dead_air_sec,
     )
 
+    # No-speech skip: less than 3 s of planned speech is noise — report it
+    # WITHOUT loading the model and WITHOUT a resume manifest (nothing to
+    # resume). _process_job maps this to status 'done' (captions-first
+    # precedent).
+    if speech_sec < 3.0:
+        wall = time.monotonic() - t0
+        stats = {
+            "platform": platform,
+            "video_id": video_id,
+            "model": model_name(),
+            "device": _effective_device()[0],
+            "compute_type": _effective_device()[1],
+            "total_sec": round(total_sec, 3),
+            "speech_sec": round(speech_sec, 3),
+            "dead_air_sec": round(dead_air_sec, 3),
+            "dead_air_pct": round(dead_air_pct, 1),
+            "segments": 0,
+            "words": 0,
+            "resumed_chunks": 0,
+            "wall_sec": round(wall, 3),
+            "speed_x": 0.0,
+            "skipped": "no-speech",
+        }
+        logger.info(
+            "transcribe %s/%s skipped: planned speech %.1fs < 3s — no model load",
+            platform, video_id, speech_sec,
+        )
+        return stats
+
+    # Model load happens only now: VAD + planning are model-free, so a
+    # no-speech video never pays the (large) load cost.
+    model = _current_model()
     existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id)}
     header, entries = _read_manifest(_manifest_path(platform, video_id))
     missing, seg_idx = _resume_plan(chunks, header, entries, existing)
@@ -520,23 +765,26 @@ def transcribe_video(
         if detected_lang is None and detected:
             detected_lang = detected  # first chunk's detection wins
         lang = language or detected_lang  # env wins; else detected; else None
-        # Per-segment insert: a crash loses at most the in-flight segment.
+        # Batch insert: one insert_transcript() call per chunk (it accepts a
+        # list); a crash loses at most the in-flight chunk.
         first_idx = seg_idx
+        batch_rows = []
         for seg in chunk_segs:
             if seg_idx in existing:
                 seg_idx += 1
                 continue
-            row = {
+            batch_rows.append({
                 "seg_idx": seg_idx,
                 "start_sec": seg["start_sec"],
                 "end_sec": seg["end_sec"],
                 "text": seg["text"],
                 "words": seg["words"],
-            }
-            archive_db.insert_transcript(platform, video_id, [row], lang=lang)
-            segments += 1
+            })
             words += len(seg["words"])
             seg_idx += 1
+        if batch_rows:
+            archive_db.insert_transcript(platform, video_id, batch_rows, lang=lang)
+        segments += len(batch_rows)
         _append_manifest_entry(manifest, ci, first_idx, len(chunk_segs))
         speech_done += ce - cs
         if progress_cb:
@@ -637,10 +885,17 @@ def _captions_first_skip(platform: str, video_id: str) -> bool:
     return bool(archive_db.transcript_for(platform, video_id))
 
 
-def _process_job(job: dict) -> dict:
-    """Run one claimed job; never raises — failures land in archive_jobs.error."""
+def _process_job(job: dict, *, multi: bool = False) -> dict:
+    """Run one claimed job; never raises — failures land in archive_jobs.error.
+
+    multi=True (worker with budget > 1): the job runs on the calling pool
+    thread's own model copy — no global _infer_lock, thread-local CUDA
+    fallback. Default False keeps the single-global-model path for direct
+    callers and tests."""
     job_id = job["id"]
     platform, video_id = job["platform"], job["video_id"]
+    if multi:
+        _multi_tls.active = True
     try:
         archive_db.update_job(job_id, status="running", progress=0.0)
 
@@ -660,12 +915,19 @@ def _process_job(job: dict) -> dict:
 
         stats = transcribe_video(platform, video_id, progress_cb=_progress)
         archive_db.update_job(job_id, status="done", progress=1.0)
+        if "skipped" not in stats:
+            # Heavy batch writes just finished — merge the FTS b-tree
+            # segments so search stays fast (best-effort inside).
+            archive_db.optimize_fts()
         return stats
     except Exception as exc:  # job-level failure — worker keeps going
         logger.exception("transcribe job %s failed", job_id)
         archive_db.update_job(job_id, status="failed",
                               error=f"{type(exc).__name__}: {exc}"[:400])
         return {"job_id": job_id, "error": str(exc)}
+    finally:
+        if multi:
+            _multi_tls.active = False
 
 
 def run_worker(
@@ -676,28 +938,24 @@ def run_worker(
 ) -> None:
     """Blocking worker loop over the transcribe queue.
 
-    GPU jobs serialize (max_workers=1); CPU jobs run 2–3 at a time via a
-    ThreadPoolExecutor (decode/VAD/DB run truly parallel; model inference is
-    serialized by _infer_lock since CTranslate2 model instances aren't
-    thread-safe — real parallel inference needs per-worker model copies).
+    Parallelism budget: _worker_budget() — 1 on CUDA by default (the legacy
+    single-global-model path with _infer_lock, byte-for-byte today's
+    behavior); >1 (CPU workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives
+    each pool thread its own model copy so inference truly runs in parallel.
+    max_workers overrides the budget (used by tests/launchers).
     """
     device, compute_type = _effective_device()
-    if max_workers is None:
-        if device == "cuda":
-            max_workers = 1
-        else:
-            try:
-                max_workers = max(2, min(3, int(os.environ.get(WORKERS_ENV, "2") or "2")))
-            except ValueError:
-                max_workers = 2
+    budget = _worker_budget() if max_workers is None else max(1, int(max_workers))
+    multi = budget > 1
     logger.info("archive transcribe worker: device=%s compute_type=%s workers=%d",
-                device, compute_type, max_workers)
+                device, compute_type, budget)
     try:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="transcribe") as pool:
+        with ThreadPoolExecutor(max_workers=budget, thread_name_prefix="transcribe") as pool:
             while True:
                 _maybe_close_idle_model()
+                archive_db.worker_heartbeat("transcribe")
                 claimed = []
-                for _ in range(max_workers):
+                for _ in range(budget):
                     job = _claim_next_job()
                     if job is None:
                         break
@@ -707,7 +965,7 @@ def run_worker(
                         break
                     time.sleep(poll_interval)
                     continue
-                futures = [pool.submit(_process_job, j) for j in claimed]
+                futures = [pool.submit(_process_job, j, multi=multi) for j in claimed]
                 for fut in futures:
                     try:
                         fut.result()
@@ -762,3 +1020,23 @@ _missing, _ = _resume_plan(_header["chunks"], _stale, _entries, {0, 1})
 assert _missing == [0, 1, 2], "model change must invalidate stale manifest entries"
 _missing, _next = _resume_plan([], None, {}, set())
 assert _missing == [] and _next == 0, "no chunks -> nothing to do"
+# worker budget: no GPU_COPIES env -> 1 copy regardless of VRAM; the VRAM
+# clamp caps copies at free_vram // 2 GiB (never below 1); CPU honors
+# VODRIP_TRANSCRIBE_WORKERS and defaults to 2.
+assert _clamp_cuda_copies(1, 100 << 30) == 1, "no GPU copies env -> 1 (probe skipped)"
+assert _clamp_cuda_copies(4, 10 << 30) == 4, "env within the VRAM budget passes through"
+assert _clamp_cuda_copies(8, 5 << 30) == 2, "VRAM budget clamps copies (5 GiB -> 2)"
+assert _clamp_cuda_copies(8, 1 << 30) == 1, "VRAM budget never drops below 1"
+_saved_override, _saved_workers = _device_override, os.environ.get(WORKERS_ENV)
+try:
+    _device_override = ("cpu", "int8")
+    os.environ[WORKERS_ENV] = "4"
+    assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
+    os.environ.pop(WORKERS_ENV, None)
+    assert _worker_budget() == 2, "CPU budget defaults to 2 workers"
+finally:
+    _device_override = _saved_override
+    if _saved_workers is None:
+        os.environ.pop(WORKERS_ENV, None)
+    else:
+        os.environ[WORKERS_ENV] = _saved_workers
