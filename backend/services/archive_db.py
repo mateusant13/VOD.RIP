@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -884,7 +885,7 @@ def search(
         loops = loops[:1]
     pattern = _fuzzy_pattern(q, [t[2] for t in loops])
     if pattern is None:
-        pattern = " OR ".join(f'"{w}"' for w in q.split() if w) or q
+        pattern = {0: " OR ".join(f'"{w}"' for w in q.split() if w) or q}
     phrase_pattern = None
     if raw_q:
         # "raw query" quoted as one FTS5 phrase; embedded quotes are escaped.
@@ -897,7 +898,15 @@ def search(
             platforms=platforms, video_id=video_id, channel=channel, kinds=kinds,
             date_from=date_from, date_to=date_to, lang=lang,
         )
-        rows = _table_search(pattern, fetch, **base)
+        # Distance tiers: one MATCH pass per tier, unioned by rowid (lowest
+        # tier wins). Scores are discounted by 0.5^tier so cross-table merges
+        # prefer the intended matches over rare expansion noise.
+        by_row: dict[int, dict] = {}
+        for dist, tier_pat in pattern.items():
+            for r in _table_search(tier_pat, fetch, **base):
+                r["_tier"] = dist
+                by_row.setdefault(r["_rowid"], r)
+        rows = list(by_row.values())
         phrase_rows: dict[int, dict] = {}
         if phrase_pattern:
             try:
@@ -919,8 +928,7 @@ def search(
         for h in table_rows:
             if max_score > 0:  # guard div-by-zero: keep raw scores if batch max is 0
                 h["score"] = h["score"] / max_score
-            if h.pop("_phrase", False):
-                h["score"] = h["score"] * _PHRASE_BOOST
+            h["score"] = h["score"] * (_PHRASE_BOOST if h.pop("_phrase", False) else 0.5 ** h.pop("_tier", 0))
             merged.append(h)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
     # Normalization collapses each table's best to exactly 1.0, so two
@@ -958,7 +966,7 @@ def _table_search(
     """One MATCH pass over one FTS table with the shared filter set.
 
     score is -bm25 (positive, higher = better); hits carry a private _rowid
-    key so the phrase/fuzzy union can dedupe by row identity, and a _phrase
+    key so the tier/phrase passes can dedupe by row identity, and a _phrase
     flag set by callers that need the exact-phrase boost."""
     sql = (
         f"SELECT t.rowid AS _rowid, -bm25({fts}) AS score, "
@@ -1056,7 +1064,7 @@ def _channel_hint_for(q: str) -> Optional[str]:
 
 _VOCAB_MAX_TOKENS = 25_000
 _VOCAB_TTL_S = 300.0
-_TOKEN_EXPAND_CAP = 8
+_TOKEN_EXPAND_CAP = 12
 _MAX_EXPANDED_TERMS = 64
 
 _vocab_lock = threading.Lock()
@@ -1103,6 +1111,104 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
     return by_len
 
 
+_ACCENT_FOLD = str.maketrans(
+    {
+        "á": "a", "à": "a", "â": "a", "ã": "a", "ä": "a", "å": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "í": "i", "ì": "i", "î": "i", "ï": "i",
+        "ó": "o", "ò": "o", "ô": "o", "õ": "o", "ö": "o",
+        "ú": "u", "ù": "u", "û": "u", "ü": "u",
+        "ç": "s", "ñ": "n",
+    }
+)
+
+
+def _phonetic_fold(word: str) -> str:
+    """Lightweight grapheme→phoneme fold that bridges ASR/typo spellings.
+
+    Reimplements the published Brazilian-Portuguese phonetic rules (Várzea
+    Paulista REDECA project, carlosjordao/metaphone-ptbr) minus the vowel
+    dropping — dropping vowels is exactly what kills 'yasuo'↔'e aço'. Folds:
+    accents, ç→s, ñ→n, y→i, ph→f, th→t, ch→x, qu→k, c→s before e/i and c→k
+    g→j before e/i, q→k, w→v, silent h dropped, doubled letters
+    collapsed, final unstressed e→i and o→u. h drops word-initially and
+    after vowels; the sh digraph is kept when the s starts the word or
+    follows a consonant ('shaco' -> 'shasu' must NOT collapse onto
+    'caso'/'saco'), while sibilant artifacts after vowels still drop
+    ('nasho' -> 'nashu' keeps bridging 'nasço'). Deliberately does NOT fold
+    intervocallic s→z ('aço' /asu/ must stay close to 'yasuo', not 'yazu')
+    and does NOT fold sh→x (the h handling is enough: 'shen'->'shen' ~
+    'suen')."""
+    w = word.lower().translate(_ACCENT_FOLD)
+    w = w.replace("ph", "f").replace("th", "t").replace("ch", "x").replace("qu", "k")
+    out: list[str] = []
+    for i, c in enumerate(w):
+        if c == "y":
+            c = "i"
+        elif c == "h":
+            # Silent h: dropped at word start and after vowels. After s it
+            # is a foreign digraph ('shaco', 'Shen') — kept unless the s
+            # itself sits after a vowel, where 'sh' is just a sibilant ASR
+            # artifact ('nasho' from 'nasço').
+            if i > 0 and w[i - 1] == "s" and (i == 1 or w[i - 2] not in "aeiou"):
+                out.append("h")
+            continue
+        elif c == "c":
+            # c before e/i is s; before other vowels fold to s too so
+            # diacritic-stripped ç tokens bridge ('aco' from 'aço' -> 'asu',
+            # 'nasco' from 'nasço' -> 'nasu'); before consonants keep c
+            # ('claro' stays 'claro').
+            c = "s" if i + 1 >= len(w) or w[i + 1] in "aeiou" else "c"
+        elif c == "g":
+            c = "j" if i + 1 < len(w) and w[i + 1] in "ei" else "g"
+        elif c == "q":
+            c = "k"
+        elif c == "w":
+            c = "v"
+        out.append(c)
+    s = "".join(out)
+    # Final unstressed vowels fold at any length — 'e aço' needs 'e' -> 'i'
+    # so the bigram key 'iasu' matches 'yasuo'.
+    if s:
+        if s[-1] == "e":
+            s = s[:-1] + "i"
+        elif s[-1] == "o":
+            s = s[:-1] + "u"
+    # Collapse doubled letters AFTER the final-vowel fold so the fold-created
+    # doubles collapse too ('yasuo' -> 'iasuu' -> 'iasu').
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+def _damerau_levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
+    """Damerau–Levenshtein (adjacent transposition counts as one edit) with
+    an early bail when the row minimum exceeds max_dist."""
+    if abs(len(a) - len(b)) > max_dist:
+        return None
+    prev2: Optional[list[int]] = None
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        row_min = i
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if (
+                prev2 is not None
+                and i > 1
+                and j > 1
+                and a[i - 1] == b[j - 2]
+                and a[i - 2] == b[j - 1]
+            ):
+                cur[j] = min(cur[j], prev2[j - 2] + cost)
+            if cur[j] < row_min:
+                row_min = cur[j]
+        if row_min > max_dist:
+            return None
+        prev2, prev = prev, cur
+    dist = prev[-1]
+    return dist if dist <= max_dist else None
+
+
 def _levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
     """Levenshtein distance with an early bail when it exceeds max_dist."""
     if abs(len(a) - len(b)) > max_dist:
@@ -1122,22 +1228,86 @@ def _levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
     return dist if dist <= max_dist else None
 
 
+_TOKEN_BIGRAM_CAP = 3
+_BIGRAM_TTL_S = 900.0
+_BIGRAM_EVICT_AT = 150_000
+_BIGRAM_MAX_ROWS = 300_000
+
+# "table1|table2" -> (loaded_at, {folded_pair_key: [(raw_pair, freq), ...]})
+_bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]]]] = {}
+_TOKEN_RE = re.compile(r"[^\w]+")
+
+
+def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]]]:
+    """Folded adjacent-pair index merged across the content tables.
+
+    Keys are phonetic folds of adjacent token pairs joined without a space
+    ('e aço' -> 'iasu'), values the canonical raw pairs ranked by frequency.
+    This is the mechanism that bridges cross-token ASR errors: query
+    'yasuo' folds to 'iasu' and picks up the corpus phrase 'e aço'. Built by
+    scanning content rows. The scan is bounded by an entry cap that evicts
+    the MOST frequent pairs when over budget — rare pairs are exactly the
+    ASR families this index exists for, while the top-frequency entries are
+    caption artifacts ('&gt;&gt;', '&nbsp;') or trivial phrases that exact
+    matching covers anyway. Cached like the vocab (TTL + row-count gate) so
+    steady chat growth does not rebuild it on every search; tables over
+    _BIGRAM_MAX_ROWS are skipped."""
+    key = "|".join(tables)
+    now = time.monotonic()
+    with _vocab_lock:
+        hit = _bigram_cache.get(key)
+        if hit and now - hit[0] < _BIGRAM_TTL_S:
+            return hit[1]
+    counts: dict[tuple[str, str], int] = {}
+    for table in tables:
+        row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+        if row_count == 0 or row_count > _BIGRAM_MAX_ROWS:
+            continue
+        for row in query(f"SELECT text FROM {table} WHERE text IS NOT NULL"):
+            toks = [t for t in _TOKEN_RE.split((row["text"] or "").lower()) if t]
+            for a, b in zip(toks, toks[1:]):
+                fk = _phonetic_fold(a) + _phonetic_fold(b)
+                if len(fk) < 4:
+                    continue
+                counts[(fk, a + " " + b)] = counts.get((fk, a + " " + b), 0) + 1
+                if len(counts) > _BIGRAM_EVICT_AT:
+                    # Drop the most frequent entries: the rare tail is the
+                    # ASR-error vocabulary, the frequent head is artifacts.
+                    for k in sorted(counts, key=counts.get, reverse=True)[
+                        : len(counts) // 4
+                    ]:
+                        del counts[k]
+    merged: dict[str, list[tuple[str, int]]] = {}
+    for (fk, pair), n in counts.items():
+        merged.setdefault(fk, []).append((pair, n))
+    for cands in merged.values():
+        cands.sort(key=lambda kv: -kv[1])
+    with _vocab_lock:
+        _bigram_cache[key] = (now, merged)
+    return merged or None
+
+
 def _token_expansions(
     token: str,
     vocabs: list[Optional[dict[int, list[tuple[str, int]]]]],
-) -> list[str]:
-    """Exact + fuzzy candidates for one query token, best ~8 by
-    (distance, frequency). Tokens shorter than 3 chars are never expanded.
-    Falls back to the bare token when nothing matches."""
+    bigrams: Optional[dict[str, list[tuple[str, int]]]],
+) -> list[tuple[str, int]]:
+    """Exact + fuzzy candidates for one query token as (term, distance)
+    pairs, best ~8 by (distance, frequency), plus folded-bigram phrases
+    (distance 1 — recall-only, never rank-pattern material). Tokens shorter
+    than 3 chars are never expanded. Falls back to the bare token (distance
+    0) when nothing matches."""
     if len(token) < 3:
-        return [token]
+        return [(token, 0)]
     now = time.monotonic()
     with _vocab_lock:
         hit = _token_cache.get(token)
         if hit and now - hit[0] < _VOCAB_TTL_S:
             return hit[1]
     best: dict[str, tuple[int, int]] = {}  # term -> (dist, -freq)
-    max_dist = max(1, len(token) // 5)
+    raw_max = max(1, len(token) // 4)  # Damerau budget on the raw spelling
+    fold = _phonetic_fold(token)
+    fold_max = max(1, len(fold) // 3)  # Damerau budget on the folded form
     for vocab in vocabs:
         if not vocab:
             continue
@@ -1147,16 +1317,23 @@ def _token_expansions(
                 # vocab; never offer it as an expansion candidate.
                 if len(term) < 3 or not term.isalnum():
                     continue
-                d = _levenshtein(token, term, max_dist)
-                if d is None:
+                d = _damerau_levenshtein(token, term, raw_max)
+                fterm = _phonetic_fold(term)
+                fd = 0 if fterm == fold else _damerau_levenshtein(fold, fterm, fold_max)
+                if d is None and fd is None:
                     continue
+                dist = min(d if d is not None else 99, fd if fd is not None else 99)
                 cur = best.get(term)
-                if cur is None or (d, -freq) < cur:
-                    best[term] = (d, -freq)
-    if not best:
-        return [token]
+                if cur is None or (dist, -freq) < cur:
+                    best[term] = (dist, -freq)
     ranked = sorted(best.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
-    out = [term for term, _ in ranked[:_TOKEN_EXPAND_CAP]]
+    out: list[tuple[str, int]] = [
+        (term, dist) for term, (dist, _) in ranked[:_TOKEN_EXPAND_CAP]
+    ]
+    if bigrams:
+        for pair, _freq in bigrams.get(fold, ()):
+            if not any(t == pair for t, _ in out):
+                out.append((pair, 1))
     with _vocab_lock:
         # Unbounded user input -> bounded cache; a clear is cheaper than LRU.
         if len(_token_cache) > 4096:
@@ -1165,35 +1342,54 @@ def _token_expansions(
     return out
 
 
-def _expand_query(q: str, vocabs: list[Optional[dict[int, list[tuple[str, int]]]]]) -> list[str]:
-    """Flatten every query token's expansion into one deduped term list."""
-    terms: list[str] = []
-    seen: set[str] = set()
+def _expand_query(q: str, tables: list[str]) -> list[tuple[str, int]]:
+    """Flatten every query token's expansion into one deduped (term, dist)
+    list (duplicates keep the smallest distance).
+
+    Adjacent query tokens also look up the folded bigram index, so a
+    multi-word mishearing ('e aço') resolves to the corpus pair with the
+    same pronunciation ('yasuo')."""
+    terms: dict[str, int] = {}
+    vocabs = [v for v in (_load_vocab(t) for t in tables) if v is not None]
+    if not vocabs:
+        return []
+    bigrams = _load_bigrams(tables)
     for w in q.split():
         if not w:
             continue
-        for t in _token_expansions(w, vocabs):
-            if t not in seen:
-                seen.add(t)
-                terms.append(t)
-    return terms
+        for t, d in _token_expansions(w, vocabs, bigrams):
+            if d < terms.get(t, 99):
+                terms[t] = d
+    if bigrams:
+        q_toks = [w for w in q.split() if w]
+        for a, b in zip(q_toks, q_toks[1:]):
+            fk = _phonetic_fold(a) + _phonetic_fold(b)
+            for pair, _freq in bigrams.get(fk, ()):
+                if 1 < terms.get(pair, 99):
+                    terms[pair] = 1
+    return sorted(terms.items(), key=lambda kv: (kv[1], kv[0]))
 
 
-def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[str]:
-    """OR-joined quoted-phrase MATCH pattern from the fuzzy expansion.
+def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[dict[int, str]]:
+    """Distance-tiered quoted-phrase MATCH patterns, {dist: OR-pattern}.
 
+    Tier 0 holds the user's own tokens plus fold-equal matches
+    ('katarina'->'catarina'); higher tiers hold distance-1/2 expansions.
+    Callers run one MATCH pass per tier and merge — BM25's IDF inflates
+    low-frequency terms, so a single OR pattern ranks rare noise above the
+    intended matches; tiering keeps distance-0 rows ahead of everything.
     Returns None to fall back to the exact token pattern: no expandable
     token, vocab unavailable, or the expansion exceeding the term cap."""
     if not any(len(w) >= 3 for w in q.split()):
         return None
     try:
-        vocabs = [v for v in (_load_vocab(t) for t in tables) if v is not None]
-        if not vocabs:
-            return None
-        terms = _expand_query(q, vocabs)
+        terms = _expand_query(q, tables)
         if not terms or len(terms) > _MAX_EXPANDED_TERMS:
             return None
-        return " OR ".join(f'"{t}"' for t in terms)
+        tiers: dict[int, list[str]] = {}
+        for t, d in terms:
+            tiers.setdefault(d, []).append(t)
+        return {d: " OR ".join(f'"{t}"' for t in ts) for d, ts in sorted(tiers.items())}
     except sqlite3.Error:
         logger.warning("fuzzy expansion failed — falling back to exact pattern")
         return None
@@ -1260,6 +1456,32 @@ assert any(
 assert any(
     h["video_id"] == _selfcheck_video for h in search("googl")
 ), "fuzzy expansion must match 'google' from 'googl'"
+# phonetic fold: c/k, ç/ss, ph/f, y/i and final unstressed vowels collapse;
+# the ASR/typo pairs from the failure corpus must fold equal or within the
+# Damerau budget on the folded form.
+assert _phonetic_fold("katarina") == "katarina"
+assert _phonetic_fold("catarina") == "satarina"
+assert _damerau_levenshtein(_phonetic_fold("katarina"), _phonetic_fold("catarina"), 1) == 1
+assert _phonetic_fold("ambessa") == _phonetic_fold("ambeça") == "ambesa"
+assert _phonetic_fold("seraphine") == _phonetic_fold("serafine") == "serafini"
+assert _phonetic_fold("yasuo") == "iasu" and _phonetic_fold("aço") == "asu"
+# FTS5 unicode61 strips diacritics before indexing: 'aço' arrives in the
+# vocab as 'aco'. The c-before-vowel rule must fold the stripped forms the
+# same way ('aco' -> 'asu', 'nasco' -> 'nasu').
+assert _phonetic_fold("aco") == "asu" and _phonetic_fold("nasco") == "nasu"
+assert _phonetic_fold("shen") == "shen" and _phonetic_fold("suen") == "suen"
+assert _damerau_levenshtein("shen", "suen", 1) == 1, "h/u substitution must fit the budget"
+# The sh digraph survives the fold at word start / after consonants, so the
+# champion 'shaco' does not collapse onto the common words 'caso'/'saco'
+# (dist 1, not 0); after a vowel the sh is a sibilant artifact ('nasho' ->
+# 'nashu' still bridges 'nasço').
+assert _phonetic_fold("shaco") == "shasu"
+assert _damerau_levenshtein(_phonetic_fold("shaco"), _phonetic_fold("caso"), 1) == 1
+assert _phonetic_fold("nasho") == "nasu", "sibilant sh after a vowel still drops"
+assert _damerau_levenshtein("nasus", "nasu", 1) == 1, "nasho still bridges nasço/nasus"
+assert _damerau_levenshtein("asu", "sasu", 1) == 1, "prefix insertion must fit the budget"
+assert _damerau_levenshtein("aurora", "aunara", 2) == 2, "two edits must be detected"
+assert _damerau_levenshtein("abc", "acb", 1) == 1, "adjacent transposition is one edit"
 upsert_video({
     "platform": _selfcheck_platform,
     "video_id": _selfcheck_video,
