@@ -490,3 +490,55 @@ async def test_status_shape(client):
     assert body["paired"] is False
     assert body["enabled"] is True
     assert body["platforms"] == {}
+
+
+def test_real_appdata_db_untouched():
+    """Merged-suite guard: the real %APPDATA%/VOD.RIP/archive.db (also the
+    cookie store's real file — same path when VODRIP_COOKIE_DB is unset)
+    must never be written by the suite.
+
+    Byte-hash comparison against the conftest-import snapshot only holds
+    while no external app instance is live (a running app checkpoints its
+    WAL into the file concurrently), so when a live WAL is detected we fall
+    back to marker rows that only this suite ever writes — real VOD ids
+    never look like them."""
+    import hashlib
+    import sqlite3
+
+    from conftest import REAL_APPDATA_DB_SHA256
+
+    real = Path(os.environ.get("APPDATA", "")) / "VOD.RIP" / "archive.db"
+    wal = real.with_name("archive.db-wal")
+    try:
+        live_writer = wal.exists() and wal.stat().st_size > 0
+    except OSError:
+        live_writer = True
+    if not live_writer:
+        try:
+            now = hashlib.sha256(real.read_bytes()).hexdigest()
+        except OSError:
+            now = None
+        assert now == REAL_APPDATA_DB_SHA256, (
+            "real %APPDATA%/VOD.RIP/archive.db changed during the run — "
+            "import-time self-checks or a test leaked onto user data"
+        )
+    try:
+        con = sqlite3.connect(f"file:{real.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return  # real DB absent/unreadable — nothing leaked onto it
+    try:
+        with con:
+            hits = con.execute(
+                "SELECT COUNT(*) FROM videos WHERE video_id IN "
+                "('__archive_selfcheck__','filter-video-1','legacy-vid','orphan-vid') "
+                "OR video_id LIKE 'filter-%' OR video_id LIKE 'kind-%'"
+            ).fetchone()[0]
+            msg_hits = con.execute(
+                "SELECT COUNT(*) FROM messages WHERE video_id IN "
+                "('__archive_selfcheck__','orphan-vid') OR video_id LIKE 'filter-%'"
+            ).fetchone()[0]
+    finally:
+        con.close()
+    assert hits == 0 and msg_hits == 0, (
+        "test-only marker rows found in the real archive.db — the suite leaked"
+    )
