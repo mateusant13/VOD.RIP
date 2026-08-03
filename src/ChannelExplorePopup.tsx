@@ -57,7 +57,6 @@ import {
   layoutExplorePopupWindow,
   applyExplorePopupWindowPosition,
   applyExplorePopupFullscreenPosition,
-  panelResizeHandleInset,
   startExplorePanelWidthResize,
   startFloatingPanelDrag,
   type PanelPos,
@@ -1729,7 +1728,7 @@ export default function ChannelExplorePopup({
         )}
       </div>
       {!fullscreen && (
-        <PanelResizeHandles onPointerDown={onPanelResize} insetPx={panelResizeHandleInset(true)} />
+        <PanelResizeHandles onPointerDown={onPanelResize} />
       )}
     </div>
   );

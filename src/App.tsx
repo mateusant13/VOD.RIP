@@ -80,7 +80,7 @@ import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
 import QueueTab from './components/QueueTab';
 import SettingsTab from './components/SettingsTab';
-import { PanelResizeHandles, panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
+import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
@@ -3036,6 +3036,17 @@ export default function App() {
     // user-owned widths (survive squeezes across drags, unlike a live snapshot).
     const dragLayout = layoutBoundsInput();
     const preferred = preferredDragRef.current;
+    const dragStartW = previewPanelWidthRef.current;
+
+    // The container height is frozen (previewPanelHeightRef) so a refetch's
+    // aspect change can't collapse the panel; a user resize must re-derive it
+    // from the new width or the panel stays locked on the vertical axis.
+    const setPreviewHeightFromWidth = (w: number) => {
+      const h = Math.round(w / Math.max(0.01, aspect));
+      previewPanelHeightRef.current = h;
+      const c = previewContainerRef.current;
+      if (c) c.style.height = `${h}px`;
+    };
 
     startPanelWidthResize(e, edge, previewPanelWidthRef, setPreviewPanelWidth, {
       panelEl: previewPanelRef.current,
@@ -3046,14 +3057,24 @@ export default function App() {
         }
         return clampPreviewPanelWidth(w, chromeH, aspect, dragLayout);
       },
-      onResizeMove: coupled
-        ? (w) => {
-            applyLayoutRowSizes(resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred));
-          }
-        : undefined,
+      onResizeMove: (w) => {
+        setPreviewHeightFromWidth(w);
+        if (coupled) {
+          applyLayoutRowSizes(resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred));
+        }
+      },
       onResizeEnd: () => {
         preferredDragRef.current.preview = previewPanelWidthRef.current;
         applyLayoutPanelClamps();
+        // Only re-derive the height when the width actually moved — a plain
+        // click on a handle must not collapse the freeze to w/aspect (e.g.
+        // after a wider-aspect refetch).
+        const w = previewPanelWidthRef.current;
+        if (w !== dragStartW) {
+          // Follow the (possibly clamped) final width; the freeze effect
+          // re-measures offsetHeight on the next render and stays consistent.
+          setPreviewHeightFromWidth(w);
+        }
         // Persist right away (localStorage + keepalive POST): waiting for the
         // debounced effect would lose the fresh `owned` on a fast reload.
         flushPanelLayoutToBackend();
@@ -5645,7 +5666,7 @@ export default function App() {
             </div>
           </div>
           {!previewFullscreen && (
-            <PanelResizeHandles onPointerDown={onPreviewPanelResize} insetPx={panelResizeHandleInset(true)} />
+            <PanelResizeHandles onPointerDown={onPreviewPanelResize} />
           )}
         </div>
       )}
@@ -5668,8 +5689,8 @@ export default function App() {
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
         <div
           ref={urlAsidePanelRef}
-          className={`group relative shrink-0 overflow-hidden bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
-          style={{ width: effectiveLayout.urlAside.w, height: effectiveLayout.urlAside.h }}
+          className={`group relative shrink-0 overflow-clip bg-zinc-950 border-2 border-white p-4 flex flex-col gap-2 min-h-0 ${platformCardShadow(layoutPlatform, true)}`}
+          style={{ width: effectiveLayout.urlAside.w, height: effectiveLayout.urlAside.h, overflowClipMargin: 6 }}
         >
           {showUrlInSidebar && (
             <div className="flex items-center justify-between shrink-0">
@@ -5698,10 +5719,9 @@ export default function App() {
             {urlTabContent}
           </div>
           {urlAsideActionBar}
-          {/* urlAside clips overflow, so its handles must sit inside the panel
-              edge or they'd be un-hittable; the seams stay owned by the
-              neighboring panels' outside handles. */}
-          <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} insetPx={panelResizeHandleInset(true)} insetShift={12} />
+          {/* urlAside uses overflow-clip + overflow-clip-margin so the
+              resize handles can straddle its border like the other panels. */}
+          <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} />
         </div>
       )}
       <div
@@ -6360,7 +6380,7 @@ export default function App() {
           />
         )}
 
-        <PanelResizeHandles onPointerDown={onMainPanelResize} insetPx={panelResizeHandleInset(false)} />
+        <PanelResizeHandles onPointerDown={onMainPanelResize} />
       </div>
       </div>
       </div>

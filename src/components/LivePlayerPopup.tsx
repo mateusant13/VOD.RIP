@@ -7,7 +7,6 @@ import ArchiveSearchPopup from './ArchiveSearchPopup';
 import type { ArchiveSearchHit, ArchiveVideoRow } from '../archiveSearchUtils';
 import {
   PanelResizeHandles,
-  panelResizeHandleInset,
   type ResizeEdge,
 } from '../explorePopupUtils';
 import {
@@ -795,7 +794,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         flexDirection: 'column',
       }}
     >
-      <PanelResizeHandles onPointerDown={handleResize} insetPx={panelResizeHandleInset(true)} />
+      <PanelResizeHandles onPointerDown={handleResize} />
 
       {/* Header bar — drag handle */}
       <div

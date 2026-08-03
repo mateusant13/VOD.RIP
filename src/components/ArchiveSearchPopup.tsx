@@ -699,7 +699,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </div>
       )}
       {!embedded && (
-        <PanelResizeHandles onPointerDown={onResizeStart} insetPx={panelResizeHandleInset(true)} />
+        <PanelResizeHandles onPointerDown={onResizeStart} />
       )}
     </div>
   );

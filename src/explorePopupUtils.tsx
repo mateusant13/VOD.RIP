@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, Dispatch, MutableRefObject, PointerEvent as ReactPointerEvent, SetStateAction } from 'react';
 
 export type PanelPos = { x: number; y: number };
@@ -140,21 +141,35 @@ function widthDeltaFromEdge(edge: ResizeEdge, dx: number, dy: number, aspect: nu
 
 export function PanelResizeHandles({
   onPointerDown,
-  insetPx,
-  insetShift = 0,
 }: {
   onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => void;
-  insetPx: number;
-  /** Shift handles inward by this many px. Needed when the host panel clips
-   *  overflow (handles outside the padding box would be un-hittable). */
-  insetShift?: number;
 }) {
+  // Hosts with overflow hidden/clip can't paint handles outside their padding
+  // box — detect that and hug the inner edge instead of straddling the border.
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [clipsOverflow, setClipsOverflow] = useState(false);
+  useLayoutEffect(() => {
+    // The containing block (offsetParent) is the panel the handles are
+    // positioned against — the DOM parent may be an inner scroll container.
+    // overflow: clip hosts can still paint outside their padding box as long
+    // as the clip margin covers the strip overhang; anything less clips.
+    const host = hostRef.current?.offsetParent as HTMLElement | null;
+    if (!host) return;
+    const cs = getComputedStyle(host);
+    const margin = parseFloat(cs.overflowClipMargin) || 0;
+    setClipsOverflow(cs.overflow === 'hidden' || (cs.overflow === 'clip' && margin < CARD_BORDER_PX));
+  });
+
   // Cursor is applied directly per edge (not group-hover): the handle is always
   // inside its own panel, so no .group ancestor is required — fixes main panel.
   const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
   const edgePad = 12;
-  const off = insetPx + 3 - insetShift;
-  const cornerOff = insetPx - insetShift;
+  // Edge strips straddle the host's border (2px out, 2px border, 2px in) so the
+  // resize cursor appears at the visible edge. Clipped hosts can't paint
+  // outside: the strip hugs the padding-box edge (border-box 0..6, still fully
+  // inside the padding box).
+  const edgeOff = clipsOverflow ? 0 : CARD_BORDER_PX + 2;
+  const cornerOff = clipsOverflow ? 0 : CARD_BORDER_PX + 2;
 
   const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string, sizeClass = '') => ({
     'data-panel-resize': true as const,
@@ -165,16 +180,16 @@ export function PanelResizeHandles({
   });
 
   return (
-    <>
-      <div {...edgeProps('n', { top: -off, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -off, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -off, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
-      <div {...edgeProps('w', { left: -off, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+    <div ref={hostRef} className="absolute inset-0 z-50 pointer-events-none" aria-hidden="true">
+      <div {...edgeProps('n', { top: -edgeOff, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('s', { bottom: -edgeOff, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -edgeOff, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      <div {...edgeProps('w', { left: -edgeOff, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
       <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
       <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
       <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
       <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
-    </>
+    </div>
   );
 }
 
