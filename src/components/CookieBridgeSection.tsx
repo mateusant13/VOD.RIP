@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, Copy, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
-import FieldCaption from './FieldCaption';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 
 /**
@@ -101,9 +100,11 @@ export default function CookieBridgeSection() {
   const platforms = status?.platforms ?? {};
 
   return (
-    <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-3">
+    <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <FieldCaption noWrap>Cookie Bridge</FieldCaption>
+        <span className={`text-[9px] font-mono ${status?.paired ? 'text-emerald-600' : 'text-zinc-600'}`}>
+          {status?.paired ? '● paired' : '○ not paired'}
+        </span>
         <button
           type="button"
           onClick={() => void toggle()}
@@ -128,9 +129,6 @@ export default function CookieBridgeSection() {
       {error ? <p className="text-[9px] text-red-500 font-mono">{error}</p> : null}
 
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-mono">
-        <span className={status?.paired ? 'text-emerald-600' : 'text-zinc-600'}>
-          {status?.paired ? '● paired' : '○ not paired'}
-        </span>
         {Object.keys(platforms).length > 0 ? (
           Object.entries(platforms).map(([platform, st]) => (
             <span key={platform} className={st.count > 0 ? 'text-zinc-500' : 'text-zinc-700'}>
