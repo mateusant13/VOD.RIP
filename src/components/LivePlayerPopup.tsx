@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw } from 'lucide-react';
+import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -10,6 +10,9 @@ import {
   type ResizeEdge,
 } from '../explorePopupUtils';
 import {
+  LIVE_PANEL_MAX_H,
+  LIVE_PANEL_MAX_W,
+  LIVE_PANEL_MIN_H,
   LIVE_PANEL_MIN_W,
   panelPosAfterResize,
   startPanelResizeDrag,
@@ -68,7 +71,6 @@ interface LevelInfo {
 
 const POPUP_WIDTH = 480;
 const POPUP_HEIGHT = 320;
-const POPUP_MIN_H = 200;
 const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while resizing
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
@@ -818,11 +820,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
     startPanelResizeDrag(e, edge, sizeRef, setSize, {
       panelEl: popupRef.current,
-      maxW: viewport.w - RESIZE_MARGIN,
-      maxH: viewport.h - RESIZE_MARGIN,
+      maxW: Math.min(viewport.w - RESIZE_MARGIN, LIVE_PANEL_MAX_W),
+      maxH: Math.min(viewport.h - RESIZE_MARGIN, LIVE_PANEL_MAX_H),
       clampSize: (s) => ({
-        w: Math.min(viewport.w - RESIZE_MARGIN, Math.max(LIVE_PANEL_MIN_W, s.w)),
-        h: Math.min(viewport.h - RESIZE_MARGIN, Math.max(POPUP_MIN_H, s.h)),
+        w: Math.min(viewport.w - RESIZE_MARGIN, Math.max(LIVE_PANEL_MIN_W, Math.min(s.w, LIVE_PANEL_MAX_W))),
+        h: Math.min(viewport.h - RESIZE_MARGIN, Math.max(LIVE_PANEL_MIN_H, Math.min(s.h, LIVE_PANEL_MAX_H))),
       }),
       onResizeMove: (next) => applyPos(next),
       onResizeEnd: () => applyPos(sizeRef.current),
@@ -917,36 +919,41 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     >
       <PanelResizeHandles onPointerDown={handleResize} />
 
-      {/* Header bar — drag handle (preview-panel chrome: badge + channel name) */}
+      {/* Header bar — drag handle, same chrome as the mini preview player
+          (eyebrow label + title + LIVE badge, labeled SEARCH ARCHIVE button,
+          close X). */}
       <div
         onMouseDown={handleMouseDown}
-        className="flex items-center justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
+        className="flex items-start justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
         style={{ cursor: drag ? 'grabbing' : 'grab' }}
       >
-        <span className="flex items-center gap-1.5 min-w-0">
-          {mode === 'live' ? (
-            <span
-              className="flex items-center gap-1 border-2 border-red-700 bg-red-950/60 text-red-400 px-1 py-px text-[8px] font-black uppercase tracking-widest shrink-0"
-              title="This is a live stream"
-            >
-              <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-              LIVE
+        <div className="flex items-start gap-1.5 min-w-0">
+          <div className="min-w-0">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
+              {mode === 'live' ? 'Live stream' : 'Live replay'}
             </span>
-          ) : (
-            <span className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-800/60 text-zinc-300 px-1 py-px text-[8px] font-black uppercase tracking-widest shrink-0">
-              REPLAY
-            </span>
-          )}
-          <span className="text-[10px] font-bold uppercase truncate text-zinc-200">
-            {channelName}
-            {activeEntry.title ? ` — ${activeEntry.title}` : ''}
-          </span>
-        </span>
+            <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
+              {channelName}
+              {activeEntry.title ? ` — ${activeEntry.title}` : ''}
+            </p>
+            {mode === 'live' ? (
+              <span className="inline-flex items-center gap-1 mt-0.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+                <span className="text-[10px] font-bold text-red-400">LIVE</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 mt-0.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-500" />
+                <span className="text-[10px] font-bold text-zinc-400">REPLAY</span>
+              </span>
+            )}
+          </div>
+        </div>
 
-        <span className="flex items-center gap-0.5 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           {channelUrl && (
             <button
-              className="live-popup-link text-zinc-400 hover:text-white p-1"
+              className="live-popup-link text-zinc-500 hover:text-white p-1 shrink-0"
               onClick={() => window.open(channelUrl, '_blank', 'noopener,noreferrer')}
               title="Open channel"
             >
@@ -954,23 +961,31 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             </button>
           )}
           <button
-            className={`live-popup-search p-1 ${searchOpen ? 'text-white bg-zinc-800' : 'text-zinc-400 hover:text-white'}`}
+            type="button"
             onClick={() => setSearchOpen((o) => !o)}
+            aria-pressed={searchOpen}
+            className={`live-popup-search flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+              searchOpen
+                ? 'bg-white text-black border-white'
+                : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+            }`}
             title="Search the local archive (transcripts + chat)"
           >
-            <Search size={13} />
+            <Search size={10} className="shrink-0" />
+            {searchOpen ? 'CLOSE SEARCH' : 'SEARCH ARCHIVE'}
           </button>
           <button
-            className="live-popup-close text-zinc-400 hover:text-white p-1"
+            className="live-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
             onClick={handleClose}
             title="Close"
           >
-            ✕
+            <X size={16} />
           </button>
-        </span>
+        </div>
       </div>
 
-      {/* Video area */}
+      {/* Video area — same as the mini preview player: click toggles
+          play/pause, loading + buffering show spinner overlays. */}
       <div
         style={{
           flex: 1,
@@ -979,25 +994,33 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           overflow: 'hidden',
         }}
       >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-        />
+        <div
+          className="absolute inset-0 z-0 cursor-pointer"
+          onClick={() => {
+            if (!loading && !error) togglePlay();
+          }}
+        >
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
+        </div>
 
         {loading && (
-          <div
-            className="absolute inset-0 flex items-center justify-center bg-black/60 text-zinc-300 font-mono text-xs uppercase tracking-widest"
-          >
-            {mode === 'replay' ? 'Loading replay…' : 'Loading live stream…'}
+          <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/60 pointer-events-none">
+            <Loader2 size={40} className="animate-spin text-zinc-300" />
+            <span className="ml-3 text-zinc-300 text-xs font-mono">
+              {mode === 'replay' ? 'Loading replay…' : 'Loading live stream…'}
+            </span>
           </div>
         )}
 
         {error && (
           <div
-            className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 bg-black/70 text-red-400 text-xs font-mono text-center px-4"
+            className="absolute inset-0 z-[1] flex flex-col items-center justify-center gap-2.5 bg-black/70 text-red-400 text-xs font-mono text-center px-4"
           >
             <div>{error}</div>
             {previewRetry && (
@@ -1016,8 +1039,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
         {!loading && !error && buffering && (
           <div
-            className="absolute inset-0 flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none"
+            className="absolute inset-0 z-[1] flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none"
           >
+            <Loader2 size={28} className="animate-spin text-zinc-200/90 mr-2" />
             Buffering…
           </div>
         )}

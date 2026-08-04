@@ -904,6 +904,14 @@ export const PREVIEW_PANEL_CHROME_H_EST = 120;
 export const PREVIEW_PANEL_PAD_H = 32;
 export const LIVE_PANEL_DEFAULT_W = 480;
 export const LIVE_PANEL_MIN_W = 320;
+/** Live player's own min height — smaller than this the transport row
+ *  collides with the header (mirror of URL_ASIDE_TRIM_MIN_H idea). */
+export const LIVE_PANEL_MIN_H = 200;
+/** Live player's own hard size cap — unlike the layout-coupled preview
+ *  panel, the floating live player caps at these fixed bounds (also
+ *  clamped to the viewport, see LivePlayerPopup handleResize). */
+export const LIVE_PANEL_MAX_W = 1280;
+export const LIVE_PANEL_MAX_H = 800;
 export const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
 export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
 /** Min height when trim UI + action buttons must stay visible. */
