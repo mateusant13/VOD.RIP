@@ -1084,3 +1084,25 @@ def test_span_respects_filters_and_ordering():
     hits_all = archive_db.search("vale da estranheza", channel="gaveta")
     vids = {h["video_id"] for h in hits_all if h["kind"] == "transcript"}
     assert {"span-vid-4", "span-vid-5"} <= vids
+
+
+def test_short_tokens_are_not_or_pattern_noise():
+    # "da" must not make rows match a phrase query when the long tokens are
+    # absent (previously every PT row containing "da" flooded the results).
+    _insert_video("noise-vid-1")
+    _insert_msg("noise-vid-1", "da da da da da da")
+    hits = archive_db.search("vale da estranheza", video_id="noise-vid-1")
+    assert all(h["kind"] != "message" for h in hits), (
+        "a row containing only 'da' must not match 'vale da estranheza'"
+    )
+
+
+def test_short_tokens_are_not_title_substring_noise():
+    # "da" must not match titles via substring ("day", "mudam").
+    archive_db.upsert_video({
+        "platform": "twitch", "video_id": "noise-vid-2", "channel": "gaveta",
+        "title": "Doomsday mudam trailer", "started_at": "2026-07-30T12:00:00Z",
+        "kind": "vod",
+    })
+    hits = archive_db.search("vale da estranheza", video_id="noise-vid-2")
+    assert all(h["video_id"] != "noise-vid-2" for h in hits)

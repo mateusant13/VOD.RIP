@@ -1310,6 +1310,10 @@ def _titles_search(
     to an FTS5 external-content titles table with a unicode61 tokenizer and
     reuse the tier/merge machinery of the content tables."""
     q_tokens = _fold_tokens(q)
+    # 1-2 char tokens are substring noise in titles ("da" ⊂ "day", "mudam").
+    # The content passes keep them for phrase adjacency; here they only
+    # match half the catalog. An all-short query simply skips the pass.
+    q_tokens = [t for t in q_tokens if len(t) >= 3]
     if not q_tokens:
         return []
     sql = "SELECT platform, video_id, channel, title, started_at AS date, kind AS video_kind FROM videos"
@@ -2021,6 +2025,14 @@ def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[dict[int, str]]:
         terms = _expand_query(q, tables)
         if not terms or len(terms) > _MAX_EXPANDED_TERMS:
             return None
+        # Ultra-common 1-2 char tokens ("da", "de", "é") are OR-pattern
+        # noise: they match a large fraction of every archive. The phrase
+        # and span passes keep them for adjacency — only the OR expansion
+        # drops them, and only when longer terms exist (an all-short query
+        # falls back to the exact pattern below).
+        long_terms = [(t, d) for t, d in terms if len(t) > 2]
+        if long_terms:
+            terms = long_terms
         tiers: dict[int, list[str]] = {}
         for t, d in terms:
             tiers.setdefault(d, []).append(t)
