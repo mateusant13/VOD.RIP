@@ -51,16 +51,22 @@ def sweep_orphaned_temps(temp_dir: Path, app_data: Path) -> dict:
     stats: dict[str, int] = {}
 
     # 1) kd_preview subdirs (sessions, preflight, caches) left by crashed
-    #    processes — an active session's dir is continuously written.
-    preview_root = temp_dir / "kd_preview"
-    if preview_root.is_dir():
-        removed = 0
-        for entry in preview_root.iterdir():
+    #    processes — an active session's dir is continuously written. The root
+    #    follows the routed cache location (cache_dir setting -> biggest fixed
+    #    drive); the legacy TEMP root is also swept when it differs.
+    from services.preview._state import preview_root
+
+    sweep_roots = {preview_root(), temp_dir / "kd_preview"}
+    removed = 0
+    for root in sweep_roots:
+        if not root.is_dir():
+            continue
+        for entry in root.iterdir():
             if entry.is_dir() and _stale(entry, orphan_cutoff):
                 shutil.rmtree(entry, ignore_errors=True)
                 if not entry.exists():
                     removed += 1
-        stats["kd_preview"] = removed
+    stats["kd_preview"] = removed
 
     # 2) vodrip-transcribe-* e2e temp dirs (the worker itself never creates
     #    them — they come from the standalone transcribe e2e test).
@@ -151,9 +157,10 @@ def whisper_cache_dir() -> Path:
     """Resolve the whisper model cache dir.
 
     Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
-    %APPDATA%/VOD.RIP/whisper-models. Pointing it at a shared HF hub dir
-    (e.g. BrandOps' models--Systran--faster-whisper-* checkpoints) lets
-    faster-whisper reuse already-downloaded models without any download.
+    cache_root()/whisper-models -> %APPDATA%/VOD.RIP/whisper-models. Pointing
+    it at a shared HF hub dir (e.g. BrandOps' models--Systran--faster-whisper-*
+    checkpoints) lets faster-whisper reuse already-downloaded models without
+    any download.
     """
     env = os.environ.get(CACHE_ENV, "").strip()
     if env:
@@ -165,6 +172,11 @@ def whisper_cache_dir() -> Path:
     ).strip()
     if setting:
         return Path(setting)
+    from services.settings import cache_root
+
+    root = cache_root()
+    if root is not None:
+        return root / "whisper-models"
     return _get_appdata_dir() / "whisper-models"
 
 
@@ -272,7 +284,17 @@ if os.environ.get("VODRIP_DISK_HYGIENE_SELFCHECK") == "1":
         for _p in (_old, _transcribe, _selfcheck_db):
             os.utime(_p, (_old_cutoff, _old_cutoff))
         os.utime(_settings_tmp, (_settings_cutoff, _settings_cutoff))
-        _stats = sweep_orphaned_temps(_tmp, _app)
+        # Pin the routed preview root to the scratch tmp so the sweep is
+        # hermetic even when a real biggest-fixed-drive cache root exists.
+        _saved_cache_dir = os.environ.get("VODRIP_CACHE_DIR")
+        os.environ["VODRIP_CACHE_DIR"] = str(_tmp)
+        try:
+            _stats = sweep_orphaned_temps(_tmp, _app)
+        finally:
+            if _saved_cache_dir is None:
+                os.environ.pop("VODRIP_CACHE_DIR", None)
+            else:
+                os.environ["VODRIP_CACHE_DIR"] = _saved_cache_dir
         assert _stats["kd_preview"] == 1, f"stale session dir must be swept: {_stats}"
         assert _stats["transcribe"] == 1, f"stale transcribe dir must be swept: {_stats}"
         assert _stats["cookie_selfcheck"] == 1, f"stale selfcheck db must be swept: {_stats}"

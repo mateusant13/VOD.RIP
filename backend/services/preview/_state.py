@@ -16,8 +16,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 
-# --- Preview root directory ---
-_PREVIEW_ROOT: Path = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
+def preview_root() -> Path:
+    """Root of the kd_preview temp/media cache.
+
+    Routed through the cache root (cache_dir setting -> biggest fixed drive)
+    when one exists; otherwise the historical TEMP location. Lazy (not a
+    module constant) so a cache_dir change is picked up at session-create
+    time and tests can pin it via VODRIP_CACHE_DIR / settings.
+    """
+    from services.settings import cache_root
+
+    root = cache_root()
+    if root is not None:
+        return root / "kd_preview"
+    return Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
 
 
 # --- Resolved stream cache ---

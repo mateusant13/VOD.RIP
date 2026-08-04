@@ -31,10 +31,17 @@ _BATCH = 128
 
 
 def _cache_dir() -> Path:
+    # Precedence: VODRIP_EMBED_CACHE env -> cache_root()/embed-models ->
+    # %APPDATA%/VOD.RIP/embed-models (app-data aware so tests stay isolated).
     env = os.environ.get("VODRIP_EMBED_CACHE", "").strip()
     if env:
         return Path(env)
-    return Path(os.environ.get("APPDATA", ".")) / "VOD.RIP" / "embed-models"
+    from services.settings import _get_appdata_dir, cache_root
+
+    root = cache_root()
+    if root is not None:
+        return root / "embed-models"
+    return _get_appdata_dir() / "embed-models"
 
 
 _lock = threading.Lock()

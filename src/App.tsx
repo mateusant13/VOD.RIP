@@ -357,6 +357,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   throttle_kib: -1,
   ffmpeg_path: '',
   temp_folder: '',
+  cache_dir: '',
   oauth: '',
   quality: '1080p',
   channel_kick_enabled: true,

@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from services.disk_detect import biggest_fixed_drive, free_space
 from services.disk_hygiene import (
     active_whisper_model_id,
     prune_inactive_whisper_models,
@@ -74,9 +75,17 @@ def _category_paths() -> dict[str, list[Path]]:
         "whisper_models": [_whisper_cache_dir()],
         "db": [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")],
         "logs": [_get_appdata_dir() / "logs", _bgutil_dir() / "pot-server.log"],
-        "preview_cache": [Path(tempfile.gettempdir()) / "kd_preview"],
+        "preview_cache": [_preview_root()],
         "update_temps": [Path(tempfile.gettempdir()) / "VOD.RIP-Updates"],
     }
+
+
+def _preview_root() -> Path:
+    """kd_preview root — routed through the cache root (cache_dir setting ->
+    biggest fixed drive), falling back to TEMP (historical location)."""
+    from services.preview._state import preview_root
+
+    return preview_root()
 
 
 # --- sizing ----------------------------------------------------------------
@@ -182,14 +191,29 @@ def disk_usage() -> dict[str, int]:
 
 @router.get("/api/disk/status")
 def disk_status() -> dict:
-    """Free space on the data drive + configured VOD retention count."""
+    """Free space on the data drive + cache location info + VOD retention."""
     free = _free_bytes()
+    cache_dir, cache_free = _cache_status()
     return {
         "free_bytes": free,
         "threshold_bytes": FREE_THRESHOLD_BYTES,
         "low": free < FREE_THRESHOLD_BYTES,
         "keep_count": _keep_count(),
+        # Effective cache root (settings.cache_dir or the auto biggest-drive
+        # pick) and free space on its volume — for the Disk UI cache row.
+        "cache_dir": cache_dir,
+        "cache_free_bytes": cache_free,
+        "biggest_drive": biggest_fixed_drive() or "",
     }
+
+
+def _cache_status() -> tuple[str, int]:
+    from services.settings import cache_root
+
+    root = cache_root()
+    if root is None:
+        return "", 0
+    return str(root), free_space(root)
 
 
 @router.post("/api/disk/cleanup")
@@ -203,7 +227,7 @@ def disk_cleanup(req: CleanupRequest) -> dict[str, int]:
             _whisper_cache_dir(), active_whisper_model_id()
         )
     elif cat == "preview_cache":
-        freed = _delete_contents(Path(tempfile.gettempdir()) / "kd_preview")
+        freed = _delete_contents(_preview_root())
     elif cat == "update_temps":
         freed = _delete_contents(Path(tempfile.gettempdir()) / "VOD.RIP-Updates")
     else:

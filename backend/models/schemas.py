@@ -74,6 +74,10 @@ class AppSettings(BaseModel):
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""
+    # Cache root for large on-disk caches (whisper models, yt-dlp cache,
+    # preview temp, embed models). '' = auto -> the fixed drive with the most
+    # free space; an explicit path wins. VODRIP_CACHE_DIR env overrides both.
+    cache_dir: str = ""
     oauth: str = ""
     youtube_cookies_file: str = ""
     youtube_cookies_browser: str = ""
@@ -121,6 +125,7 @@ class SettingsUpdate(BaseModel):
     throttle_kib: Optional[int] = None
     ffmpeg_path: Optional[str] = None
     temp_folder: Optional[str] = None
+    cache_dir: Optional[str] = None
     oauth: Optional[str] = None
     youtube_cookies_file: Optional[str] = None
     youtube_cookies_browser: Optional[str] = None

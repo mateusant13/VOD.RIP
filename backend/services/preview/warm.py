@@ -36,8 +36,8 @@ from services.preview._state import (
     _MAX_WARM_FAILURES,
     _PREFLIGHT_MUX_INFLIGHT,
     _PREFLIGHT_MUX_LOCK,
-    _PREVIEW_ROOT,
     _PRINTED_COOLDOWN,
+    preview_root,
     _RESOLVED_STREAM_CACHE,
     _RESOLVED_STREAM_LOCK,
     _RESOLVED_STREAM_MAX,
@@ -117,7 +117,7 @@ def _record_warm_failure() -> None:
 _ACTIVE_YOUTUBE_PREVIEW_LOCK = threading.Lock()
 _PREFLIGHT_MUX_LOCK = threading.Lock()
 def _preflight_mux_dir(video_id: str, prefer_height: int) -> Path:
-    return _PREVIEW_ROOT / "preflight" / f"{video_id}_{prefer_height}"
+    return preview_root() / "preflight" / f"{video_id}_{prefer_height}"
 def _preflight_seg0_ready(out_dir: Path) -> bool:
     seg0 = out_dir / "seg_000.ts"
     return seg0.is_file() and seg0.stat().st_size >= MIN_VALID_OUTPUT_BYTES
@@ -344,7 +344,7 @@ def _build_youtube_session_snapshot(
         return None
 
     session_id = secrets.token_hex(8)
-    cache_dir = _PREVIEW_ROOT / session_id
+    cache_dir = preview_root() / session_id
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     preview_audio_url: Optional[str] = None

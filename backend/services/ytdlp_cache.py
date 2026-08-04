@@ -12,12 +12,24 @@ logger = logging.getLogger(__name__)
 
 def _get_cache_dir() -> Path:
     """Return the dedicated yt-dlp cache directory for this application.
-    If the user's `Path.home()` produces a path that can't be created
-    (e.g. the home dir is a UNC share the OS won't create child
-    directories on, or has illegal characters in it), fall back to the
-    system temp dir. This is the most common cause of `[Errno 22]
+
+    Routed through the cache root (cache_dir setting -> biggest fixed drive)
+    when one exists, else the historical `~/.cache/KickDownloader`. If the
+    resolved path can't be created (e.g. the home dir is a UNC share the OS
+    won't create child directories on, or has illegal characters in it), fall
+    back to the system temp dir. This is the most common cause of `[Errno 22]
     Invalid argument` users see when fetching a VOD.
     """
+    from services.settings import cache_root
+
+    root = cache_root()
+    if root is not None:
+        target = root / "yt-dlp-cache"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+        except OSError:
+            pass
     base = Path.home() / ".cache" / "KickDownloader"
     try:
         base.mkdir(parents=True, exist_ok=True)

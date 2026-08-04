@@ -75,6 +75,9 @@ async def update_settings(update: SettingsUpdate):
         current.download_folder_confirmed = update.download_folder_confirmed
     if update.temp_folder is not None:
         current.temp_folder = update.temp_folder
+    if update.cache_dir is not None:
+        # '' = auto (biggest fixed drive); any explicit path wins.
+        current.cache_dir = update.cache_dir.strip()
     if update.oauth is not None:
         current.oauth = update.oauth
     if update.youtube_cookies_file is not None:

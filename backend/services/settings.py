@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Optional
 
 from models.schemas import AppSettings
 
@@ -25,6 +26,33 @@ def _get_appdata_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     return base / "VOD.RIP"
+
+
+def cache_root() -> Optional[Path]:
+    """Effective root for the large on-disk caches (whisper models, yt-dlp
+    cache, preview temp, embed models).
+
+    Precedence: VODRIP_CACHE_DIR env (test/portable override) ->
+    settings.cache_dir (explicit path) -> biggest fixed drive + VOD.RIP-cache
+    (auto) -> None (each cache keeps its historical default — e.g. non-Windows
+    hosts with no fixed drive to pick). Per-cache env knobs
+    (VODRIP_WHISPER_CACHE, VODRIP_EMBED_CACHE) are checked by each cache's own
+    resolver BEFORE this — env always wins over the setting.
+    """
+    env = os.environ.get("VODRIP_CACHE_DIR", "").strip()
+    if env:
+        return Path(env)
+    from deps import settings_mgr
+
+    setting = (getattr(settings_mgr.get(), "cache_dir", "") or "").strip()
+    if setting:
+        return Path(setting)
+    from services.disk_detect import biggest_fixed_drive
+
+    drive = biggest_fixed_drive()
+    if drive:
+        return Path(drive) / "VOD.RIP-cache"
+    return None
 
 
 class SettingsManager:

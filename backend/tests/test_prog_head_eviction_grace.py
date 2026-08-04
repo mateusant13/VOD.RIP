@@ -7,17 +7,15 @@ Run from anywhere: `python backend/tests/test_prog_head_eviction_grace.py`
 """
 import os
 import sys
+import tempfile
 import time
 
 _backend_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
 
-from services import preview_service
-from services.preview_service import (
-    _PROG_HEAD_DIR,
-    _PROG_HEAD_MIN_EVICT_AGE_SEC,
-)
+import services.preview.session as _preview_session
+from services.preview_service import _PROG_HEAD_MIN_EVICT_AGE_SEC
 
 # Spec: grace MUST exceed typical click-to-play latency so a user clicking
 # during a wave-completion purge always reaches the cache.
@@ -30,7 +28,10 @@ def main() -> int:
         f"grace {_PROG_HEAD_MIN_EVICT_AGE_SEC}s too short \u2014 click-to-play latency (~{_GRACE_FLOOR_SEC}s) would race"
     )
 
-    sandbox = _PROG_HEAD_DIR / "_eviction_grace_test"
+    # Pin the routed preview/cache root to a scratch dir so the sandbox never
+    # touches the real cache drive (works standalone and under pytest).
+    os.environ.setdefault("VODRIP_CACHE_DIR", tempfile.mkdtemp(prefix="prog-head-grace-"))
+    sandbox = _preview_session._prog_head_dir() / "_eviction_grace_test"
     sandbox.mkdir(parents=True, exist_ok=True)
     try:
         # Two files: fresh (1MB, mtime=now) and old (3MB, mtime far past).
@@ -48,15 +49,15 @@ def main() -> int:
         os.utime(old_meta, (old_mtime, old_mtime))
 
         # Redirect real production function to sandbox with tightened cap.
-        original_dir = preview_service._PROG_HEAD_DIR
-        original_max = preview_service._PROG_HEAD_MAX_BYTES
-        preview_service._PROG_HEAD_DIR = sandbox
-        preview_service._PROG_HEAD_MAX_BYTES = 1024 * 1024
+        original_dir = _preview_session._prog_head_dir
+        original_max = _preview_session._PROG_HEAD_MAX_BYTES
+        _preview_session._prog_head_dir = lambda: sandbox
+        _preview_session._PROG_HEAD_MAX_BYTES = 1024 * 1024
         try:
-            preview_service._prog_head_enforce_budget()
+            _preview_session._prog_head_enforce_budget()
         finally:
-            preview_service._PROG_HEAD_DIR = original_dir
-            preview_service._PROG_HEAD_MAX_BYTES = original_max
+            _preview_session._prog_head_dir = original_dir
+            _preview_session._PROG_HEAD_MAX_BYTES = original_max
 
         # Fresh file (mtime=now) is within grace \u2192 not a candidate \u2192 survives.
         # Old file (mtime=cutoff-60) is past grace \u2192 candidate \u2192 over cap \u2192 purged.

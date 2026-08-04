@@ -29,6 +29,14 @@ os.environ["VODRIP_COOKIE_DB"] = str(_TMP / "cookies.db")
 # thing that keeps those import-time singletons off the REAL %APPDATA%.
 os.environ["VODRIP_APP_DATA"] = str(_TMP / "VOD.RIP")
 
+# Pin the routed cache root (WS-8: cache_dir setting / biggest-fixed-drive
+# auto pick) to scratch. Without this, the auto pick on a dev machine
+# resolves to a REAL data drive (e.g. I:\) and any test that touches the
+# whisper/yt-dlp/preview/embed cache paths would create dirs there. Per-cache
+# env knobs (VODRIP_WHISPER_CACHE, VODRIP_EMBED_CACHE) still win; tests that
+# need the real auto-pick behavior delenv VODRIP_CACHE_DIR.
+os.environ.setdefault("VODRIP_CACHE_DIR", str(_TMP / "cache"))
+
 # Snapshot of the REAL %APPDATA% archive.db taken here, before any test
 # module import can run the archive/cookie-store self-checks. The cookie
 # store's real file is the same archive.db (VODRIP_COOKIE_DB unset →

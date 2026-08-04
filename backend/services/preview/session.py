@@ -114,11 +114,14 @@ SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
 _UPSTREAM_CHUNK_BYTES = 64 * 1024
 _UPSTREAM_CONNECT_TIMEOUT_SEC = 15
 
-from services.preview._state import _PREVIEW_ROOT
+from services.preview._state import preview_root
 
-_FULL_MUX_CACHE_DIR = _PREVIEW_ROOT / "full_mux_cache"
+def _full_mux_cache_dir() -> Path:
+    return preview_root() / "full_mux_cache"
+
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
-_PROG_HEAD_DIR = _PREVIEW_ROOT / "prog_head"
+def _prog_head_dir() -> Path:
+    return preview_root() / "prog_head"
 # ponytail: 2MiB head ≈ 20-35s of 360p — enough for instant start + early
 # playback; was 12MiB (~2-3min, ~40 VODs = ~480MB per startup wave).
 _PROG_HEAD_BYTES = 2 * 1024 * 1024
@@ -129,7 +132,7 @@ _PROG_HEAD_MAX_BYTES = 256 * 1024 * 1024
 _PROG_HEAD_TTL_SEC = 86400
 _PROG_HEAD_MIN_EVICT_AGE_SEC = 180
 def _prog_head_paths(video_id: str, height: int) -> Tuple[Path, Path]:
-    base = _PROG_HEAD_DIR / f"{video_id}_{height}"
+    base = _prog_head_dir() / f"{video_id}_{height}"
     return base.with_suffix(".bin"), base.with_suffix(".json")
 def _prog_head_lookup(video_id: str, height: int) -> Optional[Tuple[Path, int]]:
     bin_path, meta_path = _prog_head_paths(video_id, height)
@@ -150,7 +153,7 @@ def _prog_head_enforce_budget() -> None:
         cutoff = time.time() - _PROG_HEAD_MIN_EVICT_AGE_SEC
         files = [
             p
-            for p in _PROG_HEAD_DIR.glob("*.bin")
+            for p in _prog_head_dir().glob("*.bin")
             if p.is_file() and p.stat().st_mtime <= cutoff
         ]
         if not files:
@@ -251,7 +254,7 @@ def _youtube_prog_head_warm(
     try:
         from curl_cffi import requests as cffi_requests
 
-        _PROG_HEAD_DIR.mkdir(parents=True, exist_ok=True)
+        _prog_head_dir().mkdir(parents=True, exist_ok=True)
         resp = cffi_requests.get(
             prog_url,
             headers={**mux_hdrs, "Range": f"bytes=0-{_PROG_HEAD_BYTES - 1}"},
@@ -374,7 +377,15 @@ def _try_prog_head_proxy(
         status = 200
         hdrs.pop("Content-Range", None)
     return _generate, "video/mp4", hdrs, status, lambda: None
-assert _prog_head_lookup("__none__", 360) is None
+# Import-time self-check: a missing prog-head must read as a miss. The root
+# resolver now touches settings/deps (unreachable mid-import) — pin the root
+# to the temp dir for the check only.
+_orig_preview_root = preview_root
+preview_root = lambda: Path(os.environ.get("TEMP") or "/tmp")  # type: ignore[assignment]
+try:
+    assert _prog_head_lookup("__none__", 360) is None
+finally:
+    preview_root = _orig_preview_root
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -686,7 +697,7 @@ class PreviewManager:
             if h > 0:
                 variant_muxed[h] = fmt.get("acodec") not in ("none", None)
         session_id = secrets.token_hex(8)
-        cache_dir = _PREVIEW_ROOT / session_id
+        cache_dir = preview_root() / session_id
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         # For progressive sources (Twitch clips) the "master" is a single MP4
@@ -829,7 +840,7 @@ class PreviewManager:
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("Live preview requires an http(s) HLS URL")
         session_id = secrets.token_hex(8)
-        cache_dir = _PREVIEW_ROOT / session_id
+        cache_dir = preview_root() / session_id
         cache_dir.mkdir(parents=True, exist_ok=True)
         session = PreviewSession(
             session_id=session_id,
@@ -1677,7 +1688,7 @@ def _full_mux_cache_path(
     until TTL evicts them.
     """
     cache_key = f"{video_id}_{height}_full"
-    return _FULL_MUX_CACHE_DIR / f"{cache_key}.mp4"
+    return _full_mux_cache_dir() / f"{cache_key}.mp4"
 def _try_use_full_mux_cache(session: PreviewSession) -> Optional[Path]:
     """Return cached full mux path if it exists and is within TTL."""
     from services.youtube_innertube import extract_video_id
@@ -1698,7 +1709,7 @@ def _try_use_full_mux_cache(session: PreviewSession) -> Optional[Path]:
     return None
 def _enforce_full_mux_cache_budget(max_mb: int = 2000) -> None:
     """LRU eviction for full-mux persistent cache — removes oldest files when budget exceeded."""
-    cache_dir = _FULL_MUX_CACHE_DIR
+    cache_dir = _full_mux_cache_dir()
     if not cache_dir.is_dir():
         return
     files = list(cache_dir.glob("*.mp4"))

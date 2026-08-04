@@ -39,6 +39,9 @@ def scratch_env(tmp_path, monkeypatch):
     monkeypatch.setenv("VODRIP_ARCHIVE_DIR", str(appdata / "archive"))
     monkeypatch.setenv("VODRIP_WHISPER_CACHE", str(appdata / "whisper-models"))
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(appdata / "archive.db"))
+    # Route the WS-8 cache root at the scratch tmp so preview_cache and the
+    # yt-dlp cache land where the fixture writes them (kd_preview/...).
+    monkeypatch.setenv("VODRIP_CACHE_DIR", str(scratch_tmp))
     monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
     return SimpleNamespace(appdata=appdata, tmp=scratch_tmp)
 
