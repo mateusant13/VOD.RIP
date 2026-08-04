@@ -85,6 +85,9 @@ debug_full_flow.py
 # AI agent memory (not project documentation)
 backend/AGENTS.md
 
+# Test impact analysis cache (backend/tests/impact_plugin.py)
+backend/.impact-cache.json
+
 # Generated audit reports / AI agent artifacts
 report/
 audit_report*.md
