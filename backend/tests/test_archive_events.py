@@ -279,6 +279,116 @@ def test_events_real_e2e() -> None:
         print(f"SKIP real E2E: panns_inference not installed: {exc}")
 
 
+def test_events_hook_reuses_decoded_audio() -> None:
+    """detect_events_video(audio=..., speech=...) must NOT re-decode/re-VAD.
+
+    The transcribe hook passes this run's audio + regions through; a second
+    decode of a 13.5h VOD is ~19 min of duplicated CPU. Sub-minimum speech
+    exercises the no-speech skip, so no model is loaded."""
+    import numpy as np
+    from unittest.mock import patch
+
+    from services import archive_transcribe as at
+
+    _db_check()
+    archive_db.upsert_video({
+        "platform": PLATFORM,
+        "video_id": "__events_hook__",
+        "channel": "selftest",
+        "title": "hook fixture",
+        "status": "ready",
+        "archive_path": str(_TMP / "does-not-matter.wav"),
+        "duration_sec": 2.0,
+    })
+    with patch.object(at, "decode_audio") as dec, \
+         patch.object(at, "vad_speech_seconds") as vad:
+        stats = detect_events_video(
+            PLATFORM, "__events_hook__",
+            audio=np.zeros(16000 * 2, dtype=np.float32), speech=[(0.0, 2.0)],
+        )
+    dec.assert_not_called()
+    vad.assert_not_called()
+    assert stats["skipped"] == "no-speech" and stats["events"] == 0, stats
+
+
+def test_process_job_wires_events_hook() -> None:
+    """VODRIP_EVENTS_ENABLED=1 must pass an events_cb that reuses the
+    transcribe run's audio + speech (no second decode) — and the hook must
+    never fail the transcribe job."""
+    from unittest.mock import patch
+
+    from services import archive_transcribe as at
+
+    _db_check()
+    seen: dict = {}
+
+    def fake_transcribe(platform: str, video_id: str, **kw):
+        # Mirrors the real transcribe_video contract: the hook may raise but
+        # must never fail the transcription; its result merges under 'events'.
+        stats = {"segments": 1}
+        cb = kw.get("events_cb")
+        if cb:
+            try:
+                ev = cb("FAKE_AUDIO", [(0.0, 1.0)]) or {}
+            except Exception:
+                return stats  # hook failure swallowed, transcribe survives
+            if ev.get("events") is not None:
+                stats["events"] = ev["events"]
+            seen["events"] = ev
+        return stats
+
+    def fake_detect(platform: str, video_id: str, **kw):
+        return {"events": 3, "audio": kw.get("audio"), "speech": kw.get("speech")}
+
+    with patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
+         patch.object(at, "detect_events_video", side_effect=fake_detect), \
+         patch.dict(os.environ, {"VODRIP_EVENTS_ENABLED": "1"}):
+        stats = at._process_job({"id": "hook-job", "kind": "transcribe",
+                                 "platform": PLATFORM, "video_id": "vid-hook"})
+    assert seen["events"]["audio"] == "FAKE_AUDIO", "hook must receive the decoded audio"
+    assert seen["events"]["speech"] == [(0.0, 1.0)], "hook must receive the VAD regions"
+    assert seen["events"]["events"] == 3, "hook stats must flow into job stats"
+    assert stats["events"] == 3, stats
+
+    # A raising hook must not fail the job (best-effort enrichment).
+    def boom(platform: str, video_id: str, **kw):
+        raise RuntimeError("events crashed")
+
+    with patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
+         patch.object(at, "detect_events_video", side_effect=boom), \
+         patch.dict(os.environ, {"VODRIP_EVENTS_ENABLED": "1"}):
+        stats = at._process_job({"id": "hook-job-2", "kind": "transcribe",
+                                 "platform": PLATFORM, "video_id": "vid-hook"})
+    assert stats["segments"] == 1, "transcribe result must survive a failing events stage"
+
+
+def test_worker_drains_multi_job_queue() -> None:
+    """run_worker(once=True, budget=2) with 3 queued jobs must finish all 3.
+
+    Guards the per-slot refill: the old await-all barrier processed one
+    batch (2 jobs) and stopped, stranding the 3rd."""
+    from services.archive_transcribe import run_worker
+
+    _db_check()
+    fixture = _e2e_fixture()
+    ckpt = _e2e_checkpoint()
+    if fixture is None or ckpt is None:
+        print("SKIP drain test: no fixture/checkpoint")
+        return
+    for i in range(3):
+        vid = f"__drain_{i}__"
+        archive_db.upsert_video({
+            "platform": PLATFORM, "video_id": vid, "channel": "selftest",
+            "title": f"drain {i}", "status": "ready",
+            "archive_path": str(fixture), "duration_sec": 12.0,
+        })
+        archive_db.enqueue_job(f"events-drain-{i}", "events", PLATFORM, vid)
+    run_worker(once=True, poll_interval=0.3, max_workers=2)
+    statuses = {j["id"]: j["status"] for j in archive_db.list_jobs()
+                if j["id"].startswith("events-drain-")}
+    assert statuses == {f"events-drain-{i}": "done" for i in range(3)}, statuses
+
+
 if __name__ == "__main__":
     import logging
 
@@ -291,6 +401,10 @@ if __name__ == "__main__":
     test_event_classes_env_and_intersection()
     print("--- DB helpers ---")
     test_audio_events_db_replace_semantics()
+    print("--- hook + worker drain ---")
+    test_events_hook_reuses_decoded_audio()
+    test_process_job_wires_events_hook()
+    test_worker_drains_multi_job_queue()
     print("--- real E2E ---")
     test_events_real_e2e()
-    print("\nEVENTS OK — pure + DB + real E2E verified.")
+    print("\nEVENTS OK — pure + DB + hook + drain + real E2E verified.")

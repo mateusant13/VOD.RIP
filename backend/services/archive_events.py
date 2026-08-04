@@ -278,13 +278,20 @@ def detect_events_video(
     platform: str,
     video_id: str,
     *,
+    audio: Optional[Any] = None,
+    speech: Optional[list[tuple[float, float]]] = None,
     progress_cb: Optional[Callable[[float, float], None]] = None,
 ) -> dict:
     """Run the events stage for one archived video; replaces old event rows.
 
     Mirrors transcribe_video: resolve the row, decode, VAD, score, upsert
     (delete-then-insert). Returns a stats dict for job reporting. No-speech
-    videos skip without loading the model."""
+    videos skip without loading the model.
+
+    audio/speech: when given (the transcribe job's events_cb hook passes its
+    own decoded audio + VAD regions through), decode and VAD are NOT re-run —
+    a 13.5h VOD would otherwise pay ~19 min of duplicated CPU work. The
+    standalone kind='events' path leaves them None and decodes itself."""
     from services.archive_transcribe import decode_audio, vad_speech_seconds
 
     rows = archive_db.query(
@@ -294,13 +301,15 @@ def detect_events_video(
     if not rows:
         raise KeyError(f"no archived video {platform}/{video_id}")
     path = rows[0]["archive_path"]
-    if not path or not os.path.isfile(path):
-        raise FileNotFoundError(f"archive file missing for {platform}/{video_id}: {path}")
-
     t0 = time.monotonic()
-    audio = decode_audio(path)
+    if audio is None:
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(f"archive file missing for {platform}/{video_id}: {path}")
+        audio = decode_audio(path)
+        speech = vad_speech_seconds(audio)
+    elif speech is None:
+        speech = vad_speech_seconds(audio)
     total_sec = audio.size / SR_16K
-    speech = vad_speech_seconds(audio)
     speech_sec = sum(e - s for s, e in speech)
     dead_air_sec = max(0.0, total_sec - speech_sec)
     stats = {

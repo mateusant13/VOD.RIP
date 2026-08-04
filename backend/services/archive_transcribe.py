@@ -38,7 +38,7 @@ import re
 import subprocess as sp
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -435,7 +435,15 @@ _vad: Any = None
 
 
 def _get_vad() -> Any:
-    """Lazy Silero VAD model (bundled in the package — no download)."""
+    """Lazy Silero VAD model (bundled in the package — no download).
+
+    ponytail: VAD stays on CPU on purpose — silero's get_speech_timestamps
+    loops 512-sample windows with a .item() sync per window, so moving the
+    model to CUDA costs more in launch/sync than it saves (measured 12.7s
+    vs 11.6s CPU on a 300s slice). VAD is now the dominant per-VOD cost on
+    GPU nodes (~26x realtime vs 118-164x inference); the upgrade path is a
+    stateful batched reimplementation or ONNX-Runtime CUDA, not a .cuda()
+    call."""
     global _vad
     with _vad_lock:
         if _vad is None:
@@ -453,16 +461,24 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     from silero_vad import get_speech_timestamps
 
     tensor = torch.from_numpy(audio)
-    timestamps = get_speech_timestamps(
-        tensor,
-        _get_vad(),
-        sampling_rate=SAMPLE_RATE,
-        threshold=0.5,
-        min_speech_duration_ms=250,
-        min_silence_duration_ms=200,
-        speech_pad_ms=30,
-        return_seconds=True,
-    )
+    vad = _get_vad()
+    # silero's VAD model is STATEFUL (hidden state persists across the
+    # 512-sample window loop) and not thread-safe: two workers running VAD
+    # concurrently corrupt each other's state (select() out-of-range crash,
+    # reproduced with 2 concurrent jobs). The whisper path builds per-thread
+    # model copies for the same reason; here one shared lock is enough —
+    # VAD is CPU-bound, so serializing it costs no throughput.
+    with _vad_lock:
+        timestamps = get_speech_timestamps(
+            tensor,
+            vad,
+            sampling_rate=SAMPLE_RATE,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=200,
+            speech_pad_ms=30,
+            return_seconds=True,
+        )
     return [(float(t["start"]), float(t["end"])) for t in timestamps]
 
 
@@ -715,11 +731,17 @@ def transcribe_video(
     *,
     language: Optional[str] = None,
     progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
+    events_cb: Optional[Callable[[Any, list], Optional[dict]]] = None,
 ) -> dict:
     """Transcribe one archived video into the transcripts table (resume-aware).
 
     progress_cb(speech_done_sec, speech_total_sec, chunk_done, chunk_total) —
     non-speech time is deliberately excluded from the denominator.
+    events_cb(audio, speech) — optional post-transcribe stage hook (PANNs
+    event detection) that reuses THIS run's decoded audio and VAD regions
+    instead of decoding the whole file again; its stats merge into the
+    returned dict under 'events'. The hook may raise — transcription result
+    is never rolled back or failed by it.
     Returns a stats dict (also suitable for job reporting).
     """
     rows = archive_db.query(
@@ -881,6 +903,16 @@ def transcribe_video(
         platform, video_id, segments, words, dead_air_pct,
         stats["speed_x"], stats["device"], stats["compute_type"],
     )
+    if events_cb is not None:
+        # Optional enrichment stage (VODRIP_EVENTS_ENABLED=1): reuses this
+        # run's audio + VAD regions — no second decode. Best-effort: a
+        # failing stage never fails the transcribe job.
+        try:
+            ev = events_cb(audio, speech) or {}
+            if ev.get("events") is not None:
+                stats["events"] = ev["events"]
+        except Exception:
+            logger.exception("events stage failed for %s/%s", platform, video_id)
     return stats
 
 
@@ -986,26 +1018,32 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "skipped": "captions-first",
             }
 
-        def _progress(done: float, total: float, _ci: int, _n: int) -> None:
-            if total > 0:
-                archive_db.update_job(job_id, progress=min(0.999, done / total))
+        _last_progress = [0.0]
 
-        stats = transcribe_video(platform, video_id, progress_cb=_progress)
+        def _progress(done: float, total: float, _ci: int, _n: int) -> None:
+            if total <= 0:
+                return
+            # Throttle: progress rows churn the SQLite lock — at most one
+            # UPDATE every 2 s is plenty for a 0-99.9% progress bar.
+            now = time.monotonic()
+            if now - _last_progress[0] < 2.0 and done < total:
+                return
+            _last_progress[0] = now
+            archive_db.update_job(job_id, progress=min(0.999, done / total))
+
+        events_cb = None
+        if events_enabled():
+            def events_cb(audio: Any, speech: list) -> Optional[dict]:
+                return detect_events_video(platform, video_id, audio=audio, speech=speech)
+
+        stats = transcribe_video(platform, video_id, progress_cb=_progress, events_cb=events_cb)
         archive_db.update_job(job_id, status="done", progress=1.0)
         if "skipped" not in stats:
             # Heavy batch writes just finished — merge the FTS b-tree
-            # segments so search stays fast (best-effort inside).
-            archive_db.optimize_fts()
-        if "skipped" not in stats and events_enabled():
-            # Optional PANNs stage (VODRIP_EVENTS_ENABLED=1): the transcribe
-            # job is already 'done' — events are best-effort enrichment and
-            # never fail the job.
-            try:
-                ev_stats = detect_events_video(platform, video_id)
-                stats["events"] = ev_stats.get("events", 0)
-            except Exception:
-                logger.exception("events stage failed for %s/%s — transcribe already done",
-                                 platform, video_id)
+            # segments so search stays fast (best-effort inside). Skipped
+            # for tiny jobs: a few segments don't fragment anything.
+            if stats.get("segments", 0) >= 50:
+                archive_db.optimize_fts()
         return stats
     except Exception as exc:  # job-level failure — worker keeps going
         logger.exception("transcribe job %s failed", job_id)
@@ -1038,27 +1076,38 @@ def run_worker(
                 device, compute_type, budget)
     try:
         with ThreadPoolExecutor(max_workers=budget, thread_name_prefix="transcribe") as pool:
+            # Per-slot claim loop: each finished future frees a slot and a
+            # refill claims the next job immediately. The old await-all
+            # barrier idled every worker behind the slowest job of the batch
+            # (a 10-min clip sat ~1h behind a 13.5h VOD).
+            pending: dict = {}  # Future -> claimed job
+
+            def _refill() -> None:
+                while len(pending) < budget:
+                    job = _claim_next_job()
+                    if job is None:
+                        return
+                    pending[pool.submit(_process_job, job, multi=multi)] = job
+
+            _refill()
             while True:
                 _maybe_close_idle_model()
                 archive_db.worker_heartbeat("transcribe")
-                claimed = []
-                for _ in range(budget):
-                    job = _claim_next_job()
-                    if job is None:
-                        break
-                    claimed.append(job)
-                if not claimed:
+                if not pending:
                     if once:
                         break
                     time.sleep(poll_interval)
+                    _refill()
                     continue
-                futures = [pool.submit(_process_job, j, multi=multi) for j in claimed]
-                for fut in futures:
+                done, _ = wait(pending, timeout=poll_interval)
+                for fut in done:
+                    pending.pop(fut, None)
                     try:
                         fut.result()
                     except Exception:
                         logger.exception("worker future crashed")  # belt & braces
-                if once:
+                    _refill()
+                if once and not pending:
                     break
     finally:
         close_model()
