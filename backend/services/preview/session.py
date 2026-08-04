@@ -907,19 +907,12 @@ class PreviewManager:
                         pass
         except Exception as exc:
             logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
-        # DVR archive: frontend-passed vod_url first, then backend fallback via
-        # the channel's most recent VOD. Failures degrade gracefully (rail off).
-        try:
-            archive = self._resolve_live_archive(session, vod_url)
-            if archive:
-                session.archive_url, session.archive_entry_url = archive
-                session.allowed_hosts.update(_hosts_for_url(session.archive_url or ""))
-                session.allowed_hosts.update(_hosts_for_url(session.archive_entry_url or ""))
-                session.resource_map[REPLAY_PLAYLIST_RESOURCE] = (
-                    f"{REPLAY_HLS_MARKER}playlist"
-                )
-        except Exception as exc:
-            logger.debug("live session %s archive resolve failed: %s", session_id[:8], exc)
+        # DVR archive resolution is deferred to the first replay-playlist
+        # request (_ensure_live_archive) — playback start must not wait on the
+        # Twitch GQL / Kick API probe (1-2s). The frontend warms the rail by
+        # fetching the replay snapshot right after session creation; failures
+        # degrade gracefully (rail off), as before.
+        session.archive_candidate_url = vod_url
         return session
 
     def _resolve_live_archive(
@@ -966,6 +959,43 @@ class PreviewManager:
         except Exception:
             media = master
         return master, media
+
+    def _ensure_live_archive(self, session: "PreviewSession") -> bool:
+        """Lazily resolve the live DVR archive on the first replay request.
+
+        Session creation is deliberately archive-free so playback starts
+        fast; the rail resolves on demand when the frontend warms the replay
+        snapshot (a request that runs parallel to hls.js attach). Idempotent
+        and locked so concurrent warm/seek requests resolve exactly once.
+        """
+        if session.archive_entry_url:
+            return True
+        lock = getattr(session, "_archive_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            session._archive_lock = lock
+        with lock:
+            if session.archive_entry_url:
+                return True
+            try:
+                archive = self._resolve_live_archive(
+                    session,
+                    getattr(session, "archive_candidate_url", None),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "live session %s lazy archive resolve failed: %s",
+                    session.session_id[:8],
+                    exc,
+                )
+                return False
+            if not archive:
+                return False
+            session.archive_url, session.archive_entry_url = archive
+            session.allowed_hosts.update(_hosts_for_url(session.archive_url or ""))
+            session.allowed_hosts.update(_hosts_for_url(session.archive_entry_url or ""))
+            session.resource_map[REPLAY_PLAYLIST_RESOURCE] = f"{REPLAY_HLS_MARKER}playlist"
+            return True
 
 @dataclass
 class PreviewSession:
@@ -4513,6 +4543,14 @@ def resolve_upstream(session_id: str, resource_id: Optional[str]) -> str:
         or resource_id.startswith(WINDOW_HLS_SEGMENT_RESOURCE_PREFIX)
     ):
         _register_youtube_window_hls_resources(session)
+    if (
+        resource_id == REPLAY_PLAYLIST_RESOURCE
+        and REPLAY_PLAYLIST_RESOURCE not in session.resource_map
+    ):
+        # Live DVR archives resolve lazily — the first replay request (the
+        # frontend's rail warm) triggers the GQL/Kick probe off the playback
+        # critical path. No archive → 404 → the rail stays off, as before.
+        _manager._ensure_live_archive(session)
     upstream = session.resource_map.get(resource_id)
     if not upstream and session.custom_master:
         _rebuild_synthetic_resource_map(session)

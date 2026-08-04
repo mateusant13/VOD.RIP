@@ -134,6 +134,8 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const [mode, setMode] = useState<'live' | 'replay'>('live');
   const modeRef = useRef<'live' | 'replay'>('live');
   const [archiveDuration, setArchiveDuration] = useState(0); // backend-probed, session creation
+  const archiveReadyRef = useRef(false); // lazy archive resolved (replay rail usable)
+  const [archiveReady, setArchiveReady] = useState(false);
   const [snapshotDuration, setSnapshotDuration] = useState(0); // replay: video.duration
   const [railTime, setRailTime] = useState(0);
   const replayTimerRef = useRef<number | null>(null);
@@ -447,19 +449,24 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         sessionPlatformRef.current = (entry.platform || '').toLowerCase();
         setArchiveDuration(res.archive_duration ?? 0);
 
-        // Warm the LIVE rail: the backend probes archive_duration only when
-        // the replay playlist is fetched, so fetch the snapshot once and sum
-        // its EXTINF durations — the rail then spans the whole broadcast from
-        // the start instead of sitting at 1s until the first REPLAY switch.
-        if (res.archive_url) {
-          fetch(replaySnapshotUrl(res.session_id))
-            .then((r) => (r.ok ? r.text() : ''))
-            .then((text) => {
-              const total = parsePlaylistTotalSec(text);
-              if (total > 0) setArchiveDuration(total);
-            })
-            .catch(() => {});
-        }
+        // Warm the LIVE rail: the backend resolves the DVR archive lazily on
+        // this snapshot request (off the playback critical path), so fetch it
+        // unconditionally and sum its EXTINF durations — the rail then spans
+        // the whole broadcast from the start instead of sitting at 1s until
+        // the first REPLAY switch. No archive → the request 404s and the rail
+        // stays off (same as a live stream with no DVR).
+        fetch(replaySnapshotUrl(res.session_id))
+          .then((r) => (r.ok ? r.text() : ''))
+          .then((text) => {
+            if (cancelled) return;
+            const total = parsePlaylistTotalSec(text);
+            if (total > 0) {
+              setArchiveDuration(total);
+              archiveReadyRef.current = true;
+              setArchiveReady(true);
+            }
+          })
+          .catch(() => {});
 
         // Attach player to video element
         const video = videoRef.current;
@@ -609,8 +616,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     }
     const sid = sessionIdRef.current;
     const video = videoRef.current;
-    const sess = sessionRef.current;
-    if (!sid || !video || !sess?.archive_url) return;
+    if (!sid || !video || !archiveReadyRef.current) return;
     // Set the ref synchronously — createHlsPlayer reads modeRef.current and
     // the state effect would not have flushed by the time it runs.
     modeRef.current = 'replay';
@@ -760,7 +766,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     false,
   );
 
-  const archiveAvailable = Boolean(sessionRef.current?.archive_url);
+  const archiveAvailable = archiveReady;
   // Live rail: pinned at the archive edge; dragging back opens REPLAY.
   // Replay rail: full snapshot duration; max follows hls.js video.duration.
   const railMax = mode === 'live'

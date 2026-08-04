@@ -12,6 +12,8 @@ the per-session playlist TTL. Network is stubbed — no upstream calls.
 import time
 from pathlib import Path
 
+import pytest
+
 from services import preview
 from services.preview import session as session_mod
 from services.preview.hls import proxy_playlist
@@ -234,7 +236,7 @@ def test_live_session_archive_fields() -> None:
         assert sess.is_live is True
         assert sess.playlist_ttl_sec == 0.5
         assert sess.entry_url == "http://cdn.example.com/media.m3u8"
-        # archive unavailable (no vod_url, no login to fall back on) — graceful
+        # archive resolve is lazy (off the playback critical path)
         assert sess.archive_url is None and sess.archive_entry_url is None
         assert REPLAY_PLAYLIST_RESOURCE not in sess.resource_map
 
@@ -244,9 +246,21 @@ def test_live_session_archive_fields() -> None:
             "Twitch",
             vod_url="https://www.twitch.tv/videos/123456789",
         )
+        # deferred: no archive until the first replay request resolves it
+        assert sess2.archive_url is None and sess2.archive_entry_url is None
+        assert preview._manager._ensure_live_archive(sess2) is True
         assert sess2.archive_url == "http://cdn.example.com/archive-master.m3u8"
         assert sess2.archive_entry_url == "http://cdn.example.com/media.m3u8"
         assert sess2.resource_map.get(REPLAY_PLAYLIST_RESOURCE) == "replay-hls:playlist"
+        # idempotent; resolve_upstream triggers the same lazy path
+        assert preview._manager._ensure_live_archive(sess2) is True
+        assert (
+            preview.resolve_upstream(sess2.session_id, REPLAY_PLAYLIST_RESOURCE)
+            == "replay-hls:playlist"
+        )
+        # no archive → replay resource 404s (frontend rail stays off)
+        with pytest.raises(ValueError):
+            preview.resolve_upstream(sess.session_id, REPLAY_PLAYLIST_RESOURCE)
     finally:
         gql_mod.get_vod_playback_sync = real_gql
         hls_mod._fetch_and_rewrite_playlist_streaming = real_fetch
