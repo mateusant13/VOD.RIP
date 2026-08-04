@@ -32,6 +32,10 @@ def scratch_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(localappdata.parent))
     monkeypatch.setenv("TEMP", str(scratch_tmp))
     monkeypatch.setattr(tempfile, "tempdir", str(scratch_tmp))  # gettempdir() cache
+    # _get_appdata_dir() honors VODRIP_APP_DATA before APPDATA (conftest sets it
+    # for suite-wide isolation) — the logs category falls through to it, so the
+    # scratch override must include it or logs scan the conftest temp dir.
+    monkeypatch.setenv("VODRIP_APP_DATA", str(appdata))
     monkeypatch.setenv("VODRIP_ARCHIVE_DIR", str(appdata / "archive"))
     monkeypatch.setenv("VODRIP_WHISPER_CACHE", str(appdata / "whisper-models"))
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(appdata / "archive.db"))

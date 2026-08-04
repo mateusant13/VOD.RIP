@@ -38,7 +38,7 @@ async def test_upstream_503_retry_after():
         entry_url="https://example.com/vod",
         platform="Twitch",
         http_headers={},
-        allowed_hosts=set(),
+        allowed_hosts={"example.com"},  # tier-1 session whitelist — host check passes
         cache_dir=Path("."),
         kind="hls",
         crop_start=0.0,
@@ -47,8 +47,14 @@ async def test_upstream_503_retry_after():
     )
     preview_service._manager._sessions[sid] = session
 
-    original = preview_service._open_upstream_stream
+    # proxy_master lives in services.preview.session and looks _open_upstream_stream
+    # up in ITS module globals — patching the preview_service re-export shim alone is
+    # a silent no-op (the real upstream fetch would run instead).
+    import services.preview.session as _session_mod
+    shim_original = preview_service._open_upstream_stream
+    session_mod_original = _session_mod._open_upstream_stream
     preview_service._open_upstream_stream = _mock_upstream_error
+    _session_mod._open_upstream_stream = _mock_upstream_error
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -56,6 +62,7 @@ async def test_upstream_503_retry_after():
             assert resp.status_code == 503, f"Expected 503 got {resp.status_code}: {resp.text[:200]}"
             assert resp.headers.get("Retry-After") == "30", f"Missing Retry-After header: {dict(resp.headers)}"
     finally:
-        preview_service._open_upstream_stream = original
+        preview_service._open_upstream_stream = shim_original
+        _session_mod._open_upstream_stream = session_mod_original
         # Clean up the test session
         preview_service._manager._sessions.pop(sid, None)

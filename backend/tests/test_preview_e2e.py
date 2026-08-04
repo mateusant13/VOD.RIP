@@ -57,7 +57,7 @@ class TestYouTubePreviewResolve:
         }
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         with patch(
-            "services.preview_service._extract_youtube_preview_info",
+            "services.preview.session._extract_youtube_preview_info",
             return_value=prog_only,
         ):
             entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
@@ -80,7 +80,7 @@ class TestYouTubePreviewResolve:
         }
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         with patch(
-            "services.preview_service._extract_youtube_preview_info",
+            "services.preview.session._extract_youtube_preview_info",
             return_value=hls_info,
         ):
             entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
@@ -103,7 +103,11 @@ class TestYouTubePreviewResolve:
         }
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         with patch(
-            "services.preview_service._extract_youtube_preview_info",
+            "services.preview.session._extract_youtube_preview_info",
+            return_value=dash_info,
+        ), patch(
+            # dash-only input triggers the robustness re-extract — keep it offline
+            "services.preview.session._reextract_youtube_for_preview",
             return_value=dash_info,
         ):
             _entry, _hdrs, platform, _variants, kind, _yt = resolve_stream_info(url)
@@ -133,7 +137,7 @@ class TestYouTubePreviewResolve:
         }
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         with patch(
-            "services.preview_service._extract_youtube_preview_info",
+            "services.preview.session._extract_youtube_preview_info",
             return_value=dash_with_low_muxed,
         ):
             _entry, _hdrs, platform, variants, kind, _yt = resolve_stream_info(url)
@@ -192,11 +196,11 @@ class TestYouTubePreviewResolve:
             return muxed_info
 
         with patch(
-            "services.preview_service._extract_youtube_preview_info",
+            "services.preview.session._extract_youtube_preview_info",
             side_effect=_fake_extract,
         ):
             with patch(
-                "services.preview_service._reextract_youtube_for_preview",
+                "services.preview.session._reextract_youtube_for_preview",
                 return_value=muxed_info,
             ):
                 refreshed = refresh_youtube_preview_session(sid)
@@ -244,11 +248,11 @@ class TestYouTubePreviewResolve:
         }
 
         with patch(
-            "services.preview_service.resolve_stream_info",
+            "services.preview.session.resolve_stream_info",
             return_value=("https://x/v720.mp4", {}, "YouTube", dash_only["formats"], "hls", dash_only),
         ):
             with patch(
-                "services.preview_service._reextract_youtube_for_preview",
+                "services.preview.session._reextract_youtube_for_preview",
                 return_value=dash_only,
             ):
                 refreshed = refresh_youtube_preview_session(sid)
@@ -442,7 +446,7 @@ class TestPreviewAPIHTTP:
 
     @pytest.mark.asyncio
     async def test_preview_session_delete(self):
-        """Deleted sessions should not be found."""
+        """DELETE marks the session closed (grace window) and the wipe removes it."""
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             sid = secrets.token_hex(8)
@@ -464,9 +468,15 @@ class TestPreviewAPIHTTP:
             resp = await client.delete(f"/api/preview/session/{sid}")
             assert resp.status_code == 200
 
-            # Should now be gone
+            # Grace window: the session is still resolvable (so in-flight byte
+            # requests from the browser don't 404) but must be marked closed.
             found = get_session(sid)
-            assert found is None, "Deleted session should not be found"
+            assert found is not None, "Deleted session must stay in the grace window"
+            assert found.closed is True, "Deleted session must be marked closed"
+
+            # After the grace wipe it must be gone.
+            _manager._finalize_delete(sid)
+            assert get_session(sid) is None, "Wiped session should not be found"
 
             shutil.rmtree(cache_dir, ignore_errors=True)
 

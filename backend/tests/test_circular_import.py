@@ -7,10 +7,16 @@ import types
 def test_shutdown_util_no_main_import():
     """shutdown_util must not import main (would create circular import cycle)."""
     # Simulate a clean import of shutdown_util before main is loaded
-    # by removing any cached references
+    # by removing any cached references. ``main`` may already be in
+    # sys.modules from collection of other test modules (e.g.
+    # test_youtube_hls_playlist_cap does `from main import app`) — purge it
+    # too, otherwise the "not pulled in" property is unobservable and the
+    # test fails by order-dependence. main.py is a leaf wrapper around app,
+    # so a re-import is cheap and side-effect free.
     for mod in list(sys.modules.keys()):
         if "shutdown_util" in mod or "_app_state" in mod:
             del sys.modules[mod]
+    sys.modules.pop("main", None)
 
     # We only care that the module-level import doesn't try to touch main
     import services.shutdown_util  # noqa: F811
