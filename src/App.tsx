@@ -7,7 +7,7 @@ import {
   Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical, Radio,
+  GripVertical,
 } from 'lucide-react';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
@@ -262,44 +262,6 @@ const ChannelRow = memo(function ChannelRow({
       >
         <GripVertical size={12} />
       </button>
-      <button
-        type="button"
-        title="Live"
-        aria-label={`Live ${ch.displayName}`}
-        disabled={liveEntries.length === 0}
-        onClick={(e) => { e.stopPropagation(); void openLivePreview(liveEntries[0], ch.displayName, ch); }}
-        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40"
-      >
-        <Radio size={11} />
-      </button>
-      <button
-        type="button"
-        title="Search channel"
-        onClick={(e) => { e.stopPropagation(); onOpenChannelSearch(ch); }}
-        className="text-zinc-600 hover:text-white p-0.5"
-      >
-        <Search size={11} />
-      </button>
-      <button type="button" title="Edit"
-        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
-        className="text-zinc-600 hover:text-white p-0.5">
-        <Pencil size={11} />
-      </button>
-      <button type="button" title="Reload"
-        onClick={(e) => {
-          e.stopPropagation();
-          clearChannelRefreshFlight(ch.id);
-          void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
-        }}
-        disabled={ch.loading}
-        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
-        {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-      </button>
-      <button type="button" title="Delete"
-        onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
-        className="text-zinc-600 hover:text-red-400 p-0.5">
-        <X size={11} />
-      </button>
       {isEditing ? (
         <input type="text" value={editingChannelName}
           onChange={(e) => setEditingChannelName(e.target.value)}
@@ -333,7 +295,43 @@ const ChannelRow = memo(function ChannelRow({
           />
         </div>
       )}
-      <LiveBadge entries={liveEntries} invisible={liveEntries.length === 0} />
+      <LiveBadge
+        entries={liveEntries}
+        invisible={liveEntries.length === 0}
+        onClick={liveEntries.length ? (e) => {
+          e.stopPropagation();
+          void openLivePreview(liveEntries[0], ch.displayName, ch);
+        } : undefined}
+        ariaLabel={`Live ${ch.displayName}`}
+      />
+      <button
+        type="button"
+        title="Search channel"
+        onClick={(e) => { e.stopPropagation(); onOpenChannelSearch(ch); }}
+        className="text-zinc-600 hover:text-white p-0.5"
+      >
+        <Search size={11} />
+      </button>
+      <button type="button" title="Edit"
+        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
+        className="text-zinc-600 hover:text-white p-0.5">
+        <Pencil size={11} />
+      </button>
+      <button type="button" title="Reload"
+        onClick={(e) => {
+          e.stopPropagation();
+          clearChannelRefreshFlight(ch.id);
+          void refreshChannel(ch.id, undefined, channelContentFilter, { force: true, incremental: true });
+        }}
+        disabled={ch.loading}
+        className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
+        {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+      </button>
+      <button type="button" title="Delete"
+        onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
+        className="text-zinc-600 hover:text-red-400 p-0.5">
+        <X size={11} />
+      </button>
     </div>
   );
 });

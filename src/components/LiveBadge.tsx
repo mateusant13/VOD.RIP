@@ -7,16 +7,49 @@ export interface LiveEntry {
   type: string;
 }
 
-export function LiveBadge({ entries, invisible }: { entries: LiveEntry[]; invisible?: boolean }) {
+export function LiveBadge({
+  entries,
+  invisible,
+  onClick,
+  ariaLabel,
+}: {
+  entries: LiveEntry[];
+  invisible?: boolean;
+  /** When provided the badge itself is the clickable live control (opens the live player). */
+  onClick?: (e: React.MouseEvent) => void;
+  ariaLabel?: string;
+}) {
   if (entries.length === 0 && !invisible) return null;
-  return (
-    <span
-      title={entries.map((e) => `${e.platform}: ${e.title}`).join('\n')}
-      className="flex items-center gap-1 rounded bg-red-900/50 px-1 text-[10px] text-red-200 font-bold shrink-0"
-      style={invisible ? { visibility: 'hidden' } : undefined}
-    >
+  const title = entries.map((e) => `${e.platform}: ${e.title}`).join('\n');
+  const inner = (
+    <>
       <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
       LIVE
+    </>
+  );
+  const baseClass =
+    "flex items-center gap-1 rounded bg-red-900/50 px-1 text-[10px] text-red-200 font-bold shrink-0";
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        title={title}
+        aria-label={ariaLabel}
+        onClick={onClick}
+        className={`${baseClass} cursor-pointer hover:bg-red-800/70 active:bg-red-800`}
+        style={invisible ? { visibility: 'hidden' } : undefined}
+      >
+        {inner}
+      </button>
+    );
+  }
+  return (
+    <span
+      title={title}
+      className={baseClass}
+      style={invisible ? { visibility: 'hidden' } : undefined}
+    >
+      {inner}
     </span>
   );
 }
