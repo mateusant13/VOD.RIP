@@ -49,6 +49,91 @@ from services.preview.session import (
 )
 from services.preview._state import _validate_proxy_url
 
+# Upstream stall bounds. curl_cffi's tuple timeout is NOT a per-read timeout:
+# with stream=True it maps to CURLOPT_LOW_SPEED_LIMIT=1 + LOW_SPEED_TIME=ceil
+# (connect+read) — a sub-1B/s transfer aborts only after the whole window, and
+# a blocked iter_content() (bare queue.get()) holds the caller past it. The
+# per-read value keeps that libcurl window tight; the wall-clock budgets below
+# are enforced by _read_upstream_body's watchdog thread, so a 0 B/s CDN stall
+# can never hang session creation or playback past the budget.
+_UPSTREAM_READ_TIMEOUT_SEC = 10
+_UPSTREAM_PLAYLIST_DEADLINE_SEC = 20.0  # master/media playlists, LL-HLS probes, archive
+_UPSTREAM_SEGMENT_DEADLINE_SEC = 15.0  # segment/key/init fetches (proxy_segment)
+
+
+def _read_upstream_body(
+    resp: object,
+    max_bytes: int,
+    deadline_sec: float,
+    url_label: str,
+) -> list[bytes]:
+    """Drain ``resp.iter_content`` under a hard wall-clock budget.
+
+    The iteration runs in a daemon thread because a single chunk read can
+    block far past any Python-side deadline: curl_cffi's streaming
+    iter_content() is a bare queue.get() (bounded only by libcurl's low-speed
+    abort, ceil(connect+read) seconds), and requests' read timeout is
+    per-socket-recv. On expiry we raise RuntimeError and close the response
+    from a cleanup thread so the connection is released without waiting on
+    the abort.
+    ponytail: one short-lived thread per fetch; move to a shared executor if
+    profiling ever shows the spawn cost.
+    """
+    deadline = time.monotonic() + deadline_sec
+    result: list[bytes] = []
+    error: Optional[Exception] = None
+
+    def _drain() -> None:
+        nonlocal result, error
+        try:
+            total = 0
+            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"Upstream read stalled/timed out after {deadline_sec:.0f}s for {url_label}"
+                    )
+                result.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(
+                        f"Upstream response exceeds {max_bytes} byte cap for preview fetch"
+                    )
+        except Exception as exc:
+            error = exc
+
+    worker = threading.Thread(target=_drain, name="upstream-read", daemon=True)
+    worker.start()
+    worker.join(timeout=deadline_sec)
+    if worker.is_alive():
+        threading.Thread(
+            target=_abort_upstream_read,
+            args=(resp, worker),
+            name="upstream-abort",
+            daemon=True,
+        ).start()
+        raise RuntimeError(
+            f"Upstream read stalled/timed out after {deadline_sec:.0f}s for {url_label}"
+        )
+    if error is not None:
+        raise error
+    return result
+
+
+def _abort_upstream_read(resp: object, worker: threading.Thread) -> None:
+    """Close a stalled upstream response and reap its drain thread.
+
+    Runs in a daemon thread so the caller never waits on the abort: closing a
+    curl_cffi stream waits for libcurl's low-speed abort, a requests stream
+    for the blocked recv to error out.
+    """
+    try:
+        resp.close()
+    except Exception:
+        pass
+    worker.join(timeout=_UPSTREAM_READ_TIMEOUT_SEC * 2)
+
 
 def _http_get_bytes(
     session: PreviewSession,
@@ -74,6 +159,7 @@ def _http_get_bytes(
         if range_header
         else (_MAX_REWRITTEN_PLAYLIST_BYTES if is_playlist else MAX_SEGMENT_BYTES)
     )
+    timeout = (_UPSTREAM_CONNECT_TIMEOUT_SEC, _UPSTREAM_READ_TIMEOUT_SEC)
     try:
         from curl_cffi import requests as cffi_requests
 
@@ -87,13 +173,13 @@ def _http_get_bytes(
             headers=headers,
             impersonate="chrome",
             stream=True,
-            timeout=(_UPSTREAM_CONNECT_TIMEOUT_SEC, 90),
+            timeout=timeout,
             http_version=http_version,
         )
     except ImportError:
         import requests
 
-        resp = requests.get(url, headers=headers, stream=True, timeout=60)
+        resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
 
     if resp.status_code in _AUTH_ERROR_CODES:
         if not _retried and session.platform == "YouTube":
@@ -111,17 +197,12 @@ def _http_get_bytes(
                 )
         raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     resp.raise_for_status()
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > max_bytes:
-            raise RuntimeError(
-                f"Upstream response exceeds {max_bytes} byte cap for preview fetch"
-            )
+    deadline_sec = (
+        _UPSTREAM_SEGMENT_DEADLINE_SEC
+        if not is_playlist
+        else _UPSTREAM_PLAYLIST_DEADLINE_SEC
+    )
+    chunks = _read_upstream_body(resp, max_bytes, deadline_sec, url[:80])
     try:
         resp.close()
     except OSError:
