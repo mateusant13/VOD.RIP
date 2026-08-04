@@ -32,7 +32,7 @@ from services.preview_service import (
 
 
 def _sess(crop_end: float = 25.0, cache_dir: Path | None = None) -> PreviewSession:
-    return PreviewSession(
+    s = PreviewSession(
         session_id="t",
         vod_url="https://www.youtube.com/watch?v=x",
         platform="YouTube",
@@ -41,8 +41,9 @@ def _sess(crop_end: float = 25.0, cache_dir: Path | None = None) -> PreviewSessi
         cache_dir=cache_dir or Path(tempfile.mkdtemp(prefix="window_hls_test_")),
         crop_start=0,
         crop_end=crop_end,
-        dash_window_hls=True,
     )
+    s.dash_window_hls = True  # dynamic attr — window HLS is not a dataclass field
+    return s
 
 
 def test_window_hls_short_vod_muxes_full_crop():
@@ -127,9 +128,9 @@ def test_preflight_mux_adoption():
         cache_dir=cache,
         crop_start=0,
         crop_end=120,
-        dash_window_hls=True,
         prefer_height=720,
     )
+    s.dash_window_hls = True  # dynamic attr — window HLS is not a dataclass field
     s.window_hls_mux_start = 0.0
     s.window_hls_mux_end = WINDOW_HLS_INITIAL_CHUNK_SEC
     assert _try_adopt_preflight_mux(s)

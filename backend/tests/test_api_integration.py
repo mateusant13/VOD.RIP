@@ -254,25 +254,46 @@ class TestDownloadManagerRaceConditions:
 
     def test_cancel_specific_download(self):
         """Test that cancelling one download doesn't affect others."""
+        from services.ytdlp_service import CancelledError
+
+        # ponytail: the fake twitch URLs fail on the real network (~8s), racing
+        # the cancel — both workers would be gone by the time we assert. Block
+        # until the cancel event so the test is deterministic and offline.
+        def _blocking_dl(url, output_path, cancel_event=None, **kwargs):
+            while cancel_event is not None and not cancel_event.is_set():
+                time.sleep(0.005)
+            raise CancelledError("test cancelled")
+
         mgr = DownloadManager(max_workers=2)
-        id1 = mgr.start_download(
-            url="https://twitch.tv/videos/1_000_001",
-            output_file=r"C:\tmp\1.mp4",
-        )
-        id2 = mgr.start_download(
-            url="https://twitch.tv/videos/1_000_002",
-            output_file=r"C:\tmp\2.mp4",
-        )
+        try:
+            # Numeric IDs: the queue filter is_sensible_vod_url requires
+            # twitch /videos/<id> with id >= 1_000_000 — the old literal
+            # "1_000_001" strings matched only "1" and were dropped from
+            # the queue, so id2 could never be found.
+            id1 = mgr.start_download(
+                url="https://twitch.tv/videos/1000001",
+                output_file=r"C:\tmp\1.mp4",
+                download_func=_blocking_dl,
+            )
+            id2 = mgr.start_download(
+                url="https://twitch.tv/videos/1000002",
+                output_file=r"C:\tmp\2.mp4",
+                download_func=_blocking_dl,
+            )
 
-        # Cancel only the first
-        result = mgr.cancel(id1)
-        assert result is True
+            # Cancel only the first
+            result = mgr.cancel(id1)
+            assert result is True
 
-        state = mgr.get_active_and_history()
-        queue = state["queue"]
-        # id1 should be gone, id2 should remain
-        assert not any(d.download_id == id1 for d in queue)
-        assert any(d.download_id == id2 for d in queue)
+            state = mgr.get_active_and_history()
+            queue = state["queue"]
+            # id1 should be gone, id2 should remain
+            assert not any(d.download_id == id1 for d in queue)
+            assert any(d.download_id == id2 for d in queue)
+        finally:
+            # Stop the still-blocking id2 worker so the executor threads exit.
+            mgr.cancel(id2)
+            mgr._executor.shutdown(wait=True)
 
     def test_download_state_isolation(self):
         """Test that each download's state is isolated."""

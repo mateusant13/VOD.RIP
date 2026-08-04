@@ -14,6 +14,21 @@ import unittest.mock as um
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── Minimal yt_dlp to let imports through ──
+# Snapshot the real modules first: the fake replaces them only for the
+# preview_service import below, and the cleanup must RESTORE them (not pop).
+# Evicting the real yt_dlp while the already-loaded real `yt_dlp.version`
+# submodule stays cached breaks the parent's `version` attribute binding on
+# re-import — later `import yt_dlp` yields a module with no `.version`
+# (routers/system.py /api/ytdlp/status then raises AttributeError).
+_ORIG_YTDLP_MODS = {
+    name: sys.modules.get(name)
+    for name in (
+        "yt_dlp",
+        "yt_dlp.utils",
+        "yt_dlp.postprocessor",
+        "yt_dlp.postprocessor.ffmpeg",
+    )
+}
 yt_dlp_mod = types.ModuleType("yt_dlp")
 yt_dlp_mod.version = um.MagicMock(return_value="2024.01.01")
 yt_dlp_mod.DownloadError = Exception
@@ -54,12 +69,15 @@ for _poisoned in (
     "services.youtube_service",
     "services.youtube_innertube",
     "models.preview",
-    "yt_dlp",
-    "yt_dlp.utils",
-    "yt_dlp.postprocessor",
-    "yt_dlp.postprocessor.ffmpeg",
 ):
     sys.modules.pop(_poisoned, None)
+# Restore the real yt_dlp modules (or drop the fakes when the real ones were
+# never loaded) — see _ORIG_YTDLP_MODS above for why pop() alone is unsafe.
+for _name, _mod in _ORIG_YTDLP_MODS.items():
+    if _mod is not None:
+        sys.modules[_name] = _mod
+    else:
+        sys.modules.pop(_name, None)
 
 
 def make_snap(sid="snap_001"):

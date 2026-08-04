@@ -13,9 +13,10 @@ def test_resolve_youtube_browser_manual():
     assert resolve_youtube_browser("chrome", False) == "chrome"
 
 
-def test_pot_minting_disabled():
-    assert pot_minting_enabled() is False
-    assert auth_status(True)["pot_auto_available"] is False
+def test_pot_minting_enabled_default():
+    """POT minting is the fallback when browser cookies are unavailable."""
+    assert pot_minting_enabled() is True
+    assert auth_status(True)["pot_auto_available"] is True
 
 
 def test_strengthen_reads_browser_cookies():

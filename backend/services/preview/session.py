@@ -4756,8 +4756,8 @@ if __name__ == "__main__":
         cache_dir=Path("/tmp"),
         crop_start=0,
         crop_end=1158,
-        dash_window_hls=True,
     )
+    _long.dash_window_hls = True  # dynamic attr — window HLS is not a dataclass field
     _lo, _hi = _window_hls_mux_bounds(_long)
     assert _hi - _lo <= WINDOW_HLS_INITIAL_CHUNK_SEC + 0.01
     assert _hi == WINDOW_HLS_INITIAL_CHUNK_SEC
@@ -4770,8 +4770,8 @@ if __name__ == "__main__":
         cache_dir=Path("/tmp"),
         crop_start=0,
         crop_end=30,
-        dash_window_hls=True,
     )
+    _short.dash_window_hls = True  # dynamic attr — window HLS is not a dataclass field
     _slo, _shi = _window_hls_mux_bounds(_short)
     assert _shi == 30 and _slo == 0
     _seek_lo, _seek_hi = _window_hls_mux_bounds(_long, around_sec=868.5)
