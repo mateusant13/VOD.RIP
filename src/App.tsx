@@ -487,6 +487,8 @@ export default function App() {
     anonymous?: boolean;
     /** True for create_live_session sessions (live popup) — YouTube live tiers allowed. */
     isLive?: boolean;
+    /** WS-3: detected channel language from the session response ('' = unknown). */
+    channelLanguage?: string;
   } | null>(null);
   /** Menu selection — may exceed on-screen playback height until fullscreen. */
   const previewRequestedHeightRef = useRef(0);
@@ -1527,6 +1529,7 @@ export default function App() {
         activeHeight,
         anonymous: res.anonymous === true,
         isLive: res.is_live === true,
+        channelLanguage: res.channel_language ?? '',
       };
       previewSessionIdRef.current = res.session_id;
       setPreviewSessionId(res.session_id);
@@ -2868,6 +2871,7 @@ export default function App() {
       created_at: v.created_at ?? null,
       views: v.views ?? null,
       duration_string: v.duration_string ?? null,
+      channel_language: v.channel_language ?? null,
       // Native id, same format as the archive DB videos.video_id (Twitch ids
       // come 'v'-prefixed from the API; the archive stores the bare digits).
       videoId: v.platform === 'Twitch' && v.id.startsWith('v') ? v.id.slice(1) : v.id,
@@ -5606,6 +5610,14 @@ export default function App() {
                       {videoInfo.title}
                     </p>
                   )}
+                  {!isLive && previewSessionMetaRef.current?.channelLanguage ? (
+                    <span
+                      title={`Channel language: ${previewSessionMetaRef.current.channelLanguage}`}
+                      className="mt-0.5 inline-block border border-zinc-700 px-1 py-px text-[7px] font-bold uppercase tracking-wider text-zinc-400 leading-tight"
+                    >
+                      {previewSessionMetaRef.current.channelLanguage}
+                    </span>
+                  ) : null}
                   {isLive && (
                     <span className="inline-flex items-center gap-1 mt-0.5">
                       <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
@@ -6333,6 +6345,14 @@ export default function App() {
                                       {durSec != null ? (
                                         <span className="text-zinc-500 ml-1">
                                           {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
+                                        </span>
+                                      ) : null}
+                                      {v.channel_language ? (
+                                        <span
+                                          title={`Channel language: ${v.channel_language}`}
+                                          className="ml-1 shrink-0 border border-zinc-700 px-1 py-px text-[8px] font-bold uppercase tracking-wider text-zinc-400"
+                                        >
+                                          {v.channel_language}
                                         </span>
                                       ) : null}
                                     </span>

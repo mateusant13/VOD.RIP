@@ -49,6 +49,7 @@ query ChannelVideos($login: String!, $first: Int!, $after: Cursor) {
           lengthSeconds
           viewCount
           previewThumbnailURL(width: 320, height: 180)
+          language
         }
       }
     }
@@ -650,6 +651,10 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
                 "thumbnail_url": node.get("previewThumbnailURL"),
                 "url": f"https://www.twitch.tv/videos/{vid}",
                 "content_kind": "vod",
+                # VOD language = the broadcaster language at stream time
+                # (the closest anonymous GQL analogue of Helix
+                # broadcaster_language — 'pt', 'en', ... or None).
+                "language": node.get("language") or None,
             })
             if len(out) >= limit:
                 break

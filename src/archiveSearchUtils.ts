@@ -18,6 +18,8 @@ export interface ArchiveSearchHit {
   video_kind?: string | null;
   /** Transcript language tag ('pt' | 'en' | other code); null for chat rows. */
   lang?: string | null;
+  /** WS-3: detected channel language of the hit's channel (null = unknown). */
+  channel_language?: string | null;
   /** Remote hits only. */
   duration_sec?: number | null;
   duration_string?: string | null;

@@ -100,6 +100,8 @@ export interface ExplorePopupVod {
   /** Native archive video id (same value as archive DB videos.video_id) —
    *  enables the header's SEARCH THIS VIDEO button; absent → button hidden. */
   videoId?: string;
+  /** WS-3: detected channel language ('' / absent = unknown). */
+  channel_language?: string | null;
 }
 
 interface ChannelExplorePopupProps {
@@ -1464,11 +1466,17 @@ export default function ChannelExplorePopup({
                 <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
                   {vod.title}
                 </p>
-                {channelVodSubline(vod) && (
-                  <p className="text-[9px] font-mono text-zinc-500 truncate leading-tight mt-0.5">
-                    {channelVodSubline(vod)}
-                  </p>
-                )}
+                <p className="text-[9px] font-mono text-zinc-500 truncate leading-tight mt-0.5">
+                  {channelVodSubline(vod)}
+                  {vod.channel_language ? (
+                    <span
+                      className="ml-1 border border-zinc-700 px-1 py-px text-[7px] font-bold uppercase tracking-wider text-zinc-400"
+                      title={`Channel language: ${vod.channel_language}`}
+                    >
+                      {vod.channel_language}
+                    </span>
+                  ) : null}
+                </p>
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">

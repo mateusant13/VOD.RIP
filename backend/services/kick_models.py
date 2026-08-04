@@ -39,6 +39,9 @@ class KickChannel:
     live_title: Optional[str] = None
     viewers: Optional[int] = None
     playback_url: Optional[str] = None
+    # Channel language from the channel payload ('pt', 'en', ... — the
+    # broadcaster-declared language, WS-3 platform clue). None when absent.
+    language: Optional[str] = None
 
 
 def format_duration(seconds: Optional[float]) -> Optional[str]:

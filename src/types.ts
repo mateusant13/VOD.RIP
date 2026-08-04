@@ -57,6 +57,8 @@ export interface ChannelVideo {
   url: string;
   channel: string;
   content_kind?: 'vod' | 'clip' | 'stream';
+  /** Detected channel language ('pt'/'en'/'es'/raw code; absent = unknown). */
+  channel_language?: string | null;
   /** yt-dlp availability — 'subscriber_only' marks members-only rows (no preview possible). */
   availability?: string | null;
 }
@@ -112,6 +114,10 @@ export interface AppSettings {
   /** Captions-first: skip whisper for YouTube videos that already have
    * auto-caption rows at ingest (absent on older backends -> default true). */
   yt_subtitles_first?: boolean;
+  /** Default ASR language for whisper jobs: 'auto' or a family code ('pt','en','es'). */
+  asr_language?: string;
+  /** Per-channel ASR override: channel slug -> 'auto' or family code. */
+  channel_asr_languages?: Record<string, string> | null;
 }
 
 export interface DiskUsage {
@@ -200,6 +206,8 @@ export interface PreviewSessionResponse {
   archive_url?: string;
   /** Archive duration at session creation (grows while the stream runs). */
   archive_duration?: number;
+  /** WS-3: detected channel language of the previewed archived video ('' = unknown). */
+  channel_language?: string;
 }
 
 export interface PreviewSessionStatusResponse {

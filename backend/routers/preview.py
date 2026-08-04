@@ -77,6 +77,20 @@ def _session_extract_source(session) -> str:
     return last_extract_source(vid)
 
 
+def _preview_channel_language(session) -> str:
+    """Stored channel language of the previewed archived video ('' = none).
+
+    WS-3: read from videos.channel_language so the preview badge shows the
+    detected channel language; non-archived previews yield ''."""
+    platform = str(getattr(session, "platform", "") or "").strip().lower()
+    if platform not in archive_db.PLATFORMS:
+        return ""
+    video_id = _preview_video_id(platform, getattr(session, "vod_url", "") or "")
+    if not video_id:
+        return ""
+    return archive_db.video_channel_language(platform, video_id) or ""
+
+
 def _preview_session_response(session) -> PreviewSessionResponse:
     master = f"/api/preview/hls/{session.session_id}/master.m3u8"
     if session.kind == "progressive":
@@ -108,6 +122,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         anonymous=bool(getattr(session, "anonymous", False)),
         archive_url=getattr(session, "archive_entry_url", None) or "",
         archive_duration=float(getattr(session, "archive_duration", 0) or 0),
+        channel_language=_preview_channel_language(session),
     )
 
 

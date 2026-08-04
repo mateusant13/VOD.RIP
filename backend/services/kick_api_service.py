@@ -11,6 +11,7 @@ Endpoints used:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,8 @@ from services.kick_models import (
     format_duration,
 )
 from services.ytdlp_service import is_clip_url
+
+logger = logging.getLogger(__name__)
 
 _IMPERSONATE = "chrome"
 _BASE = "https://kick.com"
@@ -331,7 +334,35 @@ def get_channel_api(url: str) -> KickChannel:
         live_title=(ls.get("session_title") if ls else None),
         viewers=(ls.get("viewer_count") if ls else None),
         playback_url=data.get("playback_url"),
+        # Kick's channel payload carries the broadcaster language in the
+        # user block (top-level fallback kept for older payload shapes).
+        language=user.get("language") or data.get("language") or None,
     )
+
+
+def get_channel_language_sync(slug: str) -> Optional[str]:
+    """Language clue for a Kick channel slug (cached ~1h, best-effort).
+
+    Part of the WS-3 platform-clue path: called at channel-list refresh
+    time, never raises — a blocked/failed payload yields None (no clue)."""
+    slug = (slug or "").strip().lower()
+    if not slug:
+        return None
+    from services.channel_cache import get_cached, make_channel_cache_key, set_cached
+
+    key = make_channel_cache_key("kick-lang", slug)
+    cached = get_cached(key, ttl=3600.0)
+    if cached is not None:
+        return cached or None
+    try:
+        data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}")
+        user = data.get("user") if isinstance(data.get("user"), dict) else {}
+        lang = user.get("language") or data.get("language") or None
+    except Exception:
+        logger.debug("Kick channel language fetch failed for %s", slug, exc_info=True)
+        lang = None
+    set_cached(key, lang or "")
+    return lang or None
 
 
 # Sync helpers for FastAPI routes — curl_cffi only, never Playwright.
@@ -424,6 +455,7 @@ def get_channel_info_sync(url: str) -> dict:
         "followers": ch.followers,
         "is_live": ch.is_live,
         "live_title": ch.live_title,
+        "language": ch.language,
     }
 
 

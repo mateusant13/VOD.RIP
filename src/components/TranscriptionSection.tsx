@@ -19,6 +19,11 @@ type Props = {
 export default function TranscriptionSection({ settings, setSettings, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [channelOverridesText, setChannelOverridesText] = useState(() =>
+    Object.entries(settings.channel_asr_languages ?? {})
+      .map(([k, v]) => `${k} = ${v}`)
+      .join('\n'),
+  );
 
   const activeModel = (settings.whisper_model ?? '').trim() || 'large-v3-turbo';
 
@@ -30,6 +35,8 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         whisper_model: (settings.whisper_model ?? '').trim() || undefined,
         whisper_model_cache: (settings.whisper_model_cache ?? '').trim() || null,
         yt_subtitles_first: settings.yt_subtitles_first ?? true,
+        asr_language: settings.asr_language ?? 'auto',
+        channel_asr_languages: settings.channel_asr_languages ?? null,
       });
       setSettings(updated);
       setMsg('saved');
@@ -39,7 +46,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
     } finally {
       setSaving(false);
     }
-  }, [settings.whisper_model, settings.whisper_model_cache, settings.yt_subtitles_first, setSettings, onSaved]);
+  }, [settings.whisper_model, settings.whisper_model_cache, settings.yt_subtitles_first, settings.asr_language, settings.channel_asr_languages, setSettings, onSaved]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -72,6 +79,47 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         onChange={(c) => setSettings({ ...settings, yt_subtitles_first: c })}
         ariaLabel="use youtube subtitles first"
       />
+      <div className="flex flex-col gap-1">
+        <FieldCaption noWrap>Captions Language</FieldCaption>
+        <div className="flex items-center gap-1.5">
+          <select
+            value={settings.asr_language ?? 'auto'}
+            onChange={(e) => setSettings({ ...settings, asr_language: e.target.value })}
+            aria-label="default captions language"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-xs focus:outline-none focus:border-white"
+          >
+            <option value="auto">Auto-detect</option>
+            <option value="pt">Portuguese (pt)</option>
+            <option value="en">English (en)</option>
+            <option value="es">Spanish (es)</option>
+          </select>
+        </div>
+        <span className="text-[9px] text-zinc-600 font-mono">
+          default ASR language for Whisper jobs; per-channel overrides below win
+        </span>
+      </div>
+      <div className="flex flex-col gap-1">
+        <FieldCaption noWrap>Channel Overrides</FieldCaption>
+        <textarea
+          rows={3}
+          value={channelOverridesText}
+          onChange={(e) => {
+            const parsed: Record<string, string> = {};
+            for (const line of e.target.value.split('\n')) {
+              const m = /^\s*([^=#]+?)\s*=\s*([a-zA-Z-]+)\s*$/.exec(line);
+              if (m) parsed[m[1].trim().toLowerCase()] = m[2].toLowerCase();
+            }
+            setChannelOverridesText(e.target.value);
+            setSettings({ ...settings, channel_asr_languages: Object.keys(parsed).length ? parsed : null });
+          }}
+          placeholder={'titiltei = pt\nsrdogg = en\ngaveta = pt'}
+          aria-label="per-channel captions language overrides"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-xs focus:outline-none focus:border-white resize-y"
+        />
+        <span className="text-[9px] text-zinc-600 font-mono">
+          one per line: channel = pt|en|es|auto (overrides the default above)
+        </span>
+      </div>
       <div className="flex items-center gap-1.5">
         <button
           type="button"

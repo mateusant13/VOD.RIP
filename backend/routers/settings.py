@@ -140,6 +140,17 @@ async def update_settings(update: SettingsUpdate):
         current.yt_subtitles_first = bool(update.yt_subtitles_first)
     if update.archive_smart_enrich is not None:
         current.archive_smart_enrich = bool(update.archive_smart_enrich)
+    if update.asr_language is not None:
+        # 'auto' or a family code ('pt'/'en'/'es'); anything else is kept
+        # verbatim (whisper accepts raw codes) but never left blank.
+        val = (update.asr_language or "").strip().lower()
+        current.asr_language = val or "auto"
+    if update.channel_asr_languages is not None:
+        current.channel_asr_languages = {
+            str(k).strip(): str(v).strip().lower()
+            for k, v in (update.channel_asr_languages or {}).items()
+            if str(k).strip()
+        } or None
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
