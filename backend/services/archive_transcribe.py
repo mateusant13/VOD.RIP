@@ -119,30 +119,102 @@ def _clamp_cuda_copies(copies: int, free_vram_bytes: int) -> int:
     return max(1, min(copies, vram_cap))
 
 
-def _worker_budget() -> int:
-    """Max concurrent transcribe jobs: GPU model copies or CPU threads.
+# Per-worker peak host-RAM estimates (system RAM, not VRAM). The real peak
+# depends on model size, chunk length and ffmpeg decode buffers; the 20%
+# headroom below is the safety net for estimate error.
+# ponytail: estimates, not measurements — tuned for faster-whisper base/small
+# int8 on CPU and for host-side buffers when the model lives on VRAM. If a
+# machine OOMs at budget 2, lower the env knob or bump these constants.
+# Upgrade path: track per-job RSS (psutil.Process().memory_info().rss around
+# transcribe_video) and replace the constants with a rolling EMA.
+_CPU_WORKER_RSS_EST = int(1.5 * 1024 ** 3)  # model + VAD + audio buffers
+_GPU_COPY_RSS_EST = int(1.0 * 1024 ** 3)    # model on VRAM; audio + I/O host-side
+_RAM_HEADROOM = 0.20  # fraction of free RAM never committed to the worker budget
+_RAM_TTL_S = 5.0      # free-RAM readout cache TTL (not a syscall per job)
 
-    CUDA: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) clamped by free VRAM
-    (probed once via torch.cuda.mem_get_info() — torch is already imported
-    by the VAD path); the clamp degrades gracefully to 1 when the probe
-    fails. CPU: VODRIP_TRANSCRIBE_WORKERS (default 2).
+_ram_free_bytes = 0
+_ram_free_at = 0.0
+_ram_lock = threading.Lock()
 
-    budget == 1 is the EXACT legacy path: one process-global model,
-    _infer_lock serializing inference. budget > 1 (opt-in GPU copies, or the
-    CPU default) gives each pool thread its own model copy so inference
-    truly runs in parallel."""
-    device, _ = _effective_device()
-    if device == "cpu":
-        try:
-            return max(1, int(os.environ.get(WORKERS_ENV, "2") or "2"))
-        except ValueError:
-            return 2
+
+def _free_system_ram_bytes() -> int:
+    """Free system RAM in bytes (0 = unknown), cached for _RAM_TTL_S.
+
+    Windows: kernel32 GlobalMemoryStatusEx via ctypes (psutil is not a
+    declared dependency). POSIX fallback: sysconf(SC_AVPHYS_PAGES). This is
+    the single call site the budget clamp uses, so tests patch it directly.
+    """
+    global _ram_free_bytes, _ram_free_at
+    now = time.monotonic()
+    with _ram_lock:
+        if _ram_free_at and now - _ram_free_at < _RAM_TTL_S:
+            return _ram_free_bytes
+    free = 0
     try:
-        copies = int(os.environ.get(GPU_COPIES_ENV, "1") or "1")
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                free = int(status.ullAvailPhys)
+        else:
+            free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        free = 0  # probe failed — caller treats 0 as "unknown"
+    with _ram_lock:
+        _ram_free_bytes = free
+        _ram_free_at = now
+    return free
+
+
+def _ram_worker_clamp(configured: int, per_worker_est: int) -> int:
+    """min(configured, max(1, usable_free_ram // per_worker_est)).
+
+    usable = free * (1 - _RAM_HEADROOM) — the headroom fraction of free RAM
+    is never committed to the worker budget. Returns `configured` unchanged
+    when free RAM is unknown (0), mirroring the VRAM probe-failure path.
+    Never drops below 1; a configured 1 passes through untouched so the
+    legacy single-model path is exact regardless of RAM."""
+    if configured <= 1:
+        return configured
+    free = _free_system_ram_bytes()
+    if free <= 0:
+        return configured
+    usable = int(free * (1.0 - _RAM_HEADROOM))
+    return max(1, min(configured, usable // per_worker_est))
+
+
+def _gpu_copies() -> int:
+    """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) is a CEILING.
+
+    Clamped by free VRAM (probed via torch.cuda.mem_get_info() — torch is
+    already imported by the VAD path; probe failure degrades to trusting the
+    env cap) AND by host RAM (_GPU_COPY_RSS_EST per copy — the model lives
+    on VRAM, but audio decode + inference buffers are host-side). Never
+    below 1 when the env configures > 0; 0/absent -> auto (1 copy)."""
+    try:
+        configured = int(os.environ.get(GPU_COPIES_ENV, "1") or "1")
     except ValueError:
-        copies = 1
-    if copies <= 1:
         return 1
+    if configured <= 0:
+        configured = 1  # 0 == auto (same as absent)
+    if configured == 1:
+        return 1  # exact single-copy path — no probes at all
     free_vram = 0
     try:
         import torch
@@ -151,9 +223,34 @@ def _worker_budget() -> int:
             free_vram = int(torch.cuda.mem_get_info()[0])
     except Exception:
         pass  # probe failed — trust the env cap
-    if free_vram <= 0:
-        return copies
-    return _clamp_cuda_copies(copies, free_vram)
+    if free_vram > 0:
+        configured = _clamp_cuda_copies(configured, free_vram)
+    return _ram_worker_clamp(configured, _GPU_COPY_RSS_EST)
+
+
+def _worker_budget() -> int:
+    """Max concurrent transcribe jobs: GPU model copies or CPU threads.
+
+    The env knobs are CEILINGS, never floors: VODRIP_TRANSCRIBE_WORKERS
+    (CPU, default 2) / VODRIP_TRANSCRIBE_GPU_COPIES (CUDA, default 1) cap
+    the budget, and a system-RAM clamp (_ram_worker_clamp, 20% headroom)
+    can only reduce it further. env == 1 always wins so the legacy
+    single-model path is exact; 0/absent -> auto (CPU 2, GPU 1).
+
+    budget == 1 is the EXACT legacy path: one process-global model,
+    _infer_lock serializing inference. budget > 1 (opt-in GPU copies, or the
+    CPU default) gives each pool thread its own model copy so inference
+    truly runs in parallel."""
+    device, _ = _effective_device()
+    if device == "cpu":
+        try:
+            workers = int(os.environ.get(WORKERS_ENV, "2") or "2")
+        except ValueError:
+            return 2
+        if workers <= 0:
+            workers = 2  # 0 == auto (same as absent)
+        return _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
+    return _gpu_copies()
 
 
 # --- model cache ----------------------------------------------------------
@@ -1164,14 +1261,26 @@ assert _clamp_cuda_copies(4, 10 << 30) == 4, "env within the VRAM budget passes 
 assert _clamp_cuda_copies(8, 5 << 30) == 2, "VRAM budget clamps copies (5 GiB -> 2)"
 assert _clamp_cuda_copies(8, 1 << 30) == 1, "VRAM budget never drops below 1"
 _saved_override, _saved_workers = _device_override, os.environ.get(WORKERS_ENV)
+_saved_free_ram = _free_system_ram_bytes
 try:
     _device_override = ("cpu", "int8")
+    _free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM clamp must not bind here
     os.environ[WORKERS_ENV] = "4"
     assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
     os.environ.pop(WORKERS_ENV, None)
     assert _worker_budget() == 2, "CPU budget defaults to 2 workers"
+    # system-RAM clamp: 3 GiB free + 1.5 GiB/worker -> usable 2.4 GiB -> 1
+    # (2 workers would use 100% of free RAM; the 20% headroom forbids it);
+    # 4 GiB free -> usable 3.2 GiB -> 2; 1 GiB free -> floor 1.
+    _free_system_ram_bytes = lambda: 3 * 1024 ** 3
+    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "headroom clamps 3 GiB free to 1 worker"
+    _free_system_ram_bytes = lambda: 4 * 1024 ** 3
+    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 2, "4 GiB free fits 2 workers"
+    _free_system_ram_bytes = lambda: 1 * 1024 ** 3
+    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "RAM clamp never drops below 1"
 finally:
     _device_override = _saved_override
+    _free_system_ram_bytes = _saved_free_ram
     if _saved_workers is None:
         os.environ.pop(WORKERS_ENV, None)
     else:
