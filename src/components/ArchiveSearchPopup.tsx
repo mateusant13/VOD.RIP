@@ -160,6 +160,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const searchGenRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
   const chatGenRef = useRef(0);
+  /** Keyboard-navigated hit row (−1 = none). Reset whenever the list changes. */
+  const [activeIdx, setActiveIdx] = useState(-1);
+  const hitRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setActiveIdx(-1);
+  }, [hits]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -525,8 +533,35 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   }, []);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') onClose();
-  }, [onClose]);
+    if (e.key === 'Escape') {
+      onClose();
+      return;
+    }
+    // Arrow/Enter navigation only while typing in the search box — other
+    // controls (selects, date inputs) own their arrow keys.
+    if (e.target !== inputRef.current) return;
+    const n = hits.length;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!n) return;
+      setActiveIdx((i) => {
+        const next = i + 1 >= n ? 0 : i + 1;
+        hitRefs.current[next]?.scrollIntoView?.({ block: 'nearest' });
+        return next;
+      });
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!n) return;
+      setActiveIdx((i) => {
+        const next = i <= 0 ? n - 1 : i - 1;
+        hitRefs.current[next]?.scrollIntoView?.({ block: 'nearest' });
+        return next;
+      });
+    } else if (e.key === 'Enter' && activeIdx >= 0 && activeIdx < n) {
+      e.preventDefault();
+      selectHit(hits[activeIdx]);
+    }
+  }, [onClose, hits, activeIdx, selectHit]);
 
   const groups = selected && chat ? groupChatWindow(chat, selected.hit.offset_sec) : null;
 
@@ -538,8 +573,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       onKeyDown={handleKeyDown}
       className={
         embedded
-          ? 'flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl w-full h-full min-h-0'
-          : 'fixed flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl'
+          ? 'flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl w-full h-full min-h-0 overflow-hidden'
+          : 'fixed flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl overflow-hidden'
       }
       style={embedded ? undefined : { zIndex }}
     >
@@ -576,6 +611,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         <div className="flex flex-1 items-center gap-1.5 bg-zinc-900 border-2 border-zinc-800 focus-within:border-white px-1.5">
           <Search size={12} className="text-zinc-500 shrink-0" />
           <input
+            ref={inputRef}
             autoFocus
             type="text"
             value={inputQuery}
@@ -622,7 +658,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       </div>
 
       {/* ── FILTERS — every filter applies live to the same debounced search ── */}
-      <div className="flex flex-col gap-1 shrink-0 border border-zinc-800 bg-zinc-900/40 p-1.5">
+      <div className="flex flex-col gap-1.5 shrink-0 border border-zinc-800 bg-zinc-900/40 p-1.5">
         {!scope && (
           <div className="flex items-center gap-1.5 min-w-0">
             <label htmlFor="archive-filter-channel" className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
@@ -644,29 +680,51 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             </select>
           </div>
         )}
-        {!scope && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
+        <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
+          {!scope && (
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
+              <div className="flex gap-1 flex-wrap">
+                {ARCHIVE_PLATFORMS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    aria-pressed={platformFilter.includes(p)}
+                    onClick={() => togglePlatform(p)}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                      platformFilter.includes(p)
+                        ? 'bg-white text-black border-white'
+                        : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                    }`}
+                  >
+                    <PlatformVodIcon platform={PLATFORM_ICON_NAME[p] ?? p} className="w-3 h-3" />
+                    {p}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Kind</span>
             <div className="flex gap-1 flex-wrap">
-              {ARCHIVE_PLATFORMS.map((p) => (
+              {ARCHIVE_KINDS.map((k) => (
                 <button
-                  key={p}
+                  key={k}
                   type="button"
-                  aria-pressed={platformFilter.includes(p)}
-                  onClick={() => togglePlatform(p)}
-                  className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
-                    platformFilter.includes(p)
+                  aria-pressed={kindFilter.includes(k)}
+                  onClick={() => toggleKind(k)}
+                  className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                    kindFilter.includes(k)
                       ? 'bg-white text-black border-white'
                       : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
                   }`}
                 >
-                  <PlatformVodIcon platform={PLATFORM_ICON_NAME[p] ?? p} className="w-3 h-3" />
-                  {p}
+                  {ARCHIVE_KIND_LABELS[k as keyof typeof ARCHIVE_KIND_LABELS]}
                 </button>
               ))}
             </div>
           </div>
-        )}
+        </div>
         <div className="flex items-center gap-1.5">
           <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Day</span>
           <input
@@ -698,93 +756,75 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             EVERY DAY
           </button>
         </div>
-        <div className="flex items-center gap-1.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Kind</span>
-          <div className="flex gap-1 flex-wrap">
-            {ARCHIVE_KINDS.map((k) => (
-              <button
-                key={k}
-                type="button"
-                aria-pressed={kindFilter.includes(k)}
-                onClick={() => toggleKind(k)}
-                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
-                  kindFilter.includes(k)
-                    ? 'bg-white text-black border-white'
-                    : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
-                }`}
-              >
-                {ARCHIVE_KIND_LABELS[k as keyof typeof ARCHIVE_KIND_LABELS]}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Source</span>
-          <div className="flex border-2 border-zinc-700">
-            {ARCHIVE_SOURCES.map((s, i) => (
-              <button
-                key={s}
-                type="button"
-                aria-pressed={sourceFilter === s}
-                onClick={() => setSourceFilter(s)}
-                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
-                  i > 0 ? 'border-l-2 border-zinc-700' : ''
-                } ${
-                  sourceFilter === s
-                    ? 'bg-white text-black'
-                    : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
-                }`}
-              >
-                {ARCHIVE_SOURCE_LABELS[s]}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            aria-pressed={semanticOn}
-            disabled={sourceFilter === 'chat'}
-            onClick={() => setSemanticOn((v) => !v)}
-            title={
-              sourceFilter === 'chat'
-                ? 'Concept search covers transcripts only'
-                : 'Concept search: finds moments by meaning, not just words (first use downloads the embed model)'
-            }
-            className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
-              semanticOn
-                ? 'bg-white text-black border-white'
-                : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
-            }`}
-          >
-            SEMANTIC
-          </button>
-        </div>
-        {langsPresent.size >= 2 && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Lang</span>
-            <div className="flex gap-1 flex-wrap">
-              {ARCHIVE_LANGS.map((l) => (
+        <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 items-center">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Source</span>
+            <div className="flex border-2 border-zinc-700">
+              {ARCHIVE_SOURCES.map((s, i) => (
                 <button
-                  key={l}
+                  key={s}
                   type="button"
-                  aria-pressed={langFilter === l}
-                  onClick={() => toggleLang(l)}
-                  title={`Only show ${ARCHIVE_LANG_LABELS[l]} transcript rows`}
-                  className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
-                    langFilter === l
-                      ? 'bg-white text-black border-white'
-                      : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                  aria-pressed={sourceFilter === s}
+                  onClick={() => setSourceFilter(s)}
+                  className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                    i > 0 ? 'border-l-2 border-zinc-700' : ''
+                  } ${
+                    sourceFilter === s
+                      ? 'bg-white text-black'
+                      : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
                   }`}
                 >
-                  {ARCHIVE_LANG_LABELS[l]}
+                  {ARCHIVE_SOURCE_LABELS[s]}
                 </button>
               ))}
             </div>
           </div>
-        )}
+          <div className="flex items-center gap-1.5 min-w-0">
+            <button
+              type="button"
+              aria-pressed={semanticOn}
+              disabled={sourceFilter === 'chat'}
+              onClick={() => setSemanticOn((v) => !v)}
+              title={
+                sourceFilter === 'chat'
+                  ? 'Concept search covers transcripts only'
+                  : 'Concept search: finds moments by meaning, not just words (first use downloads the embed model)'
+              }
+              className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
+                semanticOn
+                  ? 'bg-white text-black border-white'
+                  : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+              }`}
+            >
+              SEMANTIC
+            </button>
+            {langsPresent.size >= 2 && (
+              <div className="flex gap-1 flex-wrap">
+                {ARCHIVE_LANGS.map((l) => (
+                  <button
+                    key={l}
+                    type="button"
+                    aria-pressed={langFilter === l}
+                    onClick={() => toggleLang(l)}
+                    title={`Only show ${ARCHIVE_LANG_LABELS[l]} transcript rows`}
+                    className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
+                      langFilter === l
+                        ? 'bg-white text-black border-white'
+                        : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                    }`}
+                  >
+                    {ARCHIVE_LANG_LABELS[l]}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
+      {/* ── RESULTS REGION — every scrollable list is bounded so many
+          hits can never push the panel's fixed blocks out of view ── */}
+      <div className="flex flex-col gap-1.5 min-h-0 flex-1">
       {status === 'error' && (
         <div className="border-2 border-red-500/75 bg-red-500/15 p-2 text-red-300 text-[10px] font-mono flex items-center gap-2 shrink-0">
           <span className="min-w-0 flex-1">{error}</span>
@@ -810,18 +850,29 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </p>
       )}
 
-      {/* Every hit is a partial word match (no row contains all query
-          words) — say so instead of presenting fuzzy noise as exact. */}
-      {hits.length > 0 && !hits.some((h) => !h.partial) && (
-        <p className="text-[10px] font-mono text-amber-500/80 shrink-0">
-          No exact match for &quot;{query}&quot; — showing closest word matches.
-        </p>
+      {/* Result count + coverage note. Every hit is a partial word match
+          (no row contains all query words) — say so instead of presenting
+          fuzzy noise as exact. */}
+      {status === 'done' && hits.length > 0 && (
+        <div className="flex items-center justify-between gap-2 shrink-0">
+          <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
+            {hits.length} result{hits.length === 1 ? '' : 's'}
+            {remoteStatus === 'done' && remoteHits.length > 0 && (
+              <span className="text-zinc-600"> · +{remoteHits.length} YouTube</span>
+            )}
+          </span>
+          {!hits.some((h) => !h.partial) && (
+            <span className="text-[9px] font-mono uppercase tracking-widest text-amber-500/80">
+              closest matches
+            </span>
+          )}
+        </div>
       )}
 
       {/* ── HITS ── */}
       {hits.length > 0 && (
-        <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0">
-          {hits.map((hit) => {
+        <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
+          {hits.map((hit, idx) => {
             const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
             const spans = highlightQuerySpans(hit.text, query);
             const snippet = snippetAroundMatch(hit.text, query);
@@ -834,15 +885,20 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             }
             if (cursor < snippet.length) nodes.push(snippet.slice(cursor));
             const isSelected = selected?.hit === hit;
+            const isActive = activeIdx === idx;
             return (
               <div key={`${hit.kind}:${hit.platform}:${hit.video_id}:${hit.offset_sec}`} className="flex items-stretch gap-1">
                 <button
+                  ref={(el) => { hitRefs.current[idx] = el; }}
                   type="button"
                   onClick={() => selectHit(hit)}
+                  aria-current={isActive ? 'true' : undefined}
                   className={`text-left border-2 p-1.5 flex flex-col gap-1 flex-1 min-w-0 transition-colors ${
                     isSelected
                       ? 'border-white bg-zinc-900'
-                      : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-500'
+                      : isActive
+                        ? 'border-yellow-300/70 bg-zinc-900'
+                        : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-500'
                   }`}
                 >
                 <span className="flex items-center gap-1.5 min-w-0">
@@ -903,10 +959,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
 
       {/* ── REMOTE YOUTUBE RESULTS (channel-scoped title search) ── */}
       {(remoteStatus === 'loading' || remoteStatus === 'done' || remoteStatus === 'error') && (
-        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-1.5 min-h-0 shrink-0">
+        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-1.5 min-h-0 flex-none max-h-[38%]">
           <div className="flex items-center gap-1.5 shrink-0">
             <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
               YouTube results{remoteYtHandle ? ` · @${remoteYtHandle}` : ''}
+              {remoteStatus === 'done' && remoteHits.length > 0 && (
+                <span className="text-zinc-600"> · {remoteHits.length}</span>
+              )}
             </span>
             {remoteStatus === 'loading' && (
               <Loader2 size={10} className="animate-spin text-zinc-500 shrink-0" />
@@ -921,7 +980,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             </p>
           )}
           {remoteStatus === 'done' && remoteHits.length > 0 && (
-            <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0">
+            <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
               {remoteHits.map((hit) => (
                 <button
                   key={hit.video_id}
@@ -958,7 +1017,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
 
       {/* ── NEARBY CHAT — "below the player" panel ── */}
       {selected && (
-        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-2 min-h-0">
+        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-2 min-h-0 flex-none max-h-[38%]">
           <div className="flex items-center justify-between gap-2 shrink-0">
             <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
               Nearby chat ±{CHAT_HALF_SEC}s
@@ -987,7 +1046,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             </div>
           )}
           {chatStatus === 'done' && groups && chat && (
-            <div className="flex flex-col gap-0.5 overflow-y-auto custom-scrollbar pr-1 max-h-52 min-h-0">
+            <div className="flex flex-col gap-0.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
               {chat.length === 0 && (
                 <p className="text-[10px] font-mono text-zinc-500">No archived chat near this moment.</p>
               )}
@@ -1026,6 +1085,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
           )}
         </div>
       )}
+      </div>{/* /RESULTS REGION */}
       {!embedded && (
         <PanelResizeHandles onPointerDown={onResizeStart} />
       )}

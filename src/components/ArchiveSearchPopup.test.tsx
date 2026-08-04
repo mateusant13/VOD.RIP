@@ -161,6 +161,37 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.queryByRole('button', { name: /open .* in player/i })).toBeNull();
   });
 
+  it('result count row renders; ArrowDown/Enter navigate + select hits, Escape closes', async () => {
+    const fetchMock = mockFetch([
+      HIT,
+      { ...HIT, offset_sec: 43, text: 'zebra stripes two' },
+    ]);
+    const onClose = vi.fn();
+    const onOpenHit = vi.fn();
+    render(<ArchiveSearchPopup zIndex={10} onClose={onClose} onOpenHit={onOpenHit} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    expect(await screen.findByText(/2 results/i)).toBeInTheDocument();
+
+    const rows = await screen.findAllByRole('button', { name: /zebra stripes/i });
+    expect(rows).toHaveLength(2);
+    // Navigation only while typing in the search box.
+    fireEvent.keyDown(document.body, { key: 'ArrowDown' });
+    expect(rows[0]).not.toHaveAttribute('aria-current');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(rows[0]).toHaveAttribute('aria-current', 'true');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(rows[1]).toHaveAttribute('aria-current', 'true');
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(rows[0]).toHaveAttribute('aria-current', 'true');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onOpenHit).toHaveBeenCalledTimes(1);
+    expect(onOpenHit.mock.calls[0][0]).toMatchObject({ video_id: 'v1', offset_sec: 42 });
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it('synthetic rows never seek either', async () => {
     const fetchMock = mockFetch([
       {
