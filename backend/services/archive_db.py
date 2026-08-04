@@ -1643,6 +1643,11 @@ def optimize_fts() -> None:
 
 _HITS_PER_VIDEO_CAP = 3  # dedupe ceiling: never let one video flood a result page
 _PHRASE_BOOST = 1.5      # exact-phrase matches get +50% before the cross-table merge
+# All-query-tokens-present (any order/position) matches rank between exact
+# phrase (1.5) and the tier-0 OR noise floor (1.0). This is FTS5's implicit
+# multi-word AND semantics: a row that contains every word the user typed is
+# a real match; a row with only one word is partial.
+_AND_BOOST = 1.25
 
 
 def search(
@@ -1727,11 +1732,19 @@ def search(
     if raw_q:
         # "raw query" quoted as one FTS5 phrase; embedded quotes are escaped.
         phrase_pattern = '"' + raw_q.replace('"', '""') + '"'
+    # All-tokens AND pattern: FTS5's implicit multi-word semantics. Quoted
+    # tokens joined with AND match rows containing EVERY query word (any
+    # order/position). 1-2 char tokens ("da") are OR-noise and phrase-only
+    # (mirrors the fuzzy expansion filter) — dropping them here means
+    # "vale estranheza" still finds rows that say "vale da estranheza".
+    q_tokens_all = re.findall(r"[^\W_]+", raw_q.casefold())
+    q_tokens = [t for t in q_tokens_all if len(t) >= 3]
+    and_pattern = " AND ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in q_tokens) if len(q_tokens) >= 2 else None
     # Cross-segment phrase matching: multi-word queries whose tokens are
     # split across two ADJACENT transcript segments ("…vale" | "da
     # estranheza…"). FTS5 phrases cannot span rows, so the span pass scans
     # the transcript table directly (see _phrase_span_rows).
-    span_tokens = re.findall(r"[^\W_]+", raw_q.casefold())
+    span_tokens = q_tokens_all
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -1749,6 +1762,14 @@ def search(
                 r["_tier"] = dist
                 by_row.setdefault(r["_rowid"], r)
         rows = list(by_row.values())
+        and_rows: dict[int, dict] = {}
+        if and_pattern:
+            try:
+                for r in _table_search(and_pattern, fetch, **base):
+                    r["_and"] = True  # all query tokens present: +25% before merging
+                    and_rows[r["_rowid"]] = r
+            except sqlite3.Error:
+                and_rows = {}  # pattern not parseable — degrade to phrase/fuzzy
         phrase_rows: dict[int, dict] = {}
         if phrase_pattern:
             try:
@@ -1757,10 +1778,14 @@ def search(
                     phrase_rows[r["_rowid"]] = r
             except sqlite3.Error:
                 phrase_rows = {}  # phrase not parseable — degrade to fuzzy-only
-        # Union by rowid; a phrase-marked row replaces its fuzzy twin.
+        # Union by rowid; a phrase-marked row replaces its fuzzy twin, and
+        # an AND-marked row replaces its OR-only twin (a row matching every
+        # query word is a stronger signal than a single-word fuzzy hit).
         by_row: dict[int, dict] = {}
         for r in rows:
             by_row[r["_rowid"]] = r
+        for rid, r in and_rows.items():
+            by_row[rid] = r
         for rid, r in phrase_rows.items():
             by_row[rid] = r
         table_rows = list(by_row.values())
@@ -1786,11 +1811,28 @@ def search(
                 table_rows = list(by_row.values())
         if not table_rows:
             continue
-        max_score = max(h["score"] for h in table_rows)
+        # Phrase and AND rows are coverage-tiered (flat), never normalized:
+        # raw BM25 degenerates on small tables (idf ~0 for terms in >half
+        # the rows) and a multi-rare-term OR row can out-score a phrase row
+        # after max-normalization. OR rows normalize against their own max.
+        or_max = max(
+            (h["score"] for h in table_rows if not h.get("_phrase") and not h.get("_and")),
+            default=0.0,
+        )
         for h in table_rows:
-            if max_score > 0:  # guard div-by-zero: keep raw scores if batch max is 0
-                h["score"] = h["score"] / max_score
-            h["score"] = h["score"] * (_PHRASE_BOOST if h.pop("_phrase", False) else 0.5 ** h.pop("_tier", 0))
+            phr = h.pop("_phrase", False)
+            andf = h.pop("_and", False)
+            if phr:
+                h["score"] = _PHRASE_BOOST  # exact phrase: 1.5
+            elif andf:
+                h["score"] = _AND_BOOST  # every query word present: 1.25
+            else:
+                if or_max > 0:  # guard div-by-zero: keep raw scores if OR max is 0
+                    h["score"] = h["score"] / or_max
+                h["score"] = h["score"] * 0.5 ** h.pop("_tier", 0)
+            # A multi-word hit that reached only the fuzzy OR tier matched a
+            # subset of the query — flag it so UIs can say "closest match".
+            h["partial"] = not (phr or andf)
             h["_tbl"] = tbl_idx
             merged.append(h)
     # Video-title pass: matching titles surface saved-channel uploads that
@@ -1944,6 +1986,7 @@ def _titles_search(
             "date": r["date"],
             "video_kind": r["video_kind"],
             "channel_language": r["channel_language"],
+            "partial": matched < len(q_tokens),
             "_rowid": f"t:{r['platform']}:{r['video_id']}",
             "_raw": score,
         })
@@ -2376,7 +2419,8 @@ _vocab_lock = threading.Lock()
 # test suites rebinding VODRIP_ARCHIVE_DB mid-process.
 _vocab_cache: dict[str, tuple[str, float, dict[int, list[tuple[str, int]]], int]] = {}
 # query token -> (expanded_at_monotonic, [terms, ...])
-_token_cache: dict[str, tuple[float, list[str]]] = {}
+_token_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
+_vocab_generation: dict[str, int] = {}
 
 
 def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
@@ -2412,7 +2456,12 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
         by_len.setdefault(len(term), []).append((term, int(r["n"])))
     row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
     with _vocab_lock:
-        _vocab_cache[table] = (str(_db_path()), now, by_len, row_count)
+        # Bump the per-DB generation so cached token expansions (which are
+        # vocab-derived) invalidate when the corpus grows — chat ingestion
+        # must make new words reachable within the TTL, not after it.
+        dbp = str(_db_path())
+        _vocab_generation[dbp] = _vocab_generation.get(dbp, 0) + 1
+        _vocab_cache[table] = (dbp, now, by_len, row_count)
     return by_len
 
 
@@ -2485,7 +2534,7 @@ def _phonetic_fold(word: str) -> str:
             s = s[:-1] + "u"
     # Collapse doubled letters AFTER the final-vowel fold so the fold-created
     # doubles collapse too ('yasuo' -> 'iasuu' -> 'iasu').
-    return re.sub(r"(.)\1+", r"\1", s)
+    return _DEDUP_RE.sub(r"\1", s)
 
 
 def _damerau_levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
@@ -2545,6 +2594,7 @@ _BIGRAM_MAX_ROWS = 300_000
 # "table1|table2" -> (loaded_at, {folded_pair_key: [(raw_pair, freq), ...]}, row_counts)
 _bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]], list[int]]] = {}
 _TOKEN_RE = re.compile(r"[^\w]+")
+_DEDUP_RE = re.compile(r"(.)\1+")  # fold's doubled-letter collapse — compiled once
 
 
 def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]]]:
@@ -2561,7 +2611,7 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
     matching covers anyway. Cached like the vocab (TTL + row-count gate) so
     steady chat growth does not rebuild it on every search; tables over
     _BIGRAM_MAX_ROWS are skipped."""
-    key = "|".join(tables)
+    key = str(_db_path()) + "|" + "|".join(tables)
     now = time.monotonic()
     with _vocab_lock:
         hit = _bigram_cache.get(key)
@@ -2569,18 +2619,35 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
             counts_now = [
                 query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
             ]
-            if counts_now == hit[2]:
+            # Steady chat growth must NOT rebuild the index on every search:
+            # a live stream ingests rows continuously. Reuse the cache while
+            # each table drifted by <10% (or <5000 rows for small tables).
+            drift_ok = all(
+                abs(cur - cached) <= max(5000, int(cached * 0.10))
+                for cur, cached in zip(counts_now, hit[2])
+            )
+            if drift_ok:
                 return hit[1]
-            hit = None  # rows changed since load — rebuild the index
+            hit = None  # material growth since load — rebuild the index
     counts: dict[tuple[str, str], int] = {}
     for table in tables:
         row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
         if row_count == 0 or row_count > _BIGRAM_MAX_ROWS:
             continue
+        # Fold each UNIQUE token once: re-folding every adjacent pair
+        # re-does the same word millions of times (207k message rows on the
+        # real DB -> 1.5M+ fold calls -> ~20s+ on the first search).
+        folds: dict[str, str] = {}
         for row in query(f"SELECT text FROM {table} WHERE text IS NOT NULL"):
             toks = [t for t in _TOKEN_RE.split((row["text"] or "").lower()) if t]
             for a, b in zip(toks, toks[1:]):
-                fk = _phonetic_fold(a) + _phonetic_fold(b)
+                fa = folds.get(a)
+                if fa is None:
+                    fa = folds[a] = _phonetic_fold(a)
+                fb = folds.get(b)
+                if fb is None:
+                    fb = folds[b] = _phonetic_fold(b)
+                fk = fa + fb
                 if len(fk) < 4:
                     continue
                 counts[(fk, a + " " + b)] = counts.get((fk, a + " " + b), 0) + 1
@@ -2611,20 +2678,25 @@ def _token_expansions(
 ) -> list[tuple[str, int]]:
     """Exact + fuzzy candidates for one query token as (term, distance)
     pairs, best ~8 by (distance, frequency), plus folded-bigram phrases
-    (distance 1 — recall-only, never rank-pattern material). Tokens shorter
+    pair (distance 1 — recall-only, never rank-pattern material). Tokens shorter
     than 3 chars are never expanded. Dist>=1 candidates whose MERGED corpus
     frequency exceeds _SUPPRESS_DIST1_FREQ are dropped ('cara' 3106 is chat
     spam; the legit fuzzy tail peaks at 'chaco' 570); exact/fold-equal
-    (dist 0) always survive. Short rare tokens (4-6 chars, merged freq
-    <= _PREFIX_GATE_FREQ) also get tier-0 prefix expansions, raw or
-    phonetically folded — 'kata' reaches 'catarina' via fold 'katarina'
-    startswith 'kata' — capped at _TOKEN_PREFIX_CAP. Falls back to the bare
-    token (distance 0) when nothing matches."""
+    (dist 0) always survive. Short tokens (4-6 chars) get prefix
+    expansions, raw or phonetically folded — 'kata' reaches 'catarina'
+    via fold 'katarina' startswith 'kata'. Prefix matches of tokens
+    ABSENT from the corpus sit at tier 0 (a partial word is the intended
+    target); prefix matches of PRESENT tokens sit at tier 1 so a complete
+    word never floods the top with longer forms ('vale' must not pull
+    valendo/valeu into tier 0) — capped at _TOKEN_PREFIX_CAP. Falls back
+    to the bare token (distance 0) when nothing matches."""
     if len(token) < 3:
         return [(token, 0)]
     now = time.monotonic()
+    dbp = str(_db_path())
     with _vocab_lock:
-        hit = _token_cache.get(token)
+        gen = _vocab_generation.get(dbp, 0)
+        hit = _token_cache.get((dbp, gen, token))
         if hit and now - hit[0] < _VOCAB_TTL_S:
             return hit[1]
     best: dict[str, tuple[int, int]] = {}  # term -> (dist, -freq)
@@ -2665,12 +2737,15 @@ def _token_expansions(
                 cur = best.get(term)
                 if cur is None or (dist, -freq) < cur:
                     best[term] = (dist, -freq)
-    # R2: tier-0 prefix expansion for short rare tokens. Levenshtein cannot
-    # bridge the length gap to 'catarina' from 'kata' (budget 1); the
-    # folded prefix can — fold('catarina') = 'katarina' starts with
-    # fold('kata') = 'kata' (only since R1's hard c). The freq gate keeps
-    # spam tokens from flooding tier 0 ('cara' would pull caralho/caramba/
-    # carrasco into every search).
+    # R2: prefix expansion for SHORT tokens below the spam-frequency gate.
+    # An ABSENT token is likely a partial word or mishearing ('kata'
+    # reaches 'catarina' via fold 'katarina' startswith 'kata') and its
+    # prefix matches sit at tier 0. A PRESENT token is a complete word:
+    # its prefix matches must never tie with the exact token at tier 0
+    # ('vale' would pull valendo/valeu/valerá into every 'vale' search
+    # via the 3-char fold 'val') — they are offered at tier 1 instead, so
+    # exact forms rank first while the partial word stays reachable.
+    # Tokens above the gate ('cara' 3106) are chat spam and emit nothing.
     if 4 <= len(token) <= 6 and merged_freq.get(token, 0) <= _PREFIX_GATE_FREQ:
         pref: dict[str, int] = {}
         for vocab in vocabs:
@@ -2682,10 +2757,12 @@ def _token_expansions(
                         continue
                     if term.startswith(token) or _phonetic_fold(term).startswith(fold):
                         pref[term] = pref.get(term, 0) + freq
-        for term, freq in sorted(pref.items(), key=lambda kv: -kv[1])[:_TOKEN_PREFIX_CAP]:
-            cur = best.get(term)
-            if cur is None or (0, -freq) < cur:
-                best[term] = (0, -freq)  # upgrade an existing dist-1 entry to tier 0
+        if pref:
+            pd = 0 if merged_freq.get(token, 0) == 0 else 1
+            for term, freq in sorted(pref.items(), key=lambda kv: -kv[1])[:_TOKEN_PREFIX_CAP]:
+                cur = best.get(term)
+                if cur is None or (pd, -freq) < cur:
+                    best[term] = (pd, -freq)  # upgrade an existing dist-1 entry
     ranked = sorted(best.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
     out: list[tuple[str, int]] = [
         (term, dist) for term, (dist, _) in ranked[:_TOKEN_EXPAND_CAP]
@@ -2703,7 +2780,7 @@ def _token_expansions(
         # Unbounded user input -> bounded cache; a clear is cheaper than LRU.
         if len(_token_cache) > 4096:
             _token_cache.clear()
-        _token_cache[token] = (now, out)
+        _token_cache[(dbp, gen, token)] = (now, out)
     return out
 
 

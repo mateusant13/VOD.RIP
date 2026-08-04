@@ -810,6 +810,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </p>
       )}
 
+      {/* Every hit is a partial word match (no row contains all query
+          words) — say so instead of presenting fuzzy noise as exact. */}
+      {hits.length > 0 && !hits.some((h) => !h.partial) && (
+        <p className="text-[10px] font-mono text-amber-500/80 shrink-0">
+          No exact match for &quot;{query}&quot; — showing closest word matches.
+        </p>
+      )}
+
       {/* ── HITS ── */}
       {hits.length > 0 && (
         <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0">

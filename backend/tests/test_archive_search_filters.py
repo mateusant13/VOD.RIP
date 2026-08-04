@@ -746,16 +746,20 @@ def test_token_expansions_rare_short_pair_survives_suppression():
             archive_db._token_cache.clear()
 
 
-def test_token_expansions_tier0_prefix_raw_and_folded():
-    # R2: 'cata' reaches 'catarina' by raw prefix; 'kata' via the folded
-    # prefix (fold('catarina') == 'katarina' after the hard-c fold).
-    vocab = {4: [("cata", 5), ("kata", 10)], 8: [("catarina", 30)]}
-    for tok in ("cata", "kata"):
-        with archive_db._vocab_lock:
-            archive_db._token_cache.clear()
-        cands = archive_db._token_expansions(tok, [vocab], None)
-        assert ("catarina", 0) in cands, \
-            f"{tok} must reach catarina at tier 0, got {cands}"
+def test_token_expansions_prefix_raw_and_folded():
+    # R2: 'kata' (absent from the corpus) reaches 'catarina' at tier 0 via
+    # the folded prefix; 'cata' (present as its own token) still reaches it
+    # but demoted to tier 1 — a complete word must never flood the top
+    # with its longer forms (the 'vale' -> valendo/valeu regression).
+    vocab = {4: [("cata", 5)], 8: [("catarina", 30)]}
+    with archive_db._vocab_lock:
+        archive_db._token_cache.clear()
+    cands = dict(archive_db._token_expansions("kata", [vocab], None))
+    assert cands.get("catarina") == 0, f"absent token -> tier 0, got {cands}"
+    with archive_db._vocab_lock:
+        archive_db._token_cache.clear()
+    cands = dict(archive_db._token_expansions("cata", [vocab], None))
+    assert cands.get("catarina") == 1, f"present token -> tier 1, got {cands}"
 
 
 def test_token_expansions_prefix_gate_blocks_high_freq_token():
