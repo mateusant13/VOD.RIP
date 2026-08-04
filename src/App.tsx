@@ -6220,7 +6220,7 @@ export default function App() {
                         </div>
                       ) : visibleChannelVideos.length === 0 ? (
                         <>
-                          {selectedChannelFirstLiveEntry && (channelContentFilter === 'vods' && !youtubePlatformOnly || channelContentFilter === 'streams' && youtubePlatformOnly) && (
+                          {selectedChannelFirstLiveEntry && (
                             <div
                               role="button"
                               tabIndex={0}
@@ -6275,7 +6275,7 @@ export default function App() {
                             </div>
                           )}
                           <div className={`flex flex-col gap-1 transition-opacity duration-150 ${channelsLoading ? 'opacity-60' : ''}`}>
-                          {selectedChannelFirstLiveEntry && (channelContentFilter === 'vods' && !youtubePlatformOnly || channelContentFilter === 'streams' && youtubePlatformOnly) && (
+                          {selectedChannelFirstLiveEntry && (
                             <div
                               role="button"
                               tabIndex={0}
