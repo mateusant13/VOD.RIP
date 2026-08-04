@@ -2057,7 +2057,11 @@ insert_messages(
     _selfcheck_video,
     [{"offset_sec": 1.0, "username": "checker", "text": "arquivo local google teste"}],
 )
-_hits = search("local")
+# Every content assert below is scoped to the self-check video: the contract
+# is "FTS finds MY row", not "my row ranks top-N corpus-wide". Unscoped
+# asserts flip randomly on large archives (500k+ rows push the row out of
+# the result window) and would crash the backend at import.
+_hits = search("local", video_id=_selfcheck_video)
 assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in _hits), (
     "FTS5 search must find inserted chat rows"
 )
@@ -2073,14 +2077,14 @@ insert_transcript(
 )
 assert any(
     h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
-    for h in search("transcrição")
+    for h in search("transcrição", video_id=_selfcheck_video)
 ), "FTS5 must find transcript segments (unicode61 tokenizer)"
 # Cross-segment phrase: tokens split across two adjacent segments must be
 # found with the exact-phrase boost (FTS5 phrases cannot span rows).
 _sc_span = next(
     (
         h
-        for h in search("vale da estranheza")
+        for h in search("vale da estranheza", video_id=_selfcheck_video)
         if h["video_id"] == _selfcheck_video and h["kind"] == "transcript"
     ),
     None,
@@ -2102,11 +2106,12 @@ assert query(
 )[0]["lang"] == "pt", "pt-br must normalize to pt in transcripts.lang"
 assert any(
     h["video_id"] == _selfcheck_video
-    for h in search("transcrição", lang="pt")
+    for h in search("transcrição", lang="pt", video_id=_selfcheck_video)
 ), "lang='pt' must match tagged and untagged transcript rows"
 # fuzzy expansion: a misspelled token still finds the row via the FTS5 vocab.
 assert any(
-    h["video_id"] == _selfcheck_video for h in search("googl")
+    h["video_id"] == _selfcheck_video
+    for h in search("googl", video_id=_selfcheck_video)
 ), "fuzzy expansion must match 'google' from 'googl'"
 # phonetic fold: c/k, ç/ss, ph/f, y/i and final unstressed vowels collapse;
 # the ASR/typo pairs from the failure corpus must fold equal or within the
