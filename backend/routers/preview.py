@@ -8,7 +8,7 @@ import re
 import sqlite3
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from models.schemas import LivePreviewRequest, LiveRotateRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
@@ -77,12 +77,34 @@ def _session_extract_source(session) -> str:
     return last_extract_source(vid)
 
 
+def _preview_archive_capabilities(session) -> tuple[bool, bool]:
+    """(has_transcript, has_chat) for the archived video a session maps to.
+
+    Best-effort: an unarchived URL (or a live/master.m3u8 session) yields
+    (False, False) without raising — the panel then shows empty states."""
+    platform = str(getattr(session, "platform", "") or "").strip().lower()
+    if platform not in archive_db.PLATFORMS:
+        return False, False
+    video_id = _preview_video_id(platform, getattr(session, "vod_url", "") or "")
+    if not video_id:
+        return False, False
+    try:
+        return (
+            archive_db.has_transcript(platform, video_id),
+            archive_db.has_chat(platform, video_id),
+        )
+    except Exception:
+        # A DB hiccup must never fail the preview session response.
+        return False, False
+
+
 def _preview_session_response(session) -> PreviewSessionResponse:
     master = f"/api/preview/hls/{session.session_id}/master.m3u8"
     if session.kind == "progressive":
         playback = f"/api/preview/hls/{session.session_id}/stream.mp4"
     else:
         playback = master
+    has_transcript, has_chat = _preview_archive_capabilities(session)
     return PreviewSessionResponse(
         session_id=session.session_id,
         master_url=master,
@@ -108,6 +130,8 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         anonymous=bool(getattr(session, "anonymous", False)),
         archive_url=getattr(session, "archive_entry_url", None) or "",
         archive_duration=float(getattr(session, "archive_duration", 0) or 0),
+        has_transcript=has_transcript,
+        has_chat=has_chat,
     )
 
 
@@ -120,6 +144,37 @@ def _parse_prefer_height_query(request: Request) -> Optional[int]:
     except ValueError:
         return None
     return height if height > 0 else None
+
+
+# WS-2 preview chat panel payload. Reuses the archive_db transcript/message
+# queries — no duplicated SQL — and is deliberately thin so the panel can
+# fetch the whole timeline once and sync locally while seeking.
+_PANEL_LIMIT_DEFAULT = 200_000
+_PANEL_LIMIT_MAX = 500_000
+
+
+@router.get("/api/preview/panel/{platform}/{video_id}")
+async def preview_panel(
+    platform: str,
+    video_id: str,
+    limit: int = Query(_PANEL_LIMIT_DEFAULT, ge=1, le=_PANEL_LIMIT_MAX),
+):
+    """Time-ordered transcript + chat rows for one archived video.
+
+    Strict response shape:
+      {transcript: [{offset_sec, text}], chat: [{offset_sec, text, username,
+       spam_count}], has_transcript: bool, has_chat: bool}
+    The flags mirror the preview-session capability flags so the UI can show
+    empty states without loading the full payload first."""
+    p = (platform or "").strip().lower()
+    if p not in archive_db.PLATFORMS:
+        raise HTTPException(status_code=400, detail="Unknown platform")
+    return {
+        "transcript": archive_db.transcript_offsets(p, video_id, limit),
+        "chat": archive_db.chat_for(p, video_id, limit),
+        "has_transcript": archive_db.has_transcript(p, video_id),
+        "has_chat": archive_db.has_chat(p, video_id),
+    }
 
 
 @router.post("/api/preview/warm")

@@ -1626,6 +1626,29 @@ export function applyHlsQualityLevel(
   hls.nextLevel = idx;
 }
 
+/**
+ * Index of the last preview-panel row whose offset_sec <= currentTime
+ * (binary search over the time-ordered offsets array), or -1 when
+ * currentTime precedes every row. The 10ms epsilon absorbs jitter from the
+ * throttled preview time UI so a row exactly at a seek target stays active.
+ */
+export function activePanelRowIndex(offsets: readonly number[], currentTime: number): number {
+  const t = Number.isFinite(currentTime) ? currentTime : 0;
+  let lo = 0;
+  let hi = offsets.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (offsets[mid] <= t + 0.01) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
 void (() => {
   const stub = document.createElement('video');
   Object.defineProperty(stub, 'error', { value: { code: MediaError.MEDIA_ERR_ABORTED } });
@@ -1730,6 +1753,16 @@ void (() => {
   }
   console.assert(youtubeExploreSessionStaggerMs(2) === 0, 'explore stagger disabled');
   console.assert(youtubeVideoIdFromUrl('https://youtu.be/dQw4w9WgXcQ') === 'dQw4w9WgXcQ');
+  {
+    const offs = [0, 5, 10, 10.5, 20];
+    console.assert(activePanelRowIndex(offs, -1) === -1, 'panel row index before first row');
+    console.assert(activePanelRowIndex(offs, 0) === 0, 'panel row index at first offset');
+    console.assert(activePanelRowIndex(offs, 6) === 1, 'panel row index mid-gap');
+    console.assert(activePanelRowIndex(offs, 10.5) === 3, 'panel row index at exact offset');
+    console.assert(activePanelRowIndex(offs, 999) === 4, 'panel row index after last row');
+    console.assert(activePanelRowIndex([], 5) === -1, 'panel row index empty list');
+    console.assert(activePanelRowIndex(offs, NaN) === -1, 'panel row index NaN time');
+  }
   console.assert(windowHlsVideoTimeSec(868, 823.5) === 44.5, 'vod→chunk-local time');
   console.assert(isPositionInWindowHlsMux(5, 0, 8) === true, 'in-window seek');
   console.assert(isPositionInWindowHlsMux(20, 0, 8) === false, 'out-of-window seek');

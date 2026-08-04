@@ -82,6 +82,7 @@ import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
 import QueueTab from './components/QueueTab';
 import SettingsTab from './components/SettingsTab';
+import PreviewChatPanel from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
@@ -5639,7 +5640,7 @@ export default function App() {
               </button>
             </div>
           </div>
-          <div className="flex flex-col gap-2 w-full" data-preview-panel>
+          <div className="flex flex-row gap-2 w-full min-h-0 items-stretch" data-preview-panel>
             <div
               ref={previewContainerRef}
               tabIndex={0}
@@ -5659,8 +5660,8 @@ export default function App() {
               onFocus={focusPreviewPlayer}
               className={`preview-fs-host outline-none focus:ring-2 focus:ring-white/30 bg-black overflow-hidden flex flex-col ${
                 previewFullscreen
-                  ? 'relative border-0'
-                  : 'relative w-full shrink-0 border-2 border-zinc-700'
+                  ? 'relative flex-1 min-w-0 border-0'
+                  : 'relative flex-1 min-w-0 shrink-0 border-2 border-zinc-700'
               }`}
               style={!previewFullscreen ? { height: previewPanelHeightRef.current || Math.round(effectivePreviewPanelWidth / Math.max(0.01, previewVideoAspect)), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
 
@@ -5753,6 +5754,12 @@ export default function App() {
                 />
               )}
             </div>
+            <PreviewChatPanel
+              platform={activePlatform}
+              videoId={previewArchiveVideoId}
+              currentTime={previewTimeUi}
+              hidden={previewFullscreen}
+            />
           </div>
           {!previewFullscreen && (
             <PanelResizeHandles onPointerDown={onPreviewPanelResize} />

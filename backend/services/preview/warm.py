@@ -29,6 +29,7 @@ from services.ytdlp_service import (
 from services.ytdlp_hls import _youtube_soft_neg_error
 
 from services.preview._state import (
+    _ACTIVE_YOUTUBE_PREVIEW_KEY,
     _ACTIVE_YOUTUBE_PREVIEW_LOCK,
     _CHANNEL_WARM_SLOTS,
     _CHANNEL_WARM_SLOTS_LOCK,
@@ -114,7 +115,6 @@ def _record_warm_failure() -> None:
                     _MAX_WARM_FAILURES, _WARM_COOLDOWN_SEC)
                 _PRINTED_COOLDOWN = True
             _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
-_ACTIVE_YOUTUBE_PREVIEW_LOCK = threading.Lock()
 _PREFLIGHT_MUX_LOCK = threading.Lock()
 def _preflight_mux_dir(video_id: str, prefer_height: int) -> Path:
     return preview_root() / "preflight" / f"{video_id}_{prefer_height}"
@@ -767,11 +767,12 @@ def kickoff_youtube_full_mux_warm(
 def set_active_youtube_preview(url: Optional[str]) -> None:
     """Mark which URL the user is actively previewing. Warm jobs for other URLs
     will skip their yt-dlp probe when they wake up."""
-    global _ACTIVE_YOUTUBE_PREVIEW_KEY
     try:
         key = _youtube_warm_inflight_key(url) if url else None
-        with _ACTIVE_YOUTUBE_PREVIEW_LOCK:
-            _ACTIVE_YOUTUBE_PREVIEW_KEY = key
+        from services.preview import _state as _pv_state
+
+        with _pv_state._ACTIVE_YOUTUBE_PREVIEW_LOCK:
+            _pv_state._ACTIVE_YOUTUBE_PREVIEW_KEY = key
     except Exception:
         pass
 def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:

@@ -190,7 +190,10 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at);
+-- ponytail: the (status, priority, created_at) index is created by
+-- _ensure_jobs_priority AFTER the column migration — SCHEMA's executescript
+-- runs before the rebuilds, so an index on a not-yet-migrated column would
+-- fail on any legacy DB (CREATE INDEX resolves columns at definition time).
 
 -- Per-channel/platform last-refresh time for the channel VOD index. The
 -- videos table accumulates fetched channel lists forever (upsert-only);
@@ -489,6 +492,11 @@ def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
     and the (status, priority, created_at) index replaces the old one."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
     if "priority" in cols:
+        # Column already migrated (fresh DB or intermediate version) — the
+        # index is no longer part of SCHEMA, so this migration owns it.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
+        )
         return
     conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
     conn.execute(
@@ -839,6 +847,56 @@ def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 3
              AND offset_sec BETWEEN ? AND ?
            ORDER BY offset_sec LIMIT 200""",
         (platform, video_id, offset_sec - half, offset_sec + half),
+    )
+    return [dict(r) for r in rows]
+
+
+# --- preview chat panel (WS-2) --------------------------------------------
+
+def has_transcript(platform: str, video_id: str) -> bool:
+    """True when the video has at least one transcript row (cheap EXISTS)."""
+    return bool(
+        query(
+            "SELECT 1 FROM transcripts WHERE platform = ? AND video_id = ? LIMIT 1",
+            (platform, video_id),
+        )
+    )
+
+
+def has_chat(platform: str, video_id: str) -> bool:
+    """True when the video has at least one chat row (cheap EXISTS)."""
+    return bool(
+        query(
+            "SELECT 1 FROM messages WHERE platform = ? AND video_id = ? LIMIT 1",
+            (platform, video_id),
+        )
+    )
+
+
+def transcript_offsets(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
+    """Transcript rows as preview-panel payload rows, time-ordered by start_sec.
+
+    Same transcripts table the search/transcript_for paths read; the panel
+    payload only needs (offset_sec, text) per row, so the heavy word/lang
+    columns are not selected."""
+    rows = query(
+        "SELECT start_sec AS offset_sec, text FROM transcripts "
+        "WHERE platform = ? AND video_id = ? ORDER BY start_sec LIMIT ?",
+        (platform, video_id, limit),
+    )
+    return [dict(r) for r in rows]
+
+
+def chat_for(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
+    """All chat rows for a video as preview-panel payload rows, time-ordered.
+
+    Thin projection of the same messages table chat_window/insert_messages
+    use; explicit ORDER BY offset_sec because live-capture inserts can land
+    out of order. The (platform, video_id, offset_sec) index serves it."""
+    rows = query(
+        "SELECT offset_sec, text, username, spam_count FROM messages "
+        "WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ?",
+        (platform, video_id, limit),
     )
     return [dict(r) for r in rows]
 

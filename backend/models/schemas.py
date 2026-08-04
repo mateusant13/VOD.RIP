@@ -209,6 +209,10 @@ class PreviewSessionResponse(BaseModel):
     anonymous: bool = False
     archive_url: str = ""
     archive_duration: float = 0.0
+    # WS-2 preview chat panel: true when the archived video for this session
+    # has transcript / chat rows in the local archive DB (empty states).
+    has_transcript: bool = False
+    has_chat: bool = False
 
 
 class PreviewSeekRequest(BaseModel):
