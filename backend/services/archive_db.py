@@ -130,6 +130,45 @@ CREATE TABLE IF NOT EXISTS audio_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audio_events_video ON audio_events(platform, video_id, start_sec);
 
+-- Saved-word / entity watching: entities the user (or auto mode from saved
+-- channels) wants detected across all transcriptions. entity_hits rows are
+-- the detection log; the unique key (entity, platform, video_id, seg_idx)
+-- makes repeated scans idempotent (INSERT OR IGNORE + last_seen refresh).
+CREATE TABLE IF NOT EXISTS watched_entities (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  text           TEXT NOT NULL UNIQUE,
+  kind           TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('auto','manual')),
+  source_channel TEXT,
+  aliases        TEXT NOT NULL DEFAULT '[]',
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_hits (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_id  INTEGER NOT NULL,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  seg_idx    INTEGER NOT NULL,
+  offset_sec REAL NOT NULL,
+  snippet    TEXT NOT NULL,
+  variant    TEXT,
+  seen_count INTEGER NOT NULL DEFAULT 1,
+  first_seen TEXT NOT NULL,
+  last_seen  TEXT NOT NULL,
+  acked      INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_hits_dedup
+  ON entity_hits(entity_id, platform, video_id, seg_idx);
+CREATE INDEX IF NOT EXISTS idx_entity_hits_recent ON entity_hits(last_seen);
+-- Watcher watermark: highest transcripts.id already scanned for entities.
+CREATE TABLE IF NOT EXISTS entity_watch_state (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS entity_hits_entity_ad AFTER DELETE ON watched_entities BEGIN
+  DELETE FROM entity_hits WHERE entity_id = old.id;
+END;
+
 CREATE TABLE IF NOT EXISTS video_aliases (
   platform      TEXT NOT NULL,
   video_id      TEXT NOT NULL,
@@ -1030,6 +1069,194 @@ def latest_job(platform: str, video_id: str, kind: Optional[str] = None) -> Opti
     sql += " ORDER BY created_at DESC LIMIT 1"
     rows = query(sql, params)
     return dict(rows[0]) if rows else None
+
+
+# --- entity watch (saved words / saved channels) ---------------------------
+
+def list_watched_entities() -> list[dict]:
+    """All watched entities with live hit counts (recent 30d + total)."""
+    rows = query(
+        """SELECT e.*,
+                  COUNT(h.id) AS hit_count,
+                  SUM(CASE WHEN h.acked = 0 THEN 1 ELSE 0 END) AS unacked_count
+           FROM watched_entities e
+           LEFT JOIN entity_hits h ON h.entity_id = e.id
+           GROUP BY e.id
+           ORDER BY e.kind, e.created_at"""
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["aliases"] = json.loads(d.get("aliases") or "[]")
+        out.append(d)
+    return out
+
+
+def get_watched_entity(entity_id: int) -> Optional[dict]:
+    rows = query("SELECT * FROM watched_entities WHERE id = ?", (entity_id,))
+    if not rows:
+        return None
+    d = dict(rows[0])
+    d["aliases"] = json.loads(d.get("aliases") or "[]")
+    return d
+
+
+def upsert_watched_entity(
+    text: str,
+    *,
+    kind: str = "manual",
+    source_channel: Optional[str] = None,
+    aliases: Optional[list[str]] = None,
+    enabled: bool = True,
+) -> int:
+    """Insert or update-by-text. Returns the entity id."""
+    text = text.strip()
+    if not text:
+        raise ValueError("entity text must not be empty")
+    now = _now_iso()
+    aliases_json = json.dumps(
+        [a.strip() for a in (aliases or []) if a.strip()], ensure_ascii=False
+    )
+    existing = query("SELECT id FROM watched_entities WHERE text = ?", (text,))
+    if existing:
+        eid = existing[0]["id"]
+        execute(
+            """UPDATE watched_entities
+               SET aliases = ?, enabled = ?, source_channel = COALESCE(?, source_channel)
+               WHERE id = ?""",
+            (aliases_json, 1 if enabled else 0, source_channel, eid),
+        )
+        return eid
+    execute(
+        """INSERT INTO watched_entities (text, kind, source_channel, aliases, enabled, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (text, kind, source_channel, aliases_json, 1 if enabled else 0, now),
+    )
+    return query("SELECT last_insert_rowid() AS id")[0]["id"]
+
+
+def set_watched_entity(entity_id: int, *, aliases: Optional[list[str]] = None,
+                       enabled: Optional[bool] = None) -> None:
+    sets: list[str] = []
+    params: list[Any] = []
+    if aliases is not None:
+        sets.append("aliases = ?")
+        params.append(
+            json.dumps([a.strip() for a in aliases if a.strip()], ensure_ascii=False)
+        )
+    if enabled is not None:
+        sets.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if not sets:
+        return
+    params.append(entity_id)
+    execute(f"UPDATE watched_entities SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def delete_watched_entity(entity_id: int) -> None:
+    execute("DELETE FROM watched_entities WHERE id = ?", (entity_id,))
+
+
+def record_entity_hits(hits: list[dict]) -> None:
+    """Idempotent hit insert: the (entity, platform, video_id, seg_idx) unique
+    key refreshes last_seen/seen_count instead of duplicating."""
+    now = _now_iso()
+    with _lock:
+        conn = get_conn()
+        with conn:
+            for h in hits:
+                conn.execute(
+                    """INSERT INTO entity_hits
+                       (entity_id, platform, video_id, seg_idx, offset_sec,
+                        snippet, variant, seen_count, first_seen, last_seen, acked)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)
+                       ON CONFLICT(entity_id, platform, video_id, seg_idx) DO UPDATE SET
+                         last_seen = excluded.last_seen,
+                         seen_count = seen_count + 1,
+                         snippet = excluded.snippet,
+                         variant = excluded.variant""",
+                    (
+                        h["entity_id"], h["platform"], h["video_id"], h["seg_idx"],
+                        h["offset_sec"], h["snippet"][:200], h.get("variant"),
+                        now, now,
+                    ),
+                )
+
+
+def list_entity_hits(*, entity_id: Optional[int] = None, platform: Optional[str] = None,
+                     video_id: Optional[str] = None, acked_only: Optional[bool] = None,
+                     limit: int = 100) -> list[dict]:
+    where: list[str] = []
+    params: list[Any] = []
+    if entity_id is not None:
+        where.append("h.entity_id = ?")
+        params.append(entity_id)
+    if platform:
+        where.append("h.platform = ?")
+        params.append(platform)
+    if video_id:
+        where.append("h.video_id = ?")
+        params.append(video_id)
+    if acked_only is not None:
+        where.append("h.acked = ?")
+        params.append(1 if acked_only else 0)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = query(
+        f"""SELECT h.*, e.text AS entity_text, e.kind AS entity_kind,
+                   v.title AS video_title, v.channel AS video_channel
+            FROM entity_hits h
+            JOIN watched_entities e ON e.id = h.entity_id
+            LEFT JOIN videos v ON v.platform = h.platform AND v.video_id = h.video_id
+            {where_sql}
+            ORDER BY h.last_seen DESC, h.id DESC
+            LIMIT ?""",
+        (*params, max(1, min(int(limit), 500))),
+    )
+    return [dict(r) for r in rows]
+
+
+def ack_entity_hit(hit_id: int) -> None:
+    execute("UPDATE entity_hits SET acked = 1 WHERE id = ?", (hit_id,))
+
+
+def entity_watch_cursor() -> int:
+    rows = query("SELECT value FROM entity_watch_state WHERE key = 'transcript_cursor'")
+    if not rows:
+        return 0
+    try:
+        return int(rows[0]["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_entity_watch_cursor(cursor: int) -> None:
+    execute(
+        """INSERT INTO entity_watch_state (key, value) VALUES ('transcript_cursor', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (str(cursor),),
+    )
+
+
+def transcript_rows_after(cursor: int, limit: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in query(
+            "SELECT * FROM transcripts WHERE id > ? ORDER BY id LIMIT ?",
+            (cursor, limit),
+        )
+    ]
+
+
+def recent_transcripts(platform: str, video_id: str, limit: int = 200) -> list[dict]:
+    """Transcript rows for one video (used to highlight hits in the viewer)."""
+    return [
+        dict(r)
+        for r in query(
+            "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? "
+            "ORDER BY seg_idx LIMIT ?",
+            (platform, video_id, limit),
+        )
+    ]
 
 
 def worker_heartbeat(tag: str) -> None:

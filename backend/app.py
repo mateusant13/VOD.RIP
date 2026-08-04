@@ -27,6 +27,7 @@ from routers import (
     cookie_bridge,
     disk,
     downloads,
+    entities,
     info,
     live,
     preview,
@@ -422,8 +423,24 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive chat watchdog start skipped", exc_info=True)
 
+    # Entity watcher — scans new transcription segments for saved words /
+    # saved channels (auto mode), once at startup then every minute.
+    try:
+        from services.entity_watch import start_entity_watcher
+
+        start_entity_watcher()
+        logger.info("Entity watcher started")
+    except Exception:
+        logger.debug("Entity watcher start skipped", exc_info=True)
+
     yield
     _warm_shutdown.set()
+    try:
+        from services.entity_watch import stop_entity_watcher
+
+        stop_entity_watcher(timeout=5.0)
+    except Exception:
+        logger.debug("Entity watcher stop failed", exc_info=True)
     try:
         from services.archive_watchdog import stop_archive_watchdog
 
@@ -457,6 +474,7 @@ app.include_router(live.router)
 app.include_router(downloads.router)
 app.include_router(system.router)
 app.include_router(archive.router)
+app.include_router(entities.router)
 app.include_router(cookie_bridge.router)
 app.include_router(disk.router)
 
