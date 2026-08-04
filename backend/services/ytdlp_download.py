@@ -722,6 +722,14 @@ def _build_ydl_opts(
         "no_warnings": True,
         "quiet": True,
         "concurrent_fragment_downloads": 8,
+        # Hardened transport: retry transient failures (extract + fragments),
+        # explicit socket timeout, and disable the throttled-rate floor —
+        # per-fragment speed measurement is unreliable with -N > 1 and the
+        # default 100K floor false-aborts fast lines (yt-dlp docs).
+        "retries": 10,
+        "fragment_retries": 10,
+        "socket_timeout": 20,
+        "throttledratelimit": 0,
         **_ytdlp_engine_opts(),
     }
     if audio_only:

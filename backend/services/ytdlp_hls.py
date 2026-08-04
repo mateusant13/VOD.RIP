@@ -139,7 +139,10 @@ def _silence_stderr():
                 _SILENCE_SAVED_FD = None
 
 
-SEGMENT_DOWNLOAD_WORKERS = 8
+# Per-download parallel segment fetchers. 12 saturates consumer lines when
+# the CDN throttles per connection (8 was the old floor; >16 rarely helps).
+# VODRIP_HLS_SEGMENT_WORKERS overrides for constrained machines.
+SEGMENT_DOWNLOAD_WORKERS = int(os.environ.get("VODRIP_HLS_SEGMENT_WORKERS", "12"))
 
 HLS_DOWNLOAD_AHEAD = SEGMENT_DOWNLOAD_WORKERS + 2
 
@@ -1583,6 +1586,12 @@ def _iter_response_chunks(response, chunk_size: int, stall_seconds: float):
         yield chunk
 
 
+_SEGMENT_RETRIES = 3
+_SEGMENT_RETRY_BACKOFF_SEC = 1.0
+# Exceptions that must NOT be retried (user intent / cancellation).
+_SEGMENT_NO_RETRY = (CancelledError, PausedError)
+
+
 def _download_one_segment(
     index: int,
     seg: dict,
@@ -1591,25 +1600,50 @@ def _download_one_segment(
     cancel_event: Optional[threading.Event],
     pause_event: Optional[threading.Event] = None,
 ) -> str:
+    """Fetch one HLS segment; retry transient network/CDN errors with backoff.
+
+    A single flaky segment used to kill the whole VOD job after the 90 s stall
+    timeout; CDN blips (5xx/429, mid-stream timeouts) are retried instead.
+    """
     _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
-    r = requests.get(
-        seg["url"],
-        headers=headers,
-        stream=True,
-        timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
-    )
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for chunk in _iter_response_chunks(r, 256 * 1024, _SEGMENT_STALL_SECONDS):
-            _check_pause_cancel(cancel_event, pause_event)
-            if chunk:
-                f.write(chunk)
-    size = os.path.getsize(path)
-    if size < 1024:
-        raise RuntimeError(f"HLS segment {index} is too small ({size} bytes)")
-    return path
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_SEGMENT_RETRIES):
+        _check_pause_cancel(cancel_event, pause_event)
+        try:
+            r = requests.get(
+                seg["url"],
+                headers=headers,
+                stream=True,
+                timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
+            )
+            try:
+                if r.status_code in (429,) or r.status_code >= 500:
+                    raise requests.HTTPError(
+                        f"HTTP {r.status_code} for segment {index}"
+                    )
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in _iter_response_chunks(r, 256 * 1024, _SEGMENT_STALL_SECONDS):
+                        _check_pause_cancel(cancel_event, pause_event)
+                        if chunk:
+                            f.write(chunk)
+            finally:
+                r.close()
+            size = os.path.getsize(path)
+            if size < 1024:
+                raise RuntimeError(f"HLS segment {index} is too small ({size} bytes)")
+            return path
+        except _SEGMENT_NO_RETRY:
+            raise
+        except (requests.RequestException, TimeoutError, OSError, RuntimeError) as exc:
+            last_exc = exc
+            if attempt + 1 < _SEGMENT_RETRIES:
+                time.sleep(_SEGMENT_RETRY_BACKOFF_SEC * (2 ** attempt))
+    raise RuntimeError(
+        f"HLS segment {index} failed after {_SEGMENT_RETRIES} attempts: {last_exc}"
+    ) from last_exc
 
 
 def _download_segments(
@@ -2304,7 +2338,8 @@ def _download_progressive_clip(
     tmpdir: Optional[str] = None
     media_input = media_url
     ss = start_sec
-    if _googlevideo_byte_range(media_url, start_sec, end_sec) is not None:
+    media_rng = _googlevideo_byte_range(media_url, start_sec, end_sec)
+    if media_rng is not None:
         try:
             tmpdir = tempfile.mkdtemp(prefix="prog_clip_")
             media_input = os.path.join(tmpdir, "in.mp4")
