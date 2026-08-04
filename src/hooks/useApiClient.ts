@@ -105,11 +105,12 @@ export async function apiGet<T>(path: string): Promise<T> {
   return res.json();
 }
 
-export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+export async function apiPost<T>(path: string, body: unknown, init?: RequestInit): Promise<T> {
   const res = await apiFetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    ...init,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
