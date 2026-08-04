@@ -152,3 +152,12 @@ export function replaySeekTarget(
   const finite = Number.isFinite(snapshotDurationSec) && snapshotDurationSec > 0;
   return { inSnapshot: finite && targetSec <= snapshotDurationSec - 0.5 };
 }
+
+/**
+ * Concurrent live-player cap: append *next* unless *items* already holds
+ * *max* entries. Returns the new list (or the unchanged one when blocked).
+ */
+export function appendLivePopup<T>(items: T[], next: T, max: number): { items: T[]; blocked: boolean } {
+  if (items.length >= max) return { items, blocked: true };
+  return { items: [...items, next], blocked: false };
+}

@@ -15,6 +15,7 @@ import {
   startPanelResizeDrag,
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
+import { platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
@@ -42,6 +43,8 @@ interface LivePlayerPopupProps {
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
   /** Optional saved channels (App state) — unioned into the channel dropdown. */
   savedChannels?: SavedChannel[];
+  /** Position cascade offset — 0 = default corner; each sibling steps 28px. */
+  cascadeIndex?: number;
 }
 
 type DragState = {
@@ -64,7 +67,7 @@ const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while res
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
 
-export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0 }: LivePlayerPopupProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -75,7 +78,10 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
    *  360/720/1080 or 360-anon; twitch/kick → up to source). */
   const sessionPlatformRef = useRef((entry.platform || '').toLowerCase());
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
-  const [position, setPosition] = useState({ x: window.innerWidth - POPUP_WIDTH - 24, y: 80 });
+  const [position, setPosition] = useState(() => ({
+    x: window.innerWidth - POPUP_WIDTH - 24 - cascadeIndex * 28,
+    y: 80 + cascadeIndex * 28,
+  }));
   const posRef = useRef(position);
   const [size, setSize] = useState<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
   const [loading, setLoading] = useState(true);
@@ -736,7 +742,13 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     };
   }, [drag]);
 
-  const transportBtn = 'flex items-center justify-center rounded p-1 text-white/80 hover:bg-white/10 hover:text-white';
+  // Transport buttons match the main preview player (platform accent when
+  // docked, glass when the popup is fullscreen).
+  const transportBtn = platformPreviewCtrlBtn(
+    (entry.platform ?? 'kick') as PlatformStyleKey,
+    isFullscreen,
+    false,
+  );
 
   const archiveAvailable = Boolean(sessionRef.current?.archive_url);
   // Live rail: pinned at the archive edge; dragging back opens REPLAY.
@@ -777,7 +789,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   return createPortal(
     <div
       ref={popupRef}
-      className="group"
+      className="group border-2 border-zinc-700 bg-zinc-950"
       data-live-popup
       style={{
         position: 'fixed',
@@ -786,90 +798,59 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         width: size.w,
         height: size.h,
         zIndex: 500,
-        borderRadius: 8,
-        boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
-        background: '#111',
-        border: '1px solid #333',
+        boxShadow: '6px 6px 0px 0px rgba(9,9,11,0.9)',
         display: 'flex',
         flexDirection: 'column',
       }}
     >
       <PanelResizeHandles onPointerDown={handleResize} />
 
-      {/* Header bar — drag handle */}
+      {/* Header bar — drag handle (preview-panel chrome: badge + channel name) */}
       <div
         onMouseDown={handleMouseDown}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '6px 10px',
-          background: '#1a1a2e',
-          borderRadius: '8px 8px 0 0',
-          cursor: drag ? 'grabbing' : 'grab',
-          userSelect: 'none',
-          flexShrink: 0,
-        }}
+        className="flex items-center justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
+        style={{ cursor: drag ? 'grabbing' : 'grab' }}
       >
-        <span style={{ fontSize: 12, color: mode === 'live' ? '#e06c75' : '#61afef', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: 8 }}>
-          {mode === 'live' ? '🔴 LIVESTREAM' : '⏪ REPLAY'} — {channelName}{entry.title ? ` — ${entry.title}` : ''}
+        <span className="flex items-center gap-1.5 min-w-0">
+          {mode === 'live' ? (
+            <span
+              className="flex items-center gap-1 border-2 border-red-700 bg-red-950/60 text-red-400 px-1 py-px text-[8px] font-black uppercase tracking-widest shrink-0"
+              title="This is a live stream"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+              LIVE
+            </span>
+          ) : (
+            <span className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-800/60 text-zinc-300 px-1 py-px text-[8px] font-black uppercase tracking-widest shrink-0">
+              REPLAY
+            </span>
+          )}
+          <span className="text-[10px] font-bold uppercase truncate text-zinc-200">
+            {channelName}
+            {entry.title ? ` — ${entry.title}` : ''}
+          </span>
         </span>
 
-        <span style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+        <span className="flex items-center gap-0.5 shrink-0">
           {channelUrl && (
             <button
-              className="live-popup-link"
+              className="live-popup-link text-zinc-400 hover:text-white p-1"
               onClick={() => window.open(channelUrl, '_blank', 'noopener,noreferrer')}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#888',
-                cursor: 'pointer',
-                fontSize: 16,
-                lineHeight: 1,
-                padding: '2px 6px',
-                borderRadius: 4,
-                display: 'flex',
-                alignItems: 'center',
-              }}
               title="Open channel"
             >
-              <ExternalLink size={14} />
+              <ExternalLink size={13} />
             </button>
           )}
           <button
-            className="live-popup-search"
+            className={`live-popup-search p-1 ${searchOpen ? 'text-white bg-zinc-800' : 'text-zinc-400 hover:text-white'}`}
             onClick={() => setSearchOpen((o) => !o)}
-            style={{
-              background: 'none',
-              border: searchOpen ? '1px solid #fff' : 'none',
-              color: searchOpen ? '#fff' : '#888',
-              cursor: 'pointer',
-              fontSize: 16,
-              lineHeight: 1,
-              padding: '2px 6px',
-              borderRadius: 4,
-              display: 'flex',
-              alignItems: 'center',
-            }}
             title="Search the local archive (transcripts + chat)"
           >
-            <Search size={14} />
+            <Search size={13} />
           </button>
           <button
-            className="live-popup-close"
+            className="live-popup-close text-zinc-400 hover:text-white p-1"
             onClick={handleClose}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: '#888',
-              cursor: 'pointer',
-              fontSize: 16,
-              lineHeight: 1,
-              padding: '2px 6px',
-              borderRadius: 4,
-              flexShrink: 0,
-            }}
             title="Close"
           >
             ✕
@@ -883,7 +864,6 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
           flex: 1,
           position: 'relative',
           background: '#000',
-          borderRadius: '0 0 8px 8px',
           overflow: 'hidden',
         }}
       >
@@ -897,10 +877,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
         {loading && (
           <div
-            style={{
-              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
-              justifyContent: 'center', background: 'rgba(0,0,0,0.6)', color: '#aaa', fontSize: 13,
-            }}
+            className="absolute inset-0 flex items-center justify-center bg-black/60 text-zinc-300 font-mono text-xs uppercase tracking-widest"
           >
             {mode === 'replay' ? 'Loading replay…' : 'Loading live stream…'}
           </div>
@@ -908,12 +885,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
         {error && (
           <div
-            style={{
-              position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-              alignItems: 'center', justifyContent: 'center', gap: 10,
-              background: 'rgba(0,0,0,0.7)', color: '#e06c75', fontSize: 13,
-              padding: 16, textAlign: 'center',
-            }}
+            className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 bg-black/70 text-red-400 text-xs font-mono text-center px-4"
           >
             <div>{error}</div>
             {previewRetry && (
@@ -921,12 +893,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
                 type="button"
                 onClick={retryPreview}
                 title="Retry this live stream"
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 6, fontSize: 11,
-                  fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
-                  color: '#e06c75', border: '1px solid rgba(224,108,117,0.5)',
-                  background: 'rgba(224,108,117,0.08)', padding: '4px 10px', cursor: 'pointer',
-                }}
+                className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-red-400 border-2 border-red-800 bg-red-950/30 px-2.5 py-1 hover:border-red-500 hover:text-red-300 cursor-pointer"
               >
                 <RefreshCw size={12} />
                 Retry
@@ -937,11 +904,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
         {!loading && !error && buffering && (
           <div
-            style={{
-              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
-              justifyContent: 'center', background: 'rgba(0,0,0,0.5)', color: '#aaa', fontSize: 12,
-              pointerEvents: 'none',
-            }}
+            className="absolute inset-0 flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none"
           >
             Buffering…
           </div>
@@ -949,11 +912,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
         {searchOpen && (
           <div
-            style={{
-              position: 'absolute', inset: 0, zIndex: 20,
-              display: 'flex', flexDirection: 'column',
-              background: '#111', borderRadius: '0 0 8px 8px',
-            }}
+            className="absolute inset-0 z-20 flex flex-col bg-zinc-950"
           >
             <ArchiveSearchPopup
               embedded
@@ -971,13 +930,12 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         {!loading && !error && (
           <div
             data-live-transport
-            className="px-2 py-1.5"
+            className="px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0"
             style={{
               position: 'absolute',
               insetInline: 0,
               bottom: 0,
               zIndex: 10,
-              background: 'linear-gradient(to top, rgba(0,0,0,0.85), rgba(0,0,0,0))',
             }}
           >
             <div className="flex items-center gap-1.5">
@@ -1025,7 +983,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
                   {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
                 </button>
                 {volumeMenuOpen && (
-                  <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-2 shadow-lg">
+                  <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 border-2 border-zinc-600 bg-zinc-950 px-2.5 py-2 shadow-lg">
                     <button
                       type="button"
                       onClick={(e) => {
@@ -1056,7 +1014,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
                   type="button"
                   onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
                   title={mode === 'replay' ? 'Return to live' : 'Snap to live edge'}
-                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide text-red-500 hover:bg-white/10"
+                  className="flex items-center gap-1 border-2 border-red-800 bg-red-950/30 px-1.5 py-1 text-[9px] font-bold tracking-wider text-red-400 hover:border-red-500 hover:text-red-300"
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
                   LIVE
@@ -1070,6 +1028,9 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
                   onSelect={handleQualitySelect}
                   disabled={!levels.length || mode === 'replay'}
                   buttonClassName={transportBtn}
+                  popoverClassName={isFullscreen
+                    ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
+                    : 'border-2 border-zinc-600 bg-zinc-950'}
                 />
 
                 <button

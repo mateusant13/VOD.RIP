@@ -17,7 +17,7 @@ import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
 import { LiveBadge } from './components/LiveBadge';
-import { liveArchiveContext } from './livePlayerLevels';
+import { liveArchiveContext, appendLivePopup } from './livePlayerLevels';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
 
@@ -108,6 +108,15 @@ interface ChannelLiveStatus {
 }
 
 const IS_DEV_UI = import.meta.env.DEV;
+/** Concurrent live players allowed at once (user requirement). */
+const MAX_LIVE_POPUPS = 5;
+
+interface LivePopupItem {
+  id: number;
+  entry: ChannelLiveStatus['live'][number];
+  channelName: string;
+  channel: SavedChannel | null;
+}
 const USE_MSE_DIRECT = import.meta.env.VITE_PREVIEW_MSE_DIRECT === "true";
 // Expose the flag for e2e probes (see e2e/tests/preview-mse-direct.spec.ts).
 (window as unknown as { __VITE_PREVIEW_MSE_DIRECT__?: boolean }).__VITE_PREVIEW_MSE_DIRECT__ = USE_MSE_DIRECT;
@@ -761,7 +770,11 @@ export default function App() {
   const [channelDragId, setChannelDragId] = useState<string | null>(null);
   const [channelDropInsertIndex, setChannelDropInsertIndex] = useState<number | null>(null);
   const [isLive, setIsLive] = useState(false);
-  const [livePopupEntry, setLivePopupEntry] = useState<{ entry: ChannelLiveStatus['live'][number]; channelName: string; channel: SavedChannel | null } | null>(null);
+  /** Concurrent live players — capped at MAX_LIVE_POPUPS (5). */
+  const [livePopups, setLivePopups] = useState<LivePopupItem[]>([]);
+  const livePopupsRef = useRef<LivePopupItem[]>([]);
+  const livePopupIdRef = useRef(0);
+  const [livePopupNotice, setLivePopupNotice] = useState<string | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
   const channelsPersistReadyRef = useRef(false);
   const channelsSaveTimerRef = useRef<number | null>(null);
@@ -4618,7 +4631,24 @@ export default function App() {
   const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
     if (!entry?.url) return;
     const name = channelName || entry.platform || 'Live';
-    setLivePopupEntry({ entry, channelName: name, channel: channel ?? null });
+    const item: LivePopupItem = {
+      id: ++livePopupIdRef.current,
+      entry,
+      channelName: name,
+      channel: channel ?? null,
+    };
+    const res = appendLivePopup(livePopupsRef.current, item, MAX_LIVE_POPUPS);
+    if (res.blocked) {
+      setLivePopupNotice(`Max ${MAX_LIVE_POPUPS} live players at once — close one first.`);
+      return;
+    }
+    livePopupsRef.current = res.items;
+    setLivePopups(res.items);
+  }, []);
+
+  const closeLivePopup = useCallback((id: number) => {
+    livePopupsRef.current = livePopupsRef.current.filter((p) => p.id !== id);
+    setLivePopups(livePopupsRef.current);
   }, []);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
@@ -5886,6 +5916,9 @@ export default function App() {
             {addChannelNotice && (
               <p className="text-amber-400 text-[10px] font-mono">{addChannelNotice}</p>
             )}
+            {livePopupNotice && (
+              <p className="text-amber-400 text-[10px] font-mono">{livePopupNotice}</p>
+            )}
 
             {savedChannels.length > 0 && (
               <div ref={channelListRef} className="flex flex-col gap-1">
@@ -6462,26 +6495,28 @@ export default function App() {
         TWITCH
       </div>
 
-      {livePopupEntry && (() => {
+      {livePopups.map((popup, idx) => {
         // DVR REPLAY archive context (channel slug + newest public in-progress
         // VOD) resolved from the ENTRY's own channel — the live button on any
         // row may be clicked, not just the selected channel's.
         const { channelSlug, vodUrl } = liveArchiveContext(
-          livePopupEntry.channel,
-          livePopupEntry.entry.platform,
+          popup.channel,
+          popup.entry.platform,
         );
         return (
           <LivePlayerPopup
-            entry={livePopupEntry.entry}
-            channelName={livePopupEntry.channelName}
+            key={popup.id}
+            entry={popup.entry}
+            channelName={popup.channelName}
             channelSlug={channelSlug}
             vodUrl={vodUrl}
-            onClose={() => setLivePopupEntry(null)}
+            cascadeIndex={idx}
+            onClose={() => closeLivePopup(popup.id)}
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}
           />
         );
-      })()}
+      })}
       <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
       {archiveSearchOpen && (
         <ArchiveSearchPopup

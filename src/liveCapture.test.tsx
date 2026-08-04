@@ -4,6 +4,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { LiveBadge, type LiveEntry } from "./components/LiveBadge";
+import { appendLivePopup } from "./livePlayerLevels";
 
 const mkEntry = (overrides?: Partial<LiveEntry>): LiveEntry => ({
   platform: "kick",
@@ -46,5 +47,28 @@ describe("LiveBadge", () => {
     const { container } = render(<LiveBadge entries={[mkEntry()]} />);
     expect(screen.getByText("LIVE").tagName).toBe("SPAN");
     expect(container.querySelector("button")).toBeNull();
+  });
+});
+
+describe("appendLivePopup (5-player cap)", () => {
+  it("appends up to the cap", () => {
+    const items = [1, 2, 3, 4, 5];
+    const res = appendLivePopup(items, 6, 5);
+    expect(res.blocked).toBe(true);
+    expect(res.items).toBe(items); // unchanged reference when blocked
+  });
+
+  it("blocks the 6th concurrent player", () => {
+    const items: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const r = appendLivePopup(items, i, 5);
+      expect(r.blocked).toBe(false);
+      items.push(r.items[r.items.length - 1]);
+    }
+    expect(items).toHaveLength(5);
+    const sixth = appendLivePopup(items, 99, 5);
+    expect(sixth.blocked).toBe(true);
+    expect(sixth.items).toHaveLength(5);
+    expect(sixth.items).not.toContain(99);
   });
 });
