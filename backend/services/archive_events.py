@@ -219,13 +219,20 @@ def detect_events(
     classes: Optional[list[str]] = None,
     *,
     progress_cb: Optional[Callable[[float, float], None]] = None,
+    shards: Optional[Any] = None,
 ) -> list[dict]:
     """Score VAD speech regions with the SED model; returns event rows.
 
     audio_16k: mono 16 kHz float32 samples (decode_audio output). speech:
     [(start_sec, end_sec)] regions — only these are scored. The audio is
     resampled to the model's 32 kHz once, then sliced into fixed windows
-    (VODRIP_EVENTS_WINDOW_SEC, default 30 s) per region."""
+    (VODRIP_EVENTS_WINDOW_SEC, default 30 s) per region.
+
+    shards: _ShardedAudio from services.archive_transcribe (bounded-RAM
+    path) — when given, audio_16k is ignored and each speech region is
+    pulled from the shards and resampled locally, so peak RAM is bounded by
+    one region instead of the whole file (2x the file at 32 kHz). Event rows
+    keep the same absolute offsets either way."""
     import numpy as np
     import librosa
 
@@ -239,18 +246,14 @@ def detect_events(
     window = max(5.0, _env_float(WINDOW_ENV, DEFAULT_WINDOW_SEC))
 
     t0 = time.monotonic()
-    audio = librosa.resample(np.asarray(audio_16k, dtype=np.float32),
-                             orig_sr=SR_16K, target_sr=SR_32K)
-    logger.info("resampled %d 16k samples -> 32k in %.1fs",
-                len(audio_16k), time.monotonic() - t0)
-
     label_to_ix = {lab: i for i, lab in enumerate(sed.labels)}
     cls_idx = [label_to_ix[c] for c in classes]
     win_samples = int(window * SR_32K)
     events: list[dict] = []
     done_sec = 0.0
-    for start, end in speech:
-        seg = audio[int(start * SR_32K) : int(end * SR_32K)]
+    total_speech = sum(e - s for s, e in speech)
+
+    def _score_region(seg: "Any", offset: float) -> None:
         for ws in range(0, len(seg), win_samples):
             chunk = seg[ws : ws + win_samples]
             if len(chunk) < win_samples:  # pad the tail window with zeros
@@ -259,11 +262,28 @@ def detect_events(
             frame = np.asarray(frame[0])[:, cls_idx]
             events.extend(extract_events(
                 frame, classes, threshold=threshold, min_sec=min_sec,
-                offset_sec=start + ws / SR_32K,
+                offset_sec=offset + ws / SR_32K,
             ))
-        done_sec += end - start
-        if progress_cb:
-            progress_cb(done_sec, sum(e - s for s, e in speech))
+
+    if shards is not None:
+        for start, end in speech:
+            seg = librosa.resample(shards.read(start, end),
+                                   orig_sr=SR_16K, target_sr=SR_32K)
+            _score_region(seg, start)
+            done_sec += end - start
+            if progress_cb:
+                progress_cb(done_sec, total_speech)
+    else:
+        audio = librosa.resample(np.asarray(audio_16k, dtype=np.float32),
+                                 orig_sr=SR_16K, target_sr=SR_32K)
+        logger.info("resampled %d 16k samples -> 32k in %.1fs",
+                    len(audio_16k), time.monotonic() - t0)
+        for start, end in speech:
+            seg = audio[int(start * SR_32K) : int(end * SR_32K)]
+            _score_region(seg, start)
+            done_sec += end - start
+            if progress_cb:
+                progress_cb(done_sec, total_speech)
     merged = merge_events(events)
     logger.info("PANNs: %d raw runs -> %d events for %.1fs speech (%.1fs wall)",
                 len(events), len(merged), done_sec, time.monotonic() - t0)
@@ -280,6 +300,7 @@ def detect_events_video(
     *,
     audio: Optional[Any] = None,
     speech: Optional[list[tuple[float, float]]] = None,
+    shards: Optional[Any] = None,
     progress_cb: Optional[Callable[[float, float], None]] = None,
 ) -> dict:
     """Run the events stage for one archived video; replaces old event rows.
@@ -291,7 +312,11 @@ def detect_events_video(
     audio/speech: when given (the transcribe job's events_cb hook passes its
     own decoded audio + VAD regions through), decode and VAD are NOT re-run —
     a 13.5h VOD would otherwise pay ~19 min of duplicated CPU work. The
-    standalone kind='events' path leaves them None and decodes itself."""
+    standalone kind='events' path leaves them None and decodes itself.
+
+    shards: _ShardedAudio from services.archive_transcribe (bounded-RAM
+    path) — when given, audio is None and regions are pulled from the shards,
+    so the stage never materializes the full (2x-resampled) file."""
     from services.archive_transcribe import decode_audio, vad_speech_seconds
 
     rows = archive_db.query(
@@ -302,14 +327,20 @@ def detect_events_video(
         raise KeyError(f"no archived video {platform}/{video_id}")
     path = rows[0]["archive_path"]
     t0 = time.monotonic()
-    if audio is None:
+    if audio is None and shards is None:
         if not path or not os.path.isfile(path):
             raise FileNotFoundError(f"archive file missing for {platform}/{video_id}: {path}")
         audio = decode_audio(path)
-        speech = vad_speech_seconds(audio)
-    elif speech is None:
-        speech = vad_speech_seconds(audio)
-    total_sec = audio.size / SR_16K
+    if shards is not None:
+        total_sec = shards.total_sec
+        if speech is None:
+            from services.archive_transcribe import _vad_speech_seconds_sharded
+
+            speech = _vad_speech_seconds_sharded(shards)
+    else:
+        total_sec = audio.size / SR_16K
+        if speech is None:
+            speech = vad_speech_seconds(audio)
     speech_sec = sum(e - s for s, e in speech)
     dead_air_sec = max(0.0, total_sec - speech_sec)
     stats = {
@@ -331,7 +362,7 @@ def detect_events_video(
         return stats
 
     classes = event_classes(_labels_of(_sed_model()))
-    events = detect_events(audio, speech, classes, progress_cb=progress_cb)
+    events = detect_events(audio, speech, classes, progress_cb=progress_cb, shards=shards)
     archive_db.delete_audio_events(platform, video_id)  # replace-on-rerun
     archive_db.insert_audio_events(platform, video_id, events)
     wall = time.monotonic() - t0

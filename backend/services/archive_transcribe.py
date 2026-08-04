@@ -35,21 +35,23 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess as sp
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from services import archive_db
 from services.archive_events import detect_events_video, events_enabled
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
 from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
-from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +430,236 @@ def decode_audio(path: str, ffmpeg_bin: Optional[str] = None) -> "Any":
     return samples.copy()  # writable copy: torch.from_numpy needs writable memory
 
 
+# --- sharded decode (bounded-RAM path) ------------------------------------
+# Long media is decoded ONCE into fixed-duration float32 shards on disk (one
+# ffmpeg pass piping 16 kHz mono PCM), then consumed one window at a time by
+# VAD / whisper / events. Peak RAM is bounded by a shard window, never by the
+# media length (a 13.5 h VOD = ~3.1 GB decoded — not resident all at once).
+
+SHARD_SEC_ENV = "VODRIP_TRANSCRIBE_SHARD_SEC"
+SHARD_MIN_SEC_ENV = "VODRIP_TRANSCRIBE_SHARD_MIN_SEC"
+DEFAULT_SHARD_SEC = 300.0  # ~19 MB of float32 16 kHz PCM per shard
+SHARD_THRESHOLD_SEC = 15 * 60.0  # decoded length above which transcribe_video shards
+_VAD_OVERLAP_SEC = 1.5  # VAD context on each side of a shard
+_VAD_MERGE_GAP_SEC = 0.5  # cross-shard speech regions closer than this merge
+
+
+def _shard_seconds() -> float:
+    """Fixed shard duration (VODRIP_TRANSCRIBE_SHARD_SEC, default 300 s)."""
+    try:
+        return max(1.0, float(os.environ.get(SHARD_SEC_ENV, "") or DEFAULT_SHARD_SEC))
+    except ValueError:
+        return DEFAULT_SHARD_SEC
+
+
+def _shard_threshold_sec() -> float:
+    """Decoded-length threshold that routes to the sharded path. The env knob
+    is a test hook — real runs always use the 15 min default."""
+    try:
+        return max(1.0, float(os.environ.get(SHARD_MIN_SEC_ENV, "") or SHARD_THRESHOLD_SEC))
+    except ValueError:
+        return SHARD_THRESHOLD_SEC
+
+
+def _probe_duration_sec(path: str, ffmpeg_bin: Optional[str] = None) -> Optional[float]:
+    """Best-effort media duration via ffprobe; None when it cannot be told."""
+    if ffmpeg_bin is None:
+        ffmpeg_bin = _resolve_ffmpeg_exe()
+    ffprobe = _resolve_ffprobe_exe(ffmpeg_bin)
+    if not ffprobe:
+        return None
+    try:
+        out = sp.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW,
+        )
+        if out.returncode != 0:
+            return None
+        return float(out.stdout.strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _should_shard(path: str, ffmpeg_bin: Optional[str] = None) -> bool:
+    """Route to the sharded decode path when the decoded PCM would exceed the
+    RAM budget. An unknown duration (no ffprobe) shards rather than risk a
+    multi-GB allocation — a small file on the sharded path behaves identically
+    (it fits inside one shard, so VAD sees the same single window)."""
+    duration = _probe_duration_sec(path, ffmpeg_bin)
+    return duration is None or duration >= _shard_threshold_sec()
+
+
+def _shard_sample_bounds(i: int, shard_sec: float) -> tuple[int, int]:
+    """Sample range [lo, hi) of shard i; consecutive shards are contiguous,
+    so range reads across boundaries stay exact."""
+    return int(i * shard_sec * SAMPLE_RATE), int((i + 1) * shard_sec * SAMPLE_RATE)
+
+
+class _ShardedAudio:
+    """Fixed-duration float32 shards on disk plus absolute range reads.
+
+    Shard i covers samples [_shard_sample_bounds(i)); read() returns any
+    absolute [start, end) window as one array, so VAD / whisper / events
+    consume shards without ever holding more than one window in RAM."""
+
+    __slots__ = ("files", "shard_sec", "total_samples", "total_sec")
+
+    def __init__(self, files: list, shard_sec: float) -> None:
+        self.files = list(files)
+        self.shard_sec = float(shard_sec)
+        self.total_samples = sum(Path(f).stat().st_size // 4 for f in self.files)
+        self.total_sec = self.total_samples / SAMPLE_RATE
+
+    def read(self, start_sec: float, end_sec: float) -> Any:
+        """Concatenated float32 16 kHz samples for an absolute window."""
+        import numpy as np
+
+        s0 = max(0, int(start_sec * SAMPLE_RATE))
+        e0 = min(self.total_samples, int(end_sec * SAMPLE_RATE))
+        if e0 <= s0:
+            return np.zeros(0, dtype=np.float32)
+        parts: list[Any] = []
+        for i, fpath in enumerate(self.files):
+            fs, fe = _shard_sample_bounds(i, self.shard_sec)
+            if e0 <= fs or s0 >= fe:
+                continue
+            lo = max(s0, fs) - fs
+            hi = min(e0, fe) - fs
+            parts.append(np.fromfile(fpath, dtype=np.float32, count=hi - lo, offset=lo * 4))
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+
+
+def _decode_to_shards(
+    path: str,
+    ffmpeg_bin: Optional[str] = None,
+    shard_sec: Optional[float] = None,
+    out_dir: Optional[str] = None,
+) -> Iterator[tuple[float, Any]]:
+    """Decode ONCE to fixed-duration float32 shard files; yield (start_sec, np.ndarray).
+
+    One ffmpeg process pipes mono 16 kHz f32 to stdout; stdout is sliced into
+    shard-sized buffers and each spilled to ``<out_dir>/shard_%06d.f32``.
+    Peak RAM is a couple of shard buffers, independent of media length.
+    With out_dir=None a temp dir is created and removed when the iterator is
+    exhausted or closed (also on failure); callers that need the files after
+    the loop (transcribe_video) pass their own dir and own its lifecycle."""
+    import numpy as np
+
+    if shard_sec is None:
+        shard_sec = _shard_seconds()
+    if ffmpeg_bin is None:
+        ffmpeg_bin = _resolve_ffmpeg_exe()
+    own_dir = out_dir is None
+    tmpdir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
+    shard_bytes = int(shard_sec * SAMPLE_RATE) * np.dtype(np.float32).itemsize
+    cmd = [
+        ffmpeg_bin, "-nostdin", "-v", "error", "-i", str(path),
+        "-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
+    ]
+    proc: Optional[sp.Popen] = None
+    try:
+        proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, creationflags=_NO_WINDOW)
+        idx = 0
+        while True:
+            raw = proc.stdout.read(shard_bytes)
+            if not raw:
+                break
+            fpath = tmpdir / f"shard_{idx:06d}.f32"
+            fpath.write_bytes(raw)
+            arr = np.frombuffer(raw, dtype=np.float32).copy()  # writable copy
+            yield idx * shard_sec, arr
+            idx += 1
+        proc.wait()
+        if proc.returncode != 0:
+            stderr = (proc.stderr.read() or b"").decode("utf-8", "replace")[-300:]
+            raise RuntimeError(f"ffmpeg decode failed for {path}: {stderr}")
+    finally:
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            if proc.poll() is None:  # abandoned mid-yield — stop the decode
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                proc.wait()
+        if own_dir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _merge_speech_regions(
+    regions: list[tuple[float, float]], gap: float = _VAD_MERGE_GAP_SEC
+) -> list[tuple[float, float]]:
+    """Merge regions closer than ``gap`` (sorted by start; absolute offsets).
+
+    Also collapses duplicates — adjacent shards both report a region that
+    straddles their boundary, and the merge must fuse them into one. The gap
+    (0.5 s) sits below _plan_chunks' merge gap (0.8 s), so the final chunk
+    plan matches the full-array path whenever region edges agree."""
+    merged: list[tuple[float, float]] = []
+    for s, e in sorted(regions):
+        if merged and s - merged[-1][1] <= gap:
+            ps, pe = merged[-1]
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _vad_speech_seconds_sharded(sharded_audio: _ShardedAudio) -> list[tuple[float, float]]:
+    """Silero VAD over fixed-duration shards, one window at a time.
+
+    Each shard is VAD'd on [i*S - overlap, (i+1)*S + overlap) so the
+    stateless-per-call model warms up before the shard's own zone; regions
+    intersecting the authoritative zone are kept with ABSOLUTE offsets, then
+    merged across boundaries (gap <= 0.5 s). VAD internals (vad_speech_seconds)
+    are called unchanged, per shard."""
+    regions: list[tuple[float, float]] = []
+    for i in range(len(sharded_audio.files)):
+        zone_lo = i * sharded_audio.shard_sec
+        zone_hi = min(sharded_audio.total_sec, (i + 1) * sharded_audio.shard_sec)
+        lo = max(0.0, zone_lo - _VAD_OVERLAP_SEC)
+        hi = min(sharded_audio.total_sec, (i + 1) * sharded_audio.shard_sec + _VAD_OVERLAP_SEC)
+        if hi <= lo:
+            continue
+        for local_s, local_e in vad_speech_seconds(sharded_audio.read(lo, hi)):
+            s, e = lo + local_s, lo + local_e
+            if e > zone_lo and s < zone_hi:  # keep regions touching this shard's zone
+                regions.append((s, e))
+    return _merge_speech_regions(regions)
+
+
+def _clips_to_audio(
+    sharded_audio: _ShardedAudio, run: list
+) -> tuple[Any, list[tuple[float, float]], list[float]]:
+    """One contiguous array for a batch of clips: the clips' SPEECH
+    concatenated (not their wall-clock span — a batch can span hours of a
+    13.5 h VOD), plus concat-relative clip timestamps and absolute offsets.
+
+    Batched inference sees the same per-clip windows as the full-audio path
+    (clip-local mel extraction), while peak RAM is bounded by the batch's
+    speech seconds."""
+    import numpy as np
+
+    parts: list[Any] = []
+    clips: list[tuple[float, float]] = []
+    offsets: list[float] = []
+    pos = 0
+    for _, (cs, ce) in run:
+        part = sharded_audio.read(cs, ce)
+        parts.append(part)
+        clips.append((pos / SAMPLE_RATE, (pos + part.size) / SAMPLE_RATE))
+        offsets.append(cs)
+        pos += part.size
+    audio = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    return audio, clips, offsets
+
+
 # --- VAD pre-pass ---------------------------------------------------------
 
 _vad_lock = threading.Lock()
@@ -624,6 +856,8 @@ def _transcribe_batch(
     audio: "Any",
     chunks: list[tuple[float, float]],
     language: Optional[str],
+    *,
+    clip_offsets: Optional[list[float]] = None,
 ) -> list[tuple[list[dict], Optional[str]]]:
     """Batch-decode [start,end] clips via faster-whisper's batched pipeline.
 
@@ -631,7 +865,12 @@ def _transcribe_batch(
     thousands of VAD clips stop paying per-call launch overhead (measured
     26.9x -> ~118x realtime on a 5080; 164x with beam 1). Segments carry
     absolute video timestamps; each clip's segments are returned in input
-    order, so the per-clip insert/manifest/resume contract is unchanged."""
+    order, so the per-clip insert/manifest/resume contract is unchanged.
+
+    clip_offsets: per-clip absolute offset added to the output timestamps.
+    The sharded path feeds concatenated clip audio (times relative to the
+    array) and maps segments back to video time here; None keeps the legacy
+    full-audio behavior (times already absolute) byte-identical."""
     from faster_whisper import BatchedInferencePipeline
 
     global _word_ts_ok, _device_override
@@ -704,20 +943,20 @@ def _transcribe_batch(
         per[idx].append(seg)
     out: list[tuple[list[dict], Optional[str]]] = []
     for i, segs in enumerate(per):
-        cs, ce = chunks[i]
+        base = 0.0 if clip_offsets is None else clip_offsets[i]
         items: list[dict] = []
         for seg in segs:
             words = [
                 {
                     "word": w.word,
-                    "start": round(float(w.start), 3),
-                    "end": round(float(w.end), 3),
+                    "start": round(float(w.start) + base, 3),
+                    "end": round(float(w.end) + base, 3),
                 }
                 for w in (seg.words or [])
             ]
             items.append({
-                "start_sec": round(float(seg.start), 3),
-                "end_sec": round(float(seg.end), 3),
+                "start_sec": round(float(seg.start) + base, 3),
+                "end_sec": round(float(seg.end) + base, 3),
                 "text": (seg.text or "").strip(),
                 "words": words,
             })
@@ -731,19 +970,24 @@ def transcribe_video(
     *,
     language: Optional[str] = None,
     progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
-    events_cb: Optional[Callable[[Any, list], Optional[dict]]] = None,
+    events_cb: Optional[Callable[..., Optional[dict]]] = None,
 ) -> dict:
     """Transcribe one archived video into the transcripts table (resume-aware).
 
     progress_cb(speech_done_sec, speech_total_sec, chunk_done, chunk_total) —
     non-speech time is deliberately excluded from the denominator.
-    events_cb(audio, speech) — optional post-transcribe stage hook (PANNs
-    event detection) that reuses THIS run's decoded audio and VAD regions
-    instead of decoding the whole file again; its stats merge into the
-    returned dict under 'events'. The hook may raise — transcription result
-    is never rolled back or failed by it.
+    events_cb(audio, speech, shards=None) — optional post-transcribe stage
+    hook (PANNs event detection) that reuses THIS run's decoded audio and
+    VAD regions instead of decoding the whole file again; its stats merge
+    into the returned dict under 'events'. The hook may raise — transcription
+    result is never rolled back or failed by it. shards carries the
+    _ShardedAudio when the bounded-RAM path ran (audio is None then).
     Returns a stats dict (also suitable for job reporting).
-    """
+
+    Long media (>= SHARD_THRESHOLD_SEC of decoded PCM) is decoded ONCE into
+    fixed-duration disk shards and consumed one window at a time, so peak
+    RAM is bounded regardless of VOD length; small files keep the legacy
+    full-array path byte-for-byte."""
     rows = archive_db.query(
         "SELECT * FROM videos WHERE platform = ? AND video_id = ?",
         (platform, video_id),
@@ -758,9 +1002,59 @@ def transcribe_video(
         language = os.environ.get(LANG_ENV, "").strip() or None
 
     t0 = time.monotonic()
-    audio = decode_audio(path)
-    total_sec = audio.size / SAMPLE_RATE
-    speech = vad_speech_seconds(audio)
+    if _should_shard(path):
+        # Bounded-RAM path: decode ONCE into fixed-duration PCM shards on
+        # disk and consume them one window at a time. The temp dir is
+        # removed in finally — also when the job fails.
+        shard_dir = Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
+        try:
+            return _transcribe_audio_source(
+                platform, video_id, path, language, progress_cb, events_cb, t0,
+                sharded=True, shard_dir=shard_dir,
+            )
+        finally:
+            shutil.rmtree(shard_dir, ignore_errors=True)
+    return _transcribe_audio_source(
+        platform, video_id, path, language, progress_cb, events_cb, t0,
+        sharded=False, shard_dir=None,
+    )
+
+
+def _transcribe_audio_source(
+    platform: str,
+    video_id: str,
+    path: str,
+    language: Optional[str],
+    progress_cb: Optional[Callable[[float, float, int, int], None]],
+    events_cb: Optional[Callable[..., Optional[dict]]],
+    t0: float,
+    *,
+    sharded: bool,
+    shard_dir: Optional[Path],
+) -> dict:
+    """Shared transcription core over one audio source (full array or shards).
+
+    sharded=True reads the media once into _ShardedAudio (caller owns the
+    temp dir lifecycle); sharded=False decodes the whole file as before. The
+    resume/manifest contract, per-clip inserts and stats are identical."""
+    if sharded:
+        shard_sec = _shard_seconds()
+        for _start_sec, _arr in _decode_to_shards(path, shard_sec=shard_sec, out_dir=shard_dir):
+            pass  # decode pass — PCM is spilled to disk, never held whole
+        files = sorted(shard_dir.glob("shard_*.f32"))
+        if not files:
+            raise RuntimeError(f"ffmpeg produced no audio from {path}")
+        sharded_audio = _ShardedAudio(files, shard_sec)
+        if sharded_audio.total_samples == 0:
+            raise RuntimeError(f"ffmpeg produced no audio from {path}")
+        audio = None
+        total_sec = sharded_audio.total_sec
+        speech = _vad_speech_seconds_sharded(sharded_audio)
+    else:
+        audio = decode_audio(path)
+        total_sec = audio.size / SAMPLE_RATE
+        speech = vad_speech_seconds(audio)
+        sharded_audio = None
     chunks = _plan_chunks(speech)
     speech_sec = sum(e - s for s, e in chunks)
     dead_air_sec = max(0.0, total_sec - speech_sec)
@@ -842,7 +1136,13 @@ def transcribe_video(
         while ci < n_chunks and ci in missing_set and len(run) < _batch_size():
             run.append((ci, chunks[ci]))
             ci += 1
-        batch_out = _transcribe_batch(model, audio, [c for _, c in run], language)
+        if sharded_audio is not None:
+            batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
+            batch_out = _transcribe_batch(
+                model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
+            )
+        else:
+            batch_out = _transcribe_batch(model, audio, [c for _, c in run], language)
         for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
             if detected_lang is None and detected:
                 detected_lang = detected  # first batch's detection wins
@@ -908,7 +1208,10 @@ def transcribe_video(
         # run's audio + VAD regions — no second decode. Best-effort: a
         # failing stage never fails the transcribe job.
         try:
-            ev = events_cb(audio, speech) or {}
+            if sharded_audio is not None:
+                ev = events_cb(None, speech, shards=sharded_audio) or {}
+            else:
+                ev = events_cb(audio, speech) or {}
             if ev.get("events") is not None:
                 stats["events"] = ev["events"]
         except Exception:
@@ -1033,8 +1336,10 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
 
         events_cb = None
         if events_enabled():
-            def events_cb(audio: Any, speech: list) -> Optional[dict]:
-                return detect_events_video(platform, video_id, audio=audio, speech=speech)
+            def events_cb(audio: Any, speech: list, shards: Any = None) -> Optional[dict]:
+                return detect_events_video(
+                    platform, video_id, audio=audio, speech=speech, shards=shards,
+                )
 
         stats = transcribe_video(platform, video_id, progress_cb=_progress, events_cb=events_cb)
         archive_db.update_job(job_id, status="done", progress=1.0)
@@ -1138,6 +1443,22 @@ assert _plan_chunks([(0.0, 0.2)]) == [], "sub-minimum chunks must be dropped"
 assert _plan_chunks([]) == [], "empty VAD output must plan no chunks"
 assert _plan_chunks([(0.0, 5.0), (10.0, 15.0)]) == [(0.0, 5.0), (10.0, 15.0)], (
     "wide gaps must stay separate chunks"
+)
+# sharded decode: cross-shard merge + shard sample contiguity (VAD regions
+# are per-shard with overlap; the merge gap stays below _plan_chunks' so the
+# final chunk plan matches the full-array path).
+assert _merge_speech_regions([(0.0, 5.0), (5.2, 6.0)]) == [(0.0, 6.0)], (
+    "regions within the 0.5 s merge gap must fuse"
+)
+assert _merge_speech_regions([(0.0, 5.0), (5.6, 6.0)]) == [(0.0, 5.0), (5.6, 6.0)], (
+    "wider gaps must stay separate"
+)
+assert _merge_speech_regions([(4.9, 5.1), (4.9, 5.1)]) == [(4.9, 5.1)], (
+    "duplicate cross-boundary regions must collapse"
+)
+_b1 = _shard_sample_bounds(1, 5.0)
+assert _b1 == (80000, 160000) and _b1[0] == _shard_sample_bounds(0, 5.0)[1], (
+    "shards must tile the timeline contiguously"
 )
 assert _detect_device() in (("cuda", "float16"), ("cpu", "int8")), (
     "device settings must be a known pair (nvidia -> cuda/float16, else cpu/int8)"
