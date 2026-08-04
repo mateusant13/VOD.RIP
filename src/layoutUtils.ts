@@ -2,7 +2,7 @@
  * Layout/panel utility functions extracted from App.tsx.
  */
 import { panelMaxWidthCap, readUiScale } from './uiScale';
-import { panelResizeHandleInset, type ResizeEdge } from './explorePopupUtils';
+import { panelResizeHandleInset, makeRafMoveLoop, suspendPanelTransitions, restorePanelTransitions, type ResizeEdge } from './explorePopupUtils';
 import type { PanelSize, PanelPos, LayoutPanelKey, LayoutPanelBoundsInput, PersistedPanelLayout } from './types';
 import type { MutableRefObject, Dispatch, SetStateAction, PointerEvent as ReactPointerEvent } from 'react';
 
@@ -522,6 +522,7 @@ export function startPanelResizeDrag(
   const maxW = opts?.maxW ?? panelMaxW();
   const maxH = opts?.maxH ?? panelMaxHeight();
   const panelEl = opts?.panelEl ?? null;
+  const prevTransition = suspendPanelTransitions(panelEl);
 
   if (panelEl) {
     panelEl.style.willChange = 'width, height';
@@ -539,33 +540,40 @@ export function startPanelResizeDrag(
     };
   };
 
+  const applySize = (size: PanelSize) => {
+    sizeRef.current = size;
+    if (panelEl) {
+      applyPanelSize(panelEl, size);
+    }
+    opts?.onResizeMove?.(size);
+  };
+
+  const loop = makeRafMoveLoop((x, y) => {
+    let next = calcSize(x, y);
+    if (opts?.clampSize) next = opts.clampSize(next);
+    applySize(next);
+  });
+
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
-    let next = calcSize(ev.clientX, ev.clientY);
-    if (opts?.clampSize) next = opts.clampSize(next);
-    sizeRef.current = next;
-    if (panelEl) {
-      applyPanelSize(panelEl, next);
-    }
-    opts?.onResizeMove?.(next);
+    loop.onMove(ev.clientX, ev.clientY);
   };
 
   const onUp = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
+    loop.flushSync();
     handle.releasePointerCapture(e.pointerId);
     handle.removeEventListener('pointermove', onMove);
     handle.removeEventListener('pointerup', onUp);
     handle.removeEventListener('pointercancel', onUp);
     document.body.style.userSelect = prevUserSelect;
     document.body.style.cursor = prevCursor;
+    restorePanelTransitions(panelEl, prevTransition);
     if (panelEl) {
       panelEl.style.willChange = '';
     }
     const final = opts?.clampSize ? opts.clampSize(sizeRef.current) : sizeRef.current;
-    sizeRef.current = final;
-    if (panelEl) {
-      applyPanelSize(panelEl, final);
-    }
+    applySize(final);
     setSize({ ...final });
     opts?.onResizeEnd?.();
   };
@@ -604,6 +612,11 @@ export function startPanelWidthResize(
   const startPos = opts.posRef?.current ? { ...opts.posRef.current } : null;
   const panelEl = opts.panelEl;
   const clamp = opts.clampWidth;
+  const prevTransition = suspendPanelTransitions(panelEl);
+  // Geometry reads hoisted to drag start (read-after-write would force a
+  // synchronous layout per pointermove); viewport dims cannot change mid-drag.
+  const startPanelH = panelEl ? panelEl.offsetHeight || 1 : 1;
+  const viewport = { w: window.innerWidth, h: window.innerHeight };
 
   if (panelEl) {
     panelEl.style.willChange = 'width';
@@ -631,7 +644,7 @@ export function startPanelWidthResize(
       }
 
       const minX = margin;
-      const maxX = window.innerWidth - margin - nextW;
+      const maxX = viewport.w - margin - nextW;
       if (edgeAffectsWest(edge)) {
         if (x < minX) {
           x = minX;
@@ -640,15 +653,15 @@ export function startPanelWidthResize(
         }
       } else {
         x = Math.max(minX, Math.min(x, maxX));
-        const rightBound = window.innerWidth - margin;
+        const rightBound = viewport.w - margin;
         if (x + nextW > rightBound) {
           nextW = clamp(rightBound - x);
         }
       }
 
-      const panelH = panelEl.offsetHeight || 1;
+      const panelH = startPanelH;
       const minY = margin;
-      const maxY = window.innerHeight - margin - panelH;
+      const maxY = viewport.h - margin - panelH;
       if (edgeAffectsNorth(edge) && y < minY) {
         y = minY;
       } else {
@@ -668,20 +681,26 @@ export function startPanelWidthResize(
     opts.onResizeMove?.(nextW);
   };
 
+  const loop = makeRafMoveLoop((x, y) => {
+    const delta = widthDeltaFromEdge(edge, x - startX, y - startY, opts.aspect);
+    applyWidthAndPos(clamp(startW + delta));
+  });
+
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
-    const delta = widthDeltaFromEdge(edge, ev.clientX - startX, ev.clientY - startY, opts.aspect);
-    applyWidthAndPos(clamp(startW + delta));
+    loop.onMove(ev.clientX, ev.clientY);
   };
 
   const onUp = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
+    loop.flushSync();
     handle.releasePointerCapture(e.pointerId);
     handle.removeEventListener('pointermove', onMove);
     handle.removeEventListener('pointerup', onUp);
     handle.removeEventListener('pointercancel', onUp);
     document.body.style.userSelect = prevUserSelect;
     document.body.style.cursor = prevCursor;
+    restorePanelTransitions(panelEl, prevTransition);
     if (panelEl) {
       panelEl.style.willChange = '';
     }

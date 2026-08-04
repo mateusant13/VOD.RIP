@@ -426,3 +426,61 @@ Tasks:
    interactions. Acceptance: no stutter during drag; animations intact elsewhere.
 6. Verify at 240Hz: trace shows consistent frame pacing on a 240Hz display across preview
    panel, explore popup, and live popup resizes. Acceptance: real trace, fps ≥ refresh rate.
+
+---
+## WS-9 findings (websearch, recorded 2026-08-04 before implementation)
+
+### Consensus (sources: MDN Web Docs — Pointer Events / requestAnimationFrame /
+`content-visibility`; React docs — `useSyncExternalStore`, "keep external state external";
+React Labs blog — future `use(store)` still research; community: Framer Motion / react-spring
+architecture; Chrome DevTools docs — forced reflow/layout thrash)
+
+1. Treat pointer drag as an imperative animation problem, not React rendering work.
+   React 18/19 add NO drag API; pointermove streams can exceed the display refresh rate
+   (144–240 Hz displays, high-polling-rate mice) and setState-per-move causes schedule +
+   reconcile + re-render per event, GC churn, and lost layout/paint headroom. React
+   explicitly recommends `useSyncExternalStore` for external mutable layout state (and a
+   future `use(store)` replacement is still research, not production guidance).
+2. Canonical pattern: pointerdown → `setPointerCapture(pointerId)` → pointermove updates
+   refs only → schedule ONE pending `requestAnimationFrame` → rAF callback writes the
+   latest value to `el.style` once per frame → pointerup → `releasePointerCapture` +
+   commit final value with one `setState`. Multiple pointer events collapse into one
+   paint; rAF naturally syncs to 60/120/144/165/240 Hz display rates.
+3. Avoid forced reflow: read geometry (`offsetWidth`/`offsetHeight`, `innerWidth`/
+   `innerHeight`) ONCE at drag start (or batch reads before writes); never interleave
+   `style.width = …` with a following `offsetHeight` read (that flushes layout per move).
+4. CSS transitions on the dragged/resized element add input latency ("cursor chasing") —
+   every move restarts a 150 ms ease. Disable transitions while dragging (e.g. a
+   `.dragging`/`.resizing` class → `transition: none`), restore after pointerup so
+   non-drag animations stay intact.
+5. CSS containment: `contain: layout paint` (or `contain: content`) limits layout
+   invalidation to the contained subtree — right tool for panels. `content-visibility:
+   auto` skips rendering off-screen subtrees (with `contain-intrinsic-size` to reserve
+   space) — use for long lists/offscreen panels; pitfalls: scrollbar jumps, deferred
+   layout confusing synchronous measurement, ResizeObserver loop warnings (never mutate
+   layout synchronously inside a ResizeObserver callback; batch in rAF).
+6. `will-change` only while dragging (set on pointerdown, clear on pointerup); leaving it
+   permanently raises memory/compositing cost.
+7. `startTransition` must NOT wrap pointer-move geometry updates (lowers urgency → worse
+   INP); reserve transitions for secondary derived work. Transforms beat top/left when
+   geometry allows, but width-resize inherently triggers layout — containment isolates it.
+8. Pointer Events (one API for mouse/touch/pen + capture) beat document-level
+   mousemove/mouseup listeners.
+
+### Applied decision (recorded before coding)
+- Refactor ALL drag/resize helpers to the rAF-coalesced direct-DOM-write pattern with
+  state commit on pointerup. Helpers in `src/layoutUtils.ts`
+  (`startPanelResizeDrag`, `startPanelWidthResize`) and `src/explorePopupUtils.tsx`
+  (`startExplorePanelWidthResize`, `startExplorePanelBoxResize`, `startFloatingPanelDrag`)
+  share a tiny internal rAF loop; geometry reads hoisted to drag start; no setState in
+  move path. Callers unchanged (same signatures) — App.tsx onResizeMove callbacks keep
+  firing per frame with the LATEST coalesced value.
+- No `useSyncExternalStore` rewrite: drag state is already ref-backed; only the final
+  value needs React state, and commit-on-pointerup satisfies that. (ponytail: if later a
+  second React consumer needs live drag geometry, introduce an external store + uSES then.)
+- CSS: `contain: layout paint` + `content-visibility: auto` on heavy panels/lists in
+  index.css; `.resizing` class toggles `transition: none` on the dragged element;
+  `will-change` stays pointerdown→pointerup scoped (already the pattern).
+- Baseline profiling runs against a fresh throwaway backend profile (VODRIP_APP_DATA
+  override, real user data untouched) + Vite dev server; drag driven via Playwright CDP
+  real input; rAF-delay sampler + longtask observer + React commit counter for numbers.

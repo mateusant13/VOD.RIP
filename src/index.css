@@ -420,6 +420,23 @@ html[data-viewport="narrow"] .vod-layout-row {
   gap: 0.75rem !important;
 }
 
+/* WS-9: layout containment for drag-heavy surfaces. `contain: layout`
+   isolates each panel's layout pass so resizing one panel never triggers
+   layout/paint outside its own box. Paint containment is deliberately NOT
+   used here: the resize-handle strips straddle the panel border and popup
+   shadows extend beyond it, and `contain: paint` would clip both (it is also
+   a containing block for absolute/fixed descendants — the panels are already
+   `position: relative`, so layout containment changes nothing for their
+   anchored handles). Scroll containers clip their own content by definition,
+   so they get the full `layout paint`. */
+.vod-layout-row > * {
+  contain: layout;
+}
+
+.custom-scrollbar {
+  contain: layout paint;
+}
+
 /* Fullscreen preview — larger needle rail and arrow elements */
 .preview-fs-host:fullscreen [data-preview-fs-ui] .preview-needle-rail {
   min-height: calc(1.5rem * var(--ui-scale));
