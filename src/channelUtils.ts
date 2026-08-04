@@ -140,13 +140,14 @@ export function mergeVodLists(
   opts?: { prunePlatforms?: string[] },
 ): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
-  const mappedIncoming = incoming.map(mapApiChannelItem);
+  // Watchdog synthetic rows have no real video — never let them into the cache.
+  const mappedIncoming = filterSyntheticRows(incoming).map(mapApiChannelItem);
   const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
   // ponytail: a platform with zero incoming videos almost always means a soft
   // failed/partial fetch (bot-gate, network). Pruning then wipes the cached list.
   const platformsWithIncoming = new Set(mappedIncoming.map((v) => v.platform));
 
-  for (const v of existing) {
+  for (const v of filterSyntheticRows(existing)) {
     // Always drop cached subscriber-only entries — YouTube API no longer returns them.
     if (v.availability === 'subscriber_only') continue;
     // When a platform was fully refreshed, prune cached entries absent from the fresh list.
@@ -173,12 +174,12 @@ export function mergeClipLists(
   opts?: { prunePlatforms?: string[] },
 ): ChannelVideo[] {
   const map = new Map<string, ChannelVideo>();
-  const mappedIncoming = incoming.map(mapApiChannelItem).filter(isLikelyClip);
+  const mappedIncoming = filterSyntheticRows(incoming).map(mapApiChannelItem).filter(isLikelyClip);
   const incomingKeys = new Set(mappedIncoming.map(channelVideoKey));
   // Empty incoming for a platform means a soft/partial fetch — don't wipe cache.
   const platformsWithIncoming = new Set(mappedIncoming.map((v) => v.platform));
 
-  for (const v of existing.filter(isLikelyClip)) {
+  for (const v of filterSyntheticRows(existing).filter(isLikelyClip)) {
     // Always drop cached subscriber-only entries.
     if (v.availability === 'subscriber_only') continue;
     if (opts?.prunePlatforms?.includes(v.platform) && platformsWithIncoming.has(v.platform) && !incomingKeys.has(channelVideoKey(v))) continue;
@@ -422,7 +423,18 @@ export function isSyntheticArchiveId(id: string | null | undefined): boolean {
   return /^[a-z]+-live-[a-z0-9_]+-\d+$/.test(id ?? '');
 }
 
+/** Drop watchdog synthetic rows from channel vod/clip lists — they have no
+ * real video and must never render as cards (WS-5). */
+export function filterSyntheticRows(rows: ChannelVideo[]): ChannelVideo[] {
+  return rows.filter((v) => !isSyntheticArchiveId(v.id));
+}
+
 export function buildVodUrl(v: ChannelVideo): string {
+  // Watchdog synthetic ids (<platform>-live-<slug>-<ms>) have no real video
+  // on ANY platform — never build a watch URL from them, even when a
+  // backend-built URL was persisted next to the row (callers treat '' as
+  // "no URL" and drop preview/warm affordances).
+  if (isSyntheticArchiveId(v.id)) return '';
   const isTw = v.platform === 'Twitch';
   const isClip = isLikelyClip(v);
   const twitchId = isTw && v.id.startsWith('v') ? v.id.slice(1) : v.id;
@@ -441,9 +453,6 @@ export function buildVodUrl(v: ChannelVideo): string {
   }
   if (v.platform === 'YouTube') {
     if (v.url) return v.url;
-    // Synthetic watchdog ids have no real video — never build a watch URL
-    // (callers treat '' as "no URL" and drop preview/warm affordances).
-    if (isSyntheticArchiveId(v.id)) return '';
     return `https://www.youtube.com/watch?v=${v.id}`;
   }
   return isClip
@@ -726,13 +735,15 @@ export function normalizeSavedChannel(ch: SavedChannel): SavedChannel {
   return {
     ...rest,
     youtubeSlug: ch.youtubeSlug ?? '',
-    vodVideos: dedupeYoutubeAgainstClips(vodVideos ?? [], clipVideos ?? []),
-    clipVideos: (clipVideos ?? []).map((c) => {
+    // Scrub watchdog synthetic rows persisted by earlier app versions — they
+    // have no real video and must not render as cards on next load (WS-5).
+    vodVideos: filterSyntheticRows(dedupeYoutubeAgainstClips(vodVideos ?? [], clipVideos ?? [])),
+    clipVideos: filterSyntheticRows((clipVideos ?? []).map((c) => {
       if (c.platform !== 'YouTube') return c;
       const id = youtubeVideoId(c.url || '');
       if (!id || /\/shorts\//i.test(c.url || '')) return c;
       return { ...c, url: youtubeCanonicalUrl(id, true) };
-    }),
+    })),
     vodErrors: ch.vodErrors ?? legacyErrors,
     clipErrors: ch.clipErrors ?? {},
     clipsFetched: ch.clipsFetched ?? (clipVideos?.length ?? 0) > 0,

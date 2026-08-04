@@ -19,6 +19,7 @@ import {
   parseChannelInput,
   buildVodUrl,
   isSyntheticArchiveId,
+  filterSyntheticRows,
   slugFromVideoUrl,
   youtubeSlugFromChannelUrl,
   isChannelAlreadySaved,
@@ -149,6 +150,27 @@ describe('mergeVodLists', () => {
     expect(result[0].id).toBe('v2');
     expect(result[1].id).toBe('v1');
   });
+
+  it('drops watchdog synthetic rows from incoming', () => {
+    const synthetic = makeVod({
+      platform: 'Twitch',
+      id: 'twitch-live-titiltei-1785788650977',
+      url: 'https://www.twitch.tv/videos/twitch-live-titiltei-1785788650977',
+    });
+    const result = mergeVodLists([], [synthetic]);
+    expect(result).toHaveLength(0);
+  });
+
+  it('drops watchdog synthetic rows from existing cache', () => {
+    const synthetic = makeVod({
+      platform: 'Kick',
+      id: 'kick-live-titiltei-1785788650972',
+      url: 'https://kick.com/titiltei/videos/kick-live-titiltei-1785788650972',
+    });
+    const real = makeVod({ id: 'v2' });
+    const result = mergeVodLists([synthetic, real], []);
+    expect(result.map((v) => v.id)).toEqual(['v2']);
+  });
 });
 
 describe('mergeClipLists', () => {
@@ -168,6 +190,27 @@ describe('mergeClipLists', () => {
     const result = mergeClipLists([older], [newer]);
     expect(result[0].id).toBe('c2');
     expect(result[1].id).toBe('c1');
+  });
+
+  it('drops watchdog synthetic rows from incoming', () => {
+    const synthetic = makeClip({
+      platform: 'Twitch',
+      id: 'twitch-live-titiltei-1785788650977',
+      url: 'https://www.twitch.tv/videos/twitch-live-titiltei-1785788650977',
+    });
+    const real = makeClip({ id: 'c1' });
+    const result = mergeClipLists([], [synthetic, real]);
+    expect(result.map((v) => v.id)).toEqual(['c1']);
+  });
+
+  it('drops watchdog synthetic rows from existing cache', () => {
+    const synthetic = makeClip({
+      platform: 'Kick',
+      id: 'kick-live-titiltei-1785788650972',
+      url: 'https://kick.com/titiltei/videos/kick-live-titiltei-1785788650972',
+    });
+    const result = mergeClipLists([synthetic], []);
+    expect(result).toHaveLength(0);
   });
 });
 
@@ -336,7 +379,48 @@ describe('isSyntheticArchiveId', () => {
   });
 });
 
+describe('filterSyntheticRows', () => {
+  it('drops synthetic rows for every platform', () => {
+    const rows = [
+      makeVod({ platform: 'Twitch', id: 'twitch-live-xqc_1-1750000000000' }),
+      makeVod({ platform: 'Kick', id: 'kick-live-titiltei-1785788650972' }),
+      makeVod({ platform: 'YouTube', id: 'youtube-live-somechannel-1750000000000' }),
+    ];
+    expect(filterSyntheticRows(rows)).toHaveLength(0);
+  });
+
+  it('keeps real rows untouched', () => {
+    const rows = [
+      makeVod({ id: 'v123' }),
+      makeVod({ platform: 'Kick', id: 'vod_xyz' }),
+      makeVod({ platform: 'YouTube', id: 'AbCdEfGhIjK' }),
+    ];
+    const kept = filterSyntheticRows(rows);
+    expect(kept).toHaveLength(3);
+    expect(kept).toEqual(rows);
+  });
+});
+
 describe('buildVodUrl', () => {
+  it('never builds a watch URL for a synthetic Twitch id', () => {
+    const v = makeVod({
+      platform: 'Twitch',
+      id: 'twitch-live-titiltei-1785788650977',
+      url: 'https://www.twitch.tv/videos/twitch-live-titiltei-1785788650977',
+    });
+    expect(buildVodUrl(v)).toBe('');
+  });
+
+  it('never builds a watch URL for a synthetic Kick id', () => {
+    const v = makeVod({
+      platform: 'Kick',
+      id: 'kick-live-titiltei-1785788650972',
+      url: 'https://kick.com/titiltei/videos/kick-live-titiltei-1785788650972',
+      channel: 'titiltei',
+    });
+    expect(buildVodUrl(v)).toBe('');
+  });
+
   it('uses the existing URL for Twitch VODs', () => {
     const v = makeVod({ url: 'https://twitch.tv/videos/123456' });
     expect(buildVodUrl(v)).toBe('https://twitch.tv/videos/123456');
