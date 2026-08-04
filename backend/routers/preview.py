@@ -5,6 +5,7 @@ Preview routes — preview sessions for HLS/MP4 playback.
 import asyncio
 import logging
 import re
+import sqlite3
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -52,6 +53,7 @@ from services.preview_service import (
 
 from services.youtube_diag import youtube_http_status, youtube_user_message
 from services.preview_timing import log_preview_timing
+from services import archive_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
@@ -223,6 +225,76 @@ async def preview_invalidate(req: PreviewWarmRequest):
     return {"ok": True}
 
 
+# WS-1 preview-queue priority: previewing an archived video with no transcript
+# yet enqueues (or bumps) its transcribe job to priority 1 so the worker picks
+# it before any normal-queue job.
+_PREVIEW_TRANSCRIBE_PRIORITY = 1
+
+
+def _preview_video_id(platform: str, url: str) -> Optional[str]:
+    """Archive video_id for a preview session's (platform, url), or None."""
+    p = (platform or "").strip().lower()
+    if p == "youtube":
+        from services.youtube_innertube import extract_video_id
+
+        return extract_video_id(url or "")
+    if p == "twitch":
+        m = re.search(r"twitch\.tv/videos/(\d+)", url or "", re.I)
+        return m.group(1) if m else None
+    if p == "kick":
+        from services.kick_models import extract_vod_id
+
+        return extract_vod_id(url or "")
+    return None
+
+
+def _priority_transcribe_for_preview(session) -> None:
+    """Enqueue/bump a priority-1 transcribe job for a previewed archived video.
+
+    Fires only when the archive DB has the video and transcription is enabled
+    (archive_smart_enrich — the same toggle the search enrichment uses) and
+    no transcript rows exist yet. An existing *queued* job is bumped to
+    priority 1; running/failed/done jobs are never touched — the deterministic
+    job id (PK) keeps the dedupe, so nothing double-enqueues."""
+    platform = str(getattr(session, "platform", "") or "").strip().lower()
+    if platform not in archive_db.PLATFORMS:
+        return
+    video_id = _preview_video_id(platform, getattr(session, "vod_url", "") or "")
+    if not video_id:
+        return
+    if not archive_db.query(
+        "SELECT 1 FROM videos WHERE platform = ? AND video_id = ? LIMIT 1",
+        (platform, video_id),
+    ):
+        return  # not archived — nothing to transcribe
+    try:
+        from deps import settings_mgr  # lazy: same pattern as routers.archive
+
+        enabled = bool(getattr(settings_mgr.get(), "archive_smart_enrich", True))
+    except Exception:
+        enabled = True
+    if not enabled:
+        return
+    if archive_db.transcript_for(platform, video_id):
+        return  # already transcribed
+    job_id = f"transcribe-{platform}-{video_id}"
+    latest = archive_db.latest_job(platform, video_id, kind="transcribe")
+    if latest is None:
+        try:
+            archive_db.enqueue_job(
+                job_id, "transcribe", platform, video_id,
+                priority=_PREVIEW_TRANSCRIBE_PRIORITY,
+            )
+        except sqlite3.IntegrityError:
+            pass  # raced with another enqueue — the queued row already exists
+    elif latest["status"] == "queued":
+        archive_db.execute(
+            "UPDATE archive_jobs SET priority = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'queued'",
+            (_PREVIEW_TRANSCRIBE_PRIORITY, archive_db._now_iso(), latest["id"]),
+        )
+
+
 @router.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
     # ponytail: crop_end=0 means "unknown" — let create_session fall back to
@@ -267,6 +339,17 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         )
         from services.preview_timing import log_server_session_created
         log_server_session_created(session, resolve_ms=resolve_ms)
+        # Preview-queue priority (WS-1): a previewed archived video jumps its
+        # transcribe job to the front of the queue. Best-effort — a DB hiccup
+        # must never fail the preview response.
+        try:
+            _priority_transcribe_for_preview(session)
+        except Exception:
+            logger.warning(
+                "preview priority transcribe failed id=%s",
+                session.session_id[:8],
+                exc_info=True,
+            )
         return _preview_session_response(session)
     except ValueError as e:
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)

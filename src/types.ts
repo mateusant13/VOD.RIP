@@ -82,6 +82,8 @@ export interface AppSettings {
   throttle_kib: number;
   ffmpeg_path: string;
   temp_folder: string;
+  /** Cache root for large on-disk caches ('' = auto -> biggest fixed drive). */
+  cache_dir?: string;
   oauth: string;
   youtube_cookies_file?: string;
   youtube_cookies_browser?: string;
@@ -127,6 +129,11 @@ export interface DiskStatus {
   threshold_bytes: number;
   low: boolean;
   keep_count: number;
+  /** Effective cache root ('' when none) + free space on its volume. */
+  cache_dir?: string;
+  cache_free_bytes?: number;
+  /** Auto pick: drive with the most free space (informational). */
+  biggest_drive?: string;
 }
 
 export interface UpdateInfo {

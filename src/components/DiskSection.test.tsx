@@ -24,7 +24,14 @@ const USAGE = {
   total: 14 * 1024 ** 3,
 };
 
-function stubFetch(status: { low: boolean; free_bytes: number; keep_count: number }) {
+function stubFetch(status: {
+  low: boolean;
+  free_bytes: number;
+  keep_count: number;
+  cache_dir?: string;
+  cache_free_bytes?: number;
+  biggest_drive?: string;
+}) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const body = url.includes("/api/disk/status")
@@ -100,5 +107,47 @@ describe("DiskSection", () => {
     // usage re-fetched after cleanup: fetch called for usage at least twice
     const usageCalls = vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes("/api/disk/usage"));
     expect(usageCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("shows the effective cache location and free space from status", async () => {
+    stubFetch({
+      low: false,
+      free_bytes: 120 * 1024 ** 3,
+      keep_count: 5,
+      cache_dir: "I:\\VOD.RIP-cache",
+      cache_free_bytes: 402 * 1024 ** 3,
+      biggest_drive: "I:\\",
+    });
+    render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
+    await waitFor(() =>
+      expect(screen.getByLabelText("cache location")).toBeInTheDocument()
+    );
+    expect((screen.getByLabelText("cache location") as HTMLInputElement).placeholder).toBe("Auto (biggest drive)");
+    expect(screen.getByText(/I:\\VOD.RIP-cache/)).toBeInTheDocument();
+    expect(screen.getByText(/402.00 GB free/)).toBeInTheDocument();
+    expect(screen.getByText(/auto pick: I:\\/)).toBeInTheDocument();
+  });
+
+  it("typing a cache path calls setSettings with cache_dir", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    const setSettings = vi.fn();
+    render(<DiskSection settings={BASE_SETTINGS} setSettings={setSettings} />);
+    await waitFor(() => expect(screen.getByLabelText("cache location")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("cache location"), { target: { value: "D:\\caches" } });
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ cache_dir: "D:\\caches" }));
+  });
+
+  it("Auto button returns cache_dir to auto (empty)", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    const setSettings = vi.fn();
+    render(
+      <DiskSection
+        settings={{ ...BASE_SETTINGS, cache_dir: "D:\\caches" }}
+        setSettings={setSettings}
+      />
+    );
+    await waitFor(() => expect(screen.getByLabelText("auto cache location")).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText("auto cache location"));
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ cache_dir: "" }));
   });
 });

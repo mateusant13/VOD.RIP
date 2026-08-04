@@ -75,6 +75,9 @@ async def update_settings(update: SettingsUpdate):
         current.download_folder_confirmed = update.download_folder_confirmed
     if update.temp_folder is not None:
         current.temp_folder = update.temp_folder
+    if update.cache_dir is not None:
+        # '' = auto (biggest fixed drive); any explicit path wins.
+        current.cache_dir = update.cache_dir.strip()
     if update.oauth is not None:
         current.oauth = update.oauth
     if update.youtube_cookies_file is not None:
@@ -121,6 +124,8 @@ async def update_settings(update: SettingsUpdate):
         current.skip_youtube_startup_warm = bool(update.skip_youtube_startup_warm)
     if update.cookie_bridge_enabled is not None:
         current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
+    if update.entity_watch_enabled is not None:
+        current.entity_watch_enabled = bool(update.entity_watch_enabled)
     if update.archive_vod_keep_count is not None:
         current.archive_vod_keep_count = max(1, min(50, update.archive_vod_keep_count))
     if update.whisper_model is not None:

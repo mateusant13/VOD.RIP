@@ -120,7 +120,7 @@ def _archive_dir(archive_dir: Optional[str] = None) -> Path:
 
 def _ensure_job(job_id: str, video_id: str) -> None:
     try:
-        archive_db.enqueue_job(job_id, "ingest", PLATFORM, video_id)
+        archive_db.enqueue_job(job_id, "ingest", PLATFORM, video_id, priority=0)
     except sqlite3.IntegrityError:
         pass  # already queued by a previous run
 

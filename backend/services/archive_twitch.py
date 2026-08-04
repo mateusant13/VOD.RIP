@@ -283,7 +283,7 @@ def backfill_chat(
     max_messages = max(1, int(max_messages))
 
     job_id = f"tw-backfill-{vid}-{int(time.time())}"
-    archive_db.enqueue_job(job_id, "chat_backfill", "twitch", vid)
+    archive_db.enqueue_job(job_id, "chat_backfill", "twitch", vid, priority=0)
     archive_db.update_job(job_id, status="running")
 
     inserted = 0

@@ -275,3 +275,59 @@ async def test_vods_fetch_merges_streams_tab_and_persists_stream_kind(
     assert row is not None
     assert row["kind"] == "stream"
     assert row["duration_sec"] == 14814
+
+
+@pytest.mark.asyncio
+async def test_vods_excludes_watchdog_synthetic_rows(
+    client, _fake_platform_services, _scratch_archive_db
+):
+    """Watchdog chat-capture rows use synthetic ids (<platform>-live-<slug>-<ms>)
+    with no real video behind them — the channel API must never return them
+    (they used to leak dead watch URLs into the UI: WS-5)."""
+    upsert_channel_video({
+        "platform": "twitch",
+        "video_id": "1234567890",
+        "channel": "titiltei",
+        "title": "Real VOD",
+        "kind": "vod",
+        "started_at": "2026-08-01T00:00:00Z",
+    })
+    upsert_video({
+        "platform": "twitch",
+        "video_id": "twitch-live-titiltei-1785788650977",
+        "channel": "titiltei",
+        "title": "Twitch live capture",
+        "kind": "live",
+        "started_at": "2026-08-01T00:00:00Z",
+    })
+    upsert_video({
+        "platform": "kick",
+        "video_id": "kick-live-titiltei-1785788650972",
+        "channel": "titiltei",
+        "title": "Kick live capture",
+        "kind": "live",
+        "started_at": "2026-08-01T00:00:00Z",
+    })
+
+    # Twitch-only: the index already holds a real row, so the response is
+    # served from the accumulated index (no blocking fetch).
+    resp = await client.get(_videos_url(50, platforms="Twitch"))
+    assert resp.status_code == 200
+    ids = [v["id"] for v in resp.json()["videos"]]
+    assert "1234567890" in ids
+    assert "twitch-live-titiltei-1785788650977" not in ids
+
+    # All platforms: the Kick synthetic row must not leak either (Kick has no
+    # real index rows, so the fake fetcher supplies the real ones).
+    resp_all = await client.get(_videos_url(50))
+    assert resp_all.status_code == 200
+    ids_all = [v["id"] for v in resp_all.json()["videos"]]
+    assert not any(vid.startswith(("twitch-live-", "kick-live-", "youtube-live-")) for vid in ids_all)
+    assert "kick-live-titiltei-1785788650972" not in ids_all
+
+    # Regression guard: synthetic rows stay STORED (chat history) — only the
+    # API responses exclude them.
+    stored = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM videos WHERE video_id LIKE '%-live-%'"
+    ).fetchone()
+    assert stored["n"] == 2

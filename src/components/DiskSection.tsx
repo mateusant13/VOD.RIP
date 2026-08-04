@@ -110,6 +110,10 @@ export default function DiskSection({ settings, setSettings }: Props) {
   const keepCount = settings.archive_vod_keep_count ?? 5;
   const keepValue = Number.isFinite(keepCount) ? Math.max(1, Math.min(50, keepCount)) : 5;
 
+  const cacheDir = settings.cache_dir ?? '';
+  const effectiveCache = status?.cache_dir ?? '';
+  const cacheFree = status?.cache_free_bytes;
+
   return (
     <div className="flex flex-col gap-2">
       {status?.low ? (
@@ -117,6 +121,41 @@ export default function DiskSection({ settings, setSettings }: Props) {
           LOW DISK SPACE — {formatBytes(status.free_bytes)} free. Run cleanups below or free space manually.
         </div>
       ) : null}
+
+      <div className="flex flex-col gap-1">
+        <FieldCaption noWrap>Cache Location</FieldCaption>
+        <div className="flex gap-1.5">
+          <input
+            type="text"
+            value={cacheDir}
+            onChange={(e) => setSettings({ ...settings, cache_dir: e.target.value })}
+            placeholder="Auto (biggest drive)"
+            aria-label="cache location"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-[10px] truncate focus:outline-none focus:border-white"
+          />
+          <button
+            type="button"
+            aria-label="auto cache location"
+            onClick={() => setSettings({ ...settings, cache_dir: '' })}
+            className="bg-zinc-900 text-zinc-200 font-black uppercase px-2 text-[9px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0"
+          >
+            Auto
+          </button>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[9px] text-zinc-600 font-mono">
+            {effectiveCache
+              ? `${effectiveCache} — ${cacheFree != null ? `${formatBytes(cacheFree)} free` : '…'}`
+              : 'using app data drive'}
+          </span>
+          {status?.biggest_drive ? (
+            <span className="text-[9px] text-zinc-600 font-mono">auto pick: {status.biggest_drive}</span>
+          ) : null}
+        </div>
+        <span className="text-[9px] text-zinc-700 font-mono">
+          whisper models, yt-dlp cache, preview temp &amp; embed models — applies on Save Settings (next launch)
+        </span>
+      </div>
 
       <div className="flex flex-col gap-1">
         {(usage

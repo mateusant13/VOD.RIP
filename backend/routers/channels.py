@@ -63,6 +63,17 @@ router = APIRouter(tags=["channels"])
 _bg_refresh_lock = threading.Lock()
 
 
+def _is_synthetic_video_id(video_id: str) -> bool:
+    """Watchdog chat-capture rows fall back to a synthetic id
+    (<platform>-live-<slug>-<epoch-ms>) when no real videoId could be
+    extracted (backend/services/archive_watchdog.py `_start_capture`) — there
+    is NO video for that id, so channel lists must never surface it (WS-5).
+    SQL equivalent of the exclusion:
+        video_id NOT LIKE 'twitch-live-%' AND video_id NOT LIKE 'kick-live-%'
+        AND video_id NOT LIKE 'youtube-live-%'"""
+    return video_id.startswith(("twitch-live-", "kick-live-", "youtube-live-"))
+
+
 def merge_youtube_playlists(vods: List[dict], streams: List[dict]) -> List[dict]:
     """Merge /videos and /streams tab fetches for one channel.
 
@@ -541,11 +552,14 @@ async def channel_videos(
             return out
 
         def _index_rows_by_platform() -> dict:
-            """All accumulated index rows for the wanted platforms."""
+            """All accumulated index rows for the wanted platforms, excluding
+            watchdog synthetic rows (they have no real video behind them)."""
             grouped: dict[str, list] = {}
             for label in wanted:
                 archive_platform, _, _ = platform_specs[label]
                 for r in list_videos(platform=archive_platform, channel=channel):
+                    if _is_synthetic_video_id(str(r.get("video_id") or "")):
+                        continue
                     grouped.setdefault(archive_platform, []).append(r)
             return grouped
 

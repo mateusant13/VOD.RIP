@@ -524,7 +524,7 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     url = _video_url(id_or_url)
     video_id = _video_id_from_url(url, id_or_url.strip())
     job_id = f"yt-ingest-{video_id}-{int(time.time())}"
-    _db_write(archive_db.enqueue_job, job_id, "ingest", PLATFORM, video_id)
+    _db_write(archive_db.enqueue_job, job_id, "ingest", PLATFORM, video_id, priority=0)
     report: dict = {
         "video_id": video_id,
         "title": "",

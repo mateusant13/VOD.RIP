@@ -283,7 +283,7 @@ def _maybe_enrich(
         for r in _transcribe_candidates(platform=platform, channel=channel, q=q):
             job_id = f"transcribe-{r['platform']}-{r['video_id']}"
             try:
-                archive_db.enqueue_job(job_id, "transcribe", r["platform"], r["video_id"])
+                archive_db.enqueue_job(job_id, "transcribe", r["platform"], r["video_id"], priority=0)
             except sqlite3.IntegrityError:
                 continue  # already queued by a previous search — nothing new
             with _transcribe_lock:
@@ -575,7 +575,7 @@ async def archive_jobs_enqueue(job: dict):
         raise HTTPException(status_code=400, detail="id, kind and video_id required")
     _require_platform(platform)
     try:
-        archive_db.enqueue_job(job_id, kind, platform, video_id)
+        archive_db.enqueue_job(job_id, kind, platform, video_id, priority=0)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail=f"job {job_id} already exists") from None
     return {"ok": True, "id": job_id}
