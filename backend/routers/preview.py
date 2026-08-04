@@ -96,6 +96,18 @@ def _preview_archive_capabilities(session) -> tuple[bool, bool]:
     except Exception:
         # A DB hiccup must never fail the preview session response.
         return False, False
+def _preview_channel_language(session) -> str:
+    """Stored channel language of the previewed archived video ('' = none).
+
+    WS-3: read from videos.channel_language so the preview badge shows the
+    detected channel language; non-archived previews yield ''."""
+    platform = str(getattr(session, "platform", "") or "").strip().lower()
+    if platform not in archive_db.PLATFORMS:
+        return ""
+    video_id = _preview_video_id(platform, getattr(session, "vod_url", "") or "")
+    if not video_id:
+        return ""
+    return archive_db.video_channel_language(platform, video_id) or ""
 
 
 def _preview_session_response(session) -> PreviewSessionResponse:
@@ -132,6 +144,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         archive_duration=float(getattr(session, "archive_duration", 0) or 0),
         has_transcript=has_transcript,
         has_chat=has_chat,
+        channel_language=_preview_channel_language(session),
     )
 
 

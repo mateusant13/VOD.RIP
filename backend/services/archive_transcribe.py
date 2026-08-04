@@ -1650,6 +1650,40 @@ def _captions_first_skip(platform: str, video_id: str) -> bool:
     return bool(archive_db.transcript_for(platform, video_id))
 
 
+def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
+    """ASR language for one transcribe job: override > channel > default.
+
+    Precedence (WS-3): per-channel override in settings
+    (channel_asr_languages) > persisted channel language
+    (videos.channel_language, fed by platform clues + transcript
+    aggregation) > default ASR language setting (asr_language) > auto
+    detect (None). 'auto'/'' at any level falls through to the next."""
+    from services.channel_language import normalize_language
+
+    channel = archive_db.video_channel(platform, video_id)
+    try:
+        from deps import settings_mgr  # lazy: archive_transcribe is opt-in by design
+
+        settings = settings_mgr.get()
+        overrides = getattr(settings, "channel_asr_languages", None) or {}
+    except Exception:
+        settings = None
+        overrides = {}
+    if channel:
+        lang = overrides.get(channel) or overrides.get(channel.lower())
+        hint = normalize_language(lang)
+        if hint:
+            return hint
+    stored = archive_db.video_channel_language(platform, video_id)
+    if stored:
+        return normalize_language(stored)
+    if settings is not None:
+        hint = normalize_language(getattr(settings, "asr_language", "auto"))
+        if hint:
+            return hint
+    return None
+
+
 def _process_job(job: dict, *, multi: bool = False) -> dict:
     """Run one claimed job; never raises — failures land in archive_jobs.error.
 
@@ -1697,8 +1731,19 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     platform, video_id, audio=audio, speech=speech, shards=shards,
                 )
 
-        stats = transcribe_video(platform, video_id, progress_cb=_progress, events_cb=events_cb)
+        stats = transcribe_video(
+            platform, video_id,
+            language=_resolve_job_language(platform, video_id),
+            progress_cb=_progress, events_cb=events_cb,
+        )
         archive_db.update_job(job_id, status="done", progress=1.0)
+        # New transcript evidence -> re-aggregate the channel language
+        # (throttled; best-effort — a failure must never fail the job).
+        try:
+            from services.channel_language import on_transcribe_done
+            on_transcribe_done(platform, video_id)
+        except Exception:
+            logger.debug("channel language re-aggregation failed", exc_info=True)
         if "skipped" not in stats:
             # Heavy batch writes just finished — merge the FTS b-tree
             # segments so search stays fast (best-effort inside). Skipped

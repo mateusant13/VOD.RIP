@@ -115,6 +115,11 @@ class AppSettings(BaseModel):
     # jobs for videos matching the search scope (default on). Off disables
     # the whole enrichment pass — hits-only responses.
     archive_smart_enrich: bool = True
+    # Default ASR language for whisper jobs: 'auto' (whisper auto-detects) or
+    # a family code ('pt', 'en', 'es'). Per-channel overrides win over this
+    # (channel_asr_languages: slug -> code or 'auto').
+    asr_language: str = "auto"
+    channel_asr_languages: Optional[Dict[str, str]] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -154,6 +159,8 @@ class SettingsUpdate(BaseModel):
     whisper_model_cache: Optional[str] = None
     yt_subtitles_first: Optional[bool] = None
     archive_smart_enrich: Optional[bool] = None
+    asr_language: Optional[str] = None
+    channel_asr_languages: Optional[Dict[str, str]] = None
 
 
 class OpenFolderRequest(BaseModel):
@@ -213,6 +220,10 @@ class PreviewSessionResponse(BaseModel):
     # has transcript / chat rows in the local archive DB (empty states).
     has_transcript: bool = False
     has_chat: bool = False
+    # WS-3: detected channel language of the previewed archived video
+    # ('' when the video is not archived / language unknown) — the preview
+    # header badge renders this.
+    channel_language: str = ""
 
 
 class PreviewSeekRequest(BaseModel):

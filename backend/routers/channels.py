@@ -33,6 +33,7 @@ from services.archive_db import (
 )
 from services.channel_cache import get_cached, make_channel_cache_key, set_cached
 from services.kick_api_service import (
+    get_channel_language_sync as kick_get_channel_language_sync,
     list_channel_clips_sync as kick_list_channel_clips_sync,
     list_channel_videos_sync as kick_list_channel_videos_sync,
 )
@@ -41,6 +42,8 @@ from services.twitch_gql_service import (
     list_channel_videos_sync as twitch_list_channel_videos_sync,
 )
 from services.youtube_service import list_channel_videos_sync as youtube_list_channel_videos_sync
+from services.youtube_innertube import innertube_channel_language
+from services.channel_language import aggregate_channel_language, persist_platform_clue
 from utils import (
     filter_clip_entries,
     filter_clips_by_age_window,
@@ -395,12 +398,15 @@ async def channel_videos(
         _LABEL_TO_ARCHIVE = {label: spec[0] for label, spec in platform_specs.items()}
         _ARCHIVE_TO_LABEL = {p: label for label, (p, _, _) in platform_specs.items()}
 
-        async def _fetch_one(label: str, fetch_limit: int, errors: dict) -> list:
-            """Fetch one platform's VOD list (route-payload shape)."""
+        async def _fetch_one(label: str, fetch_limit: int, errors: dict) -> tuple:
+            """Fetch one platform's VOD list + its language clue.
+
+            Returns (items, clue) — clue is the WS-3 platform language
+            ('pt'/'en'/...) or None; a failed clue never fails the fetch."""
             if label == "Kick":
                 slug = kick_ch or channel
                 if not slug:
-                    return []
+                    return [], None
                 try:
                     vids = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -413,11 +419,22 @@ async def channel_videos(
                     )
                 except asyncio.TimeoutError:
                     errors["Kick"] = "VOD fetch timed out — try again"
-                    return []
+                    return [], None
                 except Exception as e:
                 # ponytail: best-effort — return []
                     errors["Kick"] = format_platform_error(e)
-                    return []
+                    return [], None
+                try:
+                    clue = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            CHANNEL_EXECUTOR,
+                            kick_get_channel_language_sync,
+                            slug,
+                        ),
+                        timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                    )
+                except Exception:
+                    clue = None
                 return [{
                     "id": v["id"],
                     "platform": "Kick",
@@ -430,11 +447,11 @@ async def channel_videos(
                     "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
                     "channel": channel,
                     "content_kind": "vod",
-                } for v in vids]
+                } for v in vids], clue
             if label == "Twitch":
                 login = twitch_ch or channel
                 if not login:
-                    return []
+                    return [], None
                 try:
                     vids = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -447,11 +464,16 @@ async def channel_videos(
                     )
                 except asyncio.TimeoutError:
                     errors["Twitch"] = "VOD fetch timed out — try again"
-                    return []
+                    return [], None
                 except Exception as e:
                 # ponytail: best-effort — return []
                     errors["Twitch"] = format_platform_error(e)
-                    return []
+                    return [], None
+                # Twitch clue: the broadcaster language at stream time,
+                # majority across the fetched VODs (first non-null wins).
+                clue = next(
+                    (v.get("language") for v in vids if v.get("language")), None
+                )
                 return [{
                     "id": v["id"],
                     "platform": "Twitch",
@@ -464,10 +486,10 @@ async def channel_videos(
                     "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
                     "channel": channel,
                     "content_kind": "vod",
-                } for v in vids]
+                } for v in vids], clue
             ref = youtube_ch or channel
             if not ref:
-                return []
+                return [], None
             try:
                 vids = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -484,10 +506,10 @@ async def channel_videos(
                 )
             except asyncio.TimeoutError:
                 errors["YouTube"] = "VOD fetch timed out — try again"
-                return []
+                return [], None
             except Exception as e:
                 errors["YouTube"] = format_platform_error(e)
-                return []
+                return [], None
             # The /streams tab holds the channel's recorded live broadcasts
             # (was_live); the /videos flat playlist never lists them, so
             # they were invisible in the panel. Merge both tabs — best
@@ -509,14 +531,29 @@ async def channel_videos(
                 )
             except Exception:
                 streams = []
-            return merge_youtube_playlists(vids, streams)
+            items = merge_youtube_playlists(vids, streams)
+            # YouTube clue: audio language of the newest videos (innertube,
+            # no API key); a failed probe yields no clue.
+            try:
+                clue = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR,
+                        innertube_channel_language,
+                        [str(v.get("id") or "") for v in items],
+                    ),
+                    timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
+                )
+            except Exception:
+                clue = None
+            return items, clue
 
-        def _persist_platform(label: str, items: list) -> None:
+        def _persist_platform(label: str, items: list, clue: Any = None) -> None:
             """Accumulate fetched items into the permanent channel index.
 
             Upsert-only, metadata-only: archive fields (archive_path, status,
             canonical_key) are never touched, so a download in flight is
-            never clobbered by a list refresh."""
+            never clobbered by a list refresh. A non-null language clue
+            stamps videos.channel_language (WS-3 platform-clue path)."""
             archive_platform, snap_key, _ = platform_specs[label]
             for v in items:
                 upsert_channel_video({
@@ -531,25 +568,31 @@ async def channel_videos(
                     "views": v.get("views"),
                     "thumbnail_url": v.get("thumbnail_url") or v.get("thumbnail"),
                 })
+            if clue:
+                persist_platform_clue(archive_platform, channel, clue)
             if items and snap_key:
                 touch_channel_snapshot(archive_platform, snap_key)
 
-        async def _fetch_platforms(labels: List[str], fetch_limit: int, errors: dict) -> list:
-            """Parallel fetch of a subset of platforms."""
+        async def _fetch_platforms(labels: List[str], fetch_limit: int, errors: dict) -> tuple:
+            """Parallel fetch of a subset of platforms; returns (items, clues)."""
             tasks = [
                 asyncio.create_task(_fetch_one(label, fetch_limit, errors))
                 for label in labels
             ]
             if not tasks:
-                return []
+                return [], {}
             results = await asyncio.gather(*tasks, return_exceptions=True)
             out: list[dict] = []
-            for result in results:
-                if isinstance(result, list):
-                    out.extend(result)
-                elif isinstance(result, BaseException):
+            clues: dict[str, Any] = {}
+            for label, result in zip(labels, results):
+                if isinstance(result, BaseException):
                     logger.debug("Channel fetch task failed: %s", result)
-            return out
+                    continue
+                items, clue = result
+                out.extend(items)
+                if clue:
+                    clues[label] = clue
+            return out, clues
 
         def _index_rows_by_platform() -> dict:
             """All accumulated index rows for the wanted platforms, excluding
@@ -562,6 +605,25 @@ async def channel_videos(
                         continue
                     grouped.setdefault(archive_platform, []).append(r)
             return grouped
+
+        # --- effective channel language (WS-3) ---------------------------
+        # Aggregated from platform clues + transcript evidence, honoring
+        # per-channel settings overrides; same value on every video row.
+        try:
+            from deps import settings_mgr
+
+            _overrides = getattr(settings_mgr.get(), "channel_asr_languages", None) or {}
+        except Exception:
+            _overrides = {}
+        eff_language = None
+        for label in wanted:
+            archive_platform, _, _ = platform_specs[label]
+            _agg = aggregate_channel_language(
+                archive_platform, channel, overrides=_overrides
+            )
+            if _agg.get("language"):
+                eff_language = _agg["language"]
+                break
 
         def _row_to_payload_item(r: dict) -> dict:
             vid = str(r.get("video_id") or "")
@@ -585,6 +647,9 @@ async def channel_videos(
                 "url": url,
                 "channel": r.get("channel") or channel,
                 "content_kind": r.get("kind") or "vod",
+                # Effective channel language (WS-3): aggregated per channel,
+                # same value on every row (badge rendering reads it here).
+                "language": eff_language,
             }
 
         # --- index state -------------------------------------------------
@@ -613,9 +678,9 @@ async def channel_videos(
         fetched: list[dict] = []
         for label in block_set:
             fetch_limit = CHANNEL_DELTA_LIMIT if _idx(label) else limit
-            items = await _fetch_platforms([label], fetch_limit, per_platform_errors)
+            items, clues = await _fetch_platforms([label], fetch_limit, per_platform_errors)
             fetched.extend(items)
-            _persist_platform(label, items)
+            _persist_platform(label, items, clues.get(label))
 
         # Merge fetched (wins) over accumulated index rows, keyed per
         # (platform label, video id).
@@ -654,6 +719,8 @@ async def channel_videos(
             "days": days_eff,
             "per_platform_errors": per_platform_errors,
             "refreshing": refreshing,
+            # Effective channel language (WS-3) — null when undetected.
+            "channel_language": eff_language,
         }
         if fetched:
             asyncio.create_task(_warm_youtube_previews(fetched))
@@ -673,13 +740,14 @@ async def channel_videos(
                     async def _bg_refresh() -> None:
                         try:
                             bg_errors: Dict[str, str] = {}
-                            items = await _fetch_platforms(
+                            items, clues = await _fetch_platforms(
                                 bg_set, CHANNEL_DELTA_LIMIT, bg_errors
                             )
                             for label in bg_set:
                                 _persist_platform(
                                     label,
                                     [v for v in items if v.get("platform") == label],
+                                    clues.get(label),
                                 )
                             asyncio.create_task(_warm_youtube_previews(
                                 [v for v in items if v.get("platform") == "YouTube"]

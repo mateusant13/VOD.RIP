@@ -287,6 +287,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_kind_check_includes_stream(_conn)
             _ensure_channel_columns(_conn)
             _ensure_content_sha_column(_conn)
+            _ensure_channel_language_column(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_jobs_kind_events(_conn)
@@ -419,6 +420,19 @@ def _ensure_content_sha_column(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_videos_content_sha ON videos(content_sha256)"
     )
+
+
+def _ensure_channel_language_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.channel_language (per-channel language).
+
+    Owner of the per-channel language detection (WS-3): every video row of a
+    channel carries the channel's language ('pt'/'en'/'es'/raw code, NULL =
+    unknown). Populated at channel-fetch time from platform clues and by the
+    transcript-evidence aggregation (services/channel_language.py). Additive
+    only; PRAGMA table_info guard makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "channel_language" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN channel_language TEXT")
 
 
 def _ensure_lang_column(conn: sqlite3.Connection) -> None:
@@ -734,6 +748,104 @@ def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -
         params.append(channel)
     sql += " ORDER BY started_at DESC"
     return [dict(r) for r in query(sql, params)]
+
+
+# --- channel language (WS-3) ---------------------------------------------
+
+def set_channel_language(platform: str, channel: str, language: Optional[str]) -> None:
+    """Persist the per-channel language on every video row of the channel.
+
+    This is the single owner of the detected channel language — the API/UI
+    read it from videos.channel_language. Called by the platform-clue path
+    at fetch time and by the transcript aggregation (channel_language.py)."""
+    execute(
+        "UPDATE videos SET channel_language = ?, updated_at = updated_at "
+        "WHERE platform = ? AND lower(channel) = lower(?)",
+        (language, platform, channel),
+    )
+
+
+def video_channel(platform: str, video_id: str) -> Optional[str]:
+    """Channel slug of an archived video (None when the row is absent)."""
+    row = query(
+        "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return row[0]["channel"] if row else None
+
+
+def video_channel_language(platform: str, video_id: str) -> Optional[str]:
+    """Stored channel_language of the video's channel (None = unknown)."""
+    row = query(
+        "SELECT channel_language FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return row[0]["channel_language"] if row and row[0]["channel_language"] else None
+
+
+def channel_language_tally(platform: str, channel: str) -> list[dict]:
+    """Transcript-language evidence per channel: [{language, segments, videos}].
+
+    Whisper/YT-caption rows carry a per-segment lang tag (transcripts.lang);
+    the tally over all of a channel's transcribed sections is the empirical
+    language distribution the aggregation heuristic uses."""
+    return [
+        dict(r)
+        for r in query(
+            """SELECT t.lang AS language, COUNT(*) AS segments,
+                      COUNT(DISTINCT t.video_id) AS videos
+               FROM transcripts t
+               JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id
+               WHERE v.platform = ? AND lower(v.channel) = lower(?)
+                 AND t.lang IS NOT NULL AND t.lang != ''
+               GROUP BY t.lang
+               ORDER BY segments DESC""",
+            (platform, channel),
+        )
+    ]
+
+
+def channel_video_languages(platform: str, channel: str) -> list[dict]:
+    """Platform-clue evidence: distinct stored channel_language + row counts.
+
+    The clue fetch stamps videos.channel_language at channel-list refresh
+    time; the aggregation reads it back here to weigh clue vs tally."""
+    return [
+        dict(r)
+        for r in query(
+            """SELECT channel_language AS language, COUNT(*) AS videos
+               FROM videos
+               WHERE platform = ? AND lower(channel) = lower(?)
+                 AND channel_language IS NOT NULL AND channel_language != ''
+               GROUP BY channel_language
+               ORDER BY videos DESC""",
+            (platform, channel),
+        )
+    ]
+
+
+def channel_original_languages(platform: str, channel: str) -> Optional[list[dict]]:
+    """WS-4 clue: videos.original_language consensus, read DEFENSIVELY.
+
+    WS-4 (original titles) adds videos.original_language in parallel — the
+    column may not exist on this build, so the read is guarded by a PRAGMA
+    table_info check instead of crashing on sqlite3.OperationalError.
+    Returns None when the column is absent (no evidence)."""
+    cols = {row[1] for row in query("PRAGMA table_info(videos)")}
+    if "original_language" not in cols:
+        return None
+    return [
+        dict(r)
+        for r in query(
+            """SELECT original_language AS language, COUNT(*) AS videos
+               FROM videos
+               WHERE platform = ? AND lower(channel) = lower(?)
+                 AND original_language IS NOT NULL AND original_language != ''
+               GROUP BY original_language
+               ORDER BY videos DESC""",
+            (platform, channel),
+        )
+    ]
 
 
 # --- messages -------------------------------------------------------------
@@ -1672,7 +1784,7 @@ def _titles_search(
     q_tokens = [t for t in q_tokens if len(t) >= 3]
     if not q_tokens:
         return []
-    sql = "SELECT platform, video_id, channel, title, started_at AS date, kind AS video_kind FROM videos"
+    sql = "SELECT platform, video_id, channel, title, started_at AS date, kind AS video_kind, channel_language FROM videos"
     where: list[str] = []
     params: list[Any] = []
     if platforms:
@@ -1723,6 +1835,7 @@ def _titles_search(
             "title": title,
             "date": r["date"],
             "video_kind": r["video_kind"],
+            "channel_language": r["channel_language"],
             "_rowid": f"t:{r['platform']}:{r['video_id']}",
             "_raw": score,
         })
@@ -1756,7 +1869,7 @@ def _table_search(
         f"SELECT t.rowid AS _rowid, -bm25({fts}) AS score, "
         f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
         f"{langcol} AS lang, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind, v.channel_language AS channel_language "
         f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
         f"WHERE {fts} MATCH ?"
@@ -1803,6 +1916,7 @@ def _table_search(
             "title": r["title"],
             "date": r["date"],
             "video_kind": r["video_kind"],
+            "channel_language": r["channel_language"],
             "_rowid": r["_rowid"],
             "_raw": r["score"],  # pre-normalization -bm25; tie-breaker only
         }
@@ -1904,7 +2018,7 @@ def _phrase_span_rows(
     sql = (
         "SELECT t.rowid AS _rowid, t.platform, t.video_id, t.seg_idx, "
         "t.start_sec AS offset_sec, t.text, t.lang AS lang, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind, v.channel_language AS channel_language "
         "FROM transcripts t "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
         "WHERE 1=1"
@@ -1956,6 +2070,7 @@ def _phrase_span_rows(
                     "title": a["title"],
                     "date": a["date"],
                     "video_kind": a["video_kind"],
+                    "channel_language": a["channel_language"],
                     "_rowid": a["_rowid"],
                     "_raw": 1.0,
                 }
@@ -2008,7 +2123,7 @@ def _semantic_search(
     sql = (
         "SELECT t.id AS transcript_id, t.platform, t.video_id, t.start_sec, "
         "t.text, t.lang AS lang, e.vec AS vec, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind, v.channel_language AS channel_language "
         "FROM transcripts t "
         "LEFT JOIN transcript_embeddings e ON e.transcript_id = t.id "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
@@ -2067,6 +2182,7 @@ def _semantic_search(
             "title": r["title"],
             "date": r["date"],
             "video_kind": r["video_kind"],
+            "channel_language": r["channel_language"],
             "semantic": True,
         })
         if len(out) >= max(fetch * 3, 3):

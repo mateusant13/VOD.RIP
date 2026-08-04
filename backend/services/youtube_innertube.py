@@ -681,6 +681,29 @@ def _created_at_from_player_data(data: dict) -> Optional[str]:
     return None
 
 
+def _language_from_player_data(data: dict) -> Optional[str]:
+    """Audio language of a player response (≈ Data API defaultAudioLanguage).
+
+    The player response has no defaultAudioLanguage field; the audio track
+    language lives on captionTracks entries whose vssId is 'a.<lang>'
+    (auto-dubbed/translated tracks are 'a.<lang>.<kind>' — skipped). When no
+    audio track is listed, the first caption track's languageCode is the
+    closest proxy. Returns a lowercase ISO-ish code or None."""
+    caps = (data.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}
+    tracks = caps.get("captionTracks") or []
+    for t in tracks:
+        vss = str(t.get("vssId") or "")
+        if vss.startswith("a.") and "." not in vss[len("a."):]:
+            code = t.get("languageCode")
+            if code:
+                return str(code).strip().lower() or None
+    for t in tracks:
+        code = t.get("languageCode")
+        if code:
+            return str(code).strip().lower() or None
+    return None
+
+
 def _info_from_player_data(
     data: dict,
     video_id: str,
@@ -732,6 +755,8 @@ def _info_from_player_data(
         "extractor": "youtube",
         "formats": formats,
         "http_headers": dict(_STREAM_HEADERS),
+        # WS-3 platform clue: audio language from the caption track list.
+        "language": _language_from_player_data(data),
     }
 
 
@@ -1027,6 +1052,51 @@ def innertube_video_row_metadata(
     if not out:
         return None
     return out
+
+
+def innertube_video_language(
+    video_id: str,
+    session: Optional["YouTubeSession"] = None,
+    read_timeout: float = 3.0,
+) -> Optional[str]:
+    """Audio language clue for one video (WS-3, no API key).
+
+    Reuses the existing innertube multi-profile race: the language comes
+    from captionTracks' audio-track vssId, so playability failures on one
+    profile fall through to the next. Best-effort — returns None on any
+    failure."""
+    if session is None:
+        from services.youtube_session import youtube_session_from_settings
+        session = youtube_session_from_settings(video_id=video_id)
+    for name in ("IOS", "ANDROID", "WEB", "WEB_SAFARI"):
+        profile = _PROFILE_BY_NAME.get(name)
+        if not profile:
+            continue
+        try:
+            data, _status, _kind = _player_request(
+                video_id, profile, read_timeout, session=session,
+            )
+        except Exception:
+            continue
+        if not data:
+            continue
+        lang = _language_from_player_data(data)
+        if lang:
+            return lang
+    return None
+
+
+def innertube_channel_language(video_ids: list[str]) -> Optional[str]:
+    """Language clue for a YouTube channel: probe its newest videos' audio.
+
+    Tries up to 3 of the newest video ids (the channel's current language is
+    best reflected by recent uploads) and returns the first language found.
+    Best-effort; [] input yields None."""
+    for vid in (video_ids or [])[:3]:
+        lang = innertube_video_language(vid)
+        if lang:
+            return lang
+    return None
 
 
 def _ensure_info_created_at(
