@@ -30,6 +30,7 @@ import {
   isHiddenChannelPlatformError,
   syncDurationFromPreviewSession,
   videoInfoDurationSec,
+  displayTitle,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
@@ -595,6 +596,23 @@ describe('videoInfoDurationSec', () => {
   it('returns 0 when duration unknown', () => {
     expect(videoInfoDurationSec(null)).toBe(0);
     expect(videoInfoDurationSec({ title: 'x' } as VideoInfo)).toBe(0);
+  });
+});
+
+describe('displayTitle', () => {
+  it('prefers the original (non-translated) title when present', () => {
+    expect(displayTitle({ title: 'The END of Physical Media on PlayStation | Gaveta', originalTitle: 'O FIM da Mídia Física no Playstation | Gaveta' }))
+      .toBe('O FIM da Mídia Física no Playstation | Gaveta');
+  });
+  it('falls back to the stored title when no original exists', () => {
+    expect(displayTitle({ title: 'The END of Physical Media on PlayStation | Gaveta' }))
+      .toBe('The END of Physical Media on PlayStation | Gaveta');
+  });
+  it('handles whitespace-only original titles and nulls', () => {
+    expect(displayTitle({ title: '   ', originalTitle: '  ' })).toBe('Untitled');
+    expect(displayTitle(null)).toBe('Untitled');
+    expect(displayTitle(undefined)).toBe('Untitled');
+    expect(displayTitle({ title: 'Real Title' })).toBe('Real Title');
   });
 });
 

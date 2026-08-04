@@ -1029,6 +1029,88 @@ def innertube_video_row_metadata(
     return out
 
 
+def _original_language_from_player(data: Optional[dict]) -> Optional[str]:
+    """Original (non-translated) audio language from a player response.
+
+    captionTracks.defaultTranslationSourceTrackIndices points at the tracks
+    that YouTube generates translations FROM — i.e. the original-language
+    caption(s). Fall back to the first track when the field is absent.
+    Returns a lowercase 2-letter code ('pt', 'en', ...) or None when the
+    response carries no caption tracks (age-gated/member-only/offline)."""
+    tr = ((data or {}).get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}
+    tracks = tr.get("captionTracks") or []
+    if not tracks:
+        return None
+    src = tr.get("defaultTranslationSourceTrackIndices") or []
+    idx = src[0] if src else None
+    if idx is None or not (0 <= idx < len(tracks)):
+        idx = 0
+    code = str(tracks[idx].get("languageCode") or "").strip().lower().split("-")[0]
+    return code if re.fullmatch(r"[a-z]{2}", code) else None
+
+
+def innertube_original_meta(
+    video_id: str,
+    *,
+    read_timeout: float = 4.0,
+) -> Optional[dict[str, Any]]:
+    """Original (non-auto-translated) title + language for one YouTube video.
+
+    Source decision (WS-4, verified on real gaveta/mandiocaa/srdoglol videos
+    whose stored titles are English-translated):
+      1. InnerTube player with NO hl/gl (the repo's production fetch —
+         _enrich_client_context strips hl/gl; forcing en/US is exactly what
+         triggers translated titles). Returns the authored title for the
+         serving language.  CHOSEN.
+      2. yt-dlp --extractor-args "youtube:lang=pt" / hl param — REJECTED: the
+         player endpoint ignores hl (verified: lang en/pt/None all return the
+         same title; only the browse/playlist endpoints honor it, and those
+         only cover the most recent ~300 videos per channel walk).
+      3. YouTube Data API videos.list?part=snippet (defaultAudioLanguage /
+         defaultLanguage) — REJECTED: needs an API key with quota; the repo
+         only has the public InnerTube web key (AIzaSyAO_...) which is not
+         authorized for the v3 endpoint.
+    Language: _original_language_from_player (defaultTranslationSourceTrack
+    Indices -> captionTracks), verified pt for PT channels and en for EN
+    channels (e.g. Rick Astley).
+
+    Returns {"title": str|None, "language": str|None} or None when every
+    client request failed. The title is the player's serving-language copy:
+    it equals the ORIGINAL title only when the serving language matches the
+    video's original language — backfill_original_titles enforces that with
+    the language field. ponytail: a viewer whose IP language differs from the
+    video's original gets a translated title here; upgrade path = per-video
+    watch-page fetch with hl=<language> (the only endpoint that localizes
+    per video, at the cost of a ~1.4 MB page)."""
+    title: Optional[str] = None
+    language: Optional[str] = None
+    for name in ("IOS", "ANDROID", "WEB"):
+        profile = _PROFILE_BY_NAME.get(name)
+        if profile is None:
+            continue
+        try:
+            data, _status, _kind = _player_request(
+                video_id, profile, read_timeout, session=None
+            )
+        except Exception as exc:
+            logger.debug("original-meta %s request failed %s: %s", name, video_id, exc)
+            continue
+        if not data:
+            continue
+        if title is None:
+            details = data.get("videoDetails") or {}
+            t = details.get("title")
+            if isinstance(t, str) and t.strip():
+                title = t
+        if language is None:
+            language = _original_language_from_player(data)
+        if title is not None and language is not None:
+            break
+    if title is None and language is None:
+        return None
+    return {"title": title, "language": language}
+
+
 def _ensure_info_created_at(
     info: Optional[dict[str, Any]],
     video_id: str,
@@ -1249,3 +1331,25 @@ assert innertube_last_playability(None) == ("", "", "")
 assert innertube_last_playability("unknown0000") == ("", "", "")
 assert _profiles_for_session(None)[0].name == "WEB_SAFARI"
 assert "WEB_SAFARI" in _PROFILE_BY_NAME
+# WS-4 original-language rule: the translation-source track wins over track
+# order; en-US normalizes to en; empty/absent captions yield None.
+_orig_lang_pt = {
+    "captions": {
+        "playerCaptionsTracklistRenderer": {
+            "captionTracks": [{"languageCode": "pt", "vssId": "a.pt", "kind": "asr"}],
+            "defaultTranslationSourceTrackIndices": [0],
+        }
+    }
+}
+assert _original_language_from_player(_orig_lang_pt) == "pt"
+assert _original_language_from_player({
+    "captions": {"playerCaptionsTracklistRenderer": {"captionTracks": [
+        {"languageCode": "en-US", "vssId": "a.en-US", "kind": "asr"},
+        {"languageCode": "pt", "vssId": "a.pt", "kind": "asr"},
+    ], "defaultTranslationSourceTrackIndices": [1]}}
+}) == "pt", "translation-source index must win over track order"
+assert _original_language_from_player({"captions": {"playerCaptionsTracklistRenderer": {"captionTracks": [
+    {"languageCode": "en", "vssId": ".en", "kind": "standard"},
+]}}}) == "en", "missing source indices fall back to the first track"
+assert _original_language_from_player({}) is None
+assert _original_language_from_player(None) is None

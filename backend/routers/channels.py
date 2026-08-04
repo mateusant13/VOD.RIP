@@ -576,7 +576,12 @@ async def channel_videos(
             return {
                 "id": vid,
                 "platform": label,
-                "title": r.get("title") or "Untitled",
+                # WS-4: prefer the original (non-auto-translated) title; the
+                # raw fields stay in the payload for the UI preference helper
+                # and for WS-3's channel-language detection.
+                "title": r.get("original_title") or r.get("title") or "Untitled",
+                "original_title": r.get("original_title"),
+                "original_language": r.get("original_language"),
                 "duration": r.get("duration_sec"),
                 "duration_string": r.get("duration_string"),
                 "created_at": r.get("started_at"),
@@ -619,6 +624,7 @@ async def channel_videos(
 
         # Merge fetched (wins) over accumulated index rows, keyed per
         # (platform label, video id).
+        _overlay_original_titles(fetched, index_by_platform)
         merged: dict[tuple, dict] = {
             (str(v.get("platform") or ""), str(v.get("id") or "")): v for v in fetched
         }
@@ -657,6 +663,12 @@ async def channel_videos(
         }
         if fetched:
             asyncio.create_task(_warm_youtube_previews(fetched))
+        if any(v.get("platform") == "YouTube" for v in fetched):
+            # WS-4: after the walk, backfill original (non-translated) titles
+            # for this channel's rows that still lack them (new rows at
+            # ingest + legacy rows alike). Throttled inside the backfill;
+            # rows with fake/non-YouTube ids are skipped without any fetch.
+            asyncio.create_task(_run_original_backfill(channel))
         # Never cache the refreshing flag: L1 hits within 300s must not keep
         # scheduling follow-up refreshes.
         _cache_channel_payload(cache_key, {**payload, "refreshing": False})
@@ -684,6 +696,8 @@ async def channel_videos(
                             asyncio.create_task(_warm_youtube_previews(
                                 [v for v in items if v.get("platform") == "YouTube"]
                             ))
+                            if any(v.get("platform") == "YouTube" for v in items):
+                                asyncio.create_task(_run_original_backfill(channel))
                         except Exception:
                             logger.debug(
                                 "background channel delta refresh failed", exc_info=True
@@ -799,3 +813,56 @@ async def _warm_youtube_previews(videos: list[dict]) -> None:
             kickoff_youtube_batch_warm(url, prefer_height=360)
         except Exception as exc:
             logger.debug("YouTube preview warm failed for %s: %s", url[:50], exc)
+
+
+_original_backfill_inflight: set[str] = set()
+_original_backfill_lock = asyncio.Lock()
+
+
+def _overlay_original_titles(fetched: list[dict], index_by_platform: dict[str, list[dict]]) -> None:
+    """WS-4: give fresh walk items their backfilled original title/language.
+
+    The yt-dlp walk itself does not carry original_title (it serves the
+    hl-localized copy), but a previous sync's backfill may have stored it in
+    the index row. Fetched items win the merge, so the original must be
+    copied onto them here — otherwise a fresh walk would surface the
+    translated title again until the next backfill round."""
+    if not fetched:
+        return
+    by_id: dict[str, dict] = {}
+    for r in index_by_platform.get("youtube", []):
+        by_id[str(r.get("video_id") or "")] = r
+    for v in fetched:
+        if v.get("platform") != "YouTube":
+            continue
+        r = by_id.get(str(v.get("id") or ""))
+        if not r or not r.get("original_title"):
+            continue
+        v["original_title"] = r["original_title"]
+        v["original_language"] = r.get("original_language")
+        # The walk title is the hl-localized copy — the backfilled original
+        # wins the payload `title` too (same rule as _row_to_payload_item).
+        v["title"] = r["original_title"]
+
+
+async def _run_original_backfill(channel: str) -> None:
+    """Fire-and-forget WS-4 backfill on the shared channel executor.
+
+    Lazy import keeps the heavy yt_dlp module out of the hot route import
+    path; one in-flight round per channel. The backfill itself throttles and
+    skips recently-failed videos, so a busy channel never hammers YouTube."""
+    async with _original_backfill_lock:
+        if channel in _original_backfill_inflight:
+            return
+        _original_backfill_inflight.add(channel)
+    try:
+        from services.archive_ytdlp import backfill_original_titles
+
+        await asyncio.get_running_loop().run_in_executor(
+            CHANNEL_EXECUTOR, backfill_original_titles, channel
+        )
+    except Exception as exc:
+        logger.debug("original-title backfill failed for %s: %s", channel, exc)
+    finally:
+        async with _original_backfill_lock:
+            _original_backfill_inflight.discard(channel)

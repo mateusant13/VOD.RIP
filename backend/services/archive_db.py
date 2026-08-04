@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS videos (
   -- SHA-256 of the archived media file bytes (content dedup: two rows may
   -- share one archive_path when their files are byte-identical).
   content_sha256 TEXT,
+  -- WS-4: original (non-auto-translated) YouTube title + its language.
+  -- YouTube localizes titles to the viewer's hl (the channel walk's yt-dlp
+  -- default is en), so `title` may hold an auto-translated English copy for
+  -- PT channels; original_title is captured from an hl-free InnerTube player
+  -- fetch (youtube_innertube.innertube_original_meta) and preferred for
+  -- display. NULL until backfilled; original_language feeds WS-3 detection.
+  original_title TEXT,
+  original_language TEXT,
   status        TEXT NOT NULL DEFAULT 'known'
                 CHECK (status IN ('known','downloading','ready','failed')),
   kind          TEXT NOT NULL DEFAULT 'vod'
@@ -190,7 +198,6 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at);
 
 -- Per-channel/platform last-refresh time for the channel VOD index. The
 -- videos table accumulates fetched channel lists forever (upsert-only);
@@ -284,6 +291,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_kind_check_includes_stream(_conn)
             _ensure_channel_columns(_conn)
             _ensure_content_sha_column(_conn)
+            _ensure_original_columns(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_jobs_kind_events(_conn)
@@ -418,6 +426,27 @@ def _ensure_content_sha_column(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_original_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.original_title / original_language.
+
+    WS-4: YouTube localizes titles to the viewer's hl (the channel walk's
+    yt-dlp default is en), so the stored title of a PT channel may be an
+    auto-translated English copy. These columns hold the original
+    (hl-free fetch) title and its caption-derived language. Plain nullable
+    TEXT columns — ALTER ADD COLUMN matches _ensure_channel_columns; the
+    table-rebuild pattern (_ensure_kind_check_includes_stream) is only
+    needed when a CHECK constraint must widen, which is not the case here.
+    The rebuild runs BEFORE this migration in get_conn, so its
+    `INSERT INTO videos SELECT * FROM videos_old` never sees the new
+    columns at a different position. PRAGMA table_info guard makes
+    repeated calls (re-imports, reloads) no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "original_title" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN original_title TEXT")
+    if "original_language" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN original_language TEXT")
+
+
 def _ensure_lang_column(conn: sqlite3.Connection) -> None:
     """Idempotent migration: add transcripts.lang (subtitle/whisper language).
 
@@ -486,9 +515,17 @@ def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
     NOT NULL DEFAULT column): rename -> create -> copy -> drop. Legacy rows
     copy with priority=0; the rebuild DDL is the final shape (wider kind
     CHECK included), so a DB lacking both columns converges in two rebuilds
-    and the (status, priority, created_at) index replaces the old one."""
+    and the (status, priority, created_at) index replaces the old one.
+    The index is created HERE (after any rebuild) and NOT in SCHEMA: on a
+    pre-priority archive_jobs, SCHEMA's unconditional CREATE INDEX would
+    fail with 'no such column: priority' before this migration could run —
+    that is exactly the DB shape the real %APPDATA% archive.db has."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
     if "priority" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority "
+            "ON archive_jobs(status, priority, created_at)"
+        )
         return
     conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
     conn.execute(
@@ -621,16 +658,19 @@ def upsert_video(video: dict) -> None:
         "archive_path": video.get("archive_path"),
         "canonical_key": video.get("canonical_key"),
         "content_sha256": video.get("content_sha256"),
+        "original_title": video.get("original_title"),
+        "original_language": video.get("original_language"),
         "status": video.get("status", "known"),
         "updated_at": now,
     }
     execute(
         """INSERT INTO videos (platform, video_id, channel, title, started_at,
            ended_at, duration_sec, archive_path, canonical_key, content_sha256,
-           status, kind, created_at, updated_at)
+           original_title, original_language, status, kind, created_at, updated_at)
            VALUES (:platform, :video_id, :channel, :title, :started_at,
            :ended_at, :duration_sec, :archive_path, :canonical_key,
-           :content_sha256, :status, :kind, :created_at, :updated_at)
+           :content_sha256, :original_title, :original_language, :status, :kind,
+           :created_at, :updated_at)
            ON CONFLICT(platform, video_id) DO UPDATE SET
              channel=excluded.channel, title=excluded.title,
              started_at=excluded.started_at, ended_at=excluded.ended_at,
@@ -640,6 +680,10 @@ def upsert_video(video: dict) -> None:
              -- Derived, ingest-owned state: an absent dict key must never
              -- NULL out a stored hash (metadata refreshes, re-ingests).
              content_sha256=COALESCE(excluded.content_sha256, videos.content_sha256),
+             -- WS-4: same preserve rule — a channel-walk upsert that does
+             -- not know the original title must not clobber a backfilled one.
+             original_title=COALESCE(excluded.original_title, videos.original_title),
+             original_language=COALESCE(excluded.original_language, videos.original_language),
              status=excluded.status, kind=excluded.kind,
              updated_at=excluded.updated_at""",
         {**row, "created_at": now},
@@ -666,22 +710,29 @@ def upsert_channel_video(video: dict) -> None:
         "duration_string": video.get("duration_string"),
         "views": video.get("views"),
         "thumbnail_url": video.get("thumbnail_url"),
+        "original_title": video.get("original_title"),
+        "original_language": video.get("original_language"),
         "updated_at": now,
     }
     execute(
         """INSERT INTO videos (platform, video_id, channel, title, started_at,
            duration_sec, duration_string, views, thumbnail_url, kind,
-           created_at, updated_at)
+           original_title, original_language, created_at, updated_at)
            VALUES (:platform, :video_id, :channel, :title, :started_at,
            :duration_sec, :duration_string, :views, :thumbnail_url, :kind,
-           :created_at, :updated_at)
+           :original_title, :original_language, :created_at, :updated_at)
            ON CONFLICT(platform, video_id) DO UPDATE SET
              channel=excluded.channel, title=excluded.title,
              started_at=excluded.started_at,
              duration_sec=excluded.duration_sec,
              duration_string=excluded.duration_string,
              views=excluded.views, thumbnail_url=excluded.thumbnail_url,
-             kind=excluded.kind, updated_at=excluded.updated_at""",
+             kind=excluded.kind,
+             -- WS-4: an absent original key (plain list refresh) must never
+             -- clobber a backfilled original title/language.
+             original_title=COALESCE(excluded.original_title, videos.original_title),
+             original_language=COALESCE(excluded.original_language, videos.original_language),
+             updated_at=excluded.updated_at""",
         {**row, "created_at": now},
     )
 
@@ -726,6 +777,42 @@ def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -
         params.append(channel)
     sql += " ORDER BY started_at DESC"
     return [dict(r) for r in query(sql, params)]
+
+
+def videos_missing_original_title(platform: str, channel: str, limit: int) -> list[dict]:
+    """YouTube rows for a channel still lacking original_title (WS-4 backfill).
+
+    Newest first; the caller (archive_ytdlp.backfill_original_titles) applies
+    its own throttle + failure cooldown on top."""
+    rows = query(
+        """SELECT video_id, title FROM videos
+           WHERE platform = ? AND channel = ? AND (original_title IS NULL OR original_title = '')
+           ORDER BY started_at DESC LIMIT ?""",
+        (platform, channel, max(1, int(limit))),
+    )
+    return [dict(r) for r in rows]
+
+
+def set_original_title(
+    platform: str,
+    video_id: str,
+    original_title: Optional[str],
+    original_language: Optional[str],
+) -> None:
+    """Store the WS-4 original title/language for one video.
+
+    COALESCE keeps existing values, so a caller that only knows one of the
+    two fields (e.g. the language without a trustworthy title) never wipes
+    the other. Stored `title` is deliberately NOT touched — display paths
+    prefer original_title, the archive keeps the walk-time copy."""
+    execute(
+        """UPDATE videos
+           SET original_title = COALESCE(?, original_title),
+               original_language = COALESCE(?, original_language),
+               updated_at = ?
+           WHERE platform = ? AND video_id = ?""",
+        (original_title, original_language, _now_iso(), platform, video_id),
+    )
 
 
 # --- messages -------------------------------------------------------------
@@ -1614,7 +1701,8 @@ def _titles_search(
     q_tokens = [t for t in q_tokens if len(t) >= 3]
     if not q_tokens:
         return []
-    sql = "SELECT platform, video_id, channel, title, started_at AS date, kind AS video_kind FROM videos"
+    sql = ("SELECT platform, video_id, channel, title, original_title, "
+           "started_at AS date, kind AS video_kind FROM videos")
     where: list[str] = []
     params: list[Any] = []
     if platforms:
@@ -1641,8 +1729,12 @@ def _titles_search(
         sql += " WHERE " + " AND ".join(where)
     out: list[dict] = []
     for r in query(sql, params):
+        # Matching folds BOTH titles: the stored copy (what the walk saw) and
+        # the WS-4 original (what the channel actually titled the video) —
+        # "fim" finds "The END of Physical Media…" via "O FIM da Mídia…".
         title = str(r["title"] or "")
-        toks = _fold_tokens(title)
+        original = str(r["original_title"] or "")
+        toks = _fold_tokens(f"{title} {original}")
         if not toks:
             continue
         matched = sum(
@@ -1653,16 +1745,17 @@ def _titles_search(
         if not matched:
             continue
         score = matched / len(q_tokens)
+        display = original or title
         out.append({
             "kind": "title",
             "platform": r["platform"],
             "video_id": r["video_id"],
             "offset_sec": 0,
-            "text": title,
+            "text": display,
             "score": score,
             "lang": None,
             "channel": r["channel"],
-            "title": title,
+            "title": display,
             "date": r["date"],
             "video_kind": r["video_kind"],
             "_rowid": f"t:{r['platform']}:{r['video_id']}",
@@ -1698,7 +1791,11 @@ def _table_search(
         f"SELECT t.rowid AS _rowid, -bm25({fts}) AS score, "
         f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
         f"{langcol} AS lang, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, "
+        # WS-4: hit titles display the original (non-translated) YouTube
+        # title when the backfill stored one; content matching is on t.text.
+        "COALESCE(NULLIF(v.original_title, ''), v.title) AS title, "
+        "v.started_at AS date, v.kind AS video_kind "
         f"FROM {fts} f JOIN {src} t ON t.id = f.rowid "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
         f"WHERE {fts} MATCH ?"
@@ -1846,7 +1943,9 @@ def _phrase_span_rows(
     sql = (
         "SELECT t.rowid AS _rowid, t.platform, t.video_id, t.seg_idx, "
         "t.start_sec AS offset_sec, t.text, t.lang AS lang, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, "
+        "COALESCE(NULLIF(v.original_title, ''), v.title) AS title, "
+        "v.started_at AS date, v.kind AS video_kind "
         "FROM transcripts t "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
         "WHERE 1=1"
@@ -1950,7 +2049,9 @@ def _semantic_search(
     sql = (
         "SELECT t.id AS transcript_id, t.platform, t.video_id, t.start_sec, "
         "t.text, t.lang AS lang, e.vec AS vec, "
-        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "v.channel, "
+        "COALESCE(NULLIF(v.original_title, ''), v.title) AS title, "
+        "v.started_at AS date, v.kind AS video_kind "
         "FROM transcripts t "
         "LEFT JOIN transcript_embeddings e ON e.transcript_id = t.id "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "

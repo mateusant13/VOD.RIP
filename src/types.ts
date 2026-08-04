@@ -59,6 +59,9 @@ export interface ChannelVideo {
   content_kind?: 'vod' | 'clip' | 'stream';
   /** yt-dlp availability — 'subscriber_only' marks members-only rows (no preview possible). */
   availability?: string | null;
+  /** WS-4: original (non-auto-translated) YouTube title + its language. */
+  original_title?: string | null;
+  original_language?: string | null;
 }
 
 export interface ListedChannelVideo extends ChannelVideo {
