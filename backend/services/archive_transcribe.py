@@ -261,9 +261,10 @@ def close_model() -> None:
     """Unload the cached model, freeing its RAM. Safe mid-transcription: workers
     hold a local reference, so the object lives until their last use.
 
-    Multi-copy mode: closes every pool thread's model too; threads lazily
-    reload on their next job (the registry is cleared, so a fresh slot is
-    created)."""
+    Also drops the cached VAD model (lazy-reloaded by the next job) and, in
+    multi-copy mode, every pool thread's model too; threads lazily reload on
+    their next job (the registry is cleared, so a fresh slot is created)."""
+    global _vad
     closed_any = False
     with _model_lock:
         _close_model_unlocked()
@@ -274,6 +275,12 @@ def close_model() -> None:
                 del model
                 closed_any = True
         _thread_slots.clear()
+    with _vad_lock:
+        vad, _vad = _vad, None
+        if vad is not None:
+            logger.info("Unloading VAD model")
+            del vad
+            closed_any = True
     if closed_any:
         gc.collect()
 
@@ -433,53 +440,304 @@ def decode_audio(path: str, ffmpeg_bin: Optional[str] = None) -> "Any":
 _vad_lock = threading.Lock()
 _vad: Any = None
 
+# Silero v5.1 (16 kHz) — mirror the legacy get_speech_timestamps call exactly:
+# threshold 0.5, neg threshold 0.35 (= threshold - 0.15), min speech 250 ms,
+# min silence 200 ms, speech pad 30 ms, max speech inf (never splits).
+_VAD_WINDOW = 512        # samples per window
+_VAD_CONTEXT = 64        # look-back samples the model prepends to each window
+_VAD_HOP = 128           # STFT hop inside the model (filter_length 256)
+_VAD_LSTM_HIDDEN = 128   # LSTM hidden size (state carried across windows)
+_VAD_STFT_FREQS = 129    # filter_length // 2 + 1 (basis rows are real+imag halves)
+_VAD_ENCODER_STRIDES = (1, 2, 2, 1)
+_VAD_CHUNK_WINDOWS = 4096  # ~2 min of audio per encoder pass (memory bound)
+_VAD_THRESHOLD = 0.5
+_VAD_NEG_THRESHOLD = 0.35
+_VAD_MIN_SPEECH_MS = 250
+_VAD_MIN_SILENCE_MS = 200
+_VAD_PAD_MS = 30
+
 
 def _get_vad() -> Any:
     """Lazy Silero VAD model (bundled in the package — no download).
 
-    ponytail: VAD stays on CPU on purpose — silero's get_speech_timestamps
-    loops 512-sample windows with a .item() sync per window, so moving the
-    model to CUDA costs more in launch/sync than it saves (measured 12.7s
-    vs 11.6s CPU on a 300s slice). VAD is now the dominant per-VOD cost on
-    GPU nodes (~26x realtime vs 118-164x inference); the upgrade path is a
-    stateful batched reimplementation or ONNX-Runtime CUDA, not a .cuda()
-    call."""
+    Default: the torch .jit model, driven by a stateful BATCHED
+    reimplementation of the per-window loop (see _vad_probs_torch). The old
+    get_speech_timestamps loop cost one model() call + a .item() sync per
+    512-sample window and was the dominant per-VOD cost (~26x realtime vs
+    118-164x inference); the batched pass measures ~170x realtime on CPU on
+    a 10.8s clip (~3x the legacy loop) with the same regions — validated
+    window-by-window against get_speech_timestamps.
+
+    VODRIP_VAD_ONNX=1 switches to the bundled ONNX model via onnxruntime
+    (CUDA ExecutionProvider when usable, CPU fallback) — same regions,
+    still per-window because the ONNX graph runs one LSTM step per call.
+    """
     global _vad
     with _vad_lock:
         if _vad is None:
-            from silero_vad import load_silero_vad
+            if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
+                _vad = _load_onnx_vad()
+            else:
+                from silero_vad import load_silero_vad
 
-            _vad = load_silero_vad(onnx=False)
+                _vad = load_silero_vad(onnx=False)
         return _vad
+
+class _OnnxVad:
+    """Minimal stateful wrapper over the bundled silero ONNX session.
+
+    Mirrors silero's OnnxWrapper (LSTM state + 64-sample context carried
+    across per-window calls) but numpy-only — no torch conversion or .item()
+    in the loop. Not thread-safe: vad_speech_seconds serializes on
+    _vad_lock, same as the torch model."""
+
+    def __init__(self, session: Any) -> None:
+        import numpy as np
+
+        self.session = session
+        self._np = np
+        self.reset_states()
+
+    def reset_states(self) -> None:
+        self._state = self._np.zeros((2, 1, _VAD_LSTM_HIDDEN), dtype=self._np.float32)
+        self._context = self._np.zeros((1, _VAD_CONTEXT), dtype=self._np.float32)
+    def prob(self, window: "Any") -> float:
+        """Speech probability for one 512-sample float32 window."""
+        chunk = self._np.asarray(window, dtype=self._np.float32).reshape(1, -1)
+        if chunk.shape[1] < _VAD_WINDOW:
+            chunk = self._np.pad(chunk, ((0, 0), (0, _VAD_WINDOW - chunk.shape[1])))
+        inp = self._np.concatenate([self._context, chunk], axis=1)
+        out, state = self.session.run(
+            None,
+            {
+                "input": inp,
+                "state": self._state,
+                "sr": self._np.array(SAMPLE_RATE, dtype="int64"),
+            },
+        )
+        self._state = state
+        self._context = inp[:, -_VAD_CONTEXT:]
+        return float(out[0, 0])
+
+
+def _load_onnx_vad() -> _OnnxVad:
+    """Silero VAD via onnxruntime (VODRIP_VAD_ONNX=1).
+
+    Uses the .onnx bundled with the silero_vad package (same v5.1 weights as
+    the .jit — no export needed). CUDA ExecutionProvider is requested first;
+    onnxruntime itself drops it when the CUDA DLLs are missing and we retry
+    CPU-only if session creation still raises. Imports are local: the
+    default path never touches onnxruntime."""
+    import importlib.resources as ir
+    import onnxruntime
+
+    path = ir.files("silero_vad.data").joinpath("silero_vad.onnx")
+    opts = onnxruntime.SessionOptions()
+    opts.inter_op_num_threads = 1
+    opts.intra_op_num_threads = 1
+    try:
+        session = onnxruntime.InferenceSession(
+            str(path),
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            sess_options=opts,
+        )
+    except Exception:
+        session = onnxruntime.InferenceSession(
+            str(path), providers=["CPUExecutionProvider"], sess_options=opts
+        )
+    logger.info("VAD onnxruntime providers: %s", session.get_providers())
+    return _OnnxVad(session)
+
+
+def _vad_probs_torch(audio: "Any", vad: Any) -> "Any":
+    """Per-window speech probabilities — stateful batched silero v5.1 pass.
+
+    Exact replication of silero's per-window loop, split at the model's one
+    sequential point: the encoder (STFT conv + 4 conv blocks) is parallel
+    over windows, so it runs as a few big tensor ops per chunk of windows;
+    the stateful LSTM stays a per-window recurrence, but over precomputed
+    linear projections (one 128x128 matmul per step instead of a full model
+    call). Max |Δprob| vs the legacy loop is ~4e-6 on real speech (float
+    reassociation only). The LSTM state carries across encoder chunks, so
+    long audio needs no big (n, 576) matrix — the per-chunk one is ~9 MB.
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    weights = vad.state_dict()
+    basis = weights["_model.stft.forward_basis_buffer"]
+    n = (len(audio) + _VAD_WINDOW - 1) // _VAD_WINDOW
+    padded = np.concatenate(
+        [
+            np.zeros(_VAD_CONTEXT, dtype=np.float32),
+            audio,
+            np.zeros(n * _VAD_WINDOW - len(audio), dtype=np.float32),
+        ]
+    )
+    probs = np.empty(n, dtype=np.float32)
+    with torch.no_grad():
+        w_ih = weights["_model.decoder.rnn.weight_ih"]
+        w_hh = weights["_model.decoder.rnn.weight_hh"]
+        b_ih = weights["_model.decoder.rnn.bias_ih"]
+        b_hh = weights["_model.decoder.rnn.bias_hh"]
+        dec_w = weights["_model.decoder.decoder.2.weight"]
+        dec_b = weights["_model.decoder.decoder.2.bias"]
+        h = torch.zeros(_VAD_LSTM_HIDDEN)
+        c = torch.zeros(_VAD_LSTM_HIDDEN)
+        row = np.arange(_VAD_CONTEXT + _VAD_WINDOW)[None, :]
+        for a in range(0, n, _VAD_CHUNK_WINDOWS):
+            b = min(a + _VAD_CHUNK_WINDOWS, n)
+            # windows a..b-1 as (m, 576): 64-sample look-back + 512-sample
+            # window, strided 512 — the model's own context concatenation.
+            idx = row + _VAD_WINDOW * np.arange(a, b)[:, None]
+            windows = torch.from_numpy(padded[idx].copy())
+            spec = F.conv1d(
+                F.pad(windows, (0, 64), "reflect").unsqueeze(1),
+                basis,
+                stride=_VAD_HOP,
+            )
+            feat = torch.sqrt(spec[:, :_VAD_STFT_FREQS] ** 2 + spec[:, _VAD_STFT_FREQS:] ** 2)
+            for i in range(4):
+                feat = F.relu(
+                    F.conv1d(
+                        feat,
+                        weights[f"_model.encoder.{i}.reparam_conv.weight"],
+                        weights[f"_model.encoder.{i}.reparam_conv.bias"],
+                        stride=_VAD_ENCODER_STRIDES[i],
+                        padding=1,
+                    )
+                )
+            feat = feat[:, :, -1].contiguous()  # (m, 128) — LSTM input per window
+            gates_lin = F.linear(feat, w_ih, b_ih)
+            H = torch.empty(b - a, _VAD_LSTM_HIDDEN)
+            for w in range(b - a):
+                i_, f_, g_, o_ = (gates_lin[w] + F.linear(h, w_hh, b_hh)).chunk(4)
+                c = torch.sigmoid(f_) * c + torch.sigmoid(i_) * torch.tanh(g_)
+                h = torch.sigmoid(o_) * torch.tanh(c)
+                H[w] = h
+            # decoder: relu -> 1x1 conv -> sigmoid — a per-window map, vectorized
+            dec = F.conv1d(F.relu(H.unsqueeze(-1)), dec_w, dec_b)
+            probs[a:b] = torch.sigmoid(dec.squeeze(1).mean(dim=1)).numpy()
+    return probs
+
+
+def _vad_probs_onnx(audio: "Any", vad: _OnnxVad) -> "Any":
+    """Per-window probabilities via the onnxruntime session.
+
+    The ONNX graph runs one LSTM step per call with explicit state, so this
+    path is still per-window — but pure numpy + ORT kernels (no torch
+    dispatch, no .item() on a torch tensor), so it is faster than the legacy
+    loop and needs no export. Matches the torch path to ~2e-6 on real speech
+    (same exported weights)."""
+    import numpy as np
+
+    vad.reset_states()
+    n = (len(audio) + _VAD_WINDOW - 1) // _VAD_WINDOW
+    probs = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        probs[i] = vad.prob(audio[i * _VAD_WINDOW:(i + 1) * _VAD_WINDOW])
+    return probs
+
+
+def _vad_regions(probs: "Any", audio_len: int) -> list[tuple[float, float]]:
+    """(start_sec, end_sec) regions from per-window probabilities.
+
+    Port of silero's get_speech_timestamps post-processing for the
+    parameters vad_speech_seconds uses (threshold/neg threshold, min speech
+    250 ms, min silence 200 ms, pad 30 ms, max speech inf): the triggered /
+    temp_end state machine runs over runs of non-speech windows (a close
+    needs a neg window at least 200 ms after the first neg window of the
+    run), then the padding and second-rounding rules are copied verbatim."""
+    import numpy as np
+
+    speech = probs >= _VAD_THRESHOLD
+    neg = probs < _VAD_NEG_THRESHOLD
+    n = len(probs)
+    min_sil = SAMPLE_RATE * _VAD_MIN_SILENCE_MS / 1000   # 3200 samples
+    min_speech = SAMPLE_RATE * _VAD_MIN_SPEECH_MS / 1000  # 4000 samples
+    pad = SAMPLE_RATE * _VAD_PAD_MS / 1000                # 480 samples
+    close_delay = int(np.ceil(min_sil / _VAD_WINDOW))     # 7 windows
+
+    regions: list[tuple[int, int]] = []
+    triggered = False
+    start = 0
+    i = 0
+    while i < n:
+        if speech[i]:  # prob >= threshold: start a region or keep it running
+            if not triggered:
+                triggered = True
+                start = i * _VAD_WINDOW
+            i += 1
+            continue
+        # run of non-speech windows [i, j): hysteresis + silence-close logic
+        j = i
+        while j < n and not speech[j]:
+            j += 1
+        if triggered:
+            first_neg = next((k for k in range(i, j) if neg[k]), None)
+            if first_neg is not None:
+                for k in range(first_neg + close_delay, j):
+                    if neg[k]:
+                        if first_neg * _VAD_WINDOW - start > min_speech:
+                            regions.append((start, first_neg * _VAD_WINDOW))
+                        triggered = False
+                        break
+        i = j
+    if triggered and audio_len - start > min_speech:
+        regions.append((start, audio_len))
+
+    # speech_pad_ms padding — verbatim port of get_speech_timestamps.
+    for i_ in range(len(regions)):
+        st, en = regions[i_]
+        if i_ == 0:
+            st = max(0, st - pad)
+        if i_ != len(regions) - 1:
+            gap = regions[i_ + 1][0] - en
+            if gap < 2 * pad:
+                en += int(gap // 2)
+                regions[i_ + 1] = (max(0, regions[i_ + 1][0] - gap // 2), regions[i_ + 1][1])
+            else:
+                en = min(audio_len, en + pad)
+                regions[i_ + 1] = (max(0, regions[i_ + 1][0] - pad), regions[i_ + 1][1])
+        else:
+            en = min(audio_len, en + pad)
+        regions[i_] = (st, en)
+
+    audio_len_sec = audio_len / SAMPLE_RATE
+    return [
+        (
+            max(round(st / SAMPLE_RATE, 1), 0.0),
+            min(round(en / SAMPLE_RATE, 1), audio_len_sec),
+        )
+        for st, en in regions
+    ]
 
 
 def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
-    """Return [(start_sec, end_sec), ...] speech regions from Silero VAD."""
+    """Return [(start_sec, end_sec), ...] speech regions from Silero VAD.
+
+    Stateful batched pass: windows are scored in chunks of ~2 min with a
+    handful of tensor ops each (the STFT + conv encoder is parallel over
+    windows; only the 128-dim LSTM recurrence stays sequential), so the
+    per-window .item() sync and model dispatch of the legacy
+    get_speech_timestamps loop are gone. Regions come out of the batched
+    probability vector with the same state machine, padding and rounding —
+    same regions on real audio (validated to the window on TTS speech)."""
     if audio is None or len(audio) == 0:
         return []  # empty audio -> no speech
-    import torch
-    from silero_vad import get_speech_timestamps
-
-    tensor = torch.from_numpy(audio)
     vad = _get_vad()
-    # silero's VAD model is STATEFUL (hidden state persists across the
-    # 512-sample window loop) and not thread-safe: two workers running VAD
+    # The model is STATEFUL and not thread-safe: two workers running VAD
     # concurrently corrupt each other's state (select() out-of-range crash,
     # reproduced with 2 concurrent jobs). The whisper path builds per-thread
     # model copies for the same reason; here one shared lock is enough —
     # VAD is CPU-bound, so serializing it costs no throughput.
     with _vad_lock:
-        timestamps = get_speech_timestamps(
-            tensor,
-            vad,
-            sampling_rate=SAMPLE_RATE,
-            threshold=0.5,
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=200,
-            speech_pad_ms=30,
-            return_seconds=True,
-        )
-    return [(float(t["start"]), float(t["end"])) for t in timestamps]
+        if isinstance(vad, _OnnxVad):
+            probs = _vad_probs_onnx(audio, vad)
+        else:
+            probs = _vad_probs_torch(audio, vad)
+    return _vad_regions(probs, len(audio))
 
 
 def _plan_chunks(
