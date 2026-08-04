@@ -147,10 +147,11 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
              CHECK (status IN ('queued','running','done','failed')),
   progress   REAL NOT NULL DEFAULT 0,
   error      TEXT,
+  priority   INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON archive_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at);
 
 -- Per-channel/platform last-refresh time for the channel VOD index. The
 -- videos table accumulates fetched channel lists forever (upsert-only);
@@ -247,6 +248,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_jobs_kind_events(_conn)
+            _ensure_jobs_priority(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -436,6 +438,44 @@ def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
     )
     conn.execute("DROP TABLE archive_jobs_old")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON archive_jobs(status, created_at)")
+
+
+def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add archive_jobs.priority (preview-queue priority).
+
+    Same rebuild pattern as _ensure_jobs_kind_events (SQLite cannot ALTER a
+    NOT NULL DEFAULT column): rename -> create -> copy -> drop. Legacy rows
+    copy with priority=0; the rebuild DDL is the final shape (wider kind
+    CHECK included), so a DB lacking both columns converges in two rebuilds
+    and the (status, priority, created_at) index replaces the old one."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
+    if "priority" in cols:
+        return
+    conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
+    conn.execute(
+        """CREATE TABLE archive_jobs (
+             id         TEXT PRIMARY KEY,
+             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
+             platform   TEXT NOT NULL,
+             video_id   TEXT NOT NULL,
+             status     TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (status IN ('queued','running','done','failed')),
+             progress   REAL NOT NULL DEFAULT 0,
+             error      TEXT,
+             priority   INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at) "
+        "SELECT id, kind, platform, video_id, status, progress, error, 0, created_at, updated_at "
+        "FROM archive_jobs_old"
+    )
+    conn.execute("DROP TABLE archive_jobs_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
+    )
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -987,12 +1027,12 @@ def delete_video(platform: str, video_id: str) -> Optional[str]:
 
 # --- jobs -----------------------------------------------------------------
 
-def enqueue_job(job_id: str, kind: str, platform: str, video_id: str) -> None:
+def enqueue_job(job_id: str, kind: str, platform: str, video_id: str, *, priority: int = 0) -> None:
     now = _now_iso()
     execute(
         """INSERT INTO archive_jobs (id, kind, platform, video_id, status,
-           created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)""",
-        (job_id, kind, platform, video_id, now, now),
+           priority, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+        (job_id, kind, platform, video_id, priority, now, now),
     )
 
 
@@ -1014,7 +1054,10 @@ def update_job(job_id: str, *, status: Optional[str] = None,
 
 
 def list_jobs(limit: int = 50) -> list[dict]:
-    rows = query("SELECT * FROM archive_jobs ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = query(
+        "SELECT * FROM archive_jobs ORDER BY priority DESC, created_at ASC LIMIT ?",
+        (limit,),
+    )
     return [dict(r) for r in rows]
 
 

@@ -1596,7 +1596,7 @@ def _claim_next_job() -> Optional[dict]:
         """SELECT * FROM archive_jobs
            WHERE kind IN ('transcribe','events')
              AND (status = 'queued' OR (status = 'running' AND updated_at < ?))
-           ORDER BY created_at DESC
+           ORDER BY priority DESC, created_at ASC
            LIMIT 8""",
         (stale_cutoff,),
     )
