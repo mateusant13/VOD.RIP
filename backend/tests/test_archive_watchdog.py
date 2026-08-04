@@ -122,12 +122,15 @@ def test_capture_starts_rows_land_and_stream_end_closes_video():
         offsets = [r["offset_sec"] for r in rows]
         assert all(a <= b for a, b in zip(offsets, offsets[1:]))
 
-        # videos row: status 'known' + canonical_key
+        # videos row: status 'known' + canonical_key + live kind
         vids = archive_db.query("SELECT * FROM videos WHERE platform='twitch'")
         assert len(vids) == 1
         assert vids[0]["status"] == "known"
         assert vids[0]["canonical_key"] == "test-stream|2026-08-02"
         assert vids[0]["ended_at"] is None
+        # a capture is a live broadcast, never a default 'vod' row (the
+        # stale-kind bug that misclassified recorded broadcasts as uploads)
+        assert vids[0]["kind"] == "live"
 
         # stream ends -> capture stops, ended_at/duration_sec written
         live[0] = False
@@ -137,6 +140,8 @@ def test_capture_starts_rows_land_and_stream_end_closes_video():
         vids = archive_db.query("SELECT * FROM videos WHERE platform='twitch'")
         assert vids[0]["ended_at"] is not None
         assert vids[0]["duration_sec"] is not None and vids[0]["duration_sec"] > 0
+        # the stop upsert must not reset the kind back to 'vod'
+        assert vids[0]["kind"] == "live"
     finally:
         wd.stop_archive_watchdog()
 

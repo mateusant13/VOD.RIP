@@ -240,6 +240,11 @@ def _start_capture(channel: dict, platform: str, entry: dict, sink_factory) -> N
             "channel": slug,
             "title": title,
             "started_at": _iso_from_epoch_ms(start_ms),
+            # A capture IS a live broadcast — never default it to 'vod' (that
+            # misclassified 37 twitch-live-* rows and the titiltei stream row
+            # as regular uploads). Channel fetches re-classify ended captures
+            # (YouTube -> 'stream', Twitch/Kick -> 'vod').
+            "kind": "live",
             "status": "known",
             "canonical_key": canonical_key,
         })
@@ -268,6 +273,9 @@ def _stop_capture(cap: Capture, *, reason: str) -> None:
             "started_at": _iso_from_epoch_ms(cap.started_at_ts),
             "ended_at": _iso_from_epoch_ms(time.time() * 1000.0),
             "duration_sec": max((time.time() * 1000.0 - cap.started_at_ts) / 1000.0, 0.0),
+            # Keep the kind written at start; re-classification (stream/vod)
+            # is the channel fetch's job after the broadcast ends.
+            "kind": "live",
             "status": "known",
             "canonical_key": cap.canonical_key,
         })
