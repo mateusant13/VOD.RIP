@@ -112,7 +112,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
             setChannelOverridesText(e.target.value);
             setSettings({ ...settings, channel_asr_languages: Object.keys(parsed).length ? parsed : null });
           }}
-          placeholder={'titiltei = pt\nsrdogg = en\ngaveta = pt'}
+          placeholder={'titiltei = pt\nxqc = en\ngaveta = pt'}
           aria-label="per-channel captions language overrides"
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-xs focus:outline-none focus:border-white resize-y"
         />
