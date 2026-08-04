@@ -21,7 +21,8 @@ Design decisions:
     workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives each pool thread
     its own model so inference runs in parallel.
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
-    cpu/int8 (honest: this machine has no NVIDIA GPU, so real runs are CPU).
+    cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
+    so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
   * Default model 'large-v3-turbo'; override with env VODRIP_WHISPER_MODEL
     (e.g. 'freds0/distil-whisper-large-v3-ptbr' or 'small').
 
