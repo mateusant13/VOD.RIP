@@ -146,6 +146,8 @@ export interface ArchiveChatMessage {
   text: string;
   badges?: string | null;
   emotes?: string | null;
+  /** Platform chat username color (#RRGGBB); null = palette fallback. */
+  color?: string | null;
   ts?: string | null;
   /** Collapsed duplicate run length (1 = a single message, N = N identical). */
   spam_count?: number;

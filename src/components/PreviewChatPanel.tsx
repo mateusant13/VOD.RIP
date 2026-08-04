@@ -28,6 +28,7 @@ import {
 import { apiGet } from '../hooks/useApiClient';
 import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
+import { resolveChatColor } from '../chatColors';
 
 export interface PreviewPanelTranscriptRow {
   offset_sec: number;
@@ -38,6 +39,8 @@ export interface PreviewPanelChatRow {
   text: string;
   username: string;
   spam_count: number;
+  /** Platform-provided username color (#RRGGBB); null = palette fallback. */
+  color?: string | null;
 }
 export interface PreviewPanelPayload {
   transcript: PreviewPanelTranscriptRow[];
@@ -82,10 +85,12 @@ const TABS: ReadonlyArray<{
 const ChatRow = memo(function ChatRow({
   row,
   active,
+  platform,
   ref,
 }: {
   row: PreviewPanelChatRow;
   active: boolean;
+  platform: string | null;
   ref?: React.Ref<HTMLDivElement>;
 }) {
   return (
@@ -103,7 +108,12 @@ const ChatRow = memo(function ChatRow({
       <span className="text-zinc-600 font-mono text-[9px] shrink-0">
         {formatArchiveOffset(row.offset_sec)}
       </span>
-      <span className="text-zinc-200 font-bold text-[10px] shrink-0">{row.username}:</span>
+      <span
+        className="font-bold text-[10px] shrink-0"
+        style={{ color: resolveChatColor(row.color, row.username, platform) }}
+      >
+        {row.username}:
+      </span>
       <span className="text-[10px] leading-snug truncate" title={row.text}>
         {row.text}
       </span>
@@ -490,6 +500,7 @@ export function PreviewChatPanel({
                         key={idx}
                         row={row as PreviewPanelChatRow}
                         active={active}
+                        platform={platform}
                         ref={active ? activeRowRef : undefined}
                       />
                     ) : (

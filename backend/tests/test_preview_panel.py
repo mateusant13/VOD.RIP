@@ -117,7 +117,7 @@ async def test_panel_transcript_video_strict_shape_and_order():
         assert isinstance(row["text"], str) and row["text"]
     _assert_sorted(payload["transcript"], "offset_sec")
     for row in payload["chat"]:
-        assert set(row.keys()) == {"offset_sec", "text", "username", "spam_count"}
+        assert set(row.keys()) == {"offset_sec", "text", "username", "spam_count", "color"}
         assert isinstance(row["spam_count"], int) and row["spam_count"] >= 1
     _assert_sorted(payload["chat"], "offset_sec")
 

@@ -93,6 +93,28 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
+  it('colors usernames: platform color wins, palette fallback otherwise', async () => {
+    const colored: PreviewPanelPayload = {
+      ...PAYLOAD,
+      chat: [
+        // Platform-provided color (YouTube authorNameTextColor).
+        { offset_sec: 1, text: 'oi', username: 'alice', spam_count: 1, color: '#FF0033' },
+        // No stored color → deterministic palette by (username, platform).
+        { offset_sec: 3, text: 'olá', username: 'bob', spam_count: 1 },
+      ],
+    };
+    mockPanelFetch(colored);
+    render(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('oi')).toBeTruthy());
+    const alice = screen.getByText('alice:');
+    const bob = screen.getByText('bob:');
+    // jsdom normalizes hex to rgb().
+    expect(alice.getAttribute('style')).toContain('rgb(255, 0, 51)');
+    expect(bob.getAttribute('style')).toMatch(/color:\s*rgb\(/);
+    // The same user renders the same fallback color across renders.
+    expect(bob.getAttribute('style')).toBe(screen.getByText('bob:').getAttribute('style'));
+  });
+
   it('switches tabs: transcript rows, subtitles caption, chat empty state', async () => {
     mockPanelFetch(PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);

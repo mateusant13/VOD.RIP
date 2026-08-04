@@ -48,6 +48,7 @@ import {
   type ArchiveVideoRow,
 } from '../archiveSearchUtils';
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
+import { resolveChatColor } from '../chatColors';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -985,7 +986,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
               {groups.before.map((m) => (
                 <p key={`b:${m.offset_sec}:${m.username}:${m.text}`} className="text-[10px] leading-snug text-zinc-400 break-words">
                   <span className="text-zinc-600 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
-                  <span className="text-zinc-200 font-bold">{m.username}:</span> {m.text}
+                  <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
                   {typeof m.spam_count === 'number' && m.spam_count > 1 && (
                     <span className="text-[9px] font-mono text-zinc-600 ml-1" title={`${m.spam_count} identical messages collapsed`}>
                       ×{m.spam_count}
@@ -1005,7 +1006,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
               {groups.after.map((m) => (
                 <p key={`a:${m.offset_sec}:${m.username}:${m.text}`} className="text-[10px] leading-snug text-zinc-400 break-words">
                   <span className="text-zinc-600 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
-                  <span className="text-zinc-200 font-bold">{m.username}:</span> {m.text}
+                  <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
                   {typeof m.spam_count === 'number' && m.spam_count > 1 && (
                     <span className="text-[9px] font-mono text-zinc-600 ml-1" title={`${m.spam_count} identical messages collapsed`}>
                       ×{m.spam_count}

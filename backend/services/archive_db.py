@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS messages (
   badges     TEXT NOT NULL DEFAULT '[]',
   emotes     TEXT NOT NULL DEFAULT '[]',
   ts         TEXT,
+  -- Platform chat username color (#RRGGBB, NULL = use deterministic palette).
+  color      TEXT,
   -- Collapsed-duplicate counter: identical consecutive chat rows within 60 s
   -- merge into one stored row and this column counts the merged messages.
   spam_count INTEGER NOT NULL DEFAULT 1
@@ -299,6 +301,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_original_columns(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
+            _ensure_message_color_column(_conn)
             _ensure_jobs_kind_events(_conn)
             _ensure_jobs_priority(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
@@ -488,6 +491,19 @@ def _ensure_spam_column(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE messages ADD COLUMN spam_count INTEGER NOT NULL DEFAULT 1"
         )
+
+
+def _ensure_message_color_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add messages.color (platform chat username color).
+
+    YouTube live-chat renderers carry authorNameTextColor; Twitch GQL VOD
+    comments do not (clients fall back to a deterministic palette). The
+    column is NULL for rows without a platform-provided color — the UI
+    applies the per-platform palette hash then. Additive only; PRAGMA
+    table_info guard makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "color" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN color TEXT")
 
 
 def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
@@ -1002,10 +1018,14 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                     # Continuation of the previous flush's burst: bump the
                     # stored row and re-anchor it at the newest offset (a
                     # re-sent duplicate then lands at delta 0 and is consumed).
+                    # COALESCE keeps a stored platform color when the new
+                    # anchor carries none.
                     conn.execute(
-                        "UPDATE messages SET spam_count = ?, offset_sec = ? WHERE id = ?",
+                        "UPDATE messages SET spam_count = ?, offset_sec = ?, "
+                        "color = COALESCE(?, color) WHERE id = ?",
                         (int(stored["spam_count"]) + first_count,
-                         first_anchor["offset_sec"], stored["id"]),
+                         first_anchor["offset_sec"], first_anchor.get("color"),
+                         stored["id"]),
                     )
                     runs = runs[1:]
                 elif same and delta <= 0:
@@ -1014,8 +1034,8 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
             for anchor, count in runs:
                 conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
-                       user_id, username, text, badges, emotes, ts, spam_count)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       user_id, username, text, badges, emotes, ts, color, spam_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         platform,
                         video_id,
@@ -1026,6 +1046,7 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                         json.dumps(anchor.get("badges", []), ensure_ascii=False),
                         json.dumps(anchor.get("emotes", []), ensure_ascii=False),
                         anchor.get("ts"),
+                        anchor.get("color"),
                         count,
                     ),
                 )
@@ -1087,7 +1108,7 @@ def chat_for(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
     use; explicit ORDER BY offset_sec because live-capture inserts can land
     out of order. The (platform, video_id, offset_sec) index serves it."""
     rows = query(
-        "SELECT offset_sec, text, username, spam_count FROM messages "
+        "SELECT offset_sec, text, username, spam_count, color FROM messages "
         "WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ?",
         (platform, video_id, limit),
     )

@@ -292,7 +292,7 @@ def _iso_from_usec(usec: Any) -> Optional[str]:
 def _parse_live_chat(text: str) -> list[dict]:
     """NDJSON from yt-dlp's .live_chat.json -> archive message rows.
 
-    Rows: {offset_sec, user_id, username, text, badges, emotes, ts}.
+    Rows: {offset_sec, user_id, username, text, badges, emotes, ts, color}.
     offset_sec = replay fragment videoOffsetTimeMsec/1000 (stream-relative);
     falls back to wall-clock timestampUsec/1e6 when the fragment lacks one.
     """
@@ -341,6 +341,13 @@ def _parse_live_chat(text: str) -> list[dict]:
                 for run in runs
                 if run.get("emoji")
             ]
+            # YouTube live-chat renderers carry the author's chat color as
+            # #RRGGBB (authorNameTextColor); Twitch GQL VOD comments have no
+            # equivalent, so twitch rows stay NULL and the UI uses the
+            # per-platform palette. Only well-formed hex is stored.
+            color = (renderer.get("authorNameTextColor") or "").strip()
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                color = None
             rows.append({
                 "offset_sec": round(offset, 3),
                 "user_id": user_id,
@@ -349,6 +356,7 @@ def _parse_live_chat(text: str) -> list[dict]:
                 "badges": badges,
                 "emotes": emotes,
                 "ts": _iso_from_usec(usec),
+                "color": color,
             })
     return rows
 
