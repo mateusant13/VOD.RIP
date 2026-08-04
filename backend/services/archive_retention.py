@@ -10,7 +10,6 @@ is possible). Idempotent: running it repeatedly deletes nothing extra.
 from __future__ import annotations
 
 import logging
-import os
 
 from services import archive_db
 
@@ -30,10 +29,12 @@ def enforce_archive_vod_retention(keep_count: int | None = None) -> dict:
 
     For each platform, rows with archive_path NOT NULL are sorted newest-first
     (started_at DESC, as list_videos returns them); every row past the count
-    has its file unlinked (best-effort, existence-checked) and is then
-    upserted with archive_path=None + status='known'. A row whose file is
-    already gone still gets cleared — the path would lie otherwise. Rows
-    within the count are never touched. Returns {"deleted_files", "cleared_rows"}.
+    stops referencing its file and is upserted with archive_path=None +
+    status='known'. The file is unlinked only when NO remaining row points at
+    it (content dedup shares files across rows — unlink is reference-counted
+    via archive_db.release_archive_path). A row whose file is already gone
+    still gets cleared — the path would lie otherwise. Rows within the count
+    are never touched. Returns {"deleted_files", "cleared_rows"}.
     """
     if keep_count is None:
         keep_count = _keep_count()
@@ -44,18 +45,12 @@ def enforce_archive_vod_retention(keep_count: int | None = None) -> dict:
         archived = [v for v in archive_db.list_videos(platform) if v.get("archive_path")]
         for row in archived[keep_count:]:
             path = row["archive_path"]
-            if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                    deleted_files += 1
-                except OSError:
-                    logger.warning(
-                        "archive_retention: could not delete %s (%s)", path, platform
-                    )
             evicted = dict(row)
             evicted["archive_path"] = None
             evicted["status"] = "known"
-            archive_db.upsert_video(evicted)
+            archive_db.upsert_video(evicted)  # row stops referencing FIRST
+            if archive_db.release_archive_path(path):
+                deleted_files += 1
             cleared_rows += 1
             logger.info(
                 "archive_retention: evicted %s file %s (row kept, path cleared)",

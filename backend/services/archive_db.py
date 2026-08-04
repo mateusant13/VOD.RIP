@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS videos (
   duration_sec  REAL,
   archive_path  TEXT,
   canonical_key TEXT,
+  -- SHA-256 of the archived media file bytes (content dedup: two rows may
+  -- share one archive_path when their files are byte-identical).
+  content_sha256 TEXT,
   status        TEXT NOT NULL DEFAULT 'known'
                 CHECK (status IN ('known','downloading','ready','failed')),
   kind          TEXT NOT NULL DEFAULT 'vod'
@@ -228,6 +231,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_kind_column(_conn)
             _ensure_kind_check_includes_stream(_conn)
             _ensure_channel_columns(_conn)
+            _ensure_content_sha_column(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_jobs_kind_events(_conn)
@@ -341,6 +345,24 @@ def _ensure_channel_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE videos ADD COLUMN views INTEGER")
     if "thumbnail_url" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN thumbnail_url TEXT")
+
+
+def _ensure_content_sha_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.content_sha256 (content-dedup hash).
+
+    The ingest path hashes each freshly written media file and stores the
+    SHA-256 here; a second row with byte-identical content reuses the first
+    row's archive_path instead of keeping a second copy. Additive only;
+    NULL means "not yet hashed" (pre-dedup rows). PRAGMA table_info guard
+    makes repeated calls no-ops. The index is created here (not in SCHEMA)
+    so legacy DBs — where the column does not exist yet when SCHEMA's DDL
+    runs — never see a CREATE INDEX on a missing column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "content_sha256" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN content_sha256 TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_videos_content_sha ON videos(content_sha256)"
+    )
 
 
 def _ensure_lang_column(conn: sqlite3.Connection) -> None:
@@ -507,22 +529,26 @@ def upsert_video(video: dict) -> None:
         "duration_sec": video.get("duration_sec"),
         "archive_path": video.get("archive_path"),
         "canonical_key": video.get("canonical_key"),
+        "content_sha256": video.get("content_sha256"),
         "status": video.get("status", "known"),
         "updated_at": now,
     }
     execute(
         """INSERT INTO videos (platform, video_id, channel, title, started_at,
-           ended_at, duration_sec, archive_path, canonical_key, status, kind,
-           created_at, updated_at)
+           ended_at, duration_sec, archive_path, canonical_key, content_sha256,
+           status, kind, created_at, updated_at)
            VALUES (:platform, :video_id, :channel, :title, :started_at,
-           :ended_at, :duration_sec, :archive_path, :canonical_key, :status,
-           :kind, :created_at, :updated_at)
+           :ended_at, :duration_sec, :archive_path, :canonical_key,
+           :content_sha256, :status, :kind, :created_at, :updated_at)
            ON CONFLICT(platform, video_id) DO UPDATE SET
              channel=excluded.channel, title=excluded.title,
              started_at=excluded.started_at, ended_at=excluded.ended_at,
              duration_sec=excluded.duration_sec,
              archive_path=excluded.archive_path,
              canonical_key=excluded.canonical_key,
+             -- Derived, ingest-owned state: an absent dict key must never
+             -- NULL out a stored hash (metadata refreshes, re-ingests).
+             content_sha256=COALESCE(excluded.content_sha256, videos.content_sha256),
              status=excluded.status, kind=excluded.kind,
              updated_at=excluded.updated_at""",
         {**row, "created_at": now},
@@ -856,6 +882,95 @@ def dedupe_view() -> list[dict]:
     for r in rows:
         groups.setdefault(r["key"], []).append(dict(r))
     return [{"canonical_key": k, "videos": v} for k, v in groups.items()]
+
+
+# --- content dedup (SHA-256) -----------------------------------------------
+
+def find_content_duplicate(sha256: str) -> Optional[dict]:
+    """First videos row whose stored media file has this content hash.
+
+    Returns {platform, video_id, archive_path} or None. Only rows that still
+    reference a file (archive_path set) are eligible — an evicted row's hash
+    is kept but must never be a dedup target."""
+    rows = query(
+        """SELECT platform, video_id, archive_path FROM videos
+           WHERE content_sha256 = ? AND archive_path IS NOT NULL AND archive_path != ''
+           ORDER BY created_at LIMIT 1""",
+        (sha256,),
+    )
+    return dict(rows[0]) if rows else None
+
+
+def content_duplicates() -> list[dict]:
+    """Videos grouped by content hash when >= 2 rows share one media file.
+
+    Both rows must still reference a file, so evicted rows (hash kept,
+    path cleared) never pollute the list — the UI reports duplicates that
+    actually cost disk. Each group: {sha256, count, videos:[{platform,
+    video_id, channel, title, archive_path}]}."""
+    groups = query(
+        """SELECT content_sha256 AS sha256, COUNT(*) AS n
+           FROM videos
+           WHERE content_sha256 IS NOT NULL AND content_sha256 != ''
+             AND archive_path IS NOT NULL AND archive_path != ''
+           GROUP BY content_sha256 HAVING COUNT(*) > 1
+           ORDER BY n DESC, sha256"""
+    )
+    out = []
+    for g in groups:
+        members = query(
+            """SELECT platform, video_id, channel, title, archive_path
+               FROM videos WHERE content_sha256 = ?
+               ORDER BY created_at""",
+            (g["sha256"],),
+        )
+        out.append({"sha256": g["sha256"], "count": g["n"],
+                    "videos": [dict(m) for m in members]})
+    return out
+
+
+def release_archive_path(path: str) -> bool:
+    """Unlink a media file once no videos row references it anymore.
+
+    Archive rows are the source of truth for references: the caller must
+    delete its row (or clear its archive_path) BEFORE calling this. When
+    another row still points at the same path the file is kept — content
+    dedup makes shared paths the norm, and unlink would be data loss.
+    Returns True when the file was removed."""
+    if not path:
+        return False
+    remaining = query(
+        "SELECT COUNT(*) AS n FROM videos WHERE archive_path = ?",
+        (path,),
+    )[0]["n"]
+    if remaining:
+        return False
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def delete_video(platform: str, video_id: str) -> Optional[str]:
+    """Delete one videos row and release its archive file (reference-counted).
+
+    The file is unlinked only when no other row points at it. Returns the
+    released path, or None when no such row existed."""
+    rows = query(
+        "SELECT archive_path FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    if not rows:
+        return None
+    path = rows[0]["archive_path"]
+    execute(
+        "DELETE FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    if path:
+        release_archive_path(path)
+    return path
 
 
 # --- jobs -----------------------------------------------------------------
