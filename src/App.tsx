@@ -116,6 +116,9 @@ const MAX_LIVE_POPUPS = 5;
 interface LivePopupItem {
   id: number;
   entry: ChannelLiveStatus['live'][number];
+  /** All of the channel's live entries — the popup auto-advances through
+   *  them when an entry's session fails/stalls (one attempt each). */
+  entries: ChannelLiveStatus['live'];
   channelName: string;
   channel: SavedChannel | null;
 }
@@ -210,7 +213,7 @@ interface ChannelRowProps {
   isLast: boolean;
   savedChannelsLength: number;
   liveStatus: ChannelLiveStatus | undefined;
-  openLivePreview: (entry: ChannelLiveStatus['live'][number], channelName?: string, channel?: SavedChannel | null) => Promise<void> | void;
+  openLivePreview: (entry: ChannelLiveStatus['live'][number], entries: ChannelLiveStatus['live'], channelName?: string, channel?: SavedChannel | null) => Promise<void> | void;
   onOpenChannelSearch: (ch: SavedChannel) => void;
   channelListRef: MutableRefObject<HTMLDivElement | null>;
   toggleChannelSelection: (id: string) => void;
@@ -311,7 +314,7 @@ const ChannelRow = memo(function ChannelRow({
         invisible={liveEntries.length === 0}
         onClick={liveEntries.length ? (e) => {
           e.stopPropagation();
-          void openLivePreview(liveEntries[0], ch.displayName, ch);
+          void openLivePreview(liveEntries[0], liveEntries, ch.displayName, ch);
         } : undefined}
         ariaLabel={`Live ${ch.displayName}`}
       />
@@ -828,6 +831,14 @@ export default function App() {
     if (!liveStatus) return null;
     const live = liveStatus.live.filter((e) => e.is_live === true);
     return live[0] ?? null;
+  }, [channelLiveStatuses, selectedChannelId]);
+
+  /** Full live-entry list for the selected channel (fallback chain source). */
+  const selectedChannelLiveEntries = useMemo(() => {
+    if (!selectedChannelId) return [];
+    const liveStatus = channelLiveStatuses[selectedChannelId];
+    if (!liveStatus) return [];
+    return liveStatus.live.filter((e) => e.is_live === true && e.url);
   }, [channelLiveStatuses, selectedChannelId]);
 
   const allChannelVideos = useMemo(() => {
@@ -4674,12 +4685,13 @@ export default function App() {
   // and those extractors can't resolve them. Trim/download still work because
   // the session is a regular PreviewSession (kind=hls) proxied via the same
   // /api/preview/hls/{sid}/master.m3u8 endpoint.
-  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
+  const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], entries: ChannelLiveStatus['live'], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
     if (!entry?.url) return;
     const name = channelName || entry.platform || 'Live';
     const item: LivePopupItem = {
       id: ++livePopupIdRef.current,
       entry,
+      entries: entries.length > 0 ? entries : [entry],
       channelName: name,
       channel: channel ?? null,
     };
@@ -6212,8 +6224,8 @@ export default function App() {
                             <div
                               role="button"
                               tabIndex={0}
-                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName, selectedChannel)}
-                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries, selectedChannel?.displayName, selectedChannel)}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries); } }}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
@@ -6267,8 +6279,8 @@ export default function App() {
                             <div
                               role="button"
                               tabIndex={0}
-                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannel?.displayName, selectedChannel)}
-                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry); } }}
+                              onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries, selectedChannel?.displayName, selectedChannel)}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries); } }}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
@@ -6575,6 +6587,7 @@ export default function App() {
           <LivePlayerPopup
             key={popup.id}
             entry={popup.entry}
+            entries={popup.entries}
             channelName={popup.channelName}
             channelSlug={channelSlug}
             vodUrl={vodUrl}

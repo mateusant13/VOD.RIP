@@ -19,6 +19,7 @@ import { platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
+import { nextLiveEntry } from '../liveEntryFallback';
 import { fmtDuration } from '../formatters';
 import { createFullscreenGate, nativeFullscreenAdapter, type FullscreenGate } from '../utils/fullscreenGate';
 // hls.js is ~900KB and the original file deliberately code-splits it out of the
@@ -34,6 +35,10 @@ interface LiveEntry {
 
 interface LivePlayerPopupProps {
   entry: LiveEntry;
+  /** All of the channel's live entries (the badge list) — the popup
+   *  auto-advances to the next one when the opened entry's session fails or
+   *  stalls. Defaults to just `entry` when omitted. */
+  entries?: LiveEntry[];
   channelName: string;
   onClose: () => void;
   /** Platform slug for the open-channel button (twitchSlug/kickSlug/youtubeSlug). */
@@ -67,17 +72,35 @@ const POPUP_MIN_H = 200;
 const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while resizing
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
+/** Live session POST stall budget — after this the popup advances to the next
+ *  live entry (or surfaces the error) instead of pinning the spinner. */
+const SESSION_STALL_MS = 8_000;
 
-export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0 }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0 }: LivePlayerPopupProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const hlsCtorRef = useRef<typeof Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const sessionRef = useRef<PreviewSessionResponse | null>(null);
+  // Fallback chain: the popup opens on entries[0]; on session failure it
+  // advances through the rest, one attempt each (see nextLiveEntry). The
+  // index lives in a ref so late hls.js error callbacks read the CURRENT
+  // entry, not the one captured when the callback was created.
+  const allEntries = useMemo<LiveEntry[]>(
+    () => (entries && entries.length > 0 ? entries : [entry]),
+    [entries, entry],
+  );
+  const [entryIndex, setEntryIndex] = useState(0);
+  const entryIndexRef = useRef(0);
+  /** The entry this popup is currently playing (== `entry` until a fallback). */
+  const activeEntry = allEntries[entryIndex] ?? entry;
   /** Quality policy: platform drives the live level ladder (youtube →
    *  360/720/1080 or 360-anon; twitch/kick → up to source). */
-  const sessionPlatformRef = useRef((entry.platform || '').toLowerCase());
+  const sessionPlatformRef = useRef((activeEntry.platform || '').toLowerCase());
+  // First-frame timing marker (fast-start verification hook).
+  const firstFrameStartRef = useRef<number>(performance.now());
+  const firstFrameLoggedRef = useRef(false);
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
   const [position, setPosition] = useState(() => ({
     x: window.innerWidth - POPUP_WIDTH - 24 - cascadeIndex * 28,
@@ -101,8 +124,24 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   const markPreviewError = useCallback(() => {
     const wasRetry = previewRetryingRef.current;
     previewRetryingRef.current = false;
-    setPreviewRetry(previewRetryAfterError(previewRetryRef.current, entry.url, 'session', wasRetry));
-  }, [entry.url]);
+    setPreviewRetry(previewRetryAfterError(previewRetryRef.current, activeEntry.url, 'session', wasRetry));
+  }, [activeEntry.url]);
+  /** Advance to the next live entry; false when the chain is exhausted (the
+   *  caller then surfaces the error as usual). Deleting the stale session
+   *  mirrors retryPreview — a failed session must not linger on the backend. */
+  const tryAdvanceEntry = useCallback((): boolean => {
+    const next = nextLiveEntry(allEntries, entryIndexRef.current);
+    if (!next) return false;
+    const sid = sessionIdRef.current;
+    if (sid) {
+      void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
+      sessionIdRef.current = null;
+    }
+    sessionRef.current = null;
+    entryIndexRef.current += 1;
+    setEntryIndex(entryIndexRef.current);
+    return true;
+  }, [allEntries]);
   const [drag, setDrag] = useState<DragState>(null);
 
   // Transport state
@@ -151,12 +190,12 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   }, []);
 
   const channelUrl = useMemo(() => {
-    const plat = (entry.platform || '').toLowerCase();
+    const plat = (activeEntry.platform || '').toLowerCase();
     if (!channelSlug) return null;
     if (plat === 'youtube') return `https://www.youtube.com/@${channelSlug}`;
     if (plat === 'kick') return `https://kick.com/${channelSlug}`;
     return `https://www.twitch.tv/${channelSlug}`;
-  }, [entry.platform, channelSlug]);
+  }, [activeEntry.platform, channelSlug]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -272,9 +311,14 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     // adblock pLoader, and the live sync knobs. capLevelToPlayerSize is
     // DELIBERATELY absent — the mini preview caps to its panel size, the
     // live popup must keep the stream's source resolution.
+    // startLevel: 0 = the LOWEST manifest level — hls.js 1.6.2 sorts levels
+    // ascending (dist/hls.mjs: "sort levels from lowest to highest"), so
+    // index 0 is the smallest fragment → fastest first frame. MANIFEST_PARSED
+    // then moves loadLevel to the policy default (closest to 360p).
     const hls = new Hls({
       ...twitchAdBlockHlsConfig({ live: true, onAdRotation }),
       enableWorker: true,
+      startLevel: 0,
       lowLatencyMode: false,
       maxBufferLength: 6,
       maxMaxBufferLength: 12,
@@ -303,8 +347,9 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         // to source (highest manifest level — may exceed 1080p); YouTube live
         // offers exactly the policy ladder 360/720/1080, or 360-only when the
         // session is anonymous (no user cookies).
-        // Default stays the level closest to 360 (main-player convention: set
-        // hls.loadLevel AFTER MANIFEST_PARSED — never startLevel before load).
+        // Default stays the level closest to 360, set AFTER MANIFEST_PARSED
+        // (config startLevel: 0 already picked the lowest level for the first
+        // fragment; loadLevel governs everything from here on).
         const isYoutube = sessionPlatformRef.current === 'youtube';
         const { levels: filtered, defaultIndex } = filterLiveLevels(
           hls.levels.map((l, i) => ({
@@ -352,6 +397,17 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     });
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
+      // Stall guard (live only): hls.js 1.6.2 reports a stall as
+      // BUFFER_STALLED_ERROR ("stall detected" — non-fatal once per stall
+      // period, fatal after nudges fail) and breaks hard as a fatal
+      // NETWORK_ERROR. Either, with another live entry available, jumps to
+      // the next entry instead of waiting out the backend stall. Replay/rail
+      // is untouched — only LIVE mode qualifies.
+      const liveStall = modeRef.current === 'live' && (
+        data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+        (data?.type === Hls.ErrorTypes.NETWORK_ERROR && data.fatal === true)
+      );
+      if (liveStall && tryAdvanceEntry()) return;
       if (!data?.fatal) return;
       // Same retry wiring as the mini preview player: bounded network retries
       // (resume near the current position), media error recovery, then error.
@@ -382,7 +438,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry]);
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
@@ -421,9 +477,17 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     setRetryTick((t) => t + 1);
   }, []);
 
-  // Create preview session on mount
+  // Create preview session on mount — one run per entry: advancing a fallback
+  // changes activeEntry.url, which re-runs this effect; cleanup aborts the
+  // in-flight POST and destroys the hls instance, so the switch never leaks.
   useEffect(() => {
     let cancelled = false;
+    // Stall guard: abort the session POST after 8s — a hung backend must not
+    // pin the spinner (apiPost's own budget is 60s x 3 retries). The abort
+    // rejects as AbortError; the catch advances to the next entry if one
+    // exists, else surfaces the error (with the retry button) as today.
+    const controller = new AbortController();
+    const stallTimer = window.setTimeout(() => controller.abort(), SESSION_STALL_MS);
 
     (async () => {
       try {
@@ -435,18 +499,25 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
           headers?: Record<string, string>;
           platform?: string;
           vod_url?: string;
-        } = { url: entry.url, is_live: true };
-        if (entry.headers) body.headers = entry.headers;
-        if (entry.platform) body.platform = entry.platform;
+        } = { url: activeEntry.url, is_live: true };
+        if (activeEntry.headers) body.headers = activeEntry.headers;
+        if (activeEntry.platform) body.platform = activeEntry.platform;
         if (vodUrl) body.vod_url = vodUrl;
 
-        const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body);
+        const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body, { signal: controller.signal });
         if (cancelled) return;
-        if (!res) { setError('No response from server'); setLoading(false); markPreviewError(); return; }
+        window.clearTimeout(stallTimer);
+        if (!res) {
+          if (tryAdvanceEntry()) return;
+          setError('No response from server');
+          setLoading(false);
+          markPreviewError();
+          return;
+        }
 
         sessionIdRef.current = res.session_id;
         sessionRef.current = res;
-        sessionPlatformRef.current = (entry.platform || '').toLowerCase();
+        sessionPlatformRef.current = (activeEntry.platform || '').toLowerCase();
         setArchiveDuration(res.archive_duration ?? 0);
 
         // Warm the LIVE rail: the backend resolves the DVR archive lazily on
@@ -489,15 +560,24 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         video.play().catch(() => {});
       } catch (err: unknown) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to start live stream');
+          if (tryAdvanceEntry()) return;
+          const stalled = err instanceof DOMException && err.name === 'AbortError';
+          setError(stalled
+            ? 'Live session is taking too long to start'
+            : (err instanceof Error ? err.message : 'Failed to start live stream'));
           setLoading(false);
           markPreviewError();
         }
       }
     })();
 
-    return () => { cancelled = true; destroyHls(); };
-  }, [entry.url, entry.headers, entry.platform, vodUrl, abortRef, createHlsPlayer, destroyHls, retryTick, markPreviewError, clearRetry]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(stallTimer);
+      controller.abort();
+      destroyHls();
+    };
+  }, [activeEntry.url, activeEntry.headers, activeEntry.platform, vodUrl, abortRef, createHlsPlayer, destroyHls, retryTick, markPreviewError, clearRetry, tryAdvanceEntry]);
 
   // Sync transport state from the video element
   useEffect(() => {
@@ -529,6 +609,17 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
         setSnapshotDuration(video.duration);
       }
     };
+    // First-frame timing marker — logs ms from popup open to the first
+    // decodable frame (readyState >= 3, unpaused, past t=0). One-shot; the
+    // `playing`/`timeupdate` pair covers both the initial start and resume
+    // paths without polling.
+    const onFirstFrame = () => {
+      if (firstFrameLoggedRef.current) return;
+      const v = videoRef.current;
+      if (!v || v.readyState < 3 || v.paused || !(v.currentTime > 0)) return;
+      firstFrameLoggedRef.current = true;
+      console.info('[live] first-frame', Math.round(performance.now() - firstFrameStartRef.current));
+    };
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
     video.addEventListener('volumechange', onVolumeChange);
@@ -536,6 +627,8 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     video.addEventListener('durationchange', onDuration);
     video.addEventListener('waiting', showBuffering);
     video.addEventListener('playing', clearBuffering);
+    video.addEventListener('playing', onFirstFrame);
+    video.addEventListener('timeupdate', onFirstFrame);
     video.addEventListener('canplay', clearBuffering);
     return () => {
       video.removeEventListener('play', onPlay);
@@ -545,6 +638,8 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('waiting', showBuffering);
       video.removeEventListener('playing', clearBuffering);
+      video.removeEventListener('playing', onFirstFrame);
+      video.removeEventListener('timeupdate', onFirstFrame);
       video.removeEventListener('canplay', clearBuffering);
     };
   }, [showBuffering, clearBuffering]);
@@ -761,7 +856,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
   // Transport buttons match the main preview player (platform accent when
   // docked, glass when the popup is fullscreen).
   const transportBtn = platformPreviewCtrlBtn(
-    (entry.platform ?? 'kick') as PlatformStyleKey,
+    (activeEntry.platform ?? 'kick') as PlatformStyleKey,
     isFullscreen,
     false,
   );
@@ -843,7 +938,7 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
           )}
           <span className="text-[10px] font-bold uppercase truncate text-zinc-200">
             {channelName}
-            {entry.title ? ` — ${entry.title}` : ''}
+            {activeEntry.title ? ` — ${activeEntry.title}` : ''}
           </span>
         </span>
 
