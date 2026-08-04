@@ -1172,6 +1172,11 @@ def search(
     if raw_q:
         # "raw query" quoted as one FTS5 phrase; embedded quotes are escaped.
         phrase_pattern = '"' + raw_q.replace('"', '""') + '"'
+    # Cross-segment phrase matching: multi-word queries whose tokens are
+    # split across two ADJACENT transcript segments ("…vale" | "da
+    # estranheza…"). FTS5 phrases cannot span rows, so the span pass scans
+    # the transcript table directly (see _phrase_span_rows).
+    span_tokens = re.findall(r"[^\W_]+", raw_q.casefold())
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -1204,6 +1209,26 @@ def search(
         for rid, r in phrase_rows.items():
             by_row[rid] = r
         table_rows = list(by_row.values())
+        # Span pass: the exact phrase split across two adjacent segments.
+        # Row scores are re-based to the batch max so they normalize to 1.0
+        # and receive the same +50% phrase boost as within-row hits.
+        if hit_kind == "transcript" and len(span_tokens) >= 2:
+            try:
+                span_rows = _phrase_span_rows(
+                    span_tokens, fetch, platforms=platforms,
+                    video_id=video_id, channel=channel, kinds=kinds,
+                    date_from=date_from, date_to=date_to, lang=lang,
+                )
+            except sqlite3.Error:
+                span_rows = []  # scan failed — degrade to phrase/fuzzy-only
+            if span_rows:
+                sbase = max((h["score"] for h in table_rows), default=1.0)
+                for r in span_rows:
+                    r["_phrase"] = True
+                    r["score"] = sbase or 1.0
+                    r["_raw"] = r["score"]
+                    by_row[r["_rowid"]] = r
+                table_rows = list(by_row.values())
         if not table_rows:
             continue
         max_score = max(h["score"] for h in table_rows)
@@ -1423,6 +1448,132 @@ def _table_search(
         }
         for r in query(sql, params)
     ]
+
+
+def _tok_eq(a: str, b: str) -> bool:
+    """Token equality with ASR tolerance: exact for short tokens, edit
+    distance <= 1 for tokens of >= 4 chars (whisper/captions variants like
+    'estranheza' vs 'estranhesa' still match)."""
+    if a == b:
+        return True
+    if len(a) < 4 or len(b) < 4:
+        return False
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) < len(b):
+        a, b = b, a
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) <= 1
+    return any(a[:i] + a[i + 1:] == b for i in range(len(a)))
+
+
+def _phrase_span_rows(
+    q_tokens: list[str],
+    fetch: int,
+    *,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    lang: Optional[str],
+) -> list[dict]:
+    """Exact-phrase hits whose tokens sit in two ADJACENT transcript
+    segments: seg N ends with a phrase prefix and seg N+1 starts with the
+    remainder. Scans the transcript table with the shared filter set; a
+    per-row prefilter on the phrase's long (>= 4 char) tokens keeps the scan
+    proportional to the phrase's rarity instead of the archive size.
+
+    Returns hit dicts shaped like _table_search rows; score is a placeholder
+    (1.0) that the caller re-bases to the table batch max, so span hits
+    normalize like within-row phrase hits. ponytail: O(archive rows that
+    contain a long query token) per phrase search — the prefilter keeps it
+    fast for typical phrases; a trigram index would make it O(log n)."""
+    if len(q_tokens) < 2:
+        return []
+    long_toks = [t for t in q_tokens if len(t) >= 4]
+    sql = (
+        "SELECT t.rowid AS _rowid, t.platform, t.video_id, t.seg_idx, "
+        "t.start_sec AS offset_sec, t.text, t.lang AS lang, "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "FROM transcripts t "
+        "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
+        "WHERE 1=1"
+    )
+    params: list[Any] = []
+    if long_toks:
+        sql += " AND (" + " OR ".join("instr(lower(t.text), ?) > 0" for _ in long_toks) + ")"
+        params.extend(long_toks)
+    if platforms:
+        sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
+        params.extend(platforms)
+    if video_id:
+        sql += " AND t.video_id = ?"
+        params.append(video_id)
+    if channel:
+        slugs = [c.strip() for c in channel.split(",") if c.strip()]
+        if slugs:
+            sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
+            params.extend(s.lower() for s in slugs)
+    if kinds:
+        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
+        params.extend(kinds)
+    if date_from:
+        sql += " AND date(v.started_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(v.started_at) <= date(?)"
+        params.append(date_to)
+    if lang:
+        lng = lang.strip().lower()
+        if lng == "pt":
+            sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
+        elif lng == "en":
+            sql += " AND t.lang = 'en'"
+    sql += " ORDER BY t.video_id, t.seg_idx"
+    by_video: dict[str, list[dict]] = {}
+    for r in query(sql, params):
+        by_video.setdefault(r["video_id"], []).append(r)
+    hits: list[dict] = []
+    for segs in by_video.values():
+        segs.sort(key=lambda r: r["seg_idx"])
+        for a, b in zip(segs, segs[1:]):
+            if b["seg_idx"] != a["seg_idx"] + 1:
+                continue
+            a_toks = re.findall(r"[^\W_]+", a["text"].casefold())
+            b_toks = re.findall(r"[^\W_]+", b["text"].casefold())
+            for split in range(1, len(q_tokens)):
+                prefix, suffix = q_tokens[:split], q_tokens[split:]
+                if len(a_toks) < len(prefix) or len(b_toks) < len(suffix):
+                    continue
+                if not all(
+                    _tok_eq(x, y) for x, y in zip(a_toks[-len(prefix):], prefix)
+                ):
+                    continue
+                if not all(
+                    _tok_eq(x, y) for x, y in zip(b_toks[:len(suffix)], suffix)
+                ):
+                    continue
+                hit = {
+                    "kind": "transcript",
+                    "platform": a["platform"],
+                    "video_id": a["video_id"],
+                    "offset_sec": a["offset_sec"],
+                    "text": f"{a['text']} {b['text']}",
+                    "score": 1.0,
+                    "lang": a["lang"],
+                    "channel": a["channel"],
+                    "title": a["title"],
+                    "date": a["date"],
+                    "video_kind": a["video_kind"],
+                    "_rowid": a["_rowid"],
+                    "_raw": 1.0,
+                }
+                hits.append(hit)
+                break  # one hit per adjacent pair
+    hits.sort(key=lambda h: h["offset_sec"])
+    return hits[: max(fetch * 3, 3)]
 
 
 # Channel-slug cache for the channel_hint query understanding: (loaded_at,
@@ -1914,13 +2065,30 @@ assert len(chat_window(_selfcheck_platform, _selfcheck_video, 1.0)) == 1
 insert_transcript(
     _selfcheck_platform,
     _selfcheck_video,
-    [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste"}],
+    [
+        {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste vale"},
+        {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "da estranheza aconteceu"},
+    ],
     lang="pt-br",
 )
 assert any(
     h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
     for h in search("transcrição")
 ), "FTS5 must find transcript segments (unicode61 tokenizer)"
+# Cross-segment phrase: tokens split across two adjacent segments must be
+# found with the exact-phrase boost (FTS5 phrases cannot span rows).
+_sc_span = next(
+    (
+        h
+        for h in search("vale da estranheza")
+        if h["video_id"] == _selfcheck_video and h["kind"] == "transcript"
+    ),
+    None,
+)
+assert _sc_span is not None, "phrase split across adjacent segments must match"
+assert "vale da estranheza" in _sc_span["text"].casefold(), (
+    "span hit text must join both segments"
+)
 # lang contract: message hits carry lang=None; 'pt-br' normalizes to 'pt';
 # the pt filter matches tagged AND untagged (whisper) rows.
 _sc_msg_hit = next(

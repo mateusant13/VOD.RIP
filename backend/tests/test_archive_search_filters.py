@@ -1010,3 +1010,77 @@ async def test_search_auto_backfill_kicks_chatless_twitch_videos(monkeypatch):
             archive_router._backfill_inflight.clear()
             archive_router._last_auto_kick = 0.0
         archive_db.execute("DELETE FROM videos WHERE video_id IN ('1111','2222','3333')")
+
+
+# --- cross-segment phrase matching -----------------------------------------
+
+def _insert_transcript_pair(video_id, seg0, seg1, platform="twitch"):
+    archive_db.insert_transcript(
+        platform, video_id,
+        [
+            {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": seg0},
+            {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": seg1},
+        ],
+        lang="pt",
+    )
+
+
+def test_phrase_split_across_adjacent_segments():
+    _insert_video("span-vid-1")
+    _insert_transcript_pair("span-vid-1", "todo mundo cai no vale", "da estranheza quando")
+    hits = archive_db.search("vale da estranheza")
+    span = next(
+        (h for h in hits if h["video_id"] == "span-vid-1" and h["kind"] == "transcript"),
+        None,
+    )
+    assert span is not None, "phrase split across two segments must be found"
+    assert span["offset_sec"] == 0.0, "hit must point at the first segment"
+    assert "vale da estranheza" in span["text"].casefold()
+    # Exact phrase (even spanning) outranks fuzzy-only hits.
+    assert span["score"] == max(h["score"] for h in hits)
+
+
+def test_phrase_split_with_asr_variant_token():
+    _insert_video("span-vid-2")
+    _insert_transcript_pair(
+        "span-vid-2", "é o tal do vale", "da estranhesa, sabe",  # 1-edit variant
+    )
+    hits = archive_db.search("vale da estranheza")
+    span = next(
+        (h for h in hits if h["video_id"] == "span-vid-2" and h["kind"] == "transcript"),
+        None,
+    )
+    assert span is not None, "ASR 1-edit variant must still match the split phrase"
+
+
+def test_phrase_split_ignores_nonadjacent_segments():
+    _insert_video("span-vid-3")
+    archive_db.insert_transcript(
+        "twitch", "span-vid-3",
+        [
+            {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "vale tudo"},
+            {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "hoje é dia de festa"},
+            {"seg_idx": 2, "start_sec": 2.0, "end_sec": 3.0, "text": "da estranheza eu fujo"},
+        ],
+        lang="pt",
+    )
+    hits = archive_db.search("vale da estranheza")
+    span = next(
+        (h for h in hits if h["video_id"] == "span-vid-3" and h["kind"] == "transcript"),
+        None,
+    )
+    # "vale" (seg 0) and "da estranheza" (seg 2) are NOT adjacent: no span hit.
+    assert span is None or "vale da estranheza" not in span["text"].casefold()
+
+
+def test_span_respects_filters_and_ordering():
+    _insert_video("span-vid-4", platform="youtube", channel="gaveta", kind="vod")
+    _insert_video("span-vid-5", platform="youtube", channel="gaveta", kind="vod")
+    _insert_transcript_pair("span-vid-4", "primeiro vale", "da estranheza aqui", "youtube")
+    _insert_transcript_pair("span-vid-5", "segundo vale", "da estranheza ali", "youtube")
+    hits = archive_db.search("vale da estranheza", channel="gaveta", video_id="span-vid-4")
+    assert all(h["video_id"] == "span-vid-4" for h in hits)
+    assert any(h["kind"] == "transcript" for h in hits)
+    hits_all = archive_db.search("vale da estranheza", channel="gaveta")
+    vids = {h["video_id"] for h in hits_all if h["kind"] == "transcript"}
+    assert {"span-vid-4", "span-vid-5"} <= vids
