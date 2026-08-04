@@ -68,11 +68,20 @@ def _mk_session(sid: str, **over) -> session_mod.PreviewSession:
     return session_mod.PreviewSession(**kwargs)
 
 
+import services.preview.hls as hls_mod
+
+_REAL_HTTP_GET_BYTES = hls_mod._http_get_bytes
+
+
+@pytest.fixture(autouse=True)
+def _restore_http_get_bytes():
+    yield
+    hls_mod._http_get_bytes = _REAL_HTTP_GET_BYTES
+
+
 def _stub_http_get_bytes(fixture: bytes):
     def _fake(session, url, range_header=None, **_kw):
         return fixture, "application/vnd.apple.mpegurl", {}, 200
-
-    import services.preview.hls as hls_mod
 
     hls_mod._http_get_bytes = _fake
 

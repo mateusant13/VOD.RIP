@@ -111,6 +111,12 @@ def test_aggregation_real_titiltei_pt() -> None:
     # the fixture is the channel's PT-BR VOD archive), which is exactly the
     # evidence the whisper pipeline now writes per job; the tally must then
     # decide pt with transcript-source confidence.
+    # The real DB may have drifted (WS-4 wrote original_language='pt'); clear
+    # it on the copy so this test exercises the transcript-tally decision.
+    _db.execute(
+        "UPDATE videos SET original_language=NULL "
+        "WHERE platform='youtube' AND channel='titiltei'"
+    )
     _db.execute(
         "UPDATE transcripts SET lang='pt' WHERE video_id IN "
         "(SELECT v.video_id FROM videos v WHERE lower(v.channel)='titiltei')"
@@ -158,6 +164,9 @@ def test_on_transcribe_done_throttled() -> None:
 
 def test_ws4_defensive_column() -> None:
     # Without the WS-4 column the defensive read must return None, never raise.
+    # (The real DB already carries the column — drop it on the copy to
+    # synthesize the pre-WS-4 schema.)
+    _db.execute("ALTER TABLE videos DROP COLUMN original_language")
     assert _db.channel_original_languages("twitch", "titiltei") is None
     # With it (synthetic ALTER), a 100% consensus beats the transcript tally.
     _db.execute("ALTER TABLE videos ADD COLUMN original_language TEXT")

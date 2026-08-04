@@ -28,6 +28,8 @@ export interface ArchiveSearchHit {
   thumbnail_url?: string | null;
   /** Concept (embedding) hit — true only for the semantic search pass. */
   semantic?: boolean;
+  /** True when the hit matched fewer than all query tokens (closest-match). */
+  partial?: boolean;
 }
 
 export interface ArchiveVideoRow {
