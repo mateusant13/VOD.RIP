@@ -817,6 +817,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       setPosition(p);
     };
     startPanelResizeDrag(e, edge, sizeRef, setSize, {
+      panelEl: popupRef.current,
       maxW: viewport.w - RESIZE_MARGIN,
       maxH: viewport.h - RESIZE_MARGIN,
       clampSize: (s) => ({
