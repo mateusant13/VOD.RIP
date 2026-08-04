@@ -171,6 +171,132 @@ def test_migration_idempotent_on_second_call():
     archive_db.execute("SELECT kind FROM videos LIMIT 1")
 
 
+def _old_kind_schema_db() -> sqlite3.Connection:
+    """A scratch DB with the pre-'stream' videos DDL (old CHECK + indexes)."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+    db = Path(tempfile.mkdtemp(prefix="kind-rebuild-")) / "a.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE videos ("
+        "  platform TEXT NOT NULL, video_id TEXT NOT NULL, channel TEXT NOT NULL,"
+        "  title TEXT NOT NULL,"
+        "  kind TEXT NOT NULL DEFAULT 'vod' CHECK (kind IN ('vod','clip','short','live')),"
+        "  canonical_key TEXT,"
+        "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        "  PRIMARY KEY (platform, video_id)"
+        ");"
+        "CREATE INDEX idx_videos_channel ON videos(channel);"
+        "CREATE INDEX idx_videos_canonical ON videos(canonical_key);"
+        "INSERT INTO videos VALUES ('youtube','old1','gaveta','Old','vod',NULL,'t','t');"
+    )
+    conn.commit()
+    return conn
+
+
+def test_kind_check_rebuild_accepts_stream():
+    conn = _old_kind_schema_db()
+    archive_db._ensure_kind_check_includes_stream(conn)
+    conn.execute(
+        "INSERT INTO videos VALUES ('youtube','s1','gaveta','Stream','stream',NULL,'t','t')"
+    )
+    conn.commit()
+    row = conn.execute("SELECT kind FROM videos WHERE video_id='s1'").fetchone()
+    assert row[0] == "stream"
+    # Old rows survived and the indexes were recreated.
+    assert conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 2
+    idxs = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='videos'"
+        )
+    }
+    assert {"idx_videos_channel", "idx_videos_canonical"} <= idxs
+    conn.close()
+
+
+def test_kind_check_rebuild_recovers_crash_leftover():
+    conn = _old_kind_schema_db()
+    # Crash mid-swap: old data stranded in videos_old, new table an empty
+    # shell (created by the SCHEMA re-run on the next open).
+    conn.execute("ALTER TABLE videos RENAME TO videos_old")
+    conn.execute(
+        "CREATE TABLE videos (platform TEXT NOT NULL, video_id TEXT NOT NULL,"
+        " PRIMARY KEY (platform, video_id))"
+    )
+    archive_db._ensure_kind_check_includes_stream(conn)
+    # Data restored and the kind CHECK widened (stream insert works).
+    assert conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 1
+    leftover = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='videos_old'"
+    ).fetchone()[0]
+    assert leftover == 0
+    conn.execute(
+        "INSERT INTO videos VALUES ('youtube','s2','gaveta','S2','stream',NULL,'t','t')"
+    )
+    conn.commit()
+    assert conn.execute("SELECT kind FROM videos WHERE video_id='s2'").fetchone()[0] == "stream"
+    conn.close()
+
+
+def test_kind_check_rebuild_drops_dead_leftover():
+    conn = _old_kind_schema_db()
+    # Crash after the copy landed: videos has the rows, videos_old is dead.
+    conn.execute("ALTER TABLE videos RENAME TO videos_old")
+    conn.execute(
+        "CREATE TABLE videos ("
+        "  platform TEXT NOT NULL, video_id TEXT NOT NULL, channel TEXT NOT NULL,"
+        "  title TEXT NOT NULL,"
+        "  kind TEXT NOT NULL DEFAULT 'vod' CHECK (kind IN ('vod','clip','short','live','stream')),"
+        "  canonical_key TEXT,"
+        "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        "  PRIMARY KEY (platform, video_id)"
+        ")"
+    )
+    conn.execute("INSERT INTO videos SELECT * FROM videos_old")
+    archive_db._ensure_kind_check_includes_stream(conn)
+    assert conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='videos_old'"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_kind_check_rebuild_after_alter_added_column():
+    # Pre-kind DBs got kind via ALTER TABLE — the stored DDL has no kind
+    # column. The rebuild must synthesize it or the column-count differs.
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+    db = Path(tempfile.mkdtemp(prefix="kind-rebuild-alter-")) / "a.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE videos ("
+        "  platform TEXT NOT NULL, video_id TEXT NOT NULL, channel TEXT NOT NULL,"
+        "  title TEXT NOT NULL, canonical_key TEXT,"
+        "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        "  PRIMARY KEY (platform, video_id)"
+        ");"
+        "INSERT INTO videos VALUES ('youtube','old1','gaveta','Old',NULL,'t','t');"
+    )
+    conn.commit()
+    archive_db._ensure_kind_column(conn)  # ALTER path: kind column added
+    archive_db._ensure_kind_check_includes_stream(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(videos)")}
+    assert "kind" in cols
+    # kind is the last column (same position ALTER would have used).
+    order = [r[1] for r in conn.execute("PRAGMA table_info(videos)")]
+    assert order[-1] == "kind"
+    conn.execute(
+        "INSERT INTO videos VALUES ('youtube','s1','gaveta','S1',NULL,'t','t','stream')"
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT kind FROM videos WHERE video_id='s1'"
+    ).fetchone()[0] == "stream"
+    conn.close()
+
+
 def _fts_schema() -> dict[str, str]:
     rows = archive_db.query(
         "SELECT name, sql FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'"

@@ -61,6 +61,19 @@ router = APIRouter(tags=["channels"])
 # (channel, platforms) key, so concurrent opens never double-fire the
 # expensive YouTube extract.
 _bg_refresh_lock = threading.Lock()
+
+
+def merge_youtube_playlists(vods: List[dict], streams: List[dict]) -> List[dict]:
+    """Merge /videos and /streams tab fetches for one channel.
+
+    A stream entry wins over the same video's /videos row: the /videos flat
+    playlist drops live_status (NA everywhere), so a recorded broadcast that
+    shows up in both tabs would otherwise classify as kind 'vod' instead of
+    'stream'."""
+    by_id: dict[str, dict] = {str(v.get("id") or ""): v for v in streams}
+    for v in vods:
+        by_id.setdefault(str(v.get("id") or ""), v)
+    return list(by_id.values())
 _bg_refresh_inflight: set[str] = set()
 
 
@@ -464,7 +477,28 @@ async def channel_videos(
             except Exception as e:
                 errors["YouTube"] = format_platform_error(e)
                 return []
-            return vids
+            # The /streams tab holds the channel's recorded live broadcasts
+            # (was_live); the /videos flat playlist never lists them, so
+            # they were invisible in the panel. Merge both tabs — best
+            # effort: a streams-tab failure degrades to the /videos list
+            # alone, and the whole fetch must not fail on it.
+            try:
+                streams = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR,
+                        functools.partial(
+                            youtube_list_channel_videos_sync,
+                            ref,
+                            fetch_limit,
+                            playlist="streams",
+                            enrich=True,
+                        ),
+                    ),
+                    timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
+                )
+            except Exception:
+                streams = []
+            return merge_youtube_playlists(vids, streams)
 
         def _persist_platform(label: str, items: list) -> None:
             """Accumulate fetched items into the permanent channel index.

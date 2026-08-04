@@ -836,10 +836,14 @@ export default function App() {
     if (channelContentFilter === 'streams') {
       return visible(selectedChannel.vodVideos).filter((v) => v.content_kind === 'stream');
     }
-    return visible(selectedChannel.vodVideos).filter(
-      (v) => v.content_kind !== 'stream' && v.content_kind !== 'clip',
+    // Multi-platform UI: recorded YouTube broadcasts (kind 'stream') belong
+    // in the channel's VOD list — the /streams tab content is now merged
+    // into the vods fetch. YouTube-only mode keeps them out of "Videos"
+    // because its dedicated "VODs" tab shows them.
+    return visible(selectedChannel.vodVideos).filter((v) =>
+      youtubePlatformOnly ? v.content_kind !== 'stream' && v.content_kind !== 'clip' : v.content_kind !== 'clip',
     );
-  }, [selectedChannel, channelContentFilter]);
+  }, [selectedChannel, channelContentFilter, youtubePlatformOnly]);
 
   const kickChannelVideos = useMemo(
     () => allChannelVideos.filter((v) => v.platform === 'Kick'),
@@ -4091,9 +4095,10 @@ export default function App() {
           errs.YouTube = 'YouTube channel is required';
         }
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
-        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
-          !incremental && attempted.YouTube && !errs.YouTube && incoming.some((v) => v.platform === 'YouTube')
-            ? { prunePlatforms: ['YouTube'] } : undefined);
+        // No prune here: the vods fetch owns the YouTube slice (it merges
+        // /videos + /streams), so replacing it with streams-only would drop
+        // regular uploads from state on every VODs-tab visit.
+        const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
@@ -4173,6 +4178,13 @@ export default function App() {
             vodVideos,
             vodErrors: errs,
             vodPlatformsFetched,
+            // The vods fetch now merges the /streams tab, so a successful
+            // YouTube fetch with stream rows satisfies the streams cache —
+            // otherwise the prefetch effect would re-fetch content=streams
+            // and prune the merged uploads+streams list down to streams.
+            streamsFetched: !ch.youtubeSlug?.trim()
+              || incoming.some((v) => v.content_kind === 'stream')
+              || Boolean(errs.YouTube),
             loading: false,
             updatedAt: new Date().toISOString(),
           });

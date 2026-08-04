@@ -119,7 +119,7 @@ async def test_first_fetch_persists_and_second_is_served_from_disk(client, _fake
     body = first.json()
     assert len(body["videos"]) == 6
     assert body["refreshing"] is False
-    assert calls == ["Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     # Different limit = different L1 cache key; the index must serve it
     # without touching any platform service again.
@@ -128,7 +128,7 @@ async def test_first_fetch_persists_and_second_is_served_from_disk(client, _fake
     body2 = second.json()
     assert len(body2["videos"]) == 6
     assert body2["refreshing"] is False
-    assert calls == ["Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     conn = sqlite3.connect(_scratch_archive_db)
     rows = conn.execute("SELECT platform, video_id, status, archive_path FROM videos").fetchall()
@@ -147,7 +147,7 @@ async def test_force_refetches_even_when_index_exists(client, _fake_platform_ser
     body = forced.json()
     assert len(body["videos"]) == 6
     assert body["refreshing"] is False
-    assert calls == ["Kick", "Twitch", "YouTube", "Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube", "Kick", "Twitch", "YouTube", "YouTube"]
 
 
 @pytest.mark.asyncio
@@ -155,7 +155,7 @@ async def test_stale_snapshot_serves_index_and_refreshes_in_background(client, _
     calls = _fake_platform_services
 
     await client.get(_videos_url(100))
-    assert calls == ["Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     # Age the snapshots so the next request sees them stale.
     conn = sqlite3.connect(_scratch_archive_db)
@@ -175,10 +175,10 @@ async def test_stale_snapshot_serves_index_and_refreshes_in_background(client, _
     assert len(body["videos"]) == 6
     assert body["refreshing"] is True
     # Blocking fetch did NOT run — the response was served from the index.
-    assert calls == ["Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     await asyncio.sleep(0.8)  # let the background delta task finish
-    assert calls == ["Kick", "Twitch", "YouTube", "Kick", "Twitch", "YouTube"]
+    assert calls == ["Kick", "Twitch", "YouTube", "YouTube", "Kick", "Twitch", "YouTube", "YouTube"]
 
     # After the background merge the snapshot is fresh again.
     fresh = await client.get(_videos_url(88))
@@ -217,3 +217,61 @@ def test_snapshot_helper_roundtrip():
     age = channel_snapshot_age_sec("kick", "titiltei")
     assert age is not None and age < 5.0
     assert channel_snapshot_age_sec("kick", "nobody") is None
+
+
+def test_merge_youtube_playlists_streams_win_on_id():
+    vods = [{"id": "a", "content_kind": "vod"}, {"id": "b", "content_kind": "vod"}]
+    streams = [
+        {"id": "s", "content_kind": "stream"},
+        # same video id as a /videos row — the streams-tab classification
+        # (was_live) must win over the flat /videos row's 'vod'
+        {"id": "a", "content_kind": "stream"},
+    ]
+    merged = channels.merge_youtube_playlists(vods, streams)
+    by_id = {v["id"]: v for v in merged}
+    assert set(by_id) == {"a", "b", "s"}
+    assert by_id["a"]["content_kind"] == "stream"
+    assert by_id["b"]["content_kind"] == "vod"
+    assert by_id["s"]["content_kind"] == "stream"
+
+
+@pytest.mark.asyncio
+async def test_vods_fetch_merges_streams_tab_and_persists_stream_kind(
+    client, _scratch_archive_db, monkeypatch
+):
+    """The /videos fetch must also pull the /streams tab so recorded
+    broadcasts show in the channel panel, and persist them with kind
+    'stream' (not flattened to 'vod')."""
+    def playlist_aware(ref, limit, playlist="videos", enrich=True):
+        if playlist == "streams":
+            return [{
+                "id": "s1", "platform": "YouTube", "title": "Stream 1",
+                "duration": 14814, "duration_string": "4:06:54",
+                "created_at": "2026-07-01T00:00:00Z", "views": 744,
+                "thumbnail_url": "https://yt-thumb/s1",
+                "url": "https://www.youtube.com/watch?v=s1", "channel": ref,
+                "content_kind": "stream",
+            }]
+        return [{
+            "id": "u1", "platform": "YouTube", "title": "Upload 1",
+            "duration": 300, "duration_string": "0:05:00",
+            "created_at": "2026-08-01T00:00:00Z", "views": 20,
+            "thumbnail_url": "https://yt-thumb/u1",
+            "url": "https://www.youtube.com/watch?v=u1", "channel": ref,
+            "content_kind": "vod",
+        }]
+
+    monkeypatch.setattr(channels, "youtube_list_channel_videos_sync", playlist_aware)
+
+    resp = await client.get(_videos_url(100, platforms="YouTube"))
+    assert resp.status_code == 200
+    body = resp.json()
+    kinds = {v["id"]: v["content_kind"] for v in body["videos"]}
+    assert kinds == {"u1": "vod", "s1": "stream"}
+
+    row = get_conn().execute(
+        "SELECT kind, duration_sec FROM videos WHERE platform='youtube' AND video_id='s1'"
+    ).fetchone()
+    assert row is not None
+    assert row["kind"] == "stream"
+    assert row["duration_sec"] == 14814

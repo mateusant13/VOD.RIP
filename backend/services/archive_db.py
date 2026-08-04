@@ -33,7 +33,10 @@ from services.settings import _get_appdata_dir
 logger = logging.getLogger(__name__)
 
 PLATFORMS = ("youtube", "twitch", "kick")
-KINDS = ("vod", "clip", "short", "live")
+# "stream" = YouTube was_live content from the /streams tab (recorded live
+# broadcasts). Without it, _normalize_kind mapped every stream row to "vod",
+# so stream VODs were indistinguishable from regular uploads in the index.
+KINDS = ("vod", "clip", "short", "live", "stream")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
@@ -49,7 +52,7 @@ CREATE TABLE IF NOT EXISTS videos (
   status        TEXT NOT NULL DEFAULT 'known'
                 CHECK (status IN ('known','downloading','ready','failed')),
   kind          TEXT NOT NULL DEFAULT 'vod'
-                CHECK (kind IN ('vod','clip','short','live')),
+                CHECK (kind IN ('vod','clip','short','live','stream')),
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (platform, video_id)
@@ -223,6 +226,7 @@ def get_conn() -> sqlite3.Connection:
         if not _schema_ready:
             _conn.executescript(SCHEMA)
             _ensure_kind_column(_conn)
+            _ensure_kind_check_includes_stream(_conn)
             _ensure_channel_columns(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
@@ -243,7 +247,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def _ensure_kind_column(conn: sqlite3.Connection) -> None:
-    """Idempotent migration: add videos.kind (vod|clip|short|live, 'vod' default).
+    """Idempotent migration: add videos.kind (vod|clip|short|live|stream, 'vod' default).
 
     Safe on pre-kind DBs: ADD COLUMN with NOT NULL DEFAULT is immediate and
     backfills existing rows with 'vod'. PRAGMA table_info guard makes repeated
@@ -252,8 +256,75 @@ def _ensure_kind_column(conn: sqlite3.Connection) -> None:
     if "kind" not in cols:
         conn.execute(
             "ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT 'vod'"
-            " CHECK (kind IN ('vod','clip','short','live'))"
+            " CHECK (kind IN ('vod','clip','short','live','stream'))"
         )
+
+
+_VIDEO_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_canonical ON videos(canonical_key)",
+)
+
+
+def _ensure_kind_check_includes_stream(conn: sqlite3.Connection) -> None:
+    """Rebuild videos once so its kind CHECK accepts 'stream'.
+
+    The original CHECK (vod/clip/short/live) predates the recorded-broadcast
+    kind, and SQLite cannot alter constraints in place — so the table is
+    swapped via rename+copy when the stored DDL lacks 'stream'. The rebuild
+    is safe for the FTS shadow tables: transcripts/messages link to videos by
+    (platform, video_id) columns, never rowid. A crash mid-swap leaves
+    videos_old behind; the next open restores it if the copy never landed.
+    """
+    def _recreate_indexes() -> None:
+        for sql in _VIDEO_INDEX_SQL:
+            conn.execute(sql)
+
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "videos_old" in tables:
+        # Crash-leftover from a prior swap: restore when the new table is an
+        # empty shell (copy never landed), else the leftover is dead weight.
+        n_videos = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        n_old = conn.execute("SELECT COUNT(*) FROM videos_old").fetchone()[0]
+        if n_videos == 0 and n_old > 0:
+            conn.execute("DROP TABLE videos")
+            conn.execute("ALTER TABLE videos_old RENAME TO videos")
+            _recreate_indexes()
+        else:
+            conn.execute("DROP TABLE videos_old")
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'"
+    ).fetchone()
+    if not row or "stream" in (row[0] or ""):
+        return
+    ddl = (row[0] or "").replace(
+        "CHECK (kind IN ('vod','clip','short','live'))",
+        "CHECK (kind IN ('vod','clip','short','live','stream'))",
+    )
+    if "kind" not in ddl:
+        # kind was added via ALTER TABLE (pre-kind DBs) — ALTER never touches
+        # sqlite_master.sql, so the stored DDL lacks the column. Rebuild with
+        # kind appended (same position ALTER would have used: last column).
+        pk_idx = ddl.rfind("PRIMARY KEY")
+        if pk_idx == -1:
+            ddl = ddl.rstrip().rstrip(")").rstrip() + (
+                ", kind TEXT NOT NULL DEFAULT 'vod'"
+                " CHECK (kind IN ('vod','clip','short','live','stream')))"
+            )
+        else:
+            ddl = ddl[:pk_idx] + (
+                "  kind TEXT NOT NULL DEFAULT 'vod'"
+                " CHECK (kind IN ('vod','clip','short','live','stream')),\n"
+            ) + ddl[pk_idx:]
+    conn.execute("ALTER TABLE videos RENAME TO videos_old")
+    conn.execute(ddl)
+    conn.execute("INSERT INTO videos SELECT * FROM videos_old")
+    conn.execute("DROP TABLE videos_old")
+    _recreate_indexes()
 
 
 def _ensure_channel_columns(conn: sqlite3.Connection) -> None:
