@@ -39,7 +39,7 @@ import unicodedata
 from pathlib import Path
 from typing import Optional
 
-from services import archive_db, kick_api_service
+from services import archive_content_dedup, archive_db, kick_api_service
 from services.kick_models import KickVideo
 from services.settings import _get_appdata_dir
 
@@ -191,13 +191,22 @@ def _ingest_one(
     # refresh preserves status='ready' + archive_path (upserting the bare
     # base dict would clobber both).
     existing = archive_db.query(
-        "SELECT status, archive_path FROM videos WHERE platform=? AND video_id=?",
+        "SELECT status, archive_path, content_sha256 FROM videos WHERE platform=? AND video_id=?",
         (PLATFORM, v.id),
     )
     if existing and existing[0]["status"] == "ready":
         path = existing[0]["archive_path"]
         if path and Path(path).is_file():
-            archive_db.upsert_video({**base, "status": "ready", "archive_path": path})
+            ready = {**base, "status": "ready", "archive_path": path}
+            if not existing[0]["content_sha256"]:
+                # Lazy one-time backfill for rows that predate the hash
+                # column: hashing the file lets future duplicate downloads
+                # dedupe onto it. Best-effort — the row is already valid.
+                try:
+                    ready["content_sha256"] = archive_content_dedup.sha256_file(path)
+                except OSError:
+                    pass
+            archive_db.upsert_video(ready)
             _enforce_retention()
             return {**base, "action": "already_ready", "status": "ready",
                     "archive_path": path, "seconds_spent": 0.0}
@@ -228,11 +237,19 @@ def _ingest_one(
     spent = time.monotonic() - t0
 
     if outcome.get("ok"):
-        archive_db.upsert_video({**base, "status": "ready", "archive_path": str(out_path)})
+        # Content dedup: when the bytes already exist under another row, the
+        # fresh copy is dropped and BOTH rows reference the one file.
+        reg = archive_content_dedup.register_archive_file(
+            str(out_path), platform=PLATFORM, video_id=v.id
+        )
+        archive_db.upsert_video({**base, "status": "ready",
+                                 "archive_path": reg["archive_path"],
+                                 "content_sha256": reg["content_sha256"]})
         archive_db.update_job(job_id, status="done")
         logger.info("archive_kick: %s DOWNLOADED (%ds): %s", v.id, int(spent), v.title)
         _enforce_retention()
-        return {**base, "action": "downloaded", "status": "ready", "archive_path": str(out_path),
+        return {**base, "action": "downloaded", "status": "ready",
+                "archive_path": reg["archive_path"],
                 "seconds_spent": round(spent, 1)}
 
     err = str(outcome.get("error", "unknown failure"))

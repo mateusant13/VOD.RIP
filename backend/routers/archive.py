@@ -543,7 +543,10 @@ async def archive_transcript(platform: str, video_id: str):
 
 @router.get("/api/archive/dedupe")
 async def archive_dedupe():
-    return {"groups": archive_db.dedupe_view()}
+    # content_groups: byte-identical media files (SHA-256) shared by >= 2
+    # rows — the content-dedup layer, distinct from canonical_key groups.
+    return {"groups": archive_db.dedupe_view(),
+            "content_groups": archive_db.content_duplicates()}
 
 
 @router.post("/api/archive/aliases")
