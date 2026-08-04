@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import tempfile
+import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -745,6 +746,112 @@ def list_channel_videos(channel_url: str, *, tab: str = "streams", limit: int = 
         if entries:
             break
     return entries[:limit]
+
+
+# --- WS-4 original-title backfill -------------------------------------------
+
+# Never hammer YouTube: a min gap between fetches + a cooldown for videos
+# that failed or yielded no language clue. State is in-memory (process
+# lifetime), so a permanently failing video is retried at most once per app
+# restart. ponytail: upgrade path = a videos.original_fetch_failed_at column
+# so cooldowns survive restarts and skip work across processes.
+_ORIGINAL_MIN_GAP_S = 1.5
+_ORIGINAL_FAIL_COOLDOWN_S = 3600.0
+_original_last_fetch = 0.0
+_original_failed_at: dict[str, float] = {}
+_original_throttle_lock = threading.Lock()
+# The language the hl-free player response serves on this machine (see
+# innertube_original_meta's decision comment). The player title is the
+# ORIGINAL title only when it matches the video's original language; for
+# other original languages the title is an auto-translation.
+_SERVING_LANG = "pt"
+_VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
+def _mark_original_failed(video_id: str) -> None:
+    with _original_throttle_lock:
+        _original_failed_at[video_id] = time.monotonic()
+        if len(_original_failed_at) > 4096:
+            _original_failed_at.pop(next(iter(_original_failed_at)), None)
+
+
+def _original_failed_recently(video_id: str) -> bool:
+    with _original_throttle_lock:
+        at = _original_failed_at.get(video_id)
+        return at is not None and (time.monotonic() - at) < _ORIGINAL_FAIL_COOLDOWN_S
+
+
+def _original_throttle_wait() -> None:
+    """Block until the min gap since the last fetch has elapsed."""
+    with _original_throttle_lock:
+        global _original_last_fetch
+        now = time.monotonic()
+        remaining = _ORIGINAL_MIN_GAP_S - (now - _original_last_fetch)
+        _original_last_fetch = now
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def backfill_original_titles(channel: str, *, limit: int = 20) -> dict:
+    """Fetch original (non-auto-translated) titles for a channel's YouTube rows.
+
+    Wired into the channel sync path AFTER the walk: every sync fills rows
+    that still lack videos.original_title (new rows at ingest and legacy
+    rows alike), throttled (min gap between fetches, recently-failed videos
+    skipped) so the backfill never hammers YouTube.
+
+    Per-video source: innertube_original_meta (hl-free player fetch — see
+    its decision comment). original_title/original_language are stored with
+    set_original_title; the stored `title` is never touched. original_language
+    is the WS-3 channel-detection clue (column contract: videos.original_language).
+
+    Returns a report dict {candidates, fetched, skipped, no_language}."""
+    from services.youtube_innertube import innertube_original_meta
+
+    candidates = archive_db.videos_missing_original_title(PLATFORM, channel, limit)
+    report = {"candidates": len(candidates), "fetched": 0, "skipped": 0, "no_language": 0}
+    for row in candidates:
+        video_id = str(row.get("video_id") or "")
+        # Only real 11-char YouTube ids reach the network (flat-playlist
+        # fakes / synthetic watchdog rows never do).
+        if not _VIDEO_ID_RE.fullmatch(video_id) or _original_failed_recently(video_id):
+            report["skipped"] += 1
+            continue
+        _original_throttle_wait()
+        try:
+            meta = innertube_original_meta(video_id)
+        except Exception as exc:
+            logger.debug("original-title backfill fetch failed %s: %s", video_id, exc)
+            meta = None
+        if not meta or not meta.get("title"):
+            _mark_original_failed(video_id)
+            report["skipped"] += 1
+            continue
+        lang = meta.get("language")
+        if not lang:
+            # No language clue (no caption tracks: age-gated/member-only) —
+            # the player title may be a translation, so keep original_title
+            # empty rather than store a wrong "original". Retried after the
+            # cooldown.
+            _mark_original_failed(video_id)
+            report["no_language"] += 1
+            continue
+        if lang == _SERVING_LANG:
+            original_title = meta["title"]
+        elif lang == "en":
+            # The walk's default hl is en, so the stored title IS the en
+            # original (verified: browse lang=en matches stored EN titles).
+            original_title = str(row.get("title") or "")
+        else:
+            # Neither source serves this language (e.g. de on a pt/en box) —
+            # record the language as a clue, leave the title alone.
+            original_title = None
+        _db_write(
+            archive_db.set_original_title, PLATFORM, video_id,
+            original_title, lang,
+        )
+        report["fetched"] += 1
+    return report
 
 
 # --- module-level self-checks (repo convention; offline) ---------------------

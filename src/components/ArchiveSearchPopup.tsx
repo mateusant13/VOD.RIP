@@ -47,7 +47,7 @@ import {
   type ArchiveSource,
   type ArchiveVideoRow,
 } from '../archiveSearchUtils';
-import { deriveChannelDisplayName } from '../channelUtils';
+import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -105,8 +105,11 @@ const PLATFORM_ICON_NAME: Record<string, string> = {
 };
 
 function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): string {
-  const t = video?.title?.trim();
-  return t ? t : hit.video_id;
+  // WS-4: prefer the original (non-auto-translated) YouTube title when the
+  // API row carries it; displayTitle keeps this in lockstep with the other
+  // display paths.
+  const t = displayTitle({ title: video?.title, originalTitle: video?.originalTitle ?? hit.originalTitle });
+  return t !== 'Untitled' ? t : hit.video_id;
 }
 
 export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
@@ -926,7 +929,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                       YouTube
                     </span>
                     <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
-                      {hit.title}
+                      {displayTitle({ title: hit.title, originalTitle: hit.originalTitle })}
                     </span>
                     {hit.duration_string && (
                       <span className="text-[9px] font-mono text-zinc-400 shrink-0">

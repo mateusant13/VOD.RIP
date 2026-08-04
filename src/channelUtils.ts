@@ -12,6 +12,16 @@ export function bestAvailableQuality(info: VideoInfo): string {
   return 'source';
 }
 
+/** WS-4: prefer the original (non-auto-translated) YouTube title.
+ * The backend already prefers original_title in its payloads; this helper is
+ * the single display-path fallback for the frontend, so every render site
+ * that receives both fields shows the PT original instead of the en copy. */
+export function displayTitle(v: { title?: string | null; originalTitle?: string | null } | null | undefined): string {
+  const original = v?.originalTitle?.trim();
+  if (original) return original;
+  return v?.title?.trim() || 'Untitled';
+}
+
 export function detectUrlPlatform(u: string): 'kick' | 'twitch' | 'youtube' | null {
   const l = u.toLowerCase();
   if (l.includes('kick.com')) return 'kick';

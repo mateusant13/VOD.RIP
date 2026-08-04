@@ -14,6 +14,8 @@ export interface ArchiveSearchHit {
   /** Extras from the owning videos row (null when no video row exists). */
   channel?: string | null;
   title?: string | null;
+  /** WS-4: original (non-auto-translated) title when the API supplied it. */
+  originalTitle?: string | null;
   date?: string | null;
   video_kind?: string | null;
   /** Transcript language tag ('pt' | 'en' | other code); null for chat rows. */
@@ -33,6 +35,8 @@ export interface ArchiveVideoRow {
   video_id: string;
   channel?: string | null;
   title?: string | null;
+  /** WS-4: original (non-auto-translated) title when the API supplied it. */
+  originalTitle?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
   duration_sec?: number | null;
