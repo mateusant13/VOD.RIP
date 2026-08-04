@@ -4,7 +4,8 @@
  */
 
 export interface ArchiveSearchHit {
-  kind: 'transcript' | 'message';
+  /** 'title' = local video-title match; 'youtube' = remote channel-search hit. */
+  kind: 'transcript' | 'message' | 'title' | 'youtube';
   platform: string;
   video_id: string;
   offset_sec: number;
@@ -17,6 +18,10 @@ export interface ArchiveSearchHit {
   video_kind?: string | null;
   /** Transcript language tag ('pt' | 'en' | other code); null for chat rows. */
   lang?: string | null;
+  /** Remote hits only. */
+  duration_sec?: number | null;
+  duration_string?: string | null;
+  thumbnail_url?: string | null;
 }
 
 export interface ArchiveVideoRow {

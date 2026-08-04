@@ -352,6 +352,98 @@ def list_channel_videos_sync(
     return filtered
 
 
+def channel_search_url(handle: str, query: str) -> str:
+    """Channel-scoped YouTube search page URL for a handle or channel id."""
+    from urllib.parse import quote
+    h = handle.strip().lstrip("@")
+    base = (
+        f"https://www.youtube.com/channel/{h}"
+        if h.startswith("UC")
+        else f"https://www.youtube.com/@{h}"
+    )
+    return f"{base}/search?query={quote(query)}"
+
+
+def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list[dict]:
+    """Channel-scoped title search (the @handle/search tab), flat entries.
+
+    Used by the archive search UI as the remote fallback for saved YouTube
+    channels: the local index only holds the newest ~100 uploads per channel,
+    so old series ("vale da estranheza") are unreachable locally. Same
+    guarded yt-dlp + cookie machinery as list_channel_videos_sync; returns
+    [] on any fetch failure (the router surfaces the error)."""
+    from services.ytdlp_guard import guarded_youtube_dl_channel
+    from services.youtube_session import (
+        apply_ytdlp_cookie_opts,
+        youtube_session_from_settings,
+        ytdlp_extractor_args,
+    )
+
+    session = youtube_session_from_settings()
+    try:
+        from deps import settings_mgr
+        auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+    except Exception:
+        auto_auth = True
+    ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
+    base_opts: dict[str, Any] = {
+        "playlistend": max(1, min(int(limit), 50)),
+        "extract_flat": "in_playlist",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "ignoreerrors": True,
+        "socket_timeout": 12,
+        "extractor_args": {
+            "youtube": {
+                **ext_args["youtube"],
+                "player_client": ["ios", "mweb", "web"],
+            },
+            **{k: v for k, v in ext_args.items() if k != "youtube"},
+        },
+    }
+    apply_ytdlp_cookie_opts(base_opts, session, auto_auth=auto_auth)
+    url = channel_search_url(handle, query)
+    out: list[dict] = []
+    try:
+        with guarded_youtube_dl_channel(base_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        logger.debug("youtube channel search %s failed: %s", url, exc)
+        return out
+    for e in (info or {}).get("entries") or []:
+        if not e:
+            continue
+        vid = str(e.get("id") or "").strip()
+        if not vid:
+            continue
+        dur = e.get("duration")
+        duration_sec = None
+        if dur is not None:
+            try:
+                duration_sec = int(float(dur))
+            except (TypeError, ValueError):
+                pass
+        title = str(e.get("title") or "").strip()
+        out.append({
+            "id": vid,
+            "platform": "YouTube",
+            "title": title,
+            "duration": duration_sec,
+            "duration_string": _duration_string_from_sec(duration_sec) if duration_sec else None,
+            "created_at": _created_at_from_entry(e),
+            "views": e.get("view_count"),
+            "thumbnail_url": e.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "channel": e.get("channel") or e.get("uploader") or handle,
+        })
+    return out
+
+
+assert channel_search_url("gaveta", "vale da estranheza").endswith("/search?query=vale%20da%20estranheza")
+assert channel_search_url("UCabc123", "x").startswith("https://www.youtube.com/channel/UCabc123/search")
+assert channel_search_url("@gaveta", "x").startswith("https://www.youtube.com/@gaveta/search")
+
 assert channel_playlist_url("cellbit", "videos").endswith("/videos")
 assert channel_playlist_url("@cellbit", "shorts").endswith("/shorts")
 assert channel_playlist_url("UCxyz1234567890abcdefghijk", "streams").endswith("/streams")

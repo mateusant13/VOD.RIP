@@ -442,6 +442,72 @@ async def archive_search(
     return resp
 
 
+@router.get("/api/archive/search/remote")
+async def archive_search_remote(
+    q: str = Query(..., min_length=1),
+    channel: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Channel-scoped YouTube title search (remote fallback).
+
+    The local archive only indexes the newest ~100 uploads per saved channel
+    (the panel fetch cap), so old series are unreachable locally. This runs
+    the channel's own YouTube search tab via yt-dlp and returns flat hits in
+    the archive-search hit shape (kind='youtube'). Fetch failures return
+    [] + error (never a 500) — the UI surfaces it as a note."""
+    from deps import settings_mgr  # lazy: keeps routers.archive import-light
+
+    handle: Optional[str] = None
+    try:
+        saved = settings_mgr.get().saved_channels or []
+    except Exception:
+        saved = []
+    target = channel.strip().lower()
+    for entry in saved:
+        if not isinstance(entry, dict):
+            continue
+        slugs = [str(entry.get(k) or "").strip() for k in ("kickSlug", "twitchSlug", "youtubeSlug")]
+        if any(s.lower() == target for s in slugs if s):
+            handle = str(entry.get("youtubeSlug") or "").strip() or None
+            break
+    if not handle:
+        return {"hits": [], "error": f"'{channel}' has no YouTube handle — add one in Settings"}
+    from services.youtube_service import search_channel_videos_sync
+
+    try:
+        items = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None, search_channel_videos_sync, handle, q, max(1, min(int(limit), 50))
+            ),
+            timeout=25,
+        )
+    except asyncio.TimeoutError:
+        return {"hits": [], "error": "YouTube search timed out — try again"}
+    except Exception as exc:
+        logger.debug("remote search failed: %s", exc)
+        return {"hits": [], "error": "YouTube search failed"}
+    hits = [
+        {
+            "kind": "youtube",
+            "platform": "youtube",
+            "video_id": v["id"],
+            "offset_sec": 0,
+            "text": v["title"],
+            "score": 1.0,
+            "lang": None,
+            "channel": v.get("channel") or handle,
+            "title": v["title"],
+            "date": v.get("created_at"),
+            "video_kind": "vod",
+            "duration_sec": v.get("duration"),
+            "duration_string": v.get("duration_string"),
+            "thumbnail_url": v.get("thumbnail_url"),
+        }
+        for v in items
+    ]
+    return {"hits": hits, "error": None}
+
+
 @router.get("/api/archive/videos/{platform}/{video_id}/chat")
 async def archive_chat_window(platform: str, video_id: str, offset: float = 0.0, half: float = 30.0):
     _require_platform(platform)

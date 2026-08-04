@@ -85,6 +85,7 @@ function defaultPopupHeight(): number {
 }
 const SEARCH_DEBOUNCE_MS = 250;
 const SEARCH_LIMIT = 30;
+const REMOTE_LIMIT = 20;
 const CHAT_HALF_SEC = 30;
 /** Floating-mode seed position — the pre-chrome location (top 80, right 24). */
 const SEED_Y = 80;
@@ -145,6 +146,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [channelHint, setChannelHint] = useState<string | null>(null);
   /** User dismissed the hint chip — next request opts out (hint=0). */
   const [hintDisabled, setHintDisabled] = useState(false);
+  /** Remote YouTube channel-title search (kind='youtube' hits). */
+  const [remoteHits, setRemoteHits] = useState<ArchiveSearchHit[]>([]);
+  const [remoteStatus, setRemoteStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const remoteGenRef = useRef(0);
   const mountedRef = useRef(true);
   const searchGenRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
@@ -317,6 +323,30 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     return [...options.values()].sort((a, b) => a.label.localeCompare(b.label));
   }, [savedChannels, archivedChannelGroups]);
 
+  /** YouTube handle for the current scope (explicit dropdown channel or
+   *  backend hint) — null when no remote search applies. A single slug is
+   *  sent as-is even when the frontend doesn't know the channel: the backend
+   *  resolves it against its own saved_channels and reports an error note
+   *  when there is no YouTube handle (the frontend list may lag the backend,
+   *  e.g. channels present only via archived rows). */
+  const remoteYtHandle = useMemo(() => {
+    const scopeValue = channelFilter || (channelHint && !hintDisabled ? channelHint : null);
+    if (!scopeValue) return null;
+    const slugs = scopeValue
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (slugs.length === 0) return null;
+    const first = slugs[0].toLowerCase();
+    for (const ch of savedChannels ?? []) {
+      const chSlugs = [ch.twitchSlug, ch.kickSlug, ch.youtubeSlug]
+        .map((s) => (s || '').trim().toLowerCase())
+        .filter(Boolean);
+      if (chSlugs.some((s) => s === first)) return ch.youtubeSlug?.trim() || null;
+    }
+    return slugs[0];
+  }, [channelFilter, channelHint, hintDisabled, savedChannels]);
+
   const togglePlatform = useCallback((p: string) => {
     setPlatformFilter((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
   }, []);
@@ -402,6 +432,46 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setStatus('error');
       });
   }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled]);
+
+  // Remote YouTube channel-title search: the local index only holds the
+  // newest ~100 uploads per saved channel (the panel fetch cap), so old
+  // series are unreachable locally. Runs for "both" source only, and only
+  // when the scope resolves to a saved channel with a YouTube handle.
+  useEffect(() => {
+    remoteGenRef.current += 1;
+    const excludedPlatform = platformFilter.length > 0 && !platformFilter.includes('youtube');
+    const excludedKind = kindFilter.length > 0 && !kindFilter.includes('vod');
+    if (!query || scope || sourceFilter !== 'both' || excludedPlatform || excludedKind || !remoteYtHandle) {
+      setRemoteHits([]);
+      setRemoteStatus('idle');
+      setRemoteError(null);
+      return;
+    }
+    const gen = remoteGenRef.current;
+    setRemoteStatus('loading');
+    setRemoteError(null);
+    const url = `/api/archive/search/remote?q=${encodeURIComponent(query)}&channel=${encodeURIComponent(remoteYtHandle)}&limit=${REMOTE_LIMIT}`;
+    void apiGet<{ hits: ArchiveSearchHit[]; error?: string | null }>(url)
+      .then((res) => {
+        if (!mountedRef.current || gen !== remoteGenRef.current) return;
+        setRemoteHits(res.hits ?? []);
+        setRemoteError(res.error ?? null);
+        setRemoteStatus('done');
+      })
+      .catch(() => {
+        if (!mountedRef.current || gen !== remoteGenRef.current) return;
+        setRemoteHits([]);
+        setRemoteError('YouTube search unavailable');
+        setRemoteStatus('error');
+      });
+  }, [query, scope, sourceFilter, platformFilter, kindFilter, remoteYtHandle]);
+
+  // Remote hit → open in the player (no nearby-chat panel; not archived).
+  const openRemoteHit = useCallback((hit: ArchiveSearchHit) => {
+    if (!onOpenHit) return;
+    if (!buildArchiveVodUrl(hit.platform, hit.video_id, hit.channel ?? undefined)) return;
+    onOpenHit(hit, undefined);
+  }, [onOpenHit]);
 
   // Nearby chat ±30s for the selected hit.
   const selectHit = useCallback((hit: ArchiveSearchHit) => {
@@ -704,9 +774,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </div>
       )}
 
-      {status === 'done' && hits.length === 0 && (
+      {status === 'done' && hits.length === 0 && remoteStatus !== 'loading' && (
         <p className="text-[10px] font-mono text-zinc-500 shrink-0">
-          No results for &quot;{query}&quot; — nothing archived matches yet.
+          No results for &quot;{query}&quot; —{' '}
+          {remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
+            ? 'nothing local matches and YouTube found nothing either'
+            : 'nothing archived matches yet'}
+          .
         </p>
       )}
 
@@ -738,7 +812,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   }`}
                 >
                 <span className="flex items-center gap-1.5 min-w-0">
-                  {hit.kind === 'transcript'
+                  {hit.kind === 'transcript' || hit.kind === 'title'
                     ? <FileText size={10} className="text-zinc-400 shrink-0" />
                     : <MessageSquare size={10} className="text-zinc-400 shrink-0" />}
                   <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-300 shrink-0">
@@ -785,6 +859,61 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* ── REMOTE YOUTUBE RESULTS (channel-scoped title search) ── */}
+      {(remoteStatus === 'loading' || remoteStatus === 'done' || remoteStatus === 'error') && (
+        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-1.5 min-h-0 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
+              YouTube results{remoteYtHandle ? ` · @${remoteYtHandle}` : ''}
+            </span>
+            {remoteStatus === 'loading' && (
+              <Loader2 size={10} className="animate-spin text-zinc-500 shrink-0" />
+            )}
+          </div>
+          {remoteStatus === 'error' && (
+            <p className="text-[9px] font-mono text-red-400/80 shrink-0">{remoteError}</p>
+          )}
+          {remoteStatus === 'done' && remoteHits.length === 0 && (
+            <p className="text-[9px] font-mono text-zinc-600 shrink-0">
+              {remoteError ?? `No YouTube matches for "${query}"`}
+            </p>
+          )}
+          {remoteStatus === 'done' && remoteHits.length > 0 && (
+            <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0">
+              {remoteHits.map((hit) => (
+                <button
+                  key={hit.video_id}
+                  type="button"
+                  onClick={() => openRemoteHit(hit)}
+                  title="Open in the player — download from there"
+                  className="text-left border-2 border-zinc-800 bg-zinc-900/60 hover:border-zinc-500 p-1.5 flex flex-col gap-1 transition-colors"
+                >
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-300 shrink-0">
+                      youtube
+                    </span>
+                    <span className="text-[9px] font-mono uppercase tracking-widest text-[#F03030] shrink-0">
+                      YouTube
+                    </span>
+                    <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
+                      {hit.title}
+                    </span>
+                    {hit.duration_string && (
+                      <span className="text-[9px] font-mono text-zinc-400 shrink-0">
+                        {hit.duration_string}
+                      </span>
+                    )}
+                  </span>
+                  <span className="text-[10px] text-zinc-500 break-words">
+                    @{hit.channel ?? remoteYtHandle} — click to open in the player
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

@@ -22,9 +22,15 @@ const SAVED: SavedChannel = {
   updatedAt: '2026-08-01T00:00:00Z',
 };
 
-function mockFetch(hits: unknown[] = [], extra: Record<string, unknown> = {}) {
+function mockFetch(hits: unknown[] = [], extra: Record<string, unknown> = {}, remote: unknown = undefined) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/archive/search/remote')) {
+      return new Response(
+        JSON.stringify(remote === undefined ? { hits: [], error: null } : remote),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
     if (url.includes('/api/archive/search')) {
       return new Response(JSON.stringify({ hits, ...extra }), {
         status: 200,
@@ -511,8 +517,11 @@ describe('ArchiveSearchPopup', () => {
 
     // The hint is an implicit backend scope: the request must NOT echo it
     // as an explicit channel (that suppressed the hint and re-fired the
-    // search forever in a request loop).
-    const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+    // search forever in a request loop). The remote channel-search request
+    // legitimately carries channel= — exclude it from this assertion.
+    const localUrls = (list: string[]) =>
+      list.filter((u) => u.includes('q=zebra') && !u.includes('/api/archive/search/remote'));
+    const urls = localUrls(searchUrls(fetchMock));
     expect(urls[urls.length - 1]).not.toContain('channel=');
 
     // ✕ dismisses: the next request opts out via hint=0 and the chip stays
@@ -520,13 +529,13 @@ describe('ArchiveSearchPopup', () => {
     hint = undefined;
     fireEvent.click(screen.getByLabelText('Remove channel scope'));
     await waitFor(() => {
-      const u = searchUrls(fetchMock).filter((x) => x.includes('q=zebra'));
+      const u = localUrls(searchUrls(fetchMock));
       expect(u[u.length - 1]).toContain('hint=0');
     });
     expect(screen.queryByLabelText('Channel scope hint')).toBeNull();
-    const count = searchUrls(fetchMock).filter((x) => x.includes('q=zebra')).length;
-    await new Promise((r) => setTimeout(r, 150));
-    expect(searchUrls(fetchMock).filter((x) => x.includes('q=zebra')).length).toBe(count);
+    const count = localUrls(searchUrls(fetchMock)).length;
+    await new Promise<void>((r) => setTimeout(r, 150));
+    expect(localUrls(searchUrls(fetchMock)).length).toBe(count);
   });
 
   it('spam_count badge: ×N on collapsed rows, absent for single messages', async () => {
@@ -567,5 +576,110 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(screen.getByText(/KEKW/)).toBeInTheDocument());
     expect(screen.getByText('×5')).toBeInTheDocument();
     expect(screen.queryByText('×1')).toBeNull();
+  });
+
+  it('remote YouTube search: fires for a saved channel scope, renders hits, opens on click', async () => {
+    const REMOTE_HIT = {
+      kind: 'youtube',
+      platform: 'youtube',
+      video_id: 'est1',
+      offset_sec: 0,
+      text: 'VALE DA ESTRANHEZA #5 — o deserto',
+      score: 1,
+      channel: 'gaveta',
+      title: 'VALE DA ESTRANHEZA #5 — o deserto',
+      duration_string: '12:34',
+    };
+    const SAVED_GAVETA: SavedChannel = {
+      id: 'ch-gaveta',
+      displayName: 'gaveta',
+      kickSlug: '',
+      twitchSlug: '',
+      youtubeSlug: 'gaveta',
+      vodVideos: [],
+      clipVideos: [],
+      updatedAt: '2026-08-01T00:00:00Z',
+    };
+    const fetchMock = mockFetch([], {}, { hits: [REMOTE_HIT], error: null });
+    const onOpenHit = vi.fn();
+    render(
+      <ArchiveSearchPopup
+        zIndex={7}
+        onClose={() => {}}
+        onOpenHit={onOpenHit}
+        savedChannels={[SAVED_GAVETA]}
+        initialChannel="gaveta"
+      />,
+    );
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'vale da estranheza' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
+    expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toContain('channel=gaveta');
+    await screen.findByText('YouTube results · @gaveta');
+    const row = await screen.findByRole('button', { name: /VALE DA ESTRANHEZA #5/i });
+    fireEvent.click(row);
+    expect(onOpenHit).toHaveBeenCalledTimes(1);
+    expect(onOpenHit.mock.calls[0][0]).toMatchObject({
+      kind: 'youtube',
+      video_id: 'est1',
+      channel: 'gaveta',
+    });
+  });
+
+  it('remote search: fires for an archived-only channel (no savedChannels), backend resolves the slug', async () => {
+    const REMOTE_HIT = {
+      kind: 'youtube',
+      platform: 'youtube',
+      video_id: 'r2',
+      offset_sec: 0,
+      text: 'ARCHIVED ONLY HIT',
+      score: 1,
+      channel: 'srdogg',
+      title: 'ARCHIVED ONLY HIT',
+    };
+    const fetchMock = mockFetch([], {}, { hits: [REMOTE_HIT], error: null });
+    const onOpenHit = vi.fn();
+    render(
+      <ArchiveSearchPopup
+        zIndex={7}
+        onClose={() => {}}
+        onOpenHit={onOpenHit}
+        initialChannel="srdogg"
+      />,
+    );
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
+    expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toContain('channel=srdogg');
+    await screen.findByText('ARCHIVED ONLY HIT');
+  });
+
+  it('remote YouTube search: empty + error states render without breaking the local list', async () => {
+    const SAVED_GAVETA: SavedChannel = {
+      id: 'ch-gaveta',
+      displayName: 'gaveta',
+      kickSlug: '',
+      twitchSlug: '',
+      youtubeSlug: 'gaveta',
+      vodVideos: [],
+      clipVideos: [],
+      updatedAt: '2026-08-01T00:00:00Z',
+    };
+    const fetchMock = mockFetch([HIT], {}, { hits: [], error: 'YouTube search timed out — try again' });
+    render(
+      <ArchiveSearchPopup
+        zIndex={7}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+        savedChannels={[SAVED_GAVETA]}
+        initialChannel="gaveta"
+      />,
+    );
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
+    await screen.findByText('YouTube search timed out — try again');
+    // Local hit still renders alongside the remote error note.
+    expect(await screen.findByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
   });
 });

@@ -1026,6 +1026,28 @@ def search(
                 h["score"] = h["score"] / max_score
             h["score"] = h["score"] * (_PHRASE_BOOST if h.pop("_phrase", False) else 0.5 ** h.pop("_tier", 0))
             merged.append(h)
+    # Video-title pass: matching titles surface saved-channel uploads that
+    # have no transcript/chat yet (the channel index accumulates every
+    # upload the panel has ever fetched). Included only in the "both" source
+    # (titles are neither chat nor transcript). Same normalization rule as
+    # the content tables: best title hit scores 1.0.
+    if source == "both":
+        title_rows = _titles_search(
+            q,
+            fetch,
+            platforms=platforms,
+            video_id=video_id,
+            channel=channel,
+            kinds=kinds,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        if title_rows:
+            tmax = max(r["score"] for r in title_rows)
+            for r in title_rows:
+                if tmax > 0:
+                    r["score"] = r["score"] / tmax
+                merged.append(r)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
     # Normalization collapses each table's best to exactly 1.0, so two
     # tables' best hits can TIE at 1.5 after the phrase boost; the raw
@@ -1040,6 +1062,97 @@ def search(
         h.pop("_rowid", None)
         out.append(h)
     return out[:limit]
+
+
+def _fold_tokens(text: str) -> list[str]:
+    """Lowercase, accent-folded, non-alphanumeric-split tokens (titles)."""
+    import unicodedata
+    folded = "".join(
+        c for c in unicodedata.normalize("NFD", str(text or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    return [t for t in re.split(r"[^a-z0-9]+", folded) if t]
+
+
+def _titles_search(
+    q: str,
+    fetch: int,
+    *,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+) -> list[dict]:
+    """Video-title match over the videos table (folded-token coverage).
+
+    Titles are short and the videos table is small (hundreds of rows), so a
+    pure-Python pass is cheaper than an FTS5 titles index. A query token
+    matches when it is a substring of a title token (or vice-versa for
+    tokens ≥3 chars — "estranheza" finds "ESTRANHEZA"). Score = fraction of
+    query tokens matched. ponytail: when videos grows past ~10k rows, move
+    to an FTS5 external-content titles table with a unicode61 tokenizer and
+    reuse the tier/merge machinery of the content tables."""
+    q_tokens = _fold_tokens(q)
+    if not q_tokens:
+        return []
+    sql = "SELECT platform, video_id, channel, title, started_at AS date, kind AS video_kind FROM videos"
+    where: list[str] = []
+    params: list[Any] = []
+    if platforms:
+        where.append(f"platform IN ({','.join('?' * len(platforms))})")
+        params.extend(platforms)
+    if video_id:
+        where.append("video_id = ?")
+        params.append(video_id)
+    if channel:
+        slugs = [c.strip() for c in channel.split(",") if c.strip()]
+        if slugs:
+            where.append(f"lower(channel) IN ({','.join('?' * len(slugs))})")
+            params.extend(s.lower() for s in slugs)
+    if kinds:
+        where.append(f"kind IN ({','.join('?' * len(kinds))})")
+        params.extend(kinds)
+    if date_from:
+        where.append("date(started_at) >= date(?)")
+        params.append(date_from)
+    if date_to:
+        where.append("date(started_at) <= date(?)")
+        params.append(date_to)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    out: list[dict] = []
+    for r in query(sql, params):
+        title = str(r["title"] or "")
+        toks = _fold_tokens(title)
+        if not toks:
+            continue
+        matched = sum(
+            1
+            for qt in q_tokens
+            if any(qt in tt or (len(tt) >= 3 and tt in qt) for tt in toks)
+        )
+        if not matched:
+            continue
+        score = matched / len(q_tokens)
+        out.append({
+            "kind": "title",
+            "platform": r["platform"],
+            "video_id": r["video_id"],
+            "offset_sec": 0,
+            "text": title,
+            "score": score,
+            "lang": None,
+            "channel": r["channel"],
+            "title": title,
+            "date": r["date"],
+            "video_kind": r["video_kind"],
+            "_rowid": f"t:{r['platform']}:{r['video_id']}",
+            "_raw": score,
+        })
+    out.sort(key=lambda h: h["score"], reverse=True)
+    return out[:fetch]
 
 
 def _table_search(
@@ -1123,10 +1236,22 @@ def _table_search(
 
 
 # Channel-slug cache for the channel_hint query understanding: (loaded_at,
-# {lower_slug: stored_slug}); TTL 300s mirrors the vocab cache.
+# db_path, content_stamp, {lower_slug: stored_slug}); TTL 300s mirrors the
+# vocab cache. Reloads when the resolved DB path changed (test modules rebind
+# VODRIP_ARCHIVE_DB) or when videos.content stamp moved — the test suites
+# share one process-wide DB (last module-level env override wins), so a
+# TTL-only cache would silently serve another module's slugs.
 _CHANNEL_SLUG_TTL_S = 300.0
 _channel_slug_lock = threading.Lock()
-_channel_slug_cache: tuple[float, dict[str, str]] = (0.0, {})
+_channel_slug_cache: tuple[float, str, tuple[int, Optional[str]], dict[str, str]] = (
+    0.0, "", (0, None), {},
+)
+
+
+def _videos_stamp() -> tuple[int, Optional[str]]:
+    """(row count, max updated_at) — cheap content fingerprint for caches."""
+    row = query("SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM videos")[0]
+    return row["n"], row["at"]
 
 
 def _channel_hint_for(q: str) -> Optional[str]:
@@ -1142,12 +1267,16 @@ def _channel_hint_for(q: str) -> Optional[str]:
     global _channel_slug_cache
     with _channel_slug_lock:
         now = time.monotonic()
-        loaded_at, slugs = _channel_slug_cache
-        if now - loaded_at >= _CHANNEL_SLUG_TTL_S:
+        loaded_at, db_path, stamp, slugs = _channel_slug_cache
+        if (
+            now - loaded_at >= _CHANNEL_SLUG_TTL_S
+            or db_path != str(_db_path())
+            or stamp != _videos_stamp()
+        ):
             slugs = {}
             for r in query("SELECT DISTINCT lower(channel) AS slug, channel FROM videos"):
                 slugs.setdefault(r["slug"], r["channel"])
-            _channel_slug_cache = (now, slugs)
+            _channel_slug_cache = (now, str(_db_path()), _videos_stamp(), slugs)
     return slugs.get(first)
 
 
@@ -1172,7 +1301,9 @@ _TOKEN_PREFIX_CAP = 8
 
 _vocab_lock = threading.Lock()
 # content table -> (loaded_at_monotonic, {token_len: [(term, freq), ...]}, row_count)
-_vocab_cache: dict[str, tuple[float, dict[int, list[tuple[str, int]]], int]] = {}
+# (db_path, loaded_at, by_len, row_count) per table — db_path guards against
+# test suites rebinding VODRIP_ARCHIVE_DB mid-process.
+_vocab_cache: dict[str, tuple[str, float, dict[int, list[tuple[str, int]]], int]] = {}
 # query token -> (expanded_at_monotonic, [terms, ...])
 _token_cache: dict[str, tuple[float, list[str]]] = {}
 
@@ -1190,10 +1321,10 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
     now = time.monotonic()
     with _vocab_lock:
         hit = _vocab_cache.get(table)
-        if hit and now - hit[0] < _VOCAB_TTL_S:
+        if hit and now - hit[1] < _VOCAB_TTL_S and hit[0] == str(_db_path()):
             cur = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
-            if cur == hit[2]:
-                return hit[1]
+            if cur == hit[3]:
+                return hit[2]
             hit = None  # rows changed since load — rebuild the vocab
     get_conn().execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
@@ -1210,7 +1341,7 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
         by_len.setdefault(len(term), []).append((term, int(r["n"])))
     row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
     with _vocab_lock:
-        _vocab_cache[table] = (now, by_len, row_count)
+        _vocab_cache[table] = (str(_db_path()), now, by_len, row_count)
     return by_len
 
 
