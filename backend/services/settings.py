@@ -11,7 +11,13 @@ from models.schemas import AppSettings
 
 
 def _get_appdata_dir() -> Path:
-    """Return the platform-appropriate user data directory for VOD.RIP."""
+    """Return the platform-appropriate user data directory for VOD.RIP.
+
+    VODRIP_APP_DATA overrides the base dir (tests isolate all JSON/DB
+    stores from real %APPDATA% before any import-time singleton binds it;
+    the archive/cookie DBs use their own VODRIP_*_DB overrides)."""
+    if os.environ.get("VODRIP_APP_DATA", "").strip():
+        return Path(os.environ["VODRIP_APP_DATA"].strip())
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
     elif sys.platform == "darwin":

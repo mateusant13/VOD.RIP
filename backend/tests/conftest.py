@@ -23,6 +23,11 @@ from download_test_utils import purge_download_manager
 _TMP = Path(tempfile.mkdtemp(prefix="vodrip-tests-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
 os.environ["VODRIP_COOKIE_DB"] = str(_TMP / "cookies.db")
+# Isolate the settings/history/queue JSON + cookie/whisper dirs the same way:
+# app.py constructs DownloadManager/SettingsManager at import, before any
+# per-test fixture can run, so an env override (not a patch) is the only
+# thing that keeps those import-time singletons off the REAL %APPDATA%.
+os.environ["VODRIP_APP_DATA"] = str(_TMP / "VOD.RIP")
 
 # Snapshot of the REAL %APPDATA% archive.db taken here, before any test
 # module import can run the archive/cookie-store self-checks. The cookie

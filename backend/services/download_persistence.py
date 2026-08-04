@@ -14,19 +14,25 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import services.settings as _settings_mod
+
 from models.schemas import DownloadState
 from services.download_utils import (
     _DONE_STATUSES,
     _HISTORY_MAX_ENTRIES,
     _QUEUE_PERSIST_INTERVAL,
 )
-from services.settings import _get_appdata_dir
 from services.url_validation import is_sensible_vod_url
 
 if TYPE_CHECKING:
     from services.settings import SettingsManager
 
 logger = logging.getLogger(__name__)
+
+
+def _get_appdata_dir():
+    """Resolve appdata at call time (tests monkeypatch services.settings)."""
+    return _settings_mod._get_appdata_dir()
 
 
 from services.oauth_crypto import encrypt_token
