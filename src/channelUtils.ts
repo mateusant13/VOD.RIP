@@ -1046,7 +1046,6 @@ export function persistChannelLiveStatuses(
  }
 }
 
-export const MAX_SAVED_CHANNELS = 10;
 /** Highest quality from API list, or source when none listed (Kick). */
 
 export const CLIP_MAX_DURATION_SEC = 60;
