@@ -1174,7 +1174,7 @@ def search(
         phrase_pattern = '"' + raw_q.replace('"', '""') + '"'
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
-    for hit_kind, fts, src, offcol, langcol in loops:
+    for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
         base = dict(
             hit_kind=hit_kind, fts=fts, src=src, offcol=offcol, langcol=langcol,
             platforms=platforms, video_id=video_id, channel=channel, kinds=kinds,
@@ -1211,6 +1211,7 @@ def search(
             if max_score > 0:  # guard div-by-zero: keep raw scores if batch max is 0
                 h["score"] = h["score"] / max_score
             h["score"] = h["score"] * (_PHRASE_BOOST if h.pop("_phrase", False) else 0.5 ** h.pop("_tier", 0))
+            h["_tbl"] = tbl_idx
             merged.append(h)
     # Video-title pass: matching titles surface saved-channel uploads that
     # have no transcript/chat yet (the channel index accumulates every
@@ -1236,11 +1237,14 @@ def search(
                 merged.append(r)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
     # Normalization collapses each table's best to exactly 1.0, so two
-    # tables' best hits can TIE at 1.5 after the phrase boost; the raw
-    # pre-normalization score breaks such ties by relevance magnitude.
+    # tables' best hits can TIE at 1.5 after the phrase boost. Ties resolve
+    # by table priority (transcripts before messages), then by raw score —
+    # raw BM25 is only comparable WITHIN a table, so it must never be the
+    # cross-table tie-break: table stats shift with unrelated rows, making
+    # the order depend on whatever else lives in the process DB.
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
-    for h in sorted(merged, key=lambda h: (h["score"], h.pop("_raw", 0.0)), reverse=True):
+    for h in sorted(merged, key=lambda h: (h["score"], h.pop("_tbl", 0), h.pop("_raw", 0.0)), reverse=True):
         key = (h["platform"], h["video_id"])
         if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
             continue

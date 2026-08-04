@@ -571,7 +571,13 @@ def test_search_video_id_scopes_to_one_video():
         [{"offset_sec": 1.0, "username": "u", "text": "zebra zebra zebra zebra"}],
     )
     try:
-        assert archive_db.search("zebra", limit=1)[0]["video_id"] == "filter-t-louder"
+        # The 4-zebra message and lubu's phrase-hit transcript BOTH normalize
+        # to 1.5 (per-table normalization + phrase boost), so the top-1 tie
+        # is resolved by table priority — not by relevance. What the search
+        # must guarantee: the louder hit is at the top tier AND the scoped
+        # query never surfaces it (SQL-level exclusion, not post-filtering).
+        top = archive_db.search("zebra", limit=2)
+        assert {h["video_id"] for h in top} >= {"filter-t-louder", "filter-t-lubu"}
         hits = archive_db.search("zebra", video_id="filter-t-lubu")
         assert _hit_ids(hits) == {
             ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
