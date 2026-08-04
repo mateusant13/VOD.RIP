@@ -63,6 +63,7 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
+import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGate';
 import type { PreviewSessionResponse } from './types';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
@@ -891,18 +892,16 @@ export default function ChannelExplorePopup({
     startFloatingPanelDrag(e, posRef, setPos, el);
   }, [fullscreen, stackIndex]);
 
-  const toggleFullscreen = useCallback(async () => {
+  const fsGateRef = useRef<FullscreenGate | null>(null);
+  if (fsGateRef.current === null) {
+    fsGateRef.current = createFullscreenGate();
+  }
+
+  const toggleFullscreen = useCallback(() => {
     const container = containerRef.current;
     if (!container || !ready) return;
-    try {
-      if (!document.fullscreenElement) {
-        await container.requestFullscreen();
-      } else {
-        await document.exitFullscreen();
-      }
-    } catch {
-      /* fullscreen denied */
-    }
+    // Gate: single in-flight transition, direction from the current fullscreen element.
+    fsGateRef.current?.toggle(container);
   }, [ready]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -937,6 +936,7 @@ export default function ChannelExplorePopup({
 
   useEffect(() => {
     const onFullscreenChange = () => {
+      fsGateRef.current?.sync();
       const fs = document.fullscreenElement === containerRef.current;
       setFullscreen(fs);
       setFsControlsVisible(!fs);

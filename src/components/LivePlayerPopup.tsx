@@ -20,6 +20,7 @@ import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitch
 import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
 import { fmtDuration } from '../formatters';
+import { createFullscreenGate, nativeFullscreenAdapter, type FullscreenGate } from '../utils/fullscreenGate';
 // hls.js is ~900KB and the original file deliberately code-splits it out of the
 // main bundle; a static import would pull it into the initial chunk.
 import type Hls from 'hls.js';
@@ -543,7 +544,10 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
 
   // Track fullscreen state
   useEffect(() => {
-    const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    const onFsChange = () => {
+      fsGateRef.current?.sync();
+      setIsFullscreen(!!document.fullscreenElement);
+    };
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
@@ -688,11 +692,17 @@ export function LivePlayerPopup({ entry, channelName, onClose, channelSlug, vodU
     }
   }, [mode, snapshotDuration, scheduleReplaySwitch]);
 
+  // Preserves the original semantics: exit if ANY element is fullscreen,
+  // otherwise fullscreen this popup.
+  const fsGateRef = useRef<FullscreenGate | null>(null);
+  if (fsGateRef.current === null) {
+    fsGateRef.current = createFullscreenGate(nativeFullscreenAdapter, (active) => active != null);
+  }
+
   const toggleFullscreen = useCallback(() => {
     const el = popupRef.current;
     if (!el) return;
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-    else el.requestFullscreen().catch(() => {});
+    fsGateRef.current?.toggle(el);
   }, []);
 
   // --- Resize (same [data-panel-resize] pattern as the VOD preview panel) ---

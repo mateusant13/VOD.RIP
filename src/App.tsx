@@ -65,6 +65,7 @@ import { PreviewTiming, waitVideoPlayable, notePreviewGesture } from './previewT
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
+import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGate';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
@@ -2675,18 +2676,18 @@ export default function App() {
     previewContainerRef.current?.focus();
   }, []);
 
-  const togglePreviewFullscreen = useCallback(async () => {
+  const previewFsGateRef = useRef<FullscreenGate | null>(null);
+  if (previewFsGateRef.current === null) {
+    previewFsGateRef.current = createFullscreenGate();
+  }
+
+  const togglePreviewFullscreen = useCallback(() => {
     const container = previewContainerRef.current;
     if (!container || !previewVideoReady) return;
-    try {
-      if (!document.fullscreenElement) {
-        setTrimPanelHeight(0);
-        await container.requestFullscreen();
-      } else {
-        await document.exitFullscreen();
-      }
-    } catch {
-      /* fullscreen denied or unsupported */
+    // The gate ignores calls while a transition is in flight and decides
+    // direction from the CURRENT fullscreen element — no sync element check.
+    if (previewFsGateRef.current?.toggle(container) === 'enter') {
+      setTrimPanelHeight(0);
     }
   }, [previewVideoReady]);
 
@@ -2748,6 +2749,7 @@ export default function App() {
 
   useEffect(() => {
     const onFullscreenChange = () => {
+      previewFsGateRef.current?.sync();
       // Always derive state from the browser. The old YouTube-only "fake"
       // fullscreen left the controls locked after Escape.
       const fs = document.fullscreenElement === previewContainerRef.current;
