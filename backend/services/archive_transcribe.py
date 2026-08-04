@@ -1,7 +1,9 @@
 """Transcription worker — faster-whisper (CTranslate2) + Silero VAD for the local archive.
 
-Consumes ``archive_jobs`` rows with kind='transcribe' and writes word-timestamped
-segments into the ``transcripts`` table (see archive_db.insert_transcript).
+Consumes ``archive_jobs`` rows with kind='transcribe' (and kind='events' —
+the PANNs acoustic-event stage, see services.archive_events) and writes
+word-timestamped segments into the ``transcripts`` table (see
+archive_db.insert_transcript).
 
 Design decisions:
   * VAD pre-pass: Silero VAD splits the audio into speech regions; ONLY those are
@@ -43,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services import archive_db
+from services.archive_events import detect_events_video, events_enabled
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
 from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
@@ -891,7 +894,7 @@ def _now_iso() -> str:
 
 
 def _claim_next_job() -> Optional[dict]:
-    """Atomically claim the newest queued transcribe job (crash-stale ones too).
+    """Atomically claim the newest queued transcribe/events job (crash-stale too).
 
     A 'running' job is reclaimed only if untouched for 30 min — a single
     chunk can legitimately take that long on CPU."""
@@ -900,7 +903,7 @@ def _claim_next_job() -> Optional[dict]:
     # String comparison is valid: both sides come from _now_iso (UTC, same width).
     rows = archive_db.query(
         """SELECT * FROM archive_jobs
-           WHERE kind = 'transcribe'
+           WHERE kind IN ('transcribe','events')
              AND (status = 'queued' OR (status = 'running' AND updated_at < ?))
            ORDER BY created_at DESC
            LIMIT 8""",
@@ -922,6 +925,20 @@ def _claim_next_job() -> Optional[dict]:
         if cur.rowcount == 1:
             return dict(row)
     return None
+
+
+def _process_events_job(job_id: str, platform: str, video_id: str) -> dict:
+    """Run one kind='events' job (PANNs acoustic-event detection).
+
+    Same shape as the transcribe path: progress tracks speech seconds, the
+    job ends 'done' with a stats dict (or 'failed' with an error message)."""
+    def _progress(done: float, total: float) -> None:
+        if total > 0:
+            archive_db.update_job(job_id, progress=min(0.999, done / total))
+
+    stats = detect_events_video(platform, video_id, progress_cb=_progress)
+    archive_db.update_job(job_id, status="done", progress=1.0)
+    return stats
 
 
 def _captions_first_skip(platform: str, video_id: str) -> bool:
@@ -956,6 +973,9 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
     try:
         archive_db.update_job(job_id, status="running", progress=0.0)
 
+        if job.get("kind") == "events":
+            return _process_events_job(job_id, platform, video_id)
+
         if _captions_first_skip(platform, video_id):
             logger.info("captions already present for %s/%s — skipping whisper", platform, video_id)
             archive_db.update_job(job_id, status="done", progress=1.0)
@@ -976,6 +996,16 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             # Heavy batch writes just finished — merge the FTS b-tree
             # segments so search stays fast (best-effort inside).
             archive_db.optimize_fts()
+        if "skipped" not in stats and events_enabled():
+            # Optional PANNs stage (VODRIP_EVENTS_ENABLED=1): the transcribe
+            # job is already 'done' — events are best-effort enrichment and
+            # never fail the job.
+            try:
+                ev_stats = detect_events_video(platform, video_id)
+                stats["events"] = ev_stats.get("events", 0)
+            except Exception:
+                logger.exception("events stage failed for %s/%s — transcribe already done",
+                                 platform, video_id)
         return stats
     except Exception as exc:  # job-level failure — worker keeps going
         logger.exception("transcribe job %s failed", job_id)

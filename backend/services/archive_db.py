@@ -98,6 +98,20 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   text, content='transcripts', content_rowid='id');
 
+-- Acoustic-event rows from the PANNs stage (kind='events' jobs, or the
+-- VODRIP_EVENTS_ENABLED auto-run after transcription): laughs, claps,
+-- screams, music, ... with real boundaries and a confidence score.
+CREATE TABLE IF NOT EXISTS audio_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  start_sec  REAL NOT NULL,
+  end_sec    REAL NOT NULL,
+  event      TEXT NOT NULL,
+  score      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audio_events_video ON audio_events(platform, video_id, start_sec);
+
 CREATE TABLE IF NOT EXISTS video_aliases (
   platform      TEXT NOT NULL,
   video_id      TEXT NOT NULL,
@@ -108,7 +122,7 @@ CREATE TABLE IF NOT EXISTS video_aliases (
 
 CREATE TABLE IF NOT EXISTS archive_jobs (
   id         TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe')),
+  kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
   platform   TEXT NOT NULL,
   video_id   TEXT NOT NULL,
   status     TEXT NOT NULL DEFAULT 'queued'
@@ -212,6 +226,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_channel_columns(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
+            _ensure_jobs_kind_events(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -282,6 +297,40 @@ def _ensure_spam_column(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE messages ADD COLUMN spam_count INTEGER NOT NULL DEFAULT 1"
         )
+
+
+def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: widen archive_jobs.kind CHECK to include 'events'.
+
+    SQLite cannot ALTER a CHECK constraint, so the table is rebuilt
+    (rename -> create -> copy -> drop) only when the stored DDL lacks it."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='archive_jobs'"
+    ).fetchone()
+    if row and "'events'" in (row[0] or ""):
+        return
+    conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
+    conn.execute(
+        """CREATE TABLE archive_jobs (
+             id         TEXT PRIMARY KEY,
+             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
+             platform   TEXT NOT NULL,
+             video_id   TEXT NOT NULL,
+             status     TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (status IN ('queued','running','done','failed')),
+             progress   REAL NOT NULL DEFAULT 0,
+             error      TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, created_at, updated_at) "
+        "SELECT id, kind, platform, video_id, status, progress, error, created_at, updated_at "
+        "FROM archive_jobs_old"
+    )
+    conn.execute("DROP TABLE archive_jobs_old")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON archive_jobs(status, created_at)")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -666,6 +715,44 @@ def delete_transcripts(platform: str, video_id: str) -> int:
 def transcript_for(platform: str, video_id: str) -> list[dict]:
     rows = query(
         "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
+        (platform, video_id),
+    )
+    return [dict(r) for r in rows]
+
+
+def insert_audio_events(platform: str, video_id: str, events: Iterable[dict]) -> int:
+    """Insert acoustic-event rows {start_sec, end_sec, event, score}; returns count."""
+    events = list(events)
+    if not events:
+        return 0
+    conn = get_conn()
+    with _lock:
+        with conn:
+            conn.executemany(
+                """INSERT INTO audio_events (platform, video_id, start_sec, end_sec, event, score)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (platform, video_id,
+                     float(e["start_sec"]), float(e["end_sec"]),
+                     e["event"], float(e["score"]))
+                    for e in events
+                ],
+            )
+    return len(events)
+
+
+def delete_audio_events(platform: str, video_id: str) -> int:
+    """Remove every event row for a video (replace-on-rerun); returns count."""
+    cur = execute(
+        "DELETE FROM audio_events WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return cur.rowcount
+
+
+def audio_events_for(platform: str, video_id: str) -> list[dict]:
+    rows = query(
+        "SELECT * FROM audio_events WHERE platform = ? AND video_id = ? ORDER BY start_sec, event",
         (platform, video_id),
     )
     return [dict(r) for r in rows]
