@@ -18,6 +18,7 @@ override with env VODRIP_ARCHIVE_DB (used by tests).
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -2248,6 +2249,31 @@ def set_transcript_embedding(transcript_id: int, vec: bytes) -> None:
             )
 
 
+def set_transcript_embeddings(pairs: list[tuple[int, bytes]]) -> None:
+    """Upsert many segment embedding blobs in one transaction (backfill)."""
+    if not pairs:
+        return
+    with _lock:
+        with get_conn():
+            get_conn().executemany(
+                "INSERT INTO transcript_embeddings (transcript_id, vec) VALUES (?, ?) "
+                "ON CONFLICT(transcript_id) DO UPDATE SET vec = excluded.vec",
+                pairs,
+            )
+
+
+def missing_embedding_segments(limit: int = 0) -> list[sqlite3.Row]:
+    """Transcript rows without a stored vector (backfill work queue)."""
+    sql = (
+        "SELECT t.id AS transcript_id, t.text AS text FROM transcripts t "
+        "LEFT JOIN transcript_embeddings e ON e.transcript_id = t.id "
+        "WHERE e.vec IS NULL"
+    )
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return query(sql)
+
+
 _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
 
 
@@ -2477,24 +2503,14 @@ _ACCENT_FOLD = str.maketrans(
 )
 
 
-def _phonetic_fold(word: str) -> str:
-    """Lightweight grapheme→phoneme fold that bridges ASR/typo spellings.
-
-    Reimplements the published Brazilian-Portuguese phonetic rules (Várzea
-    Paulista REDECA project, carlosjordao/metaphone-ptbr) minus the vowel
-    dropping — dropping vowels is exactly what kills 'yasuo'↔'e aço'. Folds:
-    accents, ç→s, ñ→n, y→i, ph→f, th→t, ch→x, qu→k, c→s before e/i/o and
-    c→k before a/u/word-end ('cata' -> 'kata' bridges 'kata' while 'aco'
-    from 'aço' still -> 'asu'), g→j before e/i, q→k, w→v, silent h
-    dropped, doubled letters
-    collapsed, final unstressed e→i and o→u. h drops word-initially and
-    after vowels; the sh digraph is kept when the s starts the word or
-    follows a consonant ('shaco' -> 'shasu' must NOT collapse onto
-    'caso'/'saco'), while sibilant artifacts after vowels still drop
-    ('nasho' -> 'nashu' keeps bridging 'nasço'). Deliberately does NOT fold
-    intervocallic s→z ('aço' /asu/ must stay close to 'yasuo', not 'yazu')
-    and does NOT fold sh→x (the h handling is enough: 'shen'->'shen' ~
-    'suen')."""
+@functools.lru_cache(maxsize=65536)
+def _fold_core(word: str) -> str:
+    """Phonetic fold WITHOUT the final-unstressed-vowel step: digraphs,
+    hard-c, silent-h, doubling collapse. Two words whose cores are equal
+    are the same word modulo spelling ('chau'~'xau', 'xauuu'~'xau',
+    'katarina'~'catarina'); the vowel step is the lossy one — it merges
+    distinct words ('chão'->'xau', 'não'->'nau') and must not count as
+    word equality on its own."""
     w = word.lower().translate(_ACCENT_FOLD)
     w = w.replace("ph", "f").replace("th", "t").replace("ch", "x").replace("qu", "k")
     out: list[str] = []
@@ -2524,7 +2540,29 @@ def _phonetic_fold(word: str) -> str:
         elif c == "w":
             c = "v"
         out.append(c)
-    s = "".join(out)
+    return _DEDUP_RE.sub(r"\1", "".join(out))
+
+
+@functools.lru_cache(maxsize=65536)
+def _phonetic_fold(word: str) -> str:
+    """Lightweight grapheme→phoneme fold that bridges ASR/typo spellings.
+
+    Reimplements the published Brazilian-Portuguese phonetic rules (Várzea
+    Paulista REDECA project, carlosjordao/metaphone-ptbr) minus the vowel
+    dropping — dropping vowels is exactly what kills 'yasuo'↔'e aço'. Folds:
+    accents, ç→s, ñ→n, y→i, ph→f, th→t, ch→x, qu→k, c→s before e/i/o and
+    c→k before a/u/word-end ('cata' -> 'kata' bridges 'kata' while 'aco'
+    from 'aço' still -> 'asu'), g→j before e/i, q→k, w→v, silent h
+    dropped, doubled letters
+    collapsed, final unstressed e→i and o→u. h drops word-initially and
+    after vowels; the sh digraph is kept when the s starts the word or
+    follows a consonant ('shaco' -> 'shasu' must NOT collapse onto
+    'caso'/'saco'), while sibilant artifacts after vowels still drop
+    ('nasho' -> 'nashu' keeps bridging 'nasço'). Deliberately does NOT fold
+    intervocallic s→z ('aço' /asu/ must stay close to 'yasuo', not 'yazu')
+    and does NOT fold sh→x (the h handling is enough: 'shen'->'shen' ~
+    'suen')."""
+    s = _fold_core(word)
     # Final unstressed vowels fold at any length — 'e aço' needs 'e' -> 'i'
     # so the bigram key 'iasu' matches 'yasuo'.
     if s:
@@ -2722,12 +2760,33 @@ def _token_expansions(
                 # vocab; never offer it as an expansion candidate.
                 if len(term) < 3 or not term.isalnum():
                     continue
-                d = _damerau_levenshtein(token, term, raw_max)
+                # Length-gate both distance calls before paying for the DP —
+                # ~half of the bucket window is outside the raw budget, and
+                # the folded form is cached (lru on _phonetic_fold), so the
+                # per-candidate cost is a dict hit + two int compares.
+                d = None
+                if abs(len(token) - len(term)) <= raw_max:
+                    d = _damerau_levenshtein(token, term, raw_max)
                 fterm = _phonetic_fold(term)
-                fd = 0 if fterm == fold else _damerau_levenshtein(fold, fterm, fold_max)
+                fd = None
+                if d == 0:
+                    fd = 0  # raw-exact: fold can't beat dist 0
+                elif abs(len(fold) - len(fterm)) <= fold_max:
+                    fd = 0 if fterm == fold else _damerau_levenshtein(fold, fterm, fold_max)
                 if d is None and fd is None:
                     continue
                 dist = min(d if d is not None else 99, fd if fd is not None else 99)
+                # Tier-0 purity: fold equality is not word equality. The
+                # final-vowel step of the fold collapses distinct words
+                # ('chão' -> 'xau'); a fold-equal term whose raw spelling
+                # is far is a recall bridge, not an exact match — tier 1,
+                # unless the equality survives without the vowel step
+                # (digraph/doubling variants: 'chau' ~ 'xau' via ch->x,
+                # 'xauuu' ≡ 'xau'). 'katarina'/'catarina' (raw dist 1)
+                # stays 0.
+                if dist == 0 and (d is None or d > 1):
+                    if _fold_core(token) != _fold_core(term):
+                        dist = 1
                 # R3: drop dist>=1 candidates that are chat-spam common in
                 # the merged corpus ('cara' 3106, 'agora' 1184) — never the
                 # intended fuzzy target; the legit tail peaks at 'chaco'

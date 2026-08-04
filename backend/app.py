@@ -405,6 +405,29 @@ async def _app_lifespan(_app: FastAPI):
 
     threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
 
+    # Semantic-embedding backfill — embed transcript segments that lack a
+    # vector, in the background, so the first SEMANTIC search doesn't pay
+    # the inline backfill cost (up to 50k segments through torch on the
+    # request path). Only meaningful archives trigger it (>=500 missing);
+    # after a complete pass every boot finds 0 missing and exits at once.
+    # VODRIP_EMBED_BACKFILL=0 opts out (tests/constrained boxes).
+    try:
+        if os.environ.get("VODRIP_EMBED_BACKFILL", "1").strip() not in ("0", "false", "no"):
+
+            def _embed_backfill_guarded() -> None:
+                try:
+                    from services.archive_embed import backfill_missing
+
+                    done = backfill_missing(interrupt=_warm_shutdown, min_missing=500)
+                    if done:
+                        logger.info("semantic embed backfill: %d segments embedded", done)
+                except Exception:
+                    logger.debug("semantic embed backfill skipped", exc_info=True)
+
+            threading.Thread(target=_embed_backfill_guarded, daemon=True, name="embed-backfill").start()
+    except Exception:
+        logger.debug("semantic embed backfill spawn skipped", exc_info=True)
+
     # Mark startup ready immediately. The YouTube warm continues in the
     # daemon thread; first clicks in the first ~15s may pay the resolve
     # cost (3-5s) instead of hitting the warm cache. Strictly better

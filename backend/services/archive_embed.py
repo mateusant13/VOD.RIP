@@ -108,3 +108,43 @@ def embed_texts(texts: list[str], prefix: str) -> Optional[object]:
 
 def embed_query(q: str) -> Optional[object]:
     return embed_texts([q], _QUERY_PREFIX)
+
+
+def backfill_missing(
+    interrupt: Optional[threading.Event] = None,
+    min_missing: int = 0,
+) -> int:
+    """Background job: embed every transcript segment that lacks a vector.
+
+    Returns the number of segments embedded (0 = nothing to do, model
+    unavailable, or interrupted before the first batch). Batches follow
+    _BATCH; each batch is upserted in one transaction. min_missing gates
+    the work (tiny scratch archives aren't worth a model load) and the
+    caller passes a shutdown interrupt to stop mid-pass. Idempotent: after
+    a complete pass every later call returns 0 immediately.
+    """
+    from services import archive_db  # lazy: no import cycle at module scope
+
+    missing = archive_db.missing_embedding_segments()
+    if not missing or len(missing) < min_missing:
+        return 0
+    # Model load is the expensive part — fail fast before any writes.
+    probe = embed_texts(["ok"], _PASSAGE_PREFIX)
+    if probe is None:
+        return 0
+    done = 0
+    for i in range(0, len(missing), _BATCH):
+        if interrupt is not None and interrupt.is_set():
+            break
+        batch = missing[i : i + _BATCH]
+        vecs = embed_texts([r["text"] for r in batch], _PASSAGE_PREFIX)
+        if vecs is None:
+            break
+        archive_db.set_transcript_embeddings(
+            [
+                (r["transcript_id"], v.astype("<f4").tobytes())
+                for r, v in zip(batch, vecs)
+            ]
+        )
+        done += len(batch)
+    return done
