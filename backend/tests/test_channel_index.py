@@ -177,11 +177,19 @@ async def test_stale_snapshot_serves_index_and_refreshes_in_background(client, _
     # Blocking fetch did NOT run — the response was served from the index.
     assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
-    await asyncio.sleep(0.8)  # let the background delta task finish
+    # Let the background delta task finish (it also fetches platform
+    # language clues, so it is slower than the fake fetch alone — poll
+    # instead of assuming a wall-clock budget).
+    deadline = asyncio.get_event_loop().time() + 30.0
+    while True:
+        await asyncio.sleep(0.25)
+        fresh = await client.get(_videos_url(88))
+        if fresh.json()["refreshing"] is False:
+            break
+        assert asyncio.get_event_loop().time() < deadline, "background refresh never completed"
     assert calls == ["Kick", "Twitch", "YouTube", "YouTube", "Kick", "Twitch", "YouTube", "YouTube"]
 
     # After the background merge the snapshot is fresh again.
-    fresh = await client.get(_videos_url(88))
     assert fresh.json()["refreshing"] is False
 
 

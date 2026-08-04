@@ -6,7 +6,7 @@ import asyncio
 import functools
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException
