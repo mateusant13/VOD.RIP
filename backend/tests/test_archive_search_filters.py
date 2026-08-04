@@ -503,9 +503,9 @@ async def test_search_kind_uppercase_passes_router_validation():
     from routers.archive import archive_search
 
     _seed_search_fixture()
-    resp = await archive_search(q="zebra", kind="CLIP", limit=20)
+    resp = await archive_search(q="zebra", kind="CLIP", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {("message", "filter-t-titiltei")}
-    resp = await archive_search(q="zebra", kind="Vod,LIVE", limit=20)
+    resp = await archive_search(q="zebra", kind="Vod,LIVE", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {
         ("message", "filter-t-lubu"), ("message", "filter-t-yt"),
         ("transcript", "filter-t-lubu"),
@@ -534,7 +534,7 @@ async def test_search_date_requires_strict_iso():
         assert exc.value.status_code == 400
     # valid strict date passes validation and filters normally
     _seed_search_fixture()
-    resp = await archive_search(q="zebra", date_from="2026-08-01", limit=20)
+    resp = await archive_search(q="zebra", date_from="2026-08-01", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {("message", "filter-t-yt")}
 
 
@@ -627,14 +627,14 @@ async def test_search_source_router_validation_and_passthrough():
     from routers.archive import archive_search
 
     _seed_search_fixture()
-    resp = await archive_search(q="zebra", source="chat", limit=20)
+    resp = await archive_search(q="zebra", source="chat", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {
         ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
         ("message", "filter-t-yt"),
     }
-    resp = await archive_search(q="zebra", source="TRANSCRIPT", limit=20)
+    resp = await archive_search(q="zebra", source="TRANSCRIPT", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {("transcript", "filter-t-lubu")}
-    resp = await archive_search(q="zebra", source="both", limit=20)
+    resp = await archive_search(q="zebra", source="both", limit=20, semantic=False)
     assert len(resp["hits"]) == 4
     for bad in ("streamer", "chat,transcript"):
         with pytest.raises(HTTPException) as exc:
@@ -646,7 +646,7 @@ async def test_search_video_id_router_passthrough():
     from routers.archive import archive_search
 
     _seed_search_fixture()
-    resp = await archive_search(q="zebra", video_id="filter-t-lubu", limit=20)
+    resp = await archive_search(q="zebra", video_id="filter-t-lubu", limit=20, semantic=False)
     assert _hit_ids(resp["hits"]) == {
         ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
     }
@@ -660,7 +660,7 @@ async def test_search_channel_empty_segment_router_400():
     with pytest.raises(HTTPException) as exc:
         await archive_search(q="zebra", channel="lubu,", limit=20)
     assert exc.value.status_code == 400
-    resp = await archive_search(q="zebra", channel="lubu,titiltei", limit=20)
+    resp = await archive_search(q="zebra", channel="lubu,titiltei", limit=20, semantic=False)
     # case-insensitive: titiltei also matches youtube's "TiTiltei"
     assert len(resp["hits"]) == 4
 

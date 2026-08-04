@@ -104,6 +104,18 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   text, content='transcripts', content_rowid='id');
 
+-- Semantic-search vectors, one row per transcript segment (float32 blob,
+-- 1536 bytes for multilingual-e5-small). Produced lazily by the semantic
+-- search pass; the DELETE trigger keeps the row in sync with its transcript
+-- (mirrors the FTS trigger pattern).
+CREATE TABLE IF NOT EXISTS transcript_embeddings (
+  transcript_id INTEGER PRIMARY KEY,
+  vec           BLOB NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS transcript_embeddings_ad AFTER DELETE ON transcripts BEGIN
+  DELETE FROM transcript_embeddings WHERE transcript_id = old.id;
+END;
+
 -- Acoustic-event rows from the PANNs stage (kind='events' jobs, or the
 -- VODRIP_EVENTS_ENABLED auto-run after transcription): laughs, claps,
 -- screams, music, ... with real boundaries and a confidence score.
@@ -1103,6 +1115,7 @@ def search(
     video_id: Optional[str] = None,
     lang: Optional[str] = None,
     limit: int = 20,
+    semantic: bool = False,
     _channel_hint_out: Optional[list] = None,
 ) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
@@ -1276,6 +1289,21 @@ def search(
         per_video[key] = per_video.get(key, 0) + 1
         h.pop("_rowid", None)
         out.append(h)
+    if semantic and source != "chat":
+        # Concept pass: embedding-based hits lead, lexical follows (deduped
+        # by video). Any embedding failure degrades to pure lexical.
+        try:
+            sem = _semantic_search(
+                q, fetch, platforms=platforms, video_id=video_id,
+                channel=channel, kinds=kinds, date_from=date_from,
+                date_to=date_to, lang=lang,
+            )
+        except Exception:
+            sem = None
+        if sem:
+            sem_keys = {(h["platform"], h["video_id"]) for h in sem}
+            out = (sem + [h for h in out if (h["platform"], h["video_id"]) not in sem_keys])[:limit]
+            return out
     return out[:limit]
 
 
@@ -1471,6 +1499,54 @@ def _tok_eq(a: str, b: str) -> bool:
     return any(a[:i] + a[i + 1:] == b for i in range(len(a)))
 
 
+def _append_content_filters(
+    parts: list[str],
+    params: list[Any],
+    *,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    lang: Optional[str],
+    table: str = "t",
+    video: str = "v",
+    apply_lang: bool = True,
+) -> None:
+    """Shared WHERE fragment for content-table scans (transcripts/messages).
+
+    Alias-aware so the span pass, the semantic pass and _table_search build
+    identical filters: table aliases default to t (content) / v (videos)."""
+    if platforms:
+        parts.append(f"{table}.platform IN ({','.join('?' * len(platforms))})")
+        params.extend(platforms)
+    if video_id:
+        parts.append(f"{table}.video_id = ?")
+        params.append(video_id)
+    if channel:
+        slugs = [c.strip() for c in channel.split(",") if c.strip()]
+        if slugs:
+            parts.append(f"lower({video}.channel) IN ({','.join('?' * len(slugs))})")
+            params.extend(s.lower() for s in slugs)
+    if kinds:
+        parts.append(f"{video}.kind IN ({','.join('?' * len(kinds))})")
+        params.extend(kinds)
+    if date_from:
+        parts.append(f"date({video}.started_at) >= date(?)")
+        params.append(date_from)
+    if date_to:
+        parts.append(f"date({video}.started_at) <= date(?)")
+        params.append(date_to)
+    if apply_lang and lang:
+        lng = lang.strip().lower()
+        if lng == "pt":
+            # Untagged rows (whisper without detected language) are PT content.
+            parts.append(f"({table}.lang IS NULL OR {table}.lang LIKE 'pt%')")
+        elif lng == "en":
+            parts.append(f"{table}.lang = 'en'")
+
+
 def _phrase_span_rows(
     q_tokens: list[str],
     fetch: int,
@@ -1509,32 +1585,13 @@ def _phrase_span_rows(
     if long_toks:
         sql += " AND (" + " OR ".join("instr(lower(t.text), ?) > 0" for _ in long_toks) + ")"
         params.extend(long_toks)
-    if platforms:
-        sql += f" AND t.platform IN ({','.join('?' * len(platforms))})"
-        params.extend(platforms)
-    if video_id:
-        sql += " AND t.video_id = ?"
-        params.append(video_id)
-    if channel:
-        slugs = [c.strip() for c in channel.split(",") if c.strip()]
-        if slugs:
-            sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
-            params.extend(s.lower() for s in slugs)
-    if kinds:
-        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
-        params.extend(kinds)
-    if date_from:
-        sql += " AND date(v.started_at) >= date(?)"
-        params.append(date_from)
-    if date_to:
-        sql += " AND date(v.started_at) <= date(?)"
-        params.append(date_to)
-    if lang:
-        lng = lang.strip().lower()
-        if lng == "pt":
-            sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
-        elif lng == "en":
-            sql += " AND t.lang = 'en'"
+    parts: list[str] = []
+    _append_content_filters(
+        parts, params, platforms=platforms, video_id=video_id, channel=channel,
+        kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
+    )
+    if parts:
+        sql += " AND " + " AND ".join(parts)
     sql += " ORDER BY t.video_id, t.seg_idx"
     by_video: dict[str, list[dict]] = {}
     for r in query(sql, params):
@@ -1578,6 +1635,115 @@ def _phrase_span_rows(
                 break  # one hit per adjacent pair
     hits.sort(key=lambda h: h["offset_sec"])
     return hits[: max(fetch * 3, 3)]
+
+
+def set_transcript_embedding(transcript_id: int, vec: bytes) -> None:
+    """Upsert one segment's embedding blob (float32, 384 dims)."""
+    with _lock:
+        with get_conn():
+            get_conn().execute(
+                "INSERT INTO transcript_embeddings (transcript_id, vec) VALUES (?, ?) "
+                "ON CONFLICT(transcript_id) DO UPDATE SET vec = excluded.vec",
+                (transcript_id, vec),
+            )
+
+
+_EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
+
+
+def _semantic_search(
+    q: str,
+    fetch: int,
+    *,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    lang: Optional[str],
+) -> Optional[list[dict]]:
+    """Concept pass over transcript embeddings: cosine scan of the filtered
+    scope, segments embedded lazily (bounded per query). Returns hits shaped
+    like _table_search rows with score = cosine (0..1) and a 'semantic' flag,
+    or None when the embedding backend is unavailable — the caller then
+    serves pure lexical results."""
+    from services import archive_embed  # lazy: torch stays out of boot
+
+    qv = archive_embed.embed_query(q)
+    if qv is None:
+        return None
+    import numpy as np
+
+    qv = np.asarray(qv).reshape(-1)  # (1, dim) -> (dim,)
+
+    sql = (
+        "SELECT t.id AS transcript_id, t.platform, t.video_id, t.start_sec, "
+        "t.text, t.lang AS lang, e.vec AS vec, "
+        "v.channel, v.title, v.started_at AS date, v.kind AS video_kind "
+        "FROM transcripts t "
+        "LEFT JOIN transcript_embeddings e ON e.transcript_id = t.id "
+        "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
+        "WHERE 1=1"
+    )
+    params: list[Any] = []
+    parts: list[str] = []
+    _append_content_filters(
+        parts, params, platforms=platforms, video_id=video_id, channel=channel,
+        kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
+    )
+    if parts:
+        sql += " AND " + " AND ".join(parts)
+
+    def scope_rows() -> list[dict]:
+        return query(sql, params)
+
+    rows = scope_rows()
+    missing = [r for r in rows if r["vec"] is None]
+    if missing:
+        # Lazy backfill: embed the first _EMBED_BACKFILL_CAP missing segments
+        # inline, then re-read (bounded cost per query; a background index
+        # job is the upgrade path for cold multi-hundred-thousand archives).
+        todo = missing[:_EMBED_BACKFILL_CAP]
+        vecs = archive_embed.embed_texts([r["text"] for r in todo], "passage: ")
+        if vecs is None:
+            return None
+        for r, v in zip(todo, vecs):
+            set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
+        rows = scope_rows()
+    scored: list[tuple[float, dict]] = []
+    for r in rows:
+        if r["vec"] is None:
+            continue
+        v = np.frombuffer(r["vec"], dtype="<f4")
+        if v.shape[0] != qv.shape[0]:
+            continue
+        scored.append((float(np.dot(v, qv)), r))
+    scored.sort(key=lambda x: -x[0])
+    out: list[dict] = []
+    per_video: dict[tuple[str, str], int] = {}
+    for cos, r in scored:
+        key = (r["platform"], r["video_id"])
+        if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
+            continue
+        per_video[key] = per_video.get(key, 0) + 1
+        out.append({
+            "kind": "transcript",
+            "platform": r["platform"],
+            "video_id": r["video_id"],
+            "offset_sec": r["start_sec"],
+            "text": r["text"],
+            "score": cos,
+            "lang": r["lang"],
+            "channel": r["channel"],
+            "title": r["title"],
+            "date": r["date"],
+            "video_kind": r["video_kind"],
+            "semantic": True,
+        })
+        if len(out) >= max(fetch * 3, 3):
+            break
+    return out
 
 
 # Channel-slug cache for the channel_hint query understanding: (loaded_at,

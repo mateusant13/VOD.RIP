@@ -375,6 +375,7 @@ async def archive_search(
     lang: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     hint: bool = Query(True),
+    semantic: bool = Query(False),
 ):
     # platform/kind accept comma-separated lists ("twitch,kick").
     for p in (platform or "").split(","):
@@ -415,6 +416,7 @@ async def archive_search(
         video_id=video_id or None,
         lang=lang or None,
         limit=limit,
+        semantic=semantic,
         _channel_hint_out=hint_box if hint else None,
     )
     channel_hint = hint_box[0] if hint_box else None

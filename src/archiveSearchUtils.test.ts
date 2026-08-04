@@ -213,6 +213,18 @@ describe('buildSearchUrl', () => {
       '/api/archive/search?q=x&limit=30',
     );
   });
+
+  it('emits semantic only when enabled', () => {
+    expect(buildSearchUrl({ query: 'x', semantic: true })).toBe(
+      '/api/archive/search?q=x&semantic=1&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', semantic: false })).toBe(
+      '/api/archive/search?q=x&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', semantic: true, lang: 'pt' })).toBe(
+      '/api/archive/search?q=x&lang=pt&semantic=1&limit=30',
+    );
+  });
 });
 
 describe('isValidDateParam', () => {

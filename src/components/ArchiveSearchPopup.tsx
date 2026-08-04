@@ -131,6 +131,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [everyDay, setEveryDay] = useState(true);
   /** '' | 'pt' | 'en' — transcript language filter ('' = all). */
   const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>('');
+  const [semanticOn, setSemanticOn] = useState(false);
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
@@ -416,6 +417,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       lang: langFilter || null,
       limit: SEARCH_LIMIT,
       hint: hintDisabled ? false : undefined,
+      semantic: semanticOn && sourceFilter !== 'chat',
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -431,7 +433,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled, semanticOn]);
 
   // Remote YouTube channel-title search: the local index only holds the
   // newest ~100 uploads per saved channel (the panel fetch cap), so old
@@ -734,6 +736,26 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             ))}
           </div>
         </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            aria-pressed={semanticOn}
+            disabled={sourceFilter === 'chat'}
+            onClick={() => setSemanticOn((v) => !v)}
+            title={
+              sourceFilter === 'chat'
+                ? 'Concept search covers transcripts only'
+                : 'Concept search: finds moments by meaning, not just words (first use downloads the embed model)'
+            }
+            className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
+              semanticOn
+                ? 'bg-white text-black border-white'
+                : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+            }`}
+          >
+            SEMANTIC
+          </button>
+        </div>
         {langsPresent.size >= 2 && (
           <div className="flex items-center gap-1.5">
             <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Lang</span>
@@ -821,6 +843,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   {hit.kind === 'transcript' && hit.lang && (
                     <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-500 shrink-0">
                       {ARCHIVE_LANG_LABELS[hit.lang] ?? hit.lang}
+                    </span>
+                  )}
+                  {hit.semantic && (
+                    <span className="text-[8px] font-mono uppercase tracking-widest border border-cyan-700 text-cyan-400 px-1 py-px shrink-0">
+                      SEM
                     </span>
                   )}
                   <span className={`text-[9px] font-mono uppercase tracking-widest shrink-0 ${platformAccent[hit.platform] ?? 'text-zinc-400'}`}>

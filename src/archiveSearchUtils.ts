@@ -22,6 +22,8 @@ export interface ArchiveSearchHit {
   duration_sec?: number | null;
   duration_string?: string | null;
   thumbnail_url?: string | null;
+  /** Concept (embedding) hit — true only for the semantic search pass. */
+  semantic?: boolean;
 }
 
 export interface ArchiveVideoRow {
@@ -103,6 +105,8 @@ export interface ArchiveSearchFilterParams {
   limit?: number;
   /** Explicitly opt OUT of the backend's auto channel-scope (hint=0). */
   hint?: boolean;
+  /** Concept search: embedding pass over transcript segments (semantic=1). */
+  semantic?: boolean;
 }
 
 /** Query-string for GET /api/archive/search — omits unset filters. */
@@ -122,6 +126,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (dateTo) params.set('date_to', dateTo);
   if (p.lang) params.set('lang', p.lang);
   if (p.hint === false) params.set('hint', '0');
+  if (p.semantic) params.set('semantic', '1');
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }
