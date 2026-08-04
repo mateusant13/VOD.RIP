@@ -3050,7 +3050,7 @@ export default function App() {
     return layoutHasMultiplePanels(layoutBoundsInput());
   }, [layoutBoundsInput]);
 
-  const syncRowHeightsToPreview = useCallback(() => {
+  const syncRowHeightsToPreview = useCallback((commitState = true) => {
     const layout = layoutBoundsInput();
     if (!layout.previewOpen || !previewPanelRef.current) return;
     const maxH = layoutMaxPanelHeight();
@@ -3061,8 +3061,10 @@ export default function App() {
     if (nextUrlH === urlAsidePanelSizeRef.current.h && nextMainH === mainPanelSizeRef.current.h) return;
     urlAsidePanelSizeRef.current = { ...urlAsidePanelSizeRef.current, h: nextUrlH };
     mainPanelSizeRef.current = { ...mainPanelSizeRef.current, h: nextMainH };
-    setUrlAsidePanelSize((prev) => ({ ...prev, h: nextUrlH }));
-    setMainPanelSize((prev) => ({ ...prev, h: nextMainH }));
+    if (commitState) {
+      setUrlAsidePanelSize((prev) => ({ ...prev, h: nextUrlH }));
+      setMainPanelSize((prev) => ({ ...prev, h: nextMainH }));
+    }
     if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, urlAsidePanelSizeRef.current);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, mainPanelSizeRef.current);
   }, [layoutBoundsInput]);
@@ -3071,29 +3073,32 @@ export default function App() {
     preview: { w: number; h: number };
     urlAside: { w: number; h: number };
     main: { w: number; h: number };
-  }) => {
-    // Commit the FULL fitted row (dragged panel + siblings) to state, refs, and
-    // DOM on every move. State is what the render derives effective widths
-    // from; committing the siblings too keeps that derivation identical to the
+  }, commitState = true) => {
+    // Commit the FULL fitted row (dragged panel + siblings) to refs and DOM on
+    // every move. State is what the render derives effective widths from;
+    // committing the siblings too keeps that derivation identical to the
     // live drag — no proportional re-split, no release-time yank, no flicker.
-    // The restore target for a reverse drag is `preferredDragRef` (user-owned
-    // widths), which this function never touches: siblings squeezed by another
-    // panel's drag keep their owned width and grow back when the drag reverses.
+    // WS-9: during a drag, `commitState` is false — refs + DOM update per
+    // frame, React state commits once on pointerup. React's fiber holds the
+    // pre-drag style props, so its virtual DOM never changes mid-drag and it
+    // cannot clobber the direct DOM writes (verified: no style re-write on
+    // unrelated re-renders). Deferring the setStates removes the full-App
+    // re-render per frame that the coupled layout previously paid.
     const layout = layoutBoundsInput();
     previewPanelWidthRef.current = fitted.preview.w;
     urlAsidePanelSizeRef.current = fitted.urlAside;
     mainPanelSizeRef.current = fitted.main;
     if (layout.previewOpen) {
-      setPreviewPanelWidth(fitted.preview.w);
+      if (commitState) setPreviewPanelWidth(fitted.preview.w);
       if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
     }
     if (layout.urlPanelAside) {
-      setUrlAsidePanelSize(fitted.urlAside);
+      if (commitState) setUrlAsidePanelSize(fitted.urlAside);
       if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, fitted.urlAside);
     }
-    setMainPanelSize(fitted.main);
+    if (commitState) setMainPanelSize(fitted.main);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
-    syncRowHeightsToPreview();
+    syncRowHeightsToPreview(commitState);
   }, [layoutBoundsInput, syncRowHeightsToPreview]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
@@ -3128,11 +3133,20 @@ export default function App() {
       onResizeMove: (w) => {
         setPreviewHeightFromWidth(w);
         if (coupled) {
-          applyLayoutRowSizes(resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred));
+          // WS-9: refs + DOM per frame, React state commits once on pointerup
+          // (see onResizeEnd) — removes the per-frame full-App re-render.
+          applyLayoutRowSizes(resizeLayoutGivingWidthTo(dragLayout, 'preview', w, preferred), false);
         }
       },
       onResizeEnd: () => {
         preferredDragRef.current.preview = previewPanelWidthRef.current;
+        // Commit the row state once, matching the live DOM exactly (no yank).
+        if (coupled) {
+          applyLayoutRowSizes(
+            resizeLayoutGivingWidthTo(dragLayout, 'preview', previewPanelWidthRef.current, preferred),
+            true,
+          );
+        }
         applyLayoutPanelClamps();
         // Only re-derive the height when the width actually moved — a plain
         // click on a handle must not collapse the freeze to w/aspect (e.g.
@@ -3167,11 +3181,17 @@ export default function App() {
       onResizeMove: coupled
         ? (next) => {
             const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', next.w, preferred);
-            applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } });
+            // WS-9: refs + DOM per frame, React state commits once on pointerup.
+            applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: next.h } }, false);
           }
         : undefined,
       onResizeEnd: () => {
         preferredDragRef.current.urlAside = urlAsidePanelSizeRef.current.w;
+        if (coupled) {
+          // Commit the row state once; keep the live height the drag produced.
+          const fitted = resizeLayoutGivingWidthTo(dragLayout, 'urlAside', urlAsidePanelSizeRef.current.w, preferred);
+          applyLayoutRowSizes({ ...fitted, urlAside: { ...fitted.urlAside, h: urlAsidePanelSizeRef.current.h } }, true);
+        }
         applyLayoutPanelClamps();
         flushPanelLayoutToBackend();
       },
@@ -3194,11 +3214,17 @@ export default function App() {
       onResizeMove: coupled
         ? (next) => {
             const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', next.w, preferred);
-            applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } });
+            // WS-9: refs + DOM per frame, React state commits once on pointerup.
+            applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: next.h } }, false);
           }
         : undefined,
       onResizeEnd: () => {
         preferredDragRef.current.main = mainPanelSizeRef.current.w;
+        if (coupled) {
+          // Commit the row state once; keep the live height the drag produced.
+          const fitted = resizeLayoutGivingWidthTo(dragLayout, 'main', mainPanelSizeRef.current.w, preferred);
+          applyLayoutRowSizes({ ...fitted, main: { ...fitted.main, h: mainPanelSizeRef.current.h } }, true);
+        }
         applyLayoutPanelClamps();
         flushPanelLayoutToBackend();
       },

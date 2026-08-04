@@ -1444,7 +1444,7 @@ export default function ChannelExplorePopup({
       >
       <div
         className={`flex flex-col ${fullscreen ? 'relative h-full min-h-0 w-full gap-0' : 'gap-2 relative cursor-grab active:cursor-grabbing select-none'}`}
-        style={fullscreen ? undefined : { transition: 'width 0.3s ease, height 0.3s ease' }}
+        style={fullscreen ? undefined : { transition: 'none' }}
         onPointerDown={fullscreen ? undefined : onPopupDrag}
       >
         {!fullscreen && (
