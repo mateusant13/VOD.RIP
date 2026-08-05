@@ -1110,3 +1110,117 @@ def test_short_tokens_are_not_title_substring_noise():
     })
     hits = archive_db.search("vale da estranheza", video_id="noise-vid-2")
     assert all(h["video_id"] != "noise-vid-2" for h in hits)
+
+
+# --- USER (chat author) filter ---------------------------------------------
+
+def _insert_author_msg(
+    video_id: str,
+    text: str,
+    *,
+    platform: str = "twitch",
+    username: str,
+    user_id: str | None = None,
+    display_name: str | None = None,
+) -> None:
+    archive_db.insert_messages(
+        platform, video_id,
+        [{
+            "offset_sec": 1.0, "username": username,
+            "user_id": user_id, "display_name": display_name, "text": text,
+        }],
+    )
+
+
+def _seed_user_fixture():
+    archive_db.execute("DELETE FROM messages WHERE video_id LIKE 'user-%'")
+    _insert_video("user-t", channel="titiltei", started_at="2026-08-03T17:24:00Z", kind="live")
+    _insert_video("user-yt", channel="titiltei", platform="youtube",
+                  started_at="2026-08-03T18:00:00Z", kind="live")
+    _insert_video("user-k", channel="titiltei", platform="kick",
+                  started_at="2026-08-03T19:00:00Z", kind="vod")
+    # Twitch/Kick store the DISPLAYED name; YouTube stores the @handle.
+    _insert_author_msg("user-t", "olha a raposa aí", platform="twitch",
+                       username="Scriptingkata", user_id="591091436")
+    _insert_author_msg("user-yt", "olha a raposa aí", platform="youtube",
+                       username="@Scriptingkata", user_id="UCscriptingkata")
+    _insert_author_msg("user-k", "olha a raposa aí", platform="kick",
+                       username="Scriptingkata")
+    _insert_author_msg("user-t", "outra pessoa", platform="twitch", username="AlguemAe")
+
+
+def test_search_username_matches_displayed_name_case_insensitive():
+    _seed_user_fixture()
+    hits = archive_db.search("raposa", username="scriptingkata")
+    assert _hit_ids(hits) == {("message", "user-t"), ("message", "user-yt"), ("message", "user-k")}
+    # The non-author row must not surface.
+    assert all(h["video_id"] != "user-t" or h["text"] != "outra pessoa" for h in hits)
+    # Hits carry the author for display.
+    assert all(h["author"] in ("Scriptingkata", "@Scriptingkata") for h in hits)
+
+
+def test_search_username_tolerates_at_prefix():
+    _seed_user_fixture()
+    hits = archive_db.search("raposa", username="@scriptingkata")
+    assert _hit_ids(hits) == {("message", "user-t"), ("message", "user-yt"), ("message", "user-k")}
+
+
+def test_search_username_matches_resolved_display_name():
+    _seed_user_fixture()
+    # Resolved display name ('Scripting Kata') replaces the @handle match.
+    archive_db.set_message_display_name("youtube", "UCscriptingkata", "Scripting Kata")
+    hits = archive_db.search("raposa", username="scripting kata")
+    assert _hit_ids(hits) == {("message", "user-yt")}
+    hits = archive_db.search("raposa", username="scriptingkata")
+    assert _hit_ids(hits) == {("message", "user-t"), ("message", "user-yt"), ("message", "user-k")}
+
+
+def test_search_username_no_match_is_empty():
+    _seed_user_fixture()
+    assert archive_db.search("raposa", username="ninguem") == []
+
+
+def test_search_username_forces_chat_source():
+    _seed_user_fixture()
+    archive_db.insert_transcript(
+        "twitch", "user-t",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "raposa transcript"}],
+    )
+    hits = archive_db.search("raposa", username="Scriptingkata", source="transcript")
+    # transcript-only request still returns chat rows for the author:
+    # transcripts have no author, so source is coerced to chat.
+    assert _hit_ids(hits) == {("message", "user-t"), ("message", "user-yt"), ("message", "user-k")}
+
+
+def test_youtube_chat_user_ids_without_display_name_and_set():
+    _seed_user_fixture()
+    archive_db.execute(
+        "UPDATE messages SET display_name = NULL "
+        "WHERE platform = 'youtube' AND video_id = 'user-yt'"
+    )
+    ids = archive_db.youtube_chat_user_ids_without_display_name(10)
+    assert "UCscriptingkata" in ids
+    n = archive_db.set_message_display_name("youtube", "UCscriptingkata", "Scripting Kata")
+    assert n >= 1
+    assert archive_db.youtube_chat_user_ids_without_display_name(10) == []
+
+
+async def test_search_username_router_passthrough_and_validation():
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_user_fixture()
+    resp = await archive_search(q="raposa", username="@scriptingkata", limit=20, semantic=False)
+    assert _hit_ids(resp["hits"]) == {
+        ("message", "user-t"), ("message", "user-yt"), ("message", "user-k"),
+    }
+    # The router strips the '@' and the search coerces source to chat even
+    # when the caller asked for transcripts.
+    resp = await archive_search(q="raposa", username="Scriptingkata", source="transcript",
+                                limit=20, semantic=False)
+    assert _hit_ids(resp["hits"]) == {
+        ("message", "user-t"), ("message", "user-yt"), ("message", "user-k"),
+    }
+    with pytest.raises(HTTPException) as exc:
+        await archive_search(q="raposa", username="x" * 121, limit=20)
+    assert exc.value.status_code == 400

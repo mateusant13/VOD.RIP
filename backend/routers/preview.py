@@ -357,6 +357,11 @@ def _priority_transcribe_for_preview(session) -> None:
         return
     if archive_db.transcript_for(platform, video_id):
         return  # already transcribed
+    if archive_db.transcribed_on_higher_priority_platform(platform, video_id):
+        # The same VOD is transcribed on a higher-priority platform
+        # (youtube > twitch > kick) — a Kick/Twitch whisper job would be
+        # wasted; the worker also guards in-flight jobs.
+        return
     job_id = f"transcribe-{platform}-{video_id}"
     latest = archive_db.latest_job(platform, video_id, kind="transcribe")
     if latest is None:

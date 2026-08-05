@@ -1711,6 +1711,24 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "skipped": "captions-first",
             }
 
+        if archive_db.transcribed_on_higher_priority_platform(platform, video_id):
+            # The same live/VOD exists on a higher-priority platform
+            # (youtube > twitch > kick) with transcript rows already — the
+            # Kick (or Twitch) copy needs no whisper. Mirrors the download
+            # dedupe rule (archive_kick.dedupe_decision).
+            logger.info(
+                "same VOD already transcribed on a higher-priority platform — "
+                "skipping %s/%s",
+                platform, video_id,
+            )
+            archive_db.update_job(job_id, status="done", progress=1.0)
+            return {
+                "job_id": job_id,
+                "platform": platform,
+                "video_id": video_id,
+                "skipped": "dedupe-transcribed",
+            }
+
         _last_progress = [0.0]
 
         def _progress(done: float, total: float, _ci: int, _n: int) -> None:

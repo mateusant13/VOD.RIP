@@ -949,3 +949,42 @@ assert _parse_srv3("<broken") == []
 assert _parse_caption("json3", _json3_sample) == _j3
 assert _parse_caption("srv3", _srv3_sample) == _s3
 assert _parse_caption("vtt", _vtt_sample) == _segs
+
+
+def resolve_youtube_display_names(limit: int = 20) -> int:
+    """Resolve UC channel ids → display names for youtube chat rows.
+
+    YouTube live-chat payloads only carry the @handle; the name viewers see
+    is the author channel's display title. One yt-dlp channel extract per
+    distinct UC id (bounded by the caller's throttle), resolved names cached
+    in messages.display_name so re-runs skip known ids. Bot-walled channels
+    (503) stay NULL and are retried on a later run — the USER search filter
+    falls back to the @-stripped handle meanwhile.
+
+    Uses the channel-dedicated lock so preview segment yt-dlp can't starve.
+    """
+    ids = archive_db.youtube_chat_user_ids_without_display_name(limit)
+    if not ids:
+        return 0
+    resolved = 0
+    for uid in ids:
+        name = None
+        try:
+            with guarded_youtube_dl_channel(
+                {"quiet": True, "no_warnings": True, "skip_download": True}
+            ) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/channel/{uid}", download=False
+                )
+            info = info or {}
+            name = info.get("title") or info.get("channel") or info.get("uploader")
+        except Exception as exc:  # noqa: BLE001 — bot wall / dead channel
+            logger.debug("display-name resolve failed for %s: %s", uid, exc)
+            continue
+        if name:
+            try:
+                archive_db.set_message_display_name("youtube", uid, str(name))
+                resolved += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("display-name store failed for %s: %s", uid, exc)
+    return resolved

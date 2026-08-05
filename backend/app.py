@@ -93,6 +93,22 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("startup chat dedupe skipped", exc_info=True)
 
+    # Warm the YouTube chat display-name cache: resolve a bounded batch of
+    # UC channel ids (the @handle-only rows) to the names viewers see, so
+    # the USER search filter matches displayed names from the first search.
+    # Fire-and-forget; bot-walled ids stay NULL and retry on later searches.
+    def _warm_display_names() -> None:
+        try:
+            from services.archive_ytdlp import resolve_youtube_display_names
+
+            n = resolve_youtube_display_names(20)
+            if n:
+                logger.info("resolved %d youtube chat display name(s) at boot", n)
+        except Exception:
+            logger.debug("startup display-name warm skipped", exc_info=True)
+
+    threading.Thread(target=_warm_display_names, daemon=True, name="yt-display-warm").start()
+
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
         s = settings_mgr.get()

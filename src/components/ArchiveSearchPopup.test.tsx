@@ -740,3 +740,44 @@ describe('ArchiveSearchPopup', () => {
     expect(await screen.findByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
   });
 });
+
+describe('ArchiveSearchPopup USER filter', () => {
+  const HIT = {
+    kind: 'transcript' as const,
+    platform: 'twitch',
+    video_id: 'v1',
+    offset_sec: 42,
+    text: 'zebra stripes',
+    score: 1,
+    channel: 'srdogg',
+  };
+
+  it('types an author and sends it as the username param', async () => {
+    const fetchMock = mockFetch([HIT]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(query, { target: { value: 'zebra' } });
+    const user = screen.getByLabelText('Chat author');
+    fireEvent.change(user, { target: { value: '@Scriptingkata' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'username=Scriptingkata')).toBeTruthy());
+    // The @ is stripped client-side before it hits the wire.
+    expect(searchUrlWith(fetchMock, 'username=@Scriptingkata')).toBeUndefined();
+  });
+
+  it('clears the user filter with the ✕ button', async () => {
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const user = screen.getByLabelText('Chat author');
+    fireEvent.change(user, { target: { value: 'scriptingkata' } });
+    fireEvent.click(screen.getByTitle('Clear user filter'));
+    await waitFor(() => expect(screen.getByLabelText('Chat author')).toHaveValue(''));
+  });
+
+  it('renders the author on message hit rows', async () => {
+    const fetchMock = mockFetch([{ ...HIT, kind: 'message', author: '@Scriptingkata' }]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(query, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    expect(await screen.findByText('@Scriptingkata:')).toBeInTheDocument();
+  });
+});

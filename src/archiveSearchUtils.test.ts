@@ -291,3 +291,29 @@ describe('buildArchiveVodUrl', () => {
     );
   });
 });
+
+describe('buildSearchUrl username filter', () => {
+  it('omits the username param when unset or empty', () => {
+    expect(buildSearchUrl({ query: 'x' })).toBe('/api/archive/search?q=x&limit=30');
+    expect(buildSearchUrl({ query: 'x', username: '' })).toBe('/api/archive/search?q=x&limit=30');
+    expect(buildSearchUrl({ query: 'x', username: null })).toBe('/api/archive/search?q=x&limit=30');
+  });
+
+  it('sends the username param', () => {
+    expect(buildSearchUrl({ query: 'x', username: 'scriptingkata' })).toBe(
+      '/api/archive/search?q=x&username=scriptingkata&limit=30',
+    );
+  });
+
+  it('strips a leading @ (YouTube stores the @handle)', () => {
+    expect(buildSearchUrl({ query: 'x', username: '@Scriptingkata' })).toBe(
+      '/api/archive/search?q=x&username=Scriptingkata&limit=30',
+    );
+  });
+
+  it('URL-encodes display names with spaces', () => {
+    expect(buildSearchUrl({ query: 'x', username: 'Scripting Kata' })).toBe(
+      '/api/archive/search?q=x&username=Scripting+Kata&limit=30',
+    );
+  });
+});

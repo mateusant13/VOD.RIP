@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS messages (
   offset_sec REAL NOT NULL,
   user_id    TEXT,
   username   TEXT NOT NULL,
+  -- Resolved platform chat display name (YouTube only: captured chat carries
+  -- the @handle in username; the display name is resolved per UC channel id
+  -- and cached here so the USER search filter matches what viewers see).
+  display_name TEXT,
   text       TEXT NOT NULL,
   badges     TEXT NOT NULL DEFAULT '[]',
   emotes     TEXT NOT NULL DEFAULT '[]',
@@ -303,6 +307,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_message_color_column(_conn)
+            _ensure_message_display_name_column(_conn)
             _ensure_jobs_kind_events(_conn)
             _ensure_jobs_priority(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
@@ -505,6 +510,20 @@ def _ensure_message_color_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     if "color" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN color TEXT")
+
+
+def _ensure_message_display_name_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add messages.display_name (chat display name).
+
+    YouTube live-chat payloads only carry the @handle (username); the name
+    viewers actually see is resolved from the author's UC channel id and
+    cached here. NULL for rows whose display name is unresolved (Twitch and
+    Kick already store the displayed name in username, so their rows stay
+    NULL and COALESCE(display_name, username) reads them correctly).
+    Additive only; PRAGMA table_info guard makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "display_name" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN display_name TEXT")
 
 
 def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
@@ -1072,14 +1091,15 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
             for anchor, count in runs:
                 conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
-                       user_id, username, text, badges, emotes, ts, color, spam_count)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       user_id, username, display_name, text, badges, emotes, ts, color, spam_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         platform,
                         video_id,
                         float(anchor["offset_sec"]),
                         anchor.get("user_id"),
                         anchor.get("username", ""),
+                        anchor.get("display_name"),
                         anchor["text"],
                         json.dumps(anchor.get("badges", []), ensure_ascii=False),
                         json.dumps(anchor.get("emotes", []), ensure_ascii=False),
@@ -1145,6 +1165,40 @@ def has_transcript(platform: str, video_id: str) -> bool:
             (platform, video_id),
         )
     )
+
+
+def youtube_chat_user_ids_without_display_name(limit: int = 20) -> list[str]:
+    """Distinct YouTube chat author channel ids whose display name is unresolved.
+
+    YouTube live-chat payloads carry the @handle (username) and the author's
+    UC channel id, but NOT the displayed name — the resolver fetches it from
+    the channel page and caches it in messages.display_name. Rows whose
+    display name is already resolved (or that have no channel id) never
+    come back, so repeated runs stay cheap."""
+    rows = query(
+        """SELECT DISTINCT user_id FROM messages
+           WHERE platform = 'youtube'
+             AND user_id IS NOT NULL AND user_id != ''
+             AND user_id LIKE 'UC%'
+             AND display_name IS NULL
+           LIMIT ?""",
+        (int(limit),),
+    )
+    return [r["user_id"] for r in rows]
+
+
+def set_message_display_name(platform: str, user_id: str, display_name: str) -> int:
+    """Cache one author's display name on every stored row (messages table).
+
+    The user filter matches COALESCE(display_name, username), so a resolved
+    name takes effect immediately for all videos the author appears in."""
+    with _lock:
+        with get_conn() as conn:
+            cur = conn.execute(
+                "UPDATE messages SET display_name = ? WHERE platform = ? AND user_id = ?",
+                (display_name, platform, user_id),
+            )
+            return cur.rowcount
 
 
 def has_chat(platform: str, video_id: str) -> bool:
@@ -1315,6 +1369,44 @@ def dedupe_view() -> list[dict]:
     for r in rows:
         groups.setdefault(r["key"], []).append(dict(r))
     return [{"canonical_key": k, "videos": v} for k, v in groups.items()]
+
+
+# Mirrors archive_kick._PRIORITY: the platform that owns a mirrored live/VOD.
+_PLATFORM_TRANSCRIBE_PRIORITY = {"youtube": 0, "twitch": 1, "kick": 2}
+
+
+def transcribed_on_higher_priority_platform(platform: str, video_id: str) -> bool:
+    """True when the same canonical_key group has a member on a HIGHER-priority
+    platform (youtube > twitch > kick) that already has transcript rows.
+
+    Mirrors the kick download dedupe rule (archive_kick.dedupe_decision) for
+    transcription: if the YouTube (or Twitch) mirror of a Kick VOD is already
+    transcribed — free via auto-captions — whisper needn't burn GPU on the
+    Kick copy. Kick itself is never a blocker for a higher-priority member
+    (the priority direction is one-way)."""
+    if platform not in _PLATFORM_TRANSCRIBE_PRIORITY:
+        return False
+    me = _PLATFORM_TRANSCRIBE_PRIORITY[platform]
+    row = query(
+        """SELECT COALESCE(a.canonical_key, v.canonical_key) AS key
+           FROM videos v
+           LEFT JOIN video_aliases a USING (platform, video_id)
+           WHERE v.platform = ? AND v.video_id = ?""",
+        (platform, video_id),
+    )
+    if not row or not row[0]["key"]:
+        return False
+    key = row[0]["key"]
+    for g in dedupe_view():
+        if g["canonical_key"] != key:
+            continue
+        for v in g["videos"]:
+            p = v["platform"]
+            if p == platform or p not in _PLATFORM_TRANSCRIBE_PRIORITY:
+                continue
+            if _PLATFORM_TRANSCRIBE_PRIORITY[p] < me and has_transcript(p, v["video_id"]):
+                return True
+    return False
 
 
 # --- content dedup (SHA-256) -----------------------------------------------
@@ -1734,6 +1826,7 @@ def search(
     limit: int = 20,
     semantic: bool = False,
     _channel_hint_out: Optional[list] = None,
+    username: Optional[str] = None,
 ) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
     score; each hit carries enough to seek: platform, video_id, offset_sec,
@@ -1768,6 +1861,13 @@ def search(
     LEFT so rows whose video was never indexed still surface when no
     video-backed filter is active.
 
+    username narrows to chat rows from one author: case-insensitive exact
+    match on COALESCE(display_name, username), with '@' stripped on both
+    sides (YouTube rows store the @handle; Twitch/Kick store the displayed
+    name, so "scriptingkata" finds both '@Scriptingkata' and the resolved
+    display name). Setting it implies source='chat' — transcript/title rows
+    have no author.
+
     Query tokens are fuzzy-expanded from the FTS5 vocab (exact + close
     Levenshtein matches, length-filtered, capped per token and in total);
     the expansion falls back to the exact tokens when the vocab is
@@ -1791,6 +1891,9 @@ def search(
         ("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"),
         ("message", "messages_fts", "messages", "t.offset_sec", "NULL"),
     )
+    if username:
+        # Chat-only: transcripts/title rows have no author.
+        source = "chat"
     if source == "chat":
         loops = loops[1:]
     elif source == "transcript":
@@ -1822,6 +1925,7 @@ def search(
             hit_kind=hit_kind, fts=fts, src=src, offcol=offcol, langcol=langcol,
             platforms=platforms, video_id=video_id, channel=channel, kinds=kinds,
             date_from=date_from, date_to=date_to, lang=lang,
+            username=username,
         )
         # Distance tiers: one MATCH pass per tier, unioned by rowid (lowest
         # tier wins). Scores are discounted by 0.5^tier so cross-table merges
@@ -2080,16 +2184,23 @@ def _table_search(
     date_from: Optional[str],
     date_to: Optional[str],
     lang: Optional[str],
+    username: Optional[str] = None,
 ) -> list[dict]:
     """One MATCH pass over one FTS table with the shared filter set.
 
     score is -bm25 (positive, higher = better); hits carry a private _rowid
     key so the tier/phrase passes can dedupe by row identity, and a _phrase
     flag set by callers that need the exact-phrase boost."""
+    author_col = (
+        "COALESCE(t.display_name, t.username) AS author, "
+        if hit_kind == "message"
+        else "NULL AS author, "
+    )
     sql = (
         f"SELECT t.rowid AS _rowid, -bm25({fts}) AS score, "
         f"t.platform, t.video_id, {offcol} AS offset_sec, t.text, "
         f"{langcol} AS lang, "
+        f"{author_col}"
         "v.channel, "
         # WS-4: hit titles display the original (non-translated) YouTube
         # title when the backfill stored one; content matching is on t.text.
@@ -2127,6 +2238,18 @@ def _table_search(
             sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
         elif lng == "en":
             sql += " AND t.lang = 'en'"
+    if username:
+        # Author match: case-insensitive exact on the displayed name, with
+        # '@' stripped on both sides (YouTube stores @handle; Twitch/Kick
+        # store the displayed name). Once a display name is resolved it
+        # takes precedence for display, but the @handle still matches — both
+        # spellings are the same person.
+        sql += (
+            " AND (replace(lower(t.username), '@', '') = replace(lower(?), '@', '')"
+            " OR (t.display_name IS NOT NULL"
+            "     AND replace(lower(t.display_name), '@', '') = replace(lower(?), '@', '')))"
+        )
+        params.extend((username, username))
     sql += f" ORDER BY score DESC LIMIT {int(fetch)}"
     return [
         {
@@ -2135,6 +2258,7 @@ def _table_search(
             "video_id": r["video_id"],
             "offset_sec": r["offset_sec"],
             "text": r["text"],
+            "author": r["author"],
             "score": r["score"],
             "lang": r["lang"],
             "channel": r["channel"],

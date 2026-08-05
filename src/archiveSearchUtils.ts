@@ -10,6 +10,8 @@ export interface ArchiveSearchHit {
   video_id: string;
   offset_sec: number;
   text: string;
+  /** Chat author (message hits only): displayed name or @handle as stored. */
+  author?: string | null;
   score: number;
   /** Extras from the owning videos row (null when no video row exists). */
   channel?: string | null;
@@ -110,6 +112,9 @@ export interface ArchiveSearchFilterParams {
   dateTo?: string | null;
   /** Transcript language filter ('pt' | 'en'); omitted when unset. */
   lang?: string | null;
+  /** Chat author filter (case-insensitive; '@' tolerated — YouTube stores
+   *  the @handle, Twitch/Kick the displayed name). Omitted when unset. */
+  username?: string | null;
   limit?: number;
   /** Explicitly opt OUT of the backend's auto channel-scope (hint=0). */
   hint?: boolean;
@@ -133,6 +138,8 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (dateFrom) params.set('date_from', dateFrom);
   if (dateTo) params.set('date_to', dateTo);
   if (p.lang) params.set('lang', p.lang);
+  const username = (p.username ?? '').trim().replace(/^@/, '');
+  if (username) params.set('username', username);
   if (p.hint === false) params.set('hint', '0');
   if (p.semantic) params.set('semantic', '1');
   params.set('limit', String(p.limit ?? 30));

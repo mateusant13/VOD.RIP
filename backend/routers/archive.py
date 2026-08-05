@@ -53,6 +53,42 @@ _TRANSCRIBE_FAILED_FRESH_S = 3600.0
 _TRANSCRIBE_LIMIT = 1
 _transcribe_lock = threading.Lock()
 
+# YouTube chat display-name resolution: lazy, throttled, fire-and-forget.
+# A USER-filter search warms the first batch of author channel ids; resolved
+# names are cached in messages.display_name and matched on later searches.
+# Bot-walled (503) resolutions fail inside the worker and retry next run.
+_display_name_lock = threading.Lock()
+_display_name_last_run: float = 0.0
+_DISPLAY_NAME_COOLDOWN_S = 120.0
+_DISPLAY_NAME_BATCH = 20
+
+
+def _maybe_resolve_display_names() -> None:
+    """Fire one bounded display-name resolution batch, at most every
+    _DISPLAY_NAME_COOLDOWN_S. Never blocks the search response."""
+    global _display_name_last_run
+    now = time.time()
+    with _display_name_lock:
+        if now - _display_name_last_run < _DISPLAY_NAME_COOLDOWN_S:
+            return
+        _display_name_last_run = now
+    threading.Thread(
+        target=_resolve_display_names_worker,
+        daemon=True,
+        name="yt-display-names",
+    ).start()
+
+
+def _resolve_display_names_worker() -> None:
+    try:
+        from services.archive_ytdlp import resolve_youtube_display_names
+
+        n = resolve_youtube_display_names(_DISPLAY_NAME_BATCH)
+        if n:
+            logger.info("resolved %d youtube chat display name(s)", n)
+    except Exception:
+        logger.debug("display-name resolution skipped", exc_info=True)
+
 
 async def _run_backfill(video_id: str, channel: str) -> None:
     """Background task: run backfill_chat in a worker thread; drop the
@@ -406,6 +442,7 @@ async def archive_search(
     source: str = "both",
     video_id: str | None = None,
     lang: str | None = None,
+    username: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     hint: bool = Query(True),
     semantic: bool = Query(False),
@@ -433,6 +470,12 @@ async def archive_search(
         )
     if channel and any(not s.strip() for s in channel.split(",")):
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
+    # username narrows to one chat author (case-insensitive, '@' tolerated —
+    # YouTube stores the @handle; Twitch/Kick store the displayed name). The
+    # chat-source coercion happens inside archive_db.search().
+    username = (username or "").strip().lstrip("@")
+    if username and len(username) > 120:
+        raise HTTPException(status_code=400, detail="username too long")
     # channel_hint: search() understands a leading channel-slug token (see
     # archive_db.search) and reports the matched slug through the out-param.
     # hint=False (UI dismissed the chip) disables the whole implicit-scope
@@ -451,6 +494,7 @@ async def archive_search(
         limit=limit,
         semantic=semantic,
         _channel_hint_out=hint_box if hint else None,
+        username=username or None,
     )
     channel_hint = hint_box[0] if hint_box else None
     # Targeted enrichment: lazily kick chat backfill / enqueue transcribe
@@ -474,6 +518,8 @@ async def archive_search(
     resp: dict[str, Any] = {"hits": hits, "enriching": enriching}
     if channel_hint:
         resp["channel_hint"] = channel_hint
+    if username:
+        _maybe_resolve_display_names()
     return resp
 
 

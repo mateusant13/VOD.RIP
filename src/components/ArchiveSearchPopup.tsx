@@ -135,6 +135,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [everyDay, setEveryDay] = useState(true);
   /** '' | 'pt' | 'en' — transcript language filter ('' = all). */
   const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>('');
+  /** Chat author filter ('' = all authors); '@' tolerated, case-insensitive. */
+  const [userFilter, setUserFilter] = useState('');
   const [semanticOn, setSemanticOn] = useState(false);
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -427,6 +429,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       dateFrom: !everyDay && isValidDateParam(dateFrom) ? dateFrom : null,
       dateTo: !everyDay && isValidDateParam(dateTo) ? dateTo : null,
       lang: langFilter || null,
+      username: userFilter || null,
       limit: SEARCH_LIMIT,
       hint: hintDisabled ? false : undefined,
       semantic: semanticOn && sourceFilter !== 'chat',
@@ -445,7 +448,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         setError('Archive search is unavailable — is the backend running?');
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled, semanticOn]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scope, everyDay, langFilter, hintDisabled, semanticOn, userFilter]);
 
   // Remote YouTube channel-title search: the local index only holds the
   // newest ~100 uploads per saved channel (the panel fetch cap), so old
@@ -820,6 +823,28 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
             )}
           </div>
         </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">User</span>
+          <input
+            type="text"
+            aria-label="Chat author"
+            placeholder="chat author…"
+            value={userFilter}
+            onChange={(e) => setUserFilter(e.target.value)}
+            spellCheck={false}
+            className="min-w-0 flex-1 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
+          />
+          {userFilter && (
+            <button
+              type="button"
+              onClick={() => setUserFilter('')}
+              title="Clear user filter"
+              className="shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white"
+            >
+              ✕
+            </button>
+          )}
+        </div>
       </div>
 
       {/* ── RESULTS REGION — every scrollable list is bounded so many
@@ -934,6 +959,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   </span>
                 </span>
                 <span className="text-[10px] leading-snug text-zinc-400 break-words">
+                  {hit.kind === 'message' && hit.author ? (
+                    <span className="text-yellow-200/80 mr-1 shrink-0">{hit.author}:</span>
+                  ) : null}
                   {(hit.channel ?? video?.channel) ? (
                     <span className="text-zinc-500 mr-1">@{(hit.channel ?? video?.channel)}</span>
                   ) : null}
