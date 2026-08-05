@@ -433,7 +433,7 @@ async def archive_transcripts(platform: str, video_id: str, body: Any = Body(...
 
 @router.get("/api/archive/search")
 async def archive_search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(""),
     platform: str | None = None,
     channel: str | None = None,
     date_from: str | None = None,
@@ -470,12 +470,20 @@ async def archive_search(
         )
     if channel and any(not s.strip() for s in channel.split(",")):
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
-    # username narrows to one chat author (case-insensitive, '@' tolerated —
-    # YouTube stores the @handle; Twitch/Kick store the displayed name). The
-    # chat-source coercion happens inside archive_db.search().
-    username = (username or "").strip().lstrip("@")
-    if username and len(username) > 120:
+    # username narrows to one or more chat authors — comma-separated
+    # ("a,b" → OR set, '@' tolerated per token — YouTube stores the
+    # @handle; Twitch/Kick store the displayed name). The chat-source
+    # coercion happens inside archive_db.search(). With an empty q the
+    # search becomes a pure author-history query, so at least one of
+    # q/username must be present.
+    username = (username or "").strip()
+    un_tokens = [t.lstrip("@") for t in username.split(",") if t.strip()]
+    if username and any(len(t) > 120 for t in un_tokens):
         raise HTTPException(status_code=400, detail="username too long")
+    if not un_tokens:
+        username = ""
+    if not q.strip() and not username:
+        raise HTTPException(status_code=400, detail="q or username required")
     # channel_hint: search() understands a leading channel-slug token (see
     # archive_db.search) and reports the matched slug through the out-param.
     # hint=False (UI dismissed the chip) disables the whole implicit-scope
@@ -508,7 +516,9 @@ async def archive_search(
         smart_enrich = bool(getattr(settings_mgr.get(), "archive_smart_enrich", True))
     except Exception:
         smart_enrich = True
-    if smart_enrich:
+    if smart_enrich and q.strip():
+        # Empty q = author-history mode: never let enrichment kick a
+        # transcribe/backfill job as a side effect of a pure username query.
         enriching = _maybe_enrich(
             platform=platform or None,
             channel=channel or channel_hint,

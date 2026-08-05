@@ -780,4 +780,41 @@ describe('ArchiveSearchPopup USER filter', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(await screen.findByText('@Scriptingkata:')).toBeInTheDocument();
   });
+
+  it('placeholder advertises comma-separated users; comma list passes through', async () => {
+    const fetchMock = mockFetch([HIT]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const user = screen.getByPlaceholderText('user1,user2…');
+    fireEvent.change(user, { target: { value: 'Scriptingkata,AlguemAe' } });
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'username=Scriptingkata%2CAlguemAe')).toBeTruthy(),
+    );
+  });
+
+  it('empty query + user filter fires the author-history search and renders hits', async () => {
+    const fetchMock = mockFetch([
+      {
+        kind: 'message', platform: 'twitch', video_id: 'v1', offset_sec: 1801,
+        text: 'olha a raposa', author: 'Scriptingkata', channel: 'srdogg',
+        title: 'VOD A', date: '2026-08-03T17:24:00Z', video_kind: 'live',
+        channel_language: null,
+      },
+    ]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const user = screen.getByLabelText('Chat author');
+    fireEvent.change(user, { target: { value: 'Scriptingkata' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'username=Scriptingkata')).toBeTruthy());
+    expect(searchUrlWith(fetchMock, 'q=')).toBeTruthy();
+    expect(await screen.findByText('Scriptingkata:')).toBeInTheDocument();
+  });
+
+  it('empty query + user filter shows the author-only empty state', async () => {
+    mockFetch([]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const user = screen.getByLabelText('Chat author');
+    fireEvent.change(user, { target: { value: 'Scriptingkata,AlguemAe' } });
+    expect(
+      await screen.findByText('No archived messages from @Scriptingkata, @AlguemAe.'),
+    ).toBeInTheDocument();
+  });
 });

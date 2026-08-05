@@ -1122,11 +1122,12 @@ def _insert_author_msg(
     username: str,
     user_id: str | None = None,
     display_name: str | None = None,
+    offset_sec: float = 1.0,
 ) -> None:
     archive_db.insert_messages(
         platform, video_id,
         [{
-            "offset_sec": 1.0, "username": username,
+            "offset_sec": offset_sec, "username": username,
             "user_id": user_id, "display_name": display_name, "text": text,
         }],
     )
@@ -1146,6 +1147,9 @@ def _seed_user_fixture():
                        username="@Scriptingkata", user_id="UCscriptingkata")
     _insert_author_msg("user-k", "olha a raposa aí", platform="kick",
                        username="Scriptingkata")
+    _insert_author_msg("user-t", "segunda mensagem", platform="twitch",
+                       username="Scriptingkata", user_id="591091436",
+                       offset_sec=3.0)
     _insert_author_msg("user-t", "outra pessoa", platform="twitch", username="AlguemAe")
 
 
@@ -1223,4 +1227,85 @@ async def test_search_username_router_passthrough_and_validation():
     }
     with pytest.raises(HTTPException) as exc:
         await archive_search(q="raposa", username="x" * 121, limit=20)
+    assert exc.value.status_code == 400
+
+
+def test_search_username_only_empty_q_returns_author_history():
+    _seed_user_fixture()
+    hits = archive_db.search("", username="scriptingkata")
+    # Every author row, newest video first (user-k 19:00 → user-yt 18:00 →
+    # user-t 17:24), then newest offset within the video. No per-video cap:
+    # both user-t rows surface.
+    assert [h["video_id"] for h in hits] == ["user-k", "user-yt", "user-t", "user-t"]
+    assert [h["offset_sec"] for h in hits] == [1.0, 1.0, 3.0, 1.0]
+    # The non-author row must not surface.
+    assert all(h["text"] != "outra pessoa" for h in hits)
+    # Hits carry the author + video extras for rendering.
+    assert all(h["author"] in ("Scriptingkata", "@Scriptingkata") for h in hits)
+    assert all(h["channel"] == "titiltei" for h in hits)
+
+
+def test_search_username_only_empty_q_respects_shared_filters():
+    _seed_user_fixture()
+    hits = archive_db.search("", username="scriptingkata", platform="twitch")
+    assert [h["video_id"] for h in hits] == ["user-t", "user-t"]
+    hits = archive_db.search("", username="scriptingkata", channel="titiltei",
+                             date_from="2026-08-03", date_to="2026-08-03")
+    assert len(hits) == 4
+    hits = archive_db.search("", username="scriptingkata", kind="vod")
+    assert [h["video_id"] for h in hits] == ["user-k"]
+
+
+def test_search_username_comma_list_matches_any_author():
+    _seed_user_fixture()
+    # History mode: both authors, all their rows.
+    hits = archive_db.search("", username="scriptingkata,alguemae")
+    assert [h["video_id"] for h in hits] == ["user-k", "user-yt", "user-t", "user-t", "user-t"]
+    # Text mode: comma list still narrows to either author's matching rows.
+    hits = archive_db.search("raposa", username="scriptingkata,alguemae")
+    assert _hit_ids(hits) == {
+        ("message", "user-t"), ("message", "user-yt"), ("message", "user-k"),
+    }
+    # '@' tolerated per token; empty segments dropped.
+    hits = archive_db.search("raposa", username="@Scriptingkata, ,AlguemAe")
+    assert _hit_ids(hits) == {
+        ("message", "user-t"), ("message", "user-yt"), ("message", "user-k"),
+    }
+
+
+def test_search_username_comma_list_matches_resolved_display_names():
+    _seed_user_fixture()
+    archive_db.set_message_display_name("youtube", "UCscriptingkata", "Scripting Kata")
+    hits = archive_db.search("", username="scripting kata,vira lata")
+    assert [h["video_id"] for h in hits] == ["user-yt"]
+    hits = archive_db.search("", username="scriptingkata,scripting kata")
+    assert [h["video_id"] for h in hits] == ["user-k", "user-yt", "user-t", "user-t"]
+
+
+def test_search_empty_q_without_username_is_empty():
+    _seed_user_fixture()
+    assert archive_db.search("") == []
+    assert archive_db.search("   ") == []
+
+
+async def test_search_username_only_router_passthrough_and_validation():
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_user_fixture()
+    # Empty q + username → author history; no enrichment side effects.
+    resp = await archive_search(q="", username="scriptingkata,alguemae",
+                                limit=20, semantic=False)
+    assert [h["video_id"] for h in resp["hits"]] == [
+        "user-k", "user-yt", "user-t", "user-t", "user-t",
+    ]
+    assert resp["enriching"] == []
+    assert "channel_hint" not in resp
+    # Empty q AND empty username → 400 (nothing to search).
+    with pytest.raises(HTTPException) as exc:
+        await archive_search(q="", limit=20)
+    assert exc.value.status_code == 400
+    # Per-token length validation on comma lists.
+    with pytest.raises(HTTPException) as exc:
+        await archive_search(q="", username="ok," + "x" * 121, limit=20)
     assert exc.value.status_code == 400

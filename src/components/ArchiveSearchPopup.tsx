@@ -401,7 +401,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   }, [query, channelFilter]);
 
   useEffect(() => {
-    if (!query) {
+    // Empty query is still a valid search when the chat-author filter is
+    // set: the backend returns that author's whole history, newest first.
+    if (!query && !userFilter.trim()) {
       searchGenRef.current += 1;
       setStatus('idle');
       setHits([]);
@@ -828,7 +830,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
           <input
             type="text"
             aria-label="Chat author"
-            placeholder="chat author…"
+            placeholder="user1,user2…"
+            title="Chat author filter — comma-separate multiple users; leave the search box empty to list their whole history"
             value={userFilter}
             onChange={(e) => setUserFilter(e.target.value)}
             spellCheck={false}
@@ -867,11 +870,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
 
       {status === 'done' && hits.length === 0 && remoteStatus !== 'loading' && (
         <p className="text-[10px] font-mono text-zinc-500 shrink-0">
-          No results for &quot;{query}&quot; —{' '}
-          {remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
-            ? 'nothing local matches and YouTube found nothing either'
-            : 'nothing archived matches yet'}
-          .
+          {query.trim()
+            ? <>No results for &quot;{query}&quot; —{' '}
+              {remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
+                ? 'nothing local matches and YouTube found nothing either'
+                : 'nothing archived matches yet'}
+              .</>
+            : <>No archived messages from {userFilter.trim().split(',').map((u) => `@${u.trim()}`).join(', ')}.</>}
         </p>
       )}
 

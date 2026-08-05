@@ -112,8 +112,10 @@ export interface ArchiveSearchFilterParams {
   dateTo?: string | null;
   /** Transcript language filter ('pt' | 'en'); omitted when unset. */
   lang?: string | null;
-  /** Chat author filter (case-insensitive; '@' tolerated — YouTube stores
-   *  the @handle, Twitch/Kick the displayed name). Omitted when unset. */
+  /** Chat author filter — comma-separate multiple users ("a,b" matches ANY;
+   *  '@' tolerated — YouTube stores the @handle, Twitch/Kick the displayed
+   *  name). With an empty query the backend returns those authors' whole
+   *  history, newest first. Omitted when unset. */
   username?: string | null;
   limit?: number;
   /** Explicitly opt OUT of the backend's auto channel-scope (hint=0). */

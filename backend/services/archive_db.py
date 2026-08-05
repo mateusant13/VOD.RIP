@@ -1861,32 +1861,45 @@ def search(
     LEFT so rows whose video was never indexed still surface when no
     video-backed filter is active.
 
-    username narrows to chat rows from one author: case-insensitive exact
-    match on COALESCE(display_name, username), with '@' stripped on both
-    sides (YouTube rows store the @handle; Twitch/Kick store the displayed
-    name, so "scriptingkata" finds both '@Scriptingkata' and the resolved
-    display name). Setting it implies source='chat' — transcript/title rows
-    have no author.
+    username narrows to chat rows from one or more authors — comma-separated
+    ("a,b" → OR set, '@' stripped per token, empty segments dropped).
+    Case-insensitive exact match on the @-stripped username OR the resolved
+    display name (YouTube rows store the @handle; Twitch/Kick store the
+    displayed name, so "scriptingkata" finds both '@Scriptingkata' and the
+    resolved display name). Setting it implies source='chat' — transcript/
+    title rows have no author. With an empty q it becomes a pure author
+    history: every message from those authors, newest video first, no
+    per-video cap (the FTS passes never run).
 
     Query tokens are fuzzy-expanded from the FTS5 vocab (exact + close
     Levenshtein matches, length-filtered, capped per token and in total);
     the expansion falls back to the exact tokens when the vocab is
     unavailable or the query is huge."""
-    if not q.strip():
+    if not q.strip() and not (username or "").strip():
         return []
     raw_q = q.strip()
-    if channel is None and _channel_hint_out is not None:
-        hint = _channel_hint_for(raw_q)
-        if hint is not None:
-            channel = hint
-            q = " ".join(q.split()[1:]) or q
-            _channel_hint_out.append(hint)
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
     platforms = (
         [p for p in (p.strip().lower() for p in platform.split(",")) if p in PLATFORMS]
         if platform
         else []
     )
+    if not raw_q:
+        # Chat-author-only mode: every message from the chosen author(s),
+        # newest video first then newest message — no text matching, no
+        # per-video cap (the point is the author's whole history).
+        return _username_only_search(
+            fetch=max(int(limit) * 3, 3),
+            platforms=platforms, video_id=video_id, channel=channel,
+            kinds=kinds, date_from=date_from, date_to=date_to,
+            username=username,
+        )[:int(limit)]
+    if channel is None and _channel_hint_out is not None:
+        hint = _channel_hint_for(raw_q)
+        if hint is not None:
+            channel = hint
+            q = " ".join(q.split()[1:]) or q
+            _channel_hint_out.append(hint)
     loops = (
         ("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"),
         ("message", "messages_fts", "messages", "t.offset_sec", "NULL"),
@@ -2243,13 +2256,12 @@ def _table_search(
         # '@' stripped on both sides (YouTube stores @handle; Twitch/Kick
         # store the displayed name). Once a display name is resolved it
         # takes precedence for display, but the @handle still matches — both
-        # spellings are the same person.
-        sql += (
-            " AND (replace(lower(t.username), '@', '') = replace(lower(?), '@', '')"
-            " OR (t.display_name IS NOT NULL"
-            "     AND replace(lower(t.display_name), '@', '') = replace(lower(?), '@', '')))"
-        )
-        params.extend((username, username))
+        # spellings are the same person. Comma-separated = OR set.
+        tokens = _username_tokens(username)
+        if tokens:
+            clause, token_params = _username_match_clause(tokens, "t")
+            sql += f" AND {clause}"
+            params.extend(token_params)
     sql += f" ORDER BY score DESC LIMIT {int(fetch)}"
     return [
         {
@@ -2268,6 +2280,106 @@ def _table_search(
             "channel_language": r["channel_language"],
             "_rowid": r["_rowid"],
             "_raw": r["score"],  # pre-normalization -bm25; tie-breaker only
+        }
+        for r in query(sql, params)
+    ]
+
+
+def _username_tokens(username: Optional[str]) -> list[str]:
+    """Comma-separated chat authors → normalized tokens (lowercased,
+    '@'-stripped; empty segments dropped)."""
+    if not username:
+        return []
+    return [t.strip().lstrip("@").lower() for t in username.split(",") if t.strip()]
+
+
+def _username_match_clause(tokens: list[str], alias: str) -> tuple[str, list[str]]:
+    """WHERE fragment matching ANY token against the author's @-stripped
+    username or resolved display_name (display name takes precedence for
+    display, but the @handle still matches — both spellings are one person)."""
+    parts: list[str] = []
+    params: list[Any] = []
+    for t in tokens:
+        parts.append(
+            f"(replace(lower({alias}.username), '@', '') = ?"
+            f" OR ({alias}.display_name IS NOT NULL"
+            f"     AND replace(lower({alias}.display_name), '@', '') = ?))"
+        )
+        params.extend((t, t))
+    return "(" + " OR ".join(parts) + ")", params
+
+
+def _username_only_search(
+    fetch: int,
+    *,
+    platforms: list[str],
+    video_id: Optional[str],
+    channel: Optional[str],
+    kinds: list[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    username: Optional[str],
+) -> list[dict]:
+    """All chat rows from the chosen author(s) — no text matching.
+
+    Comma-separated usernames become an OR set; each token matches the
+    @-stripped username or the resolved display name. Newest video first,
+    then newest message within it. No per-video cap: the point is the
+    author's whole history, so every row counts toward `fetch` (callers
+    slice to their limit). Shared filters (platform/video/channel/kind/
+    dates) apply; hits carry the same keys as _table_search message rows."""
+    tokens = _username_tokens(username)
+    if not tokens:
+        return []
+    where, params = _username_match_clause(tokens, "m")
+    sql = (
+        "SELECT m.id AS _rowid, 1.0 AS score, m.platform, m.video_id, m.offset_sec, "
+        "m.text, NULL AS lang, COALESCE(m.display_name, m.username) AS author, "
+        "v.channel AS channel, "
+        "COALESCE(NULLIF(v.original_title, ''), v.title) AS title, "
+        "v.started_at AS date, v.kind AS video_kind, "
+        "v.channel_language AS channel_language "
+        "FROM messages m LEFT JOIN videos v "
+        "ON v.platform = m.platform AND v.video_id = m.video_id "
+        f"WHERE {where}"
+    )
+    if platforms:
+        sql += f" AND m.platform IN ({','.join('?' * len(platforms))})"
+        params.extend(platforms)
+    if video_id:
+        sql += " AND m.video_id = ?"
+        params.append(video_id)
+    if channel:
+        slugs = [c.strip().lower() for c in channel.split(",") if c.strip()]
+        if slugs:
+            sql += f" AND lower(COALESCE(v.channel, '')) IN ({','.join('?' * len(slugs))})"
+            params.extend(slugs)
+    if kinds:
+        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
+        params.extend(kinds)
+    if date_from:
+        sql += " AND date(v.started_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(v.started_at) <= date(?)"
+        params.append(date_to)
+    sql += " ORDER BY v.started_at DESC, m.offset_sec DESC LIMIT ?"
+    params.append(fetch)
+    return [
+        {
+            "kind": "message",
+            "platform": r["platform"],
+            "video_id": r["video_id"],
+            "offset_sec": r["offset_sec"],
+            "text": r["text"],
+            "author": r["author"],
+            "score": 1.0,
+            "lang": None,
+            "channel": r["channel"],
+            "title": r["title"],
+            "date": r["date"],
+            "video_kind": r["video_kind"],
+            "channel_language": r["channel_language"],
         }
         for r in query(sql, params)
     ]

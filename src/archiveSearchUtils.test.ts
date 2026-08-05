@@ -316,4 +316,15 @@ describe('buildSearchUrl username filter', () => {
       '/api/archive/search?q=x&username=Scripting+Kata&limit=30',
     );
   });
+
+  it('passes comma-separated user lists through unmodified', () => {
+    expect(buildSearchUrl({ query: '', username: 'Scriptingkata,AlguemAe' })).toBe(
+      '/api/archive/search?q=&username=Scriptingkata%2CAlguemAe&limit=30',
+    );
+    // A leading @ on the first token is stripped client-side; the backend
+    // strips per token too (YouTube stores @handles).
+    expect(buildSearchUrl({ query: 'x', username: '@Scriptingkata,@aranha' })).toBe(
+      '/api/archive/search?q=x&username=Scriptingkata%2C%40aranha&limit=30',
+    );
+  });
 });
