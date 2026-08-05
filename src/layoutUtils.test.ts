@@ -8,9 +8,14 @@ import {
   effectiveLayoutFromPreferred,
   panelPosAfterResize,
   healSqueezedPanelLayout,
+  aspectHeightForWidth,
+  ownedPanelHeightSeed,
+  rowPanelHeightFromPreview,
   PREVIEW_PANEL_MIN_W,
   LIVE_PANEL_MIN_W,
   PANEL_MIN,
+  URL_ASIDE_PANEL_DEFAULT,
+  MAIN_PANEL_DEFAULT,
 } from './layoutUtils';
 import type { LayoutPanelBoundsInput } from './types';
 
@@ -279,6 +284,87 @@ describe('layoutUtils resize budget', () => {
     const urlAside = clampPanelSizeForLayout('urlAside', { w: 0, h: 0 }, layout);
     expect(urlAside.w).toBe(PANEL_MIN.w);
     expect(urlAside.h).toBe(PANEL_MIN.h);
+  });
+
+  it('grows urlAside back toward its aspect target when the squeeze releases', () => {
+    const layout = tripleLayout();
+    const preferred = { urlAside: layout.urlAside.w, main: layout.main.w };
+    const previewMax = layoutMaxPanelWidthAtSiblingMins('preview', layout);
+    // Squeeze: the preview drag grows to max-at-sibling-mins; urlAside (and
+    // main) park at their minimums.
+    const squeezed = resizeLayoutGivingWidthTo(layout, 'preview', previewMax, preferred);
+    expect(squeezed.urlAside.w).toBe(PANEL_MIN.w);
+    expect(squeezed.main.w).toBe(PANEL_MIN.w);
+    // Release: the preview drag returns to its start width; urlAside grows
+    // back toward its aspect-consistent (default) width instead of staying
+    // thin — even when its owned width was parked at the minimum.
+    const released = resizeLayoutGivingWidthTo(
+      { ...squeezed, previewOpen: true, urlPanelAside: true },
+      'preview',
+      layout.preview.w,
+      preferred,
+    );
+    expect(released.urlAside.w).toBe(URL_ASIDE_PANEL_DEFAULT.w);
+    expect(released.main.w).toBe(MAIN_PANEL_DEFAULT.w);
+    expect(released.preview.w + released.urlAside.w + released.main.w).toBeLessThanOrEqual(
+      layoutRowWidthBudget(layout),
+    );
+
+    // Same release with urlAside's OWNED width parked thin (a previous drag
+    // wrote owned == min): the slack-grow still heals it back to the aspect
+    // target — the "permanently-thin" case from the diagnosis.
+    const thinOwned = resizeLayoutGivingWidthTo(
+      { ...squeezed, previewOpen: true, urlPanelAside: true },
+      'preview',
+      layout.preview.w,
+      { urlAside: PANEL_MIN.w, main: layout.main.w },
+    );
+    expect(thinOwned.urlAside.w).toBe(URL_ASIDE_PANEL_DEFAULT.w);
+  });
+
+  it('does not slack-grow the panel the user is actively dragging', () => {
+    const layout = tripleLayout();
+    const preferred = { urlAside: layout.urlAside.w, main: layout.main.w };
+    // A deliberate narrow drag of urlAside itself sticks at the min even
+    // though the row has slack — the slack-grow only heals squeezed SIBLINGS.
+    const narrow = resizeLayoutGivingWidthTo(layout, 'urlAside', PANEL_MIN.w, preferred);
+    expect(narrow.urlAside.w).toBe(PANEL_MIN.w);
+    expect(narrow.main.w).toBe(MAIN_PANEL_DEFAULT.w);
+  });
+
+  it('returns urlAside height toward its aspect target when the preview shrinks (two-way sync)', () => {
+    // The owned height seeds from the stored (default) shape and is NOT
+    // rewritten when a sibling squeeze parks the panel at min width.
+    const ownedH = ownedPanelHeightSeed(
+      'urlAside',
+      URL_ASIDE_PANEL_DEFAULT.w,
+      URL_ASIDE_PANEL_DEFAULT.h,
+    );
+    expect(ownedH).toBe(URL_ASIDE_PANEL_DEFAULT.h);
+    // Squeeze: preview wide (1200px → 675 tall at 16:9) — the panel follows.
+    const grown = rowPanelHeightFromPreview(ownedH, 675, 9999, PANEL_MIN.h);
+    expect(grown).toBe(675);
+    // Release: preview back to 533px (300 tall) — the panel falls back toward
+    // its aspect target (414 = the 288:414 ratio height) instead of staying
+    // tall at the ratcheted value.
+    const released = rowPanelHeightFromPreview(ownedH, 300, 9999, PANEL_MIN.h);
+    expect(released).toBeLessThan(grown);
+    expect(released).toBe(aspectHeightForWidth('urlAside', URL_ASIDE_PANEL_DEFAULT.w));
+    // A deliberate tall S-edge drag keeps its height (owned wins over preview).
+    expect(rowPanelHeightFromPreview(600, 300, 9999, PANEL_MIN.h)).toBe(600);
+    // The min clamp still holds when both preview and owned height are tiny.
+    expect(rowPanelHeightFromPreview(PANEL_MIN.h, 50, 9999, PANEL_MIN.h)).toBe(PANEL_MIN.h);
+  });
+
+  it('seeds owned heights capped at the aspect target so ratcheted loads heal', () => {
+    // Pre-fix one-way sync persisted a tall ratcheted height (620) at min width.
+    expect(ownedPanelHeightSeed('urlAside', PANEL_MIN.w, 620)).toBe(
+      aspectHeightForWidth('urlAside', PANEL_MIN.w),
+    );
+    // Main heals toward its square default.
+    expect(ownedPanelHeightSeed('main', MAIN_PANEL_DEFAULT.w, 675)).toBe(MAIN_PANEL_DEFAULT.h);
+    // Deliberate short heights are preserved (never grown by the seed).
+    expect(ownedPanelHeightSeed('main', MAIN_PANEL_DEFAULT.w, 300)).toBe(300);
   });
 
   it('effective layout never renders a panel below its min width', () => {

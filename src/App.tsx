@@ -73,7 +73,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
-import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -645,6 +645,21 @@ export default function App() {
   const preferredDragRef = useRef<{ preview: number; urlAside: number; main: number }>(
     userOwnedWidthsFrom(initialPanelLayout),
   );
+  /**
+   * User-owned heights: the height each center panel last had when the user
+   * dragged ITS south edge. Preview-driven row sync (syncRowHeightsToPreview)
+   * falls back to these when the preview shrinks instead of ratcheting at the
+   * tall value forever. Seeded from the stored height capped at the panel's
+   * aspect-consistent height, so heights ratcheted by the pre-fix one-way sync
+   * heal toward the default shape on load; a deliberate in-session S-edge drag
+   * overwrites the seed.
+   */
+  const ownedPanelHeightRef = useRef<{ urlAside: number; main: number }>({
+    urlAside: ownedPanelHeightSeed('urlAside', initialPanelLayout.urlAside.w, initialPanelLayout.urlAside.h),
+    main: ownedPanelHeightSeed('main', initialPanelLayout.main.w, initialPanelLayout.main.h),
+  });
+  /** Previous previewOpen, for the open→closed height-restore transition. */
+  const prevPreviewOpenRef = useRef(previewOpen);
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
@@ -681,6 +696,10 @@ export default function App() {
     setUrlAsidePanelSize(healed.urlAside);
     setMainPanelSize(healed.main);
     preferredDragRef.current = { ...healed.owned };
+    ownedPanelHeightRef.current = {
+      urlAside: ownedPanelHeightSeed('urlAside', healed.urlAside.w, healed.urlAside.h),
+      main: ownedPanelHeightSeed('main', healed.main.w, healed.main.h),
+    };
   }, []);
 
   const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => ({
@@ -3068,6 +3087,28 @@ export default function App() {
   }, [layoutBoundsInput]);
 
   useEffect(() => {
+    // Preview close: side panels fall back to their owned heights instead of
+    // keeping the tall height the preview's row sync forced on them (the
+    // one-way ratchet). Guarded on the open→closed transition so a deliberate
+    // closed-preview S-edge drag is never clobbered by this effect.
+    if (prevPreviewOpenRef.current && !previewOpen) {
+      const maxH = layoutMaxPanelHeight();
+      const targetUrlH = Math.min(maxH, Math.max(PANEL_MIN.h, ownedPanelHeightRef.current.urlAside));
+      if (urlAsidePanelSizeRef.current.h !== targetUrlH) {
+        const nextUrl = { ...urlAsidePanelSizeRef.current, h: targetUrlH };
+        urlAsidePanelSizeRef.current = nextUrl;
+        setUrlAsidePanelSize(nextUrl);
+        if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, nextUrl);
+      }
+      const targetMainH = Math.min(maxH, Math.max(PANEL_MIN.h, ownedPanelHeightRef.current.main));
+      if (mainPanelSizeRef.current.h !== targetMainH) {
+        const nextMain = { ...mainPanelSizeRef.current, h: targetMainH };
+        mainPanelSizeRef.current = nextMain;
+        setMainPanelSize(nextMain);
+        if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, nextMain);
+      }
+    }
+    prevPreviewOpenRef.current = previewOpen;
     applyLayoutPanelClamps();
     const onResize = () => applyLayoutPanelClamps();
     window.addEventListener('resize', onResize);
@@ -3084,8 +3125,21 @@ export default function App() {
     const maxH = layoutMaxPanelHeight();
     const previewH = Math.min(maxH, previewPanelRef.current.offsetHeight);
     if (previewH <= 0) return;
-    const nextUrlH = Math.min(maxH, Math.max(urlAsidePanelSizeRef.current.h, previewH));
-    const nextMainH = Math.min(maxH, Math.max(mainPanelSizeRef.current.h, previewH));
+    // Two-way row sync: side panels follow the preview while it is tall, but
+    // fall back to their OWNED heights when the preview shrinks — the old
+    // max(current.h, previewH) ratchet never released a tall panel.
+    const nextUrlH = rowPanelHeightFromPreview(
+      ownedPanelHeightRef.current.urlAside,
+      previewH,
+      maxH,
+      PANEL_MIN.h,
+    );
+    const nextMainH = rowPanelHeightFromPreview(
+      ownedPanelHeightRef.current.main,
+      previewH,
+      maxH,
+      PANEL_MIN.h,
+    );
     if (nextUrlH === urlAsidePanelSizeRef.current.h && nextMainH === mainPanelSizeRef.current.h) return;
     urlAsidePanelSizeRef.current = { ...urlAsidePanelSizeRef.current, h: nextUrlH };
     mainPanelSizeRef.current = { ...mainPanelSizeRef.current, h: nextMainH };
@@ -3214,6 +3268,9 @@ export default function App() {
           }
         : undefined,
       onResizeEnd: () => {
+        // Ref holds the raw drag height here (pre row-sync), which is the
+        // user's choice — the sync's fallback target for later preview shrinks.
+        ownedPanelHeightRef.current.urlAside = urlAsidePanelSizeRef.current.h;
         preferredDragRef.current.urlAside = urlAsidePanelSizeRef.current.w;
         if (coupled) {
           // Commit the row state once; keep the live height the drag produced.
@@ -3247,6 +3304,9 @@ export default function App() {
           }
         : undefined,
       onResizeEnd: () => {
+        // Ref holds the raw drag height here (pre row-sync), which is the
+        // user's choice — the sync's fallback target for later preview shrinks.
+        ownedPanelHeightRef.current.main = mainPanelSizeRef.current.h;
         preferredDragRef.current.main = mainPanelSizeRef.current.w;
         if (coupled) {
           // Commit the row state once; keep the live height the drag produced.
