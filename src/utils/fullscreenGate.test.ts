@@ -174,21 +174,26 @@ describe('fullscreenGate', () => {
     expect(adapter.activeElement()).toBe(null);
   });
 
-  it('supports the live-popup semantics: exit when ANY element is fullscreen', async () => {
+  it('live-popup semantics: targets only the toggled element — another surface\'s fullscreen does not trigger exit', async () => {
     const adapter = new FakeAdapter();
-    const gate = createFullscreenGate(adapter, (active) => active != null);
+    const gate = createFullscreenGate(adapter); // default: exit iff active === el
     const popup = el();
     const other = el();
-    adapter.active = other; // some other element (e.g. preview panel) is fullscreen
+    adapter.active = other; // e.g. the main preview panel is fullscreen
+    // The popup must NOT exit the other surface — it enters its own fullscreen.
+    expect(gate.toggle(popup)).toBe('enter');
+    expect(adapter.exitCalls).toBe(0);
+    expect(adapter.enterCalls).toBe(1);
+    await Promise.resolve();
+    expect(adapter.activeElement()).toBe(popup);
+    gate.sync();
+    expect(gate.isActive(popup)).toBe(true);
+    // Now the popup itself is fullscreen → toggle exits only it.
     expect(gate.toggle(popup)).toBe('exit');
     expect(adapter.exitCalls).toBe(1);
     await Promise.resolve();
     gate.sync();
     expect(gate.isActive(popup)).toBe(false);
-    expect(gate.toggle(popup)).toBe('enter');
-    await Promise.resolve();
-    gate.sync();
-    expect(gate.isActive(popup)).toBe(true);
   });
 
   it('toggle(null) is a no-op', () => {
