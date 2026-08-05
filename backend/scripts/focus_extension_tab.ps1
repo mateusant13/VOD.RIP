@@ -20,7 +20,10 @@ Two modes, in order:
 Exit codes:
   0 — an Extensions tab was found, selected, and its window raised
   2 — no Extensions tab; a new tab was driven in the topmost browser window
-  1 — no real browser window found (caller should spawn a fresh browser)
+  1 — no browser running at all (caller should spawn a fresh browser)
+  3 — a browser is running but no usable window / focus could not be won
+      (caller must NOT spawn chrome.exe with the URL — a running instance
+      drops the URL and leaves a stray new-tab page instead)
 
 On exit 2 the script prints the driven browser's process name (chrome,
 msedge, brave) so the caller can report the right extension-manager URL.
@@ -81,7 +84,7 @@ try {
     }
   }
 } catch {
-  exit 1
+  exit 3
 }
 
 if ($match) {
@@ -118,8 +121,12 @@ if ($match) {
 # each tab's content as a top-level window (invisible for background tabs),
 # and automation tooling spawns headless instances with their own profiles —
 # both must never receive the keystrokes.
+$browserProcs = Get-Process -ErrorAction SilentlyContinue |
+  Where-Object { $browsers -contains $_.ProcessName.ToLower() }
+if ($browserProcs.Count -eq 0) { exit 1 }   # nothing running — fresh spawn is safe
+
 $realWindows = @{}   # hwnd -> process name
-foreach ($p in Get-Process -ErrorAction SilentlyContinue | Where-Object { $browsers -contains $_.ProcessName.ToLower() }) {
+foreach ($p in $browserProcs) {
   $hw = $p.MainWindowHandle
   if ($hw -eq 0) { continue }
   $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue).CommandLine
@@ -128,7 +135,7 @@ foreach ($p in Get-Process -ErrorAction SilentlyContinue | Where-Object { $brows
   }
   $realWindows[$hw] = $p.ProcessName.ToLower()
 }
-if ($realWindows.Count -eq 0) { exit 1 }
+if ($realWindows.Count -eq 0) { exit 3 }   # running, but only tooling/windowless instances
 
 $GW_HWNDNEXT = 2
 $target = [IntPtr]::Zero
@@ -149,7 +156,7 @@ while ($h -ne [IntPtr]::Zero) {
   $h = [FocusExtNative]::GetWindow($h, $GW_HWNDNEXT)
 }
 if ($target -eq [IntPtr]::Zero) { $target = $fallback; $targetProc = $fallbackProc }
-if ($target -eq [IntPtr]::Zero) { exit 1 }
+if ($target -eq [IntPtr]::Zero) { exit 3 }
 
 $url = if ($targetProc -eq 'msedge') { 'edge://extensions' } else { 'chrome://extensions' }
 
@@ -164,35 +171,47 @@ $tpid = 0
 $curTid = [FocusExtNative]::GetCurrentThreadId()
 [FocusExtNative]::AttachThreadInput($curTid, $tpid, $true) | Out-Null
 try {
-  [FocusExtNative]::SetForegroundWindow($target) | Out-Null
-  Start-Sleep -Milliseconds 500
+  # Win focus is contested by the app the user is clicking in — retry a few
+  # times, and only then accept any other real window of the same browser
+  # family as the recipient. Bailing out here would send the caller down the
+  # spawn path, which turns into a stray new-tab page in a running browser.
+  $focused = $false
+  for ($i = 0; $i -lt 3 -and -not $focused; $i++) {
+    [FocusExtNative]::SetForegroundWindow($target) | Out-Null
+    Start-Sleep -Milliseconds 400
+    if ([FocusExtNative]::GetForegroundWindow() -eq $target) { $focused = $true }
+  }
+  if (-not $focused) {
+    $fg = [FocusExtNative]::GetForegroundWindow()
+    if (-not $realWindows.ContainsKey($fg)) { exit 3 }
+    $target = $fg   # keystrokes land in another window of the same browser — fine
+  }
+
+  # Preserve whatever the user had on the clipboard — the paste clobbers it.
+  $clipSaved = $null
+  $clipHadText = $false
+  try {
+    if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+      $clipSaved = [System.Windows.Forms.Clipboard]::GetText()
+      $clipHadText = $true
+    }
+  } catch { }
+
+  try {
+    [System.Windows.Forms.SendKeys]::SendWait("^l")          # focus omnibox
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.Clipboard]::SetText($url)
+    Start-Sleep -Milliseconds 150
+    [System.Windows.Forms.SendKeys]::SendWait("^v")          # paste URL
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+  } finally {
+    if ($clipHadText) {
+      try { [System.Windows.Forms.Clipboard]::SetText($clipSaved) } catch { }
+    }
+  }
 } finally {
   [FocusExtNative]::AttachThreadInput($curTid, $tpid, $false) | Out-Null
-}
-if ([FocusExtNative]::GetForegroundWindow() -ne $target) { exit 1 }
-
-# Preserve whatever the user had on the clipboard — the paste clobbers it.
-$clipSaved = $null
-$clipHadText = $false
-try {
-  if ([System.Windows.Forms.Clipboard]::ContainsText()) {
-    $clipSaved = [System.Windows.Forms.Clipboard]::GetText()
-    $clipHadText = $true
-  }
-} catch { }
-
-try {
-  [System.Windows.Forms.SendKeys]::SendWait("^l")          # focus omnibox
-  Start-Sleep -Milliseconds 300
-  [System.Windows.Forms.Clipboard]::SetText($url)
-  Start-Sleep -Milliseconds 150
-  [System.Windows.Forms.SendKeys]::SendWait("^v")          # paste URL
-  Start-Sleep -Milliseconds 300
-  [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-} finally {
-  if ($clipHadText) {
-    try { [System.Windows.Forms.Clipboard]::SetText($clipSaved) } catch { }
-  }
 }
 
 Write-Output $targetProc

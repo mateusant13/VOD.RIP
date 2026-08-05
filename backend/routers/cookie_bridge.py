@@ -266,58 +266,72 @@ def _activate_extension_tab() -> Optional[tuple[str, str]]:
 
     Runs scripts/focus_extension_tab.ps1, which first reuses an already-open
     extensions tab (UIA TabItem select + window raise — no CDP), and if none
-    is open, drives a new tab by keystroke (Ctrl+L -> paste -> Enter) into
-    the topmost running browser window. The keystroke path exists because a
-    running Chrome silently drops chrome:// URLs handed off through its
-    process singleton (http(s) forward fine, chrome:// die), so launching
+    is open, drives the active tab by keystroke (Ctrl+L -> paste -> Enter)
+    into the topmost running browser window. The keystroke path exists
+    because a running Chrome silently drops chrome:// URLs handed off through
+    its process singleton (http(s) forward fine, chrome:// die), so spawning
     chrome.exe with the URL only works when no browser is running yet.
 
-    Returns ("reused", None) when an existing tab was focused, or
-    (browser_name, url) when a new tab was driven; None when no browser
-    window exists (caller should spawn a fresh browser instance).
+    Returns ("reused", None) when an existing tab was focused,
+    (browser_name, url) when a tab was driven, ("none", None) when no browser
+    is running at all (caller may spawn a fresh instance), or ("blocked",
+    None) when a browser is running but its window could not be driven —
+    spawning into a running browser would only produce a stray new-tab page,
+    never the URL.
     """
     script = Path(__file__).resolve().parent.parent / "scripts" / "focus_extension_tab.ps1"
     if not script.is_file():
         return None
-    try:
-        proc = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-            ],
-            capture_output=True,
-            timeout=25,
-        )
-        if proc.returncode == 0:
-            return ("reused", None)
-        if proc.returncode == 2:
-            browser = (proc.stdout or b"").decode("utf-8", "replace").strip().lower()
-            url = _EXT_MANAGER_URLS.get(browser)
-            if url:
-                return (browser, url)
-            return None
-        return None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    for attempt in range(2):  # one retry: the first drive may lose a focus race
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                ],
+                capture_output=True,
+                timeout=25,
+            )
+            if proc.returncode == 0:
+                return ("reused", None)
+            if proc.returncode == 2:
+                browser = (proc.stdout or b"").decode("utf-8", "replace").strip().lower()
+                url = _EXT_MANAGER_URLS.get(browser)
+                if url:
+                    return (browser, url)
+                return ("blocked", None)
+            if proc.returncode == 1:
+                return ("none", None)
+            # returncode 3 (or anything else): browser runs but unusable
+            if attempt == 0 and proc.returncode == 3:
+                continue
+            return ("blocked", None)
+        except (OSError, subprocess.SubprocessError):
+            return ("blocked", None)
+    return ("blocked", None)
 
 
 def _open_extension_manager() -> dict:
     """Activate the extensions-manager tab: reuse an already-open one, else
-    drive a new tab into a running browser, else launch a fresh browser
-    instance with the URL."""
+    drive the active tab of a running browser, else launch a fresh browser
+    instance with the URL (safe only when no browser is running — a running
+    instance drops the chrome:// URL and leaves a stray new-tab page)."""
     activated = _activate_extension_tab()
     if activated:
-        if activated[0] == "reused":
+        outcome, payload = activated
+        if outcome == "reused":
             return {"launched": True, "browser": None, "url": None, "reused": True}
-        browser, url = activated
-        return {"launched": True, "browser": browser, "url": url, "reused": False}
-    # No browser window is running (or the drive failed) — spawning chrome.exe
-    # with the URL works here because a fresh instance opens it directly.
+        if outcome == "blocked":
+            return {"launched": False, "browser": None, "url": None, "reused": False}
+        if outcome != "none":  # (browser, url): the active tab was driven
+            return {"launched": True, "browser": outcome, "url": payload, "reused": False}
+    # outcome "none" or a missing script: no browser process at all — spawning
+    # chrome.exe with the URL works because a fresh instance opens it directly.
     for name, url in _EXT_MANAGER_URLS.items():
         path = _find_browser(name)
         if not path:
