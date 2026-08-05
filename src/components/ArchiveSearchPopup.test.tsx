@@ -269,19 +269,19 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('semantic=');
 
-    const toggle = screen.getByRole('button', { name: 'SEMANTIC' });
+    const toggle = screen.getByRole('button', { name: 'CONTEXT' });
     expect(toggle).not.toBeDisabled();
     fireEvent.click(toggle);
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1')).toBeTruthy());
 
     // Concept search covers transcripts only — CHAT disables the toggle.
     fireEvent.click(screen.getByRole('button', { name: 'CHAT' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'SEMANTIC' })).toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled());
     expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).not.toContain('semantic=');
 
     // Back to a transcript-capable source re-enables it (state preserved).
     fireEvent.click(screen.getByRole('button', { name: 'STREAMER' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'SEMANTIC' })).not.toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript&semantic=1')).toBeTruthy(),
     );

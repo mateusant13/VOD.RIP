@@ -806,8 +806,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
               onClick={() => setSemanticOn((v) => !v)}
               title={
                 sourceFilter === 'chat'
-                  ? 'Concept search covers transcripts only'
-                  : 'Concept search: finds moments by meaning, not just words (first use downloads the embed model)'
+                  ? 'Context search covers transcripts only'
+                  : 'Context search (semantic): finds moments by meaning, not just exact words — first use downloads the embed model'
               }
               className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
                 semanticOn
@@ -815,7 +815,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
               }`}
             >
-              SEMANTIC
+              CONTEXT
             </button>
             {langsPresent.size >= 2 && (
               <div className="flex gap-1 flex-wrap">
@@ -960,7 +960,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   )}
                   {hit.semantic && (
                     <span className="text-[8px] font-mono uppercase tracking-widest border border-cyan-700 text-cyan-400 px-1 py-px shrink-0">
-                      SEM
+                      CTX
                     </span>
                   )}
                   <span className={`text-[9px] font-mono uppercase tracking-widest shrink-0 ${platformAccent[hit.platform] ?? 'text-zinc-400'}`}>

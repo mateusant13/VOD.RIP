@@ -2626,9 +2626,12 @@ export default function App() {
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== pointerId) return;
       const sec = xToSec(ev.clientX);
+      // seek: the needle is the playhead while dragging — scrub in BOTH
+      // directions (clamp-only used to move the video only when the playhead
+      // fell outside the new range, i.e. one direction).
       const applied = which === 'in'
-        ? commitPreviewTrimRange(sec, fixedEnd, { move: 'in', fixedEnd })
-        : commitPreviewTrimRange(fixedStart, sec, { move: 'out', fixedStart });
+        ? commitPreviewTrimRange(sec, fixedEnd, { move: 'in', fixedEnd, seek: 'in' })
+        : commitPreviewTrimRange(fixedStart, sec, { move: 'out', fixedStart, seek: 'out' });
       const activeSec = which === 'in' ? applied.start : applied.end;
       updateNeedleGlance(
         which,

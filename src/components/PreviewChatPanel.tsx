@@ -42,12 +42,26 @@ export interface PreviewPanelChatRow {
   /** Platform-provided username color (#RRGGBB); null = palette fallback. */
   color?: string | null;
 }
+/** PANNs acoustic detection (LAUGH, CLAP, ...) with real boundaries. */
+export interface PreviewPanelEventRow {
+  offset_sec: number;
+  end_sec: number;
+  event: string;
+  score: number;
+}
 export interface PreviewPanelPayload {
   transcript: PreviewPanelTranscriptRow[];
   chat: PreviewPanelChatRow[];
+  events: PreviewPanelEventRow[];
   has_transcript: boolean;
   has_chat: boolean;
 }
+
+/** One row of the Transcript-tab timeline: a transcript segment or an
+ *  acoustic event, merged chronologically by offset_sec. */
+type TimelineRow =
+  | ({ kind: 'transcript' } & PreviewPanelTranscriptRow)
+  | ({ kind: 'event' } & PreviewPanelEventRow);
 
 export type PreviewPanelTab = 'chat' | 'transcript' | 'subtitles';
 
@@ -63,6 +77,7 @@ const TRANSCRIPT_ROW_H = 22;
 const WINDOW = 150;
 const EMPTY_TRANSCRIPT: PreviewPanelTranscriptRow[] = [];
 const EMPTY_CHAT: PreviewPanelChatRow[] = [];
+const EMPTY_EVENTS: PreviewPanelEventRow[] = [];
 
 interface PreviewChatPanelProps {
   platform: string | null;
@@ -160,6 +175,47 @@ const TranscriptRow = memo(function TranscriptRow({
   );
 });
 
+/** Acoustic-event row: amber LABEL + duration, interleaved with transcript
+ *  segments by offset_sec; tooltip carries the exact range + confidence. */
+const EventRow = memo(function EventRow({
+  row,
+  active,
+  ref,
+}: {
+  row: PreviewPanelEventRow;
+  active: boolean;
+  ref?: React.Ref<HTMLDivElement>;
+}) {
+  const durSec = Math.max(0, row.end_sec - row.offset_sec);
+  return (
+    <div
+      ref={ref}
+      data-panel-row
+      data-event-row={row.event}
+      aria-current={active ? 'true' : undefined}
+      style={{ height: TRANSCRIPT_ROW_H }}
+      title={`${row.event} — ${formatArchiveOffset(row.offset_sec)} to ${formatArchiveOffset(row.end_sec)} (${durSec.toFixed(1)}s, confidence ${(row.score * 100).toFixed(0)}%)`}
+      className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
+        active
+          ? 'bg-amber-300/15 border-amber-300 text-amber-200'
+          : 'border-transparent text-amber-300/70'
+      }`}
+    >
+      <span className="text-zinc-600 font-mono text-[9px] shrink-0">
+        {formatArchiveOffset(row.offset_sec)}
+      </span>
+      <span className="font-bold text-[9px] uppercase tracking-widest shrink-0">
+        {row.event}
+      </span>
+      <span className="text-[9px] font-mono text-zinc-500 shrink-0">({durSec.toFixed(1)}s)</span>
+      <span className="flex-1" />
+      <span className="text-[8px] font-mono text-zinc-600 shrink-0">
+        {(row.score * 100).toFixed(0)}%
+      </span>
+    </div>
+  );
+});
+
 function EmptyState({ text }: { text: string }) {
   return (
     <div className="flex-1 min-h-0 flex items-center justify-center px-4" data-panel-empty>
@@ -249,6 +305,21 @@ export function PreviewChatPanel({
   const chatRows = useMemo(() => payload?.chat ?? EMPTY_CHAT, [payload]);
   const transcriptRows = useMemo(() => payload?.transcript ?? EMPTY_TRANSCRIPT, [payload]);
   const chatOffsets = useMemo(() => chatRows.map((r) => r.offset_sec), [chatRows]);
+  // Transcript-tab timeline: transcript segments + acoustic events merged in
+  // chronological order (ties put the segment first — an event usually starts
+  // at a segment boundary). Raw transcriptRows/offsets stay separate for the
+  // Subtitles tab, which must index into segments only.
+  const timelineRows = useMemo(() => {
+    const rows: TimelineRow[] = transcriptRows.map((r) => ({ kind: 'transcript', ...r }));
+    for (const e of payload?.events ?? EMPTY_EVENTS) {
+      rows.push({ kind: 'event', ...e });
+    }
+    rows.sort(
+      (a, b) => a.offset_sec - b.offset_sec || (a.kind === 'transcript' ? -1 : 1),
+    );
+    return rows;
+  }, [transcriptRows, payload]);
+  const timelineOffsets = useMemo(() => timelineRows.map((r) => r.offset_sec), [timelineRows]);
   const transcriptOffsets = useMemo(
     () => transcriptRows.map((r) => r.offset_sec),
     [transcriptRows],
@@ -257,14 +328,18 @@ export function PreviewChatPanel({
     () => activePanelRowIndex(chatOffsets, currentTime),
     [chatOffsets, currentTime],
   );
+  const activeTimelineIdx = useMemo(
+    () => activePanelRowIndex(timelineOffsets, currentTime),
+    [timelineOffsets, currentTime],
+  );
   const activeTranscriptIdx = useMemo(
     () => activePanelRowIndex(transcriptOffsets, currentTime),
     [transcriptOffsets, currentTime],
   );
 
-  const list = tab === 'chat' ? chatRows : transcriptRows;
+  const list = tab === 'chat' ? chatRows : timelineRows;
   const rowH = tab === 'chat' ? CHAT_ROW_H : TRANSCRIPT_ROW_H;
-  const activeIdx = tab === 'chat' ? activeChatIdx : activeTranscriptIdx;
+  const activeIdx = tab === 'chat' ? activeChatIdx : activeTimelineIdx;
   activeIdxRef.current = activeIdx;
   rowHRef.current = rowH;
 
@@ -492,7 +567,7 @@ export function PreviewChatPanel({
               data-panel-rows
             >
               {tab === 'chat' && !payload.has_chat && <EmptyState text="No archived chat for this video." />}
-              {tab === 'transcript' && !payload.has_transcript && (
+              {tab === 'transcript' && !payload.has_transcript && timelineRows.length === 0 && (
                 <EmptyState text="No transcript for this video." />
               )}
               {list.length > 0 && (
@@ -501,18 +576,29 @@ export function PreviewChatPanel({
                   {slice.map((row, i) => {
                     const idx = windowStart + i;
                     const active = idx === activeIdx;
-                    return tab === 'chat' ? (
-                      <ChatRow
-                        key={idx}
-                        row={row as PreviewPanelChatRow}
+                    if (tab === 'chat') {
+                      return (
+                        <ChatRow
+                          key={`c${idx}`}
+                          row={row as PreviewPanelChatRow}
+                          active={active}
+                          platform={platform}
+                          ref={active ? activeRowRef : undefined}
+                        />
+                      );
+                    }
+                    const tl = row as TimelineRow;
+                    return tl.kind === 'event' ? (
+                      <EventRow
+                        key={`e${idx}`}
+                        row={tl}
                         active={active}
-                        platform={platform}
                         ref={active ? activeRowRef : undefined}
                       />
                     ) : (
                       <TranscriptRow
-                        key={idx}
-                        row={row as PreviewPanelTranscriptRow}
+                        key={`t${idx}`}
+                        row={tl}
                         active={active}
                         ref={active ? activeRowRef : undefined}
                       />

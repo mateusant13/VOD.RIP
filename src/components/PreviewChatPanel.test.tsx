@@ -16,6 +16,10 @@ const PAYLOAD: PreviewPanelPayload = {
     { offset_sec: 8, text: 'hi', username: 'carol', spam_count: 1 },
     { offset_sec: 20, text: 'pog', username: 'dave', spam_count: 1 },
   ],
+  events: [
+    { offset_sec: 3, end_sec: 3.6, event: 'Laughter', score: 0.93 },
+    { offset_sec: 12.5, end_sec: 13.2, event: 'Clapping', score: 0.81 },
+  ],
   has_transcript: true,
   has_chat: true,
 };
@@ -23,6 +27,7 @@ const PAYLOAD: PreviewPanelPayload = {
 const EMPTY_PAYLOAD: PreviewPanelPayload = {
   transcript: [],
   chat: [],
+  events: [],
   has_transcript: false,
   has_chat: false,
 };
@@ -128,6 +133,35 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('hello world');
     });
+  });
+
+  it('interleaves acoustic events into the transcript timeline in offset order', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    await waitFor(() => {
+      // Events must sit between the transcript segments at their offsets:
+      // Laughter@3 between hello world@0 and second line@5; Clapping@12.5
+      // between third line@10 and fourth line@15 (NOT appended at the end).
+      const rows = Array.from(document.querySelectorAll('[data-panel-row]')).map(
+        (el) => el.textContent ?? '',
+      );
+      expect(rows[0]).toContain('hello world');
+      expect(rows[1]).toContain('Laughter');
+      expect(rows[2]).toContain('second line');
+      expect(rows[3]).toContain('third line');
+      expect(rows[4]).toContain('Clapping');
+      expect(rows[5]).toContain('fourth line');
+    });
+
+    // Tooltip carries the exact range + confidence.
+    const laugh = document.querySelector('[data-event-row="Laughter"]') as HTMLElement;
+    expect(laugh).toBeTruthy();
+    expect(laugh.title).toContain('93%');
+    expect(laugh.title).toContain('0.6s');
+    expect(laugh.textContent).toContain('(0.6s)');
   });
 
   it('empty payload shows per-tab empty states without breaking siblings', async () => {

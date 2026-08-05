@@ -37,6 +37,7 @@ from services.archive_events import (  # noqa: E402
     extract_events,
     merge_events,
     event_classes,
+    events_enabled,
     detect_events_video,
 )
 
@@ -124,6 +125,27 @@ def test_event_classes_env_and_intersection() -> None:
             os.environ.pop("VODRIP_EVENTS_CLASSES", None)
         else:
             os.environ["VODRIP_EVENTS_CLASSES"] = saved
+
+
+def test_events_enabled_defaults_on() -> None:
+    """Events auto-run after transcription by default (laugh/scream stage is
+    part of a normal transcribe job); only an explicit VODRIP_EVENTS_ENABLED=0
+    opts out."""
+    saved = os.environ.get("VODRIP_EVENTS_ENABLED")
+    try:
+        os.environ.pop("VODRIP_EVENTS_ENABLED", None)
+        assert events_enabled() is True, "unset var must default to enabled"
+        os.environ["VODRIP_EVENTS_ENABLED"] = "0"
+        assert events_enabled() is False
+        os.environ["VODRIP_EVENTS_ENABLED"] = "off"
+        assert events_enabled() is False
+        os.environ["VODRIP_EVENTS_ENABLED"] = "1"
+        assert events_enabled() is True
+    finally:
+        if saved is None:
+            os.environ.pop("VODRIP_EVENTS_ENABLED", None)
+        else:
+            os.environ["VODRIP_EVENTS_ENABLED"] = saved
 
 
 # --- DB helpers -----------------------------------------------------------

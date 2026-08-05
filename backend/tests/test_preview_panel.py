@@ -106,11 +106,14 @@ async def test_panel_transcript_video_strict_shape_and_order():
     # default only over HTTP (covered by test_panel_http_surface).
     payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT)
     assert set(payload.keys()) == {
-        "transcript", "chat", "has_transcript", "has_chat",
+        "transcript", "chat", "events", "has_transcript", "has_chat",
     }
     assert payload["has_transcript"] is True
     assert payload["has_chat"] is True
     assert len(payload["transcript"]) > 1000
+    assert set(payload["events"][0].keys()) == {
+        "offset_sec", "end_sec", "event", "score",
+    } if payload["events"] else True
     for row in payload["transcript"]:
         assert set(row.keys()) == {"offset_sec", "text"}
         assert isinstance(row["offset_sec"], float)
@@ -142,11 +145,34 @@ async def test_panel_limit_and_unknown_platform():
     assert exc.value.status_code == 400
 
 
+async def test_panel_events_mapping_and_order():
+    """audio_events rows surface as {offset_sec, end_sec, event, score},
+    time-ordered — the UI merges them into the transcript timeline."""
+    p, vid = CHAT_ONLY_VIDEO
+    archive_db.insert_audio_events(p, vid, [
+        {"start_sec": 10.0, "end_sec": 10.9, "event": "Laughter", "score": 0.93},
+        {"start_sec": 2.0, "end_sec": 2.4, "event": "Clapping", "score": 0.71},
+        {"start_sec": 42.0, "end_sec": 42.3, "event": "Shout", "score": 0.88},
+    ])
+    try:
+        payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT)
+        events = payload["events"]
+        assert [e["event"] for e in events] == ["Clapping", "Laughter", "Shout"], (
+            "events must come back in start_sec order"
+        )
+        assert events[0] == {"offset_sec": 2.0, "end_sec": 2.4,
+                             "event": "Clapping", "score": 0.71}
+        assert events[1]["offset_sec"] == 10.0 and events[1]["end_sec"] == 10.9
+    finally:
+        archive_db.delete_audio_events(p, vid)
+
+
 async def test_panel_missing_video_empty_state():
     payload = await preview_panel("twitch", "0000000000", limit=_PANEL_LIMIT_DEFAULT)
     assert payload == {
         "transcript": [],
         "chat": [],
+        "events": [],
         "has_transcript": False,
         "has_chat": False,
     }
@@ -166,7 +192,7 @@ async def test_panel_http_surface():
         assert resp.status_code == 200
         body = resp.json()
         assert set(body.keys()) == {
-            "transcript", "chat", "has_transcript", "has_chat",
+            "transcript", "chat", "events", "has_transcript", "has_chat",
         }
         assert body["has_chat"] is True and body["has_transcript"] is False
         assert len(body["chat"]) == 5

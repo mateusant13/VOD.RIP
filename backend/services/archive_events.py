@@ -17,9 +17,9 @@ Design notes:
     0.385.pth under ~/panns_data); panns_inference is imported lazily on
     first use, so a worker with events disabled never pays its import cost.
 
-Env knobs (all optional, VODRIP_WHISPER_* style):
-  VODRIP_EVENTS_ENABLED     0|1   auto-run after each transcribe job (default 0)
-  VODRIP_EVENTS_THRESHOLD        frame-probability threshold (default 0.5)
+  Env knobs (all optional, VODRIP_WHISPER_* style):
+  VODRIP_EVENTS_ENABLED     0|1   auto-run after each transcribe job (default 1)
+  VODRIP_EVENTS_THRESHOLD        frame-probability threshold (default 0.35)
   VODRIP_EVENTS_MIN_SEC          minimum event duration (default 0.4)
   VODRIP_EVENTS_WINDOW_SEC       SED window length (default 30)
   VODRIP_EVENTS_DEVICE           cuda|cpu (default: cuda when available)
@@ -52,7 +52,11 @@ DEVICE_ENV = "VODRIP_EVENTS_DEVICE"
 CLASSES_ENV = "VODRIP_EVENTS_CLASSES"
 CHECKPOINT_ENV = "VODRIP_EVENTS_CHECKPOINT"
 
-DEFAULT_THRESHOLD = 0.5
+# 0.5 dropped every real event on music-heavy stream VODs (measured: genuine
+# laughter scores 0.4-0.53 under background music; Speech/Music dominate at
+# 0.84-0.87 but are outside the interest set). 0.35 surfaces those runs while
+# staying above the 0.28-0.36 noise floor.
+DEFAULT_THRESHOLD = 0.35
 DEFAULT_MIN_SEC = 0.4
 DEFAULT_WINDOW_SEC = 30.0
 
@@ -91,8 +95,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 def events_enabled() -> bool:
-    """True when events auto-run after each transcribe job."""
-    return os.environ.get(ENABLED_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    """True when events auto-run after each transcribe job (default ON).
+
+    VODRIP_EVENTS_ENABLED=0 opts out (tests/constrained boxes); any other
+    value or an unset var means enabled — the laughs/screams stage is part
+    of a normal transcription now, not an opt-in extra."""
+    return os.environ.get(ENABLED_ENV, "").strip().lower() not in ("0", "false", "no", "off")
+
 
 
 def event_classes(available: Optional[list[str]] = None) -> list[str]:
@@ -128,6 +137,42 @@ def _checkpoint_path() -> str:
 
 # --- model ---------------------------------------------------------------
 
+def _ensure_checkpoint() -> str:
+    """Checkpoint path, downloading it on first use (Zenodo record 3987831).
+
+    ~300 MB one-time cost per machine; cached next to the model. A failed
+    download raises FileNotFoundError with the manual path — the events
+    stage is best-effort, so a transcribe job still completes without it."""
+    ckpt = _checkpoint_path()
+    if Path(ckpt).is_file():
+        return ckpt
+    url = ("https://zenodo.org/record/3987831/files/"
+           "Cnn14_DecisionLevelMax_mAP=0.385.pth")
+    logger.warning("PANNs checkpoint missing — downloading %s (%.0f MB) -> %s",
+                   url, 300, ckpt)
+    part = str(ckpt) + ".part"
+    try:
+        import shutil
+        import urllib.request
+
+        Path(ckpt).parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=60) as resp, open(part, "wb") as f:
+            shutil.copyfileobj(resp, f, length=1024 * 256)
+        os.replace(part, ckpt)
+    except Exception as exc:
+        try:
+            Path(part).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise FileNotFoundError(
+            f"PANNs checkpoint download failed: {exc} — place "
+            "Cnn14_DecisionLevelMax_mAP=0.385.pth into ~/panns_data "
+            "(zenodo record 3987831)"
+        )
+    logger.info("PANNs checkpoint downloaded to %s", ckpt)
+    return ckpt
+
+
 def _sed_model() -> Any:
     """Lazy singleton SoundEventDetection (heavy imports stay out of module load)."""
     global _sed
@@ -137,12 +182,7 @@ def _sed_model() -> Any:
         _os.environ.setdefault("MPLBACKEND", "Agg")  # panns imports matplotlib
         from panns_inference import SoundEventDetection
 
-        ckpt = _checkpoint_path()
-        if not Path(ckpt).is_file():
-            raise FileNotFoundError(
-                f"PANNs checkpoint missing: {ckpt} — download Cnn14_DecisionLevelMax_"
-                "mAP=0.385.pth into ~/panns_data (zenodo record 3987831)"
-            )
+        ckpt = _ensure_checkpoint()
         t0 = time.monotonic()
         _sed = SoundEventDetection(checkpoint_path=ckpt, device=_effective_device())
         logger.info("PANNs SED loaded from %s in %.1fs (device=%s)",

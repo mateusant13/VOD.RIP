@@ -89,6 +89,7 @@ def _detect_device() -> tuple[str, str]:
 
 
 _device_override: Optional[tuple[str, str]] = None  # set after a CUDA failure
+_model_device: Optional[str] = None  # device of the loaded _model (drives override reloads)
 
 
 def _effective_device() -> tuple[str, str]:
@@ -302,10 +303,14 @@ def _get_model() -> Any:
     Re-loads if VODRIP_WHISPER_MODEL changed since last load. Not thread-safe
     for *concurrent* transcribe() calls — callers serialize via _infer_lock.
     """
-    global _model, _model_name, _model_last_used, _device_override
+    global _model, _model_name, _model_last_used, _device_override, _model_device
     name = model_name()
     with _model_lock:
-        if _model is not None and _model_name == name:
+        if (
+            _model is not None
+            and _model_name == name
+            and _model_device == _effective_device()[0]
+        ):
             _model_last_used = time.monotonic()
             return _model
         _close_model_unlocked()  # different model env -> drop the old one first
@@ -341,6 +346,7 @@ def _get_model() -> Any:
             else:
                 raise
         _model_name = name
+        _model_device = device
         _model_last_used = time.monotonic()
         logger.info("Whisper model %r loaded in %.1fs", name, time.monotonic() - t0)
         return _model
@@ -348,9 +354,10 @@ def _get_model() -> Any:
 
 def _close_model_unlocked() -> None:
     """Drop the cached model — caller MUST hold _model_lock."""
-    global _model, _model_name
+    global _model, _model_name, _model_device
     model, _model = _model, None
     _model_name = None
+    _model_device = None
     if model is not None:
         logger.info("Unloading whisper model")
         del model
@@ -1070,12 +1077,20 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     return _vad_regions(probs, len(audio))
 
 
+_MAX_CHUNK_SEC = 30.0  # faster-whisper mel window — longer clips get truncated
+
+
 def _plan_chunks(
     speech: list[tuple[float, float]],
     merge_gap: float = 0.8,
     min_len: float = 0.25,
 ) -> list[tuple[float, float]]:
     """Merge nearby speech regions into transcribe chunks; drop sub-minimum ones.
+
+    Chunks are capped at _MAX_CHUNK_SEC: faster-whisper's batched pipeline
+    trims every clip's mel features to 30 s (pad_or_trim to 3000 frames), so
+    an uncapped continuous-speech run would silently transcribe ONLY its
+    first 30 s ("Segment N is longer than 30 seconds" warning).
 
     Deterministic — resume relies on identical chunks across runs.
     """
@@ -1087,12 +1102,24 @@ def _plan_chunks(
         elif s - cur_e <= merge_gap:
             cur_e = max(cur_e, e)
         else:
-            if cur_e - cur_s >= min_len:
-                chunks.append((cur_s, cur_e))
+            _close_chunk(chunks, cur_s, cur_e, min_len)
             cur_s, cur_e = s, e
-    if cur_s is not None and cur_e - cur_s >= min_len:
-        chunks.append((cur_s, cur_e))
+        while cur_e - cur_s > _MAX_CHUNK_SEC:
+            _close_chunk(chunks, cur_s, cur_s + _MAX_CHUNK_SEC, min_len)
+            cur_s = cur_s + _MAX_CHUNK_SEC
+    if cur_s is not None:
+        _close_chunk(chunks, cur_s, cur_e, min_len)
     return chunks
+
+
+def _close_chunk(
+    chunks: list[tuple[float, float]],
+    s: float,
+    e: float,
+    min_len: float,
+) -> None:
+    if e - s >= min_len:
+        chunks.append((s, e))
 
 
 # --- resume manifest (JSONL) ----------------------------------------------
@@ -1863,6 +1890,12 @@ assert _plan_chunks([]) == [], "empty VAD output must plan no chunks"
 assert _plan_chunks([(0.0, 5.0), (10.0, 15.0)]) == [(0.0, 5.0), (10.0, 15.0)], (
     "wide gaps must stay separate chunks"
 )
+assert _plan_chunks([(0.0, 95.0)]) == [
+    (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
+], "chunks must be capped at the 30 s whisper window (uncapped clips truncate)"
+assert _plan_chunks([(0.0, 25.0), (25.4, 70.0)]) == [
+    (0.0, 30.0), (30.0, 60.0), (60.0, 70.0),
+], "cap must apply across merged regions"
 # sharded decode: cross-shard merge + shard sample contiguity (VAD regions
 # are per-shard with overlap; the merge gap stays below _plan_chunks' so the
 # final chunk plan matches the full-array path).

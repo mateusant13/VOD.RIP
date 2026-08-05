@@ -40,6 +40,9 @@ _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardtest-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
 os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
 os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
+# Events are default-on now; this test exercises sharding, not the PANNs
+# stage (the fake-SED comparisons at the bottom pin the shard-fed path).
+os.environ["VODRIP_EVENTS_ENABLED"] = "0"
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 

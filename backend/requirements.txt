@@ -27,3 +27,7 @@ torch==2.7.0
 torchaudio==2.7.0
 nvidia-cublas-cu12
 nvidia-cuda-runtime-cu12
+# Acoustic-event stage (services/archive_events.py) — PANNs Cnn14 SED over
+# AudioSet 527 classes (laugh/clap/scream/music...). Checkpoint downloads
+# itself on first use (zenodo record 3987831).
+panns-inference>=0.1.1

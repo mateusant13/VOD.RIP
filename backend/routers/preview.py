@@ -172,13 +172,17 @@ async def preview_panel(
     video_id: str,
     limit: int = Query(_PANEL_LIMIT_DEFAULT, ge=1, le=_PANEL_LIMIT_MAX),
 ):
-    """Time-ordered transcript + chat rows for one archived video.
+    """Time-ordered transcript + chat + acoustic-event rows for one archived
+    video.
 
     Strict response shape:
       {transcript: [{offset_sec, text}], chat: [{offset_sec, text, username,
-       spam_count}], has_transcript: bool, has_chat: bool}
-    The flags mirror the preview-session capability flags so the UI can show
-    empty states without loading the full payload first."""
+       spam_count}], events: [{offset_sec, end_sec, event, score}],
+       has_transcript: bool, has_chat: bool}
+    events are PANNs acoustic detections (LAUGH, CLAP, ...) with real
+    boundaries; the UI merges them into the transcript timeline by
+    offset_sec. The flags mirror the preview-session capability flags so the
+    UI can show empty states without loading the full payload first."""
     p = (platform or "").strip().lower()
     if p not in archive_db.PLATFORMS:
         raise HTTPException(status_code=400, detail="Unknown platform")
@@ -197,6 +201,15 @@ async def preview_panel(
     return {
         "transcript": archive_db.transcript_offsets(p, video_id, limit),
         "chat": archive_db.chat_for(p, video_id, limit),
+        "events": [
+            {
+                "offset_sec": r["start_sec"],
+                "end_sec": r["end_sec"],
+                "event": r["event"],
+                "score": r["score"],
+            }
+            for r in archive_db.audio_events_for(p, video_id)
+        ],
         "has_transcript": archive_db.has_transcript(p, video_id),
         "has_chat": archive_db.has_chat(p, video_id),
     }

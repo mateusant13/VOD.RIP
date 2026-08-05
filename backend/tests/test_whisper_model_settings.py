@@ -149,6 +149,29 @@ def test_transcribe_load_passes_resolved_id_and_cache(monkeypatch, tmp_path):
     assert kwargs.get("download_root") == str(cache)
 
 
+def test_get_model_reloads_when_device_override_flips(monkeypatch):
+    """After a CUDA OOM the override flips to CPU — the cached CUDA model is
+    broken, so _get_model must reload instead of returning it (it previously
+    compared only the model name, so the retry re-ran on the corrupted
+    context: cudaErrorInvalidDevice)."""
+    archive_transcribe._model = object()
+    archive_transcribe._model_name = "large-v3-turbo"
+    archive_transcribe._model_device = "cuda"
+    archive_transcribe._device_override = None
+    monkeypatch.setattr(archive_transcribe, "model_name", lambda: "large-v3-turbo")
+    monkeypatch.setattr(archive_transcribe, "_effective_device", lambda: ("cpu", "int8"))
+    try:
+        with patch("faster_whisper.WhisperModel") as WM:
+            archive_transcribe._get_model()
+        assert WM.call_count == 1, "override flip must trigger a reload"
+        assert WM.call_args.kwargs["device"] == "cpu"
+        assert archive_transcribe._model_device == "cpu"
+    finally:
+        archive_transcribe._model = None
+        archive_transcribe._model_name = None
+        archive_transcribe._model_device = None
+
+
 # --- pruning (disk_hygiene) -------------------------------------------------
 
 def _mk_model(cache: Path, name: str, size: int) -> None:
