@@ -72,7 +72,7 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
-import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
+import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
 import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
@@ -410,6 +410,10 @@ export default function App() {
   const [previewMetaDurationSec, setPreviewMetaDurationSec] = useState(0);
   const [trimEndSec, setTrimEndSec] = useState(3600);
   const [trimPanelHeight, setTrimPanelHeight] = useState(0);
+  /** Wheel zoom for the preview trim rail — 1 = full duration visible. */
+  const [previewTrimZoom, setPreviewTrimZoom] = useState(1);
+  /** Window centre as a fraction (0..1) of the full duration. */
+  const [previewTrimAnchorFrac, setPreviewTrimAnchorFrac] = useState(0.5);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewSessionId, setPreviewSessionId] = useState<string | null>(null);
   const [previewPlayback, setPreviewPlayback] = useState<{
@@ -575,6 +579,11 @@ export default function App() {
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
+  /** URL for which the user manually picked a download quality. When a
+   *  re-extract/refresh runs for the SAME url, the auto-set to the best
+   *  available tier must NOT clobber that pick (fixes downloads silently
+   *  switching quality after the user chose it in the VOD trim panel). */
+  const qualityUserTouchedUrlRef = useRef<string | null>(null);
   const trimPanelResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const previewOpenRef = useRef(false);
   /** True while dragging URL trim sliders or preview in/out needles. */
@@ -2598,6 +2607,8 @@ export default function App() {
     const fixedEnd = previewTrimEndRef.current;
     const dragOrigin = which === 'in' ? fixedStart : fixedEnd;
     trimDragOriginRef.current = dragOrigin;
+    // Pin the zoomed window at drag start so the mapping cannot change mid-drag.
+    const dragView = zoomWindowFromView(previewTrimZoom, previewTrimAnchorFrac, vodDurationSec);
 
     const prevUserSelect = document.body.style.userSelect;
     document.body.style.userSelect = 'none';
@@ -2606,7 +2617,7 @@ export default function App() {
       const rect = rail.getBoundingClientRect();
       if (rect.width <= 0) return 0;
       const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      return Math.round(frac * vodDurationSec);
+      return Math.round(fracToSec(frac, dragView));
     };
 
     let ended = false;
@@ -2658,7 +2669,7 @@ export default function App() {
     handle.addEventListener('pointercancel', onUp);
     handle.addEventListener('lostpointercapture', onLostCapture);
     onMove(e.nativeEvent);
-  }, [vodDurationSec, commitPreviewTrimRange, updateNeedleGlance, markPreviewTrimEndpoint]);
+  }, [vodDurationSec, previewTrimZoom, previewTrimAnchorFrac, commitPreviewTrimRange, updateNeedleGlance, markPreviewTrimEndpoint]);
 
   const finishUrlTrimDrag = useCallback(() => {
     urlTrimDragPinRef.current = null;
@@ -2765,6 +2776,8 @@ export default function App() {
   if (previewFsGateRef.current === null) {
     previewFsGateRef.current = createFullscreenGate();
   }
+  /** Whether the last fullscreenchange event had the preview as the active element. */
+  const previewFsActiveRef = useRef(false);
 
   const togglePreviewFullscreen = useCallback(() => {
     const container = previewContainerRef.current;
@@ -2838,8 +2851,14 @@ export default function App() {
       // Always derive state from the browser. The old YouTube-only "fake"
       // fullscreen left the controls locked after Escape.
       const fs = document.fullscreenElement === previewContainerRef.current;
+      const wasFs = previewFsActiveRef.current;
+      previewFsActiveRef.current = fs;
       setPreviewFullscreen(fs);
       setPreviewFsControlsVisible(!fs);
+      // Leaving fullscreen must not keep the in-fullscreen resize — reset to
+      // the default panel height (entering may keep the user's resize). The
+      // wasFs guard keeps other surfaces' fullscreenchange events out of it.
+      if (wasFs && !fs) setTrimPanelHeight(0);
       requestAnimationFrame(() => {
         void syncPreviewPlaybackToViewport(fs);
       });
@@ -3396,6 +3415,10 @@ export default function App() {
     setPreviewTrimStart(0);
     setPreviewTrimEnd(end);
     setVideoInfoUrl(trimmed);
+    // A new video starts unzoomed — the previous clip's zoom/anchor would
+    // show a nonsensical window on a different duration.
+    setPreviewTrimZoom(1);
+    setPreviewTrimAnchorFrac(0.5);
   }, []);
 
   const fetchVideoInfo = useCallback(async (videoUrl: string, hint?: FetchVideoInfoHint) => {
@@ -3415,7 +3438,9 @@ export default function App() {
     if (cached && gen === fetchVideoInfoGenRef.current) {
       setUrl(trimmed);
       setVideoInfo(cached);
-      setQuality(bestAvailableQuality(cached));
+      if (qualityUserTouchedUrlRef.current !== trimmed) {
+        setQuality(bestAvailableQuality(cached));
+      }
       const end = Math.max(1, videoInfoDurationSec(cached));
       if (end > 0) applyVideoInfoTrim(trimmed, end);
       setLoading(false);
@@ -3449,7 +3474,9 @@ export default function App() {
       };
       setUrl(trimmed);
       setVideoInfo(synthetic);
-      setQuality(bestAvailableQuality(synthetic));
+      if (qualityUserTouchedUrlRef.current !== trimmed) {
+        setQuality(bestAvailableQuality(synthetic));
+      }
       if (!previewOpen) {
         void resetPreview();
       }
@@ -3475,7 +3502,9 @@ export default function App() {
       };
       setUrl(trimmed);
       setVideoInfo(synthetic);
-      setQuality(bestAvailableQuality(synthetic));
+      if (qualityUserTouchedUrlRef.current !== trimmed) {
+        setQuality(bestAvailableQuality(synthetic));
+      }
       if (hint.skipNetwork) {
         if (!previewOpen) {
           void resetPreview();
@@ -3503,7 +3532,9 @@ export default function App() {
             if (firstKey !== undefined) cache.delete(firstKey);
           }
           setVideoInfo(info);
-          setQuality(bestAvailableQuality(info));
+          if (qualityUserTouchedUrlRef.current !== trimmed) {
+            setQuality(bestAvailableQuality(info));
+          }
           const end = Math.max(1, videoInfoDurationSec(info));
           if (end <= 0) {
             setError('Could not determine video length');
@@ -5247,7 +5278,10 @@ export default function App() {
           <div className="grid grid-cols-2 gap-2 shrink-0">
             <div className="flex flex-col gap-0.5">
               <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">Quality</span>
-                <select value={quality} onChange={(e) => setQuality(e.target.value)}
+                <select value={quality} onChange={(e) => {
+                  setQuality(e.target.value);
+                  qualityUserTouchedUrlRef.current = url.trim();
+                }}
                 className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono py-1 px-1.5 focus:outline-none focus:border-white text-[10px] cursor-pointer">
                 {/* Always offer quality tiers so users can pick higher resolutions.
                     Backend fetches the requested height on demand (yt-dlp format filter).
@@ -5492,11 +5526,37 @@ export default function App() {
     );
   };
 
+  const previewTrimView: TrimViewWindow = useMemo(
+    () => zoomWindowFromView(previewTrimZoom, previewTrimAnchorFrac, vodDurationSec),
+    [previewTrimZoom, previewTrimAnchorFrac, vodDurationSec],
+  );
+
+  // Wheel-to-zoom on the trim rail. React's synthetic onWheel is passive at the
+  // root, so preventDefault would not stop page scroll — attach a native
+  // non-passive listener instead (only while the rail is on screen).
+  useEffect(() => {
+    const rail = previewNeedleRailRef.current;
+    if (!rail || !previewOpen || vodDurationSec <= 0) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      bumpPreviewFsControls();
+      const rect = rail.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const cursorFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const factor = e.deltaY < 0 ? TRIM_ZOOM_STEP : 1 / TRIM_ZOOM_STEP;
+      const next = zoomTrimViewAround(previewTrimView, cursorFrac, factor, vodDurationSec);
+      setPreviewTrimZoom(next.zoom);
+      setPreviewTrimAnchorFrac(next.anchorFrac);
+    };
+    rail.addEventListener('wheel', onWheel, { passive: false });
+    return () => rail.removeEventListener('wheel', onWheel);
+  }, [previewOpen, vodDurationSec, previewTrimView, bumpPreviewFsControls]);
+
   const previewClipPct = vodDurationSec > 0
     ? {
-        start: (previewTrimStart / vodDurationSec) * 100,
-        end: (previewTrimEnd / vodDurationSec) * 100,
-        play: (previewTimeUi / vodDurationSec) * 100,
+        start: secToFrac(previewTrimStart, previewTrimView) * 100,
+        end: secToFrac(previewTrimEnd, previewTrimView) * 100,
+        play: secToFrac(previewTimeUi, previewTrimView) * 100,
       }
     : { start: 0, end: 100, play: 0 };
 
@@ -5509,6 +5569,14 @@ export default function App() {
             previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
           }`}>
             Clip
+            {previewTrimZoom > 1 && (
+              <span
+                className="block text-[7px] text-zinc-500"
+                title="Scroll on the rail to zoom"
+              >
+                ×{previewTrimZoom >= 10 ? Math.round(previewTrimZoom) : previewTrimZoom.toFixed(1)}
+              </span>
+            )}
           </span>
           <div
             ref={previewNeedleRailRef}
@@ -5522,7 +5590,7 @@ export default function App() {
               if (!rail || vodDurationSec <= 0) return;
               const rect = rail.getBoundingClientRect();
               const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              seekPreviewVideo(frac * vodDurationSec);
+              seekPreviewVideo(fracToSec(frac, previewTrimView));
             }}
           >
             <div
