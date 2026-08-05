@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   isLikelyClip,
   channelVideoKey,
+  bestAvailableQuality,
   mergeVodLists,
   mergeClipLists,
   channelClipsMissing,
@@ -101,6 +102,24 @@ describe('isLikelyClip', () => {
       duration: 120,
     });
     expect(isLikelyClip(v)).toBe(false);
+  });
+});
+
+describe('bestAvailableQuality', () => {
+  it('picks the first API tier — the backend lists qualities highest-first', () => {
+    expect(bestAvailableQuality({
+      title: 'x',
+      qualities: ['2160p60', '1440p60', '1080p60', '720p60', '480p60', '360p'],
+    } as unknown as VideoInfo)).toBe('2160p60');
+  });
+
+  it('lowercases the label so it matches the select option values', () => {
+    expect(bestAvailableQuality({ title: 'x', qualities: ['1080P60'] } as unknown as VideoInfo)).toBe('1080p60');
+  });
+
+  it('falls back to source when the API lists no tiers (Kick)', () => {
+    expect(bestAvailableQuality({ title: 'x', qualities: [] } as unknown as VideoInfo)).toBe('source');
+    expect(bestAvailableQuality({ title: 'x' } as unknown as VideoInfo)).toBe('source');
   });
 });
 
