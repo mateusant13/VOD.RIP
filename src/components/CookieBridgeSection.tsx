@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, Copy, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Check, Copy, ExternalLink, FolderOpen, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 
 /**
@@ -9,6 +9,11 @@ import { apiGet, apiPost } from '../hooks/useApiClient';
  * explains what gets sent where, shows pairing/platform state, and the
  * enable/disable toggle is the kill switch (backend returns 403 for ingest
  * while disabled).
+ *
+ * Install flow (drag-and-drop): the backend materializes the unpacked
+ * extension folder next to the packaged crx; the user opens
+ * chrome://extensions, toggles Developer mode, and drops the folder onto
+ * the page. No admin, no policy, no certs — works on unmanaged Windows.
  */
 
 interface PlatformBridgeStatus {
@@ -21,6 +26,18 @@ interface BridgeStatus {
   paired: boolean;
   enabled: boolean;
   platforms: Record<string, PlatformBridgeStatus>;
+}
+
+interface ExtSource {
+  extension_dir: string;
+  ready: boolean;
+  version: string | null;
+}
+
+interface OpenResult {
+  launched: boolean;
+  browser: string | null;
+  url: string | null;
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -39,8 +56,10 @@ const formatGrabTime = (iso: string | null): string => {
 export default function CookieBridgeSection() {
   const [status, setStatus] = useState<BridgeStatus | null>(null);
   const [token, setToken] = useState('');
-  const [extId, setExtId] = useState<string | null>(null);
+  const [ext, setExt] = useState<ExtSource | null>(null);
   const [busy, setBusy] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const [opened, setOpened] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,10 +78,10 @@ export default function CookieBridgeSection() {
       /* keep last known */
     }
     try {
-      const id = await apiGet<{ extension_id: string }>('/api/session/cookies/extension/id');
-      setExtId(id.extension_id);
+      const src = await apiGet<ExtSource>('/api/session/cookies/extension/source');
+      setExt(src);
     } catch {
-      setExtId(null);
+      setExt(null);
     }
   }, []);
 
@@ -84,6 +103,33 @@ export default function CookieBridgeSection() {
       setError('Could not toggle Cookie Bridge — backend unreachable?');
     }
     setBusy(false);
+  };
+
+  const openManager = async () => {
+    if (opening) return;
+    setOpening(true);
+    setError(null);
+    try {
+      const res = await apiPost<OpenResult>('/api/session/cookies/extension/open', {});
+      setOpened(res.launched);
+      if (!res.launched) {
+        setError('No Chromium browser found — open chrome://extensions manually and drop the folder.');
+      }
+      // refresh once shortly after so freshly pushed cookies show in the counts
+      setTimeout(() => void refresh(), 5000);
+    } catch {
+      setError('Could not reach the backend to open the browser tab.');
+    }
+    setOpening(false);
+  };
+
+  const revealFolder = async () => {
+    setError(null);
+    try {
+      await apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {});
+    } catch {
+      setError('Extension folder not available yet.');
+    }
   };
 
   const copyToken = async () => {
@@ -164,14 +210,50 @@ export default function CookieBridgeSection() {
         </div>
       ) : null}
 
-      <p className="text-[9px] text-zinc-600 font-mono leading-snug">
-        One-time install (no admin):{' '}
-        <span className="text-zinc-400">
-          powershell -ExecutionPolicy Bypass -File scripts\install-cookie-bridge-policy.ps1
-        </span>
-        , then restart Chrome/Edge — the extension force-installs itself via policy.
-        {extId ? <> Extension id: <span className="text-zinc-400">{extId}</span></> : null}
-      </p>
+      {ext?.ready ? (
+        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-2">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void openManager()}
+              disabled={opening}
+              className="flex items-center gap-1 bg-zinc-900 text-zinc-200 font-black uppercase px-2 py-1 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
+            >
+              {opening ? <Loader2 size={11} className="animate-spin" /> : <ExternalLink size={11} />}
+              Open extensions
+            </button>
+            <button
+              type="button"
+              onClick={() => void revealFolder()}
+              className="flex items-center gap-1 bg-zinc-900 text-zinc-200 font-black uppercase px-2 py-1 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white"
+            >
+              <FolderOpen size={11} />
+              Show folder
+            </button>
+            {ext.version ? (
+              <span className="text-[9px] text-zinc-600 font-mono ml-auto">v{ext.version}</span>
+            ) : null}
+          </div>
+          <p className="text-[9px] text-zinc-600 font-mono leading-snug">
+            Drag this folder onto the extensions page (Developer mode ON):
+            <br />
+            <span className="text-zinc-400 break-all">{ext.extension_dir}</span>
+          </p>
+          {opened ? (
+            <ol className="text-[9px] font-mono text-zinc-500 list-decimal list-inside leading-snug">
+              <li>
+                Toggle <span className="text-zinc-300">Developer mode</span> ON (top-right corner of the tab).
+              </li>
+              <li>Drop the folder above onto the page.</li>
+              <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
+            </ol>
+          ) : null}
+        </div>
+      ) : (
+        <p className="text-[9px] text-zinc-600 font-mono">
+          Extension package not installed — restart the app to refresh it, then this flow appears here.
+        </p>
+      )}
     </div>
   );
 }

@@ -21,8 +21,13 @@ import io
 import json
 import logging
 import os
+import shutil
+import struct
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
@@ -158,7 +163,7 @@ def _ext_version() -> str:
             raw = crx.read_bytes()
             # CRX2/CRX3 both embed a zip; its offset varies with the header,
             # so locate the local-file signature instead of parsing the header.
-            zip_start = raw.find(b"PK\x03\x04", 16)
+            zip_start = raw.find(b"PK\x03\x04", 12)
             if zip_start > 0:
                 with zipfile.ZipFile(io.BytesIO(raw[zip_start:])) as zf:
                     manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
@@ -167,6 +172,87 @@ def _ext_version() -> str:
             version = ""
         _ext_version_cache[key] = version
     return _ext_version_cache[key]
+
+
+def _ext_src_dir() -> Path:
+    """Unpacked extension folder for drag-and-drop load (chrome://extensions)."""
+    return _get_appdata_dir() / "cookie-extension" / "src"
+
+
+def _materialize_ext_src() -> Path:
+    """Extract the packed crx's zip payload into src/ (idempotent).
+
+    Chrome's "load unpacked" accepts a folder, not a crx, so the settings
+    install flow materializes the same bytes as a plain folder next to the
+    crx. The zip payload starts at the first PK\\x03\\x04 signature (CRX2/3
+    safe, mirrors _ext_version); zip-slip guarded; skips _metadata so the
+    unpacked load never ships Chrome's own bookkeeping.
+    """
+    src = _ext_src_dir()
+    manifest = src / "manifest.json"
+    crx = _ext_crx_path()
+    try:
+        if manifest.exists() and crx.exists() and crx.stat().st_mtime <= manifest.stat().st_mtime:
+            return src
+        raw = crx.read_bytes()
+        zip_start = raw.find(b"PK\x03\x04", 12)
+        if zip_start <= 0:
+            return src
+        src.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(raw[zip_start:])) as zf:
+            for name in zf.namelist():
+                if not name or name.startswith("_metadata/"):
+                    continue
+                target = src / name
+                if not str(target.resolve()).startswith(str(src.resolve())):
+                    continue
+                if name.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(name))
+        return src
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return src
+
+
+_BROWSER_RELS = {
+    "chrome": r"Google\Chrome\Application\chrome.exe",
+    "msedge": r"Microsoft\Edge\Application\msedge.exe",
+    "brave": r"BraveSoftware\Brave-Browser\Application\brave.exe",
+}
+_EXT_MANAGER_URLS = {
+    "chrome": "chrome://extensions/",
+    "msedge": "edge://extensions/",
+    "brave": "chrome://extensions/",
+}
+
+
+def _find_browser(name: str) -> Optional[Path]:
+    """chromium-family browser path — Program Files, Program Files (x86), then PATH."""
+    if os.name == "nt" and name in _BROWSER_RELS:
+        for root in (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        ):
+            candidate = root / _BROWSER_RELS[name]
+            if candidate.is_file():
+                return candidate
+    return Path(shutil.which(name)) if shutil.which(name) else None
+
+
+def _open_extension_manager() -> dict:
+    """Launch the default chromium-family browser at its extensions manager tab."""
+    for name, url in _EXT_MANAGER_URLS.items():
+        path = _find_browser(name)
+        if not path:
+            continue
+        try:
+            subprocess.Popen([str(path), url])
+            return {"launched": True, "browser": name, "url": url}
+        except OSError as exc:
+            logger.debug("cookie extension manager launch failed (%s): %s", name, exc)
+    return {"launched": False, "browser": None, "url": None}
 
 
 @router.get("/api/session/cookies/extension/update.xml")
@@ -214,6 +300,45 @@ async def session_cookies_extension_id():
             detail="cookie extension key not installed — run scripts/install-cookie-bridge-policy.ps1",
         )
     return {"extension_id": ext_id}
+
+
+@router.get("/api/session/cookies/extension/source")
+async def session_cookies_extension_source():
+    """Unpacked extension folder for the drag-and-drop install flow.
+
+    ``extension_dir`` is the folder the user drags onto chrome://extensions
+    (dev mode on); ``ready`` is false when no crx is installed yet.
+    """
+    src = _materialize_ext_src()
+    return {
+        "extension_dir": str(src),
+        "ready": (src / "manifest.json").exists(),
+        "version": _ext_version() or None,
+    }
+
+
+@router.post("/api/session/cookies/extension/open")
+async def session_cookies_extension_open():
+    """Best-effort: open the browser's extensions manager (chrome://extensions)."""
+    return _open_extension_manager()
+
+
+@router.post("/api/session/cookies/extension/reveal")
+async def session_cookies_extension_reveal():
+    """Open Explorer/finder at the unpacked extension folder."""
+    src = _materialize_ext_src()
+    if not (src / "manifest.json").exists():
+        raise HTTPException(status_code=404, detail="extension source not installed")
+    try:
+        if os.name == "nt":
+            os.startfile(str(src))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(src)])
+        else:
+            subprocess.Popen(["xdg-open", str(src)])
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not reveal folder: {exc}") from exc
+    return {"ok": True, "extension_dir": str(src)}
 
 
 @router.post("/api/session/cookies/enable")
