@@ -78,6 +78,11 @@ class AppSettings(BaseModel):
     # preview temp, embed models). '' = auto -> the fixed drive with the most
     # free space; an explicit path wins. VODRIP_CACHE_DIR env overrides both.
     cache_dir: str = ""
+    # Data root for transcripts/chat (archive DB + WAL/SHM). '' = auto ->
+    # %APPDATA%/VOD.RIP (app-data drive); an explicit path wins (usually the
+    # fastest disk). VODRIP_DATA_DIR env overrides both. Takes effect after
+    # restart — the DB is moved by the relocation plumbing.
+    data_dir: str = ""
     oauth: str = ""
     youtube_cookies_file: str = ""
     youtube_cookies_browser: str = ""
@@ -132,6 +137,7 @@ class SettingsUpdate(BaseModel):
     ffmpeg_path: Optional[str] = None
     temp_folder: Optional[str] = None
     cache_dir: Optional[str] = None
+    data_dir: Optional[str] = None
     oauth: Optional[str] = None
     youtube_cookies_file: Optional[str] = None
     youtube_cookies_browser: Optional[str] = None

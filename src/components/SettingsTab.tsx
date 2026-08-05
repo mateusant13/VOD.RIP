@@ -34,7 +34,7 @@ const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language', 'channel_asr_languages',
-  'cache_dir',
+  'cache_dir', 'data_dir',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
   JSON.stringify(SETTING_KEYS.map((k) => s[k] ?? null));

@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "large-v3-turbo"
 MODEL_ENV = "VODRIP_WHISPER_MODEL"
 CACHE_ENV = "VODRIP_WHISPER_CACHE"
+# Transcripts/chat data root — env override for the settings.data_dir knob.
+DATA_ENV = "VODRIP_DATA_DIR"
 
 # Preview sessions expire after 30 min of inactivity and their dirs are
 # touched on every write, so a kd_preview subdir older than 24 h is either a
@@ -133,6 +135,27 @@ def _get_appdata_dir() -> Path:
     from services.settings import _get_appdata_dir as _real
 
     return _real()
+
+
+def data_dir() -> Path:
+    """Resolve the transcripts/chat data root (archive DB + WAL/SHM).
+
+    Precedence: VODRIP_DATA_DIR env (test/portable override) ->
+    settings.data_dir (explicit path) -> %APPDATA%/VOD.RIP. The default
+    stays on the app-data drive so a clean install never moves the DB
+    unrequested; the Settings > Storage "data disk" pick writes data_dir
+    when the user opts into a faster/bigger volume. The DB relocation
+    plumbing (archive_db._db_path) is wired to this resolver separately.
+    """
+    env = os.environ.get(DATA_ENV, "").strip()
+    if env:
+        return Path(env)
+    from deps import settings_mgr
+
+    setting = (getattr(settings_mgr.get(), "data_dir", "") or "").strip()
+    if setting:
+        return Path(setting)
+    return _get_appdata_dir()
 
 
 # --- whisper model cache ---------------------------------------------------

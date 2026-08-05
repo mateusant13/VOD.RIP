@@ -24,6 +24,12 @@ const USAGE = {
   total: 14 * 1024 ** 3,
 };
 
+const DISKS = [
+  { drive: "C:\\", label: "System", total_bytes: 500 * 1024 ** 3, free_bytes: 90 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+  { drive: "D:\\", label: "Data", total_bytes: 1000 * 1024 ** 3, free_bytes: 402 * 1024 ** 3, media_type: "SSD", bus_type: "SATA", speed_rank: 2 },
+  { drive: "I:\\", label: "Archive", total_bytes: 2000 * 1024 ** 3, free_bytes: 344 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+];
+
 function stubFetch(status: {
   low: boolean;
   free_bytes: number;
@@ -38,7 +44,9 @@ function stubFetch(status: {
       ? status
       : url.includes("/api/disk/cleanup")
         ? { freed_bytes: 1024 ** 3 }
-        : USAGE;
+        : url.includes("/api/disks")
+          ? { drives: DISKS, fastest: "I:\\" }
+          : USAGE;
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -119,35 +127,64 @@ describe("DiskSection", () => {
       biggest_drive: "I:\\",
     });
     render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
-    await waitFor(() =>
-      expect(screen.getByLabelText("cache location")).toBeInTheDocument()
-    );
-    expect((screen.getByLabelText("cache location") as HTMLInputElement).placeholder).toBe("Auto (biggest drive)");
+    await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
     expect(screen.getByText(/I:\\VOD.RIP-cache/)).toBeInTheDocument();
     expect(screen.getByText(/402.00 GB free/)).toBeInTheDocument();
     expect(screen.getByText(/auto pick: I:\\/)).toBeInTheDocument();
   });
 
-  it("typing a cache path calls setSettings with cache_dir", async () => {
+  it("renders the storage selects with drive options (free space + type)", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
+    await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
+    expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
+    expect(screen.getByText("Takes effect after restart (moves the database)")).toBeInTheDocument();
+    // Drive labels appear once per select (cache + data pickers).
+    expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
+    expect(screen.getAllByRole("option", { name: "D: (402 GB free, SSD)" })).toHaveLength(2);
+    expect(screen.getByRole("option", { name: "Auto (biggest free space)" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
+  });
+
+  it("selecting a cache disk writes <drive>\\VOD.RIP-cache", async () => {
     stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
     const setSettings = vi.fn();
     render(<DiskSection settings={BASE_SETTINGS} setSettings={setSettings} />);
-    await waitFor(() => expect(screen.getByLabelText("cache location")).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText("cache location"), { target: { value: "D:\\caches" } });
-    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ cache_dir: "D:\\caches" }));
+    await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("heavy cache disk"), { target: { value: "D:\\VOD.RIP-cache" } });
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ cache_dir: "D:\\VOD.RIP-cache" }));
   });
 
-  it("Auto button returns cache_dir to auto (empty)", async () => {
+  it("selecting Auto returns cache_dir to auto (empty)", async () => {
     stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
     const setSettings = vi.fn();
     render(
       <DiskSection
-        settings={{ ...BASE_SETTINGS, cache_dir: "D:\\caches" }}
+        settings={{ ...BASE_SETTINGS, cache_dir: "D:\\VOD.RIP-cache" }}
         setSettings={setSettings}
       />
     );
-    await waitFor(() => expect(screen.getByLabelText("auto cache location")).toBeInTheDocument());
-    fireEvent.click(screen.getByLabelText("auto cache location"));
+    await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("heavy cache disk"), { target: { value: "" } });
     expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ cache_dir: "" }));
+  });
+
+  it("selecting a data disk writes <drive>\\VOD.RIP-data", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    const setSettings = vi.fn();
+    render(<DiskSection settings={BASE_SETTINGS} setSettings={setSettings} />);
+    await waitFor(() => expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("transcripts and chat data disk"), { target: { value: "I:\\VOD.RIP-data" } });
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ data_dir: "I:\\VOD.RIP-data" }));
+  });
+
+  it("surfaces a legacy custom cache path as a Custom option", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    render(
+      <DiskSection settings={{ ...BASE_SETTINGS, cache_dir: "D:\\caches" }} setSettings={() => {}} />
+    );
+    await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
+    expect(screen.getByRole("option", { name: "Custom (D:\\caches)" })).toBeInTheDocument();
+    expect(screen.getByLabelText("heavy cache disk")).toHaveValue("D:\\caches");
   });
 });

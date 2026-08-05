@@ -13,11 +13,12 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.disk_detect import biggest_fixed_drive, free_space
+from services.disk_detect import biggest_fixed_drive, disk_inventory, free_space
 from services.disk_hygiene import (
     active_whisper_model_id,
     prune_inactive_whisper_models,
@@ -29,6 +30,9 @@ router = APIRouter(tags=["disk"])
 
 FREE_THRESHOLD_BYTES = 5 * 1024**3  # low-disk warning below 5 GB free
 DEFAULT_KEEP_COUNT = 5
+# A disk with less free space than this is not offered as the "fastest" pick
+# (transcripts/chat data needs real headroom for the DB + WAL).
+_FASTEST_MIN_FREE_BYTES = 2 * 1024**3
 
 CLEANABLE = ("archive_vods", "whisper_models", "preview_cache", "update_temps")
 
@@ -187,6 +191,34 @@ def disk_usage() -> dict[str, int]:
         total += cat_bytes
     usage["total"] = total
     return usage
+
+
+def fastest_disk() -> str:
+    """Drive root (e.g. 'C:\\') of the fastest usable disk: best speed_rank
+    among drives with >= 2 GB free; ties broken by most free space. '' when
+    no usable drive exists (non-Windows host, probe failures)."""
+    best = ""
+    best_key: Optional[Tuple[int, int]] = None
+    for item in disk_inventory():
+        if item["free_bytes"] < _FASTEST_MIN_FREE_BYTES:
+            continue
+        key = (item["speed_rank"], -item["free_bytes"])
+        if best_key is None or key < best_key:
+            best, best_key = item["drive"], key
+    return best
+
+
+@router.get("/api/disks")
+def disks() -> dict:
+    """Per-drive inventory for the Settings > Storage pickers, plus the
+    auto-pick winners: the fastest usable drive (transcripts/chat data) and
+    the biggest-free-space drive (heavy caches). PowerShell classification is
+    cached 60s; probe failures degrade to Unknown ranks."""
+    return {
+        "drives": disk_inventory(),
+        "fastest": fastest_disk(),
+        "biggest": biggest_fixed_drive() or "",
+    }
 
 
 @router.get("/api/disk/status")
