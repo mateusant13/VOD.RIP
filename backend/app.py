@@ -32,6 +32,7 @@ from routers import (
     live,
     preview,
     settings,
+    subtitles,
     system,
 )
 
@@ -552,6 +553,7 @@ app.include_router(archive.router)
 app.include_router(entities.router)
 app.include_router(cookie_bridge.router)
 app.include_router(disk.router)
+app.include_router(subtitles.router)
 
 
 def _warm_youtube_session() -> None:
