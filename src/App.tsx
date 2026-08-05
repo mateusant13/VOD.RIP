@@ -69,7 +69,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, type TrimRangeOpts } from './trimUtils';
@@ -818,12 +818,24 @@ export default function App() {
     return idx > 0 ? steps[idx - 1] : 0;
   }, [clipRangeDays]);
 
-  const youtubePlatformOnly = youtubeEnabled && !kickEnabled && !twitchEnabled;
-
   const selectedChannel = useMemo(
     () => savedChannels.find((c) => c.id === selectedChannelId) ?? null,
     [savedChannels, selectedChannelId],
   );
+
+  // Effective per-channel platform flags: a channel with exactly one platform
+  // keeps it ON regardless of the global toggle, so its content can never be
+  // hidden (e.g. a Twitch-only channel with the global Twitch filter off).
+  // The persisted global flags are untouched — this only drives display/fetch.
+  const effectiveFlags = effectivePlatformFlags(selectedChannel, {
+    kick: kickEnabled,
+    twitch: twitchEnabled,
+    youtube: youtubeEnabled,
+  });
+  const effectiveKickEnabled = effectiveFlags.kick;
+  const effectiveTwitchEnabled = effectiveFlags.twitch;
+  const effectiveYoutubeEnabled = effectiveFlags.youtube;
+  const youtubePlatformOnly = effectiveYoutubeEnabled && !effectiveKickEnabled && !effectiveTwitchEnabled;
 
   const selectedChannelFirstLiveEntry = useMemo(() => {
     if (!selectedChannelId) return null;
@@ -889,7 +901,7 @@ export default function App() {
       ? { minMs: clipRangeMinDays * 86_400_000, maxMs: clipRangeDays * 86_400_000 }
       : null;
     const items: ChannelVideo[] = [];
-    if (kickEnabled && channelHasKick) {
+    if (effectiveKickEnabled && channelHasKick) {
       items.push(...channelPlatformVisibleSlice(
         kickChannelVideos,
         kickVisibleLimit,
@@ -897,7 +909,7 @@ export default function App() {
         clips,
       ));
     }
-    if (twitchEnabled && channelHasTwitch) {
+    if (effectiveTwitchEnabled && channelHasTwitch) {
       items.push(...channelPlatformVisibleSlice(
         twitchChannelVideos,
         twitchVisibleLimit,
@@ -905,7 +917,7 @@ export default function App() {
         clips,
       ));
     }
-    if (youtubeEnabled && channelHasYoutube) {
+    if (effectiveYoutubeEnabled && channelHasYoutube) {
       items.push(...channelPlatformVisibleSlice(
         youtubeChannelVideos,
         youtubeVisibleLimit,
@@ -948,9 +960,9 @@ export default function App() {
     kickChannelVideos,
     twitchChannelVideos,
     youtubeChannelVideos,
-    kickEnabled,
-    twitchEnabled,
-    youtubeEnabled,
+    effectiveKickEnabled,
+    effectiveTwitchEnabled,
+    effectiveYoutubeEnabled,
     kickVisibleLimit,
     twitchVisibleLimit,
     youtubeVisibleLimit,
@@ -980,13 +992,13 @@ export default function App() {
   }, [bulkDownloadPlatforms]);
 
   const clipsMode = channelContentFilter === 'clips';
-  const canExpandKick = kickEnabled && channelHasKick && channelPlatformCanExpand(
+  const canExpandKick = effectiveKickEnabled && channelHasKick && channelPlatformCanExpand(
     kickChannelVideos, kickVisibleLimit, channelBeyondRecent.Kick ?? false, clipsMode,
   );
-  const canExpandTwitch = twitchEnabled && channelHasTwitch && channelPlatformCanExpand(
+  const canExpandTwitch = effectiveTwitchEnabled && channelHasTwitch && channelPlatformCanExpand(
     twitchChannelVideos, twitchVisibleLimit, channelBeyondRecent.Twitch ?? false, clipsMode,
   );
-  const canExpandYoutube = youtubeEnabled && channelHasYoutube && channelPlatformCanExpand(
+  const canExpandYoutube = effectiveYoutubeEnabled && channelHasYoutube && channelPlatformCanExpand(
     youtubeChannelVideos, youtubeVisibleLimit, channelBeyondRecent.YouTube ?? false, clipsMode,
   );
   const canExpandChannelList = canExpandKick || canExpandTwitch || canExpandYoutube;
@@ -4305,19 +4317,19 @@ export default function App() {
 
     const needsFetch =
       mode === 'clips'
-        ? channelClipsMissing(ch, kickEnabled, twitchEnabled, youtubeEnabled)
+        ? channelClipsMissing(ch, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled)
         : mode === 'streams'
-          ? channelStreamsMissing(ch, youtubeEnabled)
-          : channelVodsMissing(ch, kickEnabled, twitchEnabled, youtubeEnabled);
+          ? channelStreamsMissing(ch, effectiveYoutubeEnabled)
+          : channelVodsMissing(ch, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled);
     if (!needsFetch) return;
 
-    const hasCache = channelHasCachedContent(ch, mode, kickEnabled, twitchEnabled, youtubeEnabled);
+    const hasCache = channelHasCachedContent(ch, mode, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled);
     void refreshChannelRef.current(selectedChannelId, undefined, mode, {
       silent: hasCache,
       force: !hasCache,
       incremental: hasCache,
     });
-  }, [channelContentFilter, kickEnabled, twitchEnabled, youtubeEnabled, selectedChannelId]);
+  }, [channelContentFilter, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled, selectedChannelId]);
 
   // Re-fetch when the user picks a new clip range or sort — only on the Clips tab.
   useEffect(() => {
@@ -4637,21 +4649,21 @@ export default function App() {
         setChannelBeyondRecent((prev) => ({ ...prev, [platform]: true }));
       }
     };
-    if (kickEnabled && channelHasKick) {
+    if (effectiveKickEnabled && channelHasKick) {
       setKickVisibleLimit((n) => {
         const next = n + CHANNEL_EXPAND_STEP;
         markBeyond(kickChannelVideos, next, 'Kick');
         return next;
       });
     }
-    if (twitchEnabled && channelHasTwitch) {
+    if (effectiveTwitchEnabled && channelHasTwitch) {
       setTwitchVisibleLimit((n) => {
         const next = n + CHANNEL_EXPAND_STEP;
         markBeyond(twitchChannelVideos, next, 'Twitch');
         return next;
       });
     }
-    if (youtubeEnabled && channelHasYoutube) {
+    if (effectiveYoutubeEnabled && channelHasYoutube) {
       setYoutubeVisibleLimit((n) => {
         const next = n + CHANNEL_EXPAND_STEP;
         markBeyond(youtubeChannelVideos, next, 'YouTube');
@@ -4660,9 +4672,9 @@ export default function App() {
     }
   }, [
     clipsMode,
-    kickEnabled,
-    twitchEnabled,
-    youtubeEnabled,
+    effectiveKickEnabled,
+    effectiveTwitchEnabled,
+    effectiveYoutubeEnabled,
     channelHasKick,
     channelHasTwitch,
     channelHasYoutube,
@@ -6029,12 +6041,12 @@ export default function App() {
                   {selectedChannelId === ch.id && (
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1 min-w-0">
                       {(() => {
-                        const platformFiltersOn = Number(kickEnabled) + Number(twitchEnabled) + Number(youtubeEnabled);
+                        const platformFiltersOn = Number(effectiveKickEnabled) + Number(effectiveTwitchEnabled) + Number(effectiveYoutubeEnabled);
                         // Per-channel lock: a channel whose only platform is enabled must keep it on,
                         // otherwise the chip toggle (which is global) empties this channel's view.
                         const channelPlatformsOn = (['Kick', 'Twitch', 'YouTube'] as const).filter((p) => {
                           const s = p === 'Kick' ? ch.kickSlug : p === 'Twitch' ? ch.twitchSlug : ch.youtubeSlug;
-                          const on = p === 'Kick' ? kickEnabled : p === 'Twitch' ? twitchEnabled : youtubeEnabled;
+                          const on = p === 'Kick' ? effectiveKickEnabled : p === 'Twitch' ? effectiveTwitchEnabled : effectiveYoutubeEnabled;
                           return Boolean(s?.trim()) && on;
                         }).length;
                         const chipLocked = (enabled: boolean) => enabled && (platformFiltersOn <= 1 || channelPlatformsOn <= 1);
@@ -6049,10 +6061,10 @@ export default function App() {
                               : ch.youtubeSlug;
                           if (!slug?.trim()) return null;
                           const enabled = platform === 'Kick'
-                            ? kickEnabled
+                            ? effectiveKickEnabled
                             : platform === 'Twitch'
-                              ? twitchEnabled
-                              : youtubeEnabled;
+                              ? effectiveTwitchEnabled
+                              : effectiveYoutubeEnabled;
                           const color = platform === 'Kick'
                             ? '#53fc18'
                             : platform === 'Twitch'
