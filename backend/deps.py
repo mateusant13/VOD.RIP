@@ -35,6 +35,12 @@ CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channe
 # Preview operations (session create/seek/quality/stream) run on their own
 # pool so the user's click is never queued behind batch warm tasks.
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
+# Live preview sessions (POST /api/preview/live + rotate) run on their own
+# small pool: the live POST must never queue behind slow/stuck VOD
+# create_session extracts on PREVIEW_EXECUTOR — the popup's stall budget is
+# 8s, and live creates are pure CDN fetches (no yt-dlp), so 4 workers keep
+# the badge click playable even while VOD previews are saturated.
+LIVE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live")
 # Background YouTube warm jobs (startup wave, channel-list, hover/batch).
 # Dedicated pool: bulk warms must never saturate INFO_EXECUTOR (208+ queued
 # startup jobs starved user clicks) and never compete with the user-facing

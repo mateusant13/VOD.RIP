@@ -1720,11 +1720,32 @@ export default function App() {
     const FAST_POLL_MS = 3_000;
     const SLOW_POLL_MS = 30_000;
     const FAST_POLLS = 6;
+    // Backend cache TTL (routers/live.py _LIVE_STATUS_TTL_SEC = 60s): a poll
+    // for a channel we fetched less than this ago is a guaranteed cache hit,
+    // so skip the round trip entirely — badge freshness is bounded by the
+    // backend TTL anyway, and the backend refresh only kicks on request.
+    const BACKEND_TTL_MS = 60_000;
     let pollCount = 0;
+    const fetchedAt: Record<string, number> = {};
+    const inFlight = new Set<string>();
+    // Channels that 404 (removed from backend settings, e.g. stale ids left
+    // in localStorage) are dropped from the poll list so they stop 404ing
+    // every cycle. Reset on effect re-run (tab switch / channel-list change),
+    // so a recovered channel gets one retry per visit.
+    // ponytail: no periodic revalidation; re-adding the channel mints a new
+    // id anyway, and backend settings hydrate replaces the list wholesale.
+    const droppedIds = new Set<string>();
+    // Preload the hls.js chunk while the Channels tab renders — the popup's
+    // dynamic import then resolves from the module cache instead of pulling
+    // the ~900KB chunk on the live-click critical path.
+    void import('hls.js').catch(() => {});
     const fetchOne = async (ch: SavedChannel) => {
+      if (inFlight.has(ch.id)) return;
+      inFlight.add(ch.id);
       try {
         const status = await apiGet<ChannelLiveStatus>(`/api/channels/${ch.id}/live`);
         if (!cancelled) {
+          fetchedAt[ch.id] = Date.now();
           setChannelLiveStatuses((prev) => {
             const next = { ...prev, [ch.id]: status };
             // ponytail: write last-known live status to localStorage so the next
@@ -1739,16 +1760,30 @@ export default function App() {
             return next;
           });
         }
-      } catch {
-        // Channel may lack platforms or backend is unreachable; ignore.
+      } catch (err) {
+        // The live endpoint 404s with detail "Channel not found" when the
+        // channel no longer exists in backend settings — drop it from the
+        // poll list so a stale id stops polluting every tick.
+        if (err instanceof Error && /not found/i.test(err.message)) {
+          droppedIds.add(ch.id);
+        }
+      } finally {
+        inFlight.delete(ch.id);
       }
     };
     const tick = async () => {
-      await Promise.all(savedChannelsRef.current.map(fetchOne));
-      if (cancelled) return;
+      // Schedule the next tick BEFORE awaiting the batch — one slow/cold
+      // channel must not stretch every badge's refresh cadence.
       pollCount++;
       const ms = pollCount <= FAST_POLLS ? FAST_POLL_MS : SLOW_POLL_MS;
       timeout = window.setTimeout(tick, ms);
+      const now = Date.now();
+      const due = savedChannelsRef.current.filter(
+        (ch) =>
+          !droppedIds.has(ch.id) &&
+          (fetchedAt[ch.id] ?? 0) + BACKEND_TTL_MS <= now,
+      );
+      await Promise.all(due.map(fetchOne));
     };
     tick();
     return () => {

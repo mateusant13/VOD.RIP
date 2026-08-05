@@ -71,14 +71,17 @@ def _default_channels() -> list:
 def _poll_live(channel: dict) -> list:
     """Live entries for one saved channel — the live router's own poller.
 
-    ``routers.live._fetch_channel_live_payload`` reads kick_live_info /
-    twitch_live_info / youtube_live_info (the same source as
-    /api/channels/{id}/live), so the watchdog never re-implements platform
-    checks. Entries are normalized to lowercase platform keys.
+    ``routers.live._fetch_or_cached_channel_live_payload`` reads the shared
+    live-status cache (kicking a refresh only when the entry is older than
+    the watchdog's poll interval), so the watchdog never re-implements
+    platform checks and never duplicates the warm pool / frontend poll's
+    per-channel extracts (a 30s poll loop used to re-fetch every channel
+    from scratch every cycle, burning quota). Entries are normalized to
+    lowercase platform keys.
     """
-    from routers.live import _fetch_channel_live_payload
+    from routers.live import _fetch_or_cached_channel_live_payload
 
-    payload = _fetch_channel_live_payload(channel)
+    payload = _fetch_or_cached_channel_live_payload(channel, max_age_sec=POLL_INTERVAL_SEC)
     out: list = []
     for ent in payload.get("live") or []:
         plat = (ent.get("platform") or "").lower()

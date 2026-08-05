@@ -12,6 +12,7 @@ import secrets
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -881,30 +882,41 @@ class PreviewManager:
                     ).start()
         # ponytail: warm the master playlist through the proxy so the first
         # browser <video src> request gets an instant 200 instead of cold fetch.
+        # The master fetch (proxy_playlist) and the media-entry resolution
+        # (_resolve_preview_entry) are INDEPENDENT CDN fetches of the same
+        # upstream — run them concurrently so the POST's serial fetch chain
+        # (master -> entry -> LL probe) collapses to max() instead of sum().
+        def _resolve_and_warm_master(pool, upstream_url: str) -> str:
+            mf = pool.submit(proxy_playlist, session_id, upstream_url)
+            try:
+                return _resolve_preview_entry(session, upstream_url)
+            finally:
+                try:
+                    mf.result()
+                except Exception:
+                    pass
+
         try:
-            proxy_playlist(session_id, session.master_url)
-        except Exception:
-            pass
-        # Resolve one media playlist (prewarm) and probe LL-HLS support. Twitch
-        # LL masters advertise #EXT-X-PART-INF on their media playlists; if the
-        # low_latency=true master yields none, fall back to the plain master.
-        try:
-            session.entry_url = _resolve_preview_entry(session, url)
-            session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-            if "low_latency=" in url and not _media_playlist_is_ll(session):
-                logger.info(
-                    "live session %s: LL master has no PART-INF — falling back to non-LL",
-                    session_id[:8],
-                )
-                non_ll = _strip_low_latency_param(url)
-                if non_ll and non_ll != url:
-                    session.master_url = non_ll
-                    session.entry_url = _resolve_preview_entry(session, non_ll)
-                    session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-                    try:
-                        proxy_playlist(session_id, session.master_url)
-                    except Exception:
-                        pass
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="live-create"
+            ) as pool:
+                # Resolve one media playlist (prewarm) and probe LL-HLS support.
+                # Twitch LL masters advertise #EXT-X-PART-INF on their media
+                # playlists; if the low_latency=true master yields none, fall
+                # back to the plain master. The LL probe stays dependent on the
+                # resolved entry_url — only the two master fetches overlap.
+                session.entry_url = _resolve_and_warm_master(pool, url)
+                session.allowed_hosts.update(_hosts_for_url(session.entry_url))
+                if "low_latency=" in url and not _media_playlist_is_ll(session):
+                    logger.info(
+                        "live session %s: LL master has no PART-INF — falling back to non-LL",
+                        session_id[:8],
+                    )
+                    non_ll = _strip_low_latency_param(url)
+                    if non_ll and non_ll != url:
+                        session.master_url = non_ll
+                        session.entry_url = _resolve_and_warm_master(pool, non_ll)
+                        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
         except Exception as exc:
             logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
         # DVR archive resolution is deferred to the first replay-playlist

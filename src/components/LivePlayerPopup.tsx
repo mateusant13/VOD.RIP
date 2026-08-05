@@ -484,6 +484,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // in-flight POST and destroys the hls instance, so the switch never leaks.
   useEffect(() => {
     let cancelled = false;
+    // Start the hls.js chunk load in parallel with the session POST — the
+    // ~900KB dynamic import used to sit on the playback critical path
+    // (App.tsx also preloads it when the Channels tab renders; this covers
+    // any other open path and makes the two fetches overlap instead of
+    // chaining).
+    void import('hls.js').catch(() => {});
     // Stall guard: abort the session POST after 8s — a hung backend must not
     // pin the spinner (apiPost's own budget is 60s x 3 retries). The abort
     // rejects as AbortError; the catch advances to the next entry if one
