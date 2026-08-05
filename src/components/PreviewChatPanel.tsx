@@ -1,6 +1,10 @@
 /**
  * WS-2 preview chat panel — right-side collapsible panel on the preview
  * surface with Chat / Transcript / Subtitles tabs, synced to playback time.
+ * URL-only YouTube previews (no archive row: no transcript, no chat) render
+ * subtitles-only: the panel fetches the video's own captions (en/pt/es,
+ * manual preferred over auto) from /api/subtitles instead of offering chat
+ * or transcription.
  *
  * Performance contract (acceptance #6):
  *  - All panel state (open/tab/width/data) lives INSIDE this component, so
@@ -55,6 +59,15 @@ export interface PreviewPanelPayload {
   events: PreviewPanelEventRow[];
   has_transcript: boolean;
   has_chat: boolean;
+}
+
+/** Live YouTube captions for URL-only previews (no archive row). */
+export interface PreviewSubtitlesPayload {
+  url: string;
+  lang: string | null;
+  source: 'manual' | 'auto' | null;
+  has_subtitles: boolean;
+  rows: PreviewPanelTranscriptRow[];
 }
 
 /** One row of the Transcript-tab timeline: a transcript segment or an
@@ -243,8 +256,11 @@ export function PreviewChatPanel({
   const [payload, setPayload] = useState<PreviewPanelPayload | null>(null);
   const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [retryTick, setRetryTick] = useState(0);
+  const [ytSubtitles, setYtSubtitles] = useState<PreviewSubtitlesPayload | null>(null);
+  const [subsFetchState, setSubsFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
 
   const payloadCacheRef = useRef<Map<string, PreviewPanelPayload>>(new Map());
+  const subsCacheRef = useRef<Map<string, PreviewSubtitlesPayload>>(new Map());
   const userPickedTabRef = useRef(false);
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -301,6 +317,47 @@ export function PreviewChatPanel({
     else if (tab === 'transcript' && !payload.has_transcript && payload.has_chat) setTab('chat');
   }, [payload, tab, fetchState]);
 
+  // URL-only YouTube previews (no archive transcript/chat rows): the panel
+  // is subtitles-only — fetch the video's own captions (en/pt/es, manual
+  // preferred over auto) instead of offering chat or transcription, which
+  // a bare URL has no archive data for.
+  const subtitlesOnly =
+    platform === 'youtube' && !!payload && !payload.has_transcript && !payload.has_chat;
+  useEffect(() => {
+    if (!subtitlesOnly || !videoId) {
+      setYtSubtitles(null);
+      setSubsFetchState('idle');
+      return;
+    }
+    const cached = subsCacheRef.current.get(videoId);
+    if (cached) {
+      setYtSubtitles(cached);
+      setSubsFetchState('done');
+      return;
+    }
+    let cancelled = false;
+    setSubsFetchState('loading');
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    apiGet<PreviewSubtitlesPayload>(`/api/subtitles?url=${encodeURIComponent(watchUrl)}&langs=en,pt,es`)
+      .then((p) => {
+        if (cancelled) return;
+        subsCacheRef.current.set(videoId, p);
+        setYtSubtitles(p);
+        setSubsFetchState('done');
+      })
+      .catch(() => {
+        if (!cancelled) setSubsFetchState('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [subtitlesOnly, videoId, retryTick]);
+
+  // Subtitles-only previews have no chat/transcript tabs to land on.
+  useEffect(() => {
+    if (subtitlesOnly && tab !== 'subtitles') setTab('subtitles');
+  }, [subtitlesOnly, tab]);
+
   // ── Rows / active index ---------------------------------------------------
   const chatRows = useMemo(() => payload?.chat ?? EMPTY_CHAT, [payload]);
   const transcriptRows = useMemo(() => payload?.transcript ?? EMPTY_TRANSCRIPT, [payload]);
@@ -320,10 +377,6 @@ export function PreviewChatPanel({
     return rows;
   }, [transcriptRows, payload]);
   const timelineOffsets = useMemo(() => timelineRows.map((r) => r.offset_sec), [timelineRows]);
-  const transcriptOffsets = useMemo(
-    () => transcriptRows.map((r) => r.offset_sec),
-    [transcriptRows],
-  );
   const activeChatIdx = useMemo(
     () => activePanelRowIndex(chatOffsets, currentTime),
     [chatOffsets, currentTime],
@@ -332,9 +385,13 @@ export function PreviewChatPanel({
     () => activePanelRowIndex(timelineOffsets, currentTime),
     [timelineOffsets, currentTime],
   );
-  const activeTranscriptIdx = useMemo(
-    () => activePanelRowIndex(transcriptOffsets, currentTime),
-    [transcriptOffsets, currentTime],
+  // Subtitles-tab rows: the archive transcript for archived videos, the
+  // live-fetched YouTube captions for URL-only previews.
+  const subtitleRows = subtitlesOnly ? (ytSubtitles?.rows ?? EMPTY_TRANSCRIPT) : transcriptRows;
+  const subtitleOffsets = useMemo(() => subtitleRows.map((r) => r.offset_sec), [subtitleRows]);
+  const activeSubtitleIdx = useMemo(
+    () => activePanelRowIndex(subtitleOffsets, currentTime),
+    [subtitleOffsets, currentTime],
   );
 
   const list = tab === 'chat' ? chatRows : timelineRows;
@@ -462,11 +519,11 @@ export function PreviewChatPanel({
           data-preview-chat-panel-collapsed
           onClick={() => setOpen(true)}
           className="w-7 h-full flex flex-col items-center justify-center gap-1.5 border-l-2 border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-white hover:bg-zinc-900"
-          title="Open preview chat panel"
+          title={subtitlesOnly ? 'Open preview subtitles' : 'Open preview chat panel'}
         >
-          <MessageSquare size={13} />
+          {subtitlesOnly ? <Captions size={13} /> : <MessageSquare size={13} />}
           <span className="[writing-mode:vertical-rl] rotate-180 text-[8px] font-mono uppercase tracking-widest">
-            Chat
+            {subtitlesOnly ? 'Subs' : 'Chat'}
           </span>
         </button>
       ) : (
@@ -480,25 +537,27 @@ export function PreviewChatPanel({
             <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-zinc-700 group-hover/resize:bg-zinc-500" />
           </div>
           <div className="flex items-center gap-0.5 border-b-2 border-zinc-800 px-1.5 py-1 shrink-0">
-            {TABS.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => {
-                  userPickedTabRef.current = true;
-                  setTab(id);
-                }}
-                aria-pressed={tab === id}
-                className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
-                  tab === id
-                    ? 'bg-white text-black'
-                    : 'text-zinc-500 hover:text-white hover:bg-zinc-800/60'
-                }`}
-              >
-                <Icon size={10} className="shrink-0" />
-                {label}
-              </button>
-            ))}
+            {(subtitlesOnly ? TABS.filter((t) => t.id === 'subtitles') : TABS).map(
+              ({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => {
+                    userPickedTabRef.current = true;
+                    setTab(id);
+                  }}
+                  aria-pressed={tab === id}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                    tab === id
+                      ? 'bg-white text-black'
+                      : 'text-zinc-500 hover:text-white hover:bg-zinc-800/60'
+                  }`}
+                >
+                  <Icon size={10} className="shrink-0" />
+                  {label}
+                </button>
+              ),
+            )}
             <div className="flex-1" />
             <button
               type="button"
@@ -538,24 +597,52 @@ export function PreviewChatPanel({
           )}
           {fetchState === 'done' && payload && tab === 'subtitles' && (
             <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col items-center justify-center gap-2 px-3 py-4">
-              {!payload.has_transcript ? (
+              {subtitlesOnly && subsFetchState !== 'done' && (
+                <div className="flex flex-col items-center justify-center gap-2 text-zinc-500">
+                  <Loader2 size={13} className="animate-spin" />
+                  <span className="text-[10px] font-mono">Loading subtitles…</span>
+                </div>
+              )}
+              {subtitlesOnly && subsFetchState === 'error' && (
+                <div className="flex flex-col items-center justify-center gap-2 px-4">
+                  <span className="text-red-300 text-[10px] font-mono text-center">
+                    Couldn&apos;t load subtitles.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setRetryTick((t) => t + 1)}
+                    className="flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-red-300"
+                  >
+                    <RefreshCw size={10} />
+                    Retry
+                  </button>
+                </div>
+              )}
+              {subtitlesOnly && subsFetchState === 'done' && (!ytSubtitles?.has_subtitles || subtitleRows.length === 0) && (
+                <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
+                  No subtitles available for this video.
+                </p>
+              )}
+              {!subtitlesOnly && !payload.has_transcript && (
                 <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
                   No captions for this video.
                 </p>
-              ) : activeTranscriptIdx >= 0 ? (
-                <>
-                  <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
-                    {formatArchiveOffset(currentTime)}
-                  </span>
-                  <p className="text-sm leading-relaxed text-zinc-100 text-center break-words" data-subtitle-line>
-                    {transcriptRows[activeTranscriptIdx].text}
-                  </p>
-                </>
-              ) : (
-                <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
-                  No caption at this moment.
-                </p>
               )}
+              {subtitleRows.length > 0 &&
+                (activeSubtitleIdx >= 0 ? (
+                  <>
+                    <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
+                      {formatArchiveOffset(currentTime)}
+                    </span>
+                    <p className="text-sm leading-relaxed text-zinc-100 text-center break-words" data-subtitle-line>
+                      {subtitleRows[activeSubtitleIdx].text}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
+                    No caption at this moment.
+                  </p>
+                ))}
             </div>
           )}
           {fetchState === 'done' && payload && tab !== 'subtitles' && (

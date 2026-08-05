@@ -35,16 +35,35 @@ const EMPTY_PAYLOAD: PreviewPanelPayload = {
 /** jsdom has no scrollIntoView; the panel calls it for active-row sync. */
 const origScrollIntoView = Element.prototype.scrollIntoView;
 
+const SUBTITLES_PAYLOAD = {
+  url: 'https://www.youtube.com/watch?v=yt1',
+  lang: 'pt',
+  source: 'manual',
+  has_subtitles: true,
+  rows: [
+    { offset_sec: 1, text: 'primeira legenda' },
+    { offset_sec: 6, text: 'segunda legenda' },
+  ],
+};
+
 function mockPanelFetch(
   payload: PreviewPanelPayload | null,
   status = 200,
   failFor: (url: string) => boolean = () => false,
+  subtitlesPayload: object | null = SUBTITLES_PAYLOAD,
 ) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes('/api/preview/panel/')) {
       if (failFor(url)) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
       return new Response(JSON.stringify(payload), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/subtitles')) {
+      if (failFor(url)) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
+      return new Response(JSON.stringify(subtitlesPayload), {
         status,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -326,5 +345,52 @@ describe('PreviewChatPanel', () => {
     expect(panel.className).toContain('hidden');
     rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} hidden={false} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy()); // cached, still there
+  });
+
+  it('fetches and renders live subtitles for a URL-only YouTube preview', async () => {
+    const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
+    render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} />);
+    await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
+    // Subtitles-only: no chat or transcript tabs are offered.
+    expect(screen.queryByRole('button', { name: 'Chat' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Transcript' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Subtitles' })).toBeTruthy();
+    const subsUrl = String(
+      fetchMock.mock.calls.map((c) => String(c[0])).find((u) => u.includes('/api/subtitles')) ?? '',
+    );
+    expect(subsUrl).toContain(
+      '/api/subtitles?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dyt1&langs=en,pt,es',
+    );
+  });
+
+  it('shows an explicit empty state when a URL-only YouTube video has no captions', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, {
+      ...SUBTITLES_PAYLOAD,
+      has_subtitles: false,
+      lang: null,
+      source: null,
+      rows: [],
+    });
+    render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={0} />);
+    await waitFor(() =>
+      expect(screen.getByText('No subtitles available for this video.')).toBeTruthy(),
+    );
+  });
+
+  it('shows an error state when the live subtitles fetch fails', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, (u) => u.includes('/api/subtitles'));
+    render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText("Couldn't load subtitles.")).toBeTruthy());
+  });
+
+  it('keeps the DB-driven subtitles path for archived YouTube videos', async () => {
+    const fetchMock = mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={11} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    await waitFor(() => expect(screen.getByText('third line')).toBeTruthy());
+    // Archived videos never call the live-subtitles endpoint.
+    const calls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(calls.some((u) => u.includes('/api/subtitles'))).toBe(false);
   });
 });
