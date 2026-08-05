@@ -646,11 +646,15 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
   }, [showBuffering, clearBuffering]);
 
-  // Track fullscreen state
+  // Track fullscreen state — element-equality like App.tsx and
+  // ChannelExplorePopup: this popup only claims fullscreen when IT is the
+  // fullscreen element. The old `!!document.fullscreenElement` made the icon
+  // and toggle lie whenever the main preview (or another popup) was
+  // fullscreen: the button showed "Exit" and clicking exited THAT surface.
   useEffect(() => {
     const onFsChange = () => {
       fsGateRef.current?.sync();
-      setIsFullscreen(!!document.fullscreenElement);
+      setIsFullscreen(document.fullscreenElement === popupRef.current);
     };
     document.addEventListener('fullscreenchange', onFsChange);
     return () => document.removeEventListener('fullscreenchange', onFsChange);
@@ -795,11 +799,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     }
   }, [mode, snapshotDuration, scheduleReplaySwitch]);
 
-  // Preserves the original semantics: exit if ANY element is fullscreen,
-  // otherwise fullscreen this popup.
+  // Element-equality, matching App.tsx / ChannelExplorePopup (the gate's
+  // default `(active, el) => active === el`). The old `active != null` exited
+  // ANY element's fullscreen: with the main preview fullscreen, the popup's
+  // button exited the PREVIEW instead of entering its own fullscreen — the
+  // "second click acts like a different fullscreen type" off-by-one.
   const fsGateRef = useRef<FullscreenGate | null>(null);
   if (fsGateRef.current === null) {
-    fsGateRef.current = createFullscreenGate(nativeFullscreenAdapter, (active) => active != null);
+    fsGateRef.current = createFullscreenGate(nativeFullscreenAdapter);
   }
 
   const toggleFullscreen = useCallback(() => {
@@ -960,20 +967,25 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               <ExternalLink size={13} />
             </button>
           )}
-          <button
-            type="button"
-            onClick={() => setSearchOpen((o) => !o)}
-            aria-pressed={searchOpen}
-            className={`live-popup-search flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
-              searchOpen
-                ? 'bg-white text-black border-white'
-                : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
-            }`}
-            title="Search the local archive (transcripts + chat)"
-          >
-            <Search size={10} className="shrink-0" />
-            {searchOpen ? 'CLOSE SEARCH' : 'SEARCH ARCHIVE'}
-          </button>
+          {/* Search affordance is fullscreen-hostile (the docked panel covers
+              the video) — remove it while fullscreen, like ChannelExplorePopup
+              hides its header. State survives: the panel reopens on exit. */}
+          {!isFullscreen && (
+            <button
+              type="button"
+              onClick={() => setSearchOpen((o) => !o)}
+              aria-pressed={searchOpen}
+              className={`live-popup-search flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                searchOpen
+                  ? 'bg-white text-black border-white'
+                  : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+              }`}
+              title="Search the local archive (transcripts + chat)"
+            >
+              <Search size={10} className="shrink-0" />
+              {searchOpen ? 'CLOSE SEARCH' : 'SEARCH ARCHIVE'}
+            </button>
+          )}
           <button
             className="live-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
             onClick={handleClose}
@@ -1046,7 +1058,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           </div>
         )}
 
-        {searchOpen && (
+        {/* Docked archive-search panel — never over the video while this
+            popup is fullscreen (matches ChannelExplorePopup's pattern). */}
+        {!isFullscreen && searchOpen && (
           <div
             className="absolute inset-0 z-20 flex flex-col bg-zinc-950"
           >
