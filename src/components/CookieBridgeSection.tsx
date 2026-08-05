@@ -109,17 +109,24 @@ export default function CookieBridgeSection() {
     if (opening) return;
     setOpening(true);
     setError(null);
-    try {
-      const res = await apiPost<OpenResult>('/api/session/cookies/extension/open', {});
-      setOpened(res.launched);
-      if (!res.launched) {
+    // One click opens chrome://extensions AND reveals the extension folder in
+    // Explorer. Both fire in parallel; each failure is handled independently —
+    // a failed reveal must not block the checklist, a failed open keeps the
+    // existing manual-install hint.
+    const [openRes] = await Promise.all([
+      apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null),
+      apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {}).catch(() => null),
+    ]);
+    if (openRes === null) {
+      setError('Could not reach the backend to open the browser tab.');
+    } else {
+      setOpened(openRes.launched);
+      if (!openRes.launched) {
         setError('No Chromium browser found — open chrome://extensions manually and drop the folder.');
       }
-      // refresh once shortly after so freshly pushed cookies show in the counts
-      setTimeout(() => void refresh(), 5000);
-    } catch {
-      setError('Could not reach the backend to open the browser tab.');
     }
+    // refresh once shortly after so freshly pushed cookies show in the counts
+    setTimeout(() => void refresh(), 5000);
     setOpening(false);
   };
 
@@ -146,38 +153,38 @@ export default function CookieBridgeSection() {
   const platforms = status?.platforms ?? {};
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
-        <span className={`text-[9px] font-mono ${status?.paired ? 'text-emerald-600' : 'text-zinc-600'}`}>
+        <span className={`text-xs font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-500'}`}>
           {status?.paired ? '● paired' : '○ not paired'}
         </span>
         <button
           type="button"
           onClick={() => void toggle()}
           disabled={!status || busy}
-          className={`flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase border-2 transition-colors disabled:opacity-50 ${
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-black uppercase border-2 transition-colors disabled:opacity-50 ${
             enabled
               ? 'bg-emerald-950 text-emerald-400 border-emerald-900 hover:border-emerald-500'
               : 'bg-red-950 text-red-400 border-red-900 hover:border-red-500'
           }`}
         >
-          {busy ? <Loader2 size={11} className="animate-spin" /> : enabled ? <ShieldCheck size={11} /> : <ShieldOff size={11} />}
+          {busy ? <Loader2 size={13} className="animate-spin" /> : enabled ? <ShieldCheck size={13} /> : <ShieldOff size={13} />}
           {enabled ? 'Enabled' : 'Disabled'}
         </button>
       </div>
 
-      <p className="text-[9px] text-zinc-600 font-mono leading-snug">
+      <p className="text-xs text-zinc-400 font-mono leading-relaxed">
         Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch
         auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only.
         Nothing leaves this machine. Disabling blocks all cookie ingestion.
       </p>
 
-      {error ? <p className="text-[9px] text-red-500 font-mono">{error}</p> : null}
+      {error ? <p className="text-xs text-red-400 font-mono">{error}</p> : null}
 
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-mono">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-mono">
         {Object.keys(platforms).length > 0 ? (
           Object.entries(platforms).map(([platform, st]) => (
-            <span key={platform} className={st.count > 0 ? 'text-zinc-500' : 'text-zinc-700'}>
+            <span key={platform} className={st.count > 0 ? 'text-zinc-400' : 'text-zinc-600'}>
               {PLATFORM_LABELS[platform] ?? platform}: {st.count}
               {st.lastGrabAt ? ` · ${formatGrabTime(st.lastGrabAt)}` : ''}
               {st.expiredCount > 0 ? (
@@ -186,7 +193,7 @@ export default function CookieBridgeSection() {
             </span>
           ))
         ) : (
-          <span className="text-zinc-700">no cookies stored</span>
+          <span className="text-zinc-600">no cookies stored</span>
         )}
       </div>
 
@@ -197,52 +204,52 @@ export default function CookieBridgeSection() {
             readOnly
             value={token}
             onFocus={(e) => e.target.select()}
-            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1 px-2 text-[10px] focus:outline-none focus:border-white"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
           />
           <button
             type="button"
             onClick={() => void copyToken()}
-            className="bg-zinc-900 text-zinc-200 font-black uppercase px-2 py-1 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1 shrink-0"
+            className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1.5 shrink-0"
           >
-            {copied ? <Check size={11} /> : <Copy size={11} />}
+            {copied ? <Check size={13} /> : <Copy size={13} />}
             {copied ? 'Copied' : 'Copy'}
           </button>
         </div>
       ) : null}
 
       {ext?.ready ? (
-        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-2">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 border-t-2 border-zinc-800 pt-2.5">
+          <div className="flex items-center gap-2 flex-wrap">
             <button
               type="button"
               onClick={() => void openManager()}
               disabled={opening}
-              className="flex items-center gap-1 bg-zinc-900 text-zinc-200 font-black uppercase px-2 py-1 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
+              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
             >
-              {opening ? <Loader2 size={11} className="animate-spin" /> : <ExternalLink size={11} />}
+              {opening ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />}
               Open extensions
             </button>
             <button
               type="button"
               onClick={() => void revealFolder()}
-              className="flex items-center gap-1 bg-zinc-900 text-zinc-200 font-black uppercase px-2 py-1 text-[10px] border-2 border-zinc-600 hover:border-white hover:text-white"
+              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white"
             >
-              <FolderOpen size={11} />
+              <FolderOpen size={13} />
               Show folder
             </button>
             {ext.version ? (
-              <span className="text-[9px] text-zinc-600 font-mono ml-auto">v{ext.version}</span>
+              <span className="text-xs text-zinc-500 font-mono ml-auto">v{ext.version}</span>
             ) : null}
           </div>
-          <p className="text-[9px] text-zinc-600 font-mono leading-snug">
+          <p className="text-xs text-zinc-400 font-mono leading-relaxed">
             Drag this folder onto the extensions page (Developer mode ON):
             <br />
-            <span className="text-zinc-400 break-all">{ext.extension_dir}</span>
+            <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>
           {opened ? (
-            <ol className="text-[9px] font-mono text-zinc-500 list-decimal list-inside leading-snug">
+            <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
               <li>
-                Toggle <span className="text-zinc-300">Developer mode</span> ON (top-right corner of the tab).
+                Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
               </li>
               <li>Drop the folder above onto the page.</li>
               <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
@@ -250,7 +257,7 @@ export default function CookieBridgeSection() {
           ) : null}
         </div>
       ) : (
-        <p className="text-[9px] text-zinc-600 font-mono">
+        <p className="text-xs text-zinc-500 font-mono">
           Extension package not installed — restart the app to refresh it, then this flow appears here.
         </p>
       )}
