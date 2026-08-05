@@ -948,6 +948,14 @@ def set_original_title(
 
 # --- messages -------------------------------------------------------------
 
+# Cross-writer dedupe window: multiple capture paths write the same live
+# message at slightly different offsets (watchdog live sink anchored to the
+# stream-start epoch vs Twitch GQL video-relative backfill vs YouTube replay
+# ingest), so an identical (username, text) row can arrive from a second
+# writer a couple of seconds apart. Rows inside this window are skipped.
+_CROSS_FLUSH_DEDUPE_WIN_S = 2.0
+
+
 def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     """Batch insert chat rows; each row: offset_sec, user_id, username, text,
     badges (list), emotes (list), ts (optional ISO).
@@ -958,6 +966,12 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     of a thousand). Collapse runs within the batch AND across flushes: the
     batch's first run merges into the LAST stored row for this video when it
     matches (chat_sinks flush every 5 s / 100 rows, so a burst spans flushes).
+
+    Cross-writer dedupe: every remaining run is skipped when an identical
+    (username, text) row already exists within +/-_CROSS_FLUSH_DEDUPE_WIN_S
+    (the (platform, video_id, offset_sec) index bounds the probe to the few
+    rows in the window). Multiple writers clock the same message differently,
+    so without this gate each writer appends its own copy of every message.
 
     Returns the ACCEPTED count — every row that arrived, collapsed or not
     (chat_sinks/base.py rows_flushed and the ingest API 'inserted' field
@@ -1032,6 +1046,29 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                 elif same and delta <= 0:
                     runs = runs[1:]  # re-send of the stored row — already counted
 
+            # Cross-writer dedupe: after the first-run merge above, drop any
+            # remaining anchor whose identical (username, text) row is already
+            # stored within +/-_CROSS_FLUSH_DEDUPE_WIN_S. The index bounds the
+            # probe to the few rows in the window; skipped rows are consumed
+            # (accepted still counts them) without touching spam_count — a
+            # parallel writer's copy is not spam continuation.
+            kept: list[tuple[dict, int]] = []
+            for anchor, count in runs:
+                offset = float(anchor["offset_sec"])
+                hit = conn.execute(
+                    """SELECT 1 FROM messages
+                       WHERE platform = ? AND video_id = ?
+                         AND username = ? AND text = ?
+                         AND offset_sec BETWEEN ? AND ?
+                       LIMIT 1""",
+                    (platform, video_id, anchor.get("username", ""), anchor["text"],
+                     offset - _CROSS_FLUSH_DEDUPE_WIN_S,
+                     offset + _CROSS_FLUSH_DEDUPE_WIN_S),
+                ).fetchone()
+                if hit is None:
+                    kept.append((anchor, count))
+            runs = kept
+
             for anchor, count in runs:
                 conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
@@ -1053,6 +1090,38 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                 )
                 # FTS index entry is written by the messages_ai trigger.
     return accepted
+
+
+def dedupe_messages() -> int:
+    """Delete exact-duplicate chat rows, keeping the MIN rowid per
+    (platform, video_id, offset_sec, username, text); returns the deleted
+    count.
+
+    Pre-fix builds wrote the same message more than once when multiple
+    capture paths landed the IDENTICAL (offset_sec, username, text) row
+    (watchdog live sink vs GQL backfill vs YouTube replay ingest, and the
+    yt_live tail's post-rename full re-send). The key is exact — no window —
+    so two genuinely distinct messages never merge, and the operation is
+    idempotent: a second run finds nothing and deletes 0 rows.
+
+    Bounded: one grouped pass over messages (cheap at the real ~215k-row
+    scale; FTS entries cascade via the AFTER DELETE triggers). Called once
+    per boot from the app lifespan."""
+    conn = get_conn()
+    with _lock:
+        with conn:  # transaction
+            cur = conn.execute(
+                """DELETE FROM messages WHERE id NOT IN (
+                     SELECT MIN(id) FROM messages
+                     GROUP BY platform, video_id, offset_sec, username, text
+                   )"""
+            )
+            deleted = cur.rowcount
+    if deleted:
+        # Bulk delete leaves the FTS index fragmented — merge it like the
+        # post-backfill path does so searches stay fast.
+        optimize_fts()
+    return deleted
 
 
 def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 30.0) -> list[dict]:

@@ -104,6 +104,39 @@ def _kick_backfill(video_id: str, channel: str) -> str:
         return "failed"
 
 
+def kick_preview_backfill(platform: str, video_id: str) -> str:
+    """Throttled single-video Twitch chat backfill on preview open.
+
+    Mirrors _maybe_auto_backfill's gates on ONE video: numeric (non-watchdog)
+    id, an archived row with a channel, and the same shared auto-kick
+    throttle + per-video cooldown clocks, so preview and search kicks share
+    one budget. Returns the _kick_backfill status word
+    ('queued'/'running'/'already'/'failed'), or '' when no kick applies
+    (wrong platform, synthetic id, unknown video, throttled, or cooldown)."""
+    global _last_auto_kick
+    if (platform or "").strip().lower() != "twitch":
+        return ""
+    if not video_id or not re.fullmatch(r"[0-9]+", video_id):
+        return ""
+    row = archive_db.query(
+        "SELECT channel FROM videos WHERE platform='twitch' AND video_id=?",
+        (video_id,),
+    )
+    if not row or not (row[0]["channel"] or "").strip():
+        return ""
+    now = time.monotonic()
+    with _backfill_lock:
+        if now - _last_auto_kick < _AUTO_KICK_MIN_GAP_S:
+            return ""
+        if now - _backfill_attempted_at.get(video_id, 0.0) < _BACKFILL_COOLDOWN_S:
+            return ""
+    status = _kick_backfill(video_id, row[0]["channel"])
+    if status == "queued":
+        with _backfill_lock:
+            _last_auto_kick = now
+    return status
+
+
 def _tokenize(text: str) -> list[str]:
     """Lowercase, non-alphanumeric split (matches the search tokenizer)."""
     return [t for t in re.split(r"[^0-9a-z]+", (text or "").lower()) if t]

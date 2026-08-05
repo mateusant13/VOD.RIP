@@ -455,6 +455,12 @@ export function PreviewChatPanel({
               </button>
             </div>
           )}
+          {fetchState === 'done' && !payload && (
+            // platform/videoId resolved empty (clip/live/channel/local-file
+            // previews) — there is no archive key to fetch, so say so
+            // instead of rendering a silent blank panel.
+            <EmptyState text="Chat and transcript history aren't available for this kind of preview." />
+          )}
           {fetchState === 'done' && payload && tab === 'subtitles' && (
             <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col items-center justify-center gap-2 px-3 py-4">
               {!payload.has_transcript ? (

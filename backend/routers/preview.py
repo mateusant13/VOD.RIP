@@ -182,6 +182,18 @@ async def preview_panel(
     p = (platform or "").strip().lower()
     if p not in archive_db.PLATFORMS:
         raise HTTPException(status_code=400, detail="Unknown platform")
+    if p == "twitch":
+        # Backfill-on-open: an archived Twitch VOD with no chat yet gets the
+        # same throttled background backfill as archive search, so opening
+        # the chat tab on a preview fills history without a prior search.
+        # Fire-and-forget — the kick is a no-op when throttled / cooldown /
+        # synthetic-id / unknown-video gates fail (kick_preview_backfill).
+        try:
+            from routers.archive import kick_preview_backfill
+
+            kick_preview_backfill(p, video_id)
+        except Exception:
+            logger.debug("preview chat backfill kick failed", exc_info=True)
     return {
         "transcript": archive_db.transcript_offsets(p, video_id, limit),
         "chat": archive_db.chat_for(p, video_id, limit),

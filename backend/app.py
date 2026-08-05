@@ -37,6 +37,9 @@ from routers import (
 
 logger = logging.getLogger(__name__)
 
+# At-most-once-per-boot guard for the startup chat dedupe (see lifespan).
+_chat_dedupe_done = False
+
 try:
     from services._version import __version__
 except ImportError:
@@ -69,6 +72,26 @@ async def _app_lifespan(_app: FastAPI):
             )
     except Exception:
         logger.debug("startup archive retention skipped", exc_info=True)
+
+    # One-time boot cleanup: collapse exact-duplicate chat rows left behind
+    # by pre-fix multi-writer capture (watchdog live sink vs GQL backfill vs
+    # replay ingest writing the same message at the same offset, plus the
+    # yt_live post-rename full re-send). Idempotent (second run deletes
+    # nothing) and bounded; guarded so it runs at most once per boot.
+    global _chat_dedupe_done
+    if not _chat_dedupe_done:
+        _chat_dedupe_done = True
+        try:
+            from services.archive_db import dedupe_messages
+
+            _chat_dupes = dedupe_messages()
+            if _chat_dupes:
+                logger.info(
+                    "startup chat dedupe: removed %d duplicate message row(s)",
+                    _chat_dupes,
+                )
+        except Exception:
+            logger.debug("startup chat dedupe skipped", exc_info=True)
 
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
