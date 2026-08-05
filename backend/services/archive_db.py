@@ -23,13 +23,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from services.settings import _get_appdata_dir
+from services import settings as _settings
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,33 @@ def _db_path() -> Path:
     override = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
     if override:
         return Path(override)
-    return _get_appdata_dir() / "archive.db"
+    from services.disk_hygiene import data_dir  # lazy: keeps module import light
+
+    return data_dir() / "archive.db"
+
+
+def _migrate_db_to_data_dir(target: Path) -> None:
+    """One-time move of the DB (and sidecars) to the configured data disk.
+
+    Runs before the first connection opens at a new data_dir: if a DB exists
+    at the default app-data location and the target is elsewhere, copy
+    archive.db (+ -wal/-shm) and the whisper resume manifests so the switch
+    is seamless. Idempotent — no-op when nothing to move or target exists.
+    """
+    src_dir = _settings._get_appdata_dir()
+    if src_dir == target.parent:
+        return
+    src = src_dir / "archive.db"
+    if not src.exists() or target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        p = src_dir / f"archive.db{suffix}"
+        if p.exists():
+            shutil.copy2(p, target.parent / f"archive.db{suffix}")
+    src_manifest = src_dir / "whisper_manifest"
+    if src_manifest.is_dir():
+        shutil.copytree(src_manifest, target.parent / "whisper_manifest", dirs_exist_ok=True)
 
 
 # RLock: query()/execute() hold the lock while calling get_conn(), which
@@ -264,6 +291,7 @@ def get_conn() -> sqlite3.Connection:
             _schema_ready = False
         if _conn is None:
             _conn_path = str(path)
+            _migrate_db_to_data_dir(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             # check_same_thread=False: workers (archive_transcribe, chat
             # backfill, chat sinks) call into this module from pool threads;
