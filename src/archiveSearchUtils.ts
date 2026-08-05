@@ -88,11 +88,19 @@ export function kindLabel(kind: string | null | undefined): string {
 }
 
 /** True for a real calendar date in YYYY-MM-DD (2026-02-30 is invalid). */
-export function isValidDateParam(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const [y, m, d] = value.split('-').map(Number);
+export function isValidDateParam(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/** Local-timezone YYYY-MM-DD for "today" (the date pickers show local dates). */
+export function todayIso(): string {
+  const d = new Date();
+  const m = `${d.getMonth() + 1}`.padStart(2, '0');
+  const day = `${d.getDate()}`.padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
 }
 
 export interface ArchiveSearchFilterParams {

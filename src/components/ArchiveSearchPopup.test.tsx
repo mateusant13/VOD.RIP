@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
+import { todayIso } from '../archiveSearchUtils';
 import type { SavedChannel } from '../types';
 
 const ARCHIVE_VIDEOS = {
@@ -411,6 +412,51 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
     );
+  });
+
+  it('every-day uncheck with no dates seeds today and sends a closed today→today range', async () => {
+    const fetchMock = mockFetch();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+
+    const today = todayIso();
+    fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
+    await waitFor(() =>
+      expect(
+        searchUrlWith(fetchMock, `q=zebra&date_from=${today}&date_to=${today}`),
+      ).toBeTruthy(),
+    );
+    // The seeded date is visible in the input, and the toggle stays off.
+    expect((screen.getByLabelText('From date') as HTMLInputElement).value).toBe(today);
+    expect(screen.getByRole('button', { name: 'EVERY DAY' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('start date without end date closes the range at today; end-only stays open at the start', async () => {
+    const fetchMock = mockFetch();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+
+    // From only → date_to injected as today (open-ended would reach into
+    // future-dated rows).
+    fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
+    await waitFor(() =>
+      expect(
+        searchUrlWith(fetchMock, `q=zebra&date_from=2026-07-30&date_to=${todayIso()}`),
+      ).toBeTruthy(),
+    );
+
+    // Mirror: To only → no date_from injected.
+    fireEvent.change(screen.getByLabelText('From date'), { target: { value: '' } });
+    fireEvent.change(screen.getByLabelText('To date'), { target: { value: '2026-07-30' } });
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).toContain('date_to=2026-07-30');
+      expect(urls[urls.length - 1]).not.toContain('date_from=');
+    });
   });
 
   it('lang chips appear only when both languages exist and send lang param', async () => {

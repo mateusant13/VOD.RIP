@@ -10,6 +10,7 @@ import {
   isValidDateParam,
   kindLabel,
   snippetAroundMatch,
+  todayIso,
   type ArchiveChatMessage,
 } from './archiveSearchUtils';
 
@@ -326,5 +327,18 @@ describe('buildSearchUrl username filter', () => {
     expect(buildSearchUrl({ query: 'x', username: '@Scriptingkata,@aranha' })).toBe(
       '/api/archive/search?q=x&username=Scriptingkata%2C%40aranha&limit=30',
     );
+  });
+});
+
+describe('todayIso', () => {
+  it('returns a valid local YYYY-MM-DD for today', () => {
+    const t = todayIso();
+    expect(t).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(isValidDateParam(t)).toBe(true);
+    const d = new Date();
+    const expectY = `${d.getFullYear()}`;
+    const expectM = `${d.getMonth() + 1}`.padStart(2, '0');
+    const expectD = `${d.getDate()}`.padStart(2, '0');
+    expect(t).toBe(`${expectY}-${expectM}-${expectD}`);
   });
 });

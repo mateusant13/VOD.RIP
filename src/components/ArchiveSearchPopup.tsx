@@ -38,6 +38,7 @@ import {
   groupChatWindow,
   highlightQuerySpans,
   isValidDateParam,
+  todayIso,
   kindLabel,
   snippetAroundMatch,
   type ArchiveChatMessage,
@@ -416,7 +417,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     setError(null);
     // Date inputs can hold partial/typed garbage; invalid values become unset.
     // everyDay=true ignores the stored range (default; a date pick unchecks it).
-    // channel_hint applies only while no explicit dropdown channel is set.
+    // With the range active, a start date without an end closes at today —
+    // an open-ended range would reach into future-dated rows. The mirror
+    // case (end only) stays open at the start.
+    const rangeActive = !everyDay;
+    const fromOk = rangeActive && isValidDateParam(dateFrom);
+    const toOk = rangeActive && isValidDateParam(dateTo);
+    const today = todayIso();
     const url = buildSearchUrl({
       query,
       // The hint is an implicit backend scope — echoing it here as an
@@ -428,8 +435,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       kinds: kindFilter,
       source: sourceFilter,
       videoId: scope?.videoId ?? null,
-      dateFrom: !everyDay && isValidDateParam(dateFrom) ? dateFrom : null,
-      dateTo: !everyDay && isValidDateParam(dateTo) ? dateTo : null,
+      dateFrom: fromOk ? dateFrom : null,
+      dateTo: toOk ? dateTo : fromOk ? today : null,
       lang: langFilter || null,
       username: userFilter || null,
       limit: SEARCH_LIMIT,
@@ -750,8 +757,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
           <button
             type="button"
             aria-pressed={everyDay}
-            onClick={() => setEveryDay((v) => !v)}
-            title="Every day: ignore the date range (picking a date unchecks this)"
+            onClick={() => {
+              // Unchecking with no range seeded starts from today — the
+              // toggle must have an immediate effect even before a date is
+              // picked (an empty range would behave exactly like every day).
+              if (everyDay && !dateFrom && !dateTo) setDateFrom(todayIso());
+              setEveryDay((v) => !v);
+            }}
+            title="Every day: ignore the date range. Off = filter by day — a start date without an end closes at today; unchecking with no dates starts from today"
             className={`shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
               everyDay
                 ? 'bg-white text-black border-white'
