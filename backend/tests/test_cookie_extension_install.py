@@ -67,6 +67,35 @@ def test_source_dir_under_appdata(tmp_path):
     assert _ext_src_dir().parent.name == "cookie-extension"
 
 
+def test_materialize_writes_drag_note(monkeypatch, tmp_path):
+    crx = _fake_crx(tmp_path)
+    monkeypatch.setenv("VODRIP_EXT_CRX", str(crx))
+    src = _materialize_ext_src()
+    note = src.parent / "drag this folder above.txt"
+    assert note.exists()
+    text = note.read_text(encoding="utf-8")
+    assert "VOD.RIP-cookies" in text and "drag" in text.lower()
+    # idempotent — a second materialize keeps the note
+    assert _materialize_ext_src() == src
+    assert note.exists()
+
+
+def test_reveal_opens_parent_folder(monkeypatch, tmp_path):
+    import asyncio
+
+    from routers import cookie_bridge as cb
+
+    crx = _fake_crx(tmp_path)
+    monkeypatch.setenv("VODRIP_EXT_CRX", str(crx))
+    opened = []
+    monkeypatch.setattr(cb.os, "startfile", lambda p: opened.append(p))
+    res = asyncio.run(cb.session_cookies_extension_reveal())
+    parent = cb._materialize_ext_src().parent
+    assert res["ok"] is True
+    assert opened == [str(parent)]
+    assert res["extension_dir"] == str(parent)
+
+
 def test_find_browser_prefers_program_files(monkeypatch, tmp_path):
     pf = tmp_path / "PF"
     (pf / "Google" / "Chrome" / "Application").mkdir(parents=True)

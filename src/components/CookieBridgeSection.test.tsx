@@ -12,7 +12,7 @@ const STATUS = {
 };
 
 const SOURCE = {
-  extension_dir: 'C:/AppData/VOD.RIP/cookie-extension/src',
+  extension_dir: 'C:/AppData/VOD.RIP/cookie-extension/VOD.RIP-cookies',
   ready: true,
   version: '0.7.2',
 };
@@ -67,7 +67,7 @@ describe('CookieBridgeSection extension install flow', () => {
     await screen.findByText('Open extensions');
     fireEvent.click(screen.getByText('Open extensions'));
     await waitFor(() => expect(calls.some((c) => c.includes('/extension/open'))).toBe(true));
-    await screen.findByText(/Drop the folder above onto the page/);
+    await screen.findByText(/Drop the VOD.RIP-cookies folder onto the page/);
     // "Developer mode" renders inside a styled span within the list item
     expect(screen.getByText('Developer mode')).toBeTruthy();
     expect(screen.getByText(/Open the extension popup on Kick or YouTube once/)).toBeTruthy();
@@ -81,7 +81,7 @@ describe('CookieBridgeSection extension install flow', () => {
     await screen.findByText('Open extensions');
     fireEvent.click(screen.getByText('Open extensions'));
     await screen.findByText(/no new tab opened/);
-    expect(screen.getByText(/Drop the folder above onto the page/)).toBeTruthy();
+    expect(screen.getByText(/Drop the VOD.RIP-cookies folder onto the page/)).toBeTruthy();
   });
 
   it('one click opens extensions AND reveals the folder', async () => {
@@ -93,7 +93,7 @@ describe('CookieBridgeSection extension install flow', () => {
       expect(calls.some((c) => c.includes('/extension/open'))).toBe(true);
       expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true);
     });
-    await screen.findByText(/Drop the folder above onto the page/);
+    await screen.findByText(/Drop the VOD.RIP-cookies folder onto the page/);
   });
 
   it('reveal failure still shows the checklist', async () => {
@@ -102,7 +102,7 @@ describe('CookieBridgeSection extension install flow', () => {
     await screen.findByText('Open extensions');
     fireEvent.click(screen.getByText('Open extensions'));
     await waitFor(() => expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true));
-    await screen.findByText(/Drop the folder above onto the page/);
+    await screen.findByText(/Drop the VOD.RIP-cookies folder onto the page/);
     expect(screen.queryByText(/No Chromium browser found/)).not.toBeInTheDocument();
   });
 

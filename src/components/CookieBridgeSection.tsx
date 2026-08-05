@@ -242,6 +242,7 @@ export default function CookieBridgeSection({
             <button
               type="button"
               onClick={() => void revealFolder()}
+              title="Opens the cookie-extension folder — grab the VOD.RIP-cookies folder inside"
               className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white"
             >
               <FolderOpen size={13} />
@@ -252,7 +253,8 @@ export default function CookieBridgeSection({
             ) : null}
           </div>
           <p className="text-xs text-zinc-400 font-mono leading-relaxed">
-            Drag this folder onto the extensions page (Developer mode ON):
+            Grab the <span className="text-zinc-200">VOD.RIP-cookies</span> folder (the one marked
+            “drag this folder above”) and drop it onto the extensions page (Developer mode ON):
             <br />
             <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>
@@ -267,7 +269,7 @@ export default function CookieBridgeSection({
                 <li>
                   Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
                 </li>
-                <li>Drop the folder above onto the page.</li>
+                <li>Drop the VOD.RIP-cookies folder onto the page.</li>
                 <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
               </ol>
             </>

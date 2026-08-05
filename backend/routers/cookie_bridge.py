@@ -174,6 +174,17 @@ def _ext_version() -> str:
     return _ext_version_cache[key]
 
 
+# Signpost the user drops alongside the extension folder in the parent dir —
+# "Show folder" opens the PARENT (cookie-extension/) so the user sees both the
+# folder to drag and a note marking it.
+_DRAG_NOTE_NAME = "drag this folder above.txt"
+_DRAG_NOTE_TEXT = (
+    "VOD.RIP-cookies is the folder to drag onto chrome://extensions "
+    "(Developer mode ON).\n"
+    "This note is just a reminder - drag the folder, not the note.\n"
+)
+
+
 def _ext_src_dir() -> Path:
     """Unpacked extension folder for drag-and-drop load (chrome://extensions).
 
@@ -196,7 +207,11 @@ def _materialize_ext_src() -> Path:
     src = _ext_src_dir()
     manifest = src / "manifest.json"
     crx = _ext_crx_path()
+    notes = src.parent / _DRAG_NOTE_NAME
     try:
+        src.parent.mkdir(parents=True, exist_ok=True)
+        if not notes.exists():
+            notes.write_text(_DRAG_NOTE_TEXT, encoding="utf-8")
         if manifest.exists() and crx.exists() and crx.stat().st_mtime <= manifest.stat().st_mtime:
             return src
         raw = crx.read_bytes()
@@ -366,20 +381,22 @@ async def session_cookies_extension_open():
 
 @router.post("/api/session/cookies/extension/reveal")
 async def session_cookies_extension_reveal():
-    """Open Explorer/finder at the unpacked extension folder."""
+    """Open Explorer/finder at the cookie-extension folder — the user sees the
+    VOD.RIP-cookies folder to drag PLUS the 'drag this folder above' note."""
     src = _materialize_ext_src()
     if not (src / "manifest.json").exists():
         raise HTTPException(status_code=404, detail="extension source not installed")
+    parent = src.parent
     try:
         if os.name == "nt":
-            os.startfile(str(src))
+            os.startfile(str(parent))
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(src)])
+            subprocess.Popen(["open", str(parent)])
         else:
-            subprocess.Popen(["xdg-open", str(src)])
+            subprocess.Popen(["xdg-open", str(parent)])
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"could not reveal folder: {exc}") from exc
-    return {"ok": True, "extension_dir": str(src)}
+    return {"ok": True, "extension_dir": str(parent)}
 
 
 @router.post("/api/session/cookies/enable")
