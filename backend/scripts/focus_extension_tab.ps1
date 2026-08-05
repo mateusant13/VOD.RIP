@@ -1,19 +1,50 @@
 ﻿<#
-focus_extension_tab.ps1 — switch an already-open chrome://extensions tab to the
-front instead of spawning a duplicate. Used by the Cookie Bridge "Open
-extensions" button.
+focus_extension_tab.ps1 — put the extensions manager in front of the user's
+browser. Used by the Cookie Bridge "Open extensions" button.
 
-Method: UI Automation. Chrome exposes its tab strip as TabItem elements whose
-Name is the (localized) page title, and TabItem supports SelectionItemPattern,
-so we can select the tab and raise its window — no CDP, no remote debugging.
+Two modes, in order:
+  1. REUSE — an extensions tab is already open somewhere: select that tab
+     (UI Automation TabItem + SelectionItemPattern, no CDP) and raise the
+     window, so a second click never spawns a duplicate.
+  2. DRIVE — no extensions tab open, but a real browser window exists:
+     focus the topmost one (Win32 z-order over the browser processes'
+     MainWindowHandle windows — Chrome's background-tab content windows are
+     deliberately ignored) and open the URL by keystroke (Ctrl+L -> paste ->
+     Enter). Command-line URL forwarding is NOT used: a running Chrome
+     silently drops chrome:// URLs handed off through its process singleton
+     (http(s) forward fine, chrome:// die), so we drive the omnibox the way
+     a human would. Headless/automation Chrome instances (--headless,
+     --remote-debugging*, custom --user-data-dir) are excluded — they are
+     tooling, never the user's browser.
 
 Exit codes:
   0 — an Extensions tab was found, selected, and its window raised
-  1 — no Extensions tab found (caller should open a new tab)
+  2 — no Extensions tab; a new tab was driven in the topmost browser window
+  1 — no real browser window found (caller should spawn a fresh browser)
+
+On exit 2 the script prints the driven browser's process name (chrome,
+msedge, brave) so the caller can report the right extension-manager URL.
 #>
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class FocusExtNative {
+  [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}
+"@
 
 # chrome://extensions page title per UI locale (top Chrome locales). If the
 # user's locale is missing here we fall back to opening a new tab — harmless.
@@ -29,15 +60,11 @@ $names = @(
 # Scope to Chrome-family browsers only — other apps (Explorer, terminals…)
 # also expose TabItem elements.
 $browsers = @('chrome', 'msedge', 'brave')
-$procNames = @{}
-foreach ($pn in (Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique)) {
-  if ($browsers -contains $pn.ToLower()) { $procNames[$pn.ToLower()] = $true }
-}
 
+# --- 1) reuse: select the already-open extensions tab -----------------------
 $tabCond = New-Object System.Windows.Automation.PropertyCondition(
   [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
   [System.Windows.Automation.ControlType]::TabItem)
-
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $match = $null
 try {
@@ -48,7 +75,7 @@ try {
       $procName = (Get-Process -Id $pidOf -ErrorAction SilentlyContinue).ProcessName
       if (-not $procName) { continue }
       $procName = $procName.ToLower()
-      if (-not $procNames.ContainsKey($procName)) { continue }
+      if (-not ($browsers -contains $procName)) { continue }
       $name = ($t.Current.Name -as [string]).Trim()
       if ($names -contains $name) { $match = $t; break }
     }
@@ -57,31 +84,116 @@ try {
   exit 1
 }
 
-if (-not $match) { exit 1 }
-
-try {
-  $sel = $match.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-  $sel.Select()
-} catch {
-  # Some Chromium builds expose tabs without a working selection pattern —
-  # treat as not-found so the caller opens a fresh tab.
-  exit 1
+if ($match) {
+  try {
+    $sel = $match.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    $sel.Select()
+  } catch {
+    # Some Chromium builds expose tabs without a working selection pattern —
+    # fall through to the drive path.
+    $match = $null
+  }
+  if ($match) {
+    # Raise the owning window (works even when minimized).
+    try {
+      $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+      $node = $walker.GetParent($match)
+      while ($node -and $node.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
+        $node = $walker.GetParent($node)
+      }
+      if ($node) {
+        try {
+          $wp = $node.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+          $wp.SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Normal)
+        } catch { }
+        $node.SetFocus()
+      }
+    } catch { }
+    exit 0
+  }
 }
 
-# Raise the owning window (works even when minimized).
-try {
-  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-  $node = $walker.GetParent($match)
-  while ($node -and $node.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
-    $node = $walker.GetParent($node)
+# --- 2) drive: open the URL by keystroke in the topmost REAL browser window --
+# Collect the browser processes' top-level windows first. Chrome also exposes
+# each tab's content as a top-level window (invisible for background tabs),
+# and automation tooling spawns headless instances with their own profiles —
+# both must never receive the keystrokes.
+$realWindows = @{}   # hwnd -> process name
+foreach ($p in Get-Process -ErrorAction SilentlyContinue | Where-Object { $browsers -contains $_.ProcessName.ToLower() }) {
+  $hw = $p.MainWindowHandle
+  if ($hw -eq 0) { continue }
+  $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue).CommandLine
+  if ($cl -and ($cl -match '--headless' -or $cl -match '--remote-debugging' -or $cl -match '--user-data-dir')) {
+    continue   # tooling browser, not the user's
   }
-  if ($node) {
-    try {
-      $wp = $node.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
-      $wp.SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Normal)
-    } catch { }
-    $node.SetFocus()
+  $realWindows[$hw] = $p.ProcessName.ToLower()
+}
+if ($realWindows.Count -eq 0) { exit 1 }
+
+$GW_HWNDNEXT = 2
+$target = [IntPtr]::Zero
+$targetProc = ''
+$fallback = [IntPtr]::Zero
+$fallbackProc = ''
+$h = [FocusExtNative]::GetTopWindow([IntPtr]::Zero)
+while ($h -ne [IntPtr]::Zero) {
+  if ($realWindows.ContainsKey($h)) {
+    if ([FocusExtNative]::IsWindowVisible($h) -and $target -eq [IntPtr]::Zero) {
+      $target = $h
+      $targetProc = $realWindows[$h]
+    } elseif (-not [FocusExtNative]::IsWindowVisible($h) -and $fallback -eq [IntPtr]::Zero) {
+      $fallback = $h
+      $fallbackProc = $realWindows[$h]
+    }
+  }
+  $h = [FocusExtNative]::GetWindow($h, $GW_HWNDNEXT)
+}
+if ($target -eq [IntPtr]::Zero) { $target = $fallback; $targetProc = $fallbackProc }
+if ($target -eq [IntPtr]::Zero) { exit 1 }
+
+$url = if ($targetProc -eq 'msedge') { 'edge://extensions' } else { 'chrome://extensions' }
+
+if ([FocusExtNative]::IsIconic($target)) {
+  [FocusExtNative]::ShowWindow($target, 9) | Out-Null   # SW_RESTORE
+  Start-Sleep -Milliseconds 400
+}
+# AttachThreadInput defeats Windows' foreground lock (a helper process may
+# not be allowed to steal focus from the app the user is clicking in).
+$tpid = 0
+[FocusExtNative]::GetWindowThreadProcessId($target, [ref]$tpid) | Out-Null
+$curTid = [FocusExtNative]::GetCurrentThreadId()
+[FocusExtNative]::AttachThreadInput($curTid, $tpid, $true) | Out-Null
+try {
+  [FocusExtNative]::SetForegroundWindow($target) | Out-Null
+  Start-Sleep -Milliseconds 500
+} finally {
+  [FocusExtNative]::AttachThreadInput($curTid, $tpid, $false) | Out-Null
+}
+if ([FocusExtNative]::GetForegroundWindow() -ne $target) { exit 1 }
+
+# Preserve whatever the user had on the clipboard — the paste clobbers it.
+$clipSaved = $null
+$clipHadText = $false
+try {
+  if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+    $clipSaved = [System.Windows.Forms.Clipboard]::GetText()
+    $clipHadText = $true
   }
 } catch { }
 
-exit 0
+try {
+  [System.Windows.Forms.SendKeys]::SendWait("^l")          # focus omnibox
+  Start-Sleep -Milliseconds 300
+  [System.Windows.Forms.Clipboard]::SetText($url)
+  Start-Sleep -Milliseconds 150
+  [System.Windows.Forms.SendKeys]::SendWait("^v")          # paste URL
+  Start-Sleep -Milliseconds 300
+  [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+} finally {
+  if ($clipHadText) {
+    try { [System.Windows.Forms.Clipboard]::SetText($clipSaved) } catch { }
+  }
+}
+
+Write-Output $targetProc
+exit 2

@@ -111,7 +111,7 @@ def test_open_extension_manager_launches_chrome(monkeypatch):
 
     fake = type("FakePath", (), {"__str__": lambda self: "C:/chrome.exe"})()
     monkeypatch.setattr(cb, "_find_browser", lambda name: fake if name == "chrome" else None)
-    monkeypatch.setattr(cb, "_focus_existing_extension_tab", lambda: False)
+    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: None)
     launched = {}
     with patch.object(subprocess, "Popen") as popen:
         res = _open_extension_manager()
@@ -125,7 +125,7 @@ def test_open_extension_manager_launches_chrome(monkeypatch):
 def test_open_extension_manager_reuses_open_tab(monkeypatch):
     from routers import cookie_bridge as cb
 
-    monkeypatch.setattr(cb, "_focus_existing_extension_tab", lambda: True)
+    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: ("reused", None))
     with patch.object(subprocess, "Popen") as popen:
         res = _open_extension_manager()
     assert res["launched"] is True
@@ -134,18 +134,31 @@ def test_open_extension_manager_reuses_open_tab(monkeypatch):
     popen.assert_not_called()
 
 
+def test_open_extension_manager_drives_running_browser(monkeypatch):
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: ("chrome", "chrome://extensions/"))
+    with patch.object(subprocess, "Popen") as popen:
+        res = _open_extension_manager()
+    assert res["launched"] is True
+    assert res["reused"] is False
+    assert res["browser"] == "chrome"
+    assert res["url"] == "chrome://extensions/"
+    popen.assert_not_called()
+
+
 def test_open_extension_manager_no_browser_returns_false(monkeypatch):
     from routers import cookie_bridge as cb
 
     monkeypatch.setattr(cb, "_find_browser", lambda name: None)
-    monkeypatch.setattr(cb, "_focus_existing_extension_tab", lambda: False)
+    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: None)
     res = _open_extension_manager()
     assert res["launched"] is False
     assert res["url"] is None
     assert res["reused"] is False
 
 
-def test_focus_existing_extension_tab_runs_bundled_script(monkeypatch, tmp_path):
+def test_activate_extension_tab_runs_bundled_script(monkeypatch, tmp_path):
     from routers import cookie_bridge as cb
 
     # The bundled ps1 must exist — it is the whole point of the helper.
@@ -156,23 +169,33 @@ def test_focus_existing_extension_tab_runs_bundled_script(monkeypatch, tmp_path)
     def fake_run(cmd, **kwargs):
         calls["cmd"] = cmd
         calls["timeout"] = kwargs.get("timeout")
-        return type("R", (), {"returncode": 0})()
+        return type("R", (), {"returncode": 0, "stdout": b""})()
     monkeypatch.setattr(cb.subprocess, "run", fake_run)
-    assert cb._focus_existing_extension_tab() is True
+    assert cb._activate_extension_tab() == ("reused", None)
     assert calls["cmd"][-2:] == ["-File", str(script)]
-    assert calls["timeout"] == 20
+    assert calls["timeout"] == 25
+
+    # exit 2 = a new tab was driven in the reported browser
+    monkeypatch.setattr(cb.subprocess, "run",
+                        lambda cmd, **kwargs: type("R", (), {"returncode": 2, "stdout": b"chrome\n"})())
+    assert cb._activate_extension_tab() == ("chrome", "chrome://extensions/")
+
+    # unknown browser on drive -> nothing usable, caller falls back to Popen
+    monkeypatch.setattr(cb.subprocess, "run",
+                        lambda cmd, **kwargs: type("R", (), {"returncode": 2, "stdout": b"weird\n"})())
+    assert cb._activate_extension_tab() is None
 
     def fake_run_fail(cmd, **kwargs):
-        return type("R", (), {"returncode": 1})()
+        return type("R", (), {"returncode": 1, "stdout": b""})()
     monkeypatch.setattr(cb.subprocess, "run", fake_run_fail)
-    assert cb._focus_existing_extension_tab() is False
+    assert cb._activate_extension_tab() is None
 
     monkeypatch.setattr(cb.subprocess, "run", lambda cmd, **kwargs: (_ for _ in ()).throw(OSError()))
-    assert cb._focus_existing_extension_tab() is False
+    assert cb._activate_extension_tab() is None
 
 
-def test_focus_existing_extension_tab_missing_script_returns_false(monkeypatch, tmp_path):
+def test_activate_extension_tab_missing_script_returns_none(monkeypatch, tmp_path):
     from routers import cookie_bridge as cb
 
     monkeypatch.setattr(Path, "is_file", lambda self: False)
-    assert cb._focus_existing_extension_tab() is False
+    assert cb._activate_extension_tab() is None

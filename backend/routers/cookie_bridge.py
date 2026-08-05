@@ -261,20 +261,24 @@ def _find_browser(name: str) -> Optional[Path]:
     return Path(shutil.which(name)) if shutil.which(name) else None
 
 
-def _focus_existing_extension_tab() -> bool:
-    """Bring an already-open chrome://extensions tab forward instead of
-    spawning a duplicate.
+def _activate_extension_tab() -> Optional[tuple[str, str]]:
+    """Put the extensions manager in front of the user's browser.
 
-    Uses UI Automation (scripts/focus_extension_tab.ps1): Chrome exposes its
-    tab strip as TabItem elements whose name is the localized page title, and
-    TabItem supports SelectionItemPattern, so we can select the tab and raise
-    its window without CDP or a remote-debugging port. Tab titles are matched
-    per locale (pt-BR Chrome calls the page "Extensões"); an unmatched locale
-    or a missing script simply reports False and the caller opens a fresh tab.
+    Runs scripts/focus_extension_tab.ps1, which first reuses an already-open
+    extensions tab (UIA TabItem select + window raise — no CDP), and if none
+    is open, drives a new tab by keystroke (Ctrl+L -> paste -> Enter) into
+    the topmost running browser window. The keystroke path exists because a
+    running Chrome silently drops chrome:// URLs handed off through its
+    process singleton (http(s) forward fine, chrome:// die), so launching
+    chrome.exe with the URL only works when no browser is running yet.
+
+    Returns ("reused", None) when an existing tab was focused, or
+    (browser_name, url) when a new tab was driven; None when no browser
+    window exists (caller should spawn a fresh browser instance).
     """
     script = Path(__file__).resolve().parent.parent / "scripts" / "focus_extension_tab.ps1"
     if not script.is_file():
-        return False
+        return None
     try:
         proc = subprocess.run(
             [
@@ -287,18 +291,33 @@ def _focus_existing_extension_tab() -> bool:
                 str(script),
             ],
             capture_output=True,
-            timeout=20,
+            timeout=25,
         )
-        return proc.returncode == 0
+        if proc.returncode == 0:
+            return ("reused", None)
+        if proc.returncode == 2:
+            browser = (proc.stdout or b"").decode("utf-8", "replace").strip().lower()
+            url = _EXT_MANAGER_URLS.get(browser)
+            if url:
+                return (browser, url)
+            return None
+        return None
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
 
 
 def _open_extension_manager() -> dict:
     """Activate the extensions-manager tab: reuse an already-open one, else
-    launch a fresh tab in the default chromium-family browser."""
-    if _focus_existing_extension_tab():
-        return {"launched": True, "browser": None, "url": None, "reused": True}
+    drive a new tab into a running browser, else launch a fresh browser
+    instance with the URL."""
+    activated = _activate_extension_tab()
+    if activated:
+        if activated[0] == "reused":
+            return {"launched": True, "browser": None, "url": None, "reused": True}
+        browser, url = activated
+        return {"launched": True, "browser": browser, "url": url, "reused": False}
+    # No browser window is running (or the drive failed) — spawning chrome.exe
+    # with the URL works here because a fresh instance opens it directly.
     for name, url in _EXT_MANAGER_URLS.items():
         path = _find_browser(name)
         if not path:
