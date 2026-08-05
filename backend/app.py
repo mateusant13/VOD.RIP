@@ -127,18 +127,11 @@ async def _app_lifespan(_app: FastAPI):
             cookies_from_browser=getattr(s, "youtube_cookies_browser", "") or "",
         )
 
-        # Live-status warm — pre-populate the /api/channels/{id}/live cache so
-        # the first user request after server start returns in O(1) instead of
-        # paying the full 3-5s YouTube/Twitch extract on the critical path.
-        # ponytail: a 4-worker pool inside the warm module bounds concurrency
-        # so 20 saved channels don't slam YouTube at boot.
+        # Live-status warm runs FIRST on its own daemon thread (see lifespan
+        # _warm_live_guarded) — never inside the yt-warm daemon, which waits
+        # for the sync-first-wave YouTube warm before it gets here.
         if _warm_shutdown.is_set():
             return
-        try:
-            from routers.live import warm_all_saved_channel_live_status
-            # warm_all_saved_channel_live_status()  # frontend polls on tab open
-        except Exception:
-            logger.debug("Live status warm skipped", exc_info=True)
 
     # _warm_first_wave_sync is defined OUTSIDE _warm_youtube at lifespan
     # scope so both the daemon thread and the blocking lifespan warm can
@@ -394,6 +387,26 @@ async def _app_lifespan(_app: FastAPI):
 
     _lifespan_ready = threading.Event()
     _warm_shutdown = threading.Event()
+
+    def _warm_live_guarded() -> None:
+        """Live-status warm — pre-populates the /api/channels/{id}/live cache
+        so the first Channels-tab poll after boot hits O(1) instead of paying
+        the 3-5s Kick/Twitch/YouTube extract on the request path.
+
+        Fires FIRST on its own daemon thread — before/parallel to the yt-warm
+        sync wave — and never blocks API readiness: the router serves an
+        empty + schedules a background refresh for any channel this warm
+        hasn't reached yet.
+        """
+        try:
+            from routers.live import warm_all_saved_channel_live_status
+
+            if not _warm_shutdown.is_set():
+                warm_all_saved_channel_live_status()
+        except Exception:
+            logger.debug("Live status warm skipped", exc_info=True)
+
+    threading.Thread(target=_warm_live_guarded, daemon=True, name="live-warm").start()
 
     def _warm_youtube_guarded() -> None:
         """Wrap _warm_youtube so it checks shutdown before submitting to pools."""

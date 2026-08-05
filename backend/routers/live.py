@@ -119,70 +119,118 @@ _LIVE_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _LIVE_STATUS_TTL_SEC = 60.0
 # Serving a "LIVE" badge older than this is a lie: when refreshes keep
 # failing (platform outage, parse breakage) the stale-serve path must stop
-# returning ancient payloads and report unknown (empty) instead.
-_LIVE_STATUS_MAX_STALE_SEC = 600.0
+# returning ancient payloads and report unknown (empty) instead. Kept equal
+# to the TTL so a failed refresh at most one cycle behind (see endpoint).
+_LIVE_STATUS_MAX_STALE_SEC = 60.0
 _LIVE_STATUS_LOCK = threading.Lock()
 _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
+# Platform fetches inside one channel run concurrently across this pool (the
+# warm pool + this pool bound total concurrency: 4 channels x 3 platforms
+# queue onto 6 workers). Kick/Twitch/YouTube are independent CDNs/APIs, so
+# serializing them per channel only multiplied wall time for no reason.
+_PLATFORM_FETCH_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="live-platform")
 
 
 def _fetch_channel_live_payload(channel: dict) -> dict:
     """Build the response payload for a single channel's live status.
 
-    Reads all three platform fetchers (Kick/Twitch/YouTube) sequentially —
-    YouTube is the slowest so it dominates wall time, but the per-channel
-    fetch is parallel across the pool. The returned dict matches the live
-    router response: ``{"live": [...], "channel_id": ...}``.
+    Kicks off the channel's three platform fetchers (Kick/Twitch/YouTube)
+    CONCURRENTLY on the shared platform pool — serializing them cost
+    sum(3-15s) per channel instead of max(3-15s). The returned dict matches
+    the live router response: ``{"live": [...], "channel_id": ...}``.
     """
-    live: list[dict] = []
     ks = (channel.get("kickSlug") or "").strip()
-    if ks:
-        info = kick_live_info(ks)
-        if info and info.get("url"):
-            live.append({
-                "is_live": True,
-                "platform": "Kick",
-                "title": info.get("title", ""),
-                "viewers": info.get("viewers", 0),
-                "url": info.get("url", ""),
-                "headers": info.get("headers", {}),
-                "type": "hls",
-            })
     ts = (channel.get("twitchSlug") or "").strip()
-    if ts:
-        info = twitch_live_info(ts)
-        if info and info.get("url"):
-            live.append({
-                "is_live": True,
-                "platform": "Twitch",
-                "title": info.get("title", ""),
-                "viewers": info.get("viewers", 0),
-                "url": info.get("url", ""),
-                "headers": info.get("headers", {}),
-                "type": "hls",
-                # vaft rotation extras — frontend ignores unknown keys.
-                "player_type": info.get("player_type", "embed"),
-                "ad_free": bool(info.get("ad_free")),
-                # ISO/epoch stream start — archive chat watchdog anchors
-                # message offsets to it. Frontend ignores unknown keys.
-                "started_at": info.get("started_at"),
-            })
     ys = (channel.get("youtubeSlug") or "").strip()
+
+    jobs: list[tuple[str, "object"]] = []
+    if ks:
+        jobs.append(("kick", _PLATFORM_FETCH_POOL.submit(kick_live_info, ks)))
+    if ts:
+        jobs.append(("twitch", _PLATFORM_FETCH_POOL.submit(twitch_live_info, ts)))
     if ys:
-        info = youtube_live_info(ys)
-        if info and isinstance(info, dict) and info.get("url"):
-            live.append({
-                "is_live": True,
-                "platform": "YouTube",
-                "title": info.get("title", ""),
-                "viewers": info.get("viewers", 0),
-                "url": info.get("url", ""),
-                "headers": info.get("headers", {}),
-                "type": "hls",
-                # Real videoId — archive watchdog anchors chat-capture video
-                # rows to it. Frontend ignores unknown keys.
-                "videoId": info.get("videoId"),
-            })
+        jobs.append(("youtube", _PLATFORM_FETCH_POOL.submit(youtube_live_info, ys)))
+
+    # Settle all futures; re-raise the first platform error in slug order
+    # (kick before twitch before youtube), matching the old sequential path's
+    # failure semantics so a dead platform still fails the whole refresh.
+    infos: dict[str, dict] = {}
+    first_exc: Optional[BaseException] = None
+    for plat, fut in jobs:
+        try:
+            info = fut.result()
+        except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
+            continue
+        if info and isinstance(info, dict):
+            infos[plat] = info
+    if first_exc is not None:
+        raise first_exc
+
+    live: list[dict] = []
+    kick_info = infos.get("kick")
+    if kick_info and kick_info.get("url"):
+        live.append({
+            "is_live": True,
+            "platform": "Kick",
+            "title": kick_info.get("title", ""),
+            "viewers": kick_info.get("viewers", 0),
+            "url": kick_info.get("url", ""),
+            "headers": kick_info.get("headers", {}),
+            "type": "hls",
+        })
+    tw_info = infos.get("twitch")
+    if tw_info and tw_info.get("url"):
+        live.append({
+            "is_live": True,
+            "platform": "Twitch",
+            "title": tw_info.get("title", ""),
+            "viewers": tw_info.get("viewers", 0),
+            "url": tw_info.get("url", ""),
+            "headers": tw_info.get("headers", {}),
+            "type": "hls",
+            # vaft rotation extras — frontend ignores unknown keys.
+            "player_type": tw_info.get("player_type", "embed"),
+            "ad_free": bool(tw_info.get("ad_free")),
+            # ISO/epoch stream start — archive chat watchdog anchors
+            # message offsets to it. Frontend ignores unknown keys.
+            "started_at": tw_info.get("started_at"),
+        })
+    yt_info = infos.get("youtube")
+    if yt_info and yt_info.get("url"):
+        live.append({
+            "is_live": True,
+            "platform": "YouTube",
+            "title": yt_info.get("title", ""),
+            "viewers": yt_info.get("viewers", 0),
+            "url": yt_info.get("url", ""),
+            "headers": yt_info.get("headers", {}),
+            "type": "hls",
+            # Real videoId — archive watchdog anchors chat-capture video
+            # rows to it. Frontend ignores unknown keys.
+            "videoId": yt_info.get("videoId"),
+        })
     return {"live": live, "channel_id": str(channel.get("id") or "")}
+
+
+def _fetch_or_cached_channel_live_payload(
+    channel: dict, max_age_sec: float = _LIVE_STATUS_TTL_SEC
+) -> dict:
+    """Cached payload when fresher than ``max_age_sec``, else a blocking
+    refresh (which also populates the shared cache).
+
+    Used by the archive chat watchdog: it must see current live state to
+    start/stop captures, but must NOT duplicate the warm pool / frontend
+    poll's work — a cache entry the poll just refreshed is reused as-is.
+    """
+    cid = str(channel.get("id") or "")
+    now = time.monotonic()
+    with _LIVE_STATUS_LOCK:
+        cached = _LIVE_STATUS_CACHE.get(cid)
+        if cached and (now - cached[0]) < max_age_sec:
+            return cached[1]
+    return _refresh_channel_live_cache(cid, channel)
 
 
 def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
@@ -260,9 +308,12 @@ def channel_live_status(channel_id: str) -> dict:
     """Aggregate live status for a saved channel across all platforms.
 
     Returns the cached payload (warm or last-refreshed) immediately and
-    kicks a background refresh if the entry is older than the TTL. The
-    response shape is unchanged from the prior synchronous version so the
-    existing frontend contract holds: ``{"live": [...], "channel_id": ...}``.
+    kicks a background refresh if the entry is older than the TTL — the
+    request thread NEVER blocks on a platform extract (worst case 3-15s).
+    On a true cache miss it returns an empty payload and lets the warm pool
+    fill the cache; the frontend's next poll (60s TTL) then hits the
+    refreshed entry. The response shape is unchanged from the prior
+    synchronous version: ``{"live": [...], "channel_id": ...}``.
     """
     settings = settings_mgr.get()
     channel: Optional[dict] = None
@@ -276,29 +327,31 @@ def channel_live_status(channel_id: str) -> dict:
 
     cid = str(channel_id)
     now = time.monotonic()
-    stale = True
     with _LIVE_STATUS_LOCK:
         cached = _LIVE_STATUS_CACHE.get(cid)
+
     if cached:
         ts, payload = cached
-        stale = (now - ts) >= _LIVE_STATUS_TTL_SEC
-        if not stale:
+        if (now - ts) < _LIVE_STATUS_TTL_SEC:
             return payload
-
-    if stale:
-        # Cache miss or stale. If we have *some* cached payload (stale) serve
-        # it now and refresh in the background — best UX: the user always sees
-        # last-known state within milliseconds. Beyond the max-stale bound the
-        # cached state is too old to trust — block on a synchronous refresh
-        # like a true cache miss.
-        if cached and (now - cached[0]) < _LIVE_STATUS_MAX_STALE_SEC:
-            try:
-                _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
-            except Exception:
-                logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
-            return cached[1]
-        payload = _refresh_channel_live_cache(cid, channel)
+        # Stale: serve last-known only within the max-stale bound (never a
+        # days-old "LIVE" lie); older than that report unknown (empty). Either
+        # way the refresh happens in the background — never in this thread.
+        if (now - ts) >= _LIVE_STATUS_MAX_STALE_SEC:
+            payload = {"live": [], "channel_id": cid}
+        try:
+            _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
+        except Exception:
+            logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
         return payload
+
+    # True cold miss (boot before the warm finishes): return empty instantly
+    # and schedule the background refresh.
+    try:
+        _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
+    except Exception:
+        logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
+    return {"live": [], "channel_id": cid}
 
 
 # ---------------------------------------------------------------------------
