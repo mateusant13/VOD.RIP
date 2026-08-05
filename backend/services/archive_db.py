@@ -2103,9 +2103,13 @@ def _titles_search(
 
     Titles are short and the videos table is small (hundreds of rows), so a
     pure-Python pass is cheaper than an FTS5 titles index. A query token
-    matches when it is a substring of a title token (or vice-versa for
-    tokens ≥3 chars — "estranheza" finds "ESTRANHEZA"). Score = fraction of
-    query tokens matched. ponytail: when videos grows past ~10k rows, move
+    matches when it equals a title token, is an edit-distance-1 ASR variant
+    of one (_tok_eq), or is a ≥4-char PREFIX of one ("estranh" finds
+    "ESTRANHEZA"). The reverse substring never matches: "cara"/"car" inside
+    a "caralho" query must not pull titles like "Pé na porta, I.A. na
+    cara!" — that surfaced partial=False noise at rank 1.0 above real
+    fuzzy chat hits. Score = fraction of query tokens matched. ponytail:
+    when videos grows past ~10k rows, move
     to an FTS5 external-content titles table with a unicode61 tokenizer and
     reuse the tier/merge machinery of the content tables."""
     q_tokens = _fold_tokens(q)
@@ -2154,7 +2158,7 @@ def _titles_search(
         matched = sum(
             1
             for qt in q_tokens
-            if any(qt in tt or (len(tt) >= 3 and tt in qt) for tt in toks)
+            if any(tt == qt or (len(qt) >= 4 and qt in tt) or _tok_eq(tt, qt) for tt in toks)
         )
         if not matched:
             continue
@@ -2383,6 +2387,19 @@ def _username_only_search(
         }
         for r in query(sql, params)
     ]
+
+
+def _consonant_skeleton(text: str) -> str:
+    """Consonant skeleton of a word: accent-folded, vowels stripped.
+
+    Two words that differ only in their vowels share it — 'nautilus' /
+    'nutilos' (a Brazilian mishearing the ASR layer must bridge) — while
+    consonant-altering neighbors ('caralho' / 'cavalo') never do. Used by
+    the fuzzy admission gate to separate vowel-mishearing bridges from
+    fold-collapsed noise."""
+    return "".join(
+        c for c in str(text or "").translate(_ACCENT_FOLD) if c.isalpha() and c not in "aeiou"
+    )
 
 
 def _tok_eq(a: str, b: str) -> bool:
@@ -2752,6 +2769,8 @@ _vocab_cache: dict[str, tuple[str, float, dict[int, list[tuple[str, int]]], int]
 # query token -> (expanded_at_monotonic, [terms, ...])
 _token_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 _vocab_generation: dict[str, int] = {}
+# tables with a background vocab rebuild in flight (search-latency guard)
+_vocab_rebuild_pending: set[str] = set()
 
 
 def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
@@ -2771,7 +2790,39 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
             cur = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
             if cur == hit[3]:
                 return hit[2]
-            hit = None  # rows changed since load — rebuild the vocab
+            # Corpus grew since the snapshot (live chat lands between
+            # searches): serve the STALE vocab right now — the rebuild is a
+            # 25k-row GROUP BY worth ~600ms on a 200k-message archive and
+            # must never sit in the search response — and refresh in the
+            # background. The generation bump on completion invalidates
+            # per-token expansions, so new chat words stay reachable within
+            # a TTL, not after it.
+            if table not in _vocab_rebuild_pending:
+                _vocab_rebuild_pending.add(table)
+                threading.Thread(
+                    target=_rebuild_vocab, args=(table, now), daemon=True
+                ).start()
+            return hit[2]
+    return _load_vocab_uncached(table, now)
+
+
+def _rebuild_vocab(table: str, loaded_at: float) -> None:
+    """Background vocab rebuild — keeps the search request path free of the
+    fts5vocab GROUP BY. One in-flight rebuild per table."""
+    try:
+        _load_vocab_uncached(table, loaded_at)
+    except Exception:
+        logger.warning("background vocab rebuild failed for %s", table, exc_info=True)
+    finally:
+        with _vocab_lock:
+            _vocab_rebuild_pending.discard(table)
+
+
+def _load_vocab_uncached(
+    table: str, now: float
+) -> Optional[dict[int, list[tuple[str, int]]]]:
+    """The rebuild body: recreate the fts5vocab view if needed, read the
+    top-N tokens bucketed by length, and store the snapshot."""
     get_conn().execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
         f"USING fts5vocab({table}_fts, 'row')"
@@ -3097,6 +3148,38 @@ def _token_expansions(
                 # intended fuzzy target; the legit tail peaks at 'chaco'
                 # 570. Exact/fold-equal (dist 0) always survive.
                 if dist >= 1 and merged_freq.get(term, 0) > _SUPPRESS_DIST1_FREQ:
+                    continue
+                # R4: admission gate — a fuzzy candidate must be near on the
+                # RAW spelling, not just the phonetic fold. The fold
+                # collapses distinct words ('caralho'->'karalu' is raw-3
+                # from 'cavalo'/'carrasco', fold-1), so fold-only neighbors
+                # flood the tier-1 OR pattern with unrelated terms. Survive
+                # the gate: fold-EQUAL candidates (fd == 0 — the deliberate
+                # phonetic bridges: 'yasuo'~'iaso', demoted from tier 0 by
+                # the purity rule above); raw <= 1 (true typos/ASR
+                # variants: 'estranheza'~'estranhesa'); raw <= 2 sharing a
+                # 3-char prefix (partial-word stretches: 'caraio'->'cara',
+                # 'estranheza'->'estranha'); and raw <= 2 with an equal
+                # CONSONANT skeleton (vowel-mishearing bridges:
+                # 'nautilus'~'nutilos' — 'caralho'/'cavalo' differ in
+                # consonants and stay out). Everything else is fold-collapse
+                # noise and is dropped.
+                if dist >= 1 and not (
+                    fd == 0
+                    or (
+                        d is not None
+                        and (
+                            d <= 1
+                            or (
+                                d <= 2
+                                and (
+                                    token[:3] == term[:3]
+                                    or _consonant_skeleton(token) == _consonant_skeleton(term)
+                                )
+                            )
+                        )
+                    )
+                ):
                     continue
                 cur = best.get(term)
                 if cur is None or (dist, -freq) < cur:

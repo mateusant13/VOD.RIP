@@ -162,3 +162,125 @@ def test_and_tier_any_order(scratch):
     hits = db.search("estranheza vale", limit=20)
     row = next(h for h in hits if "estranheza veio depois do vale" in h.get("text", ""))
     assert row["partial"] is False, "all words present regardless of order"
+
+
+# --- fuzzy admission gate (R4) -------------------------------------------
+
+def test_fuzzy_gate_blocks_fold_only_neighbors(scratch):
+    """'caralho' must not expand to 'cavalo'/'carrasco' — those are fold-
+    near but raw-far (raw Damerau 3); the phonetic fold collapses distinct
+    words and used to flood the tier-1 OR pattern with unrelated hits."""
+    for vid, text in (
+        ("fz1", "que cavalo bonito"),
+        ("fz2", "o carrasco não perdoa"),
+        ("fz3", "caralho que jogada"),
+    ):
+        db.insert_transcript(
+            "youtube", vid,
+            [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": text, "words": []}],
+            lang="pt",
+        )
+    terms = dict(db._expand_query("caralho", ["transcripts"]))
+    assert "cavalo" not in terms, "fold-only neighbor must not expand"
+    assert "carrasco" not in terms, "fold-only neighbor must not expand"
+    hits = db.search("caralho", limit=20)
+    texts = [h.get("text", "").lower() for h in hits]
+    assert any("caralho que jogada" in t for t in texts)
+    assert not any("cavalo" in t for t in texts)
+    assert not any("carrasco" in t for t in texts)
+
+
+def test_fuzzy_gate_keeps_true_typos_and_prefix_stretch(scratch):
+    """Raw-near variants still expand: 'estranheza'->'estranhesa' (raw 1)
+    and 'caraio'->'cara' (raw 2 + shared 3-char prefix)."""
+    db.insert_transcript(
+        "youtube", "ty1",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "aquela estranhesa de sempre, coisa estranha", "words": []}],
+        lang="pt",
+    )
+    db.insert_transcript(
+        "youtube", "ty2",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "cara que loucura carai", "words": []}],
+        lang="pt",
+    )
+    terms = dict(db._expand_query("estranheza", ["transcripts"]))
+    assert terms.get("estranhesa") == 1, "raw dist-1 ASR variant kept"
+    terms = dict(db._expand_query("caraio", ["transcripts"]))
+    assert terms.get("carai") == 1, "raw dist-1 typo kept"
+    # Raw dist-2 + shared 3-char prefix: 'estranheza'->'estranha' (same
+    # word family, ASR variant) survives the admission gate.
+    terms = dict(db._expand_query("estranheza", ["transcripts"]))
+    assert terms.get("estranha") == 2, "raw dist-2 prefix stretch kept"
+
+
+# --- title pass predicate -------------------------------------------------
+
+def test_title_no_reverse_substring(scratch):
+    """'caralho' must not match a title containing 'cara' or 'car': the old
+    bidirectional-substring rule surfaced 'Pé na porta, I.A. na cara!' at
+    score 1.0 above real fuzzy chat hits."""
+    db.upsert_video({
+        "platform": "youtube", "video_id": "tnoise", "channel": "chan",
+        "title": "Pé na porta, I.A. na cara! | Gaveta", "canonical_key": "chan-tnoise",
+    })
+    db.upsert_video({
+        "platform": "youtube", "video_id": "tgood", "channel": "chan",
+        "title": "CARALHO O QUE ACONTECEU", "canonical_key": "chan-tgood",
+    })
+    hits = db.search("caralho", limit=20)
+    title_hits = [h for h in hits if h["kind"] == "title"]
+    texts = [h.get("text", "").lower() for h in title_hits]
+    assert any("caralho o que aconteceu" in t for t in texts)
+    assert not any("na cara" in t for t in texts), "reverse substring must not match"
+
+
+def test_title_prefix_and_asr_variants(scratch):
+    """Partial-word prefixes ('estranh' -> 'ESTRANHEZA') and dist-1 ASR
+    variants ('estranheza' ~ 'estranhesa') still match titles."""
+    db.upsert_video({
+        "platform": "youtube", "video_id": "tp1", "channel": "chan",
+        "title": "ESTRANHEZA TOTAL", "canonical_key": "chan-tp1",
+    })
+    db.upsert_video({
+        "platform": "youtube", "video_id": "tp2", "channel": "chan",
+        "title": "A ESTRANHESA DO DIA", "canonical_key": "chan-tp2",
+    })
+    for q in ("estranh", "estranheza"):
+        hits = db.search(q, limit=20)
+        title_texts = [h.get("text", "").lower() for h in hits if h["kind"] == "title"]
+        assert any("estranheza total" in t for t in title_texts), q
+        assert any("estranhesa do dia" in t for t in title_texts), q
+
+
+# --- search-first vocab reload -------------------------------------------
+
+def test_vocab_stale_served_and_background_rebuild(scratch):
+    """A corpus row-count change must not block the next search with the
+    25k-row vocab rebuild: the stale vocab is served immediately and the
+    rebuild lands in the background (generation bumps, cache updates)."""
+    before = dict(db._expand_query("vale", ["transcripts"]))
+    cached_count = db._vocab_cache["transcripts"][3]
+    db.insert_transcript(
+        "youtube", "vw",
+        [{"seg_idx": 99, "start_sec": 99.0, "end_sec": 100.0,
+          "text": "zorknovo surgiu aqui", "words": []}],
+        lang="pt",
+    )
+    # Serving stale: the NEXT lookup sees the count mismatch, returns the
+    # cached vocab immediately (row count still the OLD one), and schedules
+    # a background rebuild whose snapshot eventually catches up.
+    import time as _t
+    db._expand_query("vale", ["transcripts"])  # count mismatch observed here
+    assert db._vocab_cache["transcripts"][3] == cached_count, "stale served, not rebuilt inline"
+    n = db.query("SELECT COUNT(*) AS n FROM transcripts")[0]["n"]
+    assert n == cached_count + 1, "insert landed"
+    deadline = _t.monotonic() + 10.0
+    while db._vocab_cache["transcripts"][3] != n and _t.monotonic() < deadline:
+        _t.sleep(0.05)
+    assert db._vocab_cache["transcripts"][3] == n, "background rebuild catches up"
+    # The new word is reachable once the rebuilt vocab knows it.
+    terms = dict(db._expand_query("zorknovo", ["transcripts"]))
+    assert terms.get("zorknovo") == 0
+    assert before  # sanity: the stale snapshot was non-empty

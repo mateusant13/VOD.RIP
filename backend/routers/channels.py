@@ -5,6 +5,7 @@ Channel browsing routes — VODs and clips for saved Kick/Twitch channels.
 import asyncio
 import functools
 import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -28,6 +29,7 @@ from deps import (
 from services.archive_db import (
     channel_snapshot_age_sec,
     list_videos,
+    query,
     touch_channel_snapshot,
     upsert_channel_video,
 )
@@ -99,6 +101,56 @@ def _cache_channel_payload(key: str, payload: dict) -> dict:
         return payload
     set_cached(key, payload)
     return payload
+
+
+# Max chat backfills kicked per channel VOD-list ingest. A small burst: the
+# lazy search/preview kicks cover the long tail; this only front-loads the
+# freshest chat-less VODs so they are indexed "at ingest".
+_INGEST_KICK_BURST = 4
+
+
+def _kick_ingest_chat_backfills(items: list, channel: str) -> int:
+    """Ingest-time Twitch chat backfill: kick _kick_backfill for a small
+    burst of freshly-persisted chat-less VODs so chat is indexed at ingest
+    instead of on the first search/preview (which pays the lazy delay).
+
+    Selects the newest _INGEST_KICK_BURST numeric-id Twitch items that have
+    no chat rows yet, then delegates each to routers.archive._kick_backfill
+    (its inflight + per-video cooldown gates decide what actually starts;
+    the shared search-kick throttle _AUTO_KICK_MIN_GAP_S is intentionally
+    NOT touched, so ingest kicks never consume the search budget). Never
+    raises: a failure here must not break the channel fetch. Returns how
+    many kicks were queued."""
+    try:
+        from routers.archive import _kick_backfill  # lazy: avoid import cycle
+
+        def _ts(v: dict) -> float:
+            dt = parse_video_date(v.get("created_at"))
+            return dt.timestamp() if dt else 0.0
+
+        # Item platform key is the UI label ('Twitch'); the numeric-id gate
+        # is the same one kick_preview_backfill uses (watchdog synthetic ids
+        # like 'twitch-live-<slug>-<ts>' have no real video behind them).
+        candidates = [
+            v for v in items
+            if (str(v.get("platform") or "").lower() == "twitch")
+            and re.fullmatch(r"[0-9]+", str(v.get("id") or ""))
+        ]
+        candidates.sort(key=_ts, reverse=True)
+        queued = 0
+        for v in candidates[:_INGEST_KICK_BURST]:
+            vid = str(v.get("id") or "")
+            if query(
+                "SELECT 1 FROM messages WHERE platform='twitch' AND video_id=? LIMIT 1",
+                (vid,),
+            ):
+                continue  # chat already indexed
+            if _kick_backfill(vid, channel) == "queued":
+                queued += 1
+        return queued
+    except Exception:
+        logger.debug("ingest chat backfill kick failed", exc_info=True)
+        return 0
 
 
 async def _gather_channel_clips(
@@ -568,6 +620,11 @@ async def channel_videos(
                     "views": v.get("views"),
                     "thumbnail_url": v.get("thumbnail_url") or v.get("thumbnail"),
                 })
+            if archive_platform == "twitch":
+                # Ingest-time chat backfill: fire-and-forget kick for the
+                # chat-less VODs just persisted (sync + fast; the helper
+                # never raises, so indexing can't break the fetch).
+                _kick_ingest_chat_backfills(items, channel)
             if clue:
                 persist_platform_clue(archive_platform, channel, clue)
             if items and snap_key:
