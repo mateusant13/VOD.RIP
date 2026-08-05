@@ -358,6 +358,14 @@ def _try_innertube_info(
         return None
 
 
+# Least bot-gated YouTube player-client ladder, shared by preview and full
+# downloads. android_vr/android are least bot-gated (no POT needed) and still
+# expose a muxed 360p + adaptive ladder; web_safari stays as POT last-resort.
+# ponytail: yt-dlp queries every listed client sequentially and merges, so a
+# hard-walled video pays per-client time before failing (5 clients ~= 24s).
+YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android_vr", "android", "web_safari"]
+
+
 def youtube_preview_ytdl_opts(
     full_url: str,
     oauth: Optional[str] = None,
@@ -405,13 +413,11 @@ def youtube_preview_ytdl_opts(
                 auto_auth = True
 
     extractor_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
-    # Preview needs ONE working client fast; downloads keep the full merged
-    # ladder. android_vr/android are least bot-gated (no POT needed) and still
-    # expose a muxed 360p + adaptive ladder; web_safari stays as POT last-resort.
-    # ponytail: yt-dlp queries every listed client sequentially and merges, so a
-    # hard-walled video pays per-client time before failing (5 clients ~= 24s).
+    # Preview needs ONE working client fast; full downloads mirror this exact
+    # ladder (YOUTUBE_LEAST_GATED_PLAYER_CLIENTS) so a video that previews on
+    # this network can also download without the android/web DASH throttle.
     yt_args = dict((extractor_args.get("youtube") or {}))
-    yt_args["player_client"] = ["android_vr", "android", "web_safari"]
+    yt_args["player_client"] = list(YOUTUBE_LEAST_GATED_PLAYER_CLIENTS)
     extractor_args = dict(extractor_args)
     extractor_args["youtube"] = yt_args
     if fast_only:

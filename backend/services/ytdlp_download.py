@@ -49,6 +49,7 @@ from services.ytdlp_hls import (
     _pick_format_by_height,
     prefer_height_from_quality,
     HLS_DOWNLOAD_PROGRESS_CAP,
+    YOUTUBE_LEAST_GATED_PLAYER_CLIENTS,
 )
 from services.ytdlp_cache import _get_cache_dir, _prune_cache_dir
 from services.os_services import _NO_WINDOW
@@ -771,12 +772,19 @@ def _build_ydl_opts(
         if cookie_path:
             opts["cookies"] = cookie_path
 
-    # Enable POT (Proof of Origin Token) as anti-bot measure for YouTube
+    # Enable POT (Proof of Origin Token) as anti-bot measure for YouTube.
+    # Mirror the preview ladder exactly (YOUTUBE_LEAST_GATED_PLAYER_CLIENTS):
+    # android_vr is the least bot-gated client (no POT needed) and the one the
+    # preview demonstrably uses; the old android/web ladder is what YouTube
+    # throttles to ~0 B/s on some networks (4:13 VOD zZeycndzX24 stalled at
+    # fragment 438-444 while its android_vr preview played in ~1.8s).
     if "youtube" in url.lower() and not opts.get("cookies"):
         opts["po_token"] = ["web+default", "android+default"]
         opts["extractor_args"] = opts.get("extractor_args", {})
         opts["extractor_args"].setdefault("youtube", {})
-        opts["extractor_args"]["youtube"]["player_client"] = ["android", "web"]
+        opts["extractor_args"]["youtube"]["player_client"] = list(
+            YOUTUBE_LEAST_GATED_PLAYER_CLIENTS
+        )
 
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
