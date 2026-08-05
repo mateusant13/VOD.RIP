@@ -224,9 +224,15 @@ class YTLiveSink(ChatSink):
             # to the final name when the stream ends; follow the newest file.
             hits = _chat_files(tmpdir)
             if hits and hits[-1] != chat_path:
+                # yt-dlp renames the .part file it was streaming into (atomic
+                # move), so the final file is the SAME data. Reopen at the
+                # saved position — reopening from byte 0 would re-send the
+                # whole chat into the archive and duplicate every message.
+                pos = chat_file.tell()
                 chat_file.close()
                 chat_path = hits[-1]
                 chat_file = chat_path.open("r", encoding="utf-8", errors="replace")
+                chat_file.seek(pos)
                 continue
             if not worker.is_alive():
                 self.disconnect_reason = (
