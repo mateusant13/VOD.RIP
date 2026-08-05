@@ -13,6 +13,15 @@ from services import ytdlp_env  # noqa: F401
 import yt_dlp  # noqa: E402
 
 _YTDLP_LOCK = threading.Lock()
+# Why no priority/bounded acquire here: a plain Lock has no priority, and a
+# timeout would break legitimate long downloads (a 2-hour VOD legitimately
+# holds this lock for minutes; a bounded acquire would fail preview extracts
+# that merely wait behind it). Priority for live playback is instead handled
+# structurally — live sessions never touch yt-dlp (pure CDN fetches) and run
+# on their own LIVE_EXECUTOR — and the pathological holder (a 0 B/s stalled
+# download) is reaped by DownloadManager's stall watchdog (STALL_WATCHDOG_SEC
+# = 90s), which frees this lock with a clear error instead of holding it
+# forever.
 _YTDLP_CHANNEL_LOCK = threading.Lock()
 _FORBIDDEN_PLUGIN_MARKERS = ("getpot_wpc", "getpot-wpc")
 _BLOCKED_YOUTUBE_KEYS = frozenset()

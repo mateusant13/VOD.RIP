@@ -47,6 +47,65 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Stall watchdog — a download that emits no *byte* progress for this long is
+# dead (0 B/s). A true stall emits no progress hooks, so the hook-driven
+# deadline can never fire for it; without this watchdog the process-wide
+# yt-dlp lock stays held forever, blocking every other guarded yt-dlp op
+# (preview extracts, other downloads, enrich).
+STALL_WATCHDOG_SEC = 90.0
+STALL_CHECK_INTERVAL_SEC = 10.0
+
+
+def _stall_state(
+    stall: dict, now: float, active: bool, stall_sec: float = STALL_WATCHDOG_SEC
+) -> Optional[str]:
+    """Return a stall error message when an *active* download has made no
+    byte progress for >= ``stall_sec``, else None (latching the clock on the
+    first armed check).
+
+    Pure decision helper — unit tests drive it with a fake holder + fake
+    clock, no network. ``stall`` mirrors the per-download holder written by
+    the progress hook: ``armed`` (a hook has fired — startup extract does not
+    count as stalled), ``last_bytes`` / ``last_move_wall`` (byte progress),
+    ``error`` (latched once detected).
+    """
+    if not active or not stall.get("armed"):
+        return None
+    last = stall.get("last_move_wall")
+    if last is None:
+        stall["last_move_wall"] = now
+        return None
+    if (now - last) >= stall_sec:
+        msg = stall.get("error") or "download stalled (0 B/s)"
+        stall["error"] = msg
+        return msg
+    return None
+
+
+def _stall_tick(
+    stall: dict,
+    now: float,
+    active: bool,
+    cancel_event: threading.Event,
+    abort_fns: List[Callable[[], None]],
+    stall_sec: float = STALL_WATCHDOG_SEC,
+) -> bool:
+    """One stall-watchdog interval action: returns True when a stall was
+    detected and the download was cancelled (cancel event set + abort fns
+    fired so ffmpeg children / the yt-dlp call unwind and the global yt-dlp
+    lock frees). Mirrors the daemon loop's body so tests can drive the
+    cancel wiring with a fake holder + fake events (no network)."""
+    if not _stall_state(stall, now, active, stall_sec):
+        return False
+    cancel_event.set()
+    for fn in abort_fns:
+        try:
+            fn()
+        # ponytail: survival guarantee for arbitrary abort callbacks
+        except Exception:
+            pass
+    return True
+
 
 class DownloadManager:
     def __init__(self, max_workers: int = 4):
@@ -183,6 +242,16 @@ class DownloadManager:
         deadline_holder: dict[str, Optional[float]] = {
             "deadline": (job_started + timeout_sec) if timeout_sec else None,
         }
+        # Stall watchdog state — written by the progress hook, read by a
+        # daemon thread. Armed on the first hook event so a slow startup
+        # extract (20-120s, no bytes) is never mistaken for a stall.
+        stall_holder: dict = {
+            "armed": False,
+            "last_bytes": 0.0,
+            "last_move_wall": None,
+            "error": None,
+        }
+        stall_stop = threading.Event()
 
         def _enforce_deadline() -> None:
             deadline = deadline_holder["deadline"]
@@ -192,9 +261,8 @@ class DownloadManager:
             for fn in list(abort_fns):
                 try:
                     fn()
-                # ponytail: survival guarantee for arbitrary abort callbacks
-                except Exception:
                 # ponytail: survival guarantee — deadline enforcement errors must not block cleanup
+                except Exception:
                     pass
             elapsed_min = max(1, int((time.monotonic() - job_started) // 60))
             raise ytdlp_service.DownloadTimeoutError(
@@ -221,6 +289,24 @@ class DownloadManager:
                 raise ytdlp_service.CancelledError("Download cancelled by user")
             if pause_event.is_set():
                 raise ytdlp_service.PausedError("Download paused by user")
+
+            # Stall watchdog bookkeeping: any hook event arms the clock; only
+            # *byte growth* (or a phase change) resets it — a retry loop that
+            # keeps emitting 0-byte "downloading" events is still a stall.
+            stall_holder["armed"] = True
+            if d.get("status") == "downloading":
+                db = d.get("downloaded_bytes")
+                if (
+                    isinstance(db, (int, float))
+                    and db > 0
+                    and float(db) != stall_holder.get("last_bytes")
+                ):
+                    stall_holder["last_bytes"] = float(db)
+                    stall_holder["last_move_wall"] = time.monotonic()
+            elif d.get("status") in ("finished", "postprocessing"):
+                # Phase change / mux activity counts as progress; mux hangs
+                # are bounded by the transcode deadline, not this watchdog.
+                stall_holder["last_move_wall"] = time.monotonic()
 
             if d.get("status") in ("downloading", "postprocessing"):
                 pct = _hook_progress_percent(d)
@@ -372,6 +458,37 @@ class DownloadManager:
                     info["pp_state"] = state
             _start_poller()
 
+        def _stall_watchdog_loop() -> None:
+            """Cancel a download whose bytes have not moved for
+            STALL_WATCHDOG_SEC — a true stall emits no progress hooks, so
+            neither the hook-driven deadline nor a user cancel can ever fire.
+            Cancelling frees the process-wide yt-dlp lock (held for the whole
+            download) for preview extracts / other downloads."""
+            while not stall_stop.wait(STALL_CHECK_INTERVAL_SEC):
+                with self._lock:
+                    st = self._downloads.get(download_id)
+                active = (
+                    st is not None
+                    and st.status not in _DONE_STATUSES
+                    and st.status != "Paused"
+                )
+                if not active:
+                    continue
+                if not _stall_tick(
+                    stall_holder, time.monotonic(), True, cancel_event, abort_fns
+                ):
+                    continue
+                logger.warning(
+                    "Download %s: %s — cancelling to free the yt-dlp lock",
+                    download_id, stall_holder["error"],
+                )
+
+        def _start_stall_watchdog() -> None:
+            threading.Thread(
+                target=_stall_watchdog_loop, daemon=True,
+                name=f"stall-watchdog-{download_id[:8]}",
+            ).start()
+
         def _download_worker():
             ctx_token = set_download_context(download_id)
             try:
@@ -474,13 +591,34 @@ class DownloadManager:
                 self._db.upsert_queue_entry(state, params_snapshot or None)
                 self._notify_sse(download_id, "status", "Paused")
             except ytdlp_service.CancelledError:
-                with self._lock:
-                    if state.status != "Cancelled":
-                        state.status = "Cancelled"
-                        self._notify_sse(download_id, "status", "Cancelled")
-                _cleanup_output()
+                stall_msg = stall_holder.get("error")
+                if stall_msg:
+                    with self._lock:
+                        state.status = "Failed"
+                        state.error = stall_msg
+                    self._notify_sse(download_id, "error", stall_msg)
+                    _cleanup_output()
+                else:
+                    with self._lock:
+                        if state.status != "Cancelled":
+                            state.status = "Cancelled"
+                            self._notify_sse(download_id, "status", "Cancelled")
+                    _cleanup_output()
             # ponytail: survival guarantee for download worker
             except Exception as e:
+                stall_msg = stall_holder.get("error")
+                if stall_msg and not pause_event.is_set():
+                    # The stall watchdog cancelled this download — surface its
+                    # message, not the (usually cryptic) abort-time exception.
+                    logger.warning(
+                        "Download %s failed by stall watchdog: %s", download_id, stall_msg,
+                    )
+                    with self._lock:
+                        state.status = "Failed"
+                        state.error = stall_msg
+                    self._notify_sse(download_id, "error", stall_msg)
+                    _cleanup_output()
+                    return
                 if pause_event.is_set() and not cancel_event.is_set():
                     with self._lock:
                         state.status = "Paused"
@@ -517,6 +655,7 @@ class DownloadManager:
                 self._notify_sse(download_id, "error", state.error)
                 _cleanup_output()
             finally:
+                stall_stop.set()
                 with self._lock:
                     final_state = (
                         self._downloads.get(download_id)
@@ -557,6 +696,7 @@ class DownloadManager:
                     self._db.remove_queue_entry(download_id)
                     self._db.record_history(final_state)
 
+        _start_stall_watchdog()
         self._executor.submit(_download_worker)
 
     def pause(self, download_id: str) -> bool:
