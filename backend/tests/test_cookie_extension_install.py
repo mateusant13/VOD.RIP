@@ -62,7 +62,7 @@ def test_materialize_is_idempotent_and_skips_zip_slip(monkeypatch, tmp_path):
 def test_source_dir_under_appdata(tmp_path):
     # conftest pins VODRIP_APP_DATA to a scratch root — src lives under it
     assert str(_ext_src_dir()).startswith(os.environ["VODRIP_APP_DATA"])
-    assert _ext_src_dir().name == "src"
+    assert _ext_src_dir().name == "VOD.RIP-cookies"
     assert _ext_src_dir().parent.name == "cookie-extension"
 
 

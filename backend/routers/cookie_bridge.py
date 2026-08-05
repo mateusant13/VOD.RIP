@@ -175,8 +175,13 @@ def _ext_version() -> str:
 
 
 def _ext_src_dir() -> Path:
-    """Unpacked extension folder for drag-and-drop load (chrome://extensions)."""
-    return _get_appdata_dir() / "cookie-extension" / "src"
+    """Unpacked extension folder for drag-and-drop load (chrome://extensions).
+
+    Named after the extension (not the packaging dir) so the user can
+    recognize what they are dragging; lives next to the crx it was
+    materialized from.
+    """
+    return _get_appdata_dir() / "cookie-extension" / "VOD.RIP-cookies"
 
 
 def _materialize_ext_src() -> Path:
