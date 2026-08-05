@@ -204,6 +204,18 @@ export function resizeLayoutGivingWidthTo(
           }
         }
       }
+      // Slack-grow: leftover row budget grows the center panels back toward
+      // their aspect-consistent widths (capped at defaults) — a panel squeezed
+      // to its minimum by a neighbor's growth returns to its shape once the
+      // neighbor releases the space. The dragged target is never grown: its
+      // width is the pointer's explicit choice.
+      const sibTotal = siblingSlots.reduce((sum, slot) => sum + slot.get(), 0);
+      const slack = remaining - sibTotal;
+      if (slack > 0) {
+        const grown = growCenterPanelsFromSlack(urlAside, main, slack, target);
+        urlAside = grown.urlAside;
+        main = grown.main;
+      }
     }
     return shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main });
   }
@@ -941,3 +953,89 @@ export const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {
   sw: 'nesw-resize',
 };
 export const PANEL_LAYOUT_STORAGE_KEY = 'vodrip_panel_layout';
+
+/**
+ * Aspect-consistent restore WIDTH for a center panel height: the width the
+ * panel tends back to when the row frees space, capped at its default
+ * (urlAside keeps its 288:414 default ratio; main keeps its 448 square).
+ * Floored at PANEL_MIN.w so a short panel never grows past its square-ish
+ * share (a deliberately small panel stays small).
+ */
+export function aspectWidthForHeight(key: 'urlAside' | 'main', h: number): number {
+  if (key === 'main') {
+    return Math.max(PANEL_MIN.w, Math.min(MAIN_PANEL_DEFAULT.w, Math.round(h)));
+  }
+  return Math.max(
+    PANEL_MIN.w,
+    Math.min(
+      URL_ASIDE_PANEL_DEFAULT.w,
+      Math.round((h * URL_ASIDE_PANEL_DEFAULT.w) / URL_ASIDE_PANEL_DEFAULT.h),
+    ),
+  );
+}
+
+/** Aspect-consistent restore HEIGHT for a center panel width: the height the
+ *  panel falls back to when the preview stops forcing it taller (inverse of
+ *  aspectWidthForHeight), capped at the panel's default height. */
+export function aspectHeightForWidth(key: 'urlAside' | 'main', w: number): number {
+  if (key === 'main') {
+    return Math.max(PANEL_MIN.h, Math.min(MAIN_PANEL_DEFAULT.h, Math.round(w)));
+  }
+  return Math.max(
+    PANEL_MIN.h,
+    Math.min(
+      URL_ASIDE_PANEL_DEFAULT.h,
+      Math.round((w * URL_ASIDE_PANEL_DEFAULT.h) / URL_ASIDE_PANEL_DEFAULT.w),
+    ),
+  );
+}
+
+/**
+ * Owned-height seed for a center panel: the stored height, capped at the
+ * aspect-consistent height so heights ratcheted by the old one-way preview
+ * sync heal back toward the default shape on load. Deliberate in-session
+ * S-edge drags overwrite the seed; ponytail: this means a deliberately tall
+ * panel loses its tallness across a reload (indistinguishable from ratchet
+ * pollution from the stored value alone).
+ */
+export function ownedPanelHeightSeed(key: 'urlAside' | 'main', w: number, storedH: number): number {
+  return Math.max(PANEL_MIN.h, Math.min(storedH, aspectHeightForWidth(key, w)));
+}
+
+/** Two-way preview-row height target for a side panel: row-aligned with the
+ *  preview while it is tall, falling back to the panel's own restore height
+ *  when the preview shrinks — never ratchets at the tall value. */
+export function rowPanelHeightFromPreview(
+  restoreH: number,
+  previewH: number,
+  maxH: number,
+  minH: number,
+): number {
+  return Math.min(maxH, Math.max(minH, Math.max(restoreH, previewH)));
+}
+
+/**
+ * Leftover-slack growth for the center panels (urlAside, then main): grows
+ * each toward its aspect-consistent width, capped at its default, using only
+ * slack that the rest of the row left unused. `skip` is the panel being
+ * dragged — its width is the pointer's explicit choice and must not be grown.
+ */
+function growCenterPanelsFromSlack(
+  urlAside: PanelSize,
+  main: PanelSize,
+  slack: number,
+  skip: LayoutPanelKey,
+): { urlAside: PanelSize; main: PanelSize } {
+  if (slack <= 0) return { urlAside, main };
+  const grow = (panel: PanelSize, targetW: number): PanelSize => {
+    if (targetW <= panel.w) return panel;
+    const amount = Math.min(targetW - panel.w, slack);
+    if (amount <= 0) return panel;
+    slack -= amount;
+    return { ...panel, w: panel.w + amount };
+  };
+  return {
+    urlAside: skip === 'urlAside' ? urlAside : grow(urlAside, aspectWidthForHeight('urlAside', urlAside.h)),
+    main: skip === 'main' ? main : grow(main, aspectWidthForHeight('main', main.h)),
+  };
+}
