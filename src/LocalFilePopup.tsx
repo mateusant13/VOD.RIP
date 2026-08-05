@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useLayoutEffect,
   useRef,
   useState,
@@ -7,17 +8,25 @@ import {
 import { Search, X } from 'lucide-react';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
-import type { SavedChannel } from './types';
+import type { PanelSize, SavedChannel } from './types';
 import {
   EXPLORE_PANEL_DEFAULT_W,
-  EXPLORE_PANEL_CHROME_H_EST,
   EXPLORE_VIDEO_ASPECT_DEFAULT,
   layoutExplorePopupWindow,
   startFloatingPanelDrag,
+  PanelResizeHandles,
   type PanelPos,
+  type ResizeEdge,
 } from './explorePopupUtils';
+import { panelPosAfterResize, startPanelResizeDrag } from './layoutUtils';
 import { platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import PlatformVodIcon from './components/PlatformVodIcon';
+
+/** Video-friendly resize floors — EXPLORE_PANEL_MIN_W (100) is too narrow to watch in. */
+const LOCAL_PANEL_MIN_W = 260;
+const LOCAL_PANEL_MIN_H = 170;
+/** Keep at least 32px of the popup on screen while resizing. */
+const RESIZE_MARGIN = 32;
 
 function platformKey(raw: string): PlatformStyleKey {
   const p = raw.toLowerCase();
@@ -60,33 +69,69 @@ export default function LocalFilePopup({
   /** Docked archive-search panel (global search — local files have no archive identity). */
   const [searchOpen, setSearchOpen] = useState(false);
   const platform = platformKey(item.platform);
-  const panelWidth = EXPLORE_PANEL_DEFAULT_W;
-  const videoH = Math.round((panelWidth - 24) / EXPLORE_VIDEO_ASPECT_DEFAULT);
-  const panelH = videoH + EXPLORE_PANEL_CHROME_H_EST;
+  const sizeRef = useRef<PanelSize>({
+    w: EXPLORE_PANEL_DEFAULT_W,
+    h: Math.round((EXPLORE_PANEL_DEFAULT_W - 24) / EXPLORE_VIDEO_ASPECT_DEFAULT),
+  });
+  const [size, setSize] = useState<PanelSize>(sizeRef.current);
   const src = `/api/local/media?path=${encodeURIComponent(item.filePath)}`;
 
+  // Lay the popup out once on mount (bottom-right, staggered by stackIndex).
+  // Must NOT re-run on resize — repositioning from the layout origin would
+  // snap the panel back to the corner mid-drag.
   useLayoutEffect(() => {
-    if (!containerRef.current) return;
-    layoutExplorePopupWindow(containerRef.current, panelWidth, posRef, stackIndex);
-  }, [panelWidth, stackIndex]);
+    const el = containerRef.current;
+    if (!el || posRef.current) return;
+    layoutExplorePopupWindow(el, sizeRef.current.w, posRef, stackIndex);
+    // layoutExplorePopupWindow clears the inline height; re-assert it (the
+    // panel's height is state-driven now, not implicit from content).
+    el.style.height = `${sizeRef.current.h}px`;
+  }, [stackIndex]);
 
   const onDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
     const el = containerRef.current;
     if (!el) return;
     if (!posRef.current) {
-      posRef.current = layoutExplorePopupWindow(el, panelWidth, posRef, stackIndex);
+      posRef.current = layoutExplorePopupWindow(el, sizeRef.current.w, posRef, stackIndex);
+      el.style.height = `${sizeRef.current.h}px`;
       setPos(posRef.current);
     }
     startFloatingPanelDrag(e, posRef, setPos, el);
   };
 
+  // --- Resize (same [data-panel-resize] pattern as the live player popup) ---
+  const handleResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    const startSize = { ...sizeRef.current };
+    // The mount layout effect always seeds posRef before any pointer event.
+    const startPos = posRef.current ?? { x: 0, y: 0 };
+    const viewport = { w: window.innerWidth, h: window.innerHeight };
+    const applyPos = (next: PanelSize) => {
+      const p = panelPosAfterResize(edge, startPos, startSize, next, viewport);
+      posRef.current = p;
+      setPos(p);
+    };
+    startPanelResizeDrag(e, edge, sizeRef, setSize, {
+      panelEl: containerRef.current,
+      maxW: viewport.w - RESIZE_MARGIN,
+      maxH: viewport.h - RESIZE_MARGIN,
+      clampSize: (s) => ({
+        w: Math.min(viewport.w - RESIZE_MARGIN, Math.max(LOCAL_PANEL_MIN_W, s.w)),
+        h: Math.min(viewport.h - RESIZE_MARGIN, Math.max(LOCAL_PANEL_MIN_H, s.h)),
+      }),
+      onResizeMove: (next) => applyPos(next),
+      onResizeEnd: () => applyPos(sizeRef.current),
+    });
+  }, []);
+
   return (
     <div
       ref={containerRef}
       className={`fixed flex flex-col gap-2 bg-zinc-950 border-2 border-white p-3 select-none ${platformCardShadow(platform)}`}
-      style={{ zIndex, width: panelWidth }}
+      style={{ zIndex, width: size.w, height: size.h }}
       onPointerDownCapture={onBringToFront}
     >
+      <PanelResizeHandles onPointerDown={handleResize} />
+
       <div
         className="flex items-center gap-2 cursor-grab active:cursor-grabbing min-w-0"
         onPointerDown={onDrag}
@@ -113,7 +158,7 @@ export default function LocalFilePopup({
           <X size={14} />
         </button>
       </div>
-      <div className="relative" style={{ height: videoH, maxHeight: `calc(100vh - ${panelH}px)` }}>
+      <div className="relative flex-1 min-h-0">
         <video
           key={src}
           src={src}
