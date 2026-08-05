@@ -4,7 +4,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
-import CookieBridgeSection from './CookieBridgeSection';
+import CookieBridgeSection, { type BridgeStatus } from './CookieBridgeSection';
 import DiskSection from './DiskSection';
 import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
@@ -93,6 +93,23 @@ export default function SettingsTab({
   const [savedSig, setSavedSig] = useState(() => settingsSignature(settings));
   const dirty = settingsSignature(settings) !== savedSig;
 
+  /** Latest Cookie Bridge status — drives card placement. Null until the
+   *  first fetch resolves; the card then sits at its normal (last) spot so
+   *  paired users don't see it jump on every Settings open. */
+  const [cookieStatus, setCookieStatus] = useState<BridgeStatus | null>(null);
+  const cookieCount = cookieStatus
+    ? Object.values(cookieStatus.platforms ?? {}).reduce((n, p) => n + p.count, 0)
+    : 0;
+  /** Not installed yet OR no cookies in the app → surface the install first. */
+  const needsCookieSetup =
+    cookieStatus !== null && (!cookieStatus.paired || cookieCount === 0);
+
+  const cookieCard = (
+    <SettingsCard icon={ShieldCheck} title="Cookie Bridge">
+      <CookieBridgeSection onStatusChange={setCookieStatus} />
+    </SettingsCard>
+  );
+
   const save = async () => {
     await onSave();
     setSavedSig(settingsSignature(settings));
@@ -106,6 +123,10 @@ export default function SettingsTab({
 
   return (
     <div className="flex flex-col gap-3">
+      {/* Cookie Bridge first until the extension is installed and cookies
+          are detected — after that it moves to the very bottom. */}
+      {needsCookieSetup ? cookieCard : null}
+
       {/* ── General ─────────────────────────────────────────────── */}
       <SettingsCard icon={Settings2} title="General">
         <div className="flex flex-col gap-1.5">
@@ -170,11 +191,6 @@ export default function SettingsTab({
         <DiskSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
-      {/* ── Cookie Bridge ───────────────────────────────────────── */}
-      <SettingsCard icon={ShieldCheck} title="Cookie Bridge">
-        <CookieBridgeSection />
-      </SettingsCard>
-
       {/* ── Updates ─────────────────────────────────────────────── */}
       <SettingsCard
         icon={RefreshCw}
@@ -234,6 +250,9 @@ export default function SettingsTab({
           Exit VOD.RIP
         </button>
       </SettingsCard>
+
+      {/* ── Cookie Bridge (detected → last thing the user needs) ── */}
+      {needsCookieSetup ? null : cookieCard}
 
       {/* ── Save ────────────────────────────────────────────────── */}
       <div className="flex flex-col gap-1.5 pt-1 sticky bottom-0 bg-zinc-950/95 backdrop-blur-sm pb-1">

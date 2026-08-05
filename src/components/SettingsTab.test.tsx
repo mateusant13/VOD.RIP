@@ -20,20 +20,25 @@ const BASE: AppSettings = {
   yt_subtitles_first: true,
 };
 
-function stubFetch() {
+function stubFetch(cookieStatus?: object) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      const body = url.includes("/api/disks")
-        ? {
-            drives: [
-              { drive: "C:\\", label: "System", total_bytes: 500 * 1024 ** 3, free_bytes: 90 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
-              { drive: "I:\\", label: "Archive", total_bytes: 2000 * 1024 ** 3, free_bytes: 344 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
-            ],
-            fastest: "I:\\",
-          }
-        : {};
+      let body: unknown;
+      if (url.includes("/api/disks")) {
+        body = {
+          drives: [
+            { drive: "C:\\", label: "System", total_bytes: 500 * 1024 ** 3, free_bytes: 90 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+            { drive: "I:\\", label: "Archive", total_bytes: 2000 * 1024 ** 3, free_bytes: 344 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+          ],
+          fastest: "I:\\",
+        };
+      } else if (cookieStatus !== undefined && url.includes("/api/session/cookies/status")) {
+        body = cookieStatus;
+      } else {
+        body = {};
+      }
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -128,5 +133,33 @@ describe("SettingsTab", () => {
     const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
     expect(calls.some((u) => u.includes("/api/exit"))).toBe(true);
     confirmSpy.mockRestore();
+  });
+
+  it("puts Cookie Bridge first while the extension is not installed", async () => {
+    stubFetch({ paired: false, enabled: true, platforms: {} });
+    render(<Harness />);
+    await screen.findByText(/not paired/);
+    const sections = [...document.querySelectorAll("section")];
+    expect(sections[0].textContent).toContain("Cookie Bridge");
+    expect(sections[0].textContent).not.toContain("General");
+  });
+
+  it("puts Cookie Bridge first while cookies are not detected yet", async () => {
+    stubFetch({ paired: true, enabled: true, platforms: { kick: { count: 0, lastGrabAt: null, expiredCount: 0 } } });
+    render(<Harness />);
+    await screen.findByText(/paired/);
+    const sections = [...document.querySelectorAll("section")];
+    expect(sections[0].textContent).toContain("Cookie Bridge");
+  });
+
+  it("moves Cookie Bridge to the very end once cookies are detected", async () => {
+    stubFetch({ paired: true, enabled: true, platforms: { kick: { count: 3, lastGrabAt: null, expiredCount: 0 } } });
+    render(<Harness />);
+    await screen.findByText(/paired/);
+    const sections = [...document.querySelectorAll("section")];
+    const last = sections[sections.length - 1];
+    expect(last.textContent).toContain("Cookie Bridge");
+    expect(last.textContent).not.toContain("Danger Zone");
+    expect(sections[0].textContent).toContain("General");
   });
 });

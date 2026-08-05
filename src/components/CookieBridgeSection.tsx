@@ -22,7 +22,7 @@ interface PlatformBridgeStatus {
   expiredCount: number;
 }
 
-interface BridgeStatus {
+export interface BridgeStatus {
   paired: boolean;
   enabled: boolean;
   platforms: Record<string, PlatformBridgeStatus>;
@@ -53,7 +53,12 @@ const formatGrabTime = (iso: string | null): string => {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
-export default function CookieBridgeSection() {
+export default function CookieBridgeSection({
+  onStatusChange,
+}: {
+  /** Reports each fetched bridge status so parents can reorder content. */
+  onStatusChange?: (status: BridgeStatus) => void;
+}) {
   const [status, setStatus] = useState<BridgeStatus | null>(null);
   const [token, setToken] = useState('');
   const [ext, setExt] = useState<ExtSource | null>(null);
@@ -67,6 +72,7 @@ export default function CookieBridgeSection() {
     try {
       const s = await apiGet<BridgeStatus>('/api/session/cookies/status');
       setStatus(s);
+      onStatusChange?.(s);
       setError(null);
     } catch {
       setError('Cookie Bridge API unreachable.');
@@ -83,7 +89,7 @@ export default function CookieBridgeSection() {
     } catch {
       setExt(null);
     }
-  }, []);
+  }, [onStatusChange]);
 
   useEffect(() => {
     void refresh();
