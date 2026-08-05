@@ -35,6 +35,7 @@ import {
   buildArchiveVodUrl,
   buildSearchUrl,
   formatArchiveOffset,
+  formatRelativeDate,
   groupChatWindow,
   highlightQuerySpans,
   isValidDateParam,
@@ -917,6 +918,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
           {hits.map((hit, idx) => {
             const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
+            const relativeDate = formatRelativeDate(hit.date);
             const spans = highlightQuerySpans(hit.text, query);
             const snippet = snippetAroundMatch(hit.text, query);
             let cursor = 0;
@@ -975,6 +977,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                   <span className="text-[9px] font-mono text-zinc-400 shrink-0">
                     {formatArchiveOffset(hit.offset_sec)}
                   </span>
+                  {relativeDate && (
+                    <span
+                      title={hit.date ? new Date(hit.date).toLocaleString() : undefined}
+                      className="text-[9px] font-mono text-zinc-500 shrink-0"
+                    >
+                      {relativeDate}
+                    </span>
+                  )}
                 </span>
                 <span className="text-[10px] leading-snug text-zinc-400 break-words">
                   {hit.kind === 'message' && hit.author ? (

@@ -785,6 +785,34 @@ describe('ArchiveSearchPopup', () => {
     // Local hit still renders alongside the remote error note.
     expect(await screen.findByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
   });
+
+  it('renders a relative date on hit rows with the exact date in the tooltip', async () => {
+    // Built from local components so the calendar-day gap is exact in any
+    // timezone: the label reads '2 days ago' regardless of the real clock.
+    const d = new Date();
+    const hitDate = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 2, 12).toISOString();
+    const fetchMock = mockFetch([{ ...HIT, date: hitDate }]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(query, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(row).toHaveTextContent('2 days ago');
+    expect(row.querySelector('[title]')).toHaveAttribute(
+      'title',
+      new Date(hitDate).toLocaleString(),
+    );
+  });
+
+  it('renders no date label when the hit carries no date', async () => {
+    const fetchMock = mockFetch([HIT]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(query, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(row).not.toHaveTextContent(/today|yesterday|\d+ (day|week|month|year)s? ago/);
+  });
 });
 
 describe('ArchiveSearchPopup USER filter', () => {

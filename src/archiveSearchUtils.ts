@@ -103,6 +103,37 @@ export function todayIso(): string {
   return `${d.getFullYear()}-${m}-${day}`;
 }
 
+/** Local calendar date of `d` as a UTC-midnight timestamp (day granularity). */
+function localDayNumber(d: Date): number {
+  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+/**
+ * Relative "X ago" label for an ISO timestamp vs the current local date
+ * (same local-timezone discipline as todayIso). Ladder: today → yesterday
+ * → 2–13 days → 2–5 weeks → 1–11 months → years. Null/empty/invalid input
+ * → null; future dates read as "today" (defensive).
+ *
+ * `now` is injectable so tests are deterministic; production uses new Date().
+ */
+export function formatRelativeDate(iso: string | null | undefined, now: Date = new Date()): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const days = Math.round((localDayNumber(now) - localDayNumber(d)) / 86_400_000);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days <= 13) return `${days} days ago`;
+  if (days <= 35) return `${Math.floor(days / 7)} weeks ago`; // 2–5 weeks, always plural
+  // Whole calendar months; a day-of-month later than today's means the
+  // latest month isn't complete yet (a >35-day gap always spans ≥1 month).
+  let months = (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
+  if (d.getDate() > now.getDate()) months -= 1;
+  if (months < 12) return months === 1 ? '1 month ago' : `${months} months ago`;
+  const years = Math.floor(months / 12);
+  return years === 1 ? '1 year ago' : `${years} years ago`;
+}
+
 export interface ArchiveSearchFilterParams {
   query: string;
   /** Empty/omitted = all channels; comma-joined slugs match ANY of them. */

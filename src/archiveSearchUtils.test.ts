@@ -5,6 +5,7 @@ import {
   buildSearchUrl,
   firstMatchIndex,
   formatArchiveOffset,
+  formatRelativeDate,
   groupChatWindow,
   highlightQuerySpans,
   isValidDateParam,
@@ -340,5 +341,56 @@ describe('todayIso', () => {
     const expectM = `${d.getMonth() + 1}`.padStart(2, '0');
     const expectD = `${d.getDate()}`.padStart(2, '0');
     expect(t).toBe(`${expectY}-${expectM}-${expectD}`);
+  });
+});
+
+describe('formatRelativeDate', () => {
+  // Local-noon construction keeps the intended local calendar date stable
+  // across timezones (local components → UTC → local components round-trip).
+  const iso = (y: number, m: number, d: number) => new Date(y, m - 1, d, 12).toISOString();
+  /** 2026-08-05 local noon. */
+  const now = new Date(2026, 7, 5, 12);
+
+  it('today / yesterday', () => {
+    expect(formatRelativeDate(iso(2026, 8, 5), now)).toBe('today');
+    expect(formatRelativeDate(iso(2026, 8, 4), now)).toBe('yesterday');
+  });
+
+  it('days with correct pluralization', () => {
+    expect(formatRelativeDate(iso(2026, 8, 3), now)).toBe('2 days ago');
+    expect(formatRelativeDate(iso(2026, 8, 2), now)).toBe('3 days ago');
+    expect(formatRelativeDate(iso(2026, 7, 23), now)).toBe('13 days ago');
+  });
+
+  it('weeks from 14 days up to 5 weeks', () => {
+    expect(formatRelativeDate(iso(2026, 7, 22), now)).toBe('2 weeks ago'); // 14 days
+    expect(formatRelativeDate(iso(2026, 7, 15), now)).toBe('3 weeks ago'); // 21 days
+    expect(formatRelativeDate(iso(2026, 7, 8), now)).toBe('4 weeks ago'); // 28 days
+    expect(formatRelativeDate(iso(2026, 7, 1), now)).toBe('5 weeks ago'); // 35 days
+  });
+
+  it('months (calendar) up to 11, then years', () => {
+    expect(formatRelativeDate(iso(2026, 2, 1), new Date(2026, 2, 31, 12))).toBe('1 month ago');
+    expect(formatRelativeDate(iso(2026, 6, 5), now)).toBe('2 months ago');
+    expect(formatRelativeDate(iso(2025, 9, 5), now)).toBe('11 months ago');
+    expect(formatRelativeDate(iso(2025, 8, 5), now)).toBe('1 year ago');
+    expect(formatRelativeDate(iso(2023, 8, 5), now)).toBe('3 years ago');
+  });
+
+  it('future dates read as today (defensive)', () => {
+    expect(formatRelativeDate(iso(2026, 8, 6), now)).toBe('today');
+    expect(formatRelativeDate(iso(2027, 1, 1), now)).toBe('today');
+  });
+
+  it('null / empty / invalid input returns null', () => {
+    expect(formatRelativeDate(null, now)).toBeNull();
+    expect(formatRelativeDate(undefined, now)).toBeNull();
+    expect(formatRelativeDate('', now)).toBeNull();
+    expect(formatRelativeDate('not-a-date', now)).toBeNull();
+    expect(formatRelativeDate('2026-13-99T00:00:00Z', now)).toBeNull();
+  });
+
+  it('defaults to the current date when no reference is given', () => {
+    expect(formatRelativeDate(new Date().toISOString())).toBe('today');
   });
 });
