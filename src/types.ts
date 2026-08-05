@@ -89,6 +89,10 @@ export interface AppSettings {
   temp_folder: string;
   /** Cache root for large on-disk caches ('' = auto -> biggest fixed drive). */
   cache_dir?: string;
+  /** Transcripts/chat data root — archive DB lives here ('' = auto ->
+   * app-data drive; an explicit path wins, usually the fastest disk).
+   * Takes effect after restart (DB relocation). */
+  data_dir?: string;
   oauth: string;
   youtube_cookies_file?: string;
   youtube_cookies_browser?: string;
@@ -143,6 +147,26 @@ export interface DiskStatus {
   cache_free_bytes?: number;
   /** Auto pick: drive with the most free space (informational). */
   biggest_drive?: string;
+}
+
+/** One drive letter from /api/disks (Settings > Storage pickers). */
+export interface DiskInfo {
+  drive: string;
+  label?: string;
+  total_bytes: number;
+  free_bytes: number;
+  media_type: 'NVMe' | 'SSD' | 'HDD' | 'Unknown';
+  bus_type: string;
+  /** Lower = faster: 1 NVMe, 2 SSD, 3 HDD, 4 Unknown (bus-classified). */
+  speed_rank: number;
+}
+
+export interface DisksResponse {
+  drives: DiskInfo[];
+  /** Auto pick for transcripts/chat: fastest usable drive ('' when none). */
+  fastest: string;
+  /** Auto pick for heavy caches: drive with the most free space. */
+  biggest?: string;
 }
 
 export interface UpdateInfo {

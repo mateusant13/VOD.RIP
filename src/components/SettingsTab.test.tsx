@@ -23,9 +23,22 @@ const BASE: AppSettings = {
 function stubFetch() {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () =>
-      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } })
-    )
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes("/api/disks")
+        ? {
+            drives: [
+              { drive: "C:\\", label: "System", total_bytes: 500 * 1024 ** 3, free_bytes: 90 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+              { drive: "I:\\", label: "Archive", total_bytes: 2000 * 1024 ** 3, free_bytes: 344 * 1024 ** 3, media_type: "NVMe", bus_type: "NVMe", speed_rank: 1 },
+            ],
+            fastest: "I:\\",
+          }
+        : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    })
   );
 }
 
@@ -71,6 +84,16 @@ describe("SettingsTab", () => {
     }
     expect(screen.getByText("Save Settings")).toBeInTheDocument();
     expect(screen.getByText("Exit VOD.RIP")).toBeInTheDocument();
+  });
+
+  it("renders the Storage disk pickers with drive options", async () => {
+    stubFetch();
+    render(<Harness />);
+    expect(await screen.findByLabelText("heavy cache disk")).toBeInTheDocument();
+    expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
+    expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
+    expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
+    expect(screen.getByText("Takes effect after restart (moves the database)")).toBeInTheDocument();
   });
 
   it("shows unsaved-changes chip on edit and clears it after save", async () => {

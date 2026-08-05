@@ -4,7 +4,7 @@ import FieldCaption from './FieldCaption';
 import NumberField from './NumberField';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 import { formatBytes } from '../formatters';
-import type { AppSettings, DiskStatus, DiskUsage } from '../types';
+import type { AppSettings, DiskInfo, DiskStatus, DiskUsage, DisksResponse } from '../types';
 
 type Props = {
   settings: AppSettings;
@@ -71,18 +71,21 @@ function UsageRow({
 export default function DiskSection({ settings, setSettings }: Props) {
   const [usage, setUsage] = useState<DiskUsage | null>(null);
   const [status, setStatus] = useState<DiskStatus | null>(null);
+  const [disks, setDisks] = useState<DisksResponse | null>(null);
   const [cleaning, setCleaning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastFreed, setLastFreed] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [u, s] = await Promise.all([
+      const [u, s, d] = await Promise.all([
         apiGet<DiskUsage>('/api/disk/usage'),
         apiGet<DiskStatus>('/api/disk/status'),
+        apiGet<DisksResponse>('/api/disks'),
       ]);
       setUsage(u);
       setStatus(s);
+      setDisks(d);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Disk info failed');
@@ -111,8 +114,26 @@ export default function DiskSection({ settings, setSettings }: Props) {
   const keepValue = Number.isFinite(keepCount) ? Math.max(1, Math.min(50, keepCount)) : 5;
 
   const cacheDir = settings.cache_dir ?? '';
+  const dataDir = settings.data_dir ?? '';
   const effectiveCache = status?.cache_dir ?? '';
   const cacheFree = status?.cache_free_bytes;
+
+  // Storage pickers: one option per drive letter from /api/disks. The cache
+  // pick writes <drive>\VOD.RIP-cache (same convention as the auto root);
+  // the data pick writes <drive>\VOD.RIP-data. Values that don't match any
+  // option (legacy custom paths) surface as a read-only Custom option.
+  const drives = disks?.drives ?? [];
+  const fastest = disks?.fastest ?? '';
+  const formatFree = (n: number) => formatBytes(n).replace(/\.00 /, ' ');
+  const driveLabel = (d: DiskInfo) =>
+    `${d.drive.replace(/\\+$/, '')} (${formatFree(d.free_bytes)} free, ${d.media_type})`;
+  const cacheOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-cache`, label: driveLabel(d) }));
+  const dataOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-data`, label: driveLabel(d) }));
+  const cacheCustom = cacheDir !== '' && !cacheOptions.some((o) => o.value === cacheDir);
+  const dataCustom = dataDir !== '' && !dataOptions.some((o) => o.value === dataDir);
+  const autoDataLabel = fastest
+    ? `Auto (fastest: ${fastest.replace(/\\+$/, '')})`
+    : 'Auto (fastest)';
 
   return (
     <div className="flex flex-col gap-2">
@@ -123,26 +144,45 @@ export default function DiskSection({ settings, setSettings }: Props) {
       ) : null}
 
       <div className="flex flex-col gap-1">
-        <FieldCaption noWrap>Cache Location</FieldCaption>
-        <div className="flex gap-1.5">
-          <input
-            type="text"
-            value={cacheDir}
-            onChange={(e) => setSettings({ ...settings, cache_dir: e.target.value })}
-            placeholder="Auto (biggest drive)"
-            aria-label="cache location"
-            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-[10px] truncate focus:outline-none focus:border-white"
-          />
-          <button
-            type="button"
-            aria-label="auto cache location"
-            onClick={() => setSettings({ ...settings, cache_dir: '' })}
-            className="bg-zinc-900 text-zinc-200 font-black uppercase px-2 text-[9px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0"
-          >
-            Auto
-          </button>
-        </div>
-        <div className="flex items-center gap-1.5">
+        <FieldCaption noWrap>Storage</FieldCaption>
+
+        <FieldCaption noWrap>Heavy Cache Disk</FieldCaption>
+        <select
+          aria-label="heavy cache disk"
+          value={cacheDir}
+          onChange={(e) => setSettings({ ...settings, cache_dir: e.target.value })}
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-[10px] focus:outline-none focus:border-white"
+        >
+          <option value="">Auto (biggest free space)</option>
+          {cacheOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+          {cacheCustom ? <option value={cacheDir}>Custom ({cacheDir})</option> : null}
+        </select>
+        <span className="text-[9px] text-zinc-700 font-mono">
+          whisper models, yt-dlp cache, preview temp &amp; embed models — applies on Save Settings (next launch)
+        </span>
+
+        <FieldCaption noWrap>Transcripts &amp; Chat Data Disk</FieldCaption>
+        <select
+          aria-label="transcripts and chat data disk"
+          value={dataDir}
+          onChange={(e) => setSettings({ ...settings, data_dir: e.target.value })}
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-[10px] focus:outline-none focus:border-white"
+        >
+          <option value="">{autoDataLabel}</option>
+          {dataOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+          {dataCustom ? <option value={dataDir}>Custom ({dataDir})</option> : null}
+        </select>
+        <span className="text-[9px] text-zinc-600 font-mono">Takes effect after restart (moves the database)</span>
+
+        <div className="flex items-center gap-1.5 pt-0.5">
           <span className="text-[9px] text-zinc-600 font-mono">
             {effectiveCache
               ? `${effectiveCache} — ${cacheFree != null ? `${formatBytes(cacheFree)} free` : '…'}`
@@ -152,9 +192,6 @@ export default function DiskSection({ settings, setSettings }: Props) {
             <span className="text-[9px] text-zinc-600 font-mono">auto pick: {status.biggest_drive}</span>
           ) : null}
         </div>
-        <span className="text-[9px] text-zinc-700 font-mono">
-          whisper models, yt-dlp cache, preview temp &amp; embed models — applies on Save Settings (next launch)
-        </span>
       </div>
 
       <div className="flex flex-col gap-1">

@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import shutil
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -164,6 +167,184 @@ def relocate_cache(src_dir, dst_dir) -> dict:
     except OSError as exc:
         return {"moved": False, "reason": f"copy-failed: {exc}"}
     return {"moved": True, "reason": "copied-and-verified"}
+
+
+# --- per-drive inventory + media classification (disk tiering) -------------
+# WS/disk-tiering: Settings > Storage picks a "heavy cache disk" (biggest
+# free space) and a "transcripts & chat data disk" (fastest). Space comes
+# from ctypes/shutil; media/bus classification comes from one cached
+# PowerShell call (Get-PhysicalDisk/Get-Partition). Every probe fails soft —
+# an unreadable drive or missing PowerShell just yields Unknown ranking.
+
+_LAYOUT_TTL_SEC = 60  # PowerShell classification cache TTL
+_layout_cache: dict = {}  # {"ts": float, "data": dict}
+
+
+def _drive_usage(drive: str) -> Optional[Tuple[int, int]]:
+    """(total_bytes, free_bytes) for a drive root, or None on error (e.g. an
+    empty CD-ROM has no filesystem to measure)."""
+    try:
+        u = shutil.disk_usage(drive)
+        return int(u.total), int(u.free)
+    except OSError:
+        return None
+
+
+def _volume_label(drive: str) -> str:
+    """Volume label via GetVolumeInformationW ('' on error / non-Windows)."""
+    if os.name != "nt":
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(261)
+        fs_buf = ctypes.create_unicode_buffer(261)
+        serial = ctypes.c_ulong()
+        max_comp = ctypes.c_ulong()
+        flags = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(drive),
+            buf,
+            261,
+            ctypes.byref(serial),
+            ctypes.byref(max_comp),
+            ctypes.byref(flags),
+            fs_buf,
+            261,
+        )
+        return buf.value if ok else ""
+    except (AttributeError, OSError):
+        return ""
+
+
+def _run_powershell(script: str) -> Optional[dict]:
+    """Run a PowerShell one-liner and parse stdout as JSON; None on any
+    failure (missing powershell, non-zero exit, unparseable output). Fail-soft
+    by design — callers fall back to Unknown classification."""
+    if os.name != "nt":
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,  # Storage module cold start can take ~20s
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(proc.stdout.strip() or "null")
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _storage_layout() -> dict:
+    """Physical-disk classification for each drive letter, cached 60s.
+
+    One PowerShell call returns the disk table (DeviceId -> FriendlyName /
+    MediaType / BusType) and the partition table (DriveLetter ->
+    DiskNumber); the letter-to-disk hop is what maps a drive letter to its
+    physical media. Returns {"disks": {id: {...}}, "letters": {L: id}}; any
+    probe failure returns an empty mapping (everything classifies Unknown).
+    """
+    now = time.time()
+    cached = _layout_cache.get("ts")
+    if cached is not None and now - cached < _LAYOUT_TTL_SEC:
+        return _layout_cache["data"]
+    data: dict = {"disks": {}, "letters": {}}
+    raw = _run_powershell(
+        # @(...) forces arrays so empty cmdlet output serializes as []
+        # instead of a broken "disks = ;" statement.
+        "@{ disks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | "
+        "Select-Object DeviceId, FriendlyName, MediaType, BusType); "
+        "partitions = @(Get-Partition -ErrorAction SilentlyContinue | "
+        "Select-Object DriveLetter, DiskNumber) } | ConvertTo-Json -Depth 5"
+    )
+    if raw is not None:
+        for d in raw.get("disks") or []:
+            try:
+                data["disks"][int(d["DeviceId"])] = {
+                    "friendly_name": str(d.get("FriendlyName") or ""),
+                    "media_type": str(d.get("MediaType") or "Unknown"),
+                    "bus_type": str(d.get("BusType") or "Unknown"),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        for p in raw.get("partitions") or []:
+            letter = p.get("DriveLetter")
+            if letter:
+                try:
+                    data["letters"][str(letter).upper()] = int(p["DiskNumber"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+    _layout_cache["ts"] = now
+    _layout_cache["data"] = data
+    return data
+
+
+def _speed_rank(media_type: str, bus_type: str) -> int:
+    """1=NVMe, 2=SSD, 3=HDD, 4=Unknown.
+
+    Classification is bus/media-table based, not benchmarked — a SATA SSD
+    ranks below an NVMe drive even if it wins in practice.
+    ponytail: upgrade path is a measured rank (e.g. CrystalDiskMark-style
+    sequential read via a small local benchmark cached like _storage_layout);
+    ship that only if bus classification ever misleads real users.
+    """
+    if "NVMe" in bus_type or media_type == "NVMe":
+        return 1
+    if media_type == "SSD" or bus_type == "SSD":
+        return 2
+    if media_type == "HDD" or bus_type == "HDD":
+        return 3
+    return 4
+
+
+def disk_inventory() -> List[dict]:
+    """Per-drive-letter inventory for the Storage pickers.
+
+    Each entry: {drive, label, total_bytes, free_bytes, media_type,
+    bus_type, speed_rank}. Drives without a usable filesystem are skipped;
+    classification failures degrade to media_type/bus_type 'Unknown'
+    (speed_rank 4). Never raises.
+    """
+    drives = _list_drives()
+    if not drives:
+        return []
+    layout = _storage_layout()
+    disks = layout["disks"]
+    letters = layout["letters"]
+    items: List[dict] = []
+    for drive in sorted(drives):
+        usage = _drive_usage(drive)
+        if usage is None:
+            continue
+        total_bytes, free_bytes = usage
+        letter = drive[0].upper()
+        disk = disks.get(letters.get(letter)) or {}
+        media_type = str(disk.get("media_type") or "Unknown")
+        bus_type = str(disk.get("bus_type") or "Unknown")
+        items.append(
+            {
+                "drive": drive,
+                "label": _volume_label(drive),
+                "total_bytes": total_bytes,
+                "free_bytes": free_bytes,
+                "media_type": media_type,
+                "bus_type": bus_type,
+                "speed_rank": _speed_rank(media_type, bus_type),
+            }
+        )
+    return items
 
 
 # --- module self-check (env-guarded: creates scratch temp dirs at import) --
