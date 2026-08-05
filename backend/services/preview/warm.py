@@ -119,8 +119,15 @@ _PREFLIGHT_MUX_LOCK = threading.Lock()
 def _preflight_mux_dir(video_id: str, prefer_height: int) -> Path:
     return preview_root() / "preflight" / f"{video_id}_{prefer_height}"
 def _preflight_seg0_ready(out_dir: Path) -> bool:
-    seg0 = out_dir / "seg_000.ts"
-    return seg0.is_file() and seg0.stat().st_size >= MIN_VALID_OUTPUT_BYTES
+    """seg_000 exists — .m4s when USE_FMP4 (default), else .ts."""
+    from services.preview.session import USE_FMP4
+
+    exts = ("m4s", "ts") if USE_FMP4 else ("ts", "m4s")
+    return any(
+        (out_dir / f"seg_000.{ext}").is_file()
+        and (out_dir / f"seg_000.{ext}").stat().st_size >= MIN_VALID_OUTPUT_BYTES
+        for ext in exts
+    )
 def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
     """Reuse paste-warm mux when crop starts at 0 and tier matches."""
     from services.preview.session import _window_hls_dir, _window_hls_seg0_ready
@@ -137,12 +144,14 @@ def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
         return False
     dst = _window_hls_dir(session)
     dst.mkdir(parents=True, exist_ok=True)
-    for name in ("seg_000.ts", "window.m3u8", "_v.mp4", "_a.m4a"):
+    for name in ("seg_000.m4s", "seg_000.ts", "init.mp4", "window.m3u8", "_v.mp4", "_a.m4a"):
         src_file = src / name
         if src_file.is_file():
             shutil.copy2(src_file, dst / name)
-    for seg in sorted(src.glob("seg_[0-9][0-9][0-9].ts")):
-        if seg.name == "seg_000.ts":
+    for seg in sorted(
+        [*src.glob("seg_[0-9][0-9][0-9].m4s"), *src.glob("seg_[0-9][0-9][0-9].ts")]
+    ):
+        if seg.name in ("seg_000.m4s", "seg_000.ts"):
             continue
         shutil.copy2(seg, dst / seg.name)
     return _window_hls_seg0_ready(session)
@@ -330,8 +339,8 @@ def _build_youtube_session_snapshot(
     that took a different code path — caller's job to detect via platform).
     """
     from services.preview.session import WINDOW_HLS_INITIAL_CHUNK_SEC, _merge_youtube_session_cookies
-    from services.preview.session import _apply_muxed_progressive_session, _apply_youtube_custom_master, _build_synthetic_master_playlist, _clamp_session_crop_to_vod_duration, _hosts_for_url, _pick_variant_by_height, create_session
-    from services.preview.session import _init_window_hls_mux_bounds, _resolve_preview_entry, _stash_youtube_preview_formats, _youtube_muxed_progressive_for_long_explore
+    from services.preview.session import _apply_youtube_custom_master, _build_synthetic_master_playlist, _clamp_session_crop_to_vod_duration, _hosts_for_url, _pick_variant_by_height, create_session
+    from services.preview.session import _init_window_hls_mux_bounds, _resolve_preview_entry, _stash_youtube_preview_formats
     from services.preview.session import _youtube_needs_dash_window_hls
     from services.preview.session import _resolve_youtube_preview_audio
     raw_entry, headers, platform, variant_formats, kind, yt_info = resolve_result
@@ -392,8 +401,6 @@ def _build_youtube_session_snapshot(
             if int(fmt.get("height") or 0) > 0 and fmt.get("url")
         ]
         if kind == "hls":
-            from services.ytdlp_hls import preview_fast_only_mode
-
             if platform == "YouTube":
                 _apply_youtube_custom_master(tmp, variant_formats, yt_info)
             elif len(tmp.variant_entries) >= 2:
@@ -402,19 +409,6 @@ def _build_youtube_session_snapshot(
                 )
             for _height, upstream in tmp.variant_entries:
                 tmp.allowed_hosts.update(_hosts_for_url(upstream))
-            if getattr(tmp, "dash_window_hls", False) and not preview_fast_only_mode():
-                muxed = _youtube_muxed_progressive_for_long_explore(
-                    url, oauth, prefer_height, yt_info=yt_info
-                )
-                if muxed:
-                    prog_url, prog_formats, prog_info = muxed
-                    _apply_muxed_progressive_session(
-                        tmp, prog_url, prog_formats, prog_info, prefer_height
-                    )
-                    kind = "progressive"
-                    variant_formats = prog_formats
-                    yt_info = prog_info
-                    proxy_master_url = tmp.master_url
     if kind == "progressive":
         tmp.allowed_hosts.update(_hosts_for_url(tmp.entry_url))
     elif tmp.custom_master:

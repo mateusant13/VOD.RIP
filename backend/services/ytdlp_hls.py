@@ -3208,7 +3208,11 @@ def _mux_dash_window_to_hls(
                     "-f", "hls",
                     "-hls_time", "4",
                     "-hls_playlist_type", "vod",
-                    "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+                    # ponytail: ffmpeg >= 7 removed the omit_endlist hls flag
+                    # (deprecated 6.1); the served playlist is built on-the-fly
+                    # from disk state and controls EXT-X-ENDLIST visibility, so
+                    # the flag is unnecessary — independent_segments only.
+                    "-hls_flags", "independent_segments",
                     *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
                     "-hls_segment_filename", seg_pattern,
                     playlist,
@@ -3241,7 +3245,11 @@ def _mux_dash_window_to_hls(
             "-f", "hls",
             "-hls_time", "4",
             "-hls_playlist_type", "vod",
-            "-hls_flags", "independent_segments" + (",omit_endlist" if USE_FMP4 else ""),
+            # ponytail: ffmpeg >= 7 removed the omit_endlist hls flag
+            # (deprecated 6.1); the served playlist is built on-the-fly
+            # from disk state and controls EXT-X-ENDLIST visibility, so
+            # the flag is unnecessary — independent_segments only.
+            "-hls_flags", "independent_segments",
             *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
             "-hls_segment_filename", seg_pattern,
             playlist,

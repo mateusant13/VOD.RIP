@@ -610,13 +610,11 @@ class PreviewManager:
         prefer_height = prefer_height or 360
         youtube_anonymous = False
         if detect_platform(url) == "YouTube":
-            # Quality policy: anonymous YouTube (no user cookies) is 360p-only.
-            # Clamp BEFORE the snapshot lookup + resolve so the 360p anonymous
-            # InnerTube fast path stays the one used (never break it with a
-            # 720p request).
+            # Anonymity is surfaced to the client (the frontend clamps its own
+            # menu); the served tier ladder itself is NOT capped — cookieless
+            # DASH formats resolve from this IP, so anonymous sessions expose
+            # every adaptive height up to 1080p (muxed via window-HLS).
             youtube_anonymous = _youtube_preview_is_anonymous(oauth)
-            if youtube_anonymous:
-                prefer_height = min(prefer_height, 360)
             # Wait briefly for a genuinely in-flight hover/paste warm so
             # create_session reuses the resolved-stream cache (avoids a second
             # ~3s extract). ponytail: capped low — during a startup/channel warm
@@ -736,8 +734,6 @@ class PreviewManager:
                 if int(fmt.get("height") or 0) > 0 and fmt.get("url")
             ]
             if kind == "hls":
-                from services.ytdlp_hls import preview_fast_only_mode
-
                 # YouTube-specific DASH/window-HLS master logic must not be
                 # applied to Twitch/Kick HLS — it produces an invalid custom
                 # master and the player never reaches canplay.
@@ -749,26 +745,6 @@ class PreviewManager:
                     )
                 for _height, upstream in session.variant_entries:
                     session.allowed_hosts.update(_hosts_for_url(upstream))
-                if getattr(session, "dash_window_hls", False) and not preview_fast_only_mode():
-                    muxed = _youtube_muxed_progressive_for_long_explore(
-                        session.vod_url,
-                        oauth,
-                        prefer_height,
-                        yt_info=yt_info,
-                    )
-                    if muxed:
-                        prog_url, prog_formats, prog_info = muxed
-                        _apply_muxed_progressive_session(
-                            session,
-                            prog_url,
-                            prog_formats,
-                            prog_info,
-                            prefer_height,
-                        )
-                        kind = "progressive"
-                        variant_formats = prog_formats
-                        yt_info = prog_info
-                        proxy_master_url = session.master_url
         if kind == "progressive":
             session.allowed_hosts.update(_hosts_for_url(session.entry_url))
         elif session.custom_master:
@@ -1573,8 +1549,6 @@ def refresh_youtube_preview_session(
         raise ValueError("Preview session not found or expired")
     if session.platform != "YouTube":
         return session
-    if getattr(session, "anonymous", False):
-        prefer_height = min(prefer_height, 360)
     _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
     return session
 _PREVIEW_MUX_LOCKS: Dict[str, threading.Lock] = {}
@@ -4499,10 +4473,6 @@ def set_session_prefer_height(session_id: str, prefer_height: int) -> PreviewSes
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
-    if session.platform == "YouTube" and getattr(session, "anonymous", False):
-        # Quality policy: anonymous YouTube sessions are 360p-only — a tier
-        # change can never raise the served stream above 360p.
-        prefer_height = min(prefer_height, 360)
     if session.prefer_height == prefer_height:
         return session
     session.prefer_height = prefer_height

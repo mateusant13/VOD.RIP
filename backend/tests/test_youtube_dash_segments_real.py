@@ -25,6 +25,12 @@ def _is_mpegts(body: bytes) -> bool:
     return hits >= 2
 
 
+def _is_fmp4_segment(body: bytes) -> bool:
+    """CMAF/fMP4 fragment — styp/moof box in the head (USE_FMP4 default)."""
+    head = body[:64]
+    return b"styp" in head or (b"moof" in head and b"mfhd" in head) or b"ftyp" in head
+
+
 def _fetch(c, path: str, retries: int = 180) -> tuple[int, bytes]:
     for _ in range(retries):
         resp = c.get(path)
@@ -106,12 +112,22 @@ def test_youtube_window_hls_segments_zero_one_two():
                 failures.append(f"MEDIA {url}: HTTP {media_status}")
                 c.delete(f"/api/preview/session/{sid}")
                 continue
-            media_text = media.decode("utf-8", errors="replace")
-            seg_paths = [
-                ln.strip()
-                for ln in media_text.splitlines()
-                if ln.strip().startswith("/api/") and "window-seg-" in ln
-            ]
+            # The window mux runs async — the playlist reflects disk state, so
+            # poll until the initial mux lands (segments appear in one batch).
+            seg_paths: list[str] = []
+            deadline = time.monotonic() + 45.0
+            while time.monotonic() < deadline and len(seg_paths) < 3:
+                media_text = media.decode("utf-8", errors="replace")
+                seg_paths = [
+                    ln.strip()
+                    for ln in media_text.splitlines()
+                    if ln.strip().startswith("/api/") and "window-seg-" in ln
+                ]
+                if len(seg_paths) < 3:
+                    time.sleep(0.5)
+                    _media_status, media = _fetch(c, playlist_line, retries=5)
+                    if _media_status != 200:
+                        break
             extinf = _parse_extinf_durations(media_text)
             if len(seg_paths) < 3:
                 failures.append(f"PLAYLIST {url}: only {len(seg_paths)} segments")
@@ -126,18 +142,27 @@ def test_youtube_window_hls_segments_zero_one_two():
                 if len(content) < 50_000:
                     failures.append(f"seg{idx} {url}: tiny body {len(content)}")
                     continue
-                if not _is_mpegts(content):
-                    failures.append(f"seg{idx} {url}: not MPEG-TS head={content[:20]!r}")
+                is_ts = _is_mpegts(content)
+                if not is_ts and not _is_fmp4_segment(content):
+                    failures.append(
+                        f"seg{idx} {url}: not MPEG-TS/fMP4 head={content[:20]!r}"
+                    )
                     continue
-                if idx < len(extinf):
+                # ffprobe EXTINF audit is MPEG-TS-specific; fMP4 fragments need
+                # init.mp4 context, so only audit TS segments.
+                if is_ts and idx < len(extinf):
                     audit_err = _audit_segment_body(content, extinf[idx])
                     if audit_err:
                         failures.append(f"seg{idx} {url}: {audit_err}")
 
             if len(seg_paths) >= 6:
                 status, content = _fetch(c, seg_paths[5], retries=240)
-                if status not in (200, 206) or not _is_mpegts(content):
+                if status not in (200, 206):
                     failures.append(f"seg5 {url}: seek-mid failed status={status}")
+                elif not (_is_mpegts(content) or _is_fmp4_segment(content)):
+                    failures.append(
+                        f"seg5 {url}: not MPEG-TS/fMP4 head={content[:20]!r}"
+                    )
 
             c.delete(f"/api/preview/session/{sid}")
             break

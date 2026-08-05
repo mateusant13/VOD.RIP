@@ -1,4 +1,5 @@
-"""Long-VOD explore must use muxed progressive (byte-range seek), not window HLS."""
+"""Long-VOD explore: window-HLS with the full adaptive ladder; cached full-mux
+visits serve progressive MP4s with byte-range seek."""
 from __future__ import annotations
 
 import pytest
@@ -36,8 +37,12 @@ def _create_explore_session(client: TestClient, url: str) -> dict:
     return r.json()
 
 
-def test_long_explore_downgrades_to_progressive():
-    """Full-VOD explore: progressive MP4 with mid-file range, not dash_window_hls."""
+def test_long_explore_serves_window_hls_with_full_ladder():
+    """Full-VOD explore: window-HLS session exposing the full adaptive ladder
+    (1080p included) with a playable master; mid-VOD seek remuxes a bounded
+    chunk around the playhead instead of flattening to the lone 360p muxed
+    tier. Repeat visits still get the cached progressive MP4 (byte-range
+    seek) via the full-mux cache in _finalize_youtube_session."""
     from services.youtube_session import invalidate_anonymous_session
 
     invalidate_anonymous_session()
@@ -53,19 +58,22 @@ def test_long_explore_downgrades_to_progressive():
             pytest.skip("YouTube extract blocked for explore probe URLs")
 
         sid = body["session_id"]
-        assert body.get("kind") == "progressive", body
-        assert not body.get("dash_window"), body
-        assert body.get("trim_timeline") is False
+        assert body.get("kind") == "hls", body
+        assert max(body.get("variant_heights") or [0]) >= 1080, body
 
-        stream = f"/api/preview/hls/{sid}/stream.mp4"
-        head = client.get(stream, headers={"Range": "bytes=0-8191"})
-        assert head.status_code in (200, 206), head.text[:200]
-        assert b"ftyp" in head.content[:32]
+        master = client.get(f"/api/preview/hls/{sid}/master.m3u8")
+        assert master.status_code == 200, master.text[:200]
+        assert master.text.lstrip().startswith("#EXTM3U")
+        assert "/resource?id=" in master.text
 
-        # Mid-VOD byte range (~15 min @ ~1MB/s heuristic — proves seek path)
-        mid = client.get(stream, headers={"Range": "bytes=90000000-90008191"})
-        assert mid.status_code in (200, 206), mid.text[:200]
-        assert len(mid.content) > 256
+        # Mid-VOD seek (~15 min in) must not 500 — window-HLS remuxes a
+        # bounded chunk around the playhead.
+        mid = client.post(
+            f"/api/preview/session/{sid}/seek",
+            json={"position_sec": 900.0},
+        )
+        assert mid.status_code == 200, mid.text[:200]
+        assert mid.json().get("ok") is True, mid.text[:200]
 
         client.delete(f"/api/preview/session/{sid}")
 

@@ -1,9 +1,10 @@
-"""Quality policy — anonymous YouTube previews stay 360p-only (backend half).
+"""Quality policy — anonymous YouTube previews expose the full adaptive ladder.
 
-Covers: the anonymity determination helper, the create_session clamp,
-the set_session_prefer_height / refresh clamps, live-session anonymity
-marking, and the response surfacing. All resolve/mux paths are stubbed —
-no network.
+Covers: the anonymity determination helper, create_session / quality / refresh
+height handling, live-session anonymity marking, and the response surfacing.
+Anonymous YouTube sessions keep the requested height (cookieless DASH formats
+resolve from this IP); the ``anonymous`` flag still reaches the client so the
+frontend can clamp its menu. All resolve/mux paths are stubbed — no network.
 """
 import tempfile
 from pathlib import Path
@@ -144,14 +145,15 @@ def test_anon_jar_stays_anonymous():
         assert _youtube_preview_is_anonymous(None) is True
 
 
-# ── create_session clamp ──
+# ── create_session height handling ──
 
-def test_create_session_clamps_anonymous_youtube_to_360():
+def test_create_session_anonymous_youtube_keeps_requested_height():
     session = _create_policy_session(720, _anon_settings())
     try:
         assert session.anonymous is True
-        assert session.prefer_height == 360
-        # The served entry is the 360p variant, not the requested 720p.
+        assert session.prefer_height == 720
+        # The served entry is the 360p variant (canned raw_entry), not the
+        # requested 720p — but the tier ladder is not clamped to 360p.
         assert "360.mp4" in session.entry_url
         assert session.variant_entries == [(360, "https://cdn.example.com/360.mp4"),
                                            (720, "https://cdn.example.com/720.mp4"),
@@ -213,13 +215,13 @@ def test_create_session_non_youtube_unaffected():
 
 # ── set_session_prefer_height / refresh clamps ──
 
-def test_set_prefer_height_clamps_anonymous_youtube():
+def test_set_prefer_height_anonymous_youtube_keeps_requested_height():
     _fake_session(platform="YouTube", anonymous=True)
     with patch("services.preview.session._refresh_youtube_preview_urls") as refresh:
         session = set_session_prefer_height("poltest", 1080)
-        assert session.prefer_height == 360
+        assert session.prefer_height == 1080
         refresh.assert_called_once()
-        assert refresh.call_args.kwargs["prefer_height"] == 360
+        assert refresh.call_args.kwargs["prefer_height"] == 1080
     _manager.delete_session("poltest")
 
 
@@ -241,12 +243,12 @@ def test_set_prefer_height_non_youtube_unaffected():
     _manager.delete_session("poltest")
 
 
-def test_refresh_clamps_anonymous_youtube():
+def test_refresh_anonymous_youtube_keeps_requested_height():
     _fake_session(platform="YouTube", anonymous=True)
     with patch("services.preview.session._refresh_youtube_preview_urls") as refresh:
         refresh_youtube_preview_session("poltest", prefer_height=1080)
         refresh.assert_called_once()
-        assert refresh.call_args.kwargs["prefer_height"] == 360
+        assert refresh.call_args.kwargs["prefer_height"] == 1080
     _manager.delete_session("poltest")
 
 

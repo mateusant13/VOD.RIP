@@ -778,6 +778,20 @@ def _resolve_profile(
     progressive = _formats_from_streaming_progressive(streaming)
     adaptive = _formats_from_adaptive(streaming)
     url_formats = _streaming_url_formats(streaming)
+    audio = _pick_best_audio_format(streaming)
+
+    def _info(*args, **kwargs):
+        """_info_from_player_data + the best audio-only format attached.
+
+        The audio format is NOT in ``adaptive`` (it is skipped there) — it is
+        carried as ``_preview_audio_format`` so DASH video-only tiers can be
+        muxed with audio downstream (window-HLS). Without it, a fast profile
+        win collapses the preview to the sole muxed 360p tier.
+        """
+        info = _info_from_player_data(*args, **kwargs)
+        if info and audio:
+            info["_preview_audio_format"] = audio
+        return info
 
     if master_url:
         manifest_headers = _merge_headers(profile, session)
@@ -794,7 +808,7 @@ def _resolve_profile(
                 )
             else:
                 manifest.raise_for_status()
-                info = _info_from_player_data(
+                info = _info(
                     data, video_id, manifest.text, master_url, adaptive_formats=adaptive,
                 )
                 if info:
@@ -805,7 +819,7 @@ def _resolve_profile(
                 "InnerTube %s manifest fetch failed %s: %s", profile.name, video_id, exc,
             )
         # Manifest text fetch failed — still expose master URL for HLS preview (muxed + seekable).
-        info = _info_from_player_data(
+        info = _info(
             data,
             video_id,
             None,
@@ -817,15 +831,18 @@ def _resolve_profile(
             return info
 
     if progressive:
-        info = _info_from_player_data(
-            data, video_id, None, None, adaptive_formats=progressive,
+        # Muxed progressive MP4s (e.g. ANDROID_VR itag 18) + the adaptive DASH
+        # ladder — the muxed 360p tier plays instantly while the adaptive
+        # heights (up to 1080p) stay selectable via DASH mux.
+        info = _info(
+            data, video_id, None, None, adaptive_formats=progressive + adaptive,
         )
         if info:
             logger.debug("InnerTube %s progressive formats for %s", profile.name, video_id)
             return info
 
     if url_formats:
-        info = _info_from_player_data(
+        info = _info(
             data, video_id, None, None, adaptive_formats=url_formats + adaptive,
         )
         if info:
@@ -833,7 +850,7 @@ def _resolve_profile(
             return info
 
     if adaptive:
-        info = _info_from_player_data(data, video_id, None, None, adaptive_formats=adaptive)
+        info = _info(data, video_id, None, None, adaptive_formats=adaptive)
         if info:
             logger.debug("InnerTube %s adaptiveFormats succeeded for %s", profile.name, video_id)
             return info
@@ -1357,6 +1374,11 @@ def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> 
     if not info:
         logger.debug("anonymous 360p _info_from_player_data failed for %s", video_id)
         return None
+    # The adaptive ladder is video-only — attach the audio stream so DASH
+    # tiers stay muxable (window-HLS) instead of collapsing to 360p muxed.
+    audio = _pick_best_audio_format(streaming)
+    if audio:
+        info["_preview_audio_format"] = audio
     from services.youtube_diag import log_extract_ok
 
     log_extract_ok(video_id, "innertube_anonymous_360p", info, None)
