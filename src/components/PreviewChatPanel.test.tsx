@@ -146,6 +146,25 @@ describe('PreviewChatPanel', () => {
     });
   });
 
+  it('null platform/videoId (clip/live/channel previews) shows an explanatory message instead of a blank panel', async () => {
+    const fetchMock = mockPanelFetch(PAYLOAD);
+    const { rerender } = render(<PreviewChatPanel platform={null} videoId={null} currentTime={0} />);
+    const MSG = "Chat and transcript history aren't available for this kind of preview.";
+    await waitFor(() => {
+      expect(screen.getByText(MSG)).toBeTruthy();
+    });
+    expect(fetchMock).not.toHaveBeenCalled(); // nothing to fetch without a key
+    // The message is per-panel, not per-tab — switching tabs must not blank it.
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    await waitFor(() => expect(screen.getByText(MSG)).toBeTruthy());
+    // Once a key resolves (e.g. an archived VOD URL pasted in), the panel
+    // fetches and renders normally instead of showing the message.
+    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    expect(screen.queryByText(MSG)).toBeNull();
+  });
+
   it('auto-switches from an empty Chat tab to a populated Transcript tab', async () => {
     mockPanelFetch({ ...PAYLOAD, chat: [], has_chat: false });
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
