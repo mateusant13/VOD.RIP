@@ -17,6 +17,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from services import archive_db, archive_twitch
+from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["archive"])
@@ -352,9 +353,24 @@ def _maybe_enrich(
         for r in _transcribe_candidates(platform=platform, channel=channel, q=q):
             job_id = f"transcribe-{r['platform']}-{r['video_id']}"
             try:
-                archive_db.enqueue_job(job_id, "transcribe", r["platform"], r["video_id"], priority=0)
+                # Transcript searches are the user actively asking for
+                # whisper work -> top priority (the worker's ORDER BY
+                # priority DESC picks these before the scheduler's
+                # background queue).
+                archive_db.enqueue_job(
+                    job_id, "transcribe", r["platform"], r["video_id"],
+                    priority=TRANSCRIBE_PRIORITY_HIGH,
+                )
             except sqlite3.IntegrityError:
-                continue  # already queued by a previous search — nothing new
+                # Already queued (scheduler or an earlier search) — bump it
+                # to the front so this search's transcript still jumps the
+                # queue.
+                archive_db.execute(
+                    "UPDATE archive_jobs SET priority = ? "
+                    "WHERE id = ? AND status = 'queued'",
+                    (TRANSCRIBE_PRIORITY_HIGH, job_id),
+                )
+                continue
             with _transcribe_lock:
                 _last_transcribe_kick = time.monotonic()
                 _transcribe_attempted_at[r["video_id"]] = time.monotonic()
@@ -443,10 +459,15 @@ async def archive_search(
     video_id: str | None = None,
     lang: str | None = None,
     username: str | None = None,
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=5000),
     hint: bool = Query(True),
     semantic: bool = Query(False),
 ):
+    # Semantic (embedding) search is expensive per candidate — its cap stays
+    # tight. Literal-word queries may page through every match ("infinite
+    # results"): the frontend asks for a large limit and renders incrementally.
+    if semantic:
+        limit = min(limit, 100)
     # platform/kind accept comma-separated lists ("twitch,kick").
     for p in (platform or "").split(","):
         if p.strip():

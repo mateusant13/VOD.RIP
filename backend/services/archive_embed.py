@@ -110,6 +110,25 @@ def embed_query(q: str) -> Optional[object]:
     return embed_texts([q], _QUERY_PREFIX)
 
 
+def warmup_if_indexed() -> None:
+    """Background-warm the embedding model when the archive already holds
+    vectors (the user has run a semantic search before) — the first
+    semantic query of a fresh boot then skips the ~15s transformers import
+    + model load. Archives without vectors never pay the load: semantic
+    search stays fully lazy for them (and degrades to lexical anyway)."""
+    try:
+        from services import archive_db  # lazy: no import cycle at boot
+
+        n = archive_db.query(
+            "SELECT COUNT(*) AS n FROM transcript_embeddings WHERE vec IS NOT NULL"
+        )[0]["n"]
+    except Exception:
+        return
+    if not n:
+        return
+    threading.Thread(target=_load, name="embed-warmup", daemon=True).start()
+
+
 def backfill_missing(
     interrupt: Optional[threading.Event] = None,
     min_missing: int = 0,

@@ -5798,11 +5798,15 @@ export default function App() {
             : triplePanelLayout
               ? 'gap-3'
               : 'gap-6'
-          : viewportTier === 'wide'
-            ? 'max-w-lg gap-6'
-            : 'max-w-md gap-6'
+          : 'gap-6'
       }`}
-        style={rowEdgeInsets ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth } : undefined}
+        style={
+          rowEdgeInsets
+            ? { width: rowEdgeInsets.usableWidth, maxWidth: rowEdgeInsets.usableWidth }
+            : !triplePanelLayout && !splitLayout
+              ? { width: effectiveLayout.main.w }
+              : undefined
+        }
       >
       {previewOpen && (
         <div

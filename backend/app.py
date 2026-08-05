@@ -94,6 +94,16 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("startup chat dedupe skipped", exc_info=True)
 
+    # Keep FTS5 search fast as the archive grows: PRAGMA optimize merges
+    # fragmented FTS index b-tree pages and refreshes stats. Cheap no-op
+    # when nothing is pending; no exclusive lock (safe with live readers).
+    try:
+        from services.archive_db import query as _adb_query
+
+        _adb_query("PRAGMA optimize")
+    except Exception:
+        logger.debug("startup fts optimize skipped", exc_info=True)
+
     # Warm the YouTube chat display-name cache: resolve a bounded batch of
     # UC channel ids (the @handle-only rows) to the names viewers see, so
     # the USER search filter matches displayed names from the first search.
@@ -109,6 +119,16 @@ async def _app_lifespan(_app: FastAPI):
             logger.debug("startup display-name warm skipped", exc_info=True)
 
     threading.Thread(target=_warm_display_names, daemon=True, name="yt-display-warm").start()
+
+    # Warm the semantic-search embedding model in the background (only when
+    # the archive already has vectors) so the first CTX search of a fresh
+    # boot skips the ~15s transformers import + model load.
+    try:
+        from services.archive_embed import warmup_if_indexed
+
+        warmup_if_indexed()
+    except Exception:
+        logger.debug("startup embed warm skipped", exc_info=True)
 
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
@@ -498,6 +518,31 @@ async def _app_lifespan(_app: FastAPI):
         logger.info("Archive chat watchdog started")
     except Exception:
         logger.debug("Archive chat watchdog start skipped", exc_info=True)
+
+    # Archive scheduler — proactively ingests VOD metadata for every saved
+    # channel (Twitch/Kick), backfills Twitch VOD chat, fetches YouTube
+    # captions/subtitles, and tops up the low-priority whisper queue. First
+    # pass runs immediately at boot; later passes every ~3 min and right
+    # after a channel is added (kick_scheduler_pass in routers/settings).
+    try:
+        from services.archive_scheduler import start_archive_scheduler
+
+        start_archive_scheduler()
+        logger.info("Archive scheduler started")
+    except Exception:
+        logger.debug("Archive scheduler start skipped", exc_info=True)
+
+    # Archive transcribe worker — whisper queue consumer. Idle thread that
+    # heartbeats every poll; the model loads only when a job exists and
+    # unloads after idle. Without it, queued transcription jobs would sit
+    # forever (worker_heartbeats was empty before this fix).
+    try:
+        from services.archive_transcribe import start_worker
+
+        start_worker()
+        logger.info("Archive transcribe worker started")
+    except Exception:
+        logger.debug("Archive transcribe worker start skipped", exc_info=True)
 
     # Entity watcher — scans new transcription segments for saved words /
     # saved channels (auto mode), once at startup then every minute.

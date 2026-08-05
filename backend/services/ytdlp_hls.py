@@ -2522,7 +2522,11 @@ def _googlevideo_byte_range(
     clip = max(0.1, end_sec - start_sec)
     lead = min(start_sec, 3.0)
     t0 = max(0.0, start_sec - lead)
-    t1 = min(dur, end_sec + clip * 0.08)
+    # ponytail: 8s covers googlevideo's 2-4s fragments so the window ends on a
+    # complete moof (the trailing truncated fragment is trimmed downstream);
+    # if a stream ever uses >8s fragments, the crop comes up short — upgrade path
+    # is re-fetching with a doubled margin when the mux output is shorter than clip.
+    t1 = min(dur, end_sec + max(clip * 0.08, 8.0))
     b0 = int(clen * (t0 / dur))
     b1 = min(clen - 1, int(clen * (t1 / dur)))
     if b1 <= b0:
@@ -2805,6 +2809,32 @@ def _concat_googlevideo_init_media(
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _trim_fragmented_tail(path: str) -> None:
+    """Cut a from-zero googlevideo slice at the last complete MP4 box.
+
+    Byte ranges derived from clen/dur land mid-fragment, so the trailing moof/trun
+    is truncated and ffmpeg fails with "corrupted TRUN atom" when opening the
+    slice. Walking the top-level box chain and truncating at the last complete
+    box end makes the slice openable. No-op for EBML (webm) or clean slices.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as fh:
+            o = 0
+            last_end = 0
+            while o + 8 <= size:
+                fh.seek(o)
+                box_size = int.from_bytes(fh.read(4), "big")
+                if box_size < 8 or o + box_size > size:
+                    break
+                o += box_size
+                last_end = o
+            if 0 < last_end < size:
+                fh.truncate(last_end)
+    except OSError:
+        pass
+
+
 def _fetch_googlevideo_window_local(
     url: str,
     start_sec: float,
@@ -2835,10 +2865,12 @@ def _fetch_googlevideo_window_local(
     if prefix_cache:
         _grow_googlevideo_prefix_cache(url, headers, prefix_cache, mb1, cancel_event)
         shutil.copyfile(prefix_cache, dest)
+        _trim_fragmented_tail(dest)
         return start_sec
     _fetch_googlevideo_range(
         url, (0, mb1), headers, dest, cancel_event, max_workers=max_workers
     )
+    _trim_fragmented_tail(dest)
     return start_sec
 
 
@@ -2987,35 +3019,102 @@ def _download_muxed_dash_clip(
     if remote and use_byte_range:
         raise RuntimeError("googlevideo dash clip requires local range fetch")
     inp_hdr = (hdr + reconnect) if remote else []
-    cmd += probe + inp_hdr + ["-ss", str(v_ss), "-i", v_input]
-    cmd += probe + inp_hdr + ["-ss", str(a_ss), "-i", a_input]
-    cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
-    enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
-    if enc_args:
-        cmd += enc_args
-    elif _dash_video_needs_transcode(video_url, video_fmt) and not is_ts:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
-    elif is_ts:
-        # ponytail: m4a→mpegts needs AAC ADTS for browser MSE — plain -c copy is silent
-        # initial_discontinuity: each on-demand segment resets PTS; pairs with #EXT-X-DISCONTINUITY
-        cmd += [
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-mpegts_flags",
-            "+initial_discontinuity",
-        ]
+    if used_local:
+        # pass 1: mux the whole window with no seek. The range slice is a
+        # truncated fragmented MP4 whose moov claims the full VOD duration, so
+        # -ss inside it seeks past EOF ("partial file") and yields 0 video
+        # frames; trimming the clean mux in pass 2 always works.
+        muxed_path = os.path.join(tmpdir, "muxed." + ("ts" if is_ts else "mp4"))
+        p1 = (
+            [resolved, "-y", "-hide_banner", "-loglevel", "error"]
+            + probe
+            + ["-i", v_input, "-i", a_input]
+            + ["-map", "0:v:0", "-map", "1:a:0"]
+        )
+        if is_ts:
+            # ponytail: m4a→mpegts needs AAC ADTS for browser MSE — plain -c copy is silent
+            # initial_discontinuity: each on-demand segment resets PTS; pairs with #EXT-X-DISCONTINUITY
+            p1 += [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-mpegts_flags",
+                "+initial_discontinuity",
+                "-f",
+                "mpegts",
+                muxed_path,
+            ]
+        else:
+            p1 += ["-c", "copy", muxed_path]
+        _run_ffmpeg(
+            p1,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            register_abort=register_abort,
+            phase="Muxing",
+        )
+        # pass 2: trim the clean mux to the requested crop
+        cmd += probe + ["-ss", str(start_sec), "-i", muxed_path]
+        cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "0:a:0"]
+        enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
+        if enc_args:
+            cmd += enc_args
+        elif _dash_video_needs_transcode(video_url, video_fmt) and not is_ts:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "copy"]
+        elif is_ts:
+            cmd += ["-c:v", "copy", "-c:a", "copy"]
+        else:
+            cmd += ["-c", "copy"]
+        if is_ts:
+            cmd += ["-f", "mpegts", output_path]
+        elif mp4_faststart:
+            cmd += ["-movflags", "+faststart", output_path]
+        else:
+            cmd.append(output_path)
     else:
-        cmd += ["-c", "copy"]
-    if is_ts:
-        cmd += ["-f", "mpegts", output_path]
-    elif mp4_faststart:
-        cmd += ["-movflags", "+faststart", output_path]
-    else:
-        cmd.append(output_path)
+        cmd += probe + inp_hdr + ["-ss", str(v_ss), "-i", v_input]
+        cmd += probe + inp_hdr + ["-ss", str(a_ss), "-i", a_input]
+        cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
+        enc_args = ffmpeg_h264_encode_args(video_encoder or "copy")
+        if enc_args:
+            cmd += enc_args
+        elif _dash_video_needs_transcode(
+            video_url, video_fmt
+        ) and output_path.lower().endswith(".mp4"):
+            cmd += [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "22",
+                "-c:a",
+                "copy",
+            ]
+        elif is_ts:
+            # ponytail: m4a→mpegts needs AAC ADTS for browser MSE — plain -c copy is silent
+            # initial_discontinuity: each on-demand segment resets PTS; pairs with #EXT-X-DISCONTINUITY
+            cmd += [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-mpegts_flags",
+                "+initial_discontinuity",
+            ]
+        else:
+            cmd += ["-c", "copy"]
+        if is_ts:
+            cmd += ["-f", "mpegts", output_path]
+        elif mp4_faststart:
+            cmd += ["-movflags", "+faststart", output_path]
+        else:
+            cmd.append(output_path)
     try:
         if progress_hook and remote:
             progress_hook(
@@ -3381,7 +3480,10 @@ def _download_hls_clip(
     headers = info.get("http_headers") or {}
     ffmpeg_exe = _resolve_ffmpeg_exe(opts.get("ffmpeg_location"))
 
-    if extract_video_id(url) and not _youtube_info_has_hls(info):
+    # Prefer InnerTube direct googlevideo URLs over HLS: under YouTube's bot
+    # wall the degraded extraction can include an hls-master entry, and HLS
+    # segment fetches stall there while direct DASH range fetches work.
+    if extract_video_id(url):
         https_formats = [
             f
             for f in info.get("formats") or []

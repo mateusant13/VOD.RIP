@@ -87,7 +87,13 @@ function defaultPopupHeight(): number {
   return Math.min(Math.round(window.innerHeight * 0.88), 760);
 }
 const SEARCH_DEBOUNCE_MS = 250;
-const SEARCH_LIMIT = 30;
+/** Literal-word searches return every match (the backend caps at 5000) —
+ *  the list renders incrementally, so a huge result set stays smooth. */
+const SEARCH_LIMIT_LITERAL = 2000;
+/** Semantic (embedding) search stays tight — it is expensive per candidate. */
+const SEARCH_LIMIT_SEMANTIC = 30;
+/** How many hits render per scroll batch. */
+const HITS_RENDER_CHUNK = 200;
 const REMOTE_LIMIT = 20;
 const CHAT_HALF_SEC = 30;
 /** Floating-mode seed position — the pre-chrome location (top 80, right 24). */
@@ -143,6 +149,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
+  /** How many hits are actually in the DOM — grows as the user scrolls, so
+   *  an uncapped result set never mounts thousands of rows at once. */
+  const [visibleCount, setVisibleCount] = useState(HITS_RENDER_CHUNK);
+  const hitsScrollRef = useRef<HTMLDivElement>(null);
+  const visibleCountRef = useRef(HITS_RENDER_CHUNK);
+  useEffect(() => {
+    visibleCountRef.current = visibleCount;
+  }, [visibleCount]);
   const [videos, setVideos] = useState<Record<string, ArchiveVideoRow>>({});
   const [selected, setSelected] = useState<{ hit: ArchiveSearchHit; video: ArchiveVideoRow | undefined } | null>(null);
   const [chat, setChat] = useState<ArchiveChatMessage[] | null>(null);
@@ -409,6 +423,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       searchGenRef.current += 1;
       setStatus('idle');
       setHits([]);
+      setVisibleCount(HITS_RENDER_CHUNK);
       setEnriching([]);
       setError(null);
       return;
@@ -440,7 +455,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       dateTo: toOk ? dateTo : fromOk ? today : null,
       lang: langFilter || null,
       username: userFilter || null,
-      limit: SEARCH_LIMIT,
+      limit: semanticOn ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
       hint: hintDisabled ? false : undefined,
       semantic: semanticOn && sourceFilter !== 'chat',
     });
@@ -448,6 +463,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       .then((res) => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
         setHits(res.hits ?? []);
+        setVisibleCount(HITS_RENDER_CHUNK);
+        if (hitsScrollRef.current) hitsScrollRef.current.scrollTop = 0;
         setEnriching(res.enriching ?? []);
         setChannelHint(res.channel_hint ?? null);
         setStatus('done');
@@ -553,12 +570,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
     // Arrow/Enter navigation only while typing in the search box — other
     // controls (selects, date inputs) own their arrow keys.
     if (e.target !== inputRef.current) return;
-    const n = hits.length;
+    const n = Math.min(hits.length, visibleCountRef.current);
+    // Reveal the chunk holding the target row so the highlight is visible.
+    const ensureVisible = (i: number) => {
+      if (i >= visibleCountRef.current) {
+        setVisibleCount((c) => Math.min(hits.length, Math.max(c + HITS_RENDER_CHUNK, i + 1)));
+      }
+    };
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       if (!n) return;
       setActiveIdx((i) => {
         const next = i + 1 >= n ? 0 : i + 1;
+        ensureVisible(next);
         hitRefs.current[next]?.scrollIntoView?.({ block: 'nearest' });
         return next;
       });
@@ -567,6 +591,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
       if (!n) return;
       setActiveIdx((i) => {
         const next = i <= 0 ? n - 1 : i - 1;
+        ensureVisible(next);
         hitRefs.current[next]?.scrollIntoView?.({ block: 'nearest' });
         return next;
       });
@@ -913,10 +938,22 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
         </div>
       )}
 
-      {/* ── HITS ── */}
+      {/* ── HITS — incremental: only `visibleCount` rows are mounted; the
+          scroll handler reveals the next chunk so an uncapped literal search
+          stays smooth. ── */}
       {hits.length > 0 && (
-        <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
-          {hits.map((hit, idx) => {
+        <div
+          ref={hitsScrollRef}
+          onScroll={() => {
+            const el = hitsScrollRef.current;
+            if (!el) return;
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
+              setVisibleCount((c) => Math.min(hits.length, c + HITS_RENDER_CHUNK));
+            }
+          }}
+          className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1"
+        >
+          {hits.slice(0, visibleCount).map((hit, idx) => {
             const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
             const relativeDate = formatRelativeDate(hit.date);
             const spans = highlightQuerySpans(hit.text, query);

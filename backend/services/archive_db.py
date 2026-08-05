@@ -22,6 +22,7 @@ import functools
 import json
 import logging
 import os
+import pickle
 import re
 import shutil
 import sqlite3
@@ -1865,7 +1866,9 @@ def search(
     that), scores are normalized per table (divided by the batch max, so the
     best hit of a table scores 1.0 — BM25 scales are not comparable across
     tables), and hits are deduped by (platform, video_id) with a ~3-hit cap
-    per video. When the raw query as a quoted FTS5 phrase MATCHes, those
+    per video — lifted for large limits (literal "every match" mode), so a
+    targeted word surfaces every mention instead of one video's top 3. When
+    the raw query as a quoted FTS5 phrase MATCHes, those
     hits get a +50% score boost before the cross-table merge (phrase pass
     runs first, then the fuzzy OR pass, unioned by rowid — phrase wins).
 
@@ -2079,11 +2082,16 @@ def search(
     # raw BM25 is only comparable WITHIN a table, so it must never be the
     # cross-table tie-break: table stats shift with unrelated rows, making
     # the order depend on whatever else lives in the process DB.
+    # The per-video cap exists so a common fuzzy word never lets one video
+    # flood the default result page. A caller asking for a big batch (the
+    # FE's "infinite literal results" mode sends ~2000) wants EVERY match
+    # of a targeted word — the cap lifts, small/default limits keep it.
+    cap = _HITS_PER_VIDEO_CAP if int(limit) <= _HITS_PER_VIDEO_CAP * 10 else 10**6
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
     for h in sorted(merged, key=lambda h: (h["score"], h.pop("_tbl", 0), h.pop("_raw", 0.0)), reverse=True):
         key = (h["platform"], h["video_id"])
-        if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
+        if per_video.get(key, 0) >= cap:
             continue
         per_video[key] = per_video.get(key, 0) + 1
         h.pop("_rowid", None)
@@ -2778,7 +2786,17 @@ def _channel_hint_for(q: str) -> Optional[str]:
 # degrades to the exact token pattern on failure.
 
 _VOCAB_MAX_TOKENS = 25_000
-_VOCAB_TTL_S = 300.0
+# 30 min: the vocab rebuild is row-count-gated and invalidates per-token
+# expansions via the generation bump, so a long TTL only defers the cold
+# fuzzy-expansion cost (~200ms/token) — restart or corpus growth still
+# refresh it promptly. Was 300s: every new backend process re-paid the
+# full expansion scan for each unique word within minutes.
+_VOCAB_TTL_S = 1800.0
+# Disk snapshot of the vocab (pickle beside the DB): the fts5vocab GROUP BY
+# costs ~0.5-1s per table on a fresh process — the dominant cold-search tax
+# after a backend restart. The snapshot is keyed by the content row count
+# and a TTL, so chat growth or an hour of uptime still rebuilds it.
+_VOCAB_DISK_TTL_S = 3600.0
 _TOKEN_EXPAND_CAP = 12
 _MAX_EXPANDED_TERMS = 64
 # R3/R2 tuning: dist>=1 expansions above the merged corpus frequency are
@@ -2799,6 +2817,48 @@ _token_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 _vocab_generation: dict[str, int] = {}
 # tables with a background vocab rebuild in flight (search-latency guard)
 _vocab_rebuild_pending: set[str] = set()
+
+
+def _vocab_disk_path(table: str) -> str:
+    dbp = str(_db_path())
+    return os.path.join(os.path.dirname(dbp), f".{os.path.basename(dbp)}.vocab.{table}.pkl")
+
+
+def _load_vocab_disk(table: str) -> Optional[tuple[int, dict[int, list[tuple[str, int]]]]]:
+    """Read the pickled vocab snapshot if fresh. Best-effort: any failure
+    degrades to the GROUP BY rebuild.
+
+    Returns (saved_row_count, by_len): validity is TTL AND the content
+    row count the snapshot was built from — the caller compares it with
+    the current COUNT(*) (a cheap indexed scan, same gate the warm path
+    uses) so a corpus that grew since the snapshot never serves a vocab
+    missing the new words. Old 2-tuple pickles unpickle as a length error
+    and degrade to a rebuild."""
+    try:
+        path = _vocab_disk_path(table)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as fh:
+            saved_at, saved_rows, by_len = pickle.load(fh)
+        if time.time() - saved_at > _VOCAB_DISK_TTL_S:
+            return None
+        return int(saved_rows), by_len
+    except Exception:
+        return None
+
+
+def _save_vocab_disk(
+    table: str, row_count: int, by_len: dict[int, list[tuple[str, int]]]
+) -> None:
+    """Persist the snapshot (with the content row count it was built from)
+    for the next process. Best-effort: a failed write (read-only dir, disk
+    full) only costs the next process a rebuild."""
+    try:
+        path = _vocab_disk_path(table)
+        with open(path, "wb") as fh:
+            pickle.dump((time.time(), int(row_count), by_len), fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
 
 
 def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
@@ -2831,6 +2891,23 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
                     target=_rebuild_vocab, args=(table, now), daemon=True
                 ).start()
             return hit[2]
+    # Cold path (new process or TTL expired): try the on-disk snapshot
+    # before paying for the fts5vocab GROUP BY. Disk validity is TTL-only
+    # (see _load_vocab_disk); the in-memory tuple keeps the content row
+    # count as the warm-path frequency-churn proxy.
+    disk = _load_vocab_disk(table)
+    if disk is not None:
+        saved_rows, by_len = disk
+        row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+        if saved_rows == row_count:
+            with _vocab_lock:
+                dbp = str(_db_path())
+                _vocab_generation[dbp] = _vocab_generation.get(dbp, 0) + 1
+                _vocab_cache[table] = (dbp, now, by_len, row_count)
+            return by_len
+        # Corpus grew since the snapshot — serve nothing stale: rebuild
+        # inline (same cost as no snapshot; the snapshot's win is the
+        # unchanged-corpus cold start).
     return _load_vocab_uncached(table, now)
 
 
@@ -2872,6 +2949,7 @@ def _load_vocab_uncached(
         dbp = str(_db_path())
         _vocab_generation[dbp] = _vocab_generation.get(dbp, 0) + 1
         _vocab_cache[table] = (dbp, now, by_len, row_count)
+    _save_vocab_disk(table, row_count, by_len)
     return by_len
 
 
@@ -2961,31 +3039,63 @@ def _phonetic_fold(word: str) -> str:
 
 def _damerau_levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
     """Damerau–Levenshtein (adjacent transposition counts as one edit) with
-    an early bail when the row minimum exceeds max_dist."""
-    if abs(len(a) - len(b)) > max_dist:
+    an early bail when the row minimum exceeds max_dist.
+
+    Hot path of the fuzzy expansion (~17k calls per unique query token):
+    min() calls and the loop-invariant transposition guards (prev2 is not
+    None / i > 1 / j > 1) cost ~30us/call. The rewritten inner loop hoists
+    the guards out of the j-loop and uses if-chains instead of min() —
+    identical results, ~3x faster."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_dist:
         return None
+    if lb == 0:
+        return la if la <= max_dist else None
     prev2: Optional[list[int]] = None
-    prev = list(range(len(b) + 1))
-    for i in range(1, len(a) + 1):
-        cur = [i] + [0] * len(b)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        ai = a[i - 1]
+        cur = [i] + [0] * lb
         row_min = i
-        for j in range(1, len(b) + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
-            if (
-                prev2 is not None
-                and i > 1
-                and j > 1
-                and a[i - 1] == b[j - 2]
-                and a[i - 2] == b[j - 1]
-            ):
-                cur[j] = min(cur[j], prev2[j - 2] + cost)
-            if cur[j] < row_min:
-                row_min = cur[j]
+        cur_jm1 = i  # cur[j - 1]; cur[0] = i for the first cell
+        if prev2 is not None:
+            prev2_row = prev2
+            for j in range(1, lb + 1):
+                bj = b[j - 1]
+                cost = 0 if ai == bj else 1
+                v = prev[j] + 1
+                t = cur_jm1 + 1
+                if t < v:
+                    v = t
+                t = prev[j - 1] + cost
+                if t < v:
+                    v = t
+                if ai == b[j - 2] and a[i - 2] == bj:
+                    t = prev2_row[j - 2] + cost
+                    if t < v:
+                        v = t
+                cur[j] = v
+                if v < row_min:
+                    row_min = v
+                cur_jm1 = v
+        else:
+            for j in range(1, lb + 1):
+                cost = 0 if ai == b[j - 1] else 1
+                v = prev[j] + 1
+                t = cur_jm1 + 1
+                if t < v:
+                    v = t
+                t = prev[j - 1] + cost
+                if t < v:
+                    v = t
+                cur[j] = v
+                if v < row_min:
+                    row_min = v
+                cur_jm1 = v
         if row_min > max_dist:
             return None
         prev2, prev = prev, cur
-    dist = prev[-1]
+    dist = prev[lb]
     return dist if dist <= max_dist else None
 
 
@@ -3097,6 +3207,7 @@ def _token_expansions(
     token: str,
     vocabs: list[Optional[dict[int, list[tuple[str, int]]]]],
     bigrams: Optional[dict[str, list[tuple[str, int]]]],
+    merged_freq: Optional[dict[str, int]] = None,
 ) -> list[tuple[str, int]]:
     """Exact + fuzzy candidates for one query token as (term, distance)
     pairs, best ~8 by (distance, frequency), plus folded-bigram phrases
@@ -3111,7 +3222,13 @@ def _token_expansions(
     target); prefix matches of PRESENT tokens sit at tier 1 so a complete
     word never floods the top with longer forms ('vale' must not pull
     valendo/valeu into tier 0) — capped at _TOKEN_PREFIX_CAP. Falls back
-    to the bare token (distance 0) when nothing matches."""
+    to the bare token (distance 0) when nothing matches.
+
+    merged_freq (optional): the merged per-term corpus frequency, built
+    ONCE per query by _expand_query — rebuilding it inside this function
+    for every token is the dominant cold cost (2x 25k vocab terms per
+    token). Tests call this helper with 3 args, so None falls back to
+    building it here."""
     if len(token) < 3:
         return [(token, 0)]
     now = time.monotonic()
@@ -3128,13 +3245,14 @@ def _token_expansions(
     # Merged corpus frequency per term (summed across the per-table vocabs).
     # A per-table check would miss real-DB noise: 'cara' alone has freq 755
     # in messages, 3106 once transcripts join in.
-    merged_freq: dict[str, int] = {}
-    for vocab in vocabs:
-        if not vocab:
-            continue
-        for bucket in vocab.values():
-            for term, freq in bucket:
-                merged_freq[term] = merged_freq.get(term, 0) + freq
+    if merged_freq is None:
+        merged_freq = {}
+        for vocab in vocabs:
+            if not vocab:
+                continue
+            for bucket in vocab.values():
+                for term, freq in bucket:
+                    merged_freq[term] = merged_freq.get(term, 0) + freq
     for vocab in vocabs:
         if not vocab:
             continue
@@ -3271,10 +3389,20 @@ def _expand_query(q: str, tables: list[str]) -> list[tuple[str, int]]:
     if not vocabs:
         return []
     bigrams = _load_bigrams(tables)
+    # One merged-frequency build per query, shared by every token expansion
+    # (was rebuilt inside _token_expansions per token — the dominant cold
+    # cost for multi-word queries).
+    merged_freq: dict[str, int] = {}
+    for vocab in vocabs:
+        if not vocab:
+            continue
+        for bucket in vocab.values():
+            for term, freq in bucket:
+                merged_freq[term] = merged_freq.get(term, 0) + freq
     for w in q.split():
         if not w:
             continue
-        for t, d in _token_expansions(w, vocabs, bigrams):
+        for t, d in _token_expansions(w, vocabs, bigrams, merged_freq):
             if d < terms.get(t, 99):
                 terms[t] = d
     if bigrams:

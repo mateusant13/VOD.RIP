@@ -297,6 +297,27 @@ def backfill_chat(
         (vid,),
     )
     last_seen = float(existing[0]["m"] or 0.0)  # highest offset stored; next page starts at floor
+    dur_row = archive_db.query(
+        "SELECT duration_sec FROM videos WHERE platform='twitch' AND video_id=?",
+        (vid,),
+    )
+    duration = float(dur_row[0]["duration_sec"] or 0.0) if dur_row else 0.0
+
+    def _finish() -> Dict[str, Any]:
+        archive_db.update_job(job_id, status="done", progress=1.0)
+        return {
+            "video_id": vid,
+            "channel": channel,
+            "inserted": inserted,
+            "pages": pages,
+            "backoff_retries": backoff_retries,
+            "stopped": "end_of_chat",
+        }
+
+    if duration and last_seen >= duration - 5.0:
+        # Chat already covers the whole stream (re-run or trailing error
+        # after end-of-chat) — nothing left to fetch.
+        return _finish()
     try:
         while inserted < max_messages:
             nodes, backoff_retries = _fetch_page_with_backoff(vid, last_seen, page_size, backoff_retries)
@@ -321,6 +342,11 @@ def backfill_chat(
             time.sleep(PAGE_DELAY_SEC)
         archive_db.update_job(job_id, status="done", progress=1.0)
     except Exception as exc:
+        # Twitch's comments GQL answers pages at/past end-of-chat with a
+        # 'service error' instead of an empty edge list — a fetch failure
+        # once the stored chat already covers the stream is completion.
+        if duration and last_seen >= duration - 5.0:
+            return _finish()
         archive_db.update_job(job_id, status="failed", error=str(exc)[:500])
         raise
     return {

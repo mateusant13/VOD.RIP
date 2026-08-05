@@ -112,6 +112,15 @@ async def update_settings(update: SettingsUpdate):
         current.window_geometry = update.window_geometry
     if update.saved_channels is not None:
         current.saved_channels = update.saved_channels
+        # A channel was added/edited/removed — wake the archive scheduler
+        # so indexing for the new channel starts immediately instead of
+        # waiting for the next periodic pass.
+        try:
+            from services.archive_scheduler import kick_scheduler_pass
+
+            kick_scheduler_pass()
+        except Exception:
+            logger.debug("archive scheduler kick skipped", exc_info=True)
     if update.channel_kick_enabled is not None:
         current.channel_kick_enabled = bool(update.channel_kick_enabled)
     if update.channel_twitch_enabled is not None:
