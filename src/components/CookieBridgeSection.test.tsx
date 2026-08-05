@@ -71,6 +71,17 @@ describe('CookieBridgeSection extension install flow', () => {
     // "Developer mode" renders inside a styled span within the list item
     expect(screen.getByText('Developer mode')).toBeTruthy();
     expect(screen.getByText(/Open the extension popup on Kick or YouTube once/)).toBeTruthy();
+    // fresh-tab launch: no "reused" hint
+    expect(screen.queryByText(/no new tab opened/)).not.toBeInTheDocument();
+  });
+
+  it('reports when the already-open Extensions tab was focused instead', async () => {
+    mockFetch({ open: { launched: true, browser: null, url: null, reused: true } });
+    render(<CookieBridgeSection />);
+    await screen.findByText('Open extensions');
+    fireEvent.click(screen.getByText('Open extensions'));
+    await screen.findByText(/no new tab opened/);
+    expect(screen.getByText(/Drop the folder above onto the page/)).toBeTruthy();
   });
 
   it('one click opens extensions AND reveals the folder', async () => {

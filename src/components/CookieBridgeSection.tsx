@@ -38,6 +38,8 @@ interface OpenResult {
   launched: boolean;
   browser: string | null;
   url: string | null;
+  /** True when an already-open Extensions tab was focused instead of a new tab. */
+  reused?: boolean;
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -65,6 +67,7 @@ export default function CookieBridgeSection({
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(false);
   const [opened, setOpened] = useState(false);
+  const [reused, setReused] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -127,6 +130,7 @@ export default function CookieBridgeSection({
       setError('Could not reach the backend to open the browser tab.');
     } else {
       setOpened(openRes.launched);
+      setReused(Boolean(openRes.reused));
       if (!openRes.launched) {
         setError('No Chromium browser found — open chrome://extensions manually and drop the folder.');
       }
@@ -253,13 +257,20 @@ export default function CookieBridgeSection({
             <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>
           {opened ? (
-            <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
-              <li>
-                Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
-              </li>
-              <li>Drop the folder above onto the page.</li>
-              <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
-            </ol>
+            <>
+              {reused ? (
+                <p className="text-xs text-emerald-400 font-mono">
+                  Focused the already-open Extensions tab — no new tab opened.
+                </p>
+              ) : null}
+              <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
+                <li>
+                  Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
+                </li>
+                <li>Drop the folder above onto the page.</li>
+                <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
+              </ol>
+            </>
           ) : null}
         </div>
       ) : (

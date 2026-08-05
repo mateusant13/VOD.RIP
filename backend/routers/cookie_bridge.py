@@ -246,18 +246,54 @@ def _find_browser(name: str) -> Optional[Path]:
     return Path(shutil.which(name)) if shutil.which(name) else None
 
 
+def _focus_existing_extension_tab() -> bool:
+    """Bring an already-open chrome://extensions tab forward instead of
+    spawning a duplicate.
+
+    Uses UI Automation (scripts/focus_extension_tab.ps1): Chrome exposes its
+    tab strip as TabItem elements whose name is the localized page title, and
+    TabItem supports SelectionItemPattern, so we can select the tab and raise
+    its window without CDP or a remote-debugging port. Tab titles are matched
+    per locale (pt-BR Chrome calls the page "Extensões"); an unmatched locale
+    or a missing script simply reports False and the caller opens a fresh tab.
+    """
+    script = Path(__file__).resolve().parent.parent / "scripts" / "focus_extension_tab.ps1"
+    if not script.is_file():
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _open_extension_manager() -> dict:
-    """Launch the default chromium-family browser at its extensions manager tab."""
+    """Activate the extensions-manager tab: reuse an already-open one, else
+    launch a fresh tab in the default chromium-family browser."""
+    if _focus_existing_extension_tab():
+        return {"launched": True, "browser": None, "url": None, "reused": True}
     for name, url in _EXT_MANAGER_URLS.items():
         path = _find_browser(name)
         if not path:
             continue
         try:
             subprocess.Popen([str(path), url])
-            return {"launched": True, "browser": name, "url": url}
+            return {"launched": True, "browser": name, "url": url, "reused": False}
         except OSError as exc:
             logger.debug("cookie extension manager launch failed (%s): %s", name, exc)
-    return {"launched": False, "browser": None, "url": None}
+    return {"launched": False, "browser": None, "url": None, "reused": False}
 
 
 @router.get("/api/session/cookies/extension/update.xml")
