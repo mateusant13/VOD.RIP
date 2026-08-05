@@ -266,6 +266,28 @@ export function channelPlatformCanExpand(
   return false;
 }
 
+/** Effective platform filter flags for a channel. A channel with exactly one
+ * platform forces that platform ON regardless of the global toggle, so its
+ * content can never be hidden (e.g. a Twitch-only channel with the global
+ * Twitch filter off). The persisted global flags are never mutated — only the
+ * returned copy is adjusted. */
+export function effectivePlatformFlags(
+  ch: Pick<SavedChannel, 'kickSlug' | 'twitchSlug' | 'youtubeSlug'> | null | undefined,
+  flags: { kick: boolean; twitch: boolean; youtube: boolean },
+): { kick: boolean; twitch: boolean; youtube: boolean } {
+  const hasKick = Boolean(ch?.kickSlug?.trim());
+  const hasTwitch = Boolean(ch?.twitchSlug?.trim());
+  const hasYoutube = Boolean(ch?.youtubeSlug?.trim());
+  if (Number(hasKick) + Number(hasTwitch) + Number(hasYoutube) !== 1) {
+    return { kick: flags.kick, twitch: flags.twitch, youtube: flags.youtube };
+  }
+  return {
+    kick: hasKick || flags.kick,
+    twitch: hasTwitch || flags.twitch,
+    youtube: hasYoutube || flags.youtube,
+  };
+}
+
 export function channelClipsMissing(
   ch: SavedChannel,
   kickOn: boolean,

@@ -11,6 +11,7 @@ import {
   channelClipsMissing,
   channelVodsMissing,
   channelStreamsMissing,
+  effectivePlatformFlags,
   mergeVodPlatformsFetched,
   channelPlatformVisibleSlice,
   channelPlatformCanExpand,
@@ -362,6 +363,49 @@ describe('channelVodsMissing', () => {
       ],
     });
     expect(channelVodsMissing(state, true, true)).toBe(false);
+  });
+});
+
+describe('effectivePlatformFlags', () => {
+  const twitchOnly = { kickSlug: '', twitchSlug: 'harufoxy', youtubeSlug: '' };
+  const allOff = { kick: false, twitch: false, youtube: false };
+  const allOn = { kick: true, twitch: true, youtube: true };
+
+  it('forces the only platform ON even when its global flag is off', () => {
+    expect(effectivePlatformFlags(twitchOnly, allOff)).toEqual({
+      kick: false,
+      twitch: true,
+      youtube: false,
+    });
+  });
+
+  it('forces Kick on for a Kick-only channel', () => {
+    expect(effectivePlatformFlags({ kickSlug: 'x', twitchSlug: '', youtubeSlug: '' }, allOff)).toEqual({
+      kick: true,
+      twitch: false,
+      youtube: false,
+    });
+  });
+
+  it('keeps flags unchanged for multi-platform channels', () => {
+    const multi = { kickSlug: 'x', twitchSlug: 'y', youtubeSlug: '' };
+    expect(effectivePlatformFlags(multi, { kick: true, twitch: false, youtube: true })).toEqual({
+      kick: true,
+      twitch: false,
+      youtube: true,
+    });
+  });
+
+  it('keeps flags unchanged when no channel is selected', () => {
+    expect(effectivePlatformFlags(null, allOn)).toEqual(allOn);
+    expect(effectivePlatformFlags(undefined, allOff)).toEqual(allOff);
+  });
+
+  it('never mutates the input flags object', () => {
+    const flags = { kick: false, twitch: false, youtube: false };
+    const result = effectivePlatformFlags(twitchOnly, flags);
+    expect(flags).toEqual(allOff);
+    expect(result).not.toBe(flags);
   });
 });
 
