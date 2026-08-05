@@ -38,7 +38,7 @@ function mockFetch(overrides: Record<string, unknown> = {}) {
       );
     }
     if (url.includes('/api/session/cookies/extension/reveal')) {
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({ ok: true }), { status: (overrides.revealStatus as number | undefined) ?? 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -71,6 +71,28 @@ describe('CookieBridgeSection extension install flow', () => {
     // "Developer mode" renders inside a styled span within the list item
     expect(screen.getByText('Developer mode')).toBeTruthy();
     expect(screen.getByText(/Open the extension popup on Kick or YouTube once/)).toBeTruthy();
+  });
+
+  it('one click opens extensions AND reveals the folder', async () => {
+    const { calls } = mockFetch();
+    render(<CookieBridgeSection />);
+    await screen.findByText('Open extensions');
+    fireEvent.click(screen.getByText('Open extensions'));
+    await waitFor(() => {
+      expect(calls.some((c) => c.includes('/extension/open'))).toBe(true);
+      expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true);
+    });
+    await screen.findByText(/Drop the folder above onto the page/);
+  });
+
+  it('reveal failure still shows the checklist', async () => {
+    const { calls } = mockFetch({ revealStatus: 500 });
+    render(<CookieBridgeSection />);
+    await screen.findByText('Open extensions');
+    fireEvent.click(screen.getByText('Open extensions'));
+    await waitFor(() => expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true));
+    await screen.findByText(/Drop the folder above onto the page/);
+    expect(screen.queryByText(/No Chromium browser found/)).not.toBeInTheDocument();
   });
 
   it('open failure surfaces a manual-install hint', async () => {

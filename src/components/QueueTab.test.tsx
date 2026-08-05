@@ -87,6 +87,13 @@ describe('QueueTab', () => {
     expect(onWatchLocal).toHaveBeenCalledTimes(1);
   });
 
+  it('has no inner scroll containers — the page scrolls as one', () => {
+    renderTab();
+    expect(
+      document.querySelectorAll('[class*="overflow-y-auto"], [class*="custom-scrollbar"], [class*="max-h-["]'),
+    ).toHaveLength(0);
+  });
+
   it('shows empty states for an empty queue and empty history', () => {
     renderTab({ queue: [], history: [] });
     expect(screen.getByText('NO DOWNLOADS IN QUEUE.')).toBeInTheDocument();

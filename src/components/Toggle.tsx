@@ -13,9 +13,9 @@ type Props = {
 export default function Toggle({ checked, onChange, label, hint, ariaLabel }: Props) {
   return (
     <label className="flex items-center justify-between gap-2 cursor-pointer select-none group">
-      <span className="flex flex-col gap-0.5 min-w-0">
-        <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-300">{label}</span>
-        {hint ? <span className="text-[9px] text-zinc-600 font-mono leading-snug">{hint}</span> : null}
+      <span className="flex flex-col gap-1 min-w-0">
+        <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">{label}</span>
+        {hint ? <span className="text-xs text-zinc-500 font-mono leading-relaxed">{hint}</span> : null}
       </span>
       <span
         className={`relative w-9 h-[18px] shrink-0 border-2 transition-colors focus-within:border-white ${

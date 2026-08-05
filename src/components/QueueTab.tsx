@@ -104,7 +104,7 @@ export default function QueueTab({
         </div>
       )}
 
-      <div className="flex flex-col gap-2 max-h-[240px] overflow-y-auto pr-1 custom-scrollbar">
+      <div className="flex flex-col gap-2">
         <ActiveDownloadsList
           downloads={queueDownloads}
           onPause={onPause}
@@ -160,7 +160,7 @@ export default function QueueTab({
               </label>
             </div>
           )}
-          <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto pr-1 custom-scrollbar">
+          <div className="flex flex-col gap-2">
             <ActiveDownloadsList
               downloads={recentDownloads}
               onPause={onPause}
@@ -217,7 +217,7 @@ export default function QueueTab({
             </label>
           </div>
         )}
-        <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto pr-1 custom-scrollbar">
+        <div className="flex flex-col gap-2">
           {historyDownloads.length === 0 ? (
             <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
               NO COMPLETED DOWNLOADS YET.
