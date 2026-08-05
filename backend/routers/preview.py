@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from models.schemas import LivePreviewRequest, LiveRotateRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
-from deps import INFO_EXECUTOR, PREVIEW_EXECUTOR
+from deps import INFO_EXECUTOR, LIVE_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
     PreviewMuxPending,
     REPLAY_HLS_MARKER,
@@ -444,7 +444,7 @@ async def preview_live(req: LivePreviewRequest):
         raise HTTPException(status_code=400, detail="Live preview requires a master.m3u8 url")
     try:
         session = await asyncio.get_running_loop().run_in_executor(
-            PREVIEW_EXECUTOR,
+            LIVE_EXECUTOR,
             lambda: create_live_session(url, req.headers or {}, platform, req.vod_url or None),
         )
         logger.info(
@@ -535,7 +535,7 @@ async def preview_live_rotate(session_id: str, req: LiveRotateRequest):
     """
     try:
         return await asyncio.get_running_loop().run_in_executor(
-            PREVIEW_EXECUTOR,
+            LIVE_EXECUTOR,
             lambda: _rotate_live_twitch_session(session_id, req.player_type),
         )
     except ValueError as e:
