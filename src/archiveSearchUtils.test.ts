@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ARCHIVE_FILTER_KINDS,
   ARCHIVE_KINDS,
   buildArchiveVodUrl,
   buildSearchUrl,
@@ -249,6 +250,11 @@ describe('kindLabel', () => {
     expect(kindLabel('clip')).toBe('CLIP');
     expect(kindLabel('short')).toBe('SHORT');
     expect(kindLabel('live')).toBe('LIVE');
+  });
+
+  it('offers only VOD/clip/short as filter chips — LIVE is not filterable', () => {
+    expect(ARCHIVE_FILTER_KINDS).toEqual(['vod', 'clip', 'short']);
+    expect(ARCHIVE_FILTER_KINDS).not.toContain('live');
   });
 
   it('passes unknown/empty values through harmlessly', () => {

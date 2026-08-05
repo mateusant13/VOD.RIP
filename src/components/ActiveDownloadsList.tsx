@@ -84,11 +84,13 @@ function ActiveDownloadsListInner({
         const checked = showCheckbox && selectedIds?.has(dl.download_id);
         return (
           <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-900/40 p-3 flex flex-col gap-2">
-            <div className="flex gap-2 min-w-0">
+            <div className="flex gap-3 min-w-0">
               <DownloadThumb
                 thumbnail={dl.thumbnail}
                 url={dl.url}
                 platform={dl.platform}
+                // ponytail: thumbnail 2x for readability (w-12 h-9 → w-20 h-12); revert = drop className + this comment
+                className="w-20 h-12"
               />
               <div className="flex flex-col gap-2 min-w-0 flex-1">
             <div className="flex justify-between items-center gap-2">

@@ -54,6 +54,12 @@ export const ARCHIVE_PLATFORMS = ['youtube', 'twitch', 'kick'] as const;
 export const ARCHIVE_KINDS = ['vod', 'clip', 'short', 'live'] as const;
 export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
 
+/**
+ * Kind values offered as search filter chips — LIVE is hidden so search is
+ * VOD-only (kindLabel('live') still renders badges on stored hits).
+ */
+export const ARCHIVE_FILTER_KINDS = ARCHIVE_KINDS.filter((k) => k !== 'live');
+
 export const ARCHIVE_SOURCES = ['both', 'transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 

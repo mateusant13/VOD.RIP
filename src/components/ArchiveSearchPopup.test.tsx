@@ -99,6 +99,15 @@ describe('ArchiveSearchPopup', () => {
     expect(embeddedDialog.querySelector('div')!.className).not.toContain('cursor-grab');
   });
 
+  it('kind filter chips are VOD/clip/short only — no LIVE chip', () => {
+    mockFetch();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    expect(screen.getByRole('button', { name: 'VOD' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'CLIP' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'SHORT' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'LIVE' })).toBeNull();
+  });
+
   it('floating mode: initialPos seeds the dialog position (default top-right otherwise)', () => {
     mockFetch();
     const anchored = render(

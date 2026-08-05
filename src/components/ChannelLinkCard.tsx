@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef } from 'react';
+import { X } from 'lucide-react';
 import PlatformVodIcon from './PlatformVodIcon';
 import {
   type ChannelLinkDraft,
@@ -102,9 +103,20 @@ export default function ChannelLinkCard({
       className={`border border-zinc-700 bg-zinc-900/95 p-2.5 flex flex-col gap-2 ${className}`}
     >
       <div>
-        <p id={titleId} className="text-[11px] font-black uppercase text-white tracking-wide">
-          Link channel
-        </p>
+        <div className="flex items-start justify-between gap-2">
+          <p id={titleId} className="text-[11px] font-black uppercase text-white tracking-wide">
+            Link channel
+          </p>
+          <button
+            type="button"
+            onClick={onCancel}
+            title="Close"
+            aria-label="Close"
+            className="text-zinc-500 hover:text-white transition-colors shrink-0 -mt-0.5 -mr-0.5"
+          >
+            <X size={13} />
+          </button>
+        </div>
         <p className="text-[10px] font-mono text-zinc-500 leading-snug mt-0.5">
           Usernames can be different on each platform. Edit them before adding.
         </p>

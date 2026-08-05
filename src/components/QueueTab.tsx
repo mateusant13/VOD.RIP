@@ -226,11 +226,13 @@ export default function QueueTab({
             const checked = selectedHistoryIds?.has(dl.download_id);
             const canWatch = Boolean(onWatchLocal && dl.output_file && isPlayableLocalFile(dl.output_file));
             return (
-              <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex gap-2">
+              <div key={dl.download_id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex gap-3">
                 <DownloadThumb
                   thumbnail={dl.thumbnail}
                   url={dl.url}
                   platform={dl.platform}
+                  // ponytail: thumbnail 2x for readability (w-12 h-9 → w-20 h-12); revert = drop className + this comment
+                  className="w-20 h-12"
                   watchable={canWatch}
                   onWatch={canWatch ? () => onWatchLocal!(dl) : undefined}
                 />

@@ -25,8 +25,8 @@ import {
   type ResizeEdge,
 } from '../explorePopupUtils';
 import {
+  ARCHIVE_FILTER_KINDS,
   ARCHIVE_KIND_LABELS,
-  ARCHIVE_KINDS,
   ARCHIVE_LANG_LABELS,
   ARCHIVE_LANGS,
   ARCHIVE_PLATFORMS,
@@ -720,7 +720,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Kind</span>
             <div className="flex gap-1 flex-wrap">
-              {ARCHIVE_KINDS.map((k) => (
+              {ARCHIVE_FILTER_KINDS.map((k) => (
                 <button
                   key={k}
                   type="button"
