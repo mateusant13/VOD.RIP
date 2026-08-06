@@ -61,6 +61,22 @@ def scratch(monkeypatch, tmp_path):
     add("vra", "vale da estranheza aconteceu no fim")
     add("vrb", "valeu galera valendo demais hoje")
     add("vrc", "estranheza veio depois do vale")
+    # Prime the search caches synchronously: the request path no longer
+    # builds vocab/bigrams inline (cold searches serve exact tokens and
+    # rebuild in background threads), but these tests assert the fuzzy
+    # expansion and tier contracts that need a warm vocab.
+    import time as _t
+
+    for t in ("transcripts", "messages"):
+        db._load_vocab_uncached(t, _t.monotonic())
+    tables = ["transcripts", "messages"]
+    db._load_bigrams(tables)  # cold -> kicks a background rebuild
+    key = str(db._db_path()) + "|" + "|".join(tables)
+    for _ in range(1000):
+        with db._vocab_lock:
+            if key in db._bigram_cache:
+                break
+        _t.sleep(0.005)
     return db
 
 
@@ -125,6 +141,12 @@ def test_absent_token_still_prefix_expands(scratch):
         ],
         lang="pt",
     )
+    # The new word is corpus-only until the vocab rebuild lands; prime it
+    # synchronously (production reaches the same state ~1s after ingestion
+    # via the background rebuild).
+    import time as _t
+
+    db._load_vocab_uncached("transcripts", _t.monotonic())
     terms = dict(db._expand_query("kata", ["transcripts"]))
     assert any(t == "catarina" for t in terms), "absent token keeps prefix reach"
 
@@ -205,6 +227,10 @@ def test_fuzzy_gate_keeps_true_typos_and_prefix_stretch(scratch):
           "text": "cara que loucura carai", "words": []}],
         lang="pt",
     )
+    # New corpus words need the rebuilt vocab (see absent-token test above).
+    import time as _t
+
+    db._load_vocab_uncached("transcripts", _t.monotonic())
     terms = dict(db._expand_query("estranheza", ["transcripts"]))
     assert terms.get("estranhesa") == 1, "raw dist-1 ASR variant kept"
     terms = dict(db._expand_query("caraio", ["transcripts"]))
@@ -256,10 +282,13 @@ def test_title_prefix_and_asr_variants(scratch):
 
 # --- search-first vocab reload -------------------------------------------
 
-def test_vocab_stale_served_and_background_rebuild(scratch):
+def test_vocab_stale_served_and_background_rebuild(scratch, monkeypatch):
     """A corpus row-count change must not block the next search with the
     25k-row vocab rebuild: the stale vocab is served immediately and the
     rebuild lands in the background (generation bumps, cache updates)."""
+    import threading
+    import time as _t
+
     before = dict(db._expand_query("vale", ["transcripts"]))
     cached_count = db._vocab_cache["transcripts"][3]
     db.insert_transcript(
@@ -268,14 +297,22 @@ def test_vocab_stale_served_and_background_rebuild(scratch):
           "text": "zorknovo surgiu aqui", "words": []}],
         lang="pt",
     )
-    # Serving stale: the NEXT lookup sees the count mismatch, returns the
-    # cached vocab immediately (row count still the OLD one), and schedules
-    # a background rebuild whose snapshot eventually catches up.
-    import time as _t
+    # Hold the background rebuild hostage so the stale window is
+    # deterministic: the count-mismatch lookup must serve the cached vocab
+    # while the rebuild thread is blocked, then release and watch it land.
+    gate = threading.Event()
+    orig = db._load_vocab_uncached
+
+    def gated(table, now):
+        gate.wait(10)
+        return orig(table, now)
+
+    monkeypatch.setattr(db, "_load_vocab_uncached", gated)
     db._expand_query("vale", ["transcripts"])  # count mismatch observed here
     assert db._vocab_cache["transcripts"][3] == cached_count, "stale served, not rebuilt inline"
     n = db.query("SELECT COUNT(*) AS n FROM transcripts")[0]["n"]
     assert n == cached_count + 1, "insert landed"
+    gate.set()
     deadline = _t.monotonic() + 10.0
     while db._vocab_cache["transcripts"][3] != n and _t.monotonic() < deadline:
         _t.sleep(0.05)
