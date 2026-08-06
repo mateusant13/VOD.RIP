@@ -346,8 +346,17 @@ def _server_supervisor(port: int):
     logger.info("API server supervisor stopped")
 
 
-def _wait_for_server(port: int, timeout_sec: int = 15) -> bool:
-    """Poll the API health endpoint. Returns ``True`` when ready."""
+def _wait_for_server(port: int, timeout_sec: int = 90) -> bool:
+    """Poll the API health endpoint. Returns ``True`` when ready.
+
+    The timeout must clear the full boot cost, not just the import: the
+    lifespan runs startup hygiene + archive retention + chat dedupe before
+    the API answers, and that work grows with the archive (35s+ observed on
+    a warm archive; frozen bundles pay the PyInstaller cold import on top).
+    The window only opens after this returns, so failing fast just means
+    the app never opens — wait long enough for a genuinely slow boot, and
+    let the daemon warm-ups (which never block readiness) finish after.
+    """
     import requests as http_requests
 
     deadline = time.monotonic() + timeout_sec

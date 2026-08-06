@@ -1,6 +1,6 @@
 """VOD.RIP version — single source of truth."""
 
-__version__ = "1.0.51"
+__version__ = "1.0.52"
 VERSION = __version__
 
 # Honest, self-identifying User-Agent for outgoing requests that don't already
