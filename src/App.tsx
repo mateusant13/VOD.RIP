@@ -1728,7 +1728,11 @@ export default function App() {
   // (routers.live.warm_all_saved_channel_live_status) ensures the cache
   // hits in O(1) — first poll typically completes in <50ms.
   useEffect(() => {
-    if (tab !== 'channels' || !savedChannels.length) return;
+    // ponytail: hold the live-status polls while the preview player is open —
+    // a full channel grid's poll wave (14+ parallel requests) saturates the
+    // browser's per-host connection pool and starves the preview's manifest
+    // fetch past hls.js's manifestLoadingTimeOut (10s), killing playback.
+    if (tab !== 'channels' || !savedChannels.length || previewOpen) return;
     let cancelled = false;
     let timeout: number | null = null;
     const FAST_POLL_MS = 3_000;
@@ -1804,7 +1808,7 @@ export default function App() {
       cancelled = true;
       if (timeout) window.clearTimeout(timeout);
     };
-  }, [tab, savedChannels.length]);
+  }, [tab, savedChannels.length, previewOpen]);
 
   useEffect(() => {
     if (!previewOpen || !previewPlayback?.url) return;
@@ -4511,15 +4515,27 @@ export default function App() {
     if (tab !== 'channels' || incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
     const channels = loadSavedChannels();
+    const tasks: Array<() => Promise<unknown>> = [];
     channels.forEach((c) => {
-      void refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true });
-      void refreshChannelRef.current(c.id, c, 'clips', { silent: true, incremental: true });
+      tasks.push(() => refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true }));
+      tasks.push(() => refreshChannelRef.current(c.id, c, 'clips', { silent: true, incremental: true }));
       // Stream VODs need the same incremental sync — without it the VODs tab
       // goes stale after the first full fetch and never shows new streams.
       if (c.youtubeSlug?.trim()) {
-        void refreshChannelRef.current(c.id, c, 'streams', { silent: true, incremental: true });
+        tasks.push(() => refreshChannelRef.current(c.id, c, 'streams', { silent: true, incremental: true }));
       }
     });
+    // ponytail: cap the sync's concurrency (browser limits ~6 connections per
+    // host) — firing the whole grid at once saturates the pool and starves
+    // the preview player's manifest fetch past hls.js's 10s timeout. The grid
+    // fills in the background; the preview must never wait on it.
+    let cursor = 0;
+    const runNext = (): void => {
+      if (cursor >= tasks.length) return;
+      const task = tasks[cursor++];
+      void Promise.resolve(task()).finally(runNext);
+    };
+    for (let i = 0; i < Math.min(3, tasks.length); i += 1) runNext();
   }, [tab]);
 
   // Warm YouTube preview cache for the top N long-form URLs of every channel
@@ -6085,6 +6101,7 @@ export default function App() {
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
               hidden={previewFullscreen}
+              started={previewVideoReady}
               // Reserve the player's layout minimum: the chat panel may never
               // eat into it, whatever the user's stored panel width says.
               // Row budget = card - p-4(16) - border-2(2) per side, minus the

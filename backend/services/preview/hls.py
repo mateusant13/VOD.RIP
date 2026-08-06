@@ -254,6 +254,18 @@ def proxy_master(
         raise ValueError("Preview session not found or expired")
     if session.kind == "progressive":
         raise ValueError("Use open_progressive_proxy for progressive streams")
+    if (
+        getattr(session, "dash_window_hls", False)
+        and not session.custom_master
+        and session.variant_entries
+    ):
+        # ponytail: warm-snapshot reuse can lose custom_master — rebuild the
+        # window-HLS master from memory (variant entries + local resource URL)
+        # instead of fetching upstream, which stalls the manifest request past
+        # hls.js's manifestLoadingTimeOut and aborts it.
+        from services.preview.session import _build_youtube_window_hls_master
+
+        session.custom_master = _build_youtube_window_hls_master(session)
     if session.custom_master:
         data = session.custom_master.encode("utf-8")
         from services.youtube_diag import log_preview_upstream

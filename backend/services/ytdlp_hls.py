@@ -2531,6 +2531,17 @@ def _googlevideo_byte_range(
     t1 = min(dur, end_sec + max(clip * 0.08, 8.0))
     b0 = int(clen * (t0 / dur))
     b1 = min(clen - 1, int(clen * (t1 / dur)))
+    if t0 == 0.0:
+        # The linear estimate ignores the moov/init fixed overhead (the video
+        # moov + sample tables alone run ~235KB), so an early window can end
+        # inside the sample tables with ZERO media samples (mux output silently
+        # audio-only). Pull at least the init head for video streams; audio
+        # (small EBML/moov head, tight per-URL byte budget) keeps the linear
+        # estimate. -t truncates at mux time and _trim_fragmented_tail removes
+        # any trailing partial fragment.
+        is_audio_only = bool(fmt) and (fmt.get("vcodec") in (None, "none"))
+        if not is_audio_only:
+            b1 = max(b1, min(clen - 1, _INIT_PREFIX_BYTES))
     if b1 <= b0:
         return None
     return b0, b1
@@ -2591,12 +2602,31 @@ def _fetch_googlevideo_range_once(
             f"googlevideo URL expired HTTP {resp.status_code} for {url[:80]}",
         )
     resp.raise_for_status()
+    expected = None
+    cr = resp.headers.get("content-range") or ""
+    try:
+        # Content-Range: bytes 0-5242880/61360718 -> expected body 5242881
+        if cr.startswith("bytes ") and "-" in cr:
+            span, _total = cr[6:].split("/", 1)
+            _lo, hi = span.split("-", 1)
+            expected = int(hi) - int(_lo) + 1
+    except (TypeError, ValueError):
+        pass
+    written = 0
     with open(dest, "wb") as out:
         for chunk in resp.iter_content(256 * 1024):
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("Download cancelled by user")
             if chunk:
+                written += len(chunk)
                 out.write(chunk)
+    if expected is not None and written < expected:
+        # googlevideo throttled URLs close the connection mid-body (206 with a
+        # short body) — a silently truncated file muxes to audio-only. Treat as
+        # a failed fetch so the caller retries/bisects instead of accepting it.
+        raise StaleGooglevideoUrl(
+            f"googlevideo response truncated HTTP {resp.status_code} for {url[:80]}",
+        )
 
 
 def _is_stale_googlevideo_error(exc: Exception) -> bool:
@@ -2619,9 +2649,19 @@ def _fetch_googlevideo_span_resilient(
         _fetch_googlevideo_range_once(url, byte_range, headers, dest, cancel_event)
         return
     except Exception as exc:
-        if _is_stale_googlevideo_error(exc):
-            raise StaleGooglevideoUrl(str(exc)) from exc
-        if b1 - b0 < 256 * 1024:
+        stale = _is_stale_googlevideo_error(exc)
+        if stale:
+            # ponytail: googlevideo 403s ranges above a per-stream size cap
+            # (audio often rejects >32-160KB) — that is NOT a stale URL. Only
+            # spans small enough to clear any cap count as genuinely expired.
+            if b1 - b0 <= 64 * 1024:
+                raise StaleGooglevideoUrl(str(exc)) from exc
+            logger.debug(
+                "googlevideo range 403 on %d-byte span, bisecting: %s",
+                b1 - b0,
+                exc,
+            )
+        elif b1 - b0 < 256 * 1024:
             if b0 > 0 and os.path.isfile(dest) and os.path.getsize(dest) >= 65536:
                 logger.debug("googlevideo span tail dropped %d-%d: %s", b0, b1, exc)
                 return
@@ -2673,37 +2713,48 @@ def _fetch_googlevideo_range(
         # ponytail: parallel chunk fetch uses more of the user's bandwidth/CPU for
         # large background jobs (full-VOD warm). Each worker still does resilient
         # 1MB sub-chunks so transient CDN errors are handled inside the slice.
-        tmpdir = tempfile.mkdtemp(prefix="gv_par_")
         try:
-            per_worker = total // workers
-            part_files = [os.path.join(tmpdir, f"part_{i}") for i in range(workers)]
-            part_ranges: list[tuple[int, int]] = []
-            for i in range(workers):
-                start = b0 + i * per_worker
-                end = b1 if i == workers - 1 else start + per_worker - 1
-                part_ranges.append((start, end))
+            tmpdir = tempfile.mkdtemp(prefix="gv_par_")
+            try:
+                per_worker = total // workers
+                part_files = [os.path.join(tmpdir, f"part_{i}") for i in range(workers)]
+                part_ranges: list[tuple[int, int]] = []
+                for i in range(workers):
+                    start = b0 + i * per_worker
+                    end = b1 if i == workers - 1 else start + per_worker - 1
+                    part_ranges.append((start, end))
 
-            def _download_part(idx: int) -> None:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise CancelledError("Download cancelled by user")
-                _fetch_googlevideo_range(
-                    url,
-                    part_ranges[idx],
-                    headers,
-                    part_files[idx],
-                    cancel_event,
-                    max_workers=1,
-                )
+                def _download_part(idx: int) -> None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError("Download cancelled by user")
+                    _fetch_googlevideo_range(
+                        url,
+                        part_ranges[idx],
+                        headers,
+                        part_files[idx],
+                        cancel_event,
+                        max_workers=1,
+                    )
 
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(_download_part, range(workers)))
-            with open(dest, "wb") as out:
-                for pf in part_files:
-                    with open(pf, "rb") as src:
-                        shutil.copyfileobj(src, out)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_download_part, range(workers)))
+                with open(dest, "wb") as out:
+                    for pf in part_files:
+                        with open(pf, "rb") as src:
+                            shutil.copyfileobj(src, out)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            return
+        except StaleGooglevideoUrl:
+            # ponytail: some googlevideo hosts reject concurrent ranges from one
+            # IP (403) while serial 1MB spans succeed — retry the whole span
+            # sequentially before declaring the URL stale.
+            logger.debug("googlevideo parallel fetch 403, retrying sequentially")
+            if os.path.isfile(dest):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
 
     with open(dest, "wb") as out:
         pos = b0
@@ -2814,10 +2865,15 @@ def _concat_googlevideo_init_media(
 def _trim_fragmented_tail(path: str) -> None:
     """Cut a from-zero googlevideo slice at the last complete MP4 box.
 
-    Byte ranges derived from clen/dur land mid-fragment, so the trailing moof/trun
-    is truncated and ffmpeg fails with "corrupted TRUN atom" when opening the
-    slice. Walking the top-level box chain and truncating at the last complete
-    box end makes the slice openable. No-op for EBML (webm) or clean slices.
+    Byte ranges derived from clen/dur can land mid-fragment, truncating the
+    trailing moof/trun; ffmpeg then fails with "corrupted TRUN atom" when
+    opening the slice. Walking the top-level box chain and truncating at the
+    last complete box end makes the slice openable. No-op for EBML (webm) or
+    clean slices.
+
+    A partial trailing *mdat* is decodable and must be kept: classic
+    (progressive) MP4s are ftyp+moov+one giant 64-bit mdat, and every
+    byte-range slice ends inside that mdat — cutting it empties the file.
     """
     try:
         size = os.path.getsize(path)
@@ -2826,13 +2882,26 @@ def _trim_fragmented_tail(path: str) -> None:
             last_end = 0
             while o + 8 <= size:
                 fh.seek(o)
-                box_size = int.from_bytes(fh.read(4), "big")
+                raw = fh.read(8)
+                box_size = int.from_bytes(raw[:4], "big")
+                box_type = raw[4:8]
+                if box_size == 1:  # 64-bit extended size
+                    if o + 16 > size:
+                        break
+                    fh.seek(o + 8)
+                    box_size = int.from_bytes(fh.read(8), "big")
+                elif box_size == 0:  # box extends to EOF
+                    box_size = size - o
                 if box_size < 8 or o + box_size > size:
+                    # Incomplete trailing box: cut a partial moof (corrupted
+                    # TRUN), but never a partial mdat (decodable; progressive
+                    # files end inside mdat by construction) and never at
+                    # offset 0 (EBML/webm audio has no valid mp4 box chain).
+                    if last_end > 0 and box_type != b"mdat":
+                        fh.truncate(last_end)
                     break
                 o += box_size
                 last_end = o
-            if 0 < last_end < size:
-                fh.truncate(last_end)
     except OSError:
         pass
 
@@ -3209,6 +3278,125 @@ def _download_muxed_dash_clip(
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 
 
+def _split_fmp4_window_fragments(
+    frag_path: str, output_dir: str, duration: float
+) -> Path:
+    """Split one fragmented MP4 (empty_moov+frag_keyframe) into HLS files.
+
+    Writes ``init.mp4`` (ftyp+moov), ``seg_NNN.m4s`` (each moof+mdat run), and a
+    VOD ``window.m3u8`` with ``#EXT-X-ENDLIST``. The init is the very moov the
+    muxer wrote in the same run as the moofs, so track ids (1,2) and codec
+    configs always match the segments.
+    """
+    try:
+        with open(frag_path, "rb") as fh:
+            data = fh.read()
+    finally:
+        try:
+            os.remove(frag_path)
+        except OSError:
+            pass
+    boxes = []
+    i = 0
+    n = len(data)
+    while i + 8 <= n:
+        size = int.from_bytes(data[i : i + 4], "big")
+        box_type = data[i + 4 : i + 8].decode("latin1", "replace")
+        if size < 8 or i + size > n:
+            break
+        boxes.append((box_type, i, size))
+        i += size
+    first_moof = next(
+        (k for k, (box_type, _pos, _size) in enumerate(boxes) if box_type == "moof"),
+        None,
+    )
+    if first_moof is None:
+        raise RuntimeError("fragmented mp4 produced no moof")
+    with open(os.path.join(output_dir, "init.mp4"), "wb") as fh:
+        fh.write(data[: boxes[first_moof][1]])
+    moof_positions = [pos for box_type, pos, _size in boxes if box_type == "moof"]
+    # A trailing mfra index box (movenc writes one by default in fragmented
+    # mode) is inert for HLS — exclude it from the last segment.
+    trim_mfra = 0
+    if boxes and boxes[-1][0] == "mfra":
+        trim_mfra = len(data) - boxes[-1][1]
+    seg_names = []
+    for k, pos in enumerate(moof_positions):
+        end = moof_positions[k + 1] if k + 1 < len(moof_positions) else n
+        if k == len(moof_positions) - 1:
+            end -= trim_mfra
+        seg_name = f"seg_{len(seg_names):03d}.m4s"
+        with open(os.path.join(output_dir, seg_name), "wb") as fh:
+            fh.write(data[pos:end])
+        seg_names.append(seg_name)
+    if not seg_names:
+        raise RuntimeError("fragmented mp4 produced no segments")
+    seg_sec = max(1.0, duration / len(seg_names))
+    playlist = os.path.join(output_dir, "window.m3u8")
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:7",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        "#EXT-X-TARGETDURATION:5",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        '#EXT-X-MAP:URI="init.mp4"',
+    ]
+    for seg_name in seg_names:
+        lines.append(f"#EXTINF:{seg_sec:.3f},")
+        lines.append(seg_name)
+    lines.append("#EXT-X-ENDLIST")
+    with open(playlist, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return Path(playlist)
+
+
+def _run_window_fmp4_mux(
+    ffmpeg_exe: str,
+    input_args: list,
+    duration: float,
+    output_dir: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> Path:
+    """Mux a DASH window to fMP4 HLS via the plain mp4 muxer + moof split.
+
+    ffmpeg >= 8's hlsenc fmp4 writer is broken: it never writes the init
+    fragment (7.x did) and stamps bogus tfhd track ids (1024) on every track,
+    which MSE/hls.js reject (samples silently dropped — the player stalls at
+    metadata with no error). The plain mp4 muxer emits deterministic track ids
+    (1,2) and one moov that matches the moofs it writes in the same run, so the
+    split init always agrees with the segments.
+
+    ponytail: replaces the hlsenc fmp4 path entirely; no synthesis needed.
+    """
+    frag_path = os.path.join(output_dir, "_window_frag.mp4")
+    cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        *input_args,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-t", str(duration),
+        # mirror the hlsenc codec mapping exactly (copy video, re-encode audio
+        # to AAC) — same streams, same configs as the moov we keep as init.
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "mp4",
+        # fragments at source keyframes (YouTube adaptive GOP ~4s — matches the
+        # frontend's WINDOW_HLS_SEGMENT_SEC segment math). frag_keyframe wins
+        # over frag_duration, so no duration cap is passed.
+        "-movflags", "empty_moov+frag_keyframe+default_base_moof",
+        frag_path,
+    ]
+    _run_ffmpeg(
+        cmd,
+        encode_duration=duration,
+        progress_from=10.0,
+        progress_to=92.0,
+        phase="Muxing",
+        cancel_event=cancel_event,
+    )
+    return _split_fmp4_window_fragments(frag_path, output_dir, duration)
+
+
 def _mux_dash_window_to_hls(
     video_url: str,
     audio_url: str,
@@ -3232,7 +3420,8 @@ def _mux_dash_window_to_hls(
     4-second target duration) so the frontend MSE player can attach the instant
     ``seg_000.m4s`` lands and HLS.js finalises when ``#EXT-X-ENDLIST`` appears.
     When ``USE_FMP4`` is enabled (default), segments are fragmented MP4 (CMAF)
-    with an ``init.mp4`` init fragment instead of MPEG-TS.
+    with an ``init.mp4`` init fragment instead of MPEG-TS — muxed via the plain
+    mp4 muxer and split at moof boundaries (see :func:`_run_window_fmp4_mux`).
 
     ``mux_timeout_sec`` enforces a hard ceiling on the whole ffmpeg mux (including
     the remote-URL fallback path). googlevideo CDN connections can stall without
@@ -3293,15 +3482,33 @@ def _mux_dash_window_to_hls(
             err = str(exc).lower()
             if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
                 # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
-                playlist = os.path.join(output_dir, "window.m3u8")
-                seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
-                hdr = _ffmpeg_input_headers(headers or {})
+                # with bounded ranges (googlevideo 403s open-ended Range on
+                # throttled URLs; audio caps tighter than video).
                 reconnect = _ffmpeg_reconnect_args()
                 probe = ["-probesize", "8M", "-analyzeduration", "2M"]
+                v_hdr = _ffmpeg_input_headers(
+                    {**(headers or {}), "Range": "bytes=0-2097152"}
+                )
+                a_hdr = _ffmpeg_input_headers(
+                    {**(headers or {}), "Range": "bytes=0-262144"}
+                )
+                if USE_FMP4:
+                    return _run_window_fmp4_mux(
+                        ffmpeg_exe,
+                        [
+                            *probe, *v_hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
+                            *probe, *a_hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
+                        ],
+                        duration,
+                        output_dir,
+                        cancel_event=cancel_event,
+                    )
+                playlist = os.path.join(output_dir, "window.m3u8")
+                seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
                 cmd = [
                     ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-                    *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
-                    *probe, *hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
+                    *probe, *v_hdr, *reconnect, "-ss", str(start_sec), "-i", video_url,
+                    *probe, *a_hdr, *reconnect, "-ss", str(start_sec), "-i", audio_url,
                     "-map", "0:v:0", "-map", "1:a:0",
                     "-t", str(duration),
                     "-c:v", "copy",
@@ -3314,7 +3521,6 @@ def _mux_dash_window_to_hls(
                     # from disk state and controls EXT-X-ENDLIST visibility, so
                     # the flag is unnecessary — independent_segments only.
                     "-hls_flags", "independent_segments",
-                    *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
                     "-hls_segment_filename", seg_pattern,
                     playlist,
                 ]
@@ -3331,8 +3537,21 @@ def _mux_dash_window_to_hls(
                     raise RuntimeError("remote window HLS mux produced no playlist") from exc
                 return playlist_path
             raise
+        if USE_FMP4:
+            return _run_window_fmp4_mux(
+                ffmpeg_exe,
+                [
+                    "-probesize", "8M", "-analyzeduration", "2M",
+                    "-ss", str(v_ss), "-i", v_input,
+                    "-probesize", "8M", "-analyzeduration", "2M",
+                    "-ss", str(a_ss), "-i", a_input,
+                ],
+                duration,
+                output_dir,
+                cancel_event=cancel_event,
+            )
         playlist = os.path.join(output_dir, "window.m3u8")
-        seg_pattern = os.path.join(output_dir, "seg_%03d.m4s" if USE_FMP4 else "seg_%03d.ts")
+        seg_pattern = os.path.join(output_dir, "seg_%03d.ts")
         cmd = [
             ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
             "-probesize", "8M", "-analyzeduration", "2M",
@@ -3351,7 +3570,6 @@ def _mux_dash_window_to_hls(
             # from disk state and controls EXT-X-ENDLIST visibility, so
             # the flag is unnecessary — independent_segments only.
             "-hls_flags", "independent_segments",
-            *(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"] if USE_FMP4 else []),
             "-hls_segment_filename", seg_pattern,
             playlist,
         ]

@@ -117,6 +117,33 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
+  it('defers the payload fetch until the video started (video-first gate)', async () => {
+    const fetchMock = mockPanelFetch(PAYLOAD);
+    const { rerender } = render(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started={false} />,
+    );
+    // Not started → zero network work, waiting placeholder instead.
+    expect(fetchMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/Video plays first/)).toBeTruthy());
+    // Playback starts (host flips started on canplay) → fetch + render.
+    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started />);
+    expect(fetchMock).toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+  });
+
+  it('defers the YouTube subtitles fetch until the video started', async () => {
+    const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
+    const { rerender } = render(
+      <PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started={false} />,
+    );
+    await waitFor(() => expect(screen.getByText(/Video plays first/)).toBeTruthy());
+    const urls = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls().some((u) => u.includes('/api/preview/panel/'))).toBe(false);
+    expect(urls().some((u) => u.includes('/api/subtitles'))).toBe(false);
+    rerender(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started />);
+    await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
+  });
+
   it('colors usernames: platform color wins, palette fallback otherwise', async () => {
     const colored: PreviewPanelPayload = {
       ...PAYLOAD,

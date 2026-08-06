@@ -116,6 +116,12 @@ interface PreviewChatPanelProps {
   currentTime: number;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
+  /** Video-first gate: while false the panel does NOT fetch its payload
+   *  (chat/transcript/subtitles), so the preview's first bytes go to video
+   *  playback instead of racing the panel's network work. The host flips it
+   *  on the player's canplay signal; defaults to true for callers without
+   *  a player (tests, non-preview hosts). */
+  started?: boolean;
   /** Initial open state. The explore popup opens collapsed (small strip)
    *  so the mini preview stays player-sized by default; the main preview
    *  keeps the panel open. */
@@ -273,6 +279,7 @@ export function PreviewChatPanel({
   videoId,
   currentTime,
   hidden = false,
+  started = true,
   defaultOpen = true,
   maxWidth: maxWidthProp,
   onLayoutChange,
@@ -315,6 +322,15 @@ export function PreviewChatPanel({
       setFetchState('done');
       return;
     }
+    // Video-first: the preview's canplay signal gates the panel fetch so
+    // the video's manifest/first segments get the connection before the
+    // panel's (possibly YouTube-side) network work. Cache hits above skip
+    // the gate — rendering memory is free. The started transition re-runs
+    // this effect (started is in the dep list).
+    if (!started) {
+      setFetchState('idle');
+      return;
+    }
     let cancelled = false;
     setFetchState('loading');
     apiGet<PreviewPanelPayload>(`/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}`)
@@ -338,7 +354,7 @@ export function PreviewChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [payloadKey, retryTick]);
+  }, [payloadKey, retryTick, started]);
 
   // Default tab: land on whichever source actually exists (first open only).
   useEffect(() => {
@@ -365,6 +381,12 @@ export function PreviewChatPanel({
       setSubsFetchState('done');
       return;
     }
+    // Video-first gate (same as the panel fetch above): URL-only previews
+    // fetch YouTube captions over the network — wait for canplay.
+    if (!started) {
+      setSubsFetchState('idle');
+      return;
+    }
     let cancelled = false;
     setSubsFetchState('loading');
     const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -381,7 +403,7 @@ export function PreviewChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [subtitlesOnly, videoId, retryTick]);
+  }, [subtitlesOnly, videoId, retryTick, started]);
 
   // Subtitles are a YouTube feature: the caption display is only offered for
   // YouTube videos (URL-only previews fetch live captions; archived ones show
@@ -761,6 +783,13 @@ export function PreviewChatPanel({
                   </button>
                 </>
               )}
+            </div>
+          )}
+          {!started && fetchState === 'idle' && !payload && (
+            <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-600 px-4">
+              <span className="text-[10px] font-mono text-center">
+                Video plays first — chat loads once playback starts.
+              </span>
             </div>
           )}
           {fetchState === 'loading' && (

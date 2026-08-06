@@ -1844,6 +1844,7 @@ export default function ChannelExplorePopup({
               videoId={vod.videoId ?? null}
               currentTime={currentTime}
               defaultOpen={false}
+              started={ready}
               onLayoutChange={setChatInfo}
             />
           )}

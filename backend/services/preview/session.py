@@ -1566,6 +1566,13 @@ def refresh_youtube_preview_session(
         raise ValueError("Preview session not found or expired")
     if session.platform != "YouTube":
         return session
+    if getattr(session, "dash_window_hls", False):
+        # ponytail: window-HLS must refresh upstream googlevideo URLs without
+        # touching the local window cache or session kind — the kind-flipping
+        # path below would wipe the adopted seg0 and strand the player in an
+        # empty-playlist retry loop.
+        _refresh_youtube_window_hls_urls(session, prefer_height=prefer_height)
+        return session
     _refresh_youtube_preview_urls(session, prefer_height=prefer_height)
     return session
 _PREVIEW_MUX_LOCKS: Dict[str, threading.Lock] = {}
@@ -3263,11 +3270,12 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
             break
         except Exception as exc:
             last_exc = exc
-            logger.debug(
+            logger.warning(
                 "window hls mux attempt %d session=%s: %s",
                 attempt,
                 session.session_id[:8],
                 exc,
+                exc_info=True,
             )
             _clear_youtube_window_hls_cache(session)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -3339,6 +3347,12 @@ def schedule_youtube_window_hls_mux(session_id: str) -> None:
                                 since_create_ms=(now - created) * 1000.0,
                             )
             except Exception as exc:
+                logger.warning(
+                    "window hls mux exception session=%s: %s",
+                    session_id[:8],
+                    exc,
+                    exc_info=True,
+                )
                 if _try_fallback_from_window_hls(
                     session,
                     prefer_height=session.prefer_height or 720,
@@ -3381,8 +3395,10 @@ def _register_youtube_window_hls_resources(session: PreviewSession) -> None:
     }
     session.resource_map[WINDOW_HLS_PLAYLIST_RESOURCE] = f"{WINDOW_HLS_MARKER}playlist"
     if USE_FMP4:
-        # fMP4 init segment — served via ?id=window-init
+        # fMP4 init segment — served via ?id=window-init AND the literal
+        # "init.mp4" URI the rebuilt media playlist's EXT-X-MAP references.
         session.resource_map[WINDOW_HLS_INIT_RESOURCE] = f"{WINDOW_HLS_MARKER}init.mp4"
+        session.resource_map["init.mp4"] = f"{WINDOW_HLS_MARKER}init.mp4"
     for seg in _window_hls_existing_segments(session):
         try:
             idx = int(seg.stem.split("_", 1)[1])
@@ -3422,13 +3438,11 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
     if USE_FMP4:
         lines = [
             "#EXTM3U",
-            "#EXT-X-VERSION:9",
+            "#EXT-X-VERSION:7",
             "#EXT-X-INDEPENDENT-SEGMENTS",
             f"#EXT-X-TARGETDURATION:{target_duration}",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
-            "#EXT-X-PART-INF:PART-TARGET=0.5",
-            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=60,HOLD-BACK=2.0",
             f"#EXT-X-MAP:URI=\"{base}init.mp4\"",
         ]
     else:
@@ -3448,13 +3462,6 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
         rid = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
         if USE_FMP4:
             session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.m4s"
-            # LL-HLS partial-segment hints for the first two parts of this segment.
-            lines.append(
-                f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"seg_{idx:03d}_part_000.m4s\"'
-            )
-            lines.append(
-                f'#EXT-X-PART:DURATION=0.5,URI=\"seg_{idx:03d}_part_001.m4s\",INDEPENDENT=YES'
-            )
         else:
             session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.ts"
         lines.append(f"#EXTINF:{duration:.3f},")
@@ -4539,6 +4546,7 @@ def resolve_upstream(session_id: str, resource_id: Optional[str]) -> str:
         raise ValueError("Missing preview resource id")
     if getattr(session, "dash_window_hls", False) and (
         resource_id == WINDOW_HLS_PLAYLIST_RESOURCE
+        or resource_id == "init.mp4"
         or resource_id.startswith(WINDOW_HLS_SEGMENT_RESOURCE_PREFIX)
     ):
         _register_youtube_window_hls_resources(session)
