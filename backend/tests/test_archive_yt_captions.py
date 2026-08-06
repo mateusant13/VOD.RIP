@@ -275,3 +275,44 @@ def test_parse_srv3_segments():
     assert segs[0]["text"] == "Não somos estranhos"
     assert segs[0]["words"][0] == {"word": "somos", "start": 19.146, "end": 19.492}
     assert segs[1]["text"] == "Ih." and segs[1]["start_sec"] == 25.96
+
+
+# --- speaker-turn markers ("&gt;&gt;" / ">>") must never reach segment text --
+
+def test_parse_vtt_strips_speaker_turn_markers():
+    vtt = (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:04.000\n"
+        "&gt;&gt; E aí maranguap.\n\n"
+        "00:00:04.000 --> 00:00:08.000\n"
+        "velho. >> Nossa, &gt;&gt; suporte.\n"
+    )
+    segs = archive_ytdlp._parse_vtt(vtt)
+    assert segs[0]["text"] == "E aí maranguap."
+    assert segs[1]["text"] == "velho. Nossa, suporte."
+
+
+def test_parse_vtt_drops_marker_only_cue():
+    vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:04.000\n&gt;&gt;\n"
+    assert archive_ytdlp._parse_vtt(vtt) == []
+
+
+def test_parse_json3_strips_speaker_turn_markers():
+    payload = (
+        '{"events": [{"tStartMs": 0, "dDurationMs": 4000, "segs": ['
+        '{"utf8": "&gt;&gt; "}, {"utf8": "E aí ", "tOffsetMs": 0},'
+        '{"utf8": "maranguap", "tOffsetMs": 500}]}]}'
+    )
+    segs = archive_ytdlp._parse_json3(payload)
+    assert segs[0]["text"] == "E aí maranguap"
+
+
+def test_parse_srv3_strips_speaker_turn_markers():
+    payload = (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<timedtext format="3"><body>'
+        '<p t="0" d="4000">&gt;&gt; oi <s t="200">tudo</s> bem</p>'
+        '</body></timedtext>'
+    )
+    segs = archive_ytdlp._parse_srv3(payload)
+    assert segs[0]["text"] == "oi tudo bem"
