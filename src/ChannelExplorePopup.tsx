@@ -4,10 +4,11 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search, Clapperboard, AlertCircle } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search, AlertCircle } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
-import { openTwitchClipEditor } from './twitchClip';
+import TwitchClipPopup from './components/TwitchClipPopup';
+import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -173,7 +174,14 @@ export default function ChannelExplorePopup({
   const [currentTime, setCurrentTime] = useState(0);
   /** Twitch clip editor open — transient notice in the transport row. */
   const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
-  const [clipOpening, setClipOpening] = useState(false);
+  /** Twitch clip mini-preview — opened at the current playhead. */
+  const [clipPopup, setClipPopup] = useState<{
+    url: string;
+    broadcasterLogin: string;
+    vodId: string;
+    playheadSec: number;
+    vodDurationSec: number;
+  } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
   const [sessionDurationSec, setSessionDurationSec] = useState(0);
@@ -1515,8 +1523,12 @@ export default function ChannelExplorePopup({
     clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
   }, []);
 
-  /** Open Twitch's clip editor on the current playhead position. */
-  const openExploreTwitchClip = useCallback(async () => {
+  /**
+   * Open the Twitch clip mini-preview at the current playhead (±60s window,
+   * user trims there and creates the clip). Fixes the old direct-open call,
+   * which sent offsetSec without durationSec — the backend 422'd every VOD.
+   */
+  const openExploreTwitchClip = useCallback(() => {
     const login = (vod.channel || '').trim();
     const vodId = vod.videoId ?? archiveVideoIdFromUrl(vod.url) ?? undefined;
     if (!login) {
@@ -1527,34 +1539,29 @@ export default function ChannelExplorePopup({
       showClipNotice('error', 'Not a Twitch VOD URL');
       return;
     }
-    setClipOpening(true);
-    try {
-      const res = await openTwitchClipEditor({
-        broadcasterLogin: login,
-        vodId,
-        offsetSec: Math.max(0, Math.floor(currentTime)),
-      });
-      showClipNotice('ok', `Twitch clip editor opened — ${res.url}`);
-    } catch {
-      showClipNotice('error', 'Failed to open the Twitch clip editor');
-    } finally {
-      setClipOpening(false);
-    }
-  }, [vod.channel, vod.videoId, vod.url, currentTime, showClipNotice]);
+    setClipPopup({
+      url: vod.url,
+      broadcasterLogin: login,
+      vodId,
+      playheadSec: currentTime,
+      vodDurationSec: vod.durationSec,
+    });
+  }, [vod.channel, vod.videoId, vod.url, vod.durationSec, currentTime, showClipNotice]);
 
   const exploreClipBtn = (fs: boolean) => (
     <button
       type="button"
       onClick={() => void openExploreTwitchClip()}
-      disabled={clipOpening || !vod.channel?.trim()}
+      disabled={!vod.channel?.trim()}
       className={fs ? fsCtrlBtn : ctrlBtn(false)}
       title={
         !vod.channel?.trim()
           ? 'Channel login missing — cannot open the Twitch editor'
-          : 'Open Twitch clip editor on the current moment'
+          : 'Open the Twitch clip mini-preview at the playhead'
       }
     >
-      {clipOpening ? <Loader2 size={18} className="animate-spin" /> : <Clapperboard size={18} />}
+      <TwitchLogoIcon size={16} />
+      <span className="text-[8px] font-bold uppercase tracking-wider">Twitch clip</span>
     </button>
   );
 
@@ -1928,6 +1935,19 @@ export default function ChannelExplorePopup({
       </div>
       {!fullscreen && (
         <PanelResizeHandles onPointerDown={onPanelResize} />
+      )}
+      {clipPopup && (
+        <TwitchClipPopup
+          url={clipPopup.url}
+          broadcasterLogin={clipPopup.broadcasterLogin}
+          vodId={clipPopup.vodId}
+          playheadSec={clipPopup.playheadSec}
+          vodDurationSec={clipPopup.vodDurationSec}
+          zIndex={zIndex + 50}
+          onClose={() => setClipPopup(null)}
+          onClipCreated={(editorUrl) =>
+            showClipNotice('ok', `Twitch clip editor opened — ${editorUrl}`)}
+        />
       )}
     </div>
   );

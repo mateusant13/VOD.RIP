@@ -1,0 +1,662 @@
+/**
+ * Twitch clip mini-preview — the "Twitch clip" button on the main preview and
+ * the explore popup opens this floating player on a ±60s window around the
+ * click moment instead of jumping straight to Twitch's editor. The user trims
+ * a 5..60s selection on the window timeline, then 'Create Twitch clip' opens
+ * Twitch's editor pre-positioned on the selection END (offsetSeconds is an
+ * END reference — see twitchClip.ts) and records the editor-open via the
+ * existing POST /api/twitch/clip flow (no user token needed).
+ *
+ * The mini preview reuses the main preview's session machinery: one session
+ * per popup with crop_start/crop_end = the window, exactly like App.tsx's
+ * openPreview passes the trim range. ponytail: no quality menu here — the
+ * session starts at the fast-start tier (360p) and plays the default level;
+ * the main/explore previews remain the full quality experience.
+ */
+
+import {
+  useCallback, useEffect, useMemo, useRef, useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
+import { createPortal } from 'react-dom';
+import Hls from 'hls.js';
+import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X } from 'lucide-react';
+import { apiDelete } from '../hooks/useApiClient';
+import {
+  TWITCH_CLIP_MAX_SEC,
+  TWITCH_CLIP_MIN_SEC,
+  clampClipSelection,
+  clipEditorOffsetAndDuration,
+  openTwitchClipEditor,
+  twitchClipDurationError,
+  twitchClipWindow,
+} from '../twitchClip';
+import {
+  PREVIEW_FAST_START_HEIGHT,
+  attachPreviewBufferingListeners,
+  attachProgressivePreview,
+  createPreviewSessionWithRetry,
+  detachProgressivePreview,
+  playPreviewWithAudio,
+  resolvePreviewPlayback,
+} from '../previewPlayerUtils';
+import { fracToSec, secToFrac, trimButtonDeltaForEndpoint } from '../trimUtils';
+import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
+import { formatHmsFull } from '../utils';
+import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
+import TwitchLogoIcon from './TwitchLogoIcon';
+
+const POPUP_W = 460;
+
+interface TwitchClipPopupProps {
+  /** VOD URL the mini preview plays (same session machinery as the main preview). */
+  url: string;
+  broadcasterLogin: string;
+  vodId: string;
+  /** VOD time of the click — the ±60s window is centred here. */
+  playheadSec: number;
+  /** VOD length; <=0/unknown → the upper window edge is unclamped. */
+  vodDurationSec: number;
+  zIndex: number;
+  onClose: () => void;
+  /** Called after the editor opened — parents reuse their clip notice. */
+  onClipCreated: (editorUrl: string) => void;
+}
+
+export default function TwitchClipPopup({
+  url,
+  broadcasterLogin,
+  vodId,
+  playheadSec,
+  vodDurationSec,
+  zIndex,
+  onClose,
+  onClipCreated,
+}: TwitchClipPopupProps) {
+  const win = useMemo(
+    () => twitchClipWindow(playheadSec, vodDurationSec),
+    [playheadSec, vodDurationSec],
+  );
+  const winLen = win.end - win.start;
+  const windowTooShort = winLen < TWITCH_CLIP_MIN_SEC;
+
+  const [selection, setSelection] = useState(() =>
+    clampClipSelection(win.start, win.end, win.start, win.end),
+  );
+  const selectionRef = useRef(selection);
+  const commitSelection = useCallback((next: { start: number; end: number }) => {
+    selectionRef.current = next;
+    setSelection(next);
+  }, []);
+  const [lastEndpoint, setLastEndpoint] = useState<'in' | 'out'>('out');
+  const lastEndpointRef = useRef<'in' | 'out'>('out');
+  const markEndpoint = useCallback((which: 'in' | 'out') => {
+    lastEndpointRef.current = which;
+    setLastEndpoint(which);
+  }, []);
+  const selLen = Math.max(0, selection.end - selection.start);
+
+  // Floating panel position (draggable via the header, like the other popups).
+  const [position, setPosition] = useState(() => ({
+    x: Math.max(8, window.innerWidth - POPUP_W - 24),
+    y: 80,
+  }));
+  const posRef = useRef(position);
+  const [drag, setDrag] = useState<{
+    startX: number; startY: number; offsetX: number; offsetY: number;
+  } | null>(null);
+
+  const popupRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const railRef = useRef<HTMLDivElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const timelineOffsetRef = useRef(0);
+  const currentTimeRef = useRef(Math.max(win.start, Math.min(win.end, playheadSec)));
+
+  const [playback, setPlayback] = useState<{
+    url: string;
+    kind: 'hls' | 'progressive';
+  } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+  const [buffering, setBuffering] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [currentTime, setCurrentTime] = useState(currentTimeRef.current);
+  const [retryTick, setRetryTick] = useState(0);
+  const [clipOpening, setClipOpening] = useState(false);
+  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const clipNoticeTimerRef = useRef<number | null>(null);
+
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+    if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
+    setClipNotice({ kind, text });
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+  }, []);
+
+  // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await createPreviewSessionWithRetry({
+          url,
+          crop_start: win.start,
+          crop_end: win.end,
+          prefer_height: PREVIEW_FAST_START_HEIGHT,
+        });
+        if (cancelled) {
+          // ponytail: StrictMode double-invoke — both runs share the SAME
+          // session (inflight dedup in createPreviewSessionWithRetry). Only
+          // delete when the applied run used a different session.
+          const orphanSid = res.session_id;
+          window.setTimeout(() => {
+            if (sessionIdRef.current !== orphanSid) {
+              void apiDelete(`/api/preview/session/${orphanSid}`).catch(() => {});
+            }
+          }, 5000);
+          return;
+        }
+        sessionIdRef.current = res.session_id;
+        // Window-muxed MP4 (trim_timeline) is 0-based; Twitch VOD HLS is
+        // absolute VOD time. offset maps video time → VOD time.
+        timelineOffsetRef.current = res.trim_timeline === true ? win.start : 0;
+        setPlayback({ ...resolvePreviewPlayback(url, res) });
+        setLoading(false);
+      } catch (err: unknown) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Could not start preview');
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      const hls = hlsRef.current;
+      if (hls) {
+        try { hls.stopLoad(); hls.detachMedia(); hls.destroy(); } catch { /* ignore */ }
+        hlsRef.current = null;
+      }
+      const video = videoRef.current;
+      if (video) detachProgressivePreview(video);
+      const sid = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (sid) {
+        void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
+      }
+    };
+  }, [url, win.start, win.end, retryTick]);
+
+  // ── Playback attach (HLS for Twitch VODs, progressive fallback) ──
+  useEffect(() => {
+    if (!playback?.url) return;
+    let cancelled = false;
+    const video = videoRef.current;
+    if (!video) return;
+    const bufferingHandle = attachPreviewBufferingListeners(video, (s) => {
+      if (!cancelled) setBuffering(s);
+    });
+    setLoading(true);
+    setBuffering(false);
+    setReady(false);
+
+    const initialVideoTime = timelineOffsetRef.current > 0
+      ? Math.max(0, playheadSec - win.start)
+      : Math.max(win.start, Math.min(win.end, playheadSec));
+
+    const clampToWindow = () => {
+      const base = timelineOffsetRef.current;
+      const lo = Math.max(0, win.start - base);
+      const hi = Math.max(lo, win.end - base);
+      let t = video.currentTime;
+      if (t < lo) t = lo;
+      else if (t > hi) {
+        t = hi;
+        if (!video.paused) video.pause();
+      }
+      if (Math.abs(video.currentTime - t) > 0.05) video.currentTime = t;
+      const vodTime = t + base;
+      currentTimeRef.current = vodTime;
+      setCurrentTime(vodTime);
+    };
+    video.addEventListener('timeupdate', clampToWindow);
+
+    const onCanPlay = () => {
+      if (cancelled) return;
+      setReady(true);
+      setBuffering(false);
+      setLoading(false);
+      if (video.paused) {
+        void playPreviewWithAudio(video, setMuted, 0.1).then(() => {
+          setPlaying(!video.paused);
+        });
+      }
+    };
+
+    if (playback.kind === 'progressive') {
+      attachProgressivePreview(video, playback.url);
+      video.addEventListener('loadedmetadata', () => {
+        // window-muxed MP4 is 0-based (offset set above) — land the click moment.
+        const t = timelineOffsetRef.current > 0
+          ? Math.max(0, playheadSec - win.start)
+          : Math.max(win.start, Math.min(win.end, playheadSec));
+        video.currentTime = t;
+      }, { once: true });
+      video.addEventListener('canplay', onCanPlay, { once: true });
+      return () => {
+        cancelled = true;
+        video.removeEventListener('timeupdate', clampToWindow);
+        video.removeEventListener('canplay', onCanPlay);
+        detachProgressivePreview(video);
+        bufferingHandle.detach();
+      };
+    }
+
+    const hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      backBufferLength: 12,
+      maxBufferLength: 6,
+      maxMaxBufferLength: 12,
+      startFragPrefetch: true,
+      fragLoadingTimeOut: 20000,
+      manifestLoadingTimeOut: 10000,
+      testBandwidth: false,
+      ...twitchAdBlockHlsConfig({}),
+      startPosition: initialVideoTime,
+    });
+    hlsRef.current = hls;
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (!cancelled) hls.startLoad(initialVideoTime);
+    });
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (cancelled || !data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        hls.startLoad();
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+      } else {
+        setError('Preview failed — retry');
+        setLoading(false);
+      }
+    });
+    hls.loadSource(playback.url);
+    video.addEventListener('canplay', onCanPlay, { once: true });
+
+    return () => {
+      cancelled = true;
+      video.removeEventListener('timeupdate', clampToWindow);
+      video.removeEventListener('canplay', onCanPlay);
+      try { hls.stopLoad(); hls.detachMedia(); hls.destroy(); } catch { /* ignore */ }
+      if (hlsRef.current === hls) hlsRef.current = null;
+      bufferingHandle.detach();
+    };
+    // Re-attach only when the session's playback actually changes (a retry
+    // creates a fresh session → new playback object). retryTick must NOT be a
+    // dep: it would rebuild the player against the just-deleted session.
+  }, [playback, win.start, win.end, playheadSec]);
+
+  const seekTo = useCallback((vodSec: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const t = Math.max(win.start, Math.min(win.end, vodSec));
+    video.currentTime = Math.max(0, t - timelineOffsetRef.current);
+    currentTimeRef.current = t;
+    setCurrentTime(t);
+  }, [win]);
+
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || !ready) return;
+    if (video.paused) {
+      void playPreviewWithAudio(video, setMuted, 0.1).then(() => {
+        setPlaying(!video.paused);
+      });
+    } else {
+      video.pause();
+      setPlaying(false);
+    }
+  }, [ready]);
+
+  const toggleMute = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setMuted(video.muted);
+  }, []);
+
+  // ── Trimmer ──
+  const beginHandleDrag = useCallback((
+    e: ReactPointerEvent<HTMLElement>,
+    which: 'in' | 'out',
+  ) => {
+    markEndpoint(which);
+    e.preventDefault();
+    e.stopPropagation();
+    const rail = railRef.current;
+    if (!rail) return;
+    const handle = e.currentTarget;
+    const pointerId = e.pointerId;
+    handle.setPointerCapture(pointerId);
+    const fixed = which === 'in' ? selectionRef.current.end : selectionRef.current.start;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+
+    const xToSec = (clientX: number) => {
+      const rect = rail.getBoundingClientRect();
+      if (rect.width <= 0) return win.start;
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return fracToSec(frac, win);
+    };
+
+    let ended = false;
+    const endDrag = () => {
+      if (ended) return;
+      ended = true;
+      document.body.style.userSelect = prevUserSelect;
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', endDrag);
+      handle.removeEventListener('pointercancel', endDrag);
+      handle.removeEventListener('lostpointercapture', endDrag);
+      try { handle.releasePointerCapture(pointerId); } catch { /* ignore */ }
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      const sec = xToSec(ev.clientX);
+      const res = which === 'in'
+        ? clampClipSelection(sec, fixed, win.start, win.end, { move: 'in', fixedEnd: fixed })
+        : clampClipSelection(fixed, sec, win.start, win.end, { move: 'out', fixedStart: fixed });
+      commitSelection(res);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+    handle.addEventListener('lostpointercapture', endDrag);
+  }, [win, commitSelection, markEndpoint]);
+
+  const adjustSelection = useCallback((buttonDelta: number) => {
+    const sel = selectionRef.current;
+    const which = lastEndpointRef.current;
+    const delta = trimButtonDeltaForEndpoint(which, buttonDelta);
+    const res = which === 'in'
+      ? clampClipSelection(
+        sel.start - delta, sel.end, win.start, win.end,
+        { move: 'in', fixedEnd: sel.end },
+      )
+      : clampClipSelection(
+        sel.start, sel.end + delta, win.start, win.end,
+        { move: 'out', fixedStart: sel.start },
+      );
+    commitSelection(res);
+  }, [win, commitSelection]);
+
+  // ── Final action: open Twitch's editor on the selected range (END ref) ──
+  const createClip = useCallback(async () => {
+    const sel = selectionRef.current;
+    const err = twitchClipDurationError(sel.end - sel.start);
+    if (err) {
+      showClipNotice('error', err);
+      return;
+    }
+    const { offsetSec, durationSec } = clipEditorOffsetAndDuration(sel.start, sel.end);
+    setClipOpening(true);
+    try {
+      const res = await openTwitchClipEditor({
+        broadcasterLogin,
+        vodId,
+        offsetSec,
+        durationSec,
+      });
+      onClipCreated(res.url);
+      onClose();
+    } catch {
+      showClipNotice('error', 'Failed to open the Twitch clip editor');
+    } finally {
+      setClipOpening(false);
+    }
+  }, [broadcasterLogin, vodId, onClipCreated, onClose, showClipNotice]);
+
+  const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
+  const playFrac = secToFrac(currentTime, railView) * 100;
+  const selStartFrac = secToFrac(selection.start, railView) * 100;
+  const selEndFrac = secToFrac(selection.end, railView) * 100;
+
+  const createDisabled = clipOpening || windowTooShort
+    || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
+  const createDisabledTitle = windowTooShort
+    ? `The ${Math.round(winLen)}s window is too short to clip (min ${TWITCH_CLIP_MIN_SEC}s)`
+    : selLen > TWITCH_CLIP_MAX_SEC
+      ? `Trim the selection to ${TWITCH_CLIP_MAX_SEC}s or less`
+      : selLen < TWITCH_CLIP_MIN_SEC
+        ? `Select at least ${TWITCH_CLIP_MIN_SEC}s`
+        : `Open Twitch's clip editor — ${Math.round(selLen)}s ending at ${formatHmsFull(selection.end)}`;
+
+  const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
+    const t = e.target as HTMLElement;
+    if (t.closest('.twitch-clip-popup-close')) return;
+    setDrag({ startX: e.clientX, startY: e.clientY, offsetX: posRef.current.x, offsetY: posRef.current.y });
+  }, []);
+
+  useEffect(() => {
+    if (!drag) return;
+    const onMove = (e: MouseEvent) => {
+      setPosition({
+        x: Math.max(0, Math.min(window.innerWidth - POPUP_W, drag.offsetX + e.clientX - drag.startX)),
+        y: Math.max(0, Math.min(window.innerHeight - 320, drag.offsetY + e.clientY - drag.startY)),
+      });
+    };
+    const onUp = () => setDrag(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [drag]);
+
+  return createPortal(
+    <div
+      ref={popupRef}
+      className="border-2 border-zinc-700 bg-zinc-950 flex flex-col"
+      data-twitch-clip-popup
+      style={{
+        position: 'fixed',
+        left: position.x,
+        top: position.y,
+        width: POPUP_W,
+        zIndex,
+        boxShadow: '6px 6px 0px 0px rgba(9,9,11,0.9)',
+      }}
+    >
+      {/* Header — drag handle + close */}
+      <div
+        onMouseDown={handleHeaderMouseDown}
+        className="flex items-center justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
+        style={{ cursor: drag ? 'grabbing' : 'grab' }}
+      >
+        <div className="flex items-center gap-1.5 min-w-0">
+          <TwitchLogoIcon size={12} className="text-[#9146FF] shrink-0" />
+          <div className="min-w-0">
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
+              Twitch clip
+            </span>
+            <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
+              {broadcasterLogin}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          className="twitch-clip-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
+          onClick={onClose}
+          title="Close"
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      {/* Video — click toggles play/pause */}
+      <div className="relative bg-black shrink-0" style={{ aspectRatio: '16/9' }}>
+        <div
+          className="absolute inset-0 z-0 cursor-pointer"
+          onClick={() => { if (!loading && !error) togglePlay(); }}
+        >
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted={muted}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
+        </div>
+        {loading && (
+          <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/60 text-zinc-300 text-xs font-mono pointer-events-none">
+            <Loader2 size={28} className="animate-spin text-zinc-300 mr-2" />
+            Preparing clip window…
+          </div>
+        )}
+        {error && (
+          <div className="absolute inset-0 z-[1] flex flex-col items-center justify-center gap-2.5 bg-black/70 text-red-400 text-xs font-mono text-center px-4">
+            <div>{error}</div>
+            <button
+              type="button"
+              onClick={() => { setError(null); setLoading(true); setRetryTick((t) => t + 1); }}
+              title="Retry the clip window preview"
+              className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-red-400 border-2 border-red-800 bg-red-950/30 px-2.5 py-1 hover:border-red-500 hover:text-red-300 cursor-pointer"
+            >
+              <RefreshCw size={12} />
+              Retry
+            </button>
+          </div>
+        )}
+        {!loading && !error && buffering && (
+          <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none">
+            <Loader2 size={24} className="animate-spin text-zinc-200/90 mr-2" />
+            Buffering…
+          </div>
+        )}
+        {/* Transport: play/pause + mute */}
+        {!loading && !error && (
+          <div
+            className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0"
+          >
+            <button
+              type="button"
+              onClick={togglePlay}
+              disabled={!ready}
+              className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
+              title={playing ? 'Pause' : 'Play'}
+            >
+              {playing ? <Pause size={13} /> : <Play size={13} />}
+            </button>
+            <button
+              type="button"
+              onClick={toggleMute}
+              disabled={!ready}
+              className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
+              title={muted ? 'Unmute' : 'Mute'}
+            >
+              {muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
+            </button>
+            <span className="ml-auto text-[9px] font-mono text-zinc-400 tabular-nums">
+              {formatHmsFull(currentTime)}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Trim rail: 5..60s selection on the ±60s window timeline */}
+      <div className="px-2 py-1.5 flex flex-col gap-1">
+        <div className="flex items-stretch gap-2">
+          <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600 self-center">
+            Clip
+          </span>
+          <div
+            ref={railRef}
+            className="relative flex-1 h-6 bg-zinc-800/80 cursor-pointer"
+            title="Drag handles to set the clip range (5–60s)"
+            onClick={(e) => {
+              if (e.target !== e.currentTarget) return;
+              const rail = railRef.current;
+              if (!rail) return;
+              const rect = rail.getBoundingClientRect();
+              if (rect.width <= 0) return;
+              const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              seekTo(fracToSec(frac, railView));
+            }}
+          >
+            <div
+              className="absolute top-1/2 -translate-y-1/2 h-1.5 bg-[#9146FF]/60 pointer-events-none"
+              style={{
+                left: `${selStartFrac}%`,
+                width: `${Math.max(0, selEndFrac - selStartFrac)}%`,
+              }}
+            />
+            <div
+              className="absolute top-0 bottom-0 w-px bg-white/70 -translate-x-1/2 pointer-events-none z-[1]"
+              style={{ left: `${playFrac}%` }}
+            />
+            <div
+              role="slider"
+              aria-label="Clip start"
+              aria-valuemin={win.start}
+              aria-valuemax={win.end}
+              aria-valuenow={selection.start}
+              className="absolute top-0 bottom-0 w-2 -translate-x-1/2 z-[2] touch-none cursor-ew-resize bg-white border-x border-zinc-900"
+              style={{ left: `${selStartFrac}%` }}
+              onPointerDown={(e) => beginHandleDrag(e, 'in')}
+            />
+            <div
+              role="slider"
+              aria-label="Clip end"
+              aria-valuemin={win.start}
+              aria-valuemax={win.end}
+              aria-valuenow={selection.end}
+              className="absolute top-0 bottom-0 w-2 -translate-x-1/2 z-[2] touch-none cursor-ew-resize bg-[#9146FF] border-x border-zinc-900"
+              style={{ left: `${selEndFrac}%` }}
+              onPointerDown={(e) => beginHandleDrag(e, 'out')}
+            />
+          </div>
+          <ClipDurationAdjustButtons
+            compact
+            onAdjust={adjustSelection}
+            activeEndpoint={lastEndpoint}
+            disabled={windowTooShort}
+          />
+          <span
+            className="text-[9px] font-mono w-11 shrink-0 text-right text-zinc-300 tabular-nums self-center"
+            title="Selected clip length"
+          >
+            {formatHmsFull(selLen)}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[8px] font-mono text-zinc-600 tabular-nums">
+            window {formatHmsFull(win.start)} – {formatHmsFull(win.end)}
+          </span>
+          <button
+            type="button"
+            onClick={() => void createClip()}
+            disabled={createDisabled}
+            className="flex items-center gap-1.5 border-2 border-[#9146FF] bg-[#9146FF]/20 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-[#9146FF]/35 disabled:opacity-40 disabled:pointer-events-none"
+            title={createDisabledTitle}
+          >
+            {clipOpening ? <Loader2 size={12} className="animate-spin" /> : <TwitchLogoIcon size={12} />}
+            Create Twitch clip
+          </button>
+        </div>
+        {clipNotice && (
+          <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
+            clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+          }`}>
+            <span className="truncate">{clipNotice.text}</span>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}

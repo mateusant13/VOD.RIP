@@ -69,17 +69,33 @@ async def test_live_clip_omits_vod_params(_isolated_data_dir):
 
 
 @pytest.mark.anyio
-async def test_duration_over_60_rejected(_isolated_data_dir):
+async def test_duration_out_of_range_rejected(_isolated_data_dir):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for bad in (4, 0, 61):
+            res = await _post(client, {
+                "broadcaster_login": "surtepi",
+                "vod_id": "2536167775",
+                "offset_sec": 434,
+                "duration_sec": bad,
+                "open_browser": False,
+            })
+            assert res.status_code == 422
+            assert "duration_sec must be 5..60" in res.json()["detail"]
+        rows = await _history(client)
+        assert rows == []
+
+
+@pytest.mark.anyio
+async def test_duration_at_min_boundary_accepted(_isolated_data_dir):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         res = await _post(client, {
             "broadcaster_login": "surtepi",
             "vod_id": "2536167775",
             "offset_sec": 434,
-            "duration_sec": 61,
+            "duration_sec": 5,
             "open_browser": False,
         })
-        assert res.status_code == 422
-        assert "duration_sec must be 1..60" in res.json()["detail"]
+        assert res.status_code == 200
 
 
 @pytest.mark.anyio
