@@ -24,9 +24,24 @@ import PlatformVodIcon from './components/PlatformVodIcon';
 
 /** Video-friendly resize floors — EXPLORE_PANEL_MIN_W (100) is too narrow to watch in. */
 const LOCAL_PANEL_MIN_W = 260;
-const LOCAL_PANEL_MIN_H = 170;
+/**
+ * The height floor must sit at or above the shared PANEL_MIN.h (180) that
+ * startPanelResizeDrag applies internally — below it the caller's clamp is
+ * dead code and the first frame of any east/west drag snaps the panel taller.
+ */
+const LOCAL_PANEL_MIN_H = 180;
 /** Keep at least 32px of the popup on screen while resizing. */
 const RESIZE_MARGIN = 32;
+/**
+ * Fixed chrome around the video area: p-3 (24) + border-2 (4) vertically and
+ * horizontally, plus the header row + gap (measured ~56px tall). The default
+ * height is derived from the width at the video's 16:9 so the video area
+ * fills the panel instead of opening as a short letterboxed strip (the old
+ * 149px default was also below the resize floors, so ANY handle drag snapped
+ * the panel taller on the first pointermove).
+ */
+const LOCAL_PANEL_CHROME_W = 28;
+const LOCAL_PANEL_CHROME_H = 56;
 
 function platformKey(raw: string): PlatformStyleKey {
   const p = raw.toLowerCase();
@@ -71,7 +86,7 @@ export default function LocalFilePopup({
   const platform = platformKey(item.platform);
   const sizeRef = useRef<PanelSize>({
     w: EXPLORE_PANEL_DEFAULT_W,
-    h: Math.round((EXPLORE_PANEL_DEFAULT_W - 24) / EXPLORE_VIDEO_ASPECT_DEFAULT),
+    h: Math.round((EXPLORE_PANEL_DEFAULT_W - LOCAL_PANEL_CHROME_W) / EXPLORE_VIDEO_ASPECT_DEFAULT) + LOCAL_PANEL_CHROME_H,
   });
   const [size, setSize] = useState<PanelSize>(sizeRef.current);
   const src = `/api/local/media?path=${encodeURIComponent(item.filePath)}`;
