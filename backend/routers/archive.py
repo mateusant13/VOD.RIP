@@ -202,7 +202,8 @@ def _title_relevance(q: str, title: str) -> int:
 
 
 def _maybe_auto_backfill(
-    *, platform: Optional[str], channel: Optional[str], source: str, q: str = ""
+    *, platform: Optional[str], channel: Optional[str], source: str,
+    q: str = "", video_id: Optional[str] = None,
 ) -> list[dict]:
     """Chat half of _maybe_enrich: lazily kick chat backfill for chat-less
     Twitch VODs in scope.
@@ -212,7 +213,12 @@ def _maybe_auto_backfill(
     one burst per _AUTO_KICK_MIN_GAP_S; in-flight and recently-attempted
     videos are skipped. Returns the kicked rows (video_id/channel/title) so
     the search response can show an honest 'Indexing…' line; the pre-v2
-    caller contract (return None, chat-only) is preserved for tests."""
+    caller contract (return None, chat-only) is preserved for tests.
+
+    With a video_id the scope is that single video only (a video-scoped
+    search must never kick backfills for unrelated archive-wide VODs — the
+    popup's 'Indexing N videos…' line would lie about what's being
+    indexed). Non-Twitch videos resolve to no candidates."""
     global _last_auto_kick
     if source not in ("both", "chat"):
         return []
@@ -224,28 +230,39 @@ def _maybe_auto_backfill(
     with _backfill_lock:
         if now - _last_auto_kick < _AUTO_KICK_MIN_GAP_S:
             return []
-    sql = (
-        "SELECT v.video_id, v.channel, v.title, v.started_at FROM videos v "
-        "WHERE v.platform='twitch' AND NOT EXISTS ("
-        "  SELECT 1 FROM messages m WHERE m.platform='twitch' AND m.video_id=v.video_id)"
-        # Watchdog rows are synthetic ('twitch-live-<channel>-<ts>'): backfill
-        # needs a numeric VOD id (same gate as the manual endpoint).
-        " AND v.video_id GLOB '[0-9]*'"
-    )
-    params: list[Any] = []
-    if channel:
-        slugs = [c.strip() for c in channel.split(",") if c.strip()]
-        if slugs:
-            sql += " AND lower(v.channel) IN (" + ",".join("?" * len(slugs)) + ")"
-            params.extend(s.lower() for s in slugs)
-    # Relevance is computed in Python (SQL can't score titles); the cap only
-    # bounds the scan, never the final ranking.
-    sql += " ORDER BY v.started_at DESC LIMIT 100"
-    rows = list(archive_db.query(sql, params))
-    rows.sort(key=lambda r: r["started_at"] or "", reverse=True)
-    rows.sort(key=lambda r: -_title_relevance(q, r["title"] or ""))  # stable: keeps newest-first
+    if video_id:
+        rows = list(archive_db.query(
+            "SELECT v.video_id, v.channel, v.title, v.started_at FROM videos v "
+            "WHERE v.platform='twitch' AND v.video_id=? "
+            "AND v.video_id GLOB '[0-9]*'"
+            " AND NOT EXISTS (SELECT 1 FROM messages m "
+            "  WHERE m.platform='twitch' AND m.video_id=v.video_id)",
+            (video_id,),
+        ))
+    else:
+        sql = (
+            "SELECT v.video_id, v.channel, v.title, v.started_at FROM videos v "
+            "WHERE v.platform='twitch' AND NOT EXISTS ("
+            "  SELECT 1 FROM messages m WHERE m.platform='twitch' AND m.video_id=v.video_id)"
+            # Watchdog rows are synthetic ('twitch-live-<channel>-<ts>'): backfill
+            # needs a numeric VOD id (same gate as the manual endpoint).
+            " AND v.video_id GLOB '[0-9]*'"
+        )
+        params: list[Any] = []
+        if channel:
+            slugs = [c.strip() for c in channel.split(",") if c.strip()]
+            if slugs:
+                sql += " AND lower(v.channel) IN (" + ",".join("?" * len(slugs)) + ")"
+                params.extend(s.lower() for s in slugs)
+        # Relevance is computed in Python (SQL can't score titles); the cap only
+        # bounds the scan, never the final ranking.
+        sql += " ORDER BY v.started_at DESC LIMIT 100"
+        rows = list(archive_db.query(sql, params))
+        rows.sort(key=lambda r: r["started_at"] or "", reverse=True)
+        rows.sort(key=lambda r: -_title_relevance(q, r["title"] or ""))  # stable: keeps newest-first
+        rows = rows[:_AUTO_KICK_LIMIT]
     kicked: list[dict] = []
-    for r in rows[:_AUTO_KICK_LIMIT]:
+    for r in rows:
         vid = r["video_id"]
         if not (r["channel"] or "").strip():
             continue  # nothing to backfill against without a channel
@@ -326,21 +343,24 @@ def _transcribe_candidates(
 
 
 def _maybe_enrich(
-    *, platform: Optional[str], channel: Optional[str], source: str, q: str
+    *, platform: Optional[str], channel: Optional[str], source: str, q: str,
+    video_id: Optional[str] = None,
 ) -> list[dict]:
     """Targeted background enrichment for the search scope.
 
     Chat half: kick chat backfill for chat-less Twitch VODs (existing
-    behavior + title-relevance ordering). Transcript half: enqueue ONE
-    transcribe job for the best eligible YouTube video. Runs inline (a few
-    indexed SELECTs, at most one INSERT, one create_task) — never awaited,
-    never blocks the search response. Returns what was actually kicked as
-    the response's 'enriching' list ({platform, video_id, kind, channel,
-    title}); empty when idle."""
+    behavior + title-relevance ordering; single-video scope when the search
+    is video-scoped). Transcript half: enqueue ONE transcribe job for the
+    best eligible YouTube video. Runs inline (a few indexed SELECTs, at most
+    one INSERT, one create_task) — never awaited, never blocks the search
+    response. Returns what was actually kicked as the response's
+    'enriching' list ({platform, video_id, kind, channel, title}); empty
+    when idle."""
     enriching: list[dict] = []
     if source in ("both", "chat"):
         for r in _maybe_auto_backfill(
-            platform=platform, channel=channel, source=source, q=q
+            platform=platform, channel=channel, source=source, q=q,
+            video_id=video_id,
         ):
             enriching.append({
                 "platform": "twitch",
@@ -545,6 +565,7 @@ async def archive_search(
             channel=channel or channel_hint,
             source=source,
             q=q,
+            video_id=video_id or None,
         )
     resp: dict[str, Any] = {"hits": hits, "enriching": enriching}
     if channel_hint:

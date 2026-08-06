@@ -1003,6 +1003,41 @@ async def test_search_auto_backfill_kicks_chatless_twitch_videos(monkeypatch):
             platform=None, channel="other", source="chat")
         await asyncio.sleep(0.05)
         assert sorted(calls) == ["1111", "2222", "3333"]
+        # video-scoped: only that exact video may be kicked — never archive-wide
+        with archive_router._backfill_lock:
+            archive_router._last_auto_kick = 0.0
+            archive_router._backfill_inflight.discard("4444")
+        archive_db.upsert_video({
+            "platform": "twitch", "video_id": "4444", "channel": "caedrel",
+            "title": "maranguape special", "started_at": "2026-08-04T00:00:00Z",
+            "kind": "vod",
+        })
+        archive_router._maybe_auto_backfill(
+            platform=None, channel=None, source="chat", video_id="4444")
+        await asyncio.sleep(0.05)
+        assert sorted(calls) == ["1111", "2222", "3333", "4444"]
+        # a chat-less non-Twitch video in scope never kicks (Kick/YouTube chats
+        # archive at ingest — nothing to backfill, and no misleading line)
+        with archive_router._backfill_lock:
+            archive_router._last_auto_kick = 0.0
+        archive_db.upsert_video({
+            "platform": "kick", "video_id": "kick-abc", "channel": "caedrel",
+            "title": "kick vod", "started_at": "2026-08-05T00:00:00Z", "kind": "vod",
+        })
+        archive_router._maybe_auto_backfill(
+            platform=None, channel=None, source="chat", video_id="kick-abc")
+        await asyncio.sleep(0.05)
+        assert sorted(calls) == ["1111", "2222", "3333", "4444"]
+        # a twitch video that already HAS chat never re-kicks
+        with archive_router._backfill_lock:
+            archive_router._last_auto_kick = 0.0
+        archive_db.insert_messages("twitch", "1111", [
+            {"offset_sec": 5.0, "text": "x", "username": "@u"},
+        ])
+        archive_router._maybe_auto_backfill(
+            platform=None, channel=None, source="chat", video_id="1111")
+        await asyncio.sleep(0.05)
+        assert sorted(calls) == ["1111", "2222", "3333", "4444"]
     finally:
         release.set()
         for _ in range(100):
@@ -1013,7 +1048,8 @@ async def test_search_auto_backfill_kicks_chatless_twitch_videos(monkeypatch):
         with archive_router._backfill_lock:
             archive_router._backfill_inflight.clear()
             archive_router._last_auto_kick = 0.0
-        archive_db.execute("DELETE FROM videos WHERE video_id IN ('1111','2222','3333')")
+        archive_db.execute("DELETE FROM videos WHERE video_id IN ('1111','2222','3333','4444','kick-abc')")
+        archive_db.execute("DELETE FROM messages WHERE platform='twitch' AND video_id='1111'")
 
 
 # --- cross-segment phrase matching -----------------------------------------
