@@ -834,8 +834,8 @@ export default function App() {
   const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips' | 'streams'>(
     initialChannelUi.content,
   );
-  /** Clip listing: time range (server filter) + sort key. */
-  const [clipRangeDays, setClipRangeDays] = useState<number>(7);
+  /** Clip listing: time range (server filter) + sort key. Defaults to Today. */
+  const [clipRangeDays, setClipRangeDays] = useState<number>(1);
   const [clipSort, setClipSort] = useState<'date' | 'views'>('date');
 
   // Era window: each Range option covers (previous step, selected step] —
