@@ -2,26 +2,33 @@
 
 The preview chat panel shows captions for videos opened from a bare URL —
 99% YouTube. This router fetches those captions with yt-dlp in skip_download
-mode (writesubtitles + writeautomaticsub + subtitleslangs), prefers manual
-subtitles over auto-generated for each requested language (yt-dlp's own
-merge rule: manual tracks win for a duplicate code), then serves the best
-available track as preview-panel transcript rows ({offset_sec, text}) so the
-panel's existing Subtitles tab renders them unchanged.
+mode, prefers manual subtitles over auto-generated for each requested
+language (pt > en > es family preference, mirroring archive_ytdlp's
+_CAPTION_LANG_PREF), then serves the best available track as preview-panel
+transcript rows ({offset_sec, text}) so the panel's existing Subtitles tab
+renders them unchanged.
+
+The track itself is fetched straight from its timedtext URL (ydl.urlopen)
+with the same 429 retry/backoff + format fallback (vtt -> json3 -> srv3)
+the archive ingest uses. It deliberately does NOT use yt-dlp's
+``_write_subtitles``: that downloads every regional/merged track matching
+the requested language families (each a separate, rate-limit-prone request
+— a single HTTP 429 killed the whole call) and adds file I/O for nothing.
 
 Results are cached in a small process-lifetime LRU keyed by video id —
 negative results are cached too, so a caption-less video is not re-fetched
-on every tab switch. Never touches the archive DB.
+on every tab switch. Concurrent requests for the same video share one
+in-flight fetch (single-flight) instead of each spawning a full extraction.
+Never touches the archive DB.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import shutil
-import tempfile
 import threading
+import time
 from collections import OrderedDict
-from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query
@@ -42,8 +49,20 @@ _SUBTITLE_LANG_PREF = ("pt", "pt-br", "en", "en-orig", "es", "es-419", "es-orig"
 _SUBTITLE_FAMILY_PREF = ("pt", "en", "es")
 _SUBTITLE_LANGS_DEFAULT = "en,pt,es"
 
+# Same policy as archive_ytdlp: payload fallback order (VTT carries word
+# timestamps; the timedtext API rate-limits VTT (HTTP 429) while json3/srv3
+# still serve) and 429 retry/backoff.
+_CAPTION_FMTS = ("vtt", "json3", "srv3")
+_CAPTION_RETRIES = 2
+_CAPTION_BACKOFF_S = 1.0
+
 _CACHE_MAX = 64
 _MISS = object()
+
+# In-flight single-flight: video_id -> (done event, result holder). The
+# holder stores the payload, or the exception the fetcher raised (waiters
+# re-raise it instead of duplicating the fetch).
+_INFLIGHT_TIMEOUT_S = 180.0
 
 
 class _SubsCache:
@@ -70,6 +89,8 @@ class _SubsCache:
 
 
 _subs_cache = _SubsCache(_CACHE_MAX)
+_inflight_lock = threading.Lock()
+_inflight: dict[str, tuple[threading.Event, dict[str, object]]] = {}
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -94,40 +115,23 @@ def _video_id(url: str) -> str:
     return ""
 
 
-def _subtitles_opts(outdir: Path, langs: list[str]) -> dict:
-    """Mirror archive_ytdlp._yt_opts: skip_download + caption writing.
-
-    ``subtitleslangs`` entries are family regexes (``pt.*``) so regional
-    codes (pt-BR, en-US, es-419) are matched, not just the bare code.
-    ``nopart`` keeps written files at their final path (the router parses
-    them right after ``_write_subtitles`` returns).
-    """
+def _subtitles_opts() -> dict:
+    """Mirror archive_ytdlp._yt_opts extraction side: skip_download + the
+    player clients that serve caption metadata. No caption-writing flags —
+    tracks are fetched straight from their timedtext URLs (_fetch_track)."""
     return {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 30,
-        "nopart": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web_safari"]}},
         **_ytdlp_engine_opts(),
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [f"{lang}.*" for lang in langs],
-        "outtmpl": str(outdir / "%(id)s.%(ext)s"),
     }
 
 
-def _track_lang(name: str) -> str:
-    """Language code from a written subtitle filename <id>.<lang>.<ext>[.part]."""
-    stem = name[:-5] if name.endswith(".part") else name
-    parts = stem.split(".")
-    return parts[1].lower() if len(parts) >= 3 else ""
-
-
-def _track_key(track: tuple[str, str], manual_langs: set[str]) -> tuple[int, int, int]:
+def _track_key(lang: str, manual_langs: set[str]) -> tuple[int, int, int]:
     """Sort key: language-family preference, exact pref code, manual first."""
-    lang, _ext = track
     family = lang.split("-")[0]
     fam_idx = (
         _SUBTITLE_FAMILY_PREF.index(family) if family in _SUBTITLE_FAMILY_PREF else len(_SUBTITLE_FAMILY_PREF)
@@ -137,52 +141,99 @@ def _track_key(track: tuple[str, str], manual_langs: set[str]) -> tuple[int, int
     return (fam_idx, exact, manual)
 
 
+def _candidate_tracks(info: dict) -> list[tuple[str, bool, str]]:
+    """Caption tracks of the requested families, ranked best-first.
+
+    Manual tracks (``info['subtitles']``) and auto tracks
+    (``info['automatic_captions']``) are merged; ranking mirrors
+    ``_track_key``: family preference (pt > en > es), then exact pref code,
+    then manual over auto. Merged/translated codes ('en-de-DE', 'aa-pt-BR')
+    and out-of-family ASR junk ('aa', 'ab') are skipped — they are
+    translation blobs with no search value.
+
+    Returns [(lang, is_manual, url), ...].
+    """
+    manual = {str(k).lower(): v for k, v in (info.get("subtitles") or {}).items()}
+    auto = {str(k).lower(): v for k, v in (info.get("automatic_captions") or {}).items()}
+    out: list[tuple[str, bool, str]] = []
+    for lang in set(manual) | set(auto):
+        if lang.count("-") >= 2:
+            continue  # merged/translated track (e.g. 'en-de-DE')
+        if lang.split("-")[0] not in _SUBTITLE_FAMILY_PREF:
+            continue  # ASR junk codes ('aa', 'ab', ...)
+        entries = manual.get(lang) or auto.get(lang)
+        url = next((e.get("url") for e in entries if e.get("url")), None)
+        if not url:
+            continue
+        out.append((lang, lang in manual, url))
+    out.sort(key=lambda t: _track_key(t[0], set(manual)))
+    return out
+
+
+def _fetch_track(ydl, lang: str, entries: list[dict]) -> tuple[str, str, str] | None:
+    """Download one caption track: format fallback + 429 retry.
+
+    Mirrors archive_ytdlp._fetch_caption: each format (vtt -> json3 ->
+    srv3) gets up to _CAPTION_RETRIES attempts with a 1s backoff on HTTP
+    429; any failure falls through to the next format. Returns
+    (lang, fmt, payload) or None when nothing served.
+    """
+    for fmt in _CAPTION_FMTS:
+        url = next(
+            (e.get("url") for e in entries if e.get("ext") == fmt and e.get("url")),
+            None,
+        )
+        if not url:
+            continue
+        for attempt in range(_CAPTION_RETRIES):
+            try:
+                data = ydl.urlopen(url).read().decode("utf-8", "replace")
+                return lang, fmt, data
+            except Exception as exc:
+                if getattr(exc, "code", None) == 429 and attempt < _CAPTION_RETRIES - 1:
+                    time.sleep(_CAPTION_BACKOFF_S)
+                    continue
+                logger.warning("subtitle track %s (%s) failed: %s", fmt, lang, exc)
+                break
+    return None
+
+
 def _fetch_subtitles(url: str, langs: list[str]) -> dict:
     """Fetch the best available caption track for one YouTube URL.
 
-    Returns the response payload dict; ``has_subtitles`` is False when the
-    video has none of the requested languages.
+    The ranked candidate list (see _candidate_tracks) is walked until a
+    track serves. Returns the response payload dict; ``has_subtitles`` is
+    False when the video has none of the requested languages.
     """
-    outdir = Path(tempfile.mkdtemp(prefix="yt-subs-"))
     try:
-        with guarded_youtube_dl(_subtitles_opts(outdir, langs)) as ydl:
+        with guarded_youtube_dl(_subtitles_opts()) as ydl:
             info = ydl.extract_info(url, download=False) or {}
-            video_id = str(info.get("id") or _video_id(url))
-            base = ydl.prepare_filename(info, "subtitle")
-            written = ydl._write_subtitles(info, base) or []
-            tracks: list[tuple[str, str, Path]] = []
-            seen: set[str] = set()
-            for sub, final in written:
-                for candidate in (Path(final), Path(sub)):
-                    if not candidate.is_file():
-                        continue
-                    lang = _track_lang(candidate.name)
-                    ext = candidate.name.removesuffix(".part").rsplit(".", 1)[-1]
-                    if lang and lang not in seen:
-                        seen.add(lang)
-                        tracks.append((lang, ext, candidate))
-                    break
-            if not tracks:
-                return {"url": url, "lang": None, "source": None, "has_subtitles": False, "rows": []}
-            manual_langs = {str(k).lower() for k in (info.get("subtitles") or {})}
-            best = min(tracks, key=lambda t: _track_key(t[:2], manual_langs))
-            lang, ext, path = best
-            data = path.read_text(encoding="utf-8", errors="replace")
-            segments = _parse_vtt(data) if ext == "vtt" else _parse_caption(ext, data)
-            return {
-                "url": url,
-                "lang": lang,
-                "source": "manual" if lang in manual_langs else "auto",
-                "has_subtitles": True,
-                "rows": [{"offset_sec": seg["start_sec"], "text": seg["text"]} for seg in segments],
+            merged = {
+                str(k).lower(): v
+                for k, v in {
+                    **(info.get("subtitles") or {}),
+                    **(info.get("automatic_captions") or {}),
+                }.items()
             }
+            for lang, is_manual, _url in _candidate_tracks(info):
+                got = _fetch_track(ydl, lang, merged.get(lang) or [])
+                if got is None:
+                    continue
+                fmt, data = got[1], got[2]
+                segments = _parse_vtt(data) if fmt == "vtt" else _parse_caption(fmt, data)
+                return {
+                    "url": url,
+                    "lang": lang,
+                    "source": "manual" if is_manual else "auto",
+                    "has_subtitles": True,
+                    "rows": [{"offset_sec": seg["start_sec"], "text": seg["text"]} for seg in segments],
+                }
+            return {"url": url, "lang": None, "source": None, "has_subtitles": False, "rows": []}
     except HTTPException:
         raise
     except Exception as exc:
         logger.warning("subtitles fetch failed for %s: %s", url, exc)
         raise HTTPException(status_code=502, detail=f"Could not fetch subtitles: {exc}")
-    finally:
-        shutil.rmtree(outdir, ignore_errors=True)
 
 
 @router.get("/api/subtitles")
@@ -216,6 +267,41 @@ def get_subtitles(
     lang_list = [lang.strip() for lang in langs.split(",") if lang.strip()]
     if not lang_list:
         lang_list = ["en", "pt", "es"]
-    payload = _fetch_subtitles(url, lang_list)
+
+    # Single-flight: concurrent requests for the same video (tab re-open,
+    # retry pressed while the first fetch is still running) share one
+    # extraction instead of each spawning a full yt-dlp fetch behind the
+    # global yt-dlp lock.
+    with _inflight_lock:
+        entry = _inflight.get(video_id)
+        if entry is None:
+            done = threading.Event()
+            holder: dict[str, object] = {"payload": _MISS}
+            _inflight[video_id] = (done, holder)
+            fetcher = True
+        else:
+            done, holder = entry
+            fetcher = False
+    if fetcher:
+        try:
+            payload = _fetch_subtitles(url, lang_list)
+            holder["payload"] = payload
+        except Exception as exc:  # noqa: BLE001 — waiters re-raise it
+            holder["payload"] = exc
+            raise
+        finally:
+            done.set()
+            with _inflight_lock:
+                _inflight.pop(video_id, None)
+    else:
+        if not done.wait(_INFLIGHT_TIMEOUT_S):
+            # Fetcher hung past the wait — fetch anyway (best-effort dedupe).
+            logger.warning("subtitles in-flight wait timed out for %s", video_id)
+            payload = _fetch_subtitles(url, lang_list)
+        else:
+            got = holder["payload"]
+            if isinstance(got, BaseException):
+                raise got
+            payload = got
     _subs_cache.put(video_id, payload)
     return payload
