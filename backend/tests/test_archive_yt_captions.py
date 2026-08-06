@@ -316,3 +316,39 @@ def test_parse_srv3_strips_speaker_turn_markers():
     )
     segs = archive_ytdlp._parse_srv3(payload)
     assert segs[0]["text"] == "oi tudo bem"
+def test_caption_speaker_markers_stripped():
+    """YouTube ASR '>>' speaker markers never reach stored transcript text.
+
+    The VTT payload ships them XML-escaped ('&gt;&gt;', '&amp;'); json3/srv3
+    fallbacks can carry the marker raw. All three parsers must unescape and
+    strip it at segment AND word level, keeping genuine '&' text.
+    """
+    vtt = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "&gt;&gt; E aí maranguap.\n\n"
+        "00:00:04.000 --> 00:00:07.000\n"
+        "olha &gt;&gt; isso, R&amp;B &gt;&gt; e aí?\n"
+    )
+    segs = archive_ytdlp._parse_vtt(vtt)
+    assert [s["text"] for s in segs] == ["E aí maranguap.", "olha isso, R&B e aí?"]
+
+    json3 = (
+        '{"events": [{"tStartMs": 1000, "dDurationMs": 3000, "segs": ['
+        '{"utf8": ">> ", "tOffsetMs": 0}, {"utf8": "oi", "tOffsetMs": 200}]}]}'
+    )
+    segs = archive_ytdlp._parse_json3(json3)
+    assert len(segs) == 1
+    assert segs[0]["text"] == "oi"
+    assert segs[0]["words"] == [{"word": "oi", "start": 1.2, "end": 4.0}]
+
+    srv3 = (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<timedtext format="3"><body>'
+        '<p t="1000" d="3000">&gt;&gt; <s t="200">oi</s></p>'
+        "</body></timedtext>"
+    )
+    segs = archive_ytdlp._parse_srv3(srv3)
+    assert len(segs) == 1
+    assert segs[0]["text"] == "oi"
+    assert segs[0]["words"] == [{"word": "oi", "start": 1.2, "end": 4.0}]

@@ -16,6 +16,7 @@ timestampUsec.
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -107,6 +108,23 @@ def _canonical_key(title: str, started_at: Any) -> str:
 
 # --- parsing ---------------------------------------------------------------
 
+def _clean_caption_text(raw: str) -> str:
+    """Raw caption text -> stored transcript text (source-level cleaning).
+
+    YouTube timedtext ships the caption text XML-escaped, so an ASR speaker
+    change marker arrives as '&gt;&gt;' (and a spoken '&' as '&amp;'); the
+    json3/srv3 fallback payloads can carry the same marker raw. Unescape
+    first, then drop every '>>' marker (the ASR emits it to flag speaker
+    changes, often mid-segment) so transcripts read as plain speech. Words
+    are cleaned through the same pass.
+    ponytail: a '>>' that is genuinely part of the spoken text (possible in
+    manual tracks) is dropped too — the marker cannot be told apart from
+    it, and it has no search value.
+    """
+    text = html.unescape(raw)
+    return re.sub(r"\s*>{2,}\s*", " ", text).strip()
+
+
 def _parse_vtt(text: str) -> list[dict]:
     """Convert a VTT caption document to archive transcript segments.
 
@@ -140,7 +158,11 @@ def _parse_vtt(text: str) -> list[dict]:
         start = _cue_secs(*m.groups()[:4])
         end = _cue_secs(*m.groups()[4:])
         raw = " ".join(block_lines[1:])
+<<<<<<< HEAD
         cleaned = _strip_turn_markers(_TAG_RE.sub("", raw).replace("\n", " "))
+=======
+        cleaned = _clean_caption_text(_TAG_RE.sub("", raw))
+>>>>>>> fix/yt-subtitles-live
         if not cleaned:
             continue
         words = _vtt_words(raw, end)
@@ -164,7 +186,7 @@ def _vtt_words(raw: str, cue_end: float) -> list[dict]:
     out: list[dict] = []
     for m in _WORD_TS_RE.finditer(raw):
         start = _cue_secs(*m.groups()[:4])
-        word = m.group(5).strip()
+        word = _clean_caption_text(m.group(5))
         if not word:
             continue
         out.append({"word": word, "start": round(start, 3), "end": round(cue_end, 3)})
@@ -202,7 +224,11 @@ def _parse_json3(text: str) -> list[dict]:
         else:
             end = next((s for s in starts[i + 1:] if s is not None), start + 2.0)
         segs = ev.get("segs") or []
+<<<<<<< HEAD
         text = _strip_turn_markers("".join(str(s.get("utf8", "")) for s in segs))
+=======
+        text = _clean_caption_text("".join(str(s.get("utf8", "")) for s in segs))
+>>>>>>> fix/yt-subtitles-live
         if not text:
             continue
         words = []
@@ -210,7 +236,7 @@ def _parse_json3(text: str) -> list[dict]:
             off = s.get("tOffsetMs")
             if off is None:
                 continue
-            w = str(s.get("utf8", "")).strip()
+            w = _clean_caption_text(str(s.get("utf8", "")))
             if not w:
                 continue
             words.append({
@@ -255,7 +281,11 @@ def _parse_srv3(text: str) -> list[dict]:
         start = float(t) / 1000.0
         d = p.get("d")
         end = start + (float(d) / 1000.0 if d else 0.0)
+<<<<<<< HEAD
         text = _strip_turn_markers("".join(p.itertext()))
+=======
+        text = _clean_caption_text("".join(p.itertext()))
+>>>>>>> fix/yt-subtitles-live
         if not text:
             continue
         words = []
@@ -263,7 +293,7 @@ def _parse_srv3(text: str) -> list[dict]:
             off = s.get("t")
             if off is None:
                 continue
-            w = "".join(s.itertext()).strip()
+            w = _clean_caption_text("".join(s.itertext()))
             if not w:
                 continue
             words.append({
@@ -999,6 +1029,7 @@ assert _segs[0]["text"] == "Não sei."
 assert _segs[0]["words"] == [{"word": "sei.", "start": 3.199, "end": 20.47}]
 assert _segs[1]["text"] == "Ih."
 
+<<<<<<< HEAD
 # YouTube ASR speaker-turn markers ("&gt;&gt;" / ">>") must never reach segment
 # text: stripped at parse time, whitespace collapsed, marker-only cues dropped.
 _vtt_markers = (
@@ -1032,6 +1063,20 @@ _srv3_markers = (
 )
 _sm = _parse_srv3(_srv3_markers)
 assert _sm[0]["text"] == "oi tudo bem", _sm[0]["text"]
+=======
+# ASR speaker markers: VTT ships them XML-escaped ('&gt;&gt;'); the source
+# fix must unescape + strip them (segment AND word level) so stored
+# transcripts read as plain speech, while a genuine '&' survives.
+_vtt_marker_sample = (
+    "WEBVTT\n\n"
+    "00:00:01.000 --> 00:00:04.000 align:start position:0%\n"
+    "&gt;&gt; E aí maranguap.\n\n"
+    "00:00:04.000 --> 00:00:07.000 align:start position:0%\n"
+    "olha &gt;&gt; isso, R&amp;B &gt;&gt; e aí?\n"
+)
+_segs_m = _parse_vtt(_vtt_marker_sample)
+assert [s["text"] for s in _segs_m] == ["E aí maranguap.", "olha isso, R&B e aí?"], _segs_m
+>>>>>>> fix/yt-subtitles-live
 
 _lc_sample = (
     '{"replayChatItemAction": {"videoOffsetTimeMsec": "1234", "actions": ['
