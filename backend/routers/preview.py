@@ -171,36 +171,61 @@ async def preview_panel(
     platform: str,
     video_id: str,
     limit: int = Query(_PANEL_LIMIT_DEFAULT, ge=1, le=_PANEL_LIMIT_MAX),
+    offset_sec: Optional[float] = Query(None, ge=0),
 ):
     """Time-ordered transcript + chat + acoustic-event rows for one archived
-    video.
+    video, plus a Twitch-chat backfill status envelope.
 
     Strict response shape:
       {transcript: [{offset_sec, text}], chat: [{offset_sec, text, username,
        spam_count}], events: [{offset_sec, end_sec, event, score}],
-       has_transcript: bool, has_chat: bool}
+       has_transcript: bool, has_chat: bool, backfill: 'idle'|'running'|
+       'done', backfill_progress: 0..1, total_rows: int, chat_truncated: bool}
     events are PANNs acoustic detections (LAUGH, CLAP, ...) with real
     boundaries; the UI merges them into the transcript timeline by
     offset_sec. The flags mirror the preview-session capability flags so the
-    UI can show empty states without loading the full payload first."""
+    UI can show empty states without loading the full payload first.
+
+    backfill/backfill_progress/total_rows describe the Twitch chat backfill
+    for this video (see routers.archive.preview_backfill_status): while it
+    is 'running' the chat slice is BOUNDED to a playhead-centered window
+    (offset_sec) so the panel's ~2.5 s polls never re-serialize the whole
+    growing archive; when 'done'/'idle' the full timeline (limit-capped) is
+    returned and chat_truncated reports a cut (window or limit). offset_sec
+    also seeds the background backfill at the playhead (Chatterino-style:
+    near-playhead messages arrive in the first pages)."""
     p = (platform or "").strip().lower()
     if p not in archive_db.PLATFORMS:
         raise HTTPException(status_code=400, detail="Unknown platform")
     if p == "twitch":
         # Backfill-on-open: an archived Twitch VOD with no chat yet gets the
-        # same throttled background backfill as archive search, so opening
-        # the chat tab on a preview fills history without a prior search.
-        # Fire-and-forget — the kick is a no-op when throttled / cooldown /
-        # synthetic-id / unknown-video gates fail (kick_preview_backfill).
+        # same throttled background backfill as archive search, seeded at
+        # the client's playhead, so opening the chat tab on a preview fills
+        # history without a prior search. Fire-and-forget — the kick is a
+        # no-op when throttled / cooldown / synthetic-id / unknown-video
+        # gates fail (kick_preview_backfill).
         try:
             from routers.archive import kick_preview_backfill
 
-            kick_preview_backfill(p, video_id)
+            kick_preview_backfill(p, video_id, offset_sec=offset_sec)
         except Exception:
             logger.debug("preview chat backfill kick failed", exc_info=True)
+    backfill, backfill_progress = "idle", 0.0
+    if p == "twitch":
+        try:
+            from routers.archive import preview_backfill_status
+
+            backfill, backfill_progress = preview_backfill_status(p, video_id)
+        except Exception:
+            logger.debug("preview backfill status failed", exc_info=True)
+    if backfill == "running":
+        chat, total_rows = archive_db.chat_slice_for(p, video_id, offset_sec)
+    else:
+        chat = archive_db.chat_for(p, video_id, limit)
+        total_rows = archive_db.count_messages(p, video_id)
     return {
         "transcript": archive_db.transcript_offsets(p, video_id, limit),
-        "chat": archive_db.chat_for(p, video_id, limit),
+        "chat": chat,
         "events": [
             {
                 "offset_sec": r["start_sec"],
@@ -212,6 +237,10 @@ async def preview_panel(
         ],
         "has_transcript": archive_db.has_transcript(p, video_id),
         "has_chat": archive_db.has_chat(p, video_id),
+        "backfill": backfill,
+        "backfill_progress": backfill_progress,
+        "total_rows": total_rows,
+        "chat_truncated": len(chat) < total_rows,
     }
 
 

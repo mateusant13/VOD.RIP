@@ -63,6 +63,16 @@ export interface PreviewPanelPayload {
   events: PreviewPanelEventRow[];
   has_transcript: boolean;
   has_chat: boolean;
+  /** Twitch-chat backfill status for the panel envelope (absent on
+   *  Kick/YouTube/archived payloads): 'running' → the backend is filling
+   *  chat in the background and the panel polls; 'done' → archive complete;
+   *  'idle' → nothing will come. */
+  backfill?: 'idle' | 'running' | 'done';
+  /** 0..1 progress of the in-flight backfill (row-count estimate). */
+  backfill_progress?: number;
+  /** Total chat rows in the archive for this video (the returned chat may
+   *  be a bounded playhead window of it while the backfill runs). */
+  total_rows?: number;
 }
 
 /** Live YouTube captions for URL-only previews (no archive row). */
@@ -90,6 +100,10 @@ const PANEL_W_KEY = 'vodrip.preview.chatPanelWidth';
 const PANEL_STRIP_W = 28;
 /** Matches the backend default; 12h+ of dense chat stays under this cap. */
 const PANEL_LIMIT = 200_000;
+/** While a Twitch backfill is 'running' the panel refreshes at this rate
+ *  (the backend bounds each response to a playhead window, so polling stays
+ *  cheap and chat appears progressively instead of after the whole run). */
+const PANEL_POLL_MS = 2500;
 const CHAT_ROW_H = 24;
 const TRANSCRIPT_ROW_H = 22;
 /** Rows rendered on each side of the active row (fixed-height virtualization). */
@@ -116,11 +130,14 @@ interface PreviewChatPanelProps {
   currentTime: number;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
-  /** Video-first gate: while false the panel does NOT fetch its payload
-   *  (chat/transcript/subtitles), so the preview's first bytes go to video
-   *  playback instead of racing the panel's network work. The host flips it
-   *  on the player's canplay signal; defaults to true for callers without
-   *  a player (tests, non-preview hosts). */
+  /** Live-captions gate: while false the panel does NOT fetch the video's
+   *  own YouTube subtitles (URL-only previews only), so the preview's first
+   *  bytes go to video playback instead of racing that network work. The
+   *  host flips it on the player's canplay signal; defaults to true for
+   *  callers without a player (tests, non-preview hosts). The ARCHIVE
+   *  payload (chat/transcript) deliberately ignores this gate — it starts
+   *  at session-create so a Twitch backfill kicks off as early as possible;
+   *  the video-first PLAYBACK gate lives in the hosts and is untouched. */
   started?: boolean;
   /** Initial open state. The explore popup opens collapsed (small strip)
    *  so the mini preview stays player-sized by default; the main preview
@@ -290,6 +307,9 @@ export function PreviewChatPanel({
   const [payload, setPayload] = useState<PreviewPanelPayload | null>(null);
   const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [retryTick, setRetryTick] = useState(0);
+  /** Bumped by the backfill poll loop (and the one refresh after 'done')
+   *  to re-run the payload fetch without touching the cache. */
+  const [pollTick, setPollTick] = useState(0);
   const [ytSubtitles, setYtSubtitles] = useState<PreviewSubtitlesPayload | null>(null);
   const [subsFetchState, setSubsFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   /** Inline chat-history search (filter + prev/next cursor), see below. */
@@ -298,6 +318,15 @@ export function PreviewChatPanel({
 
   const payloadCacheRef = useRef<Map<string, PreviewPanelPayload>>(new Map());
   const subsCacheRef = useRef<Map<string, PreviewSubtitlesPayload>>(new Map());
+  /** Last seen backfill status, to detect the running→done transition (the
+   *  panel refreshes once more so the final poll also carries the complete
+   *  archive). */
+  const lastBackfillRef = useRef<string | null>(null);
+  /** Playhead read at fetch time (never a fetch dependency — currentTime
+   *  changes ~4 Hz and must not re-trigger requests; the panel syncs locally
+   *  while seeking). */
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
   const userPickedTabRef = useRef(false);
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -316,24 +345,27 @@ export function PreviewChatPanel({
       setFetchState('done');
       return;
     }
+    // Cache hits only apply to the initial load — polls (pollTick > 0) must
+    // always hit the network to see the backfill's progress.
     const cached = payloadCacheRef.current.get(payloadKey);
-    if (cached) {
+    if (cached && pollTick === 0) {
       setPayload(cached);
       setFetchState('done');
       return;
     }
-    // Video-first: the preview's canplay signal gates the panel fetch so
-    // the video's manifest/first segments get the connection before the
-    // panel's (possibly YouTube-side) network work. Cache hits above skip
-    // the gate — rendering memory is free. The started transition re-runs
-    // this effect (started is in the dep list).
-    if (!started) {
-      setFetchState('idle');
-      return;
-    }
+    // The archive payload starts at session-create (as early as the key
+    // exists), NOT on canplay: a Twitch VOD's chat backfill must kick off
+    // before playback so near-playhead chat is already archived when the
+    // video starts. The video-first PLAYBACK gate is host-side and
+    // untouched. offset_sec seeds the backfill at the playhead (read from
+    // the ref so playhead motion never re-triggers this effect) and centers
+    // the backend's bounded chat window while the backfill runs.
     let cancelled = false;
     setFetchState('loading');
-    apiGet<PreviewPanelPayload>(`/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}`)
+    const offset = Math.max(0, currentTimeRef.current);
+    apiGet<PreviewPanelPayload>(
+      `/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}&offset_sec=${offset}`,
+    )
       .then((p) => {
         if (cancelled) return;
         const cache = payloadCacheRef.current;
@@ -354,12 +386,41 @@ export function PreviewChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [payloadKey, retryTick, started]);
+  }, [payloadKey, retryTick, pollTick]);
+
+  // While a Twitch backfill is 'running', refresh every PANEL_POLL_MS so
+  // chat appears progressively (the backend bounds each response to a
+  // playhead window, so polls stay cheap). Errors do not stop the loop —
+  // the next tick retries; the loop ends when the status leaves 'running'.
+  const backfillRunning = payload?.backfill === 'running';
+  useEffect(() => {
+    if (!backfillRunning) return;
+    const t = window.setTimeout(() => setPollTick((n) => n + 1), PANEL_POLL_MS);
+    return () => window.clearTimeout(t);
+  }, [backfillRunning, pollTick]);
+
+  // One extra refresh on the running→done transition: the final poll should
+  // carry the complete archive (the run may have finished between polls).
+  // The tracker resets on video switch so a cross-video transition never
+  // fires.
+  useEffect(() => {
+    lastBackfillRef.current = null;
+  }, [payloadKey]);
+  useEffect(() => {
+    const prev = lastBackfillRef.current;
+    lastBackfillRef.current = payload?.backfill ?? null;
+    if (prev === 'running' && payload?.backfill === 'done') {
+      setPollTick((n) => n + 1);
+    }
+  }, [payloadKey, payload?.backfill]);
 
   // Default tab: land on whichever source actually exists (first open only).
+  // While a Twitch backfill is 'running' the chat tab stays put (it shows a
+  // loading indicator and fills in) instead of bouncing to the transcript.
   useEffect(() => {
     if (userPickedTabRef.current || fetchState !== 'done' || !payload) return;
-    if (tab === 'chat' && !payload.has_chat && payload.has_transcript) setTab('transcript');
+    if (tab === 'chat' && !payload.has_chat && payload.backfill !== 'running' && payload.has_transcript)
+      setTab('transcript');
     else if (tab === 'transcript' && !payload.has_transcript && payload.has_chat) setTab('chat');
   }, [payload, tab, fetchState]);
 
@@ -785,10 +846,10 @@ export function PreviewChatPanel({
               )}
             </div>
           )}
-          {!started && fetchState === 'idle' && !payload && (
+          {!started && subsFetchState === 'idle' && subtitlesOnly && (
             <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-600 px-4">
               <span className="text-[10px] font-mono text-center">
-                Video plays first — chat loads once playback starts.
+                Video plays first — subtitles load once playback starts.
               </span>
             </div>
           )}
@@ -821,7 +882,7 @@ export function PreviewChatPanel({
           )}
           {fetchState === 'done' && payload && tab === 'subtitles' && (
             <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col items-center justify-center gap-2 px-3 py-4">
-              {subtitlesOnly && subsFetchState !== 'done' && (
+              {subtitlesOnly && subsFetchState === 'loading' && (
                 <div className="flex flex-col items-center justify-center gap-2 text-zinc-500">
                   <Loader2 size={13} className="animate-spin" />
                   <span className="text-[10px] font-mono">Loading subtitles…</span>
@@ -877,7 +938,15 @@ export function PreviewChatPanel({
               className="flex-1 min-h-0 overflow-y-auto custom-scrollbar"
               data-panel-rows
             >
-              {tab === 'chat' && !payload.has_chat && <EmptyState text="No archived chat for this video." />}
+              {tab === 'chat' && !payload.has_chat && (
+                <EmptyState
+                  text={
+                    payload.backfill === 'running'
+                      ? 'Loading chat…'
+                      : 'No archived chat for this video.'
+                  }
+                />
+              )}
               {tab === 'chat' && qActive && chatList.length === 0 && (
                 <EmptyState text={`No chat messages match “${chatQuery.trim()}”.`} />
               )}

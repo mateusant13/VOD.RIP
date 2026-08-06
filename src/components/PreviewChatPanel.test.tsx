@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import PreviewChatPanel, { type PreviewPanelPayload } from './PreviewChatPanel';
 
@@ -117,28 +117,33 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
-  it('defers the payload fetch until the video started (video-first gate)', async () => {
+  it('fetches the panel payload at session-create, before the video starts (video-first playback gate untouched)', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
     const { rerender } = render(
       <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started={false} />,
     );
-    // Not started → zero network work, waiting placeholder instead.
-    expect(fetchMock).not.toHaveBeenCalled();
-    await waitFor(() => expect(screen.getByText(/Video plays first/)).toBeTruthy());
-    // Playback starts (host flips started on canplay) → fetch + render.
-    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started />);
+    // Session created → the archive payload fetches immediately; the panel
+    // does NOT wait for canplay (the host's playback gate is separate, and
+    // the Twitch chat backfill must kick off before playback starts).
     expect(fetchMock).toHaveBeenCalled();
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    // The started flip (canplay) must not re-trigger the payload fetch.
+    const calls = fetchMock.mock.calls.length;
+    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started />);
+    expect(fetchMock.mock.calls.length).toBe(calls);
   });
 
-  it('defers the YouTube subtitles fetch until the video started', async () => {
+  it('defers the YouTube subtitles fetch until the video started (archive payload still loads)', async () => {
     const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
     const { rerender } = render(
       <PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started={false} />,
     );
+    // The archive payload loads at session-create; the live captions wait
+    // for canplay so the video's first bytes stay unraced.
     await waitFor(() => expect(screen.getByText(/Video plays first/)).toBeTruthy());
     const urls = () => fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(urls().some((u) => u.includes('/api/preview/panel/'))).toBe(false);
+    expect(urls().some((u) => u.includes('/api/preview/panel/'))).toBe(true);
     expect(urls().some((u) => u.includes('/api/subtitles'))).toBe(false);
     rerender(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started />);
     await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
@@ -482,5 +487,69 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => expect(screen.getByText('hi')).toBeTruthy());
     expect(screen.queryByText('LETS GO')).toBeNull();
     expect(screen.getByText('1/1')).toBeTruthy();
+  });
+
+  it('polls while the Twitch backfill runs and refreshes once after done', async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const fn = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/preview/panel/')) {
+          call += 1;
+          const p: PreviewPanelPayload =
+            call === 1
+              ? { ...PAYLOAD, chat: [PAYLOAD.chat[0]], backfill: 'running', backfill_progress: 0.25, total_rows: 1 }
+              : call === 2
+                ? { ...PAYLOAD, chat: PAYLOAD.chat.slice(0, 2), backfill: 'running', backfill_progress: 0.5, total_rows: 2 }
+                : { ...PAYLOAD, backfill: 'done', backfill_progress: 1, total_rows: 4 };
+          return new Response(JSON.stringify(p), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      vi.stubGlobal('fetch', fn);
+      render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+      // Initial fetch fires at session-create (no started gate).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fn.mock.calls.length).toBe(1);
+      // Poll 1 (still running): chat grows.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500); // PANEL_POLL_MS
+      });
+      expect(fn.mock.calls.length).toBe(2);
+      expect(screen.getByText('LETS GO')).toBeTruthy();
+      // Poll 2 returns done → exactly one transition refresh after it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fn.mock.calls.length).toBe(4);
+      // Loop stopped: no further requests while the archive is complete.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2500 * 3);
+      });
+      expect(fn.mock.calls.length).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows a loading indicator while the backfill is running, not a terminal empty state', async () => {
+    mockPanelFetch({
+      ...EMPTY_PAYLOAD,
+      backfill: 'running',
+      backfill_progress: 0.05,
+      total_rows: 0,
+    });
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('Loading chat…')).toBeTruthy());
+    expect(screen.queryByText('No archived chat for this video.')).toBeNull();
   });
 });

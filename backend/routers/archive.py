@@ -35,6 +35,9 @@ _BACKFILL_MAX_MESSAGES = 100_000
 _backfill_inflight: set[str] = set()  # video_ids currently backfilling
 _backfill_lock = threading.Lock()     # guards the set + throttle clock
 _last_auto_kick = 0.0                 # monotonic clock of the last auto-kick
+# Preview-panel progress (0..1) for in-flight runs — written by the worker
+# thread after every stored page, read under the lock by the panel endpoint.
+_backfill_progress: dict[str, float] = {}
 _AUTO_KICK_MIN_GAP_S = 15.0           # min seconds between auto-kicks
 _AUTO_KICK_LIMIT = 2                  # newest chat-less videos per search
 # Completion cooldown: a chat-less VOD (comments disabled / purged) would
@@ -91,14 +94,24 @@ def _resolve_display_names_worker() -> None:
         logger.debug("display-name resolution skipped", exc_info=True)
 
 
-async def _run_backfill(video_id: str, channel: str) -> None:
+def _set_backfill_progress(video_id: str, progress: float) -> None:
+    with _backfill_lock:
+        _backfill_progress[video_id] = progress
+
+
+async def _run_backfill(
+    video_id: str, channel: str, seed_offset_sec: Optional[float] = None
+) -> None:
     """Background task: run backfill_chat in a worker thread; drop the
     in-flight marker and stamp the completion time on exit."""
+    _set_backfill_progress(video_id, 0.0)
     try:
         await asyncio.to_thread(
             archive_twitch.backfill_chat,
             channel, video_id,
             max_messages=_BACKFILL_MAX_MESSAGES,
+            seed_offset_sec=seed_offset_sec,
+            progress_cb=lambda p: _set_backfill_progress(video_id, p),
         )
     except Exception:
         logger.exception("chat backfill failed for twitch/%s", video_id)
@@ -106,6 +119,7 @@ async def _run_backfill(video_id: str, channel: str) -> None:
         with _backfill_lock:
             _backfill_inflight.discard(video_id)
             _backfill_attempted_at[video_id] = time.monotonic()
+            _backfill_progress.pop(video_id, None)
         # Bulk chat inserts leave the FTS index fragmented; merge after every
         # completed backfill (manual or auto) so searches stay fast.
         try:
@@ -114,7 +128,9 @@ async def _run_backfill(video_id: str, channel: str) -> None:
             logger.exception("fts optimize failed after backfill")
 
 
-def _kick_backfill(video_id: str, channel: str) -> str:
+def _kick_backfill(
+    video_id: str, channel: str, seed_offset_sec: Optional[float] = None
+) -> str:
     """Start a background Twitch chat backfill; returns the status word.
 
     'queued' — task started now; 'running' — already in flight;
@@ -132,7 +148,9 @@ def _kick_backfill(video_id: str, channel: str) -> str:
     try:
         with _backfill_lock:
             _backfill_inflight.add(video_id)
-        asyncio.get_running_loop().create_task(_run_backfill(video_id, channel))
+        asyncio.get_running_loop().create_task(
+            _run_backfill(video_id, channel, seed_offset_sec=seed_offset_sec)
+        )
         return "queued"
     except Exception:
         logger.exception("could not start chat backfill for twitch/%s", video_id)
@@ -141,13 +159,17 @@ def _kick_backfill(video_id: str, channel: str) -> str:
         return "failed"
 
 
-def kick_preview_backfill(platform: str, video_id: str) -> str:
+def kick_preview_backfill(
+    platform: str, video_id: str, offset_sec: Optional[float] = None
+) -> str:
     """Throttled single-video Twitch chat backfill on preview open.
 
     Mirrors _maybe_auto_backfill's gates on ONE video: numeric (non-watchdog)
     id, an archived row with a channel, and the same shared auto-kick
     throttle + per-video cooldown clocks, so preview and search kicks share
-    one budget. Returns the _kick_backfill status word
+    one budget. *offset_sec* (the client playhead) seeds the sweep so
+    near-playhead chat arrives first (see backfill_chat). Returns the
+    _kick_backfill status word
     ('queued'/'running'/'already'/'failed'), or '' when no kick applies
     (wrong platform, synthetic id, unknown video, throttled, or cooldown)."""
     global _last_auto_kick
@@ -167,11 +189,43 @@ def kick_preview_backfill(platform: str, video_id: str) -> str:
             return ""
         if now - _backfill_attempted_at.get(video_id, 0.0) < _BACKFILL_COOLDOWN_S:
             return ""
-    status = _kick_backfill(video_id, row[0]["channel"])
+    status = _kick_backfill(video_id, row[0]["channel"], seed_offset_sec=offset_sec)
     if status == "queued":
         with _backfill_lock:
             _last_auto_kick = now
     return status
+
+
+def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
+    """('idle' | 'running' | 'done', progress 0..1) for the preview-panel
+    envelope.
+
+    'running' also covers "kick owed": the video has no chat, no run in
+    flight and no recent failed attempt, so the next panel poll will start
+    the run (the shared 15 s global throttle only delays it). 'idle' =
+    nothing will come (unknown/synthetic video, recent failed attempt) —
+    the panel stops polling. 'done' = the archive already has chat (a
+    completed or previously-archived run); the panel fetches once more."""
+    if (platform or "").strip().lower() != "twitch":
+        return "idle", 0.0
+    if not video_id or not re.fullmatch(r"[0-9]+", video_id):
+        return "idle", 0.0
+    with _backfill_lock:
+        if video_id in _backfill_inflight:
+            return "running", _backfill_progress.get(video_id, 0.0)
+    if archive_db.has_chat("twitch", video_id):
+        return "done", 1.0
+    row = archive_db.query(
+        "SELECT channel FROM videos WHERE platform='twitch' AND video_id=?",
+        (video_id,),
+    )
+    if not row or not (row[0]["channel"] or "").strip():
+        return "idle", 0.0
+    now = time.monotonic()
+    with _backfill_lock:
+        if now - _backfill_attempted_at.get(video_id, 0.0) < _BACKFILL_COOLDOWN_S:
+            return "idle", 0.0
+    return "running", 0.0
 
 
 def _tokenize(text: str) -> list[str]:
