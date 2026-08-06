@@ -1825,6 +1825,7 @@ export default function ChannelExplorePopup({
               onClose={() => setArchiveSearchOpen(false)}
               onOpenHit={onOpenHit}
               onSeekHit={(hit) => seekVideo(hit.offset_sec)}
+              onSeekOffset={(sec) => seekVideo(sec)}
               scope={{ videoId: vod.videoId, title: vod.title }}
             />
           </div>
@@ -1875,6 +1876,10 @@ export default function ChannelExplorePopup({
               videoId={vod.videoId ?? null}
               currentTime={currentTime}
               defaultOpen={false}
+              // Click-to-seek: rows/caption seek this popup's own player
+              // (seekVideo clamps to the effective duration and no-ops
+              // until ready).
+              onSeek={seekVideo}
               // Gates only the URL-only live-captions fetch (video-first);
               // the archive payload starts at session-create so the Twitch
               // chat backfill kicks off before canplay.

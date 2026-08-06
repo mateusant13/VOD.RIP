@@ -51,6 +51,7 @@ import {
 } from '../archiveSearchUtils';
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
 import { resolveChatColor } from '../chatColors';
+import { seekToTimestamp } from '../seekToTimestamp';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -63,6 +64,11 @@ interface ArchiveSearchPopupProps {
    *  click calls onSeekHit(hit) and a small per-row 'open' affordance still
    *  calls onOpenHit. Absent → current behavior (row click opens). */
   onSeekHit?: (hit: ArchiveSearchHit) => void;
+  /** When provided, chat-history messages (CHAT FROM HIT) also seek: clicking
+   *  a message seeks the host's current player to the message's offset_sec
+   *  (same player as onSeekHit, via the shared seekToTimestamp contract).
+   *  Absent → the messages stay read-only. */
+  onSeekOffset?: (offsetSec: number) => void;
   /** Render as a plain flex container filling its parent — no floating
    *  positioning, no drag/resize chrome, no zIndex (player-embedded use). */
   embedded?: boolean;
@@ -124,7 +130,7 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t !== 'Untitled' ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   // Seed exactly once from the caller-supplied anchor (else viewport top-right).
@@ -1184,11 +1190,16 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, embe
                 </div>
               )}
               {chat.slice(0, chatVisibleCount).map((m) => (
-                <p key={`c:${m.offset_sec}:${m.username}:${m.text}`} className="text-[10px] leading-snug text-zinc-400 break-words">
-                  <span className="text-zinc-600 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
+                <p
+                  key={`c:${m.offset_sec}:${m.username}:${m.text}`}
+                  onClick={onSeekOffset ? () => seekToTimestamp(m.offset_sec, onSeekOffset) : undefined}
+                  title={onSeekOffset ? `Seek to ${formatArchiveOffset(m.offset_sec)}` : undefined}
+                  className={`text-[10px] leading-snug text-zinc-200 break-words ${onSeekOffset ? 'cursor-pointer select-none' : ''}`}
+                >
+                  <span className="text-zinc-400 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                   <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
                   {typeof m.spam_count === 'number' && m.spam_count > 1 && (
-                    <span className="text-[9px] font-mono text-zinc-600 ml-1" title={`${m.spam_count} identical messages collapsed`}>
+                    <span className="text-[9px] font-mono text-zinc-500 ml-1" title={`${m.spam_count} identical messages collapsed`}>
                       ×{m.spam_count}
                     </span>
                   )}
