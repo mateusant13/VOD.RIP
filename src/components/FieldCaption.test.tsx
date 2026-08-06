@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import FieldCaption from "./FieldCaption";
 
@@ -10,13 +10,18 @@ describe("FieldCaption", () => {
 
   it("applies noWrap class when noWrap is true", () => {
     const { container } = render(<FieldCaption noWrap>Short</FieldCaption>);
-    const span = container.firstChild as HTMLElement;
-    expect(span.className).toContain("whitespace-nowrap");
+    const root = container.firstChild as HTMLElement;
+    expect(root.className).toContain("whitespace-nowrap");
   });
 
   it("does not apply noWrap when not set", () => {
     const { container } = render(<FieldCaption>Normal</FieldCaption>);
-    const span = container.firstChild as HTMLElement;
-    expect(span.className).not.toContain("whitespace-nowrap");
+    const root = container.firstChild as HTMLElement;
+    expect(root.className).not.toContain("whitespace-nowrap");
+  });
+
+  it("renders an info affordance carrying the description", () => {
+    render(<FieldCaption info="Explains the field">Label</FieldCaption>);
+    expect(screen.getByRole("button", { name: "Explains the field" })).toBeInTheDocument();
   });
 });

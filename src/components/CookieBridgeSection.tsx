@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, Copy, ExternalLink, FolderOpen, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
 import { apiGet, apiPost } from '../hooks/useApiClient';
+import InfoHint from './InfoHint';
 
 /**
  * Cookie Bridge consent + diagnostics.
@@ -170,7 +171,7 @@ export default function CookieBridgeSection({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
-        <span className={`text-xs font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-500'}`}>
+        <span className={`text-xs font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-400'}`}>
           {status?.paired ? '● paired' : '○ not paired'}
         </span>
         <button
@@ -188,18 +189,19 @@ export default function CookieBridgeSection({
         </button>
       </div>
 
-      <p className="text-xs text-zinc-400 font-mono leading-relaxed">
-        Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch
-        auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only.
-        Nothing leaves this machine. Disabling blocks all cookie ingestion.
-      </p>
+      <div className="flex items-start gap-1.5">
+        <p className="text-xs text-zinc-300 font-mono leading-relaxed">
+          Local-only cookie sync — nothing leaves this machine.
+        </p>
+        <InfoHint text="Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion." />
+      </div>
 
       {error ? <p className="text-xs text-red-400 font-mono">{error}</p> : null}
 
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-mono">
         {Object.keys(platforms).length > 0 ? (
           Object.entries(platforms).map(([platform, st]) => (
-            <span key={platform} className={st.count > 0 ? 'text-zinc-400' : 'text-zinc-600'}>
+            <span key={platform} className={st.count > 0 ? 'text-zinc-300' : 'text-zinc-400'}>
               {PLATFORM_LABELS[platform] ?? platform}: {st.count}
               {st.lastGrabAt ? ` · ${formatGrabTime(st.lastGrabAt)}` : ''}
               {st.expiredCount > 0 ? (
@@ -208,7 +210,7 @@ export default function CookieBridgeSection({
             </span>
           ))
         ) : (
-          <span className="text-zinc-600">no cookies stored</span>
+          <span className="text-zinc-400">no cookies stored</span>
         )}
       </div>
 
@@ -254,7 +256,7 @@ export default function CookieBridgeSection({
               Show folder
             </button>
             {ext.version ? (
-              <span className="text-xs text-zinc-500 font-mono ml-auto">v{ext.version}</span>
+              <span className="text-xs text-zinc-400 font-mono ml-auto">v{ext.version}</span>
             ) : null}
           </div>
           <p className="text-xs text-zinc-400 font-mono leading-relaxed">
@@ -281,7 +283,7 @@ export default function CookieBridgeSection({
           ) : null}
         </div>
       ) : (
-        <p className="text-xs text-zinc-500 font-mono">
+        <p className="text-xs text-zinc-400 font-mono">
           Extension package not installed — restart the app to refresh it, then this flow appears here.
         </p>
       )}

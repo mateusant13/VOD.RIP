@@ -4,6 +4,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
+import InfoHint from './InfoHint';
 import CookieBridgeSection, { type BridgeStatus } from './CookieBridgeSection';
 import DiskSection from './DiskSection';
 import TranscriptionSection from './TranscriptionSection';
@@ -33,7 +34,7 @@ type Props = {
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
-  'asr_language', 'channel_asr_languages',
+  'asr_language',
   'cache_dir', 'data_dir',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
@@ -170,7 +171,7 @@ export default function SettingsTab({
         </div>
         <Toggle
           label="Warm YouTube at startup"
-          hint="Pre-loads preview data for faster first play (uses ~500MB download at boot)"
+          info="Pre-loads preview data for faster first play (uses ~500MB download at boot)"
           checked={!settings.skip_youtube_startup_warm}
           onChange={(c) => setSettings({ ...settings, skip_youtube_startup_warm: !c })}
           ariaLabel="warm youtube at startup"
@@ -195,7 +196,7 @@ export default function SettingsTab({
       <SettingsCard
         icon={RefreshCw}
         title="Updates"
-        right={<span className="text-xs font-mono text-zinc-500 tabular-nums">v{appVersion ?? '…'}</span>}
+        right={<span className="text-xs font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
       >
         <div className="flex items-center gap-2 flex-wrap">
           {updateInfo ? (
@@ -237,10 +238,12 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── Danger Zone ─────────────────────────────────────────── */}
-      <SettingsCard icon={AlertTriangle} title="Danger Zone" danger>
-        <p className="text-xs text-zinc-400 font-mono leading-relaxed">
-          Exits VOD.RIP — cancels all downloads and closes the app.
-        </p>
+      <SettingsCard
+        icon={AlertTriangle}
+        title="Danger Zone"
+        danger
+        right={<InfoHint text="Exits VOD.RIP — cancels all downloads and closes the app." />}
+      >
         <button
           type="button"
           onClick={exit}

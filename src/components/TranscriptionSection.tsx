@@ -19,11 +19,6 @@ type Props = {
 export default function TranscriptionSection({ settings, setSettings, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
-  const [channelOverridesText, setChannelOverridesText] = useState(() =>
-    Object.entries(settings.channel_asr_languages ?? {})
-      .map(([k, v]) => `${k} = ${v}`)
-      .join('\n'),
-  );
 
   const activeModel = (settings.whisper_model ?? '').trim() || 'large-v3-turbo';
 
@@ -62,7 +57,12 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         />
       </div>
       <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>Model Cache Directory</FieldCaption>
+        <FieldCaption
+          noWrap
+          info="Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download"
+        >
+          Model Cache Directory
+        </FieldCaption>
         <input
           type="text"
           value={settings.whisper_model_cache ?? ''}
@@ -74,13 +74,18 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
       </div>
       <Toggle
         label="YouTube subtitles first"
-        hint="Fallback to Whisper when subtitles are unavailable"
+        info="Fallback to Whisper when subtitles are unavailable"
         checked={settings.yt_subtitles_first ?? true}
         onChange={(c) => setSettings({ ...settings, yt_subtitles_first: c })}
         ariaLabel="use youtube subtitles first"
       />
       <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>Captions Language</FieldCaption>
+        <FieldCaption
+          noWrap
+          info="Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected."
+        >
+          Captions Language
+        </FieldCaption>
         <div className="flex items-center gap-1.5">
           <select
             value={settings.asr_language ?? 'auto'}
@@ -94,31 +99,6 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
             <option value="es">Spanish (es)</option>
           </select>
         </div>
-        <span className="text-xs text-zinc-500 font-mono leading-relaxed">
-          default ASR language for Whisper jobs; per-channel overrides below win
-        </span>
-      </div>
-      <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>Channel Overrides</FieldCaption>
-        <textarea
-          rows={3}
-          value={channelOverridesText}
-          onChange={(e) => {
-            const parsed: Record<string, string> = {};
-            for (const line of e.target.value.split('\n')) {
-              const m = /^\s*([^=#]+?)\s*=\s*([a-zA-Z-]+)\s*$/.exec(line);
-              if (m) parsed[m[1].trim().toLowerCase()] = m[2].toLowerCase();
-            }
-            setChannelOverridesText(e.target.value);
-            setSettings({ ...settings, channel_asr_languages: Object.keys(parsed).length ? parsed : null });
-          }}
-          placeholder={'titiltei = pt\nxqc = en\ngaveta = pt'}
-          aria-label="per-channel captions language overrides"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white resize-y"
-        />
-        <span className="text-xs text-zinc-500 font-mono leading-relaxed">
-          one per line: channel = pt|en|es|auto (overrides the default above)
-        </span>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
         <button
@@ -130,12 +110,9 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           {saving ? <Loader2 size={13} className="animate-spin" /> : null}
           {saving ? '...' : 'Save'}
         </button>
-        <span className="text-xs text-zinc-500 font-mono">active: {activeModel}</span>
+        <span className="text-xs text-zinc-400 font-mono">active: {activeModel}</span>
         {msg ? <span className="text-xs text-emerald-500 font-mono">{msg}</span> : null}
       </div>
-      <span className="text-xs text-zinc-500 font-mono leading-relaxed">
-        cache may point at a shared HF hub dir — already-downloaded models are reused without re-download
-      </span>
     </div>
   );
 }
