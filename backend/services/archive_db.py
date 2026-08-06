@@ -1064,6 +1064,11 @@ def set_original_title(
 # writer a couple of seconds apart. Rows inside this window are skipped.
 _CROSS_FLUSH_DEDUPE_WIN_S = 2.0
 
+# Bounded-commit size for insert_messages: caps how long one SQLite write
+# transaction can hold the DB busy. A 100k-row backfill batch would
+# otherwise lock out concurrent readers/checkpoints for the whole insert.
+_MESSAGES_COMMIT_CHUNK = 5000
+
 
 def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     """Batch insert chat rows; each row: offset_sec, user_id, username, text,
@@ -1087,6 +1092,13 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     build on this). Idempotent: a re-sent row whose offset is <= the stored
     row's (delta 0) is consumed without bumping spam_count, so replaying a
     flush never double-counts.
+
+    Commits in _MESSAGES_COMMIT_CHUNK-sized chunks (not one giant
+    transaction) so a 100k-row batch never holds the SQLite write lock for
+    the whole insert; a mid-batch failure leaves the earlier chunks
+    committed and rolls back only the current one. Backfill pages and live
+    sink flushes are far below the chunk size, so their per-call atomicity
+    is unchanged.
 
     ponytail: only the batch's FIRST run merges cross-flush (per contract,
     the last stored row). A burst whose text differs from the last row but
@@ -1178,7 +1190,15 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                     kept.append((anchor, count))
             runs = kept
 
-            for anchor, count in runs:
+            # Chunked commits: a 100k-row batch must not hold the SQLite
+            # write transaction for the whole insert. The cross-flush merge
+            # and dedupe probes ran above, before any insert, so chunk
+            # boundaries cannot change their outcome. On failure mid-batch
+            # only the CURRENT chunk rolls back (earlier chunks stay
+            # committed) — callers are idempotent re-runs (backfill seeds
+            # from MAX(offset_sec), sinks re-send rows the dedupe window
+            # absorbs), so partial batches are safe.
+            for i, (anchor, count) in enumerate(runs, 1):
                 conn.execute(
                     """INSERT INTO messages (platform, video_id, offset_sec,
                        user_id, username, display_name, text, badges, emotes, ts, color, spam_count)
@@ -1199,6 +1219,8 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                     ),
                 )
                 # FTS index entry is written by the messages_ai trigger.
+                if i % _MESSAGES_COMMIT_CHUNK == 0:
+                    conn.commit()
     return accepted
 
 
@@ -1940,10 +1962,12 @@ def search(
     _channel_hint_out: Optional[list] = None,
     username: Optional[str] = None,
 ) -> list[dict]:
-    """BM25 across transcripts + messages. Returns unified hits ordered by
-    score; each hit carries enough to seek: platform, video_id, offset_sec,
-    plus the owning video's channel/title/started_at (date), video_kind and
-    lang (transcripts: transcripts.lang; messages: None).
+    """BM25 across transcripts + messages. Returns unified hits ordered
+    newest-first: the owning video's started_at desc, with score desc as the
+    within-date tiebreak and NULL dates (no videos row) last; each hit
+    carries enough to seek: platform, video_id, offset_sec, plus the owning
+    video's channel/title/started_at (date), video_kind and lang
+    (transcripts: transcripts.lang; messages: None).
 
     Merge semantics: each table is fetched ~3x limit (no per-table cap below
     that), scores are normalized per table (divided by the batch max, so the
@@ -2159,12 +2183,17 @@ def search(
                     r["score"] = r["score"] / tmax
                 merged.append(r)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
-    # Normalization collapses each table's best to exactly 1.0, so two
-    # tables' best hits can TIE at 1.5 after the phrase boost. Ties resolve
-    # by table priority (transcripts before messages), then by raw score —
-    # raw BM25 is only comparable WITHIN a table, so it must never be the
-    # cross-table tie-break: table stats shift with unrelated rows, making
-    # the order depend on whatever else lives in the process DB.
+    # Newest-first is the primary order: the owning video's started_at desc
+    # (ISO strings — the same lexicographic order the author-history path
+    # sorts by in SQL). Score desc is the within-date tiebreak, so a hit
+    # from a newer video outranks an older video's phrase hit; relevance
+    # still decides which hits of the SAME video surface first. NULL dates
+    # (LEFT JOIN miss — no videos row) sort last so archived content never
+    # hides behind orphan rows. Within a date, normalization collapses each
+    # table's best to exactly 1.0, so two tables' best hits can TIE at 1.5
+    # after the phrase boost: ties resolve by table priority (transcripts
+    # before messages), then by raw score — raw BM25 is only comparable
+    # WITHIN a table, so it must never be the cross-table tie-break.
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
     # FE's "infinite literal results" mode sends ~2000) wants EVERY match
@@ -2172,7 +2201,11 @@ def search(
     cap = _HITS_PER_VIDEO_CAP if int(limit) <= _HITS_PER_VIDEO_CAP * 10 else 10**6
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
-    for h in sorted(merged, key=lambda h: (h["score"], h.pop("_tbl", 0), h.pop("_raw", 0.0)), reverse=True):
+    for h in sorted(
+        merged,
+        key=lambda h: (h["date"] is not None, h["date"] or "", h["score"], h.pop("_tbl", 0), h.pop("_raw", 0.0)),
+        reverse=True,
+    ):
         key = (h["platform"], h["video_id"])
         if per_video.get(key, 0) >= cap:
             continue
@@ -2961,19 +2994,19 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
             cur = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
             if cur == hit[3]:
                 return hit[2]
-            # Corpus grew since the snapshot (live chat lands between
-            # searches): serve the STALE vocab right now — the rebuild is a
-            # 25k-row GROUP BY worth ~600ms on a 200k-message archive and
-            # must never sit in the search response — and refresh in the
-            # background. The generation bump on completion invalidates
-            # per-token expansions, so new chat words stay reachable within
-            # a TTL, not after it.
-            if table not in _vocab_rebuild_pending:
-                _vocab_rebuild_pending.add(table)
-                threading.Thread(
-                    target=_rebuild_vocab, args=(table, now), daemon=True
-                ).start()
-            return hit[2]
+            stale = hit[2]
+        else:
+            stale = None
+    if stale is not None:
+        # Corpus grew since the snapshot (live chat lands between searches):
+        # serve the STALE vocab right now — the rebuild is a 25k-row GROUP
+        # BY worth ~600ms on a 200k-message archive and must never sit in
+        # the search response — and refresh in the background (the lock is
+        # released first: _kick_vocab_rebuild takes _vocab_lock itself). The
+        # generation bump on completion invalidates per-token expansions, so
+        # new chat words stay reachable within a TTL, not after it.
+        _kick_vocab_rebuild(table, now)
+        return stale
     # Cold path (new process or TTL expired): try the on-disk snapshot
     # before paying for the fts5vocab GROUP BY. Disk validity is TTL-only
     # (see _load_vocab_disk); the in-memory tuple keeps the content row
@@ -2988,10 +3021,31 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
                 _vocab_generation[dbp] = _vocab_generation.get(dbp, 0) + 1
                 _vocab_cache[table] = (dbp, now, by_len, row_count)
             return by_len
-        # Corpus grew since the snapshot — serve nothing stale: rebuild
-        # inline (same cost as no snapshot; the snapshot's win is the
-        # unchanged-corpus cold start).
-    return _load_vocab_uncached(table, now)
+        # Corpus grew since the snapshot: serve the STALE snapshot right now
+        # — the GROUP BY is ~0.5-1s/table and must never sit in the search
+        # response — and refresh in the background. New corpus words become
+        # reachable once the rebuild lands (~1s), not after the next TTL.
+        _kick_vocab_rebuild(table, now)
+        return by_len
+    # No snapshot at all (first run ever / snapshot cleaned): serve NO vocab
+    # — the query degrades to the exact-token pattern for this one search,
+    # the established fallback when the vocab is unavailable — and rebuild in
+    # the background so the next search is fully fuzzy.
+    _kick_vocab_rebuild(table, now)
+    return None
+
+
+def _kick_vocab_rebuild(table: str, loaded_at: float) -> None:
+    """Start one background vocab rebuild per table; no-ops when one is
+    already in flight (the pending set also guards duplicate threads when
+    concurrent searches observe the same staleness)."""
+    with _vocab_lock:
+        if table in _vocab_rebuild_pending:
+            return
+        _vocab_rebuild_pending.add(table)
+        threading.Thread(
+            target=_rebuild_vocab, args=(table, loaded_at), daemon=True
+        ).start()
 
 
 def _rebuild_vocab(table: str, loaded_at: float) -> None:
@@ -3208,6 +3262,8 @@ _BIGRAM_MAX_ROWS = 300_000
 
 # "table1|table2" -> (loaded_at, {folded_pair_key: [(raw_pair, freq), ...]}, row_counts)
 _bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]], list[int]]] = {}
+# cache keys with a background bigram rebuild in flight (search-latency guard)
+_bigram_rebuild_pending: set[str] = set()
 _TOKEN_RE = re.compile(r"[^\w]+")
 _DEDUP_RE = re.compile(r"(.)\1+")  # fold's doubled-letter collapse — compiled once
 
@@ -3225,7 +3281,14 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
     caption artifacts ('&gt;&gt;', '&nbsp;') or trivial phrases that exact
     matching covers anyway. Cached like the vocab (TTL + row-count gate) so
     steady chat growth does not rebuild it on every search; tables over
-    _BIGRAM_MAX_ROWS are skipped."""
+    _BIGRAM_MAX_ROWS are skipped.
+
+    The rebuild is a full-corpus Python scan worth ~20s at 200k rows (207k
+    message rows -> 1.5M+ fold calls) and NEVER runs inline on the request
+    path: a stale-but-cached index is served as-is with the rebuild kicked
+    to a background thread, and a cold (uncached) index degrades to None —
+    the bigram bridge is recall-only, exact/fuzzy matching still works —
+    while the rebuild runs in the background."""
     key = str(_db_path()) + "|" + "|".join(tables)
     now = time.monotonic()
     with _vocab_lock:
@@ -3243,7 +3306,25 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
             )
             if drift_ok:
                 return hit[1]
-            hit = None  # material growth since load — rebuild the index
+        # Stale (TTL expired or material growth since load): serve the
+        # cached index and rebuild in the background. Cold (no cache yet):
+        # serve None and build in the background. Either way the request
+        # path never pays the full-corpus scan. The pending set keeps one
+        # rebuild per key even when concurrent searches observe the same
+        # staleness.
+        stale = hit[1] if hit is not None else None
+        if key not in _bigram_rebuild_pending:
+            _bigram_rebuild_pending.add(key)
+            threading.Thread(
+                target=_rebuild_bigrams, args=(key, tables, now), daemon=True
+            ).start()
+        return stale
+
+
+def _build_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]]]:
+    """The bigram rebuild body: scan every content row, fold adjacent
+    token pairs, evict the frequent tail over budget. Returns the merged
+    pair index, or None when every table is empty or over the row cap."""
     counts: dict[tuple[str, str], int] = {}
     for table in tables:
         row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
@@ -3251,7 +3332,7 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
             continue
         # Fold each UNIQUE token once: re-folding every adjacent pair
         # re-does the same word millions of times (207k message rows on the
-        # real DB -> 1.5M+ fold calls -> ~20s+ on the first search).
+        # real DB -> 1.5M+ fold calls -> ~20s+ on a rebuild).
         folds: dict[str, str] = {}
         for row in query(f"SELECT text FROM {table} WHERE text IS NOT NULL"):
             toks = [t for t in _TOKEN_RE.split((row["text"] or "").lower()) if t]
@@ -3278,12 +3359,24 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
         merged.setdefault(fk, []).append((pair, n))
     for cands in merged.values():
         cands.sort(key=lambda kv: -kv[1])
-    row_counts = [
-        query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
-    ]
-    with _vocab_lock:
-        _bigram_cache[key] = (now, merged, row_counts)
     return merged or None
+
+
+def _rebuild_bigrams(key: str, tables: list[str], loaded_at: float) -> None:
+    """Background bigram rebuild — keeps the search request path free of
+    the full-corpus scan. One in-flight rebuild per cache key."""
+    try:
+        merged = _build_bigrams(tables)
+        row_counts = [
+            query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
+        ]
+        with _vocab_lock:
+            _bigram_cache[key] = (loaded_at, merged, row_counts)
+    except Exception:
+        logger.warning("background bigram rebuild failed", exc_info=True)
+    finally:
+        with _vocab_lock:
+            _bigram_rebuild_pending.discard(key)
 
 
 def _token_expansions(
@@ -3558,6 +3651,12 @@ insert_messages(
     _selfcheck_video,
     [{"offset_sec": 1.0, "username": "checker", "text": "arquivo local google teste"}],
 )
+# Prime the vocab caches synchronously: the request path never builds them
+# inline anymore (cold searches serve exact tokens and rebuild in the
+# background), so the fuzzy assert below would otherwise race the background
+# thread — which loses on a real 200k-row archive and crashes import.
+_load_vocab_uncached("messages", time.monotonic())
+_load_vocab_uncached("transcripts", time.monotonic())
 # Every content assert below is scoped to the self-check video: the contract
 # is "FTS finds MY row", not "my row ranks top-N corpus-wide". Unscoped
 # asserts flip randomly on large archives (500k+ rows push the row out of

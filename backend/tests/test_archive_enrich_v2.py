@@ -63,8 +63,10 @@ def _reset_enrichment_state() -> None:
 def test_merge_keeps_both_kinds_and_caps_three_per_video():
     archive_db.execute("DELETE FROM messages WHERE video_id IN ('merge-a','merge-b')")
     archive_db.execute("DELETE FROM transcripts WHERE video_id IN ('merge-a','merge-b')")
-    _upsert("twitch", "merge-a", channel="aa", title="alpha")
-    _upsert("youtube", "merge-b", channel="bb", title="beta")
+    _upsert("twitch", "merge-a", channel="aa", title="alpha",
+            started_at="2026-08-01T00:00:00Z")
+    _upsert("youtube", "merge-b", channel="bb", title="beta",
+            started_at="2026-08-02T00:00:00Z")
     archive_db.insert_messages(
         "twitch", "merge-a",
         [{"offset_sec": float(i), "username": "u", "text": "mergeterm"} for i in range(4)],
@@ -83,9 +85,14 @@ def test_merge_keeps_both_kinds_and_caps_three_per_video():
         per_video[h["video_id"]] = per_video.get(h["video_id"], 0) + 1
     assert set(per_video) == {"merge-a", "merge-b"}
     assert max(per_video.values()) <= 3, "no video may exceed the 3-hit cap"
-    # scores are normalized per table (best hit of a table scores 1.0) and
-    # the merged list is ordered best-first.
-    assert hits[0]["score"] >= hits[-1]["score"]
+    # Newest-first contract: scores are normalized per table (best hit of a
+    # table scores 1.0) but the merged list orders by video date desc first
+    # (score desc only breaks within-date ties), so merge-b (newer) leads
+    # and the dates are monotonically descending.
+    assert hits[0]["video_id"] == "merge-b", "the newer video must lead"
+    assert [h["date"] for h in hits] == sorted(
+        (h["date"] for h in hits), reverse=True
+    ), "text-search hits must be newest-first"
     assert {h["kind"] for h in hits[:6]} == {"message", "transcript"}
     # BM25 is corpus-relative: leftover rows would shift avgdl and flip
     # cross-table ties in OTHER tests sharing this DB — clean up.

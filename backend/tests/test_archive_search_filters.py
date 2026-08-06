@@ -566,18 +566,22 @@ def test_search_video_id_scopes_to_one_video():
     _seed_search_fixture()
     # A louder hit on ANOTHER video would outrank every scoped hit — the
     # video_id filter must exclude it at SQL level, not by post-filtering.
+    # The louder video is the NEWEST, so under newest-first ordering its
+    # 4-zebra message leads the unscoped result page.
+    _insert_video("filter-t-louder", channel="louder",
+                  started_at="2026-08-02T12:00:00Z", kind="vod")
     archive_db.insert_messages(
         "twitch", "filter-t-louder",
         [{"offset_sec": 1.0, "username": "u", "text": "zebra zebra zebra zebra"}],
     )
     try:
-        # The 4-zebra message and lubu's phrase-hit transcript BOTH normalize
-        # to 1.5 (per-table normalization + phrase boost), so the top-1 tie
-        # is resolved by table priority — not by relevance. What the search
-        # must guarantee: the louder hit is at the top tier AND the scoped
-        # query never surfaces it (SQL-level exclusion, not post-filtering).
+        # Newest-first: the louder hit (newest video) leads the page; the
+        # scoped query must never surface it (SQL-level exclusion, not
+        # post-filtering).
         top = archive_db.search("zebra", limit=2)
-        assert {h["video_id"] for h in top} >= {"filter-t-louder", "filter-t-lubu"}
+        assert top and top[0]["video_id"] == "filter-t-louder", (
+            "the newest loudest hit must lead under newest-first ordering"
+        )
         hits = archive_db.search("zebra", video_id="filter-t-lubu")
         assert _hit_ids(hits) == {
             ("message", "filter-t-lubu"), ("transcript", "filter-t-lubu"),
@@ -585,6 +589,7 @@ def test_search_video_id_scopes_to_one_video():
         assert all(h["video_id"] == "filter-t-lubu" for h in hits)
     finally:
         archive_db.execute("DELETE FROM messages WHERE video_id='filter-t-louder'")
+        archive_db.execute("DELETE FROM videos WHERE video_id='filter-t-louder'")
 
 
 def test_search_video_id_composes_with_source_and_channel():
@@ -689,7 +694,12 @@ def test_fuzzy_expansion_arthur_to_artur():
         with archive_db._vocab_lock:
             archive_db._vocab_cache.pop("messages", None)
             archive_db._token_cache.clear()
-        vocab = archive_db._load_vocab("messages")
+        # The request path no longer rebuilds a cold vocab inline (it serves
+        # exact tokens and rebuilds in the background); this test asserts the
+        # expansion contract, so rebuild synchronously on the tiny scratch DB.
+        import time as _t
+
+        vocab = archive_db._load_vocab_uncached("messages", _t.monotonic())
         assert vocab is not None, "fts5vocab must be readable for messages"
         cands = archive_db._token_expansions(
             "arthur", [vocab], archive_db._load_bigrams(["messages"])
@@ -799,8 +809,13 @@ def test_search_cata_suppresses_cara_noise():
     )
     try:
         for tok in ("cata", "kata"):
+            # Fresh vocab over the just-seeded corpus: the request path never
+            # rebuilds inline anymore (cold = exact tokens + background
+            # rebuild), so rebuild synchronously on the tiny scratch DB.
+            import time as _t
+
+            archive_db._load_vocab_uncached("messages", _t.monotonic())
             with archive_db._vocab_lock:
-                archive_db._vocab_cache.pop("messages", None)
                 archive_db._token_cache.clear()
             hits = archive_db.search(tok, limit=30)
             assert any(h["video_id"] == cat_vid for h in hits), \

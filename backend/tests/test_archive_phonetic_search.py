@@ -112,7 +112,31 @@ def scratch(monkeypatch, tmp_path):
         add("phonv2", "no caso, né")
         add("phonv2", "quebra casco")
         add("phonv2", "o saco encheu")
+    _warm_search_caches()
     return db
+
+
+def _warm_search_caches() -> None:
+    """Prime the vocab + bigram caches synchronously. The request path no
+    longer builds either inline (cold searches serve exact tokens and
+    rebuild in background threads); these tests assert the fuzzy/bigram
+    contracts, so the caches must be warm before the first search()."""
+    import time as _t
+
+    for t in ("transcripts", "messages"):
+        db._load_vocab_uncached(t, _t.monotonic())
+    # Both cache-key shapes get exercised: direct _expand_query calls pass
+    # ["transcripts"], search() passes the full table list.
+    for tables in (["transcripts"], ["transcripts", "messages"]):
+        db._load_bigrams(tables)  # cold -> kicks a background rebuild
+        key = str(db._db_path()) + "|" + "|".join(tables)
+        for _ in range(1000):
+            with db._vocab_lock:
+                if key in db._bigram_cache:
+                    break
+            _t.sleep(0.005)
+        else:
+            raise AssertionError("background bigram rebuild did not land")
 
 
 def _texts(hits) -> list[str]:
