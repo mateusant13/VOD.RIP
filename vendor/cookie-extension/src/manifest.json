@@ -1,18 +1,15 @@
 {
-  "name": "Get cookies.txt LOCALLY",
-  "description": "Get cookies.txt, NEVER send information outside with open-source",
-  "version": "0.7.2",
+  "name": "VOD RIP Get Cookies",
+  "short_name": "VOD RIP Cookies",
+  "description": "VOD.RIP companion — export login cookies for YouTube, Twitch and Kick only, and keep the app paired locally.",
+  "version": "0.8.0",
   "manifest_version": 3,
   "permissions": ["activeTab", "alarms", "cookies", "downloads", "notifications", "clipboardWrite", "storage"],
   "host_permissions": [
-    "<all_urls>",
-    "http://127.0.0.1/*",
-    "https://kick.com/*",
-    "https://*.kick.com/*",
-    "https://youtube.com/*",
     "https://*.youtube.com/*",
-    "https://twitch.tv/*",
-    "https://*.twitch.tv/*"
+    "https://*.twitch.tv/*",
+    "https://*.kick.com/*",
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_popup": "popup.html",

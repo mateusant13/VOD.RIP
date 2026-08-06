@@ -186,4 +186,4 @@ foreach ($root in $policyRoots) {
 
 Write-Host ""
 Write-Host "Done. Restart Chrome/Edge - the extension installs automatically (no admin, no prompts)."
-Write-Host "Verify: chrome://extensions should list 'Get cookies.txt LOCALLY' as installed by policy."
+Write-Host "Verify: chrome://extensions should list 'VOD RIP Get Cookies' as installed by policy."
