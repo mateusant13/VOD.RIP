@@ -1,28 +1,40 @@
 /**
  * Switch-style toggle wrapping a real checkbox (keyboard/screen-reader safe).
  * Track = bordered box, knob slides; checked = emerald, unchecked = zinc.
+ * `info` renders a compact (i) hover affordance instead of a text line below.
  */
+import { useId } from 'react';
+import InfoHint from './InfoHint';
+
 type Props = {
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: string;
-  hint?: string;
+  info?: string;
   ariaLabel: string;
 };
 
-export default function Toggle({ checked, onChange, label, hint, ariaLabel }: Props) {
+export default function Toggle({ checked, onChange, label, info, ariaLabel }: Props) {
+  const id = useId();
   return (
-    <label className="flex items-center justify-between gap-2 cursor-pointer select-none group">
-      <span className="flex flex-col gap-1 min-w-0">
-        <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">{label}</span>
-        {hint ? <span className="text-xs text-zinc-500 font-mono leading-relaxed">{hint}</span> : null}
+    <div className="flex items-center justify-between gap-2 select-none group">
+      <span className="flex items-center gap-1.5 min-w-0">
+        <label
+          htmlFor={id}
+          className="text-xs font-bold uppercase tracking-wider text-zinc-300 cursor-pointer"
+        >
+          {label}
+        </label>
+        {info ? <InfoHint text={info} /> : null}
       </span>
-      <span
-        className={`relative w-9 h-[18px] shrink-0 border-2 transition-colors focus-within:border-white ${
+      <label
+        htmlFor={id}
+        className={`relative w-9 h-[18px] shrink-0 border-2 transition-colors cursor-pointer focus-within:border-white ${
           checked ? 'bg-emerald-950 border-emerald-600' : 'bg-zinc-900 border-zinc-700 group-hover:border-zinc-500'
         }`}
       >
         <input
+          id={id}
           type="checkbox"
           className="sr-only"
           checked={checked}
@@ -34,7 +46,7 @@ export default function Toggle({ checked, onChange, label, hint, ariaLabel }: Pr
             checked ? 'left-[18px] bg-emerald-400' : 'left-[1px] bg-zinc-500'
           }`}
         />
-      </span>
-    </label>
+      </label>
+    </div>
   );
 }

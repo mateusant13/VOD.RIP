@@ -146,7 +146,12 @@ export default function DiskSection({ settings, setSettings }: Props) {
       <div className="flex flex-col gap-1.5">
         <FieldCaption noWrap>Storage</FieldCaption>
 
-        <FieldCaption noWrap>Heavy Cache Disk</FieldCaption>
+        <FieldCaption
+          noWrap
+          info="Whisper models, yt-dlp cache, preview temp & embed models — applies on Save Settings (next launch)"
+        >
+          Heavy Cache Disk
+        </FieldCaption>
         <select
           aria-label="heavy cache disk"
           value={cacheDir}
@@ -161,11 +166,10 @@ export default function DiskSection({ settings, setSettings }: Props) {
           ))}
           {cacheCustom ? <option value={cacheDir}>Custom ({cacheDir})</option> : null}
         </select>
-        <span className="text-xs text-zinc-500 font-mono leading-relaxed">
-          whisper models, yt-dlp cache, preview temp &amp; embed models — applies on Save Settings (next launch)
-        </span>
 
-        <FieldCaption noWrap>Transcripts &amp; Chat Data Disk</FieldCaption>
+        <FieldCaption noWrap info="Takes effect after restart (moves the database)">
+          Transcripts &amp; Chat Data Disk
+        </FieldCaption>
         <select
           aria-label="transcripts and chat data disk"
           value={dataDir}
@@ -180,16 +184,15 @@ export default function DiskSection({ settings, setSettings }: Props) {
           ))}
           {dataCustom ? <option value={dataDir}>Custom ({dataDir})</option> : null}
         </select>
-        <span className="text-xs text-zinc-500 font-mono">Takes effect after restart (moves the database)</span>
 
         <div className="flex items-center gap-2 pt-0.5 flex-wrap">
-          <span className="text-xs text-zinc-500 font-mono">
+          <span className="text-xs text-zinc-400 font-mono">
             {effectiveCache
               ? `${effectiveCache} — ${cacheFree != null ? `${formatBytes(cacheFree)} free` : '…'}`
               : 'using app data drive'}
           </span>
           {status?.biggest_drive ? (
-            <span className="text-xs text-zinc-500 font-mono">auto pick: {status.biggest_drive}</span>
+            <span className="text-xs text-zinc-400 font-mono">auto pick: {status.biggest_drive}</span>
           ) : null}
         </div>
       </div>
@@ -212,14 +215,14 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
       {usage ? (
         <div className="flex items-center gap-2">
-          <span className="flex-1 text-xs text-zinc-500 font-mono uppercase tracking-wide">Total</span>
+          <span className="flex-1 text-xs text-zinc-400 font-mono uppercase tracking-wide">Total</span>
           <span className="text-xs text-zinc-100 font-mono tabular-nums w-20 text-right">{formatBytes(usage.total)}</span>
           <span className="w-16 shrink-0" aria-hidden />
         </div>
       ) : null}
 
       <div className="flex items-center gap-2 pt-0.5 flex-wrap">
-        <span className="text-xs text-zinc-500 font-mono">FREE</span>
+        <span className="text-xs text-zinc-400 font-mono">FREE</span>
         <span className="text-xs text-zinc-300 font-mono tabular-nums">
           {status ? formatBytes(status.free_bytes) : '…'}
         </span>
@@ -227,7 +230,9 @@ export default function DiskSection({ settings, setSettings }: Props) {
       </div>
 
       <div className="flex flex-col gap-1.5 pt-1">
-        <FieldCaption noWrap>Archive VODs Keep</FieldCaption>
+        <FieldCaption noWrap info="Oldest VODs kept per platform — applies on Save Settings">
+          Archive VODs Keep
+        </FieldCaption>
         <div className="flex items-center gap-2">
           <div className="w-24 shrink-0">
             <NumberField
@@ -239,7 +244,6 @@ export default function DiskSection({ settings, setSettings }: Props) {
               onChange={(v) => setSettings({ ...settings, archive_vod_keep_count: v })}
             />
           </div>
-          <span className="text-xs text-zinc-500 font-mono flex-1 leading-relaxed">oldest VODs kept per platform — applies on Save Settings</span>
         </div>
       </div>
 
