@@ -5,6 +5,7 @@ import {
   resizeLayoutGivingWidthTo,
   shrinkLayoutPanelsToFit,
   clampPanelSizeForLayout,
+  clampAllLayoutPanels,
   effectiveLayoutFromPreferred,
   panelPosAfterResize,
   healSqueezedPanelLayout,
@@ -383,6 +384,80 @@ describe('layoutUtils resize budget', () => {
     expect(effective.main.w).toBeGreaterThanOrEqual(PANEL_MIN.w);
     // Preferred inputs stay untouched (persistence contract).
     expect(preferred.urlAside.w).toBe(50);
+  });
+
+  it('distributes triple-panel overflow proportionally (no 240/240 sibling collapse)', () => {
+    // Reproduced on-enter collapse: saved widths 867/428/504 on a 1365px
+    // window rendered 765/240/240 — both siblings floored at PANEL_MIN.w
+    // because the greedy per-panel clamps ran before the fit. The overflow
+    // must scale EVERY panel by budget/total instead.
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1365 });
+    const layout: LayoutPanelBoundsInput = {
+      previewOpen: true,
+      urlPanelAside: true,
+      preview: { w: 867, h: 0 },
+      urlAside: { w: 428, h: 414 },
+      main: { w: 504, h: 448 },
+    };
+    const budget = layoutRowWidthBudget(layout);
+    const scale = budget / (867 + 428 + 504);
+    const fitted = clampAllLayoutPanels(layout);
+    // Exactly the proportional floor for every panel (the old greedy code
+    // produced 765/240/240 — urlAside/main parked at PANEL_MIN.w).
+    expect(fitted.preview.w).toBe(Math.floor(867 * scale));
+    expect(fitted.urlAside.w).toBe(Math.floor(428 * scale));
+    expect(fitted.main.w).toBe(Math.floor(504 * scale));
+    // NO panel lands at its minimum while a sibling sits far above it.
+    expect(fitted.urlAside.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(fitted.main.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(fitted.preview.w).toBeGreaterThan(PREVIEW_PANEL_MIN_W);
+    expect(fitted.preview.w + fitted.urlAside.w + fitted.main.w).toBeLessThanOrEqual(budget);
+  });
+
+  it('renders a narrow triple row proportionally through the effective path', () => {
+    // tripleLayout (640/288/448) on a viewport too narrow for the desired row:
+    // every panel scales by budget/total, none collapses to its minimum.
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1365 });
+    const layout = tripleLayout();
+    const budget = layoutRowWidthBudget(layout);
+    const scale = budget / (layout.preview.w + layout.urlAside.w + layout.main.w);
+    const effective = effectiveLayoutFromPreferred(
+      {
+        previewPanelWidth: layout.preview.w,
+        urlAside: layout.urlAside,
+        main: layout.main,
+      },
+      { previewOpen: true, urlPanelAside: true },
+    );
+    expect(effective.preview.w).toBe(Math.floor(layout.preview.w * scale));
+    expect(effective.urlAside.w).toBe(Math.floor(layout.urlAside.w * scale));
+    expect(effective.main.w).toBe(Math.floor(layout.main.w * scale));
+    expect(effective.urlAside.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(effective.main.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(effective.preview.w).toBeGreaterThan(PREVIEW_PANEL_MIN_W);
+    expect(effective.preview.w + effective.urlAside.w + effective.main.w).toBeLessThanOrEqual(budget);
+  });
+
+  it('keeps preview-only rows collapse-free (no urlAside sibling)', () => {
+    // Single-panel regression guard: with the URL panel absent, the preview is
+    // bounded by the row cap (budget minus main's minimum) and main never
+    // collapses to a PANEL_MIN.w strip.
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1365 });
+    const layout: LayoutPanelBoundsInput = {
+      previewOpen: true,
+      urlPanelAside: false,
+      preview: { w: 867, h: 0 },
+      urlAside: { w: 288, h: 414 },
+      main: { w: 504, h: 448 },
+    };
+    const fitted = clampAllLayoutPanels(layout);
+    const budget = layoutRowWidthBudget(layout);
+    expect(fitted.preview.w).toBeGreaterThanOrEqual(PREVIEW_PANEL_MIN_W);
+    expect(fitted.preview.w).toBeLessThanOrEqual(
+      layoutMaxPanelWidthAtSiblingMins('preview', layout),
+    );
+    expect(fitted.main.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(fitted.preview.w + fitted.main.w).toBeLessThanOrEqual(budget);
   });
 });
 

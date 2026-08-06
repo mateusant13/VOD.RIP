@@ -349,12 +349,15 @@ export function effectiveLayoutFromPreferred(
     main: clamped.main,
   };
   if (viewport.previewOpen) {
+    // Cap against the CLAMPED layout (fitted siblings), matching the final
+    // pass inside clampAllLayoutPanels and the DOM paint in App.tsx — the
+    // video-fit bound must not be computed against stale desired widths.
     effective.preview = {
       w: clampPreviewPanelWidth(
         clamped.preview.w,
         viewport.chromeH ?? PREVIEW_PANEL_CHROME_H_EST,
         viewport.aspect ?? PREVIEW_VIDEO_ASPECT_DEFAULT,
-        input,
+        { ...input, preview: clamped.preview, urlAside: clamped.urlAside, main: clamped.main },
       ),
       h: clamped.preview.h,
     };
@@ -376,6 +379,15 @@ export function effectiveLayoutFromPreferred(
   return effective;
 }
 
+/**
+ * Derive the runtime panel sizes for one render: height clamps first, then a
+ * PROPORTIONAL width fit, then a final min-floor/video-cap safety pass.
+ *
+ * The old order clamped widths greedily per-panel (each against "budget minus
+ * everyone else's minimum") BEFORE the fit: the preview absorbed the overflow
+ * first and the last-clamped siblings floored at PANEL_MIN.w — the collapse
+ * on enter (preview 765 + urlAside 240 + main 240 instead of ~611/302/355).
+ */
 export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   preview: PanelSize;
   urlAside: PanelSize;
@@ -387,36 +399,50 @@ export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
   let urlAside = { ...layout.urlAside };
   let main = { ...layout.main };
   let live = { ...(layout.live ?? layout.preview) };
-  const snapshot = (): LayoutPanelBoundsInput => ({
-    ...layout,
-    preview,
-    urlAside,
-    main,
-    live,
-  });
 
-  if (layout.previewOpen) {
-    if (layout.liveOpen) {
-      const clamped = clampPanelSizeForLayout('live', { ...live, h: Math.min(live.h, maxH) }, snapshot());
-      live = clamped;
-      preview = { ...preview, w: clamped.w };
-    } else {
-      const w = clampPreviewPanelWidth(
-        preview.w,
-        PREVIEW_PANEL_CHROME_H_EST,
-        PREVIEW_VIDEO_ASPECT_DEFAULT,
-        snapshot(),
-      );
-      preview = { w, h: preview.h };
-    }
+  // 1. Height clamps only. Widths keep their desired values so a row overflow
+  //    is distributed proportionally below instead of being absorbed greedily
+  //    by the first-clamped panel.
+  if (layout.liveOpen) {
+    live = { ...live, h: Math.min(maxH, Math.max(PANEL_MIN.h, live.h)) };
+    if (layout.previewOpen) preview = { ...preview, w: live.w };
   }
   if (layout.urlPanelAside) {
-    urlAside = clampPanelSizeForLayout('urlAside', { ...urlAside, h: Math.min(urlAside.h, maxH) }, snapshot());
+    urlAside = { ...urlAside, h: Math.min(maxH, Math.max(PANEL_MIN.h, urlAside.h)) };
   }
-  main = clampPanelSizeForLayout('main', { ...main, h: Math.min(main.h, maxH) }, snapshot());
+  main = { ...main, h: Math.min(maxH, Math.max(PANEL_MIN.h, main.h)) };
 
+  // 2. Proportional fit on the desired widths: every visible panel shares the
+  //    overflow (floored at its own minimum), so siblings never collapse to a
+  //    PANEL_MIN.w strip while the preview keeps most of the row.
   const fitted = shrinkLayoutPanelsToFit({ ...layout, preview, urlAside, main, live });
-  return fitted;
+
+  // 3. Final safety pass: per-panel min floors + the preview video-fit cap.
+  //    After the proportional fit these only bite in degenerate cases (tiny
+  //    viewports, desired widths below min) — they cannot re-collapse siblings.
+  const urlAsideFinal = layout.urlPanelAside
+    ? { ...fitted.urlAside, w: Math.max(PANEL_MIN.w, fitted.urlAside.w) }
+    : fitted.urlAside;
+  const mainFinal = { ...fitted.main, w: Math.max(PANEL_MIN.w, fitted.main.w) };
+  let previewFinal = fitted.preview;
+  let liveFinal = fitted.live ?? fitted.preview;
+  if (layout.previewOpen && !layout.liveOpen) {
+    previewFinal = {
+      ...fitted.preview,
+      w: clampPreviewPanelWidth(
+        fitted.preview.w,
+        PREVIEW_PANEL_CHROME_H_EST,
+        PREVIEW_VIDEO_ASPECT_DEFAULT,
+        { ...layout, preview: fitted.preview, urlAside: urlAsideFinal, main: mainFinal },
+      ),
+    };
+  } else if (layout.liveOpen) {
+    liveFinal = { ...liveFinal, w: Math.max(LIVE_PANEL_MIN_W, liveFinal.w) };
+    if (layout.previewOpen) previewFinal = { ...previewFinal, w: liveFinal.w };
+  }
+  return layout.liveOpen
+    ? { preview: previewFinal, urlAside: urlAsideFinal, main: mainFinal, live: liveFinal }
+    : { preview: previewFinal, urlAside: urlAsideFinal, main: mainFinal };
 }
 export function maxPreviewPanelWidth(
   chromeH: number,
