@@ -3470,6 +3470,10 @@ export default function App() {
     views?: number | null;
     /** Native archive video id (same value as archive DB videos.video_id). */
     videoId?: string;
+    /** Channel slug/login (broadcaster login for Twitch) — carried into the
+     *  synthetic VideoInfo so the TWITCH CLIP button stays enabled before the
+     *  (possibly skipped) /api/info/video round-trip. */
+    channel?: string | null;
     /** Skip the /api/info/video round-trip when the caller already has enough metadata
      *  (e.g. from the channel list). The VOD · Trim panel renders immediately from the
      *  hint; explicit Extract Info can still refresh later. */
@@ -3535,7 +3539,8 @@ export default function App() {
         duration_string: end > 0 ? fmtDuration(end) : null,
         created_at: hint.createdAt ?? null,
         views: hint.views ?? null,
-        uploader: null,
+        uploader: hint.channel ?? null,
+        channel: hint.channel ?? null,
         thumbnail: hint.thumbnailUrl || findCachedVideoThumbnail(trimmed, savedChannels),
         webpage_url: trimmed,
         extractor: platform,
@@ -3563,7 +3568,8 @@ export default function App() {
         title: hintTitle,
         duration: end,
         duration_string: fmtDuration(end),
-        uploader: null,
+        uploader: hint.channel ?? null,
+        channel: hint.channel ?? null,
         thumbnail: hint.thumbnailUrl || findCachedVideoThumbnail(trimmed, savedChannels),
         webpage_url: trimmed,
         extractor: platform,
@@ -5135,6 +5141,7 @@ export default function App() {
       createdAt: vod.created_at ?? null,
       views: vod.views ?? null,
       videoId: vod.videoId,
+      channel: vod.channel,
       skipNetwork: true,
     });
   }, [selectVod]);
@@ -6683,6 +6690,7 @@ export default function App() {
                                   thumbnailUrl: v.thumbnail_url ?? undefined,
                                   createdAt: v.created_at ?? null,
                                   views: v.views ?? null,
+                                  channel: v.channel,
                                   skipNetwork: true,
                                 })}}
                                 onMouseEnter={() => {
@@ -6713,6 +6721,7 @@ export default function App() {
                                       thumbnailUrl: v.thumbnail_url ?? undefined,
                                       createdAt: v.created_at ?? null,
                                       views: v.views ?? null,
+                                      channel: v.channel,
                                       skipNetwork: true,
                                     });
                                   }
