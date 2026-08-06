@@ -37,6 +37,14 @@ os.environ["VODRIP_APP_DATA"] = str(_TMP / "VOD.RIP")
 # need the real auto-pick behavior delenv VODRIP_CACHE_DIR.
 os.environ.setdefault("VODRIP_CACHE_DIR", str(_TMP / "cache"))
 
+# Same for the data root (Settings > Storage data-disk pick): the auto
+# default resolves to the FASTEST real drive (fastest_disk -> PowerShell
+# probe), so without this pin any test touching data_dir()/preview_root()
+# would stall on a real probe and create dirs on a real data drive. Tests
+# that exercise the auto behavior delenv VODRIP_DATA_DIR and patch the
+# disk inventory (see test_disk_tiering.py).
+os.environ.setdefault("VODRIP_DATA_DIR", str(_TMP / "data"))
+
 # Snapshot of the REAL %APPDATA% archive.db taken here, before any test
 # module import can run the archive/cookie-store self-checks. The cookie
 # store's real file is the same archive.db (VODRIP_COOKIE_DB unset →

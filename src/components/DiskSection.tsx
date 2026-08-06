@@ -162,7 +162,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
           {cacheCustom ? <option value={cacheDir}>Custom ({cacheDir})</option> : null}
         </select>
         <span className="text-xs text-zinc-500 font-mono leading-relaxed">
-          whisper models, yt-dlp cache, preview temp &amp; embed models — applies on Save Settings (next launch)
+          whisper models, yt-dlp cache &amp; embed models — applies on Save Settings (next launch)
         </span>
 
         <FieldCaption noWrap>Transcripts &amp; Chat Data Disk</FieldCaption>
@@ -180,7 +180,9 @@ export default function DiskSection({ settings, setSettings }: Props) {
           ))}
           {dataCustom ? <option value={dataDir}>Custom ({dataDir})</option> : null}
         </select>
-        <span className="text-xs text-zinc-500 font-mono">Takes effect after restart (moves the database)</span>
+        <span className="text-xs text-zinc-500 font-mono">
+          transcripts, chat data &amp; preview cache — takes effect after restart (moves the database)
+        </span>
 
         <div className="flex items-center gap-2 pt-0.5 flex-wrap">
           <span className="text-xs text-zinc-500 font-mono">

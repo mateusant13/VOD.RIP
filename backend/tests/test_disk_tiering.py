@@ -139,7 +139,7 @@ def test_storage_layout_parses_powershell_payload(monkeypatch):
 
 def test_fastest_disk_rank_then_free(monkeypatch):
     monkeypatch.setattr(
-        disk,
+        disk_detect,
         "disk_inventory",
         lambda: [
             _inv("C", 10 * 1024**3, 2),   # SSD, 10 GB
@@ -147,50 +147,51 @@ def test_fastest_disk_rank_then_free(monkeypatch):
             _inv("I", 9 * 1024**3, 1),    # NVMe, 9 GB -> wins on rank
         ],
     )
-    assert disk.fastest_disk() == "I:\\"
+    assert disk_detect.fastest_disk() == "I:\\"
 
 
 def test_fastest_disk_tie_breaks_by_free(monkeypatch):
     monkeypatch.setattr(
-        disk,
+        disk_detect,
         "disk_inventory",
         lambda: [
             _inv("C", 10 * 1024**3, 1),
             _inv("I", 300 * 1024**3, 1),  # same rank, more free -> wins
         ],
     )
-    assert disk.fastest_disk() == "I:\\"
+    assert disk_detect.fastest_disk() == "I:\\"
 
 
 def test_fastest_disk_excludes_low_free(monkeypatch):
     monkeypatch.setattr(
-        disk,
+        disk_detect,
         "disk_inventory",
         lambda: [
             _inv("C", 1 * 1024**3, 1),   # NVMe but < 2 GB -> excluded
             _inv("D", 100 * 1024**3, 2),  # only usable candidate
         ],
     )
-    assert disk.fastest_disk() == "D:\\"
+    assert disk_detect.fastest_disk() == "D:\\"
 
 
 def test_fastest_disk_empty(monkeypatch):
-    monkeypatch.setattr(disk, "disk_inventory", lambda: [])
-    assert disk.fastest_disk() == ""
+    monkeypatch.setattr(disk_detect, "disk_inventory", lambda: [])
+    assert disk_detect.fastest_disk() == ""
 
 
 # --- /api/disks ------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_disks_route_response(client, monkeypatch):
-    monkeypatch.setattr(
-        disk,
-        "disk_inventory",
-        lambda: [
-            _inv("C", 90 * 1024**3, 1, media="NVMe", bus="NVMe"),
-            _inv("I", 344 * 1024**3, 1, media="NVMe", bus="NVMe"),
-        ],
-    )
+    # Patch both bindings: the route's drives list reads routers.disk's
+    # imported disk_inventory, while disk_detect.fastest_disk reads the
+    # disk_detect module-level name. Patch the router's biggest import too.
+    inv = [
+        _inv("C", 90 * 1024**3, 1, media="NVMe", bus="NVMe"),
+        _inv("I", 344 * 1024**3, 1, media="NVMe", bus="NVMe"),
+    ]
+    monkeypatch.setattr(disk, "disk_inventory", lambda: inv)
+    monkeypatch.setattr(disk_detect, "disk_inventory", lambda: inv)
     monkeypatch.setattr(disk, "biggest_fixed_drive", lambda: "I:\\")
     resp = await client.get("/api/disks")
     assert resp.status_code == 200
@@ -234,16 +235,68 @@ def test_data_dir_blank_env_falls_through(monkeypatch):
         assert disk_hygiene.data_dir() == Path("Y:\\settings-data")
 
 
-def test_data_dir_defaults_to_appdata(monkeypatch):
+def test_data_dir_auto_picks_fastest_drive(monkeypatch):
+    """Auto (no env, no setting) = fastest usable drive + VOD.RIP-data."""
     monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    monkeypatch.setattr(
+        disk_detect,
+        "disk_inventory",
+        lambda: [
+            _inv("C", 3 * 1024**3, 1),    # fast but nearly full
+            _inv("H", 90 * 1024**3, 1),   # same rank, more free -> wins
+            _inv("I", 320 * 1024**3, 3),  # HDD — rank loses
+        ],
+    )
+    with _patch_settings(""):
+        assert disk_hygiene.data_dir() == Path("H:\\VOD.RIP-data")
+
+
+def test_data_dir_auto_falls_back_to_appdata(monkeypatch):
+    """No usable drive -> app-data drive (historical default)."""
+    monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    monkeypatch.setattr(disk_detect, "disk_inventory", lambda: [])
     with _patch_settings(""):
         assert disk_hygiene.data_dir() == disk_hygiene._get_appdata_dir()
 
 
 def test_data_dir_none_setting_falls_back(monkeypatch):
     monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    monkeypatch.setattr(disk_detect, "disk_inventory", lambda: [])
     with _patch_settings(None):
         assert disk_hygiene.data_dir() == disk_hygiene._get_appdata_dir()
+
+
+def test_router_db_path_follows_data_dir(monkeypatch):
+    """Disk usage "Database" row must report the real db (data-disk root),
+    not the stale app-data copy (mirrors archive_db._db_path)."""
+    monkeypatch.delenv("VODRIP_ARCHIVE_DB", raising=False)
+    monkeypatch.setenv("VODRIP_DATA_DIR", "Z:\\data")
+    assert disk._db_path() == Path("Z:\\data") / "archive.db"
+    # The per-db env knob still wins (test/portable override).
+    monkeypatch.setenv("VODRIP_ARCHIVE_DB", "Q:\\override.db")
+    assert disk._db_path() == Path("Q:\\override.db")
+
+
+def test_data_dir_auto_pick_resolves_once(monkeypatch):
+    """The auto pick is cached per process: a later drive change must not
+    move the DB path mid-session (data disk takes effect after restart)."""
+    monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    calls = {"n": 0}
+
+    def inventory():
+        calls["n"] += 1
+        return [_inv("H", 90 * 1024**3, 1)]
+
+    monkeypatch.setattr(disk_detect, "disk_inventory", inventory)
+    with _patch_settings(""):
+        first = disk_hygiene.data_dir()
+        second = disk_hygiene.data_dir()
+    assert first == second == Path("H:\\VOD.RIP-data")
+    assert calls["n"] == 1, "fastest_disk must be probed exactly once"
 
 
 # --- settings persistence --------------------------------------------------

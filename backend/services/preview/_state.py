@@ -19,17 +19,15 @@ from urllib.parse import urlparse
 def preview_root() -> Path:
     """Root of the kd_preview temp/media cache.
 
-    Routed through the cache root (cache_dir setting -> biggest fixed drive)
-    when one exists; otherwise the historical TEMP location. Lazy (not a
-    module constant) so a cache_dir change is picked up at session-create
-    time and tests can pin it via VODRIP_CACHE_DIR / settings.
+    Routed through the data root (fastest usable drive) so live preview media
+    is read/written on quick storage; the data root itself defaults to the
+    fastest drive and falls back to the app-data drive when none exists. Lazy
+    (not a module constant) so a data_dir change is picked up at
+    session-create time and tests can pin it via VODRIP_DATA_DIR / settings.
     """
-    from services.settings import cache_root
+    from services.disk_hygiene import data_dir
 
-    root = cache_root()
-    if root is not None:
-        return root / "kd_preview"
-    return Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / "kd_preview"
+    return data_dir() / "kd_preview"
 
 
 # --- Resolved stream cache ---

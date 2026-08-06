@@ -109,7 +109,7 @@ async def update_settings(update: SettingsUpdate):
         # '' = auto (biggest fixed drive); any explicit path wins.
         current.cache_dir = update.cache_dir.strip()
     if update.data_dir is not None:
-        # '' = auto (%APPDATA%/VOD.RIP); any explicit path wins.
+        # '' = auto (fastest usable drive); any explicit path wins.
         current.data_dir = update.data_dir.strip()
     if update.oauth is not None:
         current.oauth = update.oauth

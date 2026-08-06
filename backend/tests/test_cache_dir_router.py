@@ -1,9 +1,10 @@
 """WS-8 cache-dir routing — /api/settings cache_dir round-trip, per-cache
-root routing (whisper / yt-dlp / preview / embed), env-override precedence,
-and the probe-file acceptance (a configured cache_dir receives new cache
-writes). Scratch env only: the shared settings manager is redirected to a
-tmp file and VODRIP_CACHE_DIR (pinned by conftest) is cleared where the
-setting itself must win. Real %APPDATA%/VOD.RIP is never touched.
+root routing (whisper / yt-dlp / embed; preview follows the DATA disk),
+env-override precedence, and the probe-file acceptance (a configured
+cache_dir receives new cache writes). Scratch env only: the shared settings
+manager is redirected to a tmp file and VODRIP_CACHE_DIR / VODRIP_DATA_DIR
+(pinned by conftest) are cleared where the setting itself must win. Real
+%APPDATA%/VOD.RIP is never touched.
 """
 
 from __future__ import annotations
@@ -90,11 +91,16 @@ async def test_ytdlp_cache_routed_through_cache_dir(client, tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_preview_root_routed_through_cache_dir(client, monkeypatch):
+async def test_preview_root_routed_through_data_dir(client, monkeypatch):
+    """Preview media is 'fetched quickly' data: kd_preview follows the data
+    disk (fastest), NOT the heavy cache disk (biggest free)."""
     monkeypatch.delenv("VODRIP_CACHE_DIR", raising=False)
-    resp = await client.post("/api/settings", json={"cache_dir": "D:/caches"})
+    monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
+    resp = await client.post(
+        "/api/settings", json={"cache_dir": "C:/heavy", "data_dir": "D:/data"}
+    )
     assert resp.status_code == 200
-    assert preview_root() == Path("D:/caches") / "kd_preview"
+    assert preview_root() == Path("D:/data") / "kd_preview"
 
 
 def test_embed_cache_routed_through_cache_dir(monkeypatch):

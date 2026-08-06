@@ -79,9 +79,9 @@ class AppSettings(BaseModel):
     # free space; an explicit path wins. VODRIP_CACHE_DIR env overrides both.
     cache_dir: str = ""
     # Data root for transcripts/chat (archive DB + WAL/SHM). '' = auto ->
-    # %APPDATA%/VOD.RIP (app-data drive); an explicit path wins (usually the
-    # fastest disk). VODRIP_DATA_DIR env overrides both. Takes effect after
-    # restart — the DB is moved by the relocation plumbing.
+    # the fastest usable drive (<fastest>\VOD.RIP-data); an explicit path
+    # wins. VODRIP_DATA_DIR env overrides both. Takes effect after restart —
+    # the DB is moved by the relocation plumbing.
     data_dir: str = ""
     oauth: str = ""
     youtube_cookies_file: str = ""

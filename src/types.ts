@@ -90,8 +90,8 @@ export interface AppSettings {
   /** Cache root for large on-disk caches ('' = auto -> biggest fixed drive). */
   cache_dir?: string;
   /** Transcripts/chat data root — archive DB lives here ('' = auto ->
-   * app-data drive; an explicit path wins, usually the fastest disk).
-   * Takes effect after restart (DB relocation). */
+   * fastest usable drive; an explicit path wins). Takes effect after
+   * restart (DB relocation). */
   data_dir?: string;
   oauth: string;
   youtube_cookies_file?: string;

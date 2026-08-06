@@ -98,7 +98,11 @@ describe("SettingsTab", () => {
     expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
     expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
     expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
-    expect(screen.getByText("Takes effect after restart (moves the database)")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "transcripts, chat data & preview cache — takes effect after restart (moves the database)",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("shows unsaved-changes chip on edit and clears it after save", async () => {
