@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["twitch-clips"])
 
 TWITCH_CLIP_MAX_SEC = 60
+TWITCH_CLIP_MIN_SEC = 5
 TWITCH_LOGIN_RE = re.compile(r"^[A-Za-z0-9_]{1,25}$")
 HISTORY_CAP = 200
 HISTORY_FILE = "twitch_clips.json"
@@ -113,11 +114,14 @@ async def create_twitch_clip(req: TwitchClipRequest) -> Dict[str, Any]:
                 status_code=422, detail="offset_sec required for VOD clips"
             )
         if req.duration_sec is None or not (
-            1 <= req.duration_sec <= TWITCH_CLIP_MAX_SEC
+            TWITCH_CLIP_MIN_SEC <= req.duration_sec <= TWITCH_CLIP_MAX_SEC
         ):
             raise HTTPException(
                 status_code=422,
-                detail=f"duration_sec must be 1..{TWITCH_CLIP_MAX_SEC}",
+                detail=(
+                    f"duration_sec must be "
+                    f"{TWITCH_CLIP_MIN_SEC}..{TWITCH_CLIP_MAX_SEC}"
+                ),
             )
         url = (
             f"{EDITOR_HOST}?vodID={req.vod_id}"

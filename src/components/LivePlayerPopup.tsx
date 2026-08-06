@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X, Clapperboard, AlertCircle } from 'lucide-react';
+import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X, AlertCircle } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { openTwitchClipEditor } from '../twitchClip';
+import TwitchLogoIcon from './TwitchLogoIcon';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
 import type { ArchiveSearchHit, ArchiveVideoRow } from '../archiveSearchUtils';
@@ -1206,8 +1207,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                         : 'Open Twitch clip editor for this live stream'
                     }
                   >
-                    {clipOpening ? <Loader2 size={15} className="animate-spin" /> : <Clapperboard size={15} />}
-                    <span className="text-[9px] font-bold tracking-wider">CLIP</span>
+                    {clipOpening ? <Loader2 size={15} className="animate-spin" /> : <TwitchLogoIcon size={14} />}
+                    <span className="text-[9px] font-bold uppercase tracking-wider">Twitch clip</span>
                   </button>
                 )}
                 <button

@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
+import { memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
@@ -7,9 +7,11 @@ import {
   Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical, Clapperboard,
+  GripVertical,
 } from 'lucide-react';
-import { openTwitchClipEditor, twitchClipDurationError } from './twitchClip';
+import { openTwitchClipEditor } from './twitchClip';
+import TwitchClipPopup from './components/TwitchClipPopup';
+import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import { buildArchiveVodUrl, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
@@ -448,6 +450,14 @@ export default function App() {
   /** Twitch clip editor open — transient notice shown in the transport row. */
   const [clipOpenNotice, setClipOpenNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [clipOpening, setClipOpening] = useState(false);
+  /** Twitch clip mini-preview (VOD path) — opened at the current playhead. */
+  const [twitchClipPopup, setTwitchClipPopup] = useState<{
+    url: string;
+    broadcasterLogin: string;
+    vodId: string;
+    playheadSec: number;
+    vodDurationSec: number;
+  } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const previewPlayheadRef = useRef<HTMLDivElement>(null);
@@ -675,6 +685,8 @@ export default function App() {
   /** Previous previewOpen, for the open→closed height-restore transition. */
   const prevPreviewOpenRef = useRef(previewOpen);
   const previewPanelRef = useRef<HTMLDivElement>(null);
+  const previewRowRef = useRef<HTMLDivElement>(null);
+  const previewColHRef = useRef(0);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
   const panelLayoutPersistReadyRef = useRef(false);
@@ -2888,6 +2900,48 @@ export default function App() {
     previewPlayback?.kind,
     syncPreviewPlaybackToViewport,
   ]);
+
+  // Height explosion guard: PreviewChatPanel's self-stretching column grows
+  // to the unbounded virtualized list (topPad/bottomPad spacers ~112k px for
+  // a long VOD), and in an auto-height flex row the chat's content height
+  // wins over the player column's explicit height — the whole preview card
+  // balloons and the chat fills the screen. Pin the row to the player
+  // column's content height (same fix as ChannelExplorePopup, 3a2b9d4); the
+  // chat's internal `flex-1 min-h-0 overflow-y-auto` then scrolls inside it.
+  useLayoutEffect(() => {
+    const row = previewRowRef.current;
+    const col = previewContainerRef.current;
+    if (!row || !col) return;
+    if (previewFullscreen) {
+      row.style.height = '';
+      return;
+    }
+    const h = col.offsetHeight;
+    if (h > 0) {
+      previewColHRef.current = h;
+      row.style.height = `${h}px`;
+    }
+  }, [previewFullscreen, previewOpen]);
+
+  // Keep the pin exact as the player column's content height changes (video
+  // aspect resolves, panel resize, viewport clamp). Re-attaches when the
+  // preview row mounts (App stays mounted; the row is conditional). Skipped
+  // while fullscreen so exiting fullscreen never flashes a viewport-tall row.
+  useEffect(() => {
+    const col = previewContainerRef.current;
+    if (!col || !previewOpen) return;
+    const ro = new ResizeObserver(() => {
+      if (previewFsActiveRef.current) return;
+      const row = previewRowRef.current;
+      const h = col.offsetHeight;
+      if (row && h > 0 && h !== previewColHRef.current) {
+        previewColHRef.current = h;
+        row.style.height = `${h}px`;
+      }
+    });
+    ro.observe(col);
+    return () => ro.disconnect();
+  }, [previewOpen]);
 
   const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || anyExploreVolumeMenuOpen;
 
@@ -5597,7 +5651,11 @@ export default function App() {
     clipOpenNoticeTimerRef.current = window.setTimeout(() => setClipOpenNotice(null), 4000);
   }, []);
 
-  /** Open Twitch's clip editor pre-positioned on the selected range. */
+  /**
+   * VOD: open the Twitch clip mini-preview at the playhead (±60s window, user
+   * trims there and creates the clip). Live: open the editor directly — no
+   * VOD timeline to select from.
+   */
   const openPreviewTwitchClip = useCallback(async () => {
     const login = (videoInfo?.channel || '').trim();
     if (!login) {
@@ -5608,33 +5666,31 @@ export default function App() {
       showClipOpenNotice('error', 'A clip can\u2019t be clipped');
       return;
     }
-    if (!isLive) {
-      const err = twitchClipDurationError(previewClipLengthSec);
-      if (err) {
-        showClipOpenNotice('error', err);
-        return;
+    if (isLive) {
+      setClipOpening(true);
+      try {
+        const res = await openTwitchClipEditor({ broadcasterLogin: login });
+        showClipOpenNotice('ok', `Twitch clip editor opened — ${res.url}`);
+      } catch {
+        showClipOpenNotice('error', 'Failed to open the Twitch clip editor');
+      } finally {
+        setClipOpening(false);
       }
+      return;
     }
-    const vodId = isLive ? undefined : (archiveVideoIdFromUrl(url) ?? undefined);
-    if (!isLive && !vodId) {
+    const vodId = archiveVideoIdFromUrl(url) ?? undefined;
+    if (!vodId) {
       showClipOpenNotice('error', 'Not a Twitch VOD URL');
       return;
     }
-    setClipOpening(true);
-    try {
-      const res = await openTwitchClipEditor({
-        broadcasterLogin: login,
-        vodId,
-        offsetSec: isLive ? undefined : Math.max(0, Math.floor(previewTrimEnd)),
-        durationSec: isLive ? undefined : Math.round(previewClipLengthSec),
-      });
-      showClipOpenNotice('ok', `Twitch clip editor opened — ${res.url}`);
-    } catch {
-      showClipOpenNotice('error', 'Failed to open the Twitch clip editor');
-    } finally {
-      setClipOpening(false);
-    }
-  }, [videoInfo?.channel, isLive, url, previewClipLengthSec, previewTrimEnd, showClipOpenNotice]);
+    setTwitchClipPopup({
+      url: url.trim(),
+      broadcasterLogin: login,
+      vodId,
+      playheadSec: previewTimeUi,
+      vodDurationSec,
+    });
+  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, showClipOpenNotice]);
 
   const previewClipPct = vodDurationSec > 0
     ? {
@@ -5817,11 +5873,11 @@ export default function App() {
                 ? 'Extract VOD info first to enable Twitch clip'
                 : isLive
                   ? 'Open Twitch clip editor for this live stream'
-                  : 'Open Twitch clip editor on the selected range (max 60s)'
+                  : 'Open the Twitch clip mini-preview at the playhead'
             }
           >
-            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <Clapperboard size={16} />}
-            <span className="text-[9px] font-bold tracking-wider">CLIP</span>
+            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} />}
+            <span className="text-[9px] font-bold uppercase tracking-wider">Twitch clip</span>
           </button>
         )}
         {isLive && (
@@ -5974,7 +6030,7 @@ export default function App() {
               </button>
             </div>
           </div>
-          <div className="flex flex-row gap-2 w-full min-h-0 items-stretch" data-preview-panel>
+          <div ref={previewRowRef} className="flex flex-row gap-2 w-full min-h-0 items-stretch" data-preview-panel>
             <div
               ref={previewContainerRef}
               tabIndex={0}
@@ -6900,6 +6956,19 @@ export default function App() {
         );
       })}
       <NeedleGlancePopup glance={needleGlance} vodDurationSec={vodDurationSec} />
+      {twitchClipPopup && (
+        <TwitchClipPopup
+          url={twitchClipPopup.url}
+          broadcasterLogin={twitchClipPopup.broadcasterLogin}
+          vodId={twitchClipPopup.vodId}
+          playheadSec={twitchClipPopup.playheadSec}
+          vodDurationSec={twitchClipPopup.vodDurationSec}
+          zIndex={EXPLORE_POPUP_Z + 200}
+          onClose={() => setTwitchClipPopup(null)}
+          onClipCreated={(editorUrl) =>
+            showClipOpenNotice('ok', `Twitch clip editor opened — ${editorUrl}`)}
+        />
+      )}
       {archiveSearchOpen && (
         <ArchiveSearchPopup
           zIndex={EXPLORE_POPUP_Z - 100}
