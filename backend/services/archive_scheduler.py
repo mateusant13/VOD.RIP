@@ -439,6 +439,48 @@ def _backfill_youtube_chat() -> None:
         spawned += 1
 
 
+# WS-4 original-title sweep: the manual channel-sync router backfills only
+# its own channel at limit=20, so scheduled passes left every pre-WS-4 row
+# English-translated forever. One daemon sweep thread at a time — the
+# backfill's global fetch throttle serializes anyway — restarted each pass
+# until every saved YouTube channel is drained.
+ORIG_TITLES_SWEEP_LIMIT = 100
+_orig_titles_lock = threading.Lock()
+_orig_titles_thread: Optional[threading.Thread] = None
+
+
+def _backfill_original_titles(channels: list) -> None:
+    global _orig_titles_thread
+    with _orig_titles_lock:
+        if _orig_titles_thread is not None and _orig_titles_thread.is_alive():
+            return  # previous sweep still running — this pass skips
+        _orig_titles_thread = threading.Thread(
+            target=_orig_titles_worker, args=(channels,), daemon=True,
+            name="orig-titles-sweep",
+        )
+        _orig_titles_thread.start()
+
+
+def _orig_titles_worker(channels: list) -> None:
+    from services.archive_ytdlp import backfill_original_titles
+
+    slugs = {(ch.get("youtubeSlug") or "").strip().lower() for ch in channels}
+    slugs.discard("")
+    # Rows archived from a search or under a renamed slug have no saved
+    # channel entry (e.g. 'Lu Bu' vs slug 'lubumr') — sweep every DB
+    # channel too; lower() dedupes the case variants ('gaveta'/'Gaveta').
+    for r in archive_db.query(
+        "SELECT DISTINCT lower(channel) AS slug FROM videos WHERE platform='youtube'"
+    ):
+        if r["slug"]:
+            slugs.add(r["slug"])
+    for slug in slugs:
+        try:
+            backfill_original_titles(slug, limit=ORIG_TITLES_SWEEP_LIMIT)
+        except Exception as exc:  # noqa: BLE001 — one bad channel never blocks the rest
+            logger.debug("orig-title sweep failed for %s: %s", slug, exc)
+
+
 def _enqueue_transcriptions() -> None:
     rows = list(
         archive_db.query(
@@ -500,6 +542,7 @@ def _run_pass() -> None:
         _ingest_youtube(ch)
     _backfill_twitch_chat(channels)
     _backfill_youtube_chat()
+    _backfill_original_titles(channels)
     _enqueue_transcriptions()
 
 

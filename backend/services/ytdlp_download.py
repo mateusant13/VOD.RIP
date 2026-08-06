@@ -239,6 +239,44 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                 formats = list(by_key.values())
         except Exception as exc:
             logger.debug("YouTube quality enrichment failed: %s", exc)
+    # WS-4: prefer the archived original title over the en-serving yt-dlp
+    # copy (the walk stores hl=en translations). Archived row = instant DB
+    # read; otherwise one cheap hl-free InnerTube player fetch, persisted so
+    # the next lookup is a read. Language guard mirrors the backfill: pt
+    # (serving) → the fetched copy is the original; en → the yt-dlp copy IS
+    # the original, just recorded; anything else → left alone.
+    if platform == "YouTube" or re.match(r"^[a-zA-Z0-9_-]{11}$", full_url.strip()):
+        try:
+            from services.youtube_innertube import extract_video_id, innertube_original_meta
+            from services import archive_db
+
+            vid = extract_video_id(full_url)
+            row = None
+            if vid:
+                rows = archive_db.query(
+                    "SELECT original_title, original_language FROM videos"
+                    " WHERE platform='youtube' AND video_id=?",
+                    (vid,),
+                )
+                row = rows[0] if rows else None
+            original_title = str(row["original_title"] or "") if row else ""
+            if not original_title and vid:
+                meta = innertube_original_meta(vid)
+                if meta and meta.get("title") and meta.get("language") in ("pt", "en"):
+                    original_title = (
+                        meta["title"] if meta["language"] == "pt"
+                        else str(info.get("title") or "")
+                    )
+                    try:
+                        archive_db.set_original_title(
+                            "youtube", vid, original_title or None, meta["language"],
+                        )
+                    except Exception:
+                        pass
+            if original_title:
+                info["title"] = original_title
+        except Exception as exc:
+            logger.debug("original-title preference failed: %s", exc)
     qualities = _qualities_from_formats(formats, is_clip_url(full_url))
 
     created_at = info.get("created_at") or info.get("upload_date")

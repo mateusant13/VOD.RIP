@@ -1013,7 +1013,8 @@ async def _run_original_backfill(channel: str) -> None:
         from services.archive_ytdlp import backfill_original_titles
 
         await asyncio.get_running_loop().run_in_executor(
-            CHANNEL_EXECUTOR, backfill_original_titles, channel
+            CHANNEL_EXECUTOR,
+            functools.partial(backfill_original_titles, channel, limit=100),
         )
     except Exception as exc:
         logger.debug("original-title backfill failed for %s: %s", channel, exc)

@@ -1027,7 +1027,7 @@ def videos_missing_original_title(platform: str, channel: str, limit: int) -> li
     its own throttle + failure cooldown on top."""
     rows = query(
         """SELECT video_id, title FROM videos
-           WHERE platform = ? AND channel = ? AND (original_title IS NULL OR original_title = '')
+           WHERE platform = ? AND lower(channel) = lower(?) AND (original_title IS NULL OR original_title = '')
            ORDER BY started_at DESC LIMIT ?""",
         (platform, channel, max(1, int(limit))),
     )
