@@ -1351,6 +1351,63 @@ def chat_for(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def count_messages(platform: str, video_id: str) -> int:
+    """Total chat rows for one video (cheap COUNT over the video index)."""
+    return int(
+        query(
+            "SELECT COUNT(*) n FROM messages WHERE platform = ? AND video_id = ?",
+            (platform, video_id),
+        )[0]["n"]
+    )
+
+
+# Bounded preview-panel chat window (WS-2): while a Twitch backfill runs the
+# panel polls every ~2.5 s and must not re-serialize the whole growing
+# archive. Row-based (not seconds) so dense chat is not cut by a time span.
+_PANEL_CHAT_SLICE_ROWS = 4000
+
+
+def chat_slice_for(
+    platform: str,
+    video_id: str,
+    offset_sec: Optional[float],
+    slice_rows: int = _PANEL_CHAT_SLICE_ROWS,
+) -> tuple[list[dict], int]:
+    """Bounded preview-panel chat window around *offset_sec*, time-ordered.
+
+    Returns (rows, total_rows) — total_rows is the full message count and
+    the returned slice is only a window of it. The window is
+    ±slice_rows/2 rows around the first row at/after *offset_sec* (None →
+    the head of the timeline), so the panel's ±150-row render + binary
+    search stay exact while responses stay bounded. The
+    (platform, video_id, offset_sec) index serves every query."""
+    total = count_messages(platform, video_id)
+    if total == 0:
+        return [], 0
+    half = max(1, slice_rows // 2)
+    if offset_sec is None:
+        anchor = 0
+    else:
+        anchor = min(
+            int(
+                query(
+                    "SELECT COUNT(*) n FROM messages "
+                    "WHERE platform = ? AND video_id = ? AND offset_sec < ?",
+                    (platform, video_id, float(offset_sec)),
+                )[0]["n"]
+            ),
+            total - 1,
+        )
+    start = max(0, anchor - half)
+    take = min(total - start, slice_rows)
+    rows = query(
+        "SELECT offset_sec, text, username, spam_count, color FROM messages "
+        "WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ? OFFSET ?",
+        (platform, video_id, take, start),
+    )
+    return [dict(r) for r in rows], total
+
+
 # --- transcripts ----------------------------------------------------------
 
 def _normalize_lang(lang: Any) -> Optional[str]:
@@ -3569,6 +3626,18 @@ assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in
 _selfcheck_chat, _selfcheck_truncated = chat_window(_selfcheck_platform, _selfcheck_video, 1.0)
 assert len(_selfcheck_chat) == 1
 assert _selfcheck_truncated is False
+# Bounded panel slice: playhead-centered window + honest total row count.
+_sc_slice, _sc_total = chat_slice_for(_selfcheck_platform, _selfcheck_video, 0.5)
+assert _sc_total == 1
+assert [r["offset_sec"] for r in _sc_slice] == [1.0]
+_sc_slice_head, _sc_total_head = chat_slice_for(_selfcheck_platform, _selfcheck_video, None)
+assert _sc_total_head == 1
+assert [r["offset_sec"] for r in _sc_slice_head] == [1.0]
+# Playhead past the last row clamps to the tail instead of returning nothing.
+_sc_slice_tail, _sc_total_tail = chat_slice_for(_selfcheck_platform, _selfcheck_video, 999.0)
+assert _sc_total_tail == 1
+assert [r["offset_sec"] for r in _sc_slice_tail] == [1.0]
+assert count_messages(_selfcheck_platform, _selfcheck_video) == 1
 insert_transcript(
     _selfcheck_platform,
     _selfcheck_video,

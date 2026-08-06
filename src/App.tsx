@@ -6101,6 +6101,9 @@ export default function App() {
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
               hidden={previewFullscreen}
+              // Gates only the URL-only live-captions fetch (video-first);
+              // the archive payload starts at session-create so the Twitch
+              // chat backfill kicks off before canplay.
               started={previewVideoReady}
               // Reserve the player's layout minimum: the chat panel may never
               // eat into it, whatever the user's stored panel width says.

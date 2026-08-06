@@ -1844,6 +1844,9 @@ export default function ChannelExplorePopup({
               videoId={vod.videoId ?? null}
               currentTime={currentTime}
               defaultOpen={false}
+              // Gates only the URL-only live-captions fetch (video-first);
+              // the archive payload starts at session-create so the Twitch
+              // chat backfill kicks off before canplay.
               started={ready}
               onLayoutChange={setChatInfo}
             />

@@ -107,6 +107,7 @@ async def test_panel_transcript_video_strict_shape_and_order():
     payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT)
     assert set(payload.keys()) == {
         "transcript", "chat", "events", "has_transcript", "has_chat",
+        "backfill", "backfill_progress", "total_rows", "chat_truncated",
     }
     assert payload["has_transcript"] is True
     assert payload["has_chat"] is True
@@ -175,6 +176,10 @@ async def test_panel_missing_video_empty_state():
         "events": [],
         "has_transcript": False,
         "has_chat": False,
+        "backfill": "idle",
+        "backfill_progress": 0.0,
+        "total_rows": 0,
+        "chat_truncated": False,
     }
 
 
@@ -193,6 +198,7 @@ async def test_panel_http_surface():
         body = resp.json()
         assert set(body.keys()) == {
             "transcript", "chat", "events", "has_transcript", "has_chat",
+            "backfill", "backfill_progress", "total_rows", "chat_truncated",
         }
         assert body["has_chat"] is True and body["has_transcript"] is False
         assert len(body["chat"]) == 5

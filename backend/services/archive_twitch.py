@@ -30,7 +30,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from services import archive_db
 from services import twitch_gql_service
@@ -255,12 +255,115 @@ def _post_comments_page(video_id: str, offset_sec: int, page_size: int) -> List[
     return [edge.get("node") for edge in edges if edge.get("node")]
 
 
+def _backfill_outward(
+    vid: str,
+    seed_offset_sec: float,
+    max_messages: int,
+    page_size: int,
+    progress_cb: Optional[Callable[[float], None]],
+) -> tuple[float, int, int, int]:
+    """Playhead-first sweep for the preview backfill (Chatterino-style).
+
+    Order: (1) one forward page at the seed — the playhead's immediate
+    future lands first; (2) a backward walk below the lowest stored offset
+    with an exponentially-widening (span-adaptive) stride — near-playhead
+    past next, then expanding; (3) the plain forward continuation from the
+    deepest stored offset. Returns (last_seen, inserted, pages,
+    backoff_retries).
+
+    The backward phase only ever requests offsets below the lowest stored
+    row and drops nodes at/above it (they are the forward phase's job), so
+    re-runs stay idempotent and no row is inserted twice. Same 100/page
+    pages and PAGE_DELAY_SEC pacing as the forward sweep — the ordering
+    buys latency, not rate-limit headroom."""
+    inserted = 0
+    pages = 0
+    backoff_retries = 0
+    seed = max(0.0, float(seed_offset_sec))
+
+    # Phase 1 — seed page: what the viewer is about to see, in ~1 s.
+    nodes, backoff_retries = _fetch_page_with_backoff(vid, seed, page_size, backoff_retries)
+    pages += 1
+    if nodes:
+        row = archive_db.query(
+            "SELECT MAX(offset_sec) m FROM messages "
+            "WHERE platform='twitch' AND video_id=?",
+            (vid,),
+        )
+        hi0 = float(row[0]["m"] or -1.0)
+        new = [
+            n for n in nodes
+            if float(n.get("contentOffsetSeconds") or 0.0) > hi0
+        ]
+        if new:
+            archive_db.insert_messages("twitch", vid, [_message_row(n) for n in new])
+            inserted += len(new)
+            if progress_cb is not None:
+                progress_cb(inserted / max_messages)
+
+    # Phase 2 — backward walk from the lowest stored offset down to 0.
+    row = archive_db.query(
+        "SELECT MIN(offset_sec) lo FROM messages "
+        "WHERE platform='twitch' AND video_id=?",
+        (vid,),
+    )
+    lo = float(row[0]["lo"] or seed)
+    stride = 1.0
+    while lo > 0 and inserted < max_messages:
+        target = max(0.0, lo - stride)
+        nodes, backoff_retries = _fetch_page_with_backoff(
+            vid, target, page_size, backoff_retries
+        )
+        pages += 1
+        if not nodes:
+            break  # nothing at/below target — backward sweep is done
+        span = 0.0
+        if len(nodes) >= 2:
+            span = float(nodes[-1].get("contentOffsetSeconds") or 0.0) - float(
+                nodes[0].get("contentOffsetSeconds") or 0.0
+            )
+        new = [
+            n for n in nodes
+            if float(n.get("contentOffsetSeconds") or 0.0) < lo
+        ]
+        if new:
+            rows = [_message_row(n) for n in new]
+            archive_db.insert_messages("twitch", vid, rows)
+            inserted += len(rows)
+            lo = min(float(n.get("contentOffsetSeconds") or 0.0) for n in new)
+            if len(rows) < page_size // 2:
+                # Sparse chat or a page dominated by already-stored territory:
+                # leap by the page's chat span so each page still yields
+                # ~page_size new rows instead of re-probing the same window.
+                stride = max(stride * 2.0, span)
+            if target <= 0.0:
+                break  # reached the first message — nothing exists below it
+            if progress_cb is not None:
+                progress_cb(inserted / max_messages)
+        else:
+            if target <= 0.0:
+                break  # page at 0 all already-stored → [0, lo) is empty
+            stride = max(stride * 2.0, span)
+        time.sleep(PAGE_DELAY_SEC)
+
+    # Phase 3 — forward continuation from the deepest stored offset (the
+    # seed page may have spilled past it), preserving re-run seeding.
+    row = archive_db.query(
+        "SELECT MAX(offset_sec) hi FROM messages "
+        "WHERE platform='twitch' AND video_id=?",
+        (vid,),
+    )
+    return float(row[0]["hi"] or seed), inserted, pages, backoff_retries
+
+
 def backfill_chat(
     channel: str,
     video_id: str,
     *,
     max_messages: int = 200,
     page_size: int = PAGE_SIZE,
+    seed_offset_sec: Optional[float] = None,
+    progress_cb: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Backfill chat for one Twitch VOD into the archive.
 
@@ -269,6 +372,12 @@ def backfill_chat(
     or below the last seen offset — the API clamps its window to the tail),
     or when a hard error escapes the 429 backoff loop. One archive_jobs row
     (kind 'chat_backfill') tracks the run.
+
+    With *seed_offset_sec* the sweep starts at that playhead and pages
+    OUTWARD (backward below the seed first, then forward from the deepest
+    stored offset — see _backfill_outward); without it the sweep is the
+    plain incremental forward run from MAX(offset_sec). *progress_cb*
+    (inserted / max_messages) fires after every stored page.
 
     Backoff on 429: 1s → double → cap 30s; after BACKOFF_MAX_ATTEMPTS the
     _RateLimited is re-raised so the caller can schedule a retry later.
@@ -318,6 +427,17 @@ def backfill_chat(
         # Chat already covers the whole stream (re-run or trailing error
         # after end-of-chat) — nothing left to fetch.
         return _finish()
+    if seed_offset_sec is not None:
+        # Preview kick: seed at the client's playhead (Chatterino-style) so
+        # near-playhead messages arrive in the first pages. Re-runs anchor
+        # on the stored range either way.
+        last_seen, inserted, pages, backoff_retries = _backfill_outward(
+            vid,
+            max(0.0, float(seed_offset_sec)),
+            max_messages,
+            page_size,
+            progress_cb,
+        )
     try:
         while inserted < max_messages:
             nodes, backoff_retries = _fetch_page_with_backoff(vid, last_seen, page_size, backoff_retries)
@@ -334,6 +454,8 @@ def backfill_chat(
             if rows:
                 archive_db.insert_messages("twitch", vid, rows)
                 inserted += len(rows)
+                if progress_cb is not None:
+                    progress_cb(inserted / max_messages)
             else:
                 # Whole page was dups: window clamped at the chat tail → end.
                 break
