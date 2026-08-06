@@ -106,6 +106,37 @@ def _platform_enabled(channel: dict, platform: str) -> bool:
         return True
 
 
+def _order_channels(channels: list, prio: set[tuple[str, str]]) -> list:
+    """Stable priority-first ordering of the saved-channel list.
+
+    Channels inside their top-priority window (just added, or the user
+    viewing their page — see archive_db.mark_channel_priority) sort ahead
+    of the older backlog; everything else keeps its saved order. Applied
+    once per pass, so the YouTube per-pass budget and the backfill legs
+    both consume priority channels first. Pure — the caller supplies the
+    priority set, which keeps the self-check DB-free."""
+    if not prio:
+        return channels
+
+    def _is_prio(ch: dict) -> bool:
+        for platform, key in (
+            ("twitch", ch.get("twitchSlug")),
+            ("kick", ch.get("kickSlug")),
+            ("youtube", ch.get("youtubeSlug")),
+        ):
+            slug = (key or "").strip().lower()
+            if slug and (platform, slug) in prio:
+                return True
+        return False
+
+    return sorted(channels, key=lambda ch: not _is_prio(ch))
+
+
+def _ordered_channels(channels: list) -> list:
+    """_order_channels fed with the live priority set from the DB."""
+    return _order_channels(channels, archive_db.priority_channel_keys())
+
+
 def _ingest_twitch(channel: dict) -> None:
     if not _platform_enabled(channel, "twitch"):
         return
@@ -257,9 +288,13 @@ def _backfill_twitch_chat(channels: list) -> None:
     # stored offset), so a mid-fetch 'service error' leaves partial chat
     # that the re-run completes instead of skipping forever.
     ph = ",".join("?" * len(slugs))
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = list(
         archive_db.query(
             """SELECT v.video_id, v.channel, v.started_at FROM videos v
+               LEFT JOIN channel_priorities cp
+                 ON cp.platform='twitch' AND cp.channel_key=lower(v.channel)
+                  AND cp.priority_until > ?
                WHERE v.platform='twitch'
                  AND v.video_id GLOB '[0-9]*'
                  AND lower(v.channel) IN (%s)
@@ -268,9 +303,9 @@ def _backfill_twitch_chat(channels: list) -> None:
                  AND NOT EXISTS (SELECT 1 FROM archive_jobs j
                                  WHERE j.kind='chat_backfill' AND j.platform='twitch'
                                    AND j.video_id=v.video_id AND j.status='done')
-               ORDER BY v.started_at ASC"""
+               ORDER BY (cp.priority_until IS NOT NULL) DESC, v.started_at ASC"""
             % ph,
-            tuple(slugs),
+            (now_iso,) + tuple(slugs),
         )
     )
     now_utc = datetime.now(timezone.utc)
@@ -352,18 +387,23 @@ def _backfill_youtube_chat() -> None:
         free = TWITCH_BACKFILL_MAX_INFLIGHT - len(_backfill_inflight)
     if free <= 0:
         return
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = list(
         archive_db.query(
-            """SELECT video_id FROM videos
-               WHERE platform='youtube'
-                 AND kind='stream'
-                 AND video_id NOT LIKE 'youtube-live-%'
+            """SELECT videos.video_id FROM videos
+               LEFT JOIN channel_priorities cp
+                 ON cp.platform='youtube' AND cp.channel_key=lower(videos.channel)
+                  AND cp.priority_until > ?
+               WHERE videos.platform='youtube'
+                 AND videos.kind='stream'
+                 AND videos.video_id NOT LIKE 'youtube-live-%'
                  AND NOT EXISTS (SELECT 1 FROM messages m
                                  WHERE m.platform='youtube' AND m.video_id=videos.video_id)
                  AND NOT EXISTS (SELECT 1 FROM archive_jobs j
                                  WHERE j.kind='chat_backfill' AND j.platform='youtube'
                                    AND j.video_id=videos.video_id AND j.status='done')
-               ORDER BY started_at ASC"""
+               ORDER BY (cp.priority_until IS NOT NULL) DESC, videos.started_at ASC""",
+            (now_iso,),
         )
     )
     now_utc = datetime.now(timezone.utc)
@@ -447,6 +487,13 @@ def _run_pass() -> None:
     channels = _channels()
     if not channels:
         return
+    # Lazy housekeeping: drop expired priority windows so the table never
+    # grows and the next read of the live set is exact.
+    try:
+        archive_db.expire_channel_priorities()
+    except Exception:  # noqa: BLE001 — pruning must never break a pass
+        logger.debug("channel priority prune failed", exc_info=True)
+    channels = _ordered_channels(channels)
     for ch in channels:
         _ingest_twitch(ch)
         _ingest_kick(ch)
@@ -509,3 +556,25 @@ assert _video_id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1") == 
 assert _video_id_from_url("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 assert _VIDEO_ID_RE.fullmatch("dQw4w9WgXcQ")
 assert not _VIDEO_ID_RE.fullmatch("dQw4w9WgX")
+# Top-priority ordering: a channel inside its priority window leads the
+# pass; expired/unrelated priorities leave the saved order untouched.
+assert _order_channels(
+    [
+        {"id": "backlog-1", "twitchSlug": "oldchan"},
+        {"id": "hot", "twitchSlug": "newchan"},
+        {"id": "backlog-2", "twitchSlug": "zoldchan"},
+    ],
+    {("twitch", "newchan")},
+)[0]["id"] == "hot", "priority channel must lead the pass"
+assert [c["id"] for c in _order_channels(
+    [
+        {"id": "backlog-1", "twitchSlug": "oldchan"},
+        {"id": "hot", "twitchSlug": "newchan", "kickSlug": "newchan"},
+        {"id": "backlog-2", "twitchSlug": "zoldchan"},
+    ],
+    {("kick", "newchan")},
+)] == ["hot", "backlog-1", "backlog-2"], "kick priority must reorder the list"
+assert [c["id"] for c in _order_channels(
+    [{"id": "a", "kickSlug": "x"}, {"id": "b", "kickSlug": "y"}],
+    {("twitch", "x")},  # expired/mismatched platform — no longer priority
+)] == ["a", "b"], "expired or platform-mismatched priority must not reorder"

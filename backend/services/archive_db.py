@@ -222,6 +222,18 @@ CREATE TABLE IF NOT EXISTS channel_snapshots (
   PRIMARY KEY (platform, channel_key)
 );
 
+-- Archive-scheduler top-priority windows: a channel marked here (newly
+-- added, or the user viewing its page) is processed ahead of the queued
+-- older backlog until priority_until (ISO UTC) expires — bounded, so the
+-- backlog can never starve permanently. channel_key is lowercased so the
+-- scheduler's lower(channel) joins match YouTube @Handles too.
+CREATE TABLE IF NOT EXISTS channel_priorities (
+  platform       TEXT NOT NULL CHECK (platform IN ('youtube','twitch','kick')),
+  channel_key    TEXT NOT NULL,
+  priority_until TEXT NOT NULL,
+  PRIMARY KEY (platform, channel_key)
+);
+
 -- Worker liveness: the transcribe worker stamps a heartbeat every poll
 -- iteration; search enrichment checks worker_live() before enqueueing jobs
 -- so the honest 'Indexing…' line never sits on a queue nobody consumes.
@@ -846,6 +858,55 @@ def channel_snapshot_age_sec(platform: str, channel_key: str) -> Optional[float]
         return None
     age = (datetime.now(timezone.utc) - fetched).total_seconds()
     return max(0.0, age)
+
+
+# --- scheduler top-priority windows --------------------------------------
+
+# Default window a channel stays top-priority after being added or viewed.
+# 30 min at the scheduler's 180 s pass cadence = ~10 passes — enough for a
+# fresh channel's first ingests without starving the older backlog forever.
+PRIORITY_WINDOW_S = 1800.0
+
+
+def mark_channel_priority(
+    platform: str, channel_key: str, *, window_s: float = PRIORITY_WINDOW_S
+) -> None:
+    """Top-priority this channel for the archive scheduler until now+window_s.
+
+    The key is lowercased to match the scheduler's lower(channel) joins.
+    Upsert semantics: repeat marks (repeated page views) extend the window."""
+    key = (channel_key or "").strip().lower()
+    if not key or platform not in PLATFORMS:
+        return
+    from datetime import datetime, timedelta, timezone
+
+    until = (datetime.now(timezone.utc) + timedelta(seconds=window_s)).isoformat(
+        timespec="seconds"
+    )
+    execute(
+        """INSERT INTO channel_priorities (platform, channel_key, priority_until)
+           VALUES (?, ?, ?)
+           ON CONFLICT(platform, channel_key) DO UPDATE SET
+             priority_until=excluded.priority_until""",
+        (platform, key, until),
+    )
+
+
+def priority_channel_keys() -> set[tuple[str, str]]:
+    """(platform, channel_key) pairs still inside their priority window."""
+    now = _now_iso()
+    rows = query(
+        "SELECT platform, channel_key FROM channel_priorities WHERE priority_until > ?",
+        (now,),
+    )
+    return {(r["platform"], r["channel_key"]) for r in rows}
+
+
+def expire_channel_priorities() -> int:
+    """Drop expired priority rows (lazy housekeeping); returns count removed."""
+    now = _now_iso()
+    cur = execute("DELETE FROM channel_priorities WHERE priority_until <= ?", (now,))
+    return cur.rowcount
 
 
 def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -> list[dict]:

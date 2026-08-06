@@ -29,6 +29,7 @@ from deps import (
 from services.archive_db import (
     channel_snapshot_age_sec,
     list_videos,
+    mark_channel_priority,
     query,
     touch_channel_snapshot,
     upsert_channel_video,
@@ -342,6 +343,22 @@ async def channel_videos(
         twitch_ch = (twitch_login or default_slug).strip().lower()
         youtube_ch = (youtube_slug or default_slug).strip()
         channel = kick_ch or twitch_ch or youtube_ch
+        # User-opened channel page (the channel browse UI calls this on
+        # expand/refresh) — top-priority the resolved platform slugs so the
+        # archive scheduler processes this channel ahead of the backlog.
+        # Deliberately BEFORE the cache lookup: a cached page open is still
+        # the user viewing the channel. The dashboard's passive
+        # /api/channels/*/live badge poll never lands here.
+        for _p, _slug in (
+            ("kick", kick_ch),
+            ("twitch", twitch_ch),
+            ("youtube", youtube_ch),
+        ):
+            if (_slug or "").strip():
+                try:
+                    mark_channel_priority(_p, _slug)
+                except Exception:  # noqa: BLE001 — marking must never fail the fetch
+                    logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         wanted = parse_wanted_platforms(platforms)
         content_norm = (content or "").strip().lower()
         force_refresh = force == "1"
@@ -862,6 +879,18 @@ async def channel_clips(
         if not kick_ch and not twitch_ch and not youtube_ch:
             raise ValueError("Provide url, kick_slug, twitch_login, or youtube_slug")
         channel = kick_ch or twitch_ch or youtube_ch
+        # Same user-view signal as /api/channel/videos (the browse UI's clips
+        # tab) — top-priority the resolved slugs before any cache return.
+        for _p, _slug in (
+            ("kick", kick_ch),
+            ("twitch", twitch_ch),
+            ("youtube", youtube_ch),
+        ):
+            if (_slug or "").strip():
+                try:
+                    mark_channel_priority(_p, _slug)
+                except Exception:  # noqa: BLE001 — marking must never fail the fetch
+                    logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         wanted = parse_wanted_platforms(platforms)
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
         days_norm = max(0, min(int(days), 365))

@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["settings"])
 
 
+def _prioritize_new_channels(old: list, new: list) -> None:
+    """Top-priority the archive scheduler for channels that were just added.
+
+    The FE saves the whole saved_channels list on every change (debounced),
+    so a fresh channel is one whose id was not in the previous list. Marking
+    happens before the swap so its first ingest passes skip the older
+    backlog; edit/removal of existing ids leaves their priority untouched.
+    """
+    old_ids = {str(c.get("id") or "") for c in (old or [])}
+    fresh = [
+        c for c in (new or [])
+        if str(c.get("id") or "") and str(c.get("id")) not in old_ids
+    ]
+    if not fresh:
+        return
+    try:
+        from services.archive_db import mark_channel_priority
+
+        for ch in fresh:
+            for platform, key in (
+                ("twitch", ch.get("twitchSlug")),
+                ("kick", ch.get("kickSlug")),
+                ("youtube", ch.get("youtubeSlug")),
+            ):
+                if (key or "").strip():
+                    mark_channel_priority(platform, key)
+    except Exception:  # noqa: BLE001 — priority marking must never fail the save
+        logger.debug("channel priority mark skipped", exc_info=True)
+
+
 @router.get("/api/settings", response_model=AppSettings)
 async def get_settings():
     return settings_mgr.get()
@@ -111,6 +141,7 @@ async def update_settings(update: SettingsUpdate):
     if update.window_geometry is not None:
         current.window_geometry = update.window_geometry
     if update.saved_channels is not None:
+        _prioritize_new_channels(current.saved_channels, update.saved_channels)
         current.saved_channels = update.saved_channels
         # A channel was added/edited/removed — wake the archive scheduler
         # so indexing for the new channel starts immediately instead of
