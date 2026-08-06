@@ -261,87 +261,74 @@ def _find_browser(name: str) -> Optional[Path]:
     return Path(shutil.which(name)) if shutil.which(name) else None
 
 
-def _activate_extension_tab() -> Optional[tuple[str, str]]:
-    """Put the extensions manager in front of the user's browser.
+def _drive_extension_tab() -> Optional[tuple[str, str]]:
+    """Open the extensions manager in a NEW tab of a RUNNING browser.
 
-    Runs scripts/focus_extension_tab.ps1, which first reuses an already-open
-    extensions tab (UIA TabItem select + window raise — no CDP), and if none
-    is open, drives the active tab by keystroke (Ctrl+L -> paste -> Enter)
-    into the topmost running browser window. The keystroke path exists
-    because a running Chrome silently drops chrome:// URLs handed off through
-    its process singleton (http(s) forward fine, chrome:// die), so spawning
-    chrome.exe with the URL only works when no browser is running yet.
+    Runs scripts/open_extension_new_tab.ps1, which drives the frontmost
+    Chromium window with keystrokes: new tab first (Ctrl+T), then navigate
+    that tab (Ctrl+L -> paste -> Enter). A command-line launch cannot be used
+    while the browser runs: chrome:// URLs are dropped by the
+    process-singleton handoff and leave a stray blank tab (http(s) forward
+    fine, chrome:// die). Keystrokes land in a brand-new tab, so the user's
+    active tab is never touched.
 
-    Returns ("reused", None) when an existing tab was focused,
-    (browser_name, url) when a tab was driven, ("none", None) when no browser
-    is running at all (caller may spawn a fresh instance), or ("blocked",
-    None) when a browser is running but its window could not be driven —
-    spawning into a running browser would only produce a stray new-tab page,
-    never the URL.
+    Returns (browser_name, url) when the new tab was driven, ("none", None)
+    when no browser is running at all (caller may spawn a fresh instance), or
+    ("blocked", None) when a browser runs but its window could not be driven.
     """
-    script = Path(__file__).resolve().parent.parent / "scripts" / "focus_extension_tab.ps1"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "open_extension_new_tab.ps1"
     if not script.is_file():
         return None
-    for attempt in range(2):  # one retry: the first drive may lose a focus race
-        try:
-            proc = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(script),
-                ],
-                capture_output=True,
-                timeout=25,
-            )
-            if proc.returncode == 0:
-                return ("reused", None)
-            if proc.returncode == 2:
-                browser = (proc.stdout or b"").decode("utf-8", "replace").strip().lower()
-                url = _EXT_MANAGER_URLS.get(browser)
-                if url:
-                    return (browser, url)
-                return ("blocked", None)
-            if proc.returncode == 1:
-                return ("none", None)
-            # returncode 3 (or anything else): browser runs but unusable
-            if attempt == 0 and proc.returncode == 3:
-                continue
-            return ("blocked", None)
-        except (OSError, subprocess.SubprocessError):
-            return ("blocked", None)
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            timeout=25,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ("blocked", None)
+    browser = (proc.stdout or b"").decode("utf-8", "replace").strip().lower()
+    if proc.returncode == 0 and browser in _EXT_MANAGER_URLS:
+        return (browser, _EXT_MANAGER_URLS[browser])
+    if proc.returncode == 1:
+        return ("none", None)
     return ("blocked", None)
 
 
 def _open_extension_manager() -> dict:
-    """Activate the extensions-manager tab: reuse an already-open one, else
-    drive the active tab of a running browser, else launch a fresh browser
-    instance with the URL (safe only when no browser is running — a running
-    instance drops the chrome:// URL and leaves a stray new-tab page)."""
-    activated = _activate_extension_tab()
-    if activated:
-        outcome, payload = activated
-        if outcome == "reused":
-            return {"launched": True, "browser": None, "url": None, "reused": True}
+    """Open the browser's extensions manager in a NEW tab, always.
+
+    When a Chromium browser is running, drive it with keystrokes (new tab
+    first, then navigate — the active tab is never touched); when none is
+    running, spawn a fresh instance with the URL, which opens directly because
+    there is no process singleton to drop it. This always targets the user's
+    real browser exe — the app's own WebView2 cookie store is never involved.
+    """
+    driven = _drive_extension_tab()
+    if driven:
+        outcome, payload = driven
         if outcome == "blocked":
-            return {"launched": False, "browser": None, "url": None, "reused": False, "blocked": True}
-        if outcome != "none":  # (browser, url): the active tab was driven
-            return {"launched": True, "browser": outcome, "url": payload, "reused": False}
-    # outcome "none" or a missing script: no browser process at all — spawning
-    # chrome.exe with the URL works because a fresh instance opens it directly.
+            return {"launched": False, "browser": None, "url": None, "blocked": True}
+        if outcome != "none":
+            return {"launched": True, "browser": outcome, "url": payload}
     for name, url in _EXT_MANAGER_URLS.items():
         path = _find_browser(name)
         if not path:
             continue
         try:
             subprocess.Popen([str(path), url])
-            return {"launched": True, "browser": name, "url": url, "reused": False}
+            return {"launched": True, "browser": name, "url": url}
         except OSError as exc:
             logger.debug("cookie extension manager launch failed (%s): %s", name, exc)
-    return {"launched": False, "browser": None, "url": None, "reused": False}
+    return {"launched": False, "browser": None, "url": None}
 
 
 @router.get("/api/session/cookies/extension/update.xml")
@@ -408,7 +395,7 @@ async def session_cookies_extension_source():
 
 @router.post("/api/session/cookies/extension/open")
 async def session_cookies_extension_open():
-    """Best-effort: open the browser's extensions manager (chrome://extensions)."""
+    """Open chrome://extensions in a NEW tab of the user's browser (never the active tab)."""
     return _open_extension_manager()
 
 
