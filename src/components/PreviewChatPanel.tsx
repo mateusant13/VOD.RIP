@@ -116,6 +116,10 @@ interface PreviewChatPanelProps {
   currentTime: number;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
+  /** Initial open state. The explore popup opens collapsed (small strip)
+   *  so the mini preview stays player-sized by default; the main preview
+   *  keeps the panel open. */
+  defaultOpen?: boolean;
   /** Cap on the rendered width. The host reserves player space so the video
    *  never drops below its layout minimum; below PANEL_MIN_W there is no room
    *  at all and the panel collapses to zero width (no strip). Defaults to the
@@ -269,10 +273,11 @@ export function PreviewChatPanel({
   videoId,
   currentTime,
   hidden = false,
+  defaultOpen = true,
   maxWidth: maxWidthProp,
   onLayoutChange,
 }: PreviewChatPanelProps) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(defaultOpen);
   const [tab, setTab] = useState<PreviewPanelTab>('chat');
   const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
   const [payload, setPayload] = useState<PreviewPanelPayload | null>(null);
@@ -630,7 +635,15 @@ export function PreviewChatPanel({
         <button
           type="button"
           data-preview-chat-panel-collapsed
-          onClick={() => setOpen(true)}
+          onClick={() => {
+            // Re-arm playback follow when opening from the collapsed strip:
+            // the effect guards on activeIdx changing, so a panel opened
+            // mid-playback at an unchanged index must still jump to the
+            // row under the playhead.
+            prevActiveIdxRef.current = null;
+            followRef.current = true;
+            setOpen(true);
+          }}
           className="w-7 h-full flex flex-col items-center justify-center gap-1.5 border-l-2 border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-white hover:bg-zinc-900"
           title={subtitlesOnly ? 'Open preview subtitles' : 'Open preview chat panel'}
         >
