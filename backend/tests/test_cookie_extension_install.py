@@ -106,122 +106,69 @@ def test_find_browser_prefers_program_files(monkeypatch, tmp_path):
     assert _find_browser("definitely-not-a-browser") is None
 
 
-def test_open_extension_manager_launches_chrome(monkeypatch):
+def _fake_run(returncode: int, stdout: str = ""):
+    return lambda cmd, **kwargs: type("R", (), {"returncode": returncode, "stdout": stdout.encode()})
+
+
+def test_open_extension_manager_drives_new_tab(monkeypatch):
     from routers import cookie_bridge as cb
 
-    fake = type("FakePath", (), {"__str__": lambda self: "C:/chrome.exe"})()
-    monkeypatch.setattr(cb, "_find_browser", lambda name: fake if name == "chrome" else None)
-    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: None)
-    launched = {}
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(0, "chrome\n"))
     with patch.object(subprocess, "Popen") as popen:
         res = _open_extension_manager()
-    assert res["launched"] is True
-    assert res["browser"] == "chrome"
-    assert res["url"] == "chrome://extensions/"
-    assert res["reused"] is False
+    assert res == {"launched": True, "browser": "chrome", "url": "chrome://extensions/"}
+    # the ps1 drives the running browser — no process spawn here
+    popen.assert_not_called()
+
+
+def test_open_extension_manager_spawns_fresh_instance_when_none_running(monkeypatch):
+    from routers import cookie_bridge as cb
+
+    fake = type("FakePath", (), {"__str__": lambda self: "C:/Program Files/Google/Chrome/Application/chrome.exe"})()
+    monkeypatch.setattr(cb, "_find_browser", lambda name: fake if name == "chrome" else None)
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(1, "none\n"))
+    with patch.object(subprocess, "Popen") as popen:
+        res = _open_extension_manager()
+    assert res == {"launched": True, "browser": "chrome", "url": "chrome://extensions/"}
+    # no singleton to drop the URL when nothing is running — plain spawn opens it
+    assert popen.call_args.args[0] == ["C:/Program Files/Google/Chrome/Application/chrome.exe", "chrome://extensions/"]
     popen.assert_called_once()
 
 
-def test_open_extension_manager_reuses_open_tab(monkeypatch):
+def test_open_extension_manager_blocked_when_drive_fails(monkeypatch):
     from routers import cookie_bridge as cb
 
-    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: ("reused", None))
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(2, "chrome\n"))
     with patch.object(subprocess, "Popen") as popen:
         res = _open_extension_manager()
-    assert res["launched"] is True
-    assert res["reused"] is True
-    assert res["url"] is None
+    assert res == {"launched": False, "browser": None, "url": None, "blocked": True}
     popen.assert_not_called()
 
 
-def test_open_extension_manager_drives_running_browser(monkeypatch):
+def test_open_extension_manager_falls_through_to_next_browser(monkeypatch):
     from routers import cookie_bridge as cb
 
-    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: ("chrome", "chrome://extensions/"))
-    with patch.object(subprocess, "Popen") as popen:
+    paths = {"chrome": "C:/chrome.exe", "msedge": "C:/msedge.exe"}
+    monkeypatch.setattr(cb, "_find_browser", lambda name: paths.get(name))
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(1, "none\n"))
+    launched = []
+
+    def fake_popen(cmd, **kwargs):
+        if cmd[0] == "C:/chrome.exe":
+            raise OSError("boom")
+        launched.append(cmd)
+        return object()
+
+    with patch.object(subprocess, "Popen", side_effect=fake_popen) as popen:
         res = _open_extension_manager()
-    assert res["launched"] is True
-    assert res["reused"] is False
-    assert res["browser"] == "chrome"
-    assert res["url"] == "chrome://extensions/"
-    popen.assert_not_called()
+    assert res == {"launched": True, "browser": "msedge", "url": "edge://extensions/"}
+    assert launched == [["C:/msedge.exe", "edge://extensions/"]]
 
 
 def test_open_extension_manager_no_browser_returns_false(monkeypatch):
     from routers import cookie_bridge as cb
 
     monkeypatch.setattr(cb, "_find_browser", lambda name: None)
-    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: None)
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(1, "none\n"))
     res = _open_extension_manager()
-    assert res["launched"] is False
-    assert res["url"] is None
-    assert res["reused"] is False
-
-
-def test_activate_extension_tab_runs_bundled_script(monkeypatch, tmp_path):
-    from routers import cookie_bridge as cb
-
-    # The bundled ps1 must exist — it is the whole point of the helper.
-    script = Path(__file__).resolve().parent.parent / "scripts" / "focus_extension_tab.ps1"
-    assert script.is_file()
-
-    calls = {}
-    def fake_run(cmd, **kwargs):
-        calls["cmd"] = cmd
-        calls["timeout"] = kwargs.get("timeout")
-        return type("R", (), {"returncode": 0, "stdout": b""})()
-    monkeypatch.setattr(cb.subprocess, "run", fake_run)
-    assert cb._activate_extension_tab() == ("reused", None)
-    assert calls["cmd"][-2:] == ["-File", str(script)]
-    assert calls["timeout"] == 25
-
-    # exit 2 = the active tab was driven in the reported browser
-    monkeypatch.setattr(cb.subprocess, "run",
-                        lambda cmd, **kwargs: type("R", (), {"returncode": 2, "stdout": b"chrome\n"})())
-    assert cb._activate_extension_tab() == ("chrome", "chrome://extensions/")
-
-    # unknown browser on drive -> unusable, caller must not spawn
-    monkeypatch.setattr(cb.subprocess, "run",
-                        lambda cmd, **kwargs: type("R", (), {"returncode": 2, "stdout": b"weird\n"})())
-    assert cb._activate_extension_tab() == ("blocked", None)
-
-    # exit 1 = no browser running at all -> fresh spawn is safe
-    def fake_run_fail(cmd, **kwargs):
-        return type("R", (), {"returncode": 1, "stdout": b""})()
-    monkeypatch.setattr(cb.subprocess, "run", fake_run_fail)
-    assert cb._activate_extension_tab() == ("none", None)
-
-    # exit 3 = browser running but undrivable -> blocked, NEVER spawn
-    monkeypatch.setattr(cb.subprocess, "run",
-                        lambda cmd, **kwargs: type("R", (), {"returncode": 3, "stdout": b""})())
-    assert cb._activate_extension_tab() == ("blocked", None)
-
-    # a transient exit-3 is retried once before giving up
-    seq = [type("R", (), {"returncode": 3, "stdout": b""})(),
-           type("R", (), {"returncode": 2, "stdout": b"chrome\n"})()]
-    monkeypatch.setattr(cb.subprocess, "run", lambda cmd, **kwargs: seq.pop(0))
-    assert cb._activate_extension_tab() == ("chrome", "chrome://extensions/")
-
-    monkeypatch.setattr(cb.subprocess, "run", lambda cmd, **kwargs: (_ for _ in ()).throw(OSError()))
-    assert cb._activate_extension_tab() == ("blocked", None)
-
-
-def test_open_extension_manager_never_spawns_into_running_browser(monkeypatch):
-    from routers import cookie_bridge as cb
-
-    # Browser running but undrivable: the button must report failure instead
-    # of spawning chrome.exe (which yields a stray new-tab page, never the URL).
-    monkeypatch.setattr(cb, "_find_browser", lambda name: "C:/chrome.exe" if name == "chrome" else None)
-    monkeypatch.setattr(cb, "_activate_extension_tab", lambda: ("blocked", None))
-    with patch.object(subprocess, "Popen") as popen:
-        res = _open_extension_manager()
-    assert res["launched"] is False
-    assert res["url"] is None
-    popen.assert_not_called()
-
-
-def test_activate_extension_tab_missing_script_returns_none(monkeypatch, tmp_path):
-    from routers import cookie_bridge as cb
-
-    monkeypatch.setattr(Path, "is_file", lambda self: False)
-    assert cb._activate_extension_tab() is None
+    assert res == {"launched": False, "browser": None, "url": None}

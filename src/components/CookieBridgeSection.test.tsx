@@ -75,13 +75,25 @@ describe('CookieBridgeSection extension install flow', () => {
     expect(screen.queryByText(/no new tab opened/)).not.toBeInTheDocument();
   });
 
-  it('reports when the already-open Extensions tab was focused instead', async () => {
+  it('ignores a stale reused hint from an old backend response', async () => {
+    // Backend now ALWAYS opens a new tab — this test guards that the hint
+    // never appears even if a stale response carries `reused: true`.
     mockFetch({ open: { launched: true, browser: null, url: null, reused: true } });
     render(<CookieBridgeSection />);
     await screen.findByText('Open extensions');
     fireEvent.click(screen.getByText('Open extensions'));
-    await screen.findByText(/no new tab opened/);
-    expect(screen.getByText(/Drop the VOD.RIP-cookies folder onto the page/)).toBeTruthy();
+    await screen.findByText(/Drop the VOD.RIP-cookies folder onto the page/);
+    expect(screen.queryByText(/no new tab opened/)).not.toBeInTheDocument();
+  });
+
+  it('blocked drive surfaces the could-not-focus manual hint', async () => {
+    const { calls } = mockFetch({ open: { launched: false, browser: null, url: null, blocked: true } });
+    render(<CookieBridgeSection />);
+    await screen.findByText('Open extensions');
+    fireEvent.click(screen.getByText('Open extensions'));
+    await waitFor(() => expect(calls.some((c) => c.includes('/extension/open'))).toBe(true));
+    await screen.findByText(/Browser window could not be focused/);
+    expect(screen.queryByText(/No Chromium browser found/)).not.toBeInTheDocument();
   });
 
   it('one click opens extensions AND reveals the folder', async () => {

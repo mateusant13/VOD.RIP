@@ -38,9 +38,7 @@ interface OpenResult {
   launched: boolean;
   browser: string | null;
   url: string | null;
-  /** True when an already-open Extensions tab was focused instead of a new tab. */
-  reused?: boolean;
-  /** True when a browser runs but its window could not be driven safely. */
+  /** True when a browser runs but its window could not be driven. */
   blocked?: boolean;
 }
 
@@ -69,7 +67,6 @@ export default function CookieBridgeSection({
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(false);
   const [opened, setOpened] = useState(false);
-  const [reused, setReused] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -120,17 +117,15 @@ export default function CookieBridgeSection({
     if (opening) return;
     setOpening(true);
     setError(null);
-    // Open the browser tab FIRST, then reveal the folder. Firing reveal in
-    // parallel pops an Explorer window that steals focus mid-drive and can
-    // misdirect the Ctrl+L/paste/Enter sequence into another app. Each
-    // failure is handled independently — a failed reveal must not block the
-    // checklist, a failed open keeps the existing manual-install hint.
+    // Open the browser tab FIRST, then reveal the folder — the new tab lands
+    // focused and the Explorer window pops behind it. Each failure is handled
+    // independently — a failed reveal must not block the checklist, a failed
+    // open keeps the existing manual-install hint.
     const openRes = await apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null);
     if (openRes === null) {
       setError('Could not reach the backend to open the browser tab.');
     } else {
       setOpened(openRes.launched);
-      setReused(Boolean(openRes.reused));
       if (!openRes.launched) {
         setError(
           openRes.blocked
@@ -265,11 +260,6 @@ export default function CookieBridgeSection({
           </p>
           {opened ? (
             <>
-              {reused ? (
-                <p className="text-xs text-emerald-400 font-mono">
-                  Focused the already-open Extensions tab — no new tab opened.
-                </p>
-              ) : null}
               <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
                 <li>
                   Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
