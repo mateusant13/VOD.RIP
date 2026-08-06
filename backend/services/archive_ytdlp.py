@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from services import archive_db
+from services.chat_sinks.yt_live import _base_usec_from_info
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 from services.ytdlp_guard import guarded_youtube_dl, guarded_youtube_dl_channel
 
@@ -289,12 +290,16 @@ def _iso_from_usec(usec: Any) -> Optional[str]:
         return None
 
 
-def _parse_live_chat(text: str) -> list[dict]:
+def _parse_live_chat(text: str, base_usec: Optional[float] = None) -> list[dict]:
     """NDJSON from yt-dlp's .live_chat.json -> archive message rows.
 
     Rows: {offset_sec, user_id, username, text, badges, emotes, ts, color}.
     offset_sec = replay fragment videoOffsetTimeMsec/1000 (stream-relative);
-    falls back to wall-clock timestampUsec/1e6 when the fragment lacks one.
+    fragments that lack it (the live-captured early phase) fall back to
+    (timestampUsec - base_usec)/1e6 against the stream start. Rows with
+    neither anchor are skipped — a raw wall-clock epoch is never a
+    VOD-relative offset (it would land a 1.7e9-second row in the middle of
+    the chat timeline and break the panel's time mapping).
     """
     rows: list[dict] = []
     for line in text.splitlines():
@@ -328,8 +333,10 @@ def _parse_live_chat(text: str) -> list[dict]:
             usec = renderer.get("timestampUsec")
             if frag_ms is not None:
                 offset = float(frag_ms) / 1000.0
+            elif base_usec is not None and usec is not None:
+                offset = (float(usec) - base_usec) / 1e6
             else:
-                offset = float(usec or 0) / 1e6
+                continue  # no anchor — cannot produce a VOD-relative offset
             badges = [
                 b.get("liveChatAuthorBadgeRenderer", {}).get("tooltip", "")
                 for b in (renderer.get("authorBadges") or [])
@@ -600,7 +607,10 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
                             chat_file = Path(sub)
                             break
                     if chat_file and chat_file.is_file():
-                        rows = _parse_live_chat(chat_file.read_text(encoding="utf-8"))
+                        rows = _parse_live_chat(
+                            chat_file.read_text(encoding="utf-8"),
+                            base_usec=_base_usec_from_info(info),
+                        )
                         if rows:
                             _db_write(archive_db.insert_messages, PLATFORM, video_id, rows)
                             report["chat_messages"] = len(rows)
@@ -907,6 +917,20 @@ assert _rows[0]["text"] == "oi titi"
 assert _rows[0]["badges"] == ["Owner"]
 assert _rows[0]["emotes"] == [{"id": "x1", "text": ":titi:"}]
 assert _rows[0]["ts"] == "2026-07-30T23:22:17+00:00"
+
+# No videoOffsetTimeMsec: anchored against the stream start (base_usec)…
+_lc_no_frag = (
+    '{"replayChatItemAction": {"actions": ['
+    '{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {'
+    '"message": {"runs": [{"text": "sem offset"}]}, '
+    '"authorName": {"simpleText": "@ancla"}, "timestampUsec": "1785453743783005"'
+    '}}}}]}}\n'
+)
+_rows2 = _parse_live_chat(_lc_no_frag, base_usec=1785453737783005)
+assert len(_rows2) == 1, _rows2
+assert abs(_rows2[0]["offset_sec"] - 6.0) < 1e-9, _rows2[0]["offset_sec"]
+# …and SKIPPED when no anchor exists (an epoch wall-clock is never an offset).
+assert _parse_live_chat(_lc_no_frag) == []
 
 _json3_sample = (
     '{"events": ['
