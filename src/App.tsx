@@ -523,6 +523,10 @@ export default function App() {
     url: string;
     session: PreviewSessionResponse;
   } | null>(null);
+  /** URL of the last VOD clicked in a list — auto-opens the main preview once its info loads. */
+  const autoOpenPreviewPendingRef = useRef<string | null>(null);
+  /** Bumped on every list-VOD click so re-clicking the already-active VOD re-fires the auto-open effect. */
+  const [autoOpenPreviewTick, setAutoOpenPreviewTick] = useState(0);
   const previewTimingRef = useRef<PreviewTiming | null>(null);
   const previewSeekDebounceRef = useRef<number | null>(null);
   const previewPlaybackKindRef = useRef<'hls' | 'progressive'>('progressive');
@@ -1646,6 +1650,27 @@ export default function App() {
       return false;
     }
   }, [url, trimEndSec, trimStartSec, vodDurationSec, previewSessionId, destroyPreviewPlayer, videoInfo, videoInfo?.qualities, videoInfo?.title]);
+
+  // List-VOD click → main preview. selectVod records the clicked URL; once the
+  // info fetch for it lands (and the video gate passes — the same conditions
+  // that enable the WATCH PREVIEW button), open the preview. The pending flag
+  // drops only when the user moves on to a different URL — NOT when the info
+  // for the clicked URL is missing: a superseded fetch's finally{} clears
+  // `loading` before the newest fetch lands, so dropping on videoInfoUrl
+  // mismatch there would strand the newest click.
+  useEffect(() => {
+    const pendingUrl = autoOpenPreviewPendingRef.current;
+    if (!pendingUrl) return;
+    if (url.trim() !== pendingUrl) {
+      autoOpenPreviewPendingRef.current = null;
+      return;
+    }
+    if (loading) return; // info fetch still in flight
+    if (videoInfoUrl !== pendingUrl) return; // fetch failed or still running — wait
+    autoOpenPreviewPendingRef.current = null;
+    if (vodDurationSec <= 0 || trimEndSec <= trimStartSec) return;
+    void openPreview();
+  }, [loading, videoInfoUrl, url, vodDurationSec, trimEndSec, trimStartSec, openPreview, autoOpenPreviewTick]);
 
   /**
    * RETRY button for the failing media only. First click re-runs just the
@@ -5122,12 +5147,19 @@ export default function App() {
     badge?: ChannelPreviewBadge,
     hint?: FetchVideoInfoHint,
   ) => {
+    autoOpenPreviewPendingRef.current = vodUrl.trim();
+    setAutoOpenPreviewTick((t) => t + 1);
     setUrl(vodUrl);
     setChannelVodPanelOpen(true);
     setUrlTabBarHidden(true);
     setPreviewChannelBadge(badge ?? null);
     void fetchVideoInfo(vodUrl, hint);
   }, [fetchVideoInfo]);
+
+  /** History-row click → same flow as a channel-list pick (auto-opens the preview). */
+  const handleOpenVodFromHistory = useCallback((vodUrl: string) => {
+    selectVod(vodUrl);
+  }, [selectVod]);
 
   const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
     selectVod(vod.url, {
@@ -5541,22 +5573,32 @@ export default function App() {
             warmYoutubePreview(trimmed);
           }
         }}
-        onClick={openPreview}
+        onClick={() => {
+          if (previewOpen) {
+            void resetPreview();
+          } else {
+            void openPreview();
+          }
+        }}
         disabled={
-          previewVideoLoading
-          || loading
-          || vodDurationSec <= 0
-          || trimEndSec <= trimStartSec
-          || (url.trim() !== '' && videoInfoUrl !== url.trim())
+          previewOpen
+            ? false
+            : (previewVideoLoading
+              || loading
+              || vodDurationSec <= 0
+              || trimEndSec <= trimStartSec
+              || (url.trim() !== '' && videoInfoUrl !== url.trim()))
         }
         className={`flex-1 min-h-0 ${platformWatchPreviewBtn(urlActionPlatform, previewOpen)} disabled:opacity-40`}
       >
         {previewVideoLoading ? (
           <Loader2 size={12} className="animate-spin shrink-0" />
+        ) : previewOpen ? (
+          <X size={12} className="shrink-0" />
         ) : (
           <Play size={12} fill="currentColor" className="shrink-0" />
         )}
-        Watch preview
+        {previewOpen ? 'Close preview' : 'Watch preview'}
       </button>
       <button
         onClick={promptStartDownload}
@@ -6870,6 +6912,7 @@ export default function App() {
             onToggleRecentSelection={toggleRecentSelection}
             onBulkDeleteRecent={handleBulkDeleteRecent}
             onWatchLocal={openLocalFilePreview}
+            onOpenVod={handleOpenVodFromHistory}
           />
         )}
 

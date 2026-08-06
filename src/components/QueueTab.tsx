@@ -34,6 +34,8 @@ type Props = {
   onToggleRecentSelection?: (id: string) => void;
   onBulkDeleteRecent?: () => void;
   onWatchLocal?: (dl: DownloadState) => void;
+  /** Click a history row's title to open that VOD in the main preview (URL tab). */
+  onOpenVod?: (url: string) => void;
 };
 
 export default function QueueTab({
@@ -58,6 +60,7 @@ export default function QueueTab({
   onToggleRecentSelection,
   onBulkDeleteRecent,
   onWatchLocal,
+  onOpenVod,
 }: Props) {
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
@@ -275,9 +278,20 @@ export default function QueueTab({
                     ) : (
                       <PlatformVodIcon platform={dl.platform} className="w-4 h-4" />
                     )}
-                    <span className="text-xs font-mono text-zinc-300 truncate">
-                      {dl.title || dl.url}
-                    </span>
+                    {onOpenVod ? (
+                      <button
+                        type="button"
+                        onClick={() => onOpenVod(dl.url)}
+                        title="Open preview for this VOD"
+                        className="text-xs font-mono text-zinc-300 truncate min-w-0 text-left hover:text-white cursor-pointer"
+                      >
+                        {dl.title || dl.url}
+                      </button>
+                    ) : (
+                      <span className="text-xs font-mono text-zinc-300 truncate">
+                        {dl.title || dl.url}
+                      </span>
+                    )}
                   </div>
                   <span className="text-[10px] font-mono shrink-0 text-[#53fc18]">{dl.status}</span>
                 </div>

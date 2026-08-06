@@ -65,6 +65,27 @@ describe('QueueTab', () => {
     expect(handlers.onOpenFolder).toHaveBeenCalledWith('C:\\VODs\\A.mp4');
   });
 
+  it('clicking a history row title opens that VOD via onOpenVod', () => {
+    const onOpenVod = vi.fn();
+    render(
+      <QueueTab
+        queueDownloads={[]}
+        historyDownloads={[DL({ download_id: 'dl-7', title: 'VOD H', url: 'https://www.twitch.tv/videos/7', status: 'Completed' })]}
+        onPause={() => {}}
+        onResume={() => {}}
+        onCancel={() => {}}
+        onDelete={() => {}}
+        onDeleteHistory={() => {}}
+        onOpenFolder={() => {}}
+        onRefresh={() => {}}
+        basename={(p) => p}
+        onOpenVod={onOpenVod}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'VOD H' }));
+    expect(onOpenVod).toHaveBeenCalledWith('https://www.twitch.tv/videos/7');
+  });
+
   it('playable history row offers a watch button that fires onWatchLocal', () => {
     const onWatchLocal = vi.fn();
     render(
