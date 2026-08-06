@@ -181,9 +181,11 @@ export default function ChannelExplorePopup({
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
   /** Chat-history column alongside the video; the panel reports its footprint.
    *  The container grows to panelWidth + footprint so the video never shrinks
-   *  when the chat opens. */
+   *  when the chat opens. The explore popup starts collapsed (strip only) so
+   *  the mini preview is player-sized by default; the main preview keeps the
+   *  chat open. */
   const [chatInfo, setChatInfo] = useState<{ open: boolean; width: number }>(() => ({
-    open: true,
+    open: false,
     width: readPreviewChatPanelWidth(),
   }));
   const chatTotalRef = useRef(0);
@@ -251,6 +253,15 @@ export default function ChannelExplorePopup({
   const posRef = useRef<PanelPos | null>(null);
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
   const videoWrapRef = useRef<HTMLDivElement>(null);
+  /** Player column (video + chrome + optional archive-search dock). Its
+   *  content height bounds the row, so the self-stretching chat column can
+   *  never inflate the popup to the unbounded chat list height (~112k px). */
+  const playerColRef = useRef<HTMLDivElement>(null);
+  const playerRowRef = useRef<HTMLDivElement>(null);
+  const fullscreenRef = useRef(false);
+  fullscreenRef.current = fullscreen;
+  /** Pinned row height (px); 0 = pre-measure (row auto-sized for one frame). */
+  const playerColHRef = useRef(0);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
   const seekDebounceRef = useRef<number | null>(null);
   const playbackKindRef = useRef<'hls' | 'progressive'>('progressive');
@@ -265,6 +276,49 @@ export default function ChannelExplorePopup({
   useEffect(() => {
     playbackKindRef.current = playback?.kind ?? 'progressive';
   }, [playback?.kind]);
+
+  // Height explosion guard: the row's height is content-driven and
+  // PreviewChatPanel's `self-stretch` column grows to the unbounded
+  // virtualized chat list (~112k px for a long VOD → whole popup becomes an
+  // invisible overlay). Pin the row to the player column's content height.
+  // `items-start` on the row keeps the video column at its natural content
+  // height (never squeezed), while the chat panel's `self-stretch` re-engages
+  // and matches the pinned row exactly. Direct style writes (not state) so the
+  // position layout effect below reads the pinned height in the same commit.
+  useLayoutEffect(() => {
+    const row = playerRowRef.current;
+    const col = playerColRef.current;
+    if (!row || !col) return;
+    if (fullscreen) {
+      row.style.height = '';
+      return;
+    }
+    const h = col.offsetHeight;
+    if (h > 0) {
+      playerColHRef.current = h;
+      row.style.height = `${h}px`;
+    }
+  }, [fullscreen]);
+
+  // Keep the pin exact as the column's content height changes (video aspect
+  // resolves, chat opens/narrows the video, archive-search dock toggles,
+  // viewport resize). Skipped while fullscreen so exiting fullscreen never
+  // flashes a viewport-tall row.
+  useEffect(() => {
+    const col = playerColRef.current;
+    if (!col) return;
+    const ro = new ResizeObserver(() => {
+      if (fullscreenRef.current) return;
+      const row = playerRowRef.current;
+      const h = col.offsetHeight;
+      if (row && h > 0 && h !== playerColHRef.current) {
+        playerColHRef.current = h;
+        row.style.height = `${h}px`;
+      }
+    });
+    ro.observe(col);
+    return () => ro.disconnect();
+  }, []);
 
   // vaft midroll rotation — inert unless the player is a Twitch live session
   // (only Twitch live playlists contain 'stitched' segments). The backend
@@ -1592,8 +1646,17 @@ export default function ChannelExplorePopup({
             </div>
           </div>
         )}
-        <div className={fullscreen ? 'relative flex flex-col gap-0 min-w-0 flex-1 min-h-0 w-full' : 'flex flex-row gap-2 min-w-0 min-h-0'}>
-          <div className={`relative flex flex-col ${fullscreen ? 'h-full min-h-0 gap-0 w-full' : 'gap-2 min-w-0 flex-1'}`}>
+        <div
+          ref={playerRowRef}
+          // Height is pinned by the height-explosion guard via direct style
+          // write (see useLayoutEffect above) so the chat column self-stretches
+          // to exactly the player column height.
+          className={fullscreen ? 'relative flex flex-col gap-0 min-w-0 flex-1 min-h-0 w-full' : 'flex flex-row gap-2 min-w-0 min-h-0 items-start'}
+        >
+          <div
+            ref={playerColRef}
+            className={`relative flex flex-col ${fullscreen ? 'h-full min-h-0 gap-0 w-full' : 'gap-2 min-w-0 flex-1'}`}
+          >
         <div
           ref={videoWrapRef}
           className={`relative bg-black overflow-hidden w-full cursor-pointer ${
@@ -1780,6 +1843,7 @@ export default function ChannelExplorePopup({
               platform={platform}
               videoId={vod.videoId ?? null}
               currentTime={currentTime}
+              defaultOpen={false}
               onLayoutChange={setChatInfo}
             />
           )}
