@@ -3,8 +3,8 @@
 # Version fields track backend/services/_version.py (single source of truth).
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 0, 52, 0),
-        prodvers=(1, 0, 52, 0),
+        filevers=(1, 0, 53, 0),
+        prodvers=(1, 0, 53, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "VOD.RIP"),
                         StringStruct("FileDescription", "VOD.RIP — Kick & Twitch VOD downloader"),
-                        StringStruct("FileVersion", "1.0.52.0"),
+                        StringStruct("FileVersion", "1.0.53.0"),
                         StringStruct("InternalName", "VOD.RIP"),
                         StringStruct("LegalCopyright", "Copyright (c) mateusant13"),
                         StringStruct("OriginalFilename", "VOD-RIP.EXE"),
                         StringStruct("ProductName", "VOD.RIP"),
-                        StringStruct("ProductVersion", "1.0.52.0"),
+                        StringStruct("ProductVersion", "1.0.53.0"),
                     ],
                 )
             ]
