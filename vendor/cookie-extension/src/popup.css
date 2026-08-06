@@ -20,6 +20,13 @@ h1 {
   text-align: center;
 }
 
+h1 > img.header-icon {
+  height: 1em;
+  width: 1em;
+  vertical-align: -0.15em;
+  margin-right: 0.3em;
+}
+
 h1 > a#location {
   color: #3153ee;
 }

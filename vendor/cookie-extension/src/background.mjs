@@ -19,13 +19,19 @@ const updateBadgeCounter = async () => {
     chrome.action.setBadgeText({ tabId, text: '' });
     return;
   }
-  const url = new URL(urlString);
-  const cookies = await getAllCookies({
-    url: url.href,
-    partitionKey: { topLevelSite: url.origin },
-  });
-  const text = cookies.length.toFixed();
-  chrome.action.setBadgeText({ tabId, text });
+  try {
+    const url = new URL(urlString);
+    const cookies = await getAllCookies({
+      url: url.href,
+      partitionKey: { topLevelSite: url.origin },
+    });
+    const text = cookies.length.toFixed();
+    chrome.action.setBadgeText({ tabId, text });
+  } catch {
+    // host permission not granted for this tab (only youtube/twitch/kick) —
+    // the badge stays as-is; activeTab covers the popup's own read.
+    chrome.action.setBadgeText({ tabId, text: '' });
+  }
 };
 
 chrome.cookies.onChanged.addListener(updateBadgeCounter);
@@ -87,10 +93,9 @@ chrome.runtime.onInstalled.addListener(({ previousVersion, reason }) => {
     const currentVersion = chrome.runtime.getManifest().version;
     chrome.notifications.create('updated', {
       type: 'basic',
-      title: 'Get cookies.txt LOCALLY',
+      title: 'VOD RIP Get Cookies',
       message: `Updated from ${previousVersion} to ${currentVersion}`,
       iconUrl: '/images/icon128.png',
-      buttons: [{ title: 'Github Releases' }, { title: 'Uninstall' }],
     });
   }
 });
@@ -99,25 +104,6 @@ chrome.runtime.onStartup.addListener(() => {
   armHeartbeat();
   pushBridgeCookies();
 });
-
-// Update notification's button handler
-chrome.notifications.onButtonClicked.addListener(
-  (notificationId, buttonIndex) => {
-    console.log(notificationId, buttonIndex);
-    if (notificationId === 'updated') {
-      switch (buttonIndex) {
-        case 0:
-          chrome.tabs.create({
-            url: 'https://github.com/kairi003/Get-cookies.txt-LOCALLY/releases',
-          });
-          break;
-        case 1:
-          chrome.management.uninstallSelf({ showConfirmDialog: true });
-          break;
-      }
-    }
-  },
-);
 
 // TODO: use offscreen API to integrate implementation in chrome and firefox
 // Save file message listener for firefox
