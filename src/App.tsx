@@ -6883,8 +6883,14 @@ export default function App() {
           />
         )}
 
-        <PanelResizeHandles onPointerDown={onMainPanelResize} />
       </div>
+
+      {/* Handles must be a direct child of the panel, NOT of the tab-content
+          scroll container: on CHANNELS/HISTORY/SETTINGS that container carries
+          .custom-scrollbar (contain: layout paint), which would make it the
+          containing block for the absolute handle host and park the handles at
+          the scroll-area edge instead of the panel border. */}
+      <PanelResizeHandles onPointerDown={onMainPanelResize} />
       </div>
       </div>
 
