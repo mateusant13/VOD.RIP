@@ -40,6 +40,8 @@ interface OpenResult {
   url: string | null;
   /** True when an already-open Extensions tab was focused instead of a new tab. */
   reused?: boolean;
+  /** True when a browser runs but its window could not be driven safely. */
+  blocked?: boolean;
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -118,23 +120,26 @@ export default function CookieBridgeSection({
     if (opening) return;
     setOpening(true);
     setError(null);
-    // One click opens chrome://extensions AND reveals the extension folder in
-    // Explorer. Both fire in parallel; each failure is handled independently —
-    // a failed reveal must not block the checklist, a failed open keeps the
-    // existing manual-install hint.
-    const [openRes] = await Promise.all([
-      apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null),
-      apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {}).catch(() => null),
-    ]);
+    // Open the browser tab FIRST, then reveal the folder. Firing reveal in
+    // parallel pops an Explorer window that steals focus mid-drive and can
+    // misdirect the Ctrl+L/paste/Enter sequence into another app. Each
+    // failure is handled independently — a failed reveal must not block the
+    // checklist, a failed open keeps the existing manual-install hint.
+    const openRes = await apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null);
     if (openRes === null) {
       setError('Could not reach the backend to open the browser tab.');
     } else {
       setOpened(openRes.launched);
       setReused(Boolean(openRes.reused));
       if (!openRes.launched) {
-        setError('No Chromium browser found — open chrome://extensions manually and drop the folder.');
+        setError(
+          openRes.blocked
+            ? 'Browser window could not be focused — open chrome://extensions manually and drop the folder.'
+            : 'No Chromium browser found — open chrome://extensions manually and drop the folder.',
+        );
       }
     }
+    void apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {}).catch(() => null);
     // refresh once shortly after so freshly pushed cookies show in the counts
     setTimeout(() => void refresh(), 5000);
     setOpening(false);

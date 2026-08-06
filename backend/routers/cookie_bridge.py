@@ -327,7 +327,7 @@ def _open_extension_manager() -> dict:
         if outcome == "reused":
             return {"launched": True, "browser": None, "url": None, "reused": True}
         if outcome == "blocked":
-            return {"launched": False, "browser": None, "url": None, "reused": False}
+            return {"launched": False, "browser": None, "url": None, "reused": False, "blocked": True}
         if outcome != "none":  # (browser, url): the active tab was driven
             return {"launched": True, "browser": outcome, "url": payload, "reused": False}
     # outcome "none" or a missing script: no browser process at all — spawning

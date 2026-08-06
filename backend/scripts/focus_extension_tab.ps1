@@ -197,14 +197,51 @@ try {
     }
   } catch { }
 
+  # UIA-read the omnibox text of the target window — the address bar is the
+  # Edit whose value carries a scheme URL (chrome:// or edge://); page inputs
+  # never do. Its Name is locale-localized, so matching is on the value.
+  function Get-OmniboxValue {
+    param([IntPtr]$hwnd)
+    try {
+      $win = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+      $editCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+      $edits = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+      foreach ($e in $edits) {
+        try {
+          $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+          $v = ($vp.Current.Value -as [string]).Trim()
+          if ($v -match '^(chrome|edge)://') { return $v }
+        } catch { }
+      }
+    } catch { }
+    return ''
+  }
+
+  # Drive with verification: only press Enter when the omnibox provably holds
+  # the URL, and only declare success when it navigated there. A lost focus
+  # race otherwise lands the paste/Enter in another app, or Enter picks a
+  # highlighted suggestion — the chrome://www.extensions.com/ symptom. Retry a
+  # few times; on persistent failure exit 3 so the caller never spawns into a
+  # running browser (stray new tab) and never reports a mangled URL as success.
+  $expected = $url.TrimEnd('/')
+  $driven = $false
   try {
+    for ($i = 0; $i -lt 3 -and -not $driven; $i++) {
+    [FocusExtNative]::SetForegroundWindow($target) | Out-Null
+    Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait("^l")          # focus omnibox
     Start-Sleep -Milliseconds 300
     [System.Windows.Forms.Clipboard]::SetText($url)
     Start-Sleep -Milliseconds 150
     [System.Windows.Forms.SendKeys]::SendWait("^v")          # paste URL
-    Start-Sleep -Milliseconds 300
+    Start-Sleep -Milliseconds 400
+    if ((Get-OmniboxValue $target).TrimEnd('/') -ne $expected) { continue }
     [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Seconds 2
+    if ((Get-OmniboxValue $target).TrimEnd('/') -eq $expected) { $driven = $true }
+  }
   } finally {
     if ($clipHadText) {
       try { [System.Windows.Forms.Clipboard]::SetText($clipSaved) } catch { }
@@ -214,5 +251,6 @@ try {
   [FocusExtNative]::AttachThreadInput($curTid, $tpid, $false) | Out-Null
 }
 
+if (-not $driven) { exit 3 }   # never verified — do not let the caller spawn
 Write-Output $targetProc
 exit 2
