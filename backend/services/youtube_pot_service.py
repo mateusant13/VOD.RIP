@@ -77,11 +77,12 @@ _last_ready: bool = False
 def _frozen_exe_dir() -> Optional[Path]:
     """Directory containing the running frozen EXE, or None when not frozen.
 
-    Mirrors the helper in ``ytdlp_ffmpeg._bundled_ffmpeg_dirs``: under a
-    PyInstaller one-file bootloader ``sys.executable`` points inside the
-    temp extract dir, while under COLLECT (the layout vod-rip.spec
-    emits) it points at the EXE on disk. Both put ``runtime/`` next to
-    the EXE so this single helper covers both.
+    PyInstaller 6.x keeps ``sys.executable`` pointing at the original EXE on
+    disk in both layouts — the onedir COLLECT output and the onefile
+    bootloader (the onefile payload extracts to ``sys._MEIPASS`` instead).
+    ``runtime/`` therefore lives beside the EXE for onedir builds but inside
+    ``_MEIPASS`` for onefile builds — see ``_frozen_runtime_paths``, which
+    checks both.
     """
     if not getattr(sys, "frozen", False):
         return None
@@ -92,20 +93,28 @@ def _frozen_runtime_paths() -> Optional[tuple[Path, Path]]:
     """Pair of ``(node.exe, bgutil main.js)`` for the frozen installer.
 
     ``scripts/download-node.ps1`` drops a private Node 20 at
-    ``build/external/node.exe`` (bundled by vod-rip.spec to
-    ``<exe-dir>/runtime/node.exe``), and ``scripts/build-bgutil-bundle.ps1``
-    drops a built bgutil server at ``<exe-dir>/runtime/bgutil-pot/``.
+    ``build/external/node.exe`` (bundled by the spec to
+    ``runtime/node.exe``), and ``scripts/build-bgutil-bundle.ps1`` drops a
+    built bgutil server at ``runtime/bgutil-pot/``. Mirrors
+    ``ytdlp_ffmpeg._bundled_ffmpeg_dirs``, which checks both layouts: the
+    onedir COLLECT tree sits next to the EXE (``sys.executable.parent``),
+    while a onefile build extracts its payload to ``sys._MEIPASS`` (a temp
+    dir that is deleted on exit).
     Returns ``(node_exe, main_js)`` when both artefacts exist on disk,
     or ``None`` when either is missing — callers fall back to PATH /
     lazy bootstrap in that case.
     """
-    exe_dir = _frozen_exe_dir()
-    if exe_dir is None:
+    if not getattr(sys, "frozen", False):
         return None
-    node_exe = exe_dir / "runtime" / "node.exe"
-    main_js = exe_dir / "runtime" / "bgutil-pot" / "server" / "build" / "main.js"
-    if node_exe.is_file() and main_js.is_file():
-        return node_exe, main_js
+    candidates: list[Path] = [Path(sys.executable).resolve().parent]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass))
+    for base in candidates:
+        node_exe = base / "runtime" / "node.exe"
+        main_js = base / "runtime" / "bgutil-pot" / "server" / "build" / "main.js"
+        if node_exe.is_file() and main_js.is_file():
+            return node_exe, main_js
     return None
 
 

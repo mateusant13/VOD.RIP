@@ -82,6 +82,9 @@ backend/scripts/test_clip_preview.py
 backend/test_downloads.py
 debug_full_flow.py
 
+# Signing secrets (never commit a .pfx / password file — see docs/SIGNING.md)
+signing/
+
 # AI agent memory (not project documentation)
 backend/AGENTS.md
 

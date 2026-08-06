@@ -13,7 +13,7 @@
     "build-copy": "vite build && node -e \"const fs=require('fs');const d='backend/static';fs.mkdirSync(d,{recursive:true});fs.copyFileSync('dist/index.html',d+'/index.html')\"",
     "preview": "vite preview",
     "sync-icon": "python scripts/generate-icon.py",
-    "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs && node scripts/stage-cookie-extension.mjs",
+    "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --clean --noconfirm && node scripts/deploy-dist.mjs && node scripts/stage-cookie-extension.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sign-release.ps1",
     "test:e2e": "playwright test --config=e2e/playwright.config.ts",
     "test:e2e:list": "playwright test --config=e2e/playwright.config.ts --list"
   },

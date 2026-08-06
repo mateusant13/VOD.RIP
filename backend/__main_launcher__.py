@@ -19,6 +19,7 @@ import logging
 import logging.handlers
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -94,6 +95,40 @@ def _get_resources_dir() -> Path:
         if candidate.is_dir():
             return candidate
     return _get_install_dir()
+
+
+def _materialize_cookie_extension() -> None:
+    """Copy the bundled cookie bridge extension out of a onefile payload.
+
+    vod-rip-onefile.spec bundles ``cookie-extension/src`` as a onefile data
+    payload, which PyInstaller extracts to ``sys._MEIPASS`` — a temp dir that
+    is deleted on exit. The extension must live NEXT TO the exe (the README
+    tells users to drag the folder into chrome://extensions), so copy it out
+    once on first run. Onedir builds skip this: the folder is already staged
+    beside the exe by scripts/stage-cookie-extension.mjs and ``_MEIPASS``
+    does not exist there. Best-effort only — never block startup on a copy
+    failure.
+    """
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if not meipass:
+            return
+        src = Path(meipass) / "cookie-extension" / "src"
+        if not src.is_dir():
+            return  # onedir layout (or bundle missing the fork) — skip silently
+        dest = _get_install_dir() / "cookie-extension" / "src"
+        if dest.is_dir():
+            return  # already materialized (prior run / staged onedir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+        logging.getLogger("VOD.RIP").info(
+            "Materialized cookie extension next to exe: %s", dest
+        )
+    except Exception as exc:
+        # ponytail: best-effort — a failed copy must never block startup
+        logging.getLogger("VOD.RIP").warning(
+            "Cookie extension materialize failed: %s", exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +254,14 @@ def _resolve_app_icon_path() -> str | None:
     resources = _get_resources_dir()
     dev_root = Path(__file__).resolve().parent.parent
 
-    for base in (install, resources, install / "_internal", dev_root):
+    bases = [install, resources, install / "_internal", dev_root]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        # onefile: bundled datas (icon.ico) extract to the temp dir, not
+        # beside the EXE — include it so the window/tray keep the icon.
+        bases.append(Path(meipass))
+
+    for base in bases:
         candidates.extend([
             base / "icon.ico",
             base / "assets" / "icon.ico",
@@ -585,6 +627,10 @@ def main():
     port = int(os.environ.get("PORT", 7897))
 
     if getattr(sys, "frozen", False):
+        # onefile: bundle the cookie bridge extension out of the temp
+        # extract dir so it sits next to the exe for manual install.
+        _materialize_cookie_extension()
+
         # Hard process-level singleton. The file lock is held for the
         # lifetime of the first process; a second VOD-RIP.exe cannot
         # acquire it and must exit immediately, even during the first

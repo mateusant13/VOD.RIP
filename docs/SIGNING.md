@@ -14,6 +14,29 @@ requires ~3,000 successful installs before SmartScreen stops prompting.
 EV certs from DigiCert, Sectigo, or GlobalSign are US$240-500/year and ship
 with a hardware token (USB dongle) for the signing key.
 
+## Getting a certificate
+
+Commercial EV certs are not the only option — free / low-cost paths exist
+for open-source projects:
+
+- **[SignPath Foundation](https://signpath.org/foundation/)** — free code
+  signing for open-source projects. You upload the unsigned artifact and
+  SignPath signs it in their HSM and returns the Authenticode-signed binary;
+  the private key never leaves their infrastructure.
+- **[Certum Open Source signing](https://www.certum.eu/en/signing-services/opensource-signing/)** —
+  free OV code-signing certificate for open-source projects (one per
+  project), delivered through a remote signing service.
+- **[Azure Trusted Signing](https://learn.microsoft.com/en-us/azure/trusted-signing/)** —
+  Microsoft's managed signing service, free up to a monthly quota; DigiCert-
+  backed certificates with no hardware token. `scripts/sign-release.ps1`
+  supports any cert chain via the standard signtool flags.
+
+> **CI status:** the repo's GitHub Actions secrets (`VODRIP_CERT_B64`,
+> `VODRIP_CERT_PWD`, `VODRIP_TIMESTAMP`) are currently **unset**, so the
+> "Sign artefacts (Authenticode)" step in `.github/workflows/release.yml` is
+> a no-op and releases ship unsigned. Set the three secrets (see "CI
+> signing" below) to enable signed releases.
+
 ## Local signing
 
 1. Drop your `.pfx` at `signing/vodrip.pfx` (the path is referenced from

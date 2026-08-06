@@ -1,9 +1,10 @@
 # PyInstaller Windows version resource — taskbar / Properties show "VOD.RIP"
 # ruff: noqa: F821  (VSVersionInfo/FixedFileInfo/etc. come from PyInstaller runtime, not real names)
+# Version fields track backend/services/_version.py (single source of truth).
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 0, 45, 0),
-        prodvers=(1, 0, 45, 0),
+        filevers=(1, 0, 50, 0),
+        prodvers=(1, 0, 50, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -17,14 +18,14 @@ VSVersionInfo(
                 StringTable(
                     "040904B0",
                     [
-                        StringStruct("CompanyName", "mateusant13"),
-                        StringStruct("FileDescription", "VOD.RIP — Kick & Twitch downloader"),
-                        StringStruct("FileVersion", "1.0.45.0"),
+                        StringStruct("CompanyName", "VOD.RIP"),
+                        StringStruct("FileDescription", "VOD.RIP — Kick & Twitch VOD downloader"),
+                        StringStruct("FileVersion", "1.0.50.0"),
                         StringStruct("InternalName", "VOD.RIP"),
                         StringStruct("LegalCopyright", "Copyright (c) mateusant13"),
                         StringStruct("OriginalFilename", "VOD-RIP.EXE"),
                         StringStruct("ProductName", "VOD.RIP"),
-                        StringStruct("ProductVersion", "1.0.45.0"),
+                        StringStruct("ProductVersion", "1.0.50.0"),
                     ],
                 )
             ]
