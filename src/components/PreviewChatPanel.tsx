@@ -23,11 +23,15 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Captions,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   FileText,
   Loader2,
   MessageSquare,
   RefreshCw,
+  Search,
+  X,
 } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
 import { activePanelRowIndex } from '../previewPlayerUtils';
@@ -258,6 +262,9 @@ export function PreviewChatPanel({
   const [retryTick, setRetryTick] = useState(0);
   const [ytSubtitles, setYtSubtitles] = useState<PreviewSubtitlesPayload | null>(null);
   const [subsFetchState, setSubsFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  /** Inline chat-history search (filter + prev/next cursor), see below. */
+  const [chatQuery, setChatQuery] = useState('');
+  const [searchIdx, setSearchIdx] = useState(-1);
 
   const payloadCacheRef = useRef<Map<string, PreviewPanelPayload>>(new Map());
   const subsCacheRef = useRef<Map<string, PreviewSubtitlesPayload>>(new Map());
@@ -353,15 +360,36 @@ export function PreviewChatPanel({
     };
   }, [subtitlesOnly, videoId, retryTick]);
 
+  // Subtitles are a YouTube feature: the caption display is only offered for
+  // YouTube videos (URL-only previews fetch live captions; archived ones show
+  // their transcript). Twitch/Kick VODs and clips get the Transcript tab (the
+  // archive's auto-transcript) but no Subtitles tab.
+  const subtitlesTabEnabled = platform === 'youtube';
   // Subtitles-only previews have no chat/transcript tabs to land on.
   useEffect(() => {
     if (subtitlesOnly && tab !== 'subtitles') setTab('subtitles');
   }, [subtitlesOnly, tab]);
+  // Stale tab across video switches: a non-YouTube video must never keep the
+  // Subtitles tab selected (its tab is hidden for that platform).
+  useEffect(() => {
+    if (!subtitlesTabEnabled && tab === 'subtitles') setTab('chat');
+  }, [subtitlesTabEnabled, tab]);
 
   // ── Rows / active index ---------------------------------------------------
   const chatRows = useMemo(() => payload?.chat ?? EMPTY_CHAT, [payload]);
   const transcriptRows = useMemo(() => payload?.transcript ?? EMPTY_TRANSCRIPT, [payload]);
-  const chatOffsets = useMemo(() => chatRows.map((r) => r.offset_sec), [chatRows]);
+  /** Chat-tab list: the full history, or only rows matching the inline search
+   *  query (case-insensitive on username and text). */
+  const chatList = useMemo(() => {
+    const q = chatQuery.trim().toLowerCase();
+    if (!q) return chatRows;
+    return chatRows.filter(
+      (r) => r.username.toLowerCase().includes(q) || r.text.toLowerCase().includes(q),
+    );
+  }, [chatRows, chatQuery]);
+  const chatOffsets = useMemo(() => chatList.map((r) => r.offset_sec), [chatList]);
+  /** The search is live only on the chat tab with a non-empty query. */
+  const qActive = chatQuery.trim().length > 0 && tab === 'chat';
   // Transcript-tab timeline: transcript segments + acoustic events merged in
   // chronological order (ties put the segment first — an event usually starts
   // at a segment boundary). Raw transcriptRows/offsets stay separate for the
@@ -381,32 +409,40 @@ export function PreviewChatPanel({
     () => activePanelRowIndex(chatOffsets, currentTime),
     [chatOffsets, currentTime],
   );
+  const activeChatIdxRef = useRef(-1);
+  activeChatIdxRef.current = activeChatIdx;
   const activeTimelineIdx = useMemo(
     () => activePanelRowIndex(timelineOffsets, currentTime),
     [timelineOffsets, currentTime],
   );
-  // Subtitles-tab rows: the archive transcript for archived videos, the
-  // live-fetched YouTube captions for URL-only previews.
-  const subtitleRows = subtitlesOnly ? (ytSubtitles?.rows ?? EMPTY_TRANSCRIPT) : transcriptRows;
+  // Subtitles-tab rows: the archive transcript for archived YouTube videos,
+  // the live-fetched YouTube captions for URL-only previews. Non-YouTube
+  // platforms have no Subtitles tab (transcript lives in the Transcript tab).
+  const subtitleRows = subtitlesTabEnabled
+    ? (subtitlesOnly ? (ytSubtitles?.rows ?? EMPTY_TRANSCRIPT) : transcriptRows)
+    : EMPTY_TRANSCRIPT;
   const subtitleOffsets = useMemo(() => subtitleRows.map((r) => r.offset_sec), [subtitleRows]);
   const activeSubtitleIdx = useMemo(
     () => activePanelRowIndex(subtitleOffsets, currentTime),
     [subtitleOffsets, currentTime],
   );
 
-  const list = tab === 'chat' ? chatRows : timelineRows;
+  const list = tab === 'chat' ? chatList : timelineRows;
   const rowH = tab === 'chat' ? CHAT_ROW_H : TRANSCRIPT_ROW_H;
   const activeIdx = tab === 'chat' ? activeChatIdx : activeTimelineIdx;
   activeIdxRef.current = activeIdx;
   rowHRef.current = rowH;
+  /** Row the view centers on: the search cursor while a query is active,
+   *  the playback-synced row otherwise. */
+  const focusIdx = qActive && searchIdx >= 0 ? searchIdx : activeIdx;
 
-  // Fixed-height virtualization: window of WINDOW rows around the active row
-  // with spacer divs above/below, so scroll height stays exact (active row's
-  // content offset is always activeIdx * rowH).
+  // Fixed-height virtualization: window of WINDOW rows around the focus row
+  // with spacer divs above/below, so scroll height stays exact (the focus
+  // row's content offset is always focusIdx * rowH).
   const windowStart = useMemo(() => {
     const maxStart = Math.max(0, list.length - 2 * WINDOW - 1);
-    return Math.max(0, Math.min(activeIdx - WINDOW, maxStart));
-  }, [list.length, activeIdx]);
+    return Math.max(0, Math.min(focusIdx - WINDOW, maxStart));
+  }, [list.length, focusIdx]);
   const windowEnd = Math.min(list.length, windowStart + 2 * WINDOW + 1);
   const slice = useMemo(() => list.slice(windowStart, windowEnd), [list, windowStart, windowEnd]);
   const topPad = windowStart * rowH;
@@ -421,7 +457,7 @@ export function PreviewChatPanel({
   }, [tab]);
 
   useEffect(() => {
-    if (fetchState !== 'done') return;
+    if (fetchState !== 'done' || qActive) return;
     if (prevActiveIdxRef.current === activeIdx) return;
     prevActiveIdxRef.current = activeIdx;
     const el = scrollRef.current;
@@ -432,7 +468,7 @@ export function PreviewChatPanel({
     }
     autoScrollingRef.current = true;
     activeRowRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [activeIdx, fetchState]);
+  }, [activeIdx, fetchState, qActive]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -456,6 +492,49 @@ export function PreviewChatPanel({
     followRef.current = true;
     target.scrollIntoView({ block: 'nearest' });
   }, []);
+
+  // ── Inline chat search -----------------------------------------------------
+  // Activating the query jumps the cursor to the match nearest playback time
+  // (the filtered list's active row); clearing it re-arms playback follow.
+  useEffect(() => {
+    if (qActive) {
+      setSearchIdx(activeChatIdxRef.current >= 0 ? activeChatIdxRef.current : 0);
+    } else {
+      setSearchIdx(-1);
+      prevActiveIdxRef.current = null;
+    }
+  }, [qActive]);
+
+  // Keep the cursor in range while typing shrinks the match set.
+  useEffect(() => {
+    if (!qActive || searchIdx < 0) return;
+    if (chatList.length === 0) {
+      if (searchIdx !== -1) setSearchIdx(-1);
+    } else if (searchIdx >= chatList.length) {
+      setSearchIdx(Math.max(0, chatList.length - 1));
+    }
+  }, [qActive, chatList.length, searchIdx]);
+
+  // Scroll the cursor row into view (exact content offset: fixed row height).
+  useEffect(() => {
+    if (!qActive || searchIdx < 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    autoScrollingRef.current = true;
+    el.scrollTop = searchIdx * CHAT_ROW_H;
+  }, [qActive, searchIdx]);
+
+  const stepSearch = useCallback(
+    (dir: 1 | -1) => {
+      setSearchIdx((i) => {
+        const n = chatList.length;
+        if (n === 0) return -1;
+        if (i < 0) return dir > 0 ? 0 : n - 1;
+        return (i + dir + n) % n;
+      });
+    },
+    [chatList.length],
+  );
 
   // ── Self-contained width resize (rAF + pointer capture + direct writes) ---
   const widthRef = useRef(width);
@@ -537,7 +616,12 @@ export function PreviewChatPanel({
             <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-zinc-700 group-hover/resize:bg-zinc-500" />
           </div>
           <div className="flex items-center gap-0.5 border-b-2 border-zinc-800 px-1.5 py-1 shrink-0">
-            {(subtitlesOnly ? TABS.filter((t) => t.id === 'subtitles') : TABS).map(
+            {(subtitlesOnly
+              ? TABS.filter((t) => t.id === 'subtitles')
+              : subtitlesTabEnabled
+                ? TABS
+                : TABS.filter((t) => t.id !== 'subtitles')
+            ).map(
               ({ id, label, icon: Icon }) => (
                 <button
                   key={id}
@@ -568,6 +652,70 @@ export function PreviewChatPanel({
               <ChevronRight size={14} />
             </button>
           </div>
+          {fetchState === 'done' && payload && tab === 'chat' && payload.has_chat && (
+            <div
+              data-chat-search
+              className="flex items-center gap-1.5 border-b-2 border-zinc-800 px-1.5 py-1 shrink-0"
+            >
+              <Search size={10} className="text-zinc-500 shrink-0" />
+              <input
+                value={chatQuery}
+                onChange={(e) => setChatQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    stepSearch(e.shiftKey ? -1 : 1);
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setChatQuery('');
+                  }
+                }}
+                placeholder="Search chat…"
+                aria-label="Search chat history"
+                spellCheck={false}
+                className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 outline-none focus:border-white placeholder:text-zinc-600"
+              />
+              {qActive && (
+                <span
+                  data-chat-search-count
+                  className="text-[9px] font-mono text-zinc-500 shrink-0"
+                >
+                  {chatList.length > 0 ? `${searchIdx + 1}/${chatList.length}` : '0/0'}
+                </span>
+              )}
+              {qActive && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => stepSearch(-1)}
+                    title="Previous match (Shift+Enter)"
+                    className="text-zinc-500 hover:text-white p-0.5"
+                    aria-label="Previous match"
+                  >
+                    <ChevronUp size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => stepSearch(1)}
+                    title="Next match (Enter)"
+                    className="text-zinc-500 hover:text-white p-0.5"
+                    aria-label="Next match"
+                  >
+                    <ChevronDown size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChatQuery('')}
+                    title="Clear search (Esc)"
+                    className="text-zinc-500 hover:text-white p-0.5"
+                    aria-label="Clear chat search"
+                  >
+                    <X size={11} />
+                  </button>
+                </>
+              )}
+            </div>
+          )}
           {fetchState === 'loading' && (
             <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-500">
               <Loader2 size={13} className="animate-spin" />
@@ -654,6 +802,9 @@ export function PreviewChatPanel({
               data-panel-rows
             >
               {tab === 'chat' && !payload.has_chat && <EmptyState text="No archived chat for this video." />}
+              {tab === 'chat' && qActive && chatList.length === 0 && (
+                <EmptyState text={`No chat messages match “${chatQuery.trim()}”.`} />
+              )}
               {tab === 'transcript' && !payload.has_transcript && timelineRows.length === 0 && (
                 <EmptyState text="No transcript for this video." />
               )}
@@ -662,7 +813,7 @@ export function PreviewChatPanel({
                   <div style={{ height: topPad }} />
                   {slice.map((row, i) => {
                     const idx = windowStart + i;
-                    const active = idx === activeIdx;
+                    const active = idx === focusIdx;
                     if (tab === 'chat') {
                       return (
                         <ChatRow

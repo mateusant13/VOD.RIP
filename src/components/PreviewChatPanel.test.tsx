@@ -141,7 +141,7 @@ describe('PreviewChatPanel', () => {
 
   it('switches tabs: transcript rows, subtitles caption, chat empty state', async () => {
     mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    render(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
 
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
@@ -152,6 +152,15 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('hello world');
     });
+  });
+
+  it('hides the Subtitles tab for non-YouTube platforms (Twitch/Kick VODs, clips)', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    // The archived transcript stays available — under its Transcript tab.
+    expect(screen.getByRole('button', { name: 'Transcript' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Subtitles' })).toBeNull();
   });
 
   it('interleaves acoustic events into the transcript timeline in offset order', async () => {
@@ -183,7 +192,7 @@ describe('PreviewChatPanel', () => {
     expect(laugh.textContent).toContain('(0.6s)');
   });
 
-  it('empty payload shows per-tab empty states without breaking siblings', async () => {
+  it('empty payload shows per-tab empty states; no Subtitles tab off-YouTube', async () => {
     mockPanelFetch(EMPTY_PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => {
@@ -193,10 +202,8 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => {
       expect(screen.getByText('No transcript for this video.')).toBeTruthy();
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
-    await waitFor(() => {
-      expect(screen.getByText('No captions for this video.')).toBeTruthy();
-    });
+    // Subtitles are YouTube-only — a Twitch/Kick VOD has no Subtitles tab.
+    expect(screen.queryByRole('button', { name: 'Subtitles' })).toBeNull();
   });
 
   it('null platform/videoId (clip/live/channel previews) shows an explanatory message instead of a blank panel', async () => {
@@ -228,7 +235,7 @@ describe('PreviewChatPanel', () => {
   it('highlights the active chat/transcript row and updates the subtitle on currentTime change', async () => {
     mockPanelFetch(PAYLOAD);
     const { rerender } = render(
-      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={6} />,
+      <PreviewChatPanel platform="youtube" videoId="v1" currentTime={6} />,
     );
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     // chat offsets [1,3,8,20]: t=6 → last offset ≤ 6 is index 1 (LETS GO).
@@ -244,7 +251,7 @@ describe('PreviewChatPanel', () => {
     });
 
     // Seek to t=12: transcript active row moves to index 2, caption to third line.
-    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={12} />);
+    rerender(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={12} />);
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     await waitFor(() => expect(activeRowText()).toContain('third line'));
     fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
@@ -392,5 +399,61 @@ describe('PreviewChatPanel', () => {
     // Archived videos never call the live-subtitles endpoint.
     const calls = fetchMock.mock.calls.map((c) => String(c[0]));
     expect(calls.some((u) => u.includes('/api/subtitles'))).toBe(false);
+  });
+
+  it('searches chat inline: filters rows, counts matches, navigates with Enter', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+
+    const input = screen.getByRole('textbox', { name: 'Search chat history' });
+    // 'g' matches alice 'gg', bob 'LETS GO', dave 'pog' → 3 matches.
+    fireEvent.change(input, { target: { value: 'g' } });
+    await waitFor(() => {
+      expect(screen.getByText('1/3')).toBeTruthy();
+    });
+    // Unmatched rows are filtered out of the DOM.
+    expect(screen.queryByText('hi')).toBeNull();
+    expect(screen.getByText('gg')).toBeTruthy();
+    expect(screen.getByText('LETS GO')).toBeTruthy();
+    expect(screen.getByText('pog')).toBeTruthy();
+
+    // Enter cycles next; Shift+Enter goes back; wraps at the ends.
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(screen.getByText('2/3')).toBeTruthy());
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(screen.getByText('1/3')).toBeTruthy()); // wrapped
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
+    await waitFor(() => expect(screen.getByText('3/3')).toBeTruthy());
+
+    // Esc clears the query and restores the full list.
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await waitFor(() => expect(screen.getByText('hi')).toBeTruthy());
+    expect(screen.queryByText('1/3')).toBeNull();
+  });
+
+  it('shows an empty state when the chat search matches nothing', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search chat history' }), {
+      target: { value: 'xyzzy' },
+    });
+    await waitFor(() =>
+      expect(screen.getByText('No chat messages match “xyzzy”.')).toBeTruthy(),
+    );
+  });
+
+  it('matches usernames too, not just message text', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search chat history' }), {
+      target: { value: 'carol' },
+    });
+    await waitFor(() => expect(screen.getByText('hi')).toBeTruthy());
+    expect(screen.queryByText('LETS GO')).toBeNull();
+    expect(screen.getByText('1/1')).toBeTruthy();
   });
 });
