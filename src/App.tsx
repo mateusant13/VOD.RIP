@@ -3061,6 +3061,10 @@ export default function App() {
   // Render-time effective layout: enforces viewport bounds on the preferred widths.
   // This is the SOLE source of truth for panel widths in JSX. State holds preferred;
   // the effective layout is re-derived each render from preferred + viewport.
+  // innerWidth/innerHeight in the deps: the viewport is part of the derived
+  // value (layoutRowWidthBudget etc. read it), so a window resize must
+  // recompute — otherwise derived props (e.g. the chat panel's maxWidth) go
+  // stale while the DOM width is kept live by applyLayoutPanelClamps.
   const effectiveLayout = useMemo<EffectivePanelLayout>(
     () =>
       effectiveLayoutFromPreferred(
@@ -3083,6 +3087,8 @@ export default function App() {
       previewOpen,
       channelVodPanelOpen,
       previewVideoAspect,
+      window.innerWidth,
+      window.innerHeight,
     ],
   );
   const effectivePreviewPanelWidth = effectiveLayout.preview.w;
@@ -6002,10 +6008,13 @@ export default function App() {
               currentTime={previewTimeUi}
               hidden={previewFullscreen}
               // Reserve the player's layout minimum: the chat panel may never
-              // eat into it, whatever the user's stored panel width says
-              // (gap-2 row = 8px). Below the panel's own minimum there is no
-              // room for chat at all and it collapses to zero width.
-              maxWidth={Math.max(0, effectivePreviewPanelWidth - PREVIEW_PANEL_MIN_W - 8)}
+              // eat into it, whatever the user's stored panel width says.
+              // Row budget = card - p-4(16) - border-2(2) per side, minus the
+              // PREVIEW_PANEL_MIN_W(280) player reserve and the row's gap-2(8).
+              // Below the panel's own minimum there is no room for chat at all
+              // and it collapses to zero width. Keep the 36 in sync with the
+              // card's p-4/border-2 classes.
+              maxWidth={Math.max(0, effectivePreviewPanelWidth - PREVIEW_PANEL_MIN_W - 8 - 36)}
             />
           </div>
           {!previewFullscreen && (
