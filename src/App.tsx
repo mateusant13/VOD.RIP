@@ -6205,6 +6205,11 @@ export default function App() {
               platform={activePlatform}
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
+              // Click-to-seek: chat/transcript/event rows and the subtitle
+              // caption seek the CURRENT preview player (seekPreviewVideo
+              // clamps to the trim window and no-ops until the player is
+              // ready; the shared seekToTimestamp helper owns the dispatch).
+              onSeek={seekPreviewVideo}
               hidden={previewFullscreen}
               // Gates only the URL-only live-captions fetch (video-first);
               // the archive payload starts at session-create so the Twitch
@@ -7047,6 +7052,7 @@ export default function App() {
           onClose={() => setPreviewSearchOpen(false)}
           onOpenHit={openArchiveHit}
           onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
+          onSeekOffset={previewArchiveVideoId ? (sec) => seekPreviewVideo(sec) : undefined}
           scope={previewSearchScope}
           savedChannels={savedChannels}
         />

@@ -552,4 +552,54 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => expect(screen.getByText('Loading chat…')).toBeTruthy());
     expect(screen.queryByText('No archived chat for this video.')).toBeNull();
   });
+
+  it('seeks the player when a chat row is clicked (onSeek), rows show the pointer affordance', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} onSeek={onSeek} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    expect(document.querySelector('[data-panel-row]')?.className).toContain('cursor-pointer');
+    fireEvent.click(screen.getByText('LETS GO'));
+    expect(onSeek).toHaveBeenCalledTimes(1);
+    expect(onSeek).toHaveBeenCalledWith(3);
+  });
+
+  it('seeks the player when a transcript row or acoustic-event row is clicked', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} onSeek={onSeek} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    await waitFor(() => expect(screen.getByText('second line')).toBeTruthy());
+    fireEvent.click(screen.getByText('second line'));
+    expect(onSeek).toHaveBeenCalledWith(5);
+    fireEvent.click(screen.getByText('Laughter'));
+    expect(onSeek).toHaveBeenCalledWith(3);
+  });
+
+  it('seeks the player when the subtitle caption is clicked', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    render(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={6} onSeek={onSeek} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('second line');
+    });
+    fireEvent.click(document.querySelector('[data-subtitle-line]') as HTMLElement);
+    expect(onSeek).toHaveBeenCalledTimes(1);
+    expect(onSeek).toHaveBeenCalledWith(5);
+  });
+
+  it('keeps rows scroll-only (no pointer affordance, no seek) without onSeek', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    const rows = Array.from(document.querySelectorAll('[data-panel-row]'));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => !r.className.includes('cursor-pointer'))).toBe(true);
+    fireEvent.click(screen.getByText('LETS GO'));
+    expect(onSeek).not.toHaveBeenCalled();
+  });
 });

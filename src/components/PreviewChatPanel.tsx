@@ -37,6 +37,7 @@ import { apiGet } from '../hooks/useApiClient';
 import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
+import { seekToTimestamp } from '../seekToTimestamp';
 
 export interface PreviewPanelTranscriptRow {
   offset_sec: number;
@@ -128,6 +129,11 @@ interface PreviewChatPanelProps {
   platform: string | null;
   videoId: string | null;
   currentTime: number;
+  /** Click-to-seek: the host's CURRENT-player seek (main preview or the
+   *  popup's own player). When provided, chat/transcript/event rows and the
+   *  subtitle caption become clickable and seek to the row's offset_sec.
+   *  Absent → rows keep the scroll-only behavior (no player to seek). */
+  onSeek?: (offsetSec: number) => void;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
   /** Live-captions gate: while false the panel does NOT fetch the video's
@@ -168,11 +174,13 @@ const ChatRow = memo(function ChatRow({
   row,
   active,
   platform,
+  onSeek,
   ref,
 }: {
   row: PreviewPanelChatRow;
   active: boolean;
   platform: string | null;
+  onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
   return (
@@ -181,13 +189,15 @@ const ChatRow = memo(function ChatRow({
       data-panel-row
       aria-current={active ? 'true' : undefined}
       style={{ height: CHAT_ROW_H }}
+      onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
+      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)}` : undefined}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-yellow-300/10 border-yellow-300 text-zinc-100'
-          : 'border-transparent text-zinc-400'
-      }`}
+          : 'border-transparent text-zinc-200 hover:bg-zinc-900/70'
+      } ${onSeek ? 'cursor-pointer select-none' : ''}`}
     >
-      <span className="text-zinc-600 font-mono text-[9px] shrink-0">
+      <span className="text-zinc-300 font-mono text-[9px] shrink-0">
         {formatArchiveOffset(row.offset_sec)}
       </span>
       <span
@@ -201,7 +211,7 @@ const ChatRow = memo(function ChatRow({
       </span>
       {typeof row.spam_count === 'number' && row.spam_count > 1 && (
         <span
-          className="text-[9px] font-mono text-zinc-500 shrink-0"
+          className="text-[9px] font-mono text-zinc-400 shrink-0"
           title={`${row.spam_count} identical messages collapsed`}
         >
           ×{row.spam_count}
@@ -214,10 +224,12 @@ const ChatRow = memo(function ChatRow({
 const TranscriptRow = memo(function TranscriptRow({
   row,
   active,
+  onSeek,
   ref,
 }: {
   row: PreviewPanelTranscriptRow;
   active: boolean;
+  onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
   return (
@@ -226,13 +238,15 @@ const TranscriptRow = memo(function TranscriptRow({
       data-panel-row
       aria-current={active ? 'true' : undefined}
       style={{ height: TRANSCRIPT_ROW_H }}
+      onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
+      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)}` : undefined}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-yellow-300/10 border-yellow-300 text-zinc-100'
-          : 'border-transparent text-zinc-400'
-      }`}
+          : 'border-transparent text-zinc-200 hover:bg-zinc-900/70'
+      } ${onSeek ? 'cursor-pointer select-none' : ''}`}
     >
-      <span className="text-zinc-600 font-mono text-[9px] shrink-0">
+      <span className="text-zinc-300 font-mono text-[9px] shrink-0">
         {formatArchiveOffset(row.offset_sec)}
       </span>
       <span className="text-[10px] leading-snug truncate" title={row.text}>
@@ -247,13 +261,16 @@ const TranscriptRow = memo(function TranscriptRow({
 const EventRow = memo(function EventRow({
   row,
   active,
+  onSeek,
   ref,
 }: {
   row: PreviewPanelEventRow;
   active: boolean;
+  onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
   const durSec = Math.max(0, row.end_sec - row.offset_sec);
+  const rangeTitle = `${row.event} — ${formatArchiveOffset(row.offset_sec)} to ${formatArchiveOffset(row.end_sec)} (${durSec.toFixed(1)}s, confidence ${(row.score * 100).toFixed(0)}%)`;
   return (
     <div
       ref={ref}
@@ -261,22 +278,23 @@ const EventRow = memo(function EventRow({
       data-event-row={row.event}
       aria-current={active ? 'true' : undefined}
       style={{ height: TRANSCRIPT_ROW_H }}
-      title={`${row.event} — ${formatArchiveOffset(row.offset_sec)} to ${formatArchiveOffset(row.end_sec)} (${durSec.toFixed(1)}s, confidence ${(row.score * 100).toFixed(0)}%)`}
+      onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
+      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)} — ${rangeTitle}` : rangeTitle}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-amber-300/15 border-amber-300 text-amber-200'
-          : 'border-transparent text-amber-300/70'
-      }`}
+          : 'border-transparent text-amber-300'
+      } ${onSeek ? 'cursor-pointer select-none' : ''}`}
     >
-      <span className="text-zinc-600 font-mono text-[9px] shrink-0">
+      <span className="text-zinc-400 font-mono text-[9px] shrink-0">
         {formatArchiveOffset(row.offset_sec)}
       </span>
       <span className="font-bold text-[9px] uppercase tracking-widest shrink-0">
         {row.event}
       </span>
-      <span className="text-[9px] font-mono text-zinc-500 shrink-0">({durSec.toFixed(1)}s)</span>
+      <span className="text-[9px] font-mono text-zinc-400 shrink-0">({durSec.toFixed(1)}s)</span>
       <span className="flex-1" />
-      <span className="text-[8px] font-mono text-zinc-600 shrink-0">
+      <span className="text-[8px] font-mono text-zinc-500 shrink-0">
         {(row.score * 100).toFixed(0)}%
       </span>
     </div>
@@ -295,6 +313,7 @@ export function PreviewChatPanel({
   platform,
   videoId,
   currentTime,
+  onSeek,
   hidden = false,
   started = true,
   defaultOpen = true,
@@ -919,7 +938,20 @@ export function PreviewChatPanel({
                     <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
                       {formatArchiveOffset(currentTime)}
                     </span>
-                    <p className="text-sm leading-relaxed text-zinc-100 text-center break-words" data-subtitle-line>
+                    <p
+                      className={`text-sm leading-relaxed text-zinc-100 text-center break-words ${onSeek ? 'cursor-pointer select-none' : ''}`}
+                      data-subtitle-line
+                      onClick={
+                        onSeek
+                          ? () => seekToTimestamp(subtitleRows[activeSubtitleIdx].offset_sec, onSeek)
+                          : undefined
+                      }
+                      title={
+                        onSeek
+                          ? `Seek to ${formatArchiveOffset(subtitleRows[activeSubtitleIdx].offset_sec)}`
+                          : undefined
+                      }
+                    >
                       {subtitleRows[activeSubtitleIdx].text}
                     </p>
                   </>
@@ -966,6 +998,7 @@ export function PreviewChatPanel({
                           row={row as PreviewPanelChatRow}
                           active={active}
                           platform={platform}
+                          onSeek={onSeek}
                           ref={active ? activeRowRef : undefined}
                         />
                       );
@@ -976,6 +1009,7 @@ export function PreviewChatPanel({
                         key={`e${idx}`}
                         row={tl}
                         active={active}
+                        onSeek={onSeek}
                         ref={active ? activeRowRef : undefined}
                       />
                     ) : (
@@ -983,6 +1017,7 @@ export function PreviewChatPanel({
                         key={`t${idx}`}
                         row={tl}
                         active={active}
+                        onSeek={onSeek}
                         ref={active ? activeRowRef : undefined}
                       />
                     );

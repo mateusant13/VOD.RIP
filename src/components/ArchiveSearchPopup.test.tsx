@@ -812,6 +812,55 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
+  it('chat-history message click seeks via onSeekOffset (shared seekToTimestamp contract)', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'at the hit' },
+              { platform: 'twitch', video_id: 'v1', offset_sec: 500, username: 'bob', text: 'way past the old 60s window' },
+            ],
+            truncated: false,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    const onSeekOffset = vi.fn();
+    render(
+      <ArchiveSearchPopup
+        zIndex={10}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+        onSeekOffset={onSeekOffset}
+      />,
+    );
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    await screen.findByText(/way past the old 60s window/i);
+    fireEvent.click(screen.getByText(/way past the old 60s window/i));
+    expect(onSeekOffset).toHaveBeenCalledTimes(1);
+    expect(onSeekOffset).toHaveBeenCalledWith(500);
+  });
+
   it('remote YouTube search: fires for a saved channel scope, renders hits, opens on click', async () => {
     const REMOTE_HIT = {
       kind: 'youtube',
