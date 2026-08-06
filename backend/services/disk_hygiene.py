@@ -54,11 +54,17 @@ def sweep_orphaned_temps(temp_dir: Path, app_data: Path) -> dict:
 
     # 1) kd_preview subdirs (sessions, preflight, caches) left by crashed
     #    processes — an active session's dir is continuously written. The root
-    #    follows the routed cache location (cache_dir setting -> biggest fixed
-    #    drive); the legacy TEMP root is also swept when it differs.
+    #    follows the data root (fastest disk); the legacy TEMP root and the
+    #    legacy cache-root location (preview pre-dated the data-disk routing)
+    #    are also swept so pre-move sessions age out instead of leaking.
     from services.preview._state import preview_root
 
     sweep_roots = {preview_root(), temp_dir / "kd_preview"}
+    from services.settings import cache_root
+
+    legacy = cache_root()
+    if legacy is not None:
+        sweep_roots.add(legacy / "kd_preview")
     removed = 0
     for root in sweep_roots:
         if not root.is_dir():
@@ -137,16 +143,29 @@ def _get_appdata_dir() -> Path:
     return _real()
 
 
+# Auto pick for the data root, resolved once per process: transcripts/chat
+# are "fetched quickly" data, so the default is the FASTEST usable drive
+# (matching the Settings > Storage "Auto (fastest: X:)" label). Resolved
+# lazily on first use (which may probe drives for ~seconds) and cached —
+# data_dir() runs on every DB open, so it must never re-probe. The env and
+# settings branches above stay live; only the auto fallback is pinned, which
+# matches the "takes effect after restart" contract for the data-disk pick.
+_auto_data_dir: Optional[Path] = None
+
+
 def data_dir() -> Path:
     """Resolve the transcripts/chat data root (archive DB + WAL/SHM).
 
     Precedence: VODRIP_DATA_DIR env (test/portable override) ->
-    settings.data_dir (explicit path) -> %APPDATA%/VOD.RIP. The default
-    stays on the app-data drive so a clean install never moves the DB
-    unrequested; the Settings > Storage "data disk" pick writes data_dir
-    when the user opts into a faster/bigger volume. The DB relocation
-    plumbing (archive_db._db_path) is wired to this resolver separately.
+    settings.data_dir (explicit path) -> fastest usable drive (auto, e.g.
+    '<fastest>\\VOD.RIP-data') -> %APPDATA%/VOD.RIP when no usable drive
+    exists. The Settings > Storage "data disk" pick writes data_dir to opt
+    into a specific volume; the DB relocation plumbing (archive_db._db_path
+    / _migrate_db_to_data_dir) moves an existing app-data DB once, so a
+    clean install's DB lands on the fast drive unrequested — that IS the
+    advertised auto behavior.
     """
+    global _auto_data_dir
     env = os.environ.get(DATA_ENV, "").strip()
     if env:
         return Path(env)
@@ -155,7 +174,14 @@ def data_dir() -> Path:
     setting = (getattr(settings_mgr.get(), "data_dir", "") or "").strip()
     if setting:
         return Path(setting)
-    return _get_appdata_dir()
+    if _auto_data_dir is None:
+        from services.disk_detect import fastest_disk
+
+        drive = fastest_disk()
+        _auto_data_dir = (
+            Path(drive) / "VOD.RIP-data" if drive else _get_appdata_dir()
+        )
+    return _auto_data_dir
 
 
 # --- whisper model cache ---------------------------------------------------
@@ -307,17 +333,21 @@ if os.environ.get("VODRIP_DISK_HYGIENE_SELFCHECK") == "1":
         for _p in (_old, _transcribe, _selfcheck_db):
             os.utime(_p, (_old_cutoff, _old_cutoff))
         os.utime(_settings_tmp, (_settings_cutoff, _settings_cutoff))
-        # Pin the routed preview root to the scratch tmp so the sweep is
-        # hermetic even when a real biggest-fixed-drive cache root exists.
+        # Pin the routed preview root (now the DATA root) and the legacy
+        # cache root to the scratch tmp so the sweep is hermetic even when
+        # real data/cache drives exist.
+        _saved_data_dir = os.environ.get("VODRIP_DATA_DIR")
         _saved_cache_dir = os.environ.get("VODRIP_CACHE_DIR")
+        os.environ["VODRIP_DATA_DIR"] = str(_tmp)
         os.environ["VODRIP_CACHE_DIR"] = str(_tmp)
         try:
             _stats = sweep_orphaned_temps(_tmp, _app)
         finally:
-            if _saved_cache_dir is None:
-                os.environ.pop("VODRIP_CACHE_DIR", None)
-            else:
-                os.environ["VODRIP_CACHE_DIR"] = _saved_cache_dir
+            for _name, _saved in (("VODRIP_DATA_DIR", _saved_data_dir), ("VODRIP_CACHE_DIR", _saved_cache_dir)):
+                if _saved is None:
+                    os.environ.pop(_name, None)
+                else:
+                    os.environ[_name] = _saved
         assert _stats["kd_preview"] == 1, f"stale session dir must be swept: {_stats}"
         assert _stats["transcribe"] == 1, f"stale transcribe dir must be swept: {_stats}"
         assert _stats["cookie_selfcheck"] == 1, f"stale selfcheck db must be swept: {_stats}"

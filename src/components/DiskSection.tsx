@@ -167,7 +167,8 @@ export default function DiskSection({ settings, setSettings }: Props) {
           {cacheCustom ? <option value={cacheDir}>Custom ({cacheDir})</option> : null}
         </select>
 
-        <FieldCaption noWrap info="Takes effect after restart (moves the database)">
+
+        <FieldCaption noWrap info="transcripts, chat data & preview cache — takes effect after restart (moves the database)">
           Transcripts &amp; Chat Data Disk
         </FieldCaption>
         <select
@@ -184,6 +185,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
           ))}
           {dataCustom ? <option value={dataDir}>Custom ({dataDir})</option> : null}
         </select>
+
 
         <div className="flex items-center gap-2 pt-0.5 flex-wrap">
           <span className="text-xs text-zinc-400 font-mono">

@@ -13,12 +13,16 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.disk_detect import biggest_fixed_drive, disk_inventory, free_space
+from services.disk_detect import (
+    biggest_fixed_drive,
+    disk_inventory,
+    fastest_disk,
+    free_space,
+)
 from services.disk_hygiene import (
     active_whisper_model_id,
     prune_inactive_whisper_models,
@@ -30,9 +34,6 @@ router = APIRouter(tags=["disk"])
 
 FREE_THRESHOLD_BYTES = 5 * 1024**3  # low-disk warning below 5 GB free
 DEFAULT_KEEP_COUNT = 5
-# A disk with less free space than this is not offered as the "fastest" pick
-# (transcripts/chat data needs real headroom for the DB + WAL).
-_FASTEST_MIN_FREE_BYTES = 2 * 1024**3
 
 CLEANABLE = ("archive_vods", "whisper_models", "preview_cache", "update_temps")
 
@@ -57,10 +58,14 @@ def _whisper_cache_dir() -> Path:
 
 
 def _db_path() -> Path:
+    # Mirrors archive_db._db_path so the usage "Database" row reports the
+    # REAL db (data-disk root) instead of the stale app-data copy.
     override = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
     if override:
         return Path(override)
-    return _get_appdata_dir() / "archive.db"
+    from services.disk_hygiene import data_dir
+
+    return data_dir() / "archive.db"
 
 
 def _bgutil_dir() -> Path:
@@ -85,8 +90,8 @@ def _category_paths() -> dict[str, list[Path]]:
 
 
 def _preview_root() -> Path:
-    """kd_preview root — routed through the cache root (cache_dir setting ->
-    biggest fixed drive), falling back to TEMP (historical location)."""
+    """kd_preview root — routed through the data root (fastest disk) so live
+    preview media is fetched from quick storage (see services.preview._state)."""
     from services.preview._state import preview_root
 
     return preview_root()
@@ -191,21 +196,6 @@ def disk_usage() -> dict[str, int]:
         total += cat_bytes
     usage["total"] = total
     return usage
-
-
-def fastest_disk() -> str:
-    """Drive root (e.g. 'C:\\') of the fastest usable disk: best speed_rank
-    among drives with >= 2 GB free; ties broken by most free space. '' when
-    no usable drive exists (non-Windows host, probe failures)."""
-    best = ""
-    best_key: Optional[Tuple[int, int]] = None
-    for item in disk_inventory():
-        if item["free_bytes"] < _FASTEST_MIN_FREE_BYTES:
-            continue
-        key = (item["speed_rank"], -item["free_bytes"])
-        if best_key is None or key < best_key:
-            best, best_key = item["drive"], key
-    return best
 
 
 @router.get("/api/disks")

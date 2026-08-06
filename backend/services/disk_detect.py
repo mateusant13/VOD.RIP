@@ -111,6 +111,28 @@ def biggest_fixed_drive() -> Optional[str]:
     return best
 
 
+# A disk with less free space than this is not offered as the "fastest" pick:
+# transcripts/chat data needs real headroom for the DB + WAL + vocab snapshots.
+_FASTEST_MIN_FREE_BYTES = 2 * 1024**3
+
+
+def fastest_disk() -> str:
+    """Drive root (e.g. 'C:\\') of the fastest usable disk: best speed_rank
+    among drives with >= _FASTEST_MIN_FREE_BYTES free; ties broken by most
+    free space. '' when no usable drive exists (non-Windows host, probe
+    failures). The heavy-cache counterpart is biggest_fixed_drive().
+    """
+    best = ""
+    best_key: Optional[Tuple[int, int]] = None
+    for item in disk_inventory():
+        if item["free_bytes"] < _FASTEST_MIN_FREE_BYTES:
+            continue
+        key = (item["speed_rank"], -item["free_bytes"])
+        if best_key is None or key < best_key:
+            best, best_key = item["drive"], key
+    return best
+
+
 # --- relocation -----------------------------------------------------------
 
 def _same_volume(a: Path, b: Path) -> bool:

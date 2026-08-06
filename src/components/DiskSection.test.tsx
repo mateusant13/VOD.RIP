@@ -138,7 +138,7 @@ describe("DiskSection", () => {
     render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
     await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
     expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Takes effect after restart (moves the database)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "transcripts, chat data & preview cache — takes effect after restart (moves the database)" })).toBeInTheDocument();
     // Drive labels appear once per select (cache + data pickers).
     expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
     expect(screen.getAllByRole("option", { name: "D: (402 GB free, SSD)" })).toHaveLength(2);

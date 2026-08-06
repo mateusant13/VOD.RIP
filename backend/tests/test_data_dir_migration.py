@@ -1,6 +1,8 @@
 """data_dir wiring: archive_db._db_path follows the data-disk resolver and
 the one-time DB migration runs before the first connection at a new path."""
-from services import archive_db, settings as _settings
+from pathlib import Path
+
+from services import archive_db, disk_detect, disk_hygiene, settings as _settings
 
 
 def test_db_path_precedence(monkeypatch, tmp_path):
@@ -14,9 +16,25 @@ def test_db_path_precedence(monkeypatch, tmp_path):
     monkeypatch.delenv("VODRIP_ARCHIVE_DB")
     assert archive_db._db_path() == tmp_path / "data" / "archive.db"
 
-    # 3. Cleared -> default app-data location (unchanged behavior).
+    # 3. Cleared -> auto: fastest usable drive when one exists; no drives
+    #    here, so the app-data location remains the fallback.
     monkeypatch.delenv("VODRIP_DATA_DIR")
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    monkeypatch.setattr(disk_detect, "disk_inventory", lambda: [])
     assert archive_db._db_path() == appdata / "archive.db"
+
+    # 4. Auto with a usable fastest drive -> <fastest>\VOD.RIP-data.
+    monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
+    monkeypatch.setattr(
+        disk_detect,
+        "disk_inventory",
+        lambda: [{
+            "drive": "H:\\", "label": "", "total_bytes": 10**12,
+            "free_bytes": 90 * 1024**3, "media_type": "NVMe",
+            "bus_type": "NVMe", "speed_rank": 1,
+        }],
+    )
+    assert archive_db._db_path() == Path("H:\\VOD.RIP-data") / "archive.db"
 
 
 def test_db_migrates_to_data_dir_before_first_open(monkeypatch, tmp_path):

@@ -98,7 +98,7 @@ describe("SettingsTab", () => {
     expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
     expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
     expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Takes effect after restart (moves the database)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "transcripts, chat data & preview cache — takes effect after restart (moves the database)" })).toBeInTheDocument();
   });
 
   it("keeps option rows compact: descriptions live on the (i) affordance, not as text", () => {
@@ -106,11 +106,11 @@ describe("SettingsTab", () => {
     render(<Harness />);
     // Descriptions must not render as body text...
     expect(screen.queryByText("Pre-loads preview data for faster first play (uses ~500MB download at boot)")).not.toBeInTheDocument();
-    expect(screen.queryByText("Takes effect after restart (moves the database)")).not.toBeInTheDocument();
+    expect(screen.queryByText("transcripts, chat data & preview cache — takes effect after restart (moves the database)")).not.toBeInTheDocument();
     expect(screen.queryByText("Exits VOD.RIP — cancels all downloads and closes the app.")).not.toBeInTheDocument();
     // ...but stay reachable via the hover/info buttons.
     expect(screen.getByRole("button", { name: "Pre-loads preview data for faster first play (uses ~500MB download at boot)" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Takes effect after restart (moves the database)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "transcripts, chat data & preview cache — takes effect after restart (moves the database)" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Exits VOD.RIP — cancels all downloads and closes the app." })).toBeInTheDocument();
   });
 
