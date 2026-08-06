@@ -80,7 +80,7 @@ export default function LocalFilePopup({
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
-  const [, setPos] = useState<PanelPos | null>(null);
+  const [pos, setPos] = useState<PanelPos | null>(null);
   /** Docked archive-search panel (global search — local files have no archive identity). */
   const [searchOpen, setSearchOpen] = useState(false);
   const platform = platformKey(item.platform);
@@ -138,11 +138,14 @@ export default function LocalFilePopup({
     });
   }, []);
 
+  // left/top come from state once a drag/resize has run (mount layout and
+  // mid-drag writes set them imperatively); before that, keep them out of
+  // the style prop so React never overwrites the imperative values.
   return (
     <div
       ref={containerRef}
       className={`fixed flex flex-col gap-2 bg-zinc-950 border-2 border-white p-3 select-none ${platformCardShadow(platform)}`}
-      style={{ zIndex, width: size.w, height: size.h }}
+      style={{ zIndex, width: size.w, height: size.h, ...(pos ? { left: pos.x, top: pos.y } : {}) }}
       onPointerDownCapture={onBringToFront}
     >
       <PanelResizeHandles onPointerDown={handleResize} />
