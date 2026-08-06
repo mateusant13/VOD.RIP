@@ -86,6 +86,8 @@ const PANEL_MIN_W = 220;
 const PANEL_MAX_W = 560;
 const PANEL_DEFAULT_W = 320;
 const PANEL_W_KEY = 'vodrip.preview.chatPanelWidth';
+/** Width the collapsed strip occupies (matches the w-7 button). */
+const PANEL_STRIP_W = 28;
 /** Matches the backend default; 12h+ of dense chat stays under this cap. */
 const PANEL_LIMIT = 200_000;
 const CHAT_ROW_H = 24;
@@ -96,12 +98,33 @@ const EMPTY_TRANSCRIPT: PreviewPanelTranscriptRow[] = [];
 const EMPTY_CHAT: PreviewPanelChatRow[] = [];
 const EMPTY_EVENTS: PreviewPanelEventRow[] = [];
 
+/** Persisted panel width (stored on drag commit). The rendered width may be
+ *  clamped below it by the host's `maxWidth`; the stored value resurfaces
+ *  when the host has room again. */
+export function readPreviewChatPanelWidth(): number {
+  try {
+    const w = Number(localStorage.getItem(PANEL_W_KEY));
+    return w >= PANEL_MIN_W && w <= PANEL_MAX_W ? w : PANEL_DEFAULT_W;
+  } catch {
+    return PANEL_DEFAULT_W;
+  }
+}
+
 interface PreviewChatPanelProps {
   platform: string | null;
   videoId: string | null;
   currentTime: number;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
+  /** Cap on the rendered width. The host reserves player space so the video
+   *  never drops below its layout minimum; below PANEL_MIN_W there is no room
+   *  at all and the panel collapses to zero width (no strip). Defaults to the
+   *  panel's own max (no cap). */
+  maxWidth?: number;
+  /** Reports the space the panel actually occupies: width = rendered width
+   *  (open), strip width (collapsed), or 0 (space-forced). The explore popup
+   *  sizes its container from this. */
+  onLayoutChange?: (info: { open: boolean; width: number }) => void;
 }
 
 const TABS: ReadonlyArray<{
@@ -246,17 +269,12 @@ export function PreviewChatPanel({
   videoId,
   currentTime,
   hidden = false,
+  maxWidth: maxWidthProp,
+  onLayoutChange,
 }: PreviewChatPanelProps) {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<PreviewPanelTab>('chat');
-  const [width, setWidth] = useState<number>(() => {
-    try {
-      const w = Number(localStorage.getItem(PANEL_W_KEY));
-      return w >= PANEL_MIN_W && w <= PANEL_MAX_W ? w : PANEL_DEFAULT_W;
-    } catch {
-      return PANEL_DEFAULT_W;
-    }
-  });
+  const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
   const [payload, setPayload] = useState<PreviewPanelPayload | null>(null);
   const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [retryTick, setRetryTick] = useState(0);
@@ -537,8 +555,18 @@ export function PreviewChatPanel({
   );
 
   // ── Self-contained width resize (rAF + pointer capture + direct writes) ---
-  const widthRef = useRef(width);
-  widthRef.current = width;
+  const widthCap = Math.min(PANEL_MAX_W, maxWidthProp ?? PANEL_MAX_W);
+  const spaceForced = open && widthCap < PANEL_MIN_W;
+  const renderedW = spaceForced ? 0 : open ? Math.min(width, widthCap) : PANEL_STRIP_W;
+  const widthRef = useRef(renderedW);
+  widthRef.current = renderedW;
+
+  // The host (main preview / explore popup) reserves player space so the
+  // video never drops below its layout minimum — report what we actually
+  // occupy so the popup can size its container.
+  useEffect(() => {
+    onLayoutChange?.({ open: open && !spaceForced, width: renderedW });
+  }, [onLayoutChange, open, spaceForced, renderedW]);
 
   const onResizeStart = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -555,7 +583,11 @@ export function PreviewChatPanel({
     const onMove = (ev: PointerEvent) => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
-        const w = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, startW + (startX - ev.clientX)));
+        // Clamp to the host's cap: the player's minimum width wins over the
+        // user's wider preference while space is tight (stored width keeps
+        // the preference; it resurfaces when the cap lifts).
+        const raw = startW + (startX - ev.clientX);
+        const w = Math.min(widthCap, Math.max(PANEL_MIN_W, raw));
         widthRef.current = w;
         // Direct style write: zero React re-renders while dragging.
         el.style.width = `${w}px`;
@@ -571,18 +603,20 @@ export function PreviewChatPanel({
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onUp);
-      const w = widthRef.current;
+      const raw = startW + (startX - ev.clientX);
+      const stored = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, raw));
+      widthRef.current = Math.min(widthCap, stored);
       try {
-        localStorage.setItem(PANEL_W_KEY, String(w));
+        localStorage.setItem(PANEL_W_KEY, String(stored));
       } catch {
         /* storage blocked */
       }
-      setWidth(w); // state commit on pointerup only
+      setWidth(stored); // state commit on pointerup only
     };
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onUp);
-  }, []);
+  }, [widthCap]);
 
   // ── Render ----------------------------------------------------------------
   return (
@@ -590,9 +624,9 @@ export function PreviewChatPanel({
       ref={panelRef}
       data-preview-chat-panel
       className={`shrink-0 self-stretch min-w-0 ${hidden ? 'hidden' : ''}`}
-      style={open ? { width } : undefined}
+      style={spaceForced ? { width: 0 } : open ? { width: renderedW } : undefined}
     >
-      {!open ? (
+      {spaceForced ? null : !open ? (
         <button
           type="button"
           data-preview-chat-panel-collapsed

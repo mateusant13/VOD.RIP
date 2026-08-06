@@ -7,6 +7,7 @@ import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchA
 import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
+import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 import {
@@ -170,6 +171,17 @@ export default function ChannelExplorePopup({
   const [sessionDurationSec, setSessionDurationSec] = useState(0);
   const [windowHlsMuxEndSec, setWindowHlsMuxEndSec] = useState(0);
   const [panelWidth, setPanelWidth] = useState(EXPLORE_PANEL_DEFAULT_W);
+  /** Chat-history column alongside the video; the panel reports its footprint.
+   *  The container grows to panelWidth + footprint so the video never shrinks
+   *  when the chat opens. */
+  const [chatInfo, setChatInfo] = useState<{ open: boolean; width: number }>(() => ({
+    open: true,
+    width: readPreviewChatPanelWidth(),
+  }));
+  const chatTotalRef = useRef(0);
+  const chatTotal = chatInfo.open ? chatInfo.width + 8 : chatInfo.width; // gap-2 row
+  chatTotalRef.current = chatTotal;
+  const containerW = panelWidth + chatTotal;
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [pos, setPos] = useState<PanelPos | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
@@ -876,19 +888,21 @@ export default function ChannelExplorePopup({
       aspect: videoAspectRef.current,
       posRef,
       setPos,
-      clampWidth: (w) => clampExplorePanelWidth(w, chromeHRef.current, videoAspectRef.current),
+      // The drag resizes the video; the container is video + chat footprint.
+      clampWidth: (w) =>
+        Math.max(60, clampExplorePanelWidth(w + chatTotal, chromeHRef.current, videoAspectRef.current) - chatTotal),
     });
-  }, []);
+  }, [chatTotal]);
 
   const onPopupDrag = useCallback((e: ReactPointerEvent<HTMLElement>) => {
     if (fullscreen) return;
     const t = e.target as HTMLElement;
     if (t.tagName === 'VIDEO') return;
-    if (t.closest('button, input, select, textarea, a, [role="slider"], [data-player-menu]')) return;
+    if (t.closest('button, input, select, textarea, a, [role="slider"], [data-player-menu], [data-preview-chat-panel]')) return;
     const el = containerRef.current;
     if (!el) return;
     if (!posRef.current) {
-      posRef.current = layoutExplorePopupWindow(el, panelWidthRef.current, posRef, stackIndex);
+      posRef.current = layoutExplorePopupWindow(el, panelWidthRef.current + chatTotal, posRef, stackIndex);
       setPos(posRef.current);
     }
     startFloatingPanelDrag(e, posRef, setPos, el);
@@ -949,7 +963,7 @@ export default function ChannelExplorePopup({
       } else if (posRef.current) {
         applyExplorePopupWindowPosition(el, posRef.current);
       } else {
-        const p = layoutExplorePopupWindow(el, panelWidthRef.current, posRef, stackIndex);
+        const p = layoutExplorePopupWindow(el, panelWidthRef.current + chatTotal, posRef, stackIndex);
         setPos(p);
       }
       void syncPlaybackToViewport(fs);
@@ -961,7 +975,7 @@ export default function ChannelExplorePopup({
   useEffect(() => {
     if (!ready || fullscreen) return;
     void syncPlaybackToViewport();
-  }, [ready, fullscreen, panelWidth, videoAspect, syncPlaybackToViewport]);
+  }, [ready, fullscreen, panelWidth, videoAspect, chatTotal, syncPlaybackToViewport]);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -970,23 +984,26 @@ export default function ChannelExplorePopup({
       applyExplorePopupFullscreenPosition(el);
       return;
     }
-    const p = layoutExplorePopupWindow(el, panelWidth, posRef, stackIndex);
+    const p = layoutExplorePopupWindow(el, containerW, posRef, stackIndex);
     setPos((prev) => (prev?.x === p.x && prev?.y === p.y ? prev : p));
-  }, [fullscreen, panelWidth, videoAspect, stackIndex]);
+  }, [fullscreen, containerW, videoAspect, stackIndex]);
 
   useEffect(() => {
     if (fullscreen) return;
     const fit = () => {
-      const clampedW = clampExplorePanelWidth(
-        panelWidthRef.current,
+      // Clamp the total (video + chat) to the viewport budget; the video
+      // keeps the remainder (60px floor while the chat is open).
+      const totalW = clampExplorePanelWidth(
+        panelWidthRef.current + chatTotalRef.current,
         chromeHRef.current,
         videoAspectRef.current,
       );
+      const clampedW = Math.max(60, totalW - chatTotalRef.current);
       panelWidthRef.current = clampedW;
       setPanelWidth(clampedW);
       const el = containerRef.current;
       if (!el) return;
-      const p = layoutExplorePopupWindow(el, clampedW, posRef, stackIndex);
+      const p = layoutExplorePopupWindow(el, totalW, posRef, stackIndex);
       setPos(p);
     };
     window.addEventListener('resize', fit);
@@ -1432,7 +1449,7 @@ export default function ChannelExplorePopup({
       } : {
         position: 'fixed',
         zIndex,
-        width: panelWidth,
+        width: containerW,
         ...(pos
           ? { top: pos.y, left: pos.x, right: 'auto', bottom: 'auto' }
           : {
@@ -1507,6 +1524,8 @@ export default function ChannelExplorePopup({
             </div>
           </div>
         )}
+        <div className={fullscreen ? 'relative flex flex-col gap-0 min-w-0 flex-1 min-h-0 w-full' : 'flex flex-row gap-2 min-w-0 min-h-0'}>
+          <div className={`relative flex flex-col ${fullscreen ? 'h-full min-h-0 gap-0 w-full' : 'gap-2 min-w-0 flex-1'}`}>
         <div
           ref={videoWrapRef}
           className={`relative bg-black overflow-hidden w-full cursor-pointer ${
@@ -1559,11 +1578,12 @@ export default function ChannelExplorePopup({
               }
               videoAspectRef.current = aspect;
               setVideoAspect(aspect);
-              const clampedW = clampExplorePanelWidth(
-                panelWidthRef.current,
+              const totalW = clampExplorePanelWidth(
+                panelWidthRef.current + chatTotalRef.current,
                 chromeHRef.current,
                 aspect,
               );
+              const clampedW = Math.max(60, totalW - chatTotalRef.current);
               panelWidthRef.current = clampedW;
               setPanelWidth(clampedW);
             }}
@@ -1647,6 +1667,53 @@ export default function ChannelExplorePopup({
             />
           </div>
         )}
+        {!fullscreen && (
+          <>
+            {timelineUi}
+            <p className="text-[8px] font-mono text-zinc-600 uppercase tracking-wider text-center shrink-0">
+              Fullscreen to explore
+            </p>
+            <div className="flex items-center justify-between gap-2 shrink-0">
+              <div className="flex items-center gap-1.5">
+                <button type="button" onClick={togglePlay} disabled={!ready} className={ctrlBtn(false)}>
+                  {playing ? <Pause size={18} /> : <Play size={18} />}
+                </button>
+                {volumeUi(false)}
+                <button
+                  type="button"
+                  onClick={() => onCarryToUrl(vod)}
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                  title="Send to URL panel for rip"
+                >
+                  <ArrowRightToLine size={14} />
+                  URL
+                </button>
+              </div>
+              <div className="flex items-center gap-1.5 ml-auto">
+                {qualityUi(false)}
+                <button
+                  type="button"
+                  onClick={() => void toggleFullscreen()}
+                  disabled={!ready}
+                  className={platformPreviewCtrlBtn(platform, false, true)}
+                  title="Fullscreen"
+                >
+                  <Maximize2 size={18} />
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+          </div>
+          {!fullscreen && (
+            <PreviewChatPanel
+              platform={platform}
+              videoId={vod.videoId ?? null}
+              currentTime={currentTime}
+              onLayoutChange={setChatInfo}
+            />
+          )}
+        </div>
         {fullscreen && (
           <>
             <div
@@ -1695,43 +1762,6 @@ export default function ChannelExplorePopup({
               title="Exit fullscreen"
               onClick={() => void toggleFullscreen()}
             />
-          </>
-        )}
-        {!fullscreen && (
-          <>
-            {timelineUi}
-            <p className="text-[8px] font-mono text-zinc-600 uppercase tracking-wider text-center shrink-0">
-              Fullscreen to explore
-            </p>
-            <div className="flex items-center justify-between gap-2 shrink-0">
-              <div className="flex items-center gap-1.5">
-                <button type="button" onClick={togglePlay} disabled={!ready} className={ctrlBtn(false)}>
-                  {playing ? <Pause size={18} /> : <Play size={18} />}
-                </button>
-                {volumeUi(false)}
-                <button
-                  type="button"
-                  onClick={() => onCarryToUrl(vod)}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                  title="Send to URL panel for rip"
-                >
-                  <ArrowRightToLine size={14} />
-                  URL
-                </button>
-              </div>
-              <div className="flex items-center gap-1.5 ml-auto">
-                {qualityUi(false)}
-                <button
-                  type="button"
-                  onClick={() => void toggleFullscreen()}
-                  disabled={!ready}
-                  className={platformPreviewCtrlBtn(platform, false, true)}
-                  title="Fullscreen"
-                >
-                  <Maximize2 size={18} />
-                </button>
-              </div>
-            </div>
           </>
         )}
       </div>

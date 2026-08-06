@@ -6001,6 +6001,11 @@ export default function App() {
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
               hidden={previewFullscreen}
+              // Reserve the player's layout minimum: the chat panel may never
+              // eat into it, whatever the user's stored panel width says
+              // (gap-2 row = 8px). Below the panel's own minimum there is no
+              // room for chat at all and it collapses to zero width.
+              maxWidth={Math.max(0, effectivePreviewPanelWidth - PREVIEW_PANEL_MIN_W - 8)}
             />
           </div>
           {!previewFullscreen && (
