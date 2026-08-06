@@ -34,6 +34,7 @@ from routers import (
     settings,
     subtitles,
     system,
+    twitch_clips,
 )
 
 logger = logging.getLogger(__name__)
@@ -599,6 +600,7 @@ app.include_router(entities.router)
 app.include_router(cookie_bridge.router)
 app.include_router(disk.router)
 app.include_router(subtitles.router)
+app.include_router(twitch_clips.router)
 
 
 def _warm_youtube_session() -> None:

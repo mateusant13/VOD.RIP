@@ -42,8 +42,7 @@ function renderTab(over: { queue?: DownloadState[]; history?: DownloadState[] } 
 describe('QueueTab', () => {
   it('renders queue and history rows with enlarged (w-20 h-12) thumbnails', () => {
     renderTab();
-    expect(screen.getByText('Queue')).toBeInTheDocument();
-    expect(screen.getByText('History')).toBeInTheDocument();
+    expect(screen.getAllByText('History').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('VOD A')).toBeInTheDocument();
     expect(screen.getByText('VOD B')).toBeInTheDocument();
     const thumbs = document.querySelectorAll('img');

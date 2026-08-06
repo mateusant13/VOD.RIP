@@ -7,8 +7,9 @@ import {
   Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical,
+  GripVertical, Clapperboard,
 } from 'lucide-react';
+import { openTwitchClipEditor, twitchClipDurationError } from './twitchClip';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import { buildArchiveVodUrl, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
@@ -444,6 +445,10 @@ export default function App() {
   const [urlTabBarHidden, setUrlTabBarHidden] = useState(false);
   const [previewTrimStart, setPreviewTrimStart] = useState(0);
   const [previewTrimEnd, setPreviewTrimEnd] = useState(3600);
+  /** Twitch clip editor open — transient notice shown in the transport row. */
+  const [clipOpenNotice, setClipOpenNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [clipOpening, setClipOpening] = useState(false);
+  const clipOpenNoticeTimerRef = useRef<number | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const previewPlayheadRef = useRef<HTMLDivElement>(null);
   const previewCurrentTimeRef = useRef(0);
@@ -2972,6 +2977,7 @@ export default function App() {
       views: v.views ?? null,
       duration_string: v.duration_string ?? null,
       channel_language: v.channel_language ?? null,
+      channel: v.channel,
       // Native id, same format as the archive DB videos.video_id (Twitch ids
       // come 'v'-prefixed from the API; the archive stores the bare digits).
       videoId: v.platform === 'Twitch' && v.id.startsWith('v') ? v.id.slice(1) : v.id,
@@ -3025,6 +3031,7 @@ export default function App() {
       isClip: false,
       initialTimeSec: hit.offset_sec,
       videoId: hit.video_id,
+      channel: video?.channel ?? undefined,
     };
     setExplorePopups((prev) => {
       const next = prev.filter((p) => p.vod.url !== vodUrl);
@@ -5568,6 +5575,51 @@ export default function App() {
     return () => rail.removeEventListener('wheel', onWheel);
   }, [previewOpen, vodDurationSec, previewTrimView, bumpPreviewFsControls]);
 
+  const showClipOpenNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+    if (clipOpenNoticeTimerRef.current) window.clearTimeout(clipOpenNoticeTimerRef.current);
+    setClipOpenNotice({ kind, text });
+    clipOpenNoticeTimerRef.current = window.setTimeout(() => setClipOpenNotice(null), 4000);
+  }, []);
+
+  /** Open Twitch's clip editor pre-positioned on the selected range. */
+  const openPreviewTwitchClip = useCallback(async () => {
+    const login = (videoInfo?.channel || '').trim();
+    if (!login) {
+      showClipOpenNotice('error', 'Extract VOD info first (need the channel login)');
+      return;
+    }
+    if (isClipUrl(url.trim())) {
+      showClipOpenNotice('error', 'A clip can\u2019t be clipped');
+      return;
+    }
+    if (!isLive) {
+      const err = twitchClipDurationError(previewClipLengthSec);
+      if (err) {
+        showClipOpenNotice('error', err);
+        return;
+      }
+    }
+    const vodId = isLive ? undefined : (archiveVideoIdFromUrl(url) ?? undefined);
+    if (!isLive && !vodId) {
+      showClipOpenNotice('error', 'Not a Twitch VOD URL');
+      return;
+    }
+    setClipOpening(true);
+    try {
+      const res = await openTwitchClipEditor({
+        broadcasterLogin: login,
+        vodId,
+        offsetSec: isLive ? undefined : Math.max(0, Math.floor(previewTrimEnd)),
+        durationSec: isLive ? undefined : Math.round(previewClipLengthSec),
+      });
+      showClipOpenNotice('ok', `Twitch clip editor opened — ${res.url}`);
+    } catch {
+      showClipOpenNotice('error', 'Failed to open the Twitch clip editor');
+    } finally {
+      setClipOpening(false);
+    }
+  }, [videoInfo?.channel, isLive, url, previewClipLengthSec, previewTrimEnd, showClipOpenNotice]);
+
   const previewClipPct = vodDurationSec > 0
     ? {
         start: secToFrac(previewTrimStart, previewTrimView) * 100,
@@ -5738,6 +5790,24 @@ export default function App() {
         })}
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
+        {urlPlatform === 'twitch' && (
+          <button
+            type="button"
+            onClick={() => void openPreviewTwitchClip()}
+            disabled={clipOpening || !videoInfo?.channel?.trim()}
+            className={previewCtrlBtn(previewFullscreen, true)}
+            title={
+              !videoInfo?.channel?.trim()
+                ? 'Extract VOD info first to enable Twitch clip'
+                : isLive
+                  ? 'Open Twitch clip editor for this live stream'
+                  : 'Open Twitch clip editor on the selected range (max 60s)'
+            }
+          >
+            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <Clapperboard size={16} />}
+            <span className="text-[9px] font-bold tracking-wider">CLIP</span>
+          </button>
+        )}
         {isLive && (
           <button
             type="button"
@@ -5993,6 +6063,14 @@ export default function App() {
               >
                 {previewTimelineUi}
                 {previewTransportUi({ fsCornerExit: previewFullscreen })}
+                {clipOpenNotice && (
+                  <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider px-1 ${
+                    clipOpenNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+                  }`}>
+                    <AlertCircle size={11} className="shrink-0" />
+                    <span className="truncate">{clipOpenNotice.text}</span>
+                  </div>
+                )}
               </div>
               {previewFullscreen && (
                 <div
@@ -6125,7 +6203,7 @@ export default function App() {
               {t === 'channels' && <Users size={14} className="shrink-0" />}
               {t === 'queue' && <Download size={14} className="shrink-0" />}
               {t === 'settings' && <Settings2 size={14} className="shrink-0" />}
-              <span className="truncate">{t === 'url' ? 'URL' : t === 'channels' ? 'CHANNELS' : t === 'queue' ? 'QUEUE' : 'SETTINGS'}</span>
+              <span className="truncate">{t === 'url' ? 'URL' : t === 'channels' ? 'CHANNELS' : t === 'queue' ? 'HISTORY' : 'SETTINGS'}</span>
             </button>
           ))}
         </div>

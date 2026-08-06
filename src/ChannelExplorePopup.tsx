@@ -4,8 +4,10 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search, Clapperboard, AlertCircle } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
+import { archiveVideoIdFromUrl } from './archiveScope';
+import { openTwitchClipEditor } from './twitchClip';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -101,6 +103,8 @@ export interface ExplorePopupVod {
   /** Native archive video id (same value as archive DB videos.video_id) —
    *  enables the header's SEARCH THIS VIDEO button; absent → button hidden. */
   videoId?: string;
+  /** Channel slug/login (broadcaster login for Twitch) — enables the CLIP button. */
+  channel?: string;
   /** WS-3: detected channel language ('' / absent = unknown). */
   channel_language?: string | null;
 }
@@ -167,6 +171,10 @@ export default function ChannelExplorePopup({
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  /** Twitch clip editor open — transient notice in the transport row. */
+  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [clipOpening, setClipOpening] = useState(false);
+  const clipNoticeTimerRef = useRef<number | null>(null);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
   const [sessionDurationSec, setSessionDurationSec] = useState(0);
   const [windowHlsMuxEndSec, setWindowHlsMuxEndSec] = useState(0);
@@ -1423,6 +1431,66 @@ export default function ChannelExplorePopup({
     />
   );
 
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+    if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
+    setClipNotice({ kind, text });
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+  }, []);
+
+  /** Open Twitch's clip editor on the current playhead position. */
+  const openExploreTwitchClip = useCallback(async () => {
+    const login = (vod.channel || '').trim();
+    const vodId = vod.videoId ?? archiveVideoIdFromUrl(vod.url) ?? undefined;
+    if (!login) {
+      showClipNotice('error', 'Channel login missing — cannot open the Twitch editor');
+      return;
+    }
+    if (!vodId) {
+      showClipNotice('error', 'Not a Twitch VOD URL');
+      return;
+    }
+    setClipOpening(true);
+    try {
+      const res = await openTwitchClipEditor({
+        broadcasterLogin: login,
+        vodId,
+        offsetSec: Math.max(0, Math.floor(currentTime)),
+      });
+      showClipNotice('ok', `Twitch clip editor opened — ${res.url}`);
+    } catch {
+      showClipNotice('error', 'Failed to open the Twitch clip editor');
+    } finally {
+      setClipOpening(false);
+    }
+  }, [vod.channel, vod.videoId, vod.url, currentTime, showClipNotice]);
+
+  const exploreClipBtn = (fs: boolean) => (
+    <button
+      type="button"
+      onClick={() => void openExploreTwitchClip()}
+      disabled={clipOpening || !vod.channel?.trim()}
+      className={fs ? fsCtrlBtn : ctrlBtn(false)}
+      title={
+        !vod.channel?.trim()
+          ? 'Channel login missing — cannot open the Twitch editor'
+          : 'Open Twitch clip editor on the current moment'
+      }
+    >
+      {clipOpening ? <Loader2 size={18} className="animate-spin" /> : <Clapperboard size={18} />}
+    </button>
+  );
+
+  const clipNoticeUi = (
+    <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider px-1 ${
+      clipNotice?.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+    }`}>
+      <AlertCircle size={11} className="shrink-0" />
+      <span className="truncate">{clipNotice?.text}</span>
+    </div>
+  );
+
+  const showClipButton = platform === 'twitch' && !vod.isClip;
+
   return (
     <div
       ref={containerRef}
@@ -1679,6 +1747,7 @@ export default function ChannelExplorePopup({
                   {playing ? <Pause size={18} /> : <Play size={18} />}
                 </button>
                 {volumeUi(false)}
+                {showClipButton && exploreClipBtn(false)}
                 <button
                   type="button"
                   onClick={() => onCarryToUrl(vod)}
@@ -1702,6 +1771,7 @@ export default function ChannelExplorePopup({
                 </button>
               </div>
             </div>
+            {clipNotice && clipNoticeUi}
           </>
         )}
           </div>
@@ -1733,6 +1803,7 @@ export default function ChannelExplorePopup({
                     {playing ? <Pause size={18} /> : <Play size={18} />}
                   </button>
                   {volumeUi(true)}
+                  {showClipButton && exploreClipBtn(true)}
                   <button
                     type="button"
                     onClick={() => onCarryToUrl(vod)}
@@ -1756,6 +1827,7 @@ export default function ChannelExplorePopup({
                   </button>
                 </div>
               </div>
+              {clipNotice && clipNoticeUi}
             </div>
             <div
               className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"

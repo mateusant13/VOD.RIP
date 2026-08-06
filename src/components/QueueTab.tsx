@@ -1,10 +1,13 @@
 
-import { FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Clapperboard, ExternalLink, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
 import { vodCheckboxStyle, platformAccentColor } from '../platformColors';
 import { ActiveDownloadsList } from './ActiveDownloadsList';
 import DownloadThumb from './DownloadThumb';
 import PlatformVodIcon from './PlatformVodIcon';
 import type { DownloadState } from '../types';
+import { fetchTwitchClipHistory, type TwitchClipRecord } from '../twitchClip';
+import { formatHmsFull } from '../utils';
 
 function isPlayableLocalFile(path: string): boolean {
   return /\.(mp4|mkv|webm|mov|m4v)$/i.test(path);
@@ -59,12 +62,24 @@ export default function QueueTab({
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
   const historyAllSelected = historyDownloads.length > 0 && selectedHistoryIds?.size === historyDownloads.length;
+  const [twitchClips, setTwitchClips] = useState<TwitchClipRecord[]>([]);
+  const [twitchClipsLoading, setTwitchClipsLoading] = useState(false);
+  const loadTwitchClips = () => {
+    setTwitchClipsLoading(true);
+    fetchTwitchClipHistory()
+      .then((rows) => setTwitchClips(rows))
+      .catch(() => setTwitchClips([]))
+      .finally(() => setTwitchClipsLoading(false));
+  };
+  useEffect(() => {
+    loadTwitchClips();
+  }, []);
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-          Queue
+          History
         </span>
         <div className="flex items-center gap-2">
           {selectedQueueIds && selectedQueueIds.size > 0 && (
@@ -295,6 +310,56 @@ export default function QueueTab({
             );
           })}
         </div>
+      </div>
+
+      <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1.5">
+            <Clapperboard size={11} className="text-[#9146FF]" />
+            Twitch Clips
+          </span>
+          <button
+            type="button"
+            onClick={loadTwitchClips}
+            className={`text-zinc-500 hover:text-white transition-colors ${twitchClipsLoading ? 'animate-spin' : ''}`}
+            title="Refresh Twitch clip history"
+          >
+            <RefreshCw size={14} />
+          </button>
+        </div>
+        {twitchClips.length === 0 ? (
+          <div className="text-center text-zinc-600 font-mono text-xs py-4 border-2 border-dashed border-zinc-800">
+            NO TWITCH CLIPS YET — use the CLIP button in a Twitch preview.
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {twitchClips.map((c) => (
+              <div key={c.id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex items-center gap-3">
+                <Clapperboard size={14} className="shrink-0 text-[#9146FF]" />
+                <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+                  <span className="text-xs font-mono text-zinc-300 truncate">
+                    {c.channel}
+                    {c.vod_id ? ` · VOD ${c.vod_id}` : ' · live'}
+                    {c.duration_sec ? ` · ${Math.round(c.duration_sec)}s` : ''}
+                  </span>
+                  <span className="text-[10px] font-mono text-zinc-500 truncate">
+                    {c.offset_sec != null ? `offset ${formatHmsFull(c.offset_sec)} · ` : ''}
+                    {new Date(c.created_at).toLocaleString()}
+                  </span>
+                </div>
+                <a
+                  href={c.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
+                  title="Open Twitch clip editor"
+                >
+                  <ExternalLink size={12} /> Editor
+                </a>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

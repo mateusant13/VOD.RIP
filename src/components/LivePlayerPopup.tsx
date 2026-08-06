@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X, Clapperboard, AlertCircle } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
+import { openTwitchClipEditor } from '../twitchClip';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
 import type { ArchiveSearchHit, ArchiveVideoRow } from '../archiveSearchUtils';
@@ -151,6 +152,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const [muted, setMuted] = useState(true);
   const [volume, setVolume] = useState(1);
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
+  /** Twitch clip editor open — transient notice in the transport row. */
+  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [clipOpening, setClipOpening] = useState(false);
+  const clipNoticeTimerRef = useRef<number | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   /** Docked archive-search panel (global search — live has no archive identity). */
   const [searchOpen, setSearchOpen] = useState(false);
@@ -877,8 +882,31 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     false,
   );
 
-  const archiveAvailable = archiveReady;
-  // Live rail: pinned at the archive edge; dragging back opens REPLAY.
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+    if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
+    setClipNotice({ kind, text });
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+  }, []);
+
+  /** Open Twitch's clip editor for the live broadcast (web editor picks the window). */
+  const openLiveTwitchClip = useCallback(async () => {
+    const login = (channelSlug || '').trim();
+    if (!login) {
+      showClipNotice('error', 'Channel login missing — cannot open the Twitch editor');
+      return;
+    }
+    setClipOpening(true);
+    try {
+      const res = await openTwitchClipEditor({ broadcasterLogin: login });
+      showClipNotice('ok', `Twitch clip editor opened — ${res.url}`);
+    } catch {
+      showClipNotice('error', 'Failed to open the Twitch clip editor');
+    } finally {
+      setClipOpening(false);
+    }
+  }, [channelSlug, showClipNotice]);
+
+  const archiveAvailable = archiveReady;  // Live rail: pinned at the archive edge; dragging back opens REPLAY.
   // Replay rail: full snapshot duration; max follows hls.js video.duration.
   const railMax = mode === 'live'
     ? (archiveDuration > 0 ? archiveDuration : 1)
@@ -1166,6 +1194,22 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               </div>
 
               <div className="ml-auto flex items-center gap-1.5">
+                {(activeEntry.platform || '').toLowerCase() === 'twitch' && (
+                  <button
+                    type="button"
+                    onClick={() => void openLiveTwitchClip()}
+                    disabled={clipOpening || !channelSlug?.trim()}
+                    className={transportBtn}
+                    title={
+                      !channelSlug?.trim()
+                        ? 'Channel login missing — cannot open the Twitch editor'
+                        : 'Open Twitch clip editor for this live stream'
+                    }
+                  >
+                    {clipOpening ? <Loader2 size={15} className="animate-spin" /> : <Clapperboard size={15} />}
+                    <span className="text-[9px] font-bold tracking-wider">CLIP</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
@@ -1199,6 +1243,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 </button>
               </div>
             </div>
+            {clipNotice && (
+              <div className={`mt-1 flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
+                clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+              }`}>
+                <AlertCircle size={11} className="shrink-0" />
+                <span className="truncate">{clipNotice.text}</span>
+              </div>
+            )}
           </div>
         )}
       </div>
