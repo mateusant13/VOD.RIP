@@ -5091,6 +5091,16 @@ export default function App() {
     return archiveVideoIdFromUrl(url);
   }, [videoInfo?.id, url]);
 
+  /** Stable scope object for the preview-search popup. App rebuilds this
+   *  inline on every render (preview time sync re-renders constantly); the
+   *  popup's search effect depends on the scope CONTENT, but a raw literal
+   *  would still churn the whole popup subtree each tick. Memoize on the
+   *  primitive values so the prop identity is stable. */
+  const previewSearchScope = useMemo(
+    () => (previewArchiveVideoId ? { videoId: previewArchiveVideoId, title: videoInfo?.title ?? '' } : undefined),
+    [previewArchiveVideoId, videoInfo?.title],
+  );
+
   const estBytes = estimateDownloadBytes(
     videoInfo,
     quality,
@@ -6798,7 +6808,7 @@ export default function App() {
           onClose={() => setPreviewSearchOpen(false)}
           onOpenHit={openArchiveHit}
           onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
-          scope={previewArchiveVideoId ? { videoId: previewArchiveVideoId, title: videoInfo?.title ?? '' } : undefined}
+          scope={previewSearchScope}
           savedChannels={savedChannels}
         />
       )}

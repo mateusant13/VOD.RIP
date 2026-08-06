@@ -5,7 +5,10 @@ import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './typ
 
 /** Warm response cache — skip recently-warmed URLs to avoid redundant POSTs. */
 const _warmCache = new Map<string, number>();
-const _WARM_CACHE_TTL_MS = 120_000; // 2 min
+// 10 min (was 2 min): the 120s TTL re-fired the channel-rail warm every
+// ~2 min (observed `extract ok` storm), and the backend extract cache
+// (now 128 slots) keeps those entries alive — 2-min re-warm was pure churn.
+const _WARM_CACHE_TTL_MS = 600_000;
 
 // Rehydrate from localStorage so restarts reuse recent warms.
 (function _initWarmCache() {

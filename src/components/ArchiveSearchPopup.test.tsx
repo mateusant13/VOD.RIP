@@ -650,6 +650,128 @@ describe('ArchiveSearchPopup', () => {
     expect(localUrls(searchUrls(fetchMock)).length).toBe(count);
   });
 
+  it('scope object identity changes (App re-renders) do not re-fire the search', async () => {
+    // App passes the preview-search scope as an inline literal — a NEW
+    // object on every render (the preview player re-renders App on time
+    // sync). The search effect must depend on the scope's CONTENT, not its
+    // identity, or every parent render re-issues the request (the observed
+    // storm: GET /api/archive/search?q=...&video_id=... re-firing every
+    // ~1-2s for 25+ minutes). The response also updates enriching +
+    // channel_hint — those must not feed back into the search either.
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search/remote')) {
+        return new Response(
+          JSON.stringify({ hits: [], error: null }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/search')) {
+        return new Response(
+          JSON.stringify({
+            hits: [HIT],
+            enriching: [{ platform: 'twitch', video_id: 'v2', kind: 'chat_backfill', channel: 'srdogg', title: 'VOD B' }],
+            channel_hint: 'srdogg',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    // Local search calls only — the remote channel-title request legitimately
+    // fires when the hint arrives and would pollute a raw count.
+    const localSearchCount = () =>
+      searchUrls(fetchMock).filter(
+        (u) => u.includes('q=maranguape') && !u.includes('/api/archive/search/remote'),
+      ).length;
+
+    const { rerender } = render(
+      <ArchiveSearchPopup
+        zIndex={10}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+        scope={{ videoId: 'v1', title: 'VOD A' }}
+      />,
+    );
+    const input = screen.getByPlaceholderText('SEARCH THIS VIDEO...');
+    fireEvent.change(input, { target: { value: 'maranguape' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=maranguape')).toBeTruthy());
+    // Response state settled: hits + enriching + channel_hint applied.
+    await screen.findByLabelText('Channel scope hint');
+    const countAfterSettle = localSearchCount();
+    expect(countAfterSettle).toBeGreaterThan(0);
+
+    // Simulate an App re-render: a fresh inline scope object with identical
+    // content (identity changed, meaning did not).
+    rerender(
+      <ArchiveSearchPopup
+        zIndex={10}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+        scope={{ videoId: 'v1', title: 'VOD A' }}
+      />,
+    );
+    await new Promise<void>((r) => setTimeout(r, 150));
+    expect(localSearchCount()).toBe(countAfterSettle);
+  });
+
+  it('chat hit opens the whole history from the hit (half=0), not a ±30s slice', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'at the hit' },
+              { platform: 'twitch', video_id: 'v1', offset_sec: 500, username: 'bob', text: 'way past the old 60s window' },
+              { platform: 'twitch', video_id: 'v1', offset_sec: 1000, username: 'carol', text: 'end of vod' },
+            ],
+            truncated: false,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    fireEvent.click(row);
+    // From-offset mode: half=0, anchored at the hit.
+    const chatUrl = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .find((u) => u.includes('/chat?'));
+    expect(chatUrl).toContain('half=0');
+    expect(chatUrl).toContain('offset=42');
+    // Rows far beyond ±30s render — the whole remaining history is fed in.
+    await screen.findByText(/way past the old 60s window/i);
+    expect(screen.getByText(/end of vod/i)).toBeInTheDocument();
+    // Marker line preserved at the hit offset.
+    expect(screen.getByText(/Hit moment 00:42/)).toBeInTheDocument();
+  });
+
   it('spam_count badge: ×N on collapsed rows, absent for single messages', async () => {
     const fetchMock = mockFetch([HIT], {});
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {

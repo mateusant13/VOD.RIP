@@ -155,7 +155,9 @@ _EXTRACT_INFLIGHT: dict[str, tuple[threading.Event, dict]] = {}
 _EXTRACT_CACHE_LOCK = threading.Lock()
 # yt-dlp getpot_wpc registers globally ÔÇö guarded_youtube_dl serializes all YoutubeDL().
 _EXTRACT_CACHE_TTL_SEC = 6 * 3600
-_EXTRACT_CACHE_MAX = 32
+# Startup warms ~40 VODs; a 32-slot cache evicted those entries mid-wave and
+# forced a re-extract on every 2-min channel-rail re-warm (observed storm).
+_EXTRACT_CACHE_MAX = 128
 _EXTRACT_WAIT_SEC = 120
 _YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
 _PREVIEW_EXTRACT_RACE_SEC = 5.5  # wall clock — innertube + yt-dlp paths race together
@@ -3415,6 +3417,10 @@ def _ytdlp_audio_section_download(
                 "format": "bestaudio/best",
                 "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
                 "force_keyframes_at_cuts": True,
+                # Abort when the CDN crawls (0.00B/s observed on this IP) —
+                # yt-dlp's per-connection socket timeout alone can't catch a
+                # trickle; throttledratelimit gives up after 5s below 100K.
+                "throttledratelimit": "100K",
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -3665,6 +3671,9 @@ def ytdlp_section_mux_to_ts(
                 "force_keyframes_at_cuts": True,
                 "format": "bv*+ba/b",
                 "merge_output_format": "mp4",
+                # Abort on CDN trickle (0.00B/s observed) — see the same guard
+                # in _ytdlp_audio_section_download.
+                "throttledratelimit": "100K",
             }
         )
         with YoutubeDL(opts) as ydl:

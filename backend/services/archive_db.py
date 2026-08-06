@@ -1173,15 +1173,37 @@ def dedupe_messages() -> int:
     return deleted
 
 
-def chat_window(platform: str, video_id: str, offset_sec: float, half: float = 30.0) -> list[dict]:
+CHAT_WINDOW_HALF_LIMIT = 200
+CHAT_FROM_OFFSET_LIMIT = 5000
+
+
+def chat_window(
+    platform: str, video_id: str, offset_sec: float, half: float = 30.0
+) -> tuple[list[dict], bool]:
+    """Chat rows for a video, time-ordered. Returns (rows, truncated).
+
+    half > 0 → the classic ±half window around offset_sec (BETWEEN, capped at
+    CHAT_WINDOW_HALF_LIMIT rows; truncated always False). half <= 0 → "from
+    offset onward": every row with offset_sec >= offset_sec, capped at
+    CHAT_FROM_OFFSET_LIMIT rows — the popup's whole-history-from-hit view.
+    The +1 probe distinguishes "hit the cap exactly" from "tail cut off"."""
+    if half is not None and half > 0:
+        rows = query(
+            """SELECT * FROM messages
+               WHERE platform = ? AND video_id = ?
+                 AND offset_sec BETWEEN ? AND ?
+               ORDER BY offset_sec LIMIT ?""",
+            (platform, video_id, offset_sec - half, offset_sec + half, CHAT_WINDOW_HALF_LIMIT),
+        )
+        return [dict(r) for r in rows], False
     rows = query(
         """SELECT * FROM messages
-           WHERE platform = ? AND video_id = ?
-             AND offset_sec BETWEEN ? AND ?
-           ORDER BY offset_sec LIMIT 200""",
-        (platform, video_id, offset_sec - half, offset_sec + half),
+           WHERE platform = ? AND video_id = ? AND offset_sec >= ?
+           ORDER BY offset_sec LIMIT ?""",
+        (platform, video_id, offset_sec, CHAT_FROM_OFFSET_LIMIT + 1),
     )
-    return [dict(r) for r in rows]
+    truncated = len(rows) > CHAT_FROM_OFFSET_LIMIT
+    return [dict(r) for r in rows[:CHAT_FROM_OFFSET_LIMIT]], truncated
 
 
 # --- preview chat panel (WS-2) --------------------------------------------
@@ -3483,7 +3505,9 @@ _hits = search("local", video_id=_selfcheck_video)
 assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in _hits), (
     "FTS5 search must find inserted chat rows"
 )
-assert len(chat_window(_selfcheck_platform, _selfcheck_video, 1.0)) == 1
+_selfcheck_chat, _selfcheck_truncated = chat_window(_selfcheck_platform, _selfcheck_video, 1.0)
+assert len(_selfcheck_chat) == 1
+assert _selfcheck_truncated is False
 insert_transcript(
     _selfcheck_platform,
     _selfcheck_video,

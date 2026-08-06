@@ -114,5 +114,48 @@ def test_chat_window_includes_color():
     archive_db.insert_messages("youtube", "v1", [
         {"offset_sec": 5.0, "username": "Alice", "text": "oi", "color": "#0057E7"},
     ])
-    rows = archive_db.chat_window("youtube", "v1", 10.0)
+    rows, truncated = archive_db.chat_window("youtube", "v1", 10.0)
     assert rows[0]["color"] == "#0057E7"
+    assert truncated is False
+
+
+def test_chat_window_from_offset_mode():
+    """half <= 0 → the whole history from offset_sec onward, time-ordered."""
+    archive_db.insert_messages("youtube", "v2", [
+        {"offset_sec": 10.0, "username": "a", "text": "before"},
+        {"offset_sec": 20.0, "username": "b", "text": "hit"},
+        {"offset_sec": 20.0, "username": "c", "text": "same second"},
+        {"offset_sec": 35.0, "username": "d", "text": "later"},
+        {"offset_sec": 60.0, "username": "e", "text": "end"},
+    ])
+    rows, truncated = archive_db.chat_window("youtube", "v2", 20.0, half=0)
+    assert truncated is False
+    assert [r["offset_sec"] for r in rows] == [20.0, 20.0, 35.0, 60.0]
+    assert rows[0]["text"] == "hit"
+
+    # The ±half mode is unchanged (BETWEEN 25±30 → rows 10..55; 60 excluded;
+    # cap, truncated False).
+    rows2, truncated2 = archive_db.chat_window("youtube", "v2", 25.0)
+    assert truncated2 is False
+    assert [r["offset_sec"] for r in rows2] == [10.0, 20.0, 20.0, 35.0]
+
+
+def test_chat_window_from_offset_truncates_at_cap():
+    """A history longer than the from-offset cap reports truncated=True and
+    returns exactly the first CHAT_FROM_OFFSET_LIMIT rows."""
+    total = archive_db.CHAT_FROM_OFFSET_LIMIT + 1
+    archive_db.insert_messages("youtube", "v3", [
+        {"offset_sec": float(i), "username": f"u{i}", "text": f"msg {i}"}
+        for i in range(total)
+    ])
+    rows, truncated = archive_db.chat_window("youtube", "v3", 0.0, half=0)
+    assert truncated is True
+    assert len(rows) == archive_db.CHAT_FROM_OFFSET_LIMIT
+    assert rows[0]["offset_sec"] == 0.0
+    assert rows[-1]["offset_sec"] == float(archive_db.CHAT_FROM_OFFSET_LIMIT - 1)
+
+    # Exactly-at-cap (offset 1.0 → rows 1..5000, no tail left) stays
+    # untruncated; only a longer tail reports it.
+    rows2, truncated2 = archive_db.chat_window("youtube", "v3", 1.0, half=0)
+    assert truncated2 is False
+    assert len(rows2) == archive_db.CHAT_FROM_OFFSET_LIMIT

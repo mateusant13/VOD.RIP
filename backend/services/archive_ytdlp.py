@@ -290,6 +290,21 @@ def _iso_from_usec(usec: Any) -> Optional[str]:
         return None
 
 
+def _text_or_empty(value: Any) -> str:
+    """Coerce one raw yt-dlp live-chat renderer field to text (trust boundary).
+
+    Renderer fields are documented strings but some arrive as numbers
+    (authorNameTextColor has been observed as a raw packed-ARGB int); a bare
+    .strip() on those crashed the whole chat ingest ("'int' object has no
+    attribute 'strip'"), dropping every chat row for the video. Numbers
+    become their str() form and are then rejected by the downstream format
+    checks (e.g. the #RRGGBB color regex), so no row is lost for a shape
+    variance."""
+    if value is None:
+        return ""
+    return value.strip() if isinstance(value, str) else str(value)
+
+
 def _parse_live_chat(text: str, base_usec: Optional[float] = None) -> list[dict]:
     """NDJSON from yt-dlp's .live_chat.json -> archive message rows.
 
@@ -324,12 +339,20 @@ def _parse_live_chat(text: str, base_usec: Optional[float] = None) -> list[dict]
                     break
             if not renderer:
                 continue
-            runs = ((renderer.get("message") or {}).get("runs") or [])
-            text = "".join(str(run.get("text", "")) for run in runs).strip()
+            msg = renderer.get("message")
+            runs = msg.get("runs") if isinstance(msg, dict) else None
+            runs = runs if isinstance(runs, list) else []
+            text = "".join(
+                str(run.get("text", "")) if isinstance(run, dict) else ""
+                for run in runs
+            ).strip()
             if not text:
                 continue
-            author = (renderer.get("authorName") or {}).get("simpleText") or ""
-            user_id = renderer.get("authorExternalChannelId") or None
+            author_name = renderer.get("authorName")
+            author = _text_or_empty(
+                author_name.get("simpleText") if isinstance(author_name, dict) else None
+            )
+            user_id = _text_or_empty(renderer.get("authorExternalChannelId")) or None
             usec = renderer.get("timestampUsec")
             if frag_ms is not None:
                 offset = float(frag_ms) / 1000.0
@@ -337,22 +360,31 @@ def _parse_live_chat(text: str, base_usec: Optional[float] = None) -> list[dict]
                 offset = (float(usec) - base_usec) / 1e6
             else:
                 continue  # no anchor — cannot produce a VOD-relative offset
-            badges = [
-                b.get("liveChatAuthorBadgeRenderer", {}).get("tooltip", "")
-                for b in (renderer.get("authorBadges") or [])
-                if b.get("liveChatAuthorBadgeRenderer", {}).get("tooltip")
-            ]
-            emotes = [
-                {"id": run.get("emoji", {}).get("emojiId"),
-                 "text": (run.get("emoji", {}).get("shortcuts") or [""])[0]}
-                for run in runs
-                if run.get("emoji")
-            ]
+            badges = []
+            for b in renderer.get("authorBadges") or []:
+                badge = b.get("liveChatAuthorBadgeRenderer") if isinstance(b, dict) else None
+                tip = _text_or_empty(badge.get("tooltip") if isinstance(badge, dict) else None)
+                if tip:
+                    badges.append(tip)
+            emotes = []
+            for run in runs:
+                emoji = run.get("emoji") if isinstance(run, dict) else None
+                if not isinstance(emoji, dict):
+                    continue
+                shortcuts = emoji.get("shortcuts")
+                emotes.append({
+                    "id": _text_or_empty(emoji.get("emojiId")) or None,
+                    "text": _text_or_empty(
+                        shortcuts[0] if isinstance(shortcuts, list) and shortcuts else None
+                    ),
+                })
             # YouTube live-chat renderers carry the author's chat color as
             # #RRGGBB (authorNameTextColor); Twitch GQL VOD comments have no
             # equivalent, so twitch rows stay NULL and the UI uses the
-            # per-platform palette. Only well-formed hex is stored.
-            color = (renderer.get("authorNameTextColor") or "").strip()
+            # per-platform palette. Only well-formed hex is stored. Some
+            # renderers send it as a raw packed-ARGB int — _text_or_empty
+            # coerces it and the hex check below rejects it (NULL).
+            color = _text_or_empty(renderer.get("authorNameTextColor"))
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
                 color = None
             rows.append({
@@ -529,6 +561,34 @@ def _video_id_from_url(url: str, fallback: str) -> str:
     return m.group(1) if m else fallback
 
 
+def _fetch_live_chat(ydl: Any, info: dict, video_id: str) -> tuple[int, str, Optional[str]]:
+    """Best-effort live-chat replay fetch -> (count, status, error).
+
+    status: 'replay' | 'none' | 'error'. Never raises; failures are
+    reported so callers can log and continue (chat is best-effort)."""
+    try:
+        chat_file = None
+        sub_base = ydl.prepare_filename(info, "subtitle")
+        written = ydl._write_subtitles(info, sub_base)
+        for sub, _final in written or []:
+            if str(sub).endswith(".live_chat.json"):
+                chat_file = Path(sub)
+                break
+        if chat_file and chat_file.is_file():
+            rows = _parse_live_chat(
+                chat_file.read_text(encoding="utf-8"),
+                base_usec=_base_usec_from_info(info),
+            )
+            if rows:
+                _db_write(archive_db.insert_messages, PLATFORM, video_id, rows)
+                return len(rows), "replay", None
+            return 0, "none", None  # replay exists but is empty
+        return 0, "none", None
+    except Exception as exc:
+        logger.warning("live chat failed for %s: %s", video_id, exc)
+        return 0, "error", str(exc)
+
+
 def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     """Ingest one YouTube video: metadata + captions + best-effort live chat.
 
@@ -598,29 +658,10 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
 
             # Live chat replay (best-effort; VODs have none).
             if info.get("live_status") in ("was_live", "is_live"):
-                try:
-                    chat_file = None
-                    sub_base = ydl.prepare_filename(info, "subtitle")
-                    written = ydl._write_subtitles(info, sub_base)
-                    for sub, _final in written or []:
-                        if str(sub).endswith(".live_chat.json"):
-                            chat_file = Path(sub)
-                            break
-                    if chat_file and chat_file.is_file():
-                        rows = _parse_live_chat(
-                            chat_file.read_text(encoding="utf-8"),
-                            base_usec=_base_usec_from_info(info),
-                        )
-                        if rows:
-                            _db_write(archive_db.insert_messages, PLATFORM, video_id, rows)
-                            report["chat_messages"] = len(rows)
-                            report["chat"] = "replay"
-                        else:
-                            report["chat"] = "none"  # replay exists but is empty
-                except Exception as exc:
-                    logger.warning("live chat failed for %s: %s", video_id, exc)
-                    report["chat"] = "error"
-                    report["chat_error"] = str(exc)
+                n, status, err = _fetch_live_chat(ydl, info, video_id)
+                report["chat_messages"] = n
+                report["chat"] = status
+                report["chat_error"] = err
 
             # Auto captions -> transcript segments (vtt -> json3 -> srv3
             # fallback; failures stay non-fatal, reported as caption_error).
@@ -660,6 +701,50 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
                 outdir.rmdir()
             except OSError:
                 pass
+    return report
+
+
+def backfill_live_chat(video_id: str) -> dict:
+    """Retro chat-only backfill for one already-ingested YouTube video.
+
+    Refetches live-chat replay for videos whose chat ingest crashed
+    historically (the authorNameTextColor int bug dropped every chat row)
+    but whose captions already archived — the scheduler's covered-skip
+    would never re-ingest them. Chat-only: no caption re-fetch (they exist
+    already; re-fetching adds YouTube API pressure for nothing).
+
+    Returns report {video_id, chat_messages, chat: 'replay'|'none'|'error'}.
+    Raises on metadata extraction failure; chat failures are reported, not
+    raised (same contract as ingest_video)."""
+    url = _video_url(video_id)
+    vid = _video_id_from_url(url, video_id.strip())
+    report: dict = {
+        "video_id": vid,
+        "chat_messages": 0,
+        "chat": "none",
+        "chat_error": None,
+    }
+    outdir = Path(tempfile.mkdtemp(prefix=f"yt-chat-{vid}-"))
+    try:
+        with guarded_youtube_dl(_yt_opts(outdir)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError(f"no extract info for {url}")
+            if info.get("id"):
+                vid = str(info["id"])
+            report["video_id"] = vid
+            if info.get("live_status") in ("was_live", "is_live"):
+                n, status, err = _fetch_live_chat(ydl, info, vid)
+                report["chat_messages"] = n
+                report["chat"] = status
+                report["chat_error"] = err
+    finally:
+        try:
+            for f in outdir.iterdir():
+                f.unlink(missing_ok=True)
+            outdir.rmdir()
+        except OSError:
+            pass
     return report
 
 
@@ -931,6 +1016,23 @@ assert len(_rows2) == 1, _rows2
 assert abs(_rows2[0]["offset_sec"] - 6.0) < 1e-9, _rows2[0]["offset_sec"]
 # …and SKIPPED when no anchor exists (an epoch wall-clock is never an offset).
 assert _parse_live_chat(_lc_no_frag) == []
+
+# Trust boundary: renderer fields are documented strings but some arrive as
+# numbers (authorNameTextColor as a raw packed-ARGB int crashed the whole
+# ingest with "'int' object has no attribute 'strip'").
+_lc_int_color = (
+    '{"replayChatItemAction": {"videoOffsetTimeMsec": "1500", "actions": ['
+    '{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {'
+    '"message": {"runs": [{"text": "cor numerica"}]}, '
+    '"authorName": {"simpleText": "@numerico"}, '
+    '"authorExternalChannelId": "UC2", "timestampUsec": "1785453737783005", '
+    '"authorNameTextColor": 3019898879}}}}]}}\n'
+)
+_rows_int = _parse_live_chat(_lc_int_color)
+assert len(_rows_int) == 1, _rows_int
+assert _rows_int[0]["offset_sec"] == 1.5
+assert _rows_int[0]["username"] == "@numerico"
+assert _rows_int[0]["color"] is None, "an int color is not well-formed hex -> NULL"
 
 _json3_sample = (
     '{"events": ['

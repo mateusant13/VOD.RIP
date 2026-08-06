@@ -132,6 +132,12 @@ _PROG_HEAD_MIN_BYTES = _PROG_HEAD_BYTES // 4
 _PROG_HEAD_MAX_BYTES = 256 * 1024 * 1024
 _PROG_HEAD_TTL_SEC = 86400
 _PROG_HEAD_MIN_EVICT_AGE_SEC = 180
+# Wall-clock cap for ONE head download. The per-read timeout (10, 30) only
+# bounds a single recv — a CDN trickle (0.00B/s crawling, observed on this
+# IP) delivers bytes often enough to never trip it and pins one of the 2
+# GESTURE_WARM_EXECUTOR workers for 27+ min. 2MiB at any sane rate is <10s;
+# 30s is generous. Exceeded = the warm gives up (worker freed, cache miss).
+_PROG_HEAD_STALL_S = 30.0
 def _prog_head_paths(video_id: str, height: int) -> Tuple[Path, Path]:
     base = _prog_head_dir() / f"{video_id}_{height}"
     return base.with_suffix(".bin"), base.with_suffix(".json")
@@ -269,9 +275,16 @@ def _youtube_prog_head_warm(
                 return False
             total = _total_from_content_range(resp.headers.get("Content-Range", "")) or 0
             written = 0
+            stall_deadline = time.monotonic() + _PROG_HEAD_STALL_S
             with open(tmp, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=262144):
                     if not chunk:
+                        break
+                    if time.monotonic() > stall_deadline:
+                        logger.info(
+                            "prog head warm: %s stalled >%.0fs at %d bytes, aborting",
+                            vid, _PROG_HEAD_STALL_S, written,
+                        )
                         break
                     fh.write(chunk)
                     written += len(chunk)
@@ -683,7 +696,11 @@ class PreviewManager:
                 break
             except BaseException as exc:
                 if _try == 0 and _youtube_soft_neg_error(exc):
-                    time.sleep(random.uniform(30, 90))
+                    # ponytail: 30-90s made session_ready 52s+ (observed); a
+                    # short backoff still spreads retries without burning the
+                    # user's click on a dead wait. Upgrade path: honor a
+                    # Retry-After header if YouTube ever sends one.
+                    time.sleep(random.uniform(5, 15))
                     continue
                 raise
 
