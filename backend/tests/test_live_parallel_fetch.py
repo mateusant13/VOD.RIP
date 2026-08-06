@@ -31,13 +31,33 @@ class _FakePool:
         return None
 
 
+class _ImmediatePool:
+    """Executes the submitted callable synchronously; returns a completed Future."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.calls.append((fn, args, kwargs))
+        from concurrent.futures import Future
+
+        fut = Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001
+            fut.set_exception(exc)
+        return fut
+
+
 @pytest.fixture(autouse=True)
 def _isolate_live_state(monkeypatch):
     live_router._LIVE_STATUS_CACHE.clear()
+    live_router._LIVE_REFRESH_INFLIGHT.clear()
     pool = _FakePool()
     monkeypatch.setattr(live_router, "_LIVE_WARM_POOL", pool)
     yield pool
     live_router._LIVE_STATUS_CACHE.clear()
+    live_router._LIVE_REFRESH_INFLIGHT.clear()
 
 
 def _settings(channels):
@@ -188,6 +208,69 @@ def test_beyond_max_stale_serves_empty(monkeypatch, _isolate_live_state):
 
     assert live_router.channel_live_status("ch_ancient1") == {"live": [], "channel_id": "ch_ancient1"}
     assert len(pool.calls) == 1
+
+
+def test_ttl_trip_waits_and_returns_fresh(monkeypatch, _isolate_live_state):
+    """A TTL-trip read must return the FRESH payload (after the bounded wait),
+    not the stale one — that is the poll that updates the badge, so a
+    streamer going live shows up on this poll instead of the next one."""
+    pool = _ImmediatePool()
+    monkeypatch.setattr(live_router, "_LIVE_WARM_POOL", pool)
+    monkeypatch.setattr(
+        live_router, "settings_mgr",
+        _settings([{"id": "ch_trip1", "twitchSlug": "t"}]),
+    )
+    stale = {"live": [], "channel_id": "ch_trip1"}
+    fresh = {"live": [_live_entry("Twitch")], "channel_id": "ch_trip1"}
+    live_router._LIVE_STATUS_CACHE["ch_trip1"] = (
+        time.monotonic() - live_router._LIVE_STATUS_TTL_SEC - 1.0, stale,
+    )
+    monkeypatch.setattr(
+        live_router, "_fetch_channel_live_payload",
+        lambda ch: fresh,
+    )
+
+    payload = live_router.channel_live_status("ch_trip1")
+    assert payload == fresh, "TTL-trip must return the refreshed payload, not the stale one"
+    assert len(pool.calls) == 1
+
+
+def test_ttl_trip_shares_inflight_refresh(monkeypatch, _isolate_live_state):
+    """Two overlapping TTL-trip reads for the same channel must share ONE
+    refresh — the inflight map dedupes so the rate-limited platform APIs are
+    never double-fetched by the poll + watchdog."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        monkeypatch.setattr(live_router, "_LIVE_WARM_POOL", executor)
+        monkeypatch.setattr(
+            live_router, "settings_mgr",
+            _settings([{"id": "ch_trip2", "twitchSlug": "t"}]),
+        )
+        stale = {"live": [], "channel_id": "ch_trip2"}
+        fresh = {"live": [_live_entry("Twitch")], "channel_id": "ch_trip2"}
+        live_router._LIVE_STATUS_CACHE["ch_trip2"] = (
+            time.monotonic() - live_router._LIVE_STATUS_TTL_SEC - 1.0, stale,
+        )
+        calls = {"n": 0}
+
+        def slow_fetch(channel):
+            calls["n"] += 1
+            time.sleep(0.2)
+            return fresh
+
+        monkeypatch.setattr(live_router, "_fetch_channel_live_payload", slow_fetch)
+
+        # Simulate the watchdog already holding an in-flight refresh.
+        inflight = live_router._submit_refresh("ch_trip2", {"id": "ch_trip2", "twitchSlug": "t"})
+        assert inflight is not None
+
+        payload = live_router.channel_live_status("ch_trip2")
+        assert payload == fresh
+        assert calls["n"] == 1, "second TTL-trip must reuse the in-flight refresh"
+    finally:
+        executor.shutdown(wait=True)
 
 
 def test_unknown_channel_404(monkeypatch, _isolate_live_state):

@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -107,8 +107,13 @@ def check_live_status(
 # Live-status reads must return in <100ms so the Channels tab can paint the
 # "LIVE" badge immediately on app open — but the underlying yt-dlp extract
 # (YouTube/Twitch) takes 3-5s. The cache stores the *response payload* (list
-# of LiveStatus dicts) keyed by channel_id with a 60s TTL; reads return the
-# cached payload instantly and trigger a background refresh if stale. On
+# of LiveStatus dicts) keyed by channel_id with a 60s TTL; fresh reads return
+# the cached payload instantly. On a TTL-trip the read kicks a refresh and
+# WAITS (bounded, `_LIVE_REFRESH_WAIT_SEC`) for it, returning the FRESH
+# payload — so the poll that crosses the TTL is the one that updates the
+# badge. Serving the stale payload on the trip meant the frontend saw the
+# refreshed state only on its next poll (60s later), a full cycle of badge
+# lag. Concurrent trips share one in-flight refresh (deduped by channel). On
 # server startup we pre-warm the cache for every saved channel so the very
 # first user request hits the warm cache.
 #
@@ -122,6 +127,18 @@ _LIVE_STATUS_TTL_SEC = 60.0
 # returning ancient payloads and report unknown (empty) instead. Kept equal
 # to the TTL so a failed refresh at most one cycle behind (see endpoint).
 _LIVE_STATUS_MAX_STALE_SEC = 60.0
+# How long a TTL-trip read waits for its kicked refresh before falling back
+# to the stale serve. Platform extracts run 3-15s (parallel per channel), so
+# a 20s bound covers one refresh plus warm-pool queueing headroom.
+_LIVE_REFRESH_WAIT_SEC = 20.0
+# channel_id -> in-flight refresh Future. TTL-trip reads WAIT on the shared
+# future and return the FRESH payload — without this, the poll that crosses
+# the TTL serves the stale one and the frontend only sees the refresh on its
+# NEXT poll (60s later), which made LIVE badges lag a full cycle behind the
+# streamer going live and blink out on every trip. The map dedupes concurrent
+# trips (frontend poll + archive watchdog) so the rate-limited platform APIs
+# are never double-fetched.
+_LIVE_REFRESH_INFLIGHT: dict[str, "Future"] = {}
 _LIVE_STATUS_LOCK = threading.Lock()
 _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
 # Platform fetches inside one channel run concurrently across this pool (the
@@ -230,7 +247,57 @@ def _fetch_or_cached_channel_live_payload(
         cached = _LIVE_STATUS_CACHE.get(cid)
         if cached and (now - cached[0]) < max_age_sec:
             return cached[1]
+    fut = _submit_refresh(cid, channel)
+    if fut is not None:
+        try:
+            return fut.result(timeout=_LIVE_REFRESH_WAIT_SEC)
+        except TimeoutError:
+            logger.debug("live status refresh wait timed out for %s", cid)
+        except Exception as exc:
+            logger.debug("live status refresh wait failed for %s: %s", cid, exc)
+        # Refresh still running in the pool — reuse the cache (stale-bound)
+        # rather than launching a duplicate fetch.
+        with _LIVE_STATUS_LOCK:
+            cached = _LIVE_STATUS_CACHE.get(cid)
+        if cached and (time.monotonic() - cached[0]) < _LIVE_STATUS_MAX_STALE_SEC:
+            return cached[1]
+        return {"live": [], "channel_id": cid}
+    # Pool unavailable (shutdown/stub): refresh synchronously — the watchdog
+    # needs current state to start/stop captures and has no other path.
     return _refresh_channel_live_cache(cid, channel)
+
+
+def _submit_refresh(channel_id: str, channel: dict) -> Optional["Future"]:
+    """Submit a deduped background refresh for a channel.
+
+    Returns the shared in-flight Future — concurrent callers (frontend poll,
+    archive watchdog, warm) wait on the SAME refresh instead of double-fetching
+    the rate-limited platform APIs. Returns None when the pool is unavailable
+    or rejected the submit; callers then fall back to the stale-serve path.
+    """
+    with _LIVE_STATUS_LOCK:
+        fut = _LIVE_REFRESH_INFLIGHT.get(channel_id)
+        if fut is not None and not fut.done():
+            return fut
+    try:
+        fut = _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, channel_id, channel)
+    except Exception:
+        logger.debug("live refresh submit failed for %s", channel_id, exc_info=True)
+        return None
+    if fut is None:  # stubbed/unavailable pool (tests, shutdown)
+        return None
+    with _LIVE_STATUS_LOCK:
+        # A concurrent caller may have inserted a refresh while we were
+        # submitting — reuse it instead of stacking a duplicate fetch.
+        existing = _LIVE_REFRESH_INFLIGHT.get(channel_id)
+        if existing is not None and not existing.done():
+            return existing
+        _LIVE_REFRESH_INFLIGHT[channel_id] = fut
+    fut.add_done_callback(
+        lambda f, cid=channel_id: _LIVE_REFRESH_INFLIGHT.pop(cid, None)
+        if _LIVE_REFRESH_INFLIGHT.get(cid) is f else None
+    )
+    return fut
 
 
 def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
@@ -266,10 +333,7 @@ def warm_channel_live_status(channel_id: str) -> None:
             break
     if channel is None:
         return
-    try:
-        _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, str(channel_id), channel)
-    except Exception:
-        logger.debug("live warm submit failed for %s", channel_id, exc_info=True)
+    _submit_refresh(str(channel_id), channel)
 
 
 def warm_all_saved_channel_live_status() -> None:
@@ -294,11 +358,8 @@ def warm_all_saved_channel_live_status() -> None:
         cid = str(ch.get("id") or "")
         if not cid:
             continue
-        try:
-            _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, ch)
+        if _submit_refresh(cid, ch) is not None:
             count += 1
-        except Exception:
-            logger.debug("live warm submit failed for %s", cid, exc_info=True)
     if count:
         logger.info("live warm: %d channel(s) queued", count)
 
@@ -307,13 +368,16 @@ def warm_all_saved_channel_live_status() -> None:
 def channel_live_status(channel_id: str) -> dict:
     """Aggregate live status for a saved channel across all platforms.
 
-    Returns the cached payload (warm or last-refreshed) immediately and
-    kicks a background refresh if the entry is older than the TTL — the
-    request thread NEVER blocks on a platform extract (worst case 3-15s).
-    On a true cache miss it returns an empty payload and lets the warm pool
-    fill the cache; the frontend's next poll (60s TTL) then hits the
-    refreshed entry. The response shape is unchanged from the prior
-    synchronous version: ``{"live": [...], "channel_id": ...}``.
+    Returns the cached payload (warm or last-refreshed) immediately while it
+    is younger than the TTL. On a TTL-trip it kicks a refresh and WAITS for
+    it (bounded by ``_LIVE_REFRESH_WAIT_SEC``) so this poll returns the
+    FRESH payload — the poll that crosses the TTL is the one that updates the
+    badge. The old fire-and-forget path served the stale payload here and the
+    frontend only saw the refresh on its next poll (60s later), which made
+    LIVE badges lag a full poll cycle behind the streamer going live. A true
+    cold miss returns an empty payload instantly and lets the warm pool fill
+    the cache. The response shape is unchanged from the prior synchronous
+    version: ``{"live": [...], "channel_id": ...}``.
     """
     settings = settings_mgr.get()
     channel: Optional[dict] = None
@@ -334,23 +398,30 @@ def channel_live_status(channel_id: str) -> dict:
         ts, payload = cached
         if (now - ts) < _LIVE_STATUS_TTL_SEC:
             return payload
-        # Stale: serve last-known only within the max-stale bound (never a
-        # days-old "LIVE" lie); older than that report unknown (empty). Either
-        # way the refresh happens in the background — never in this thread.
-        if (now - ts) >= _LIVE_STATUS_MAX_STALE_SEC:
+        # TTL-trip: WAIT (bounded) on the kicked refresh and return the FRESH
+        # payload. The old fire-and-forget path returned the stale payload
+        # here, so the frontend only saw the refreshed state on its NEXT poll
+        # (60s later) — LIVE badges lagged a full poll cycle behind the
+        # streamer going live, and since MAX_STALE == TTL the stale entry was
+        # served as empty, blinking the badge out every cycle. Waiting makes
+        # the poll that crosses the TTL the one that updates the badge.
+        fut = _submit_refresh(cid, channel)
+        if fut is not None:
+            try:
+                return fut.result(timeout=_LIVE_REFRESH_WAIT_SEC)
+            except TimeoutError:
+                logger.debug("live status refresh wait timed out for %s", cid)
+            except Exception as exc:
+                logger.debug("live status refresh wait failed for %s: %s", cid, exc)
+        # Refresh unavailable/timed out: serve last-known only within the
+        # max-stale bound (never a days-old "LIVE" lie); older → unknown.
+        if (time.monotonic() - ts) >= _LIVE_STATUS_MAX_STALE_SEC:
             payload = {"live": [], "channel_id": cid}
-        try:
-            _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
-        except Exception:
-            logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
         return payload
 
     # True cold miss (boot before the warm finishes): return empty instantly
     # and schedule the background refresh.
-    try:
-        _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, cid, channel)
-    except Exception:
-        logger.debug("live status refresh submit failed for %s", cid, exc_info=True)
+    _submit_refresh(cid, channel)
     return {"live": [], "channel_id": cid}
 
 
