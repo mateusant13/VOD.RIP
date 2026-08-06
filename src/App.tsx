@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useCallback, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
+import { memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
@@ -675,6 +675,8 @@ export default function App() {
   /** Previous previewOpen, for the open→closed height-restore transition. */
   const prevPreviewOpenRef = useRef(previewOpen);
   const previewPanelRef = useRef<HTMLDivElement>(null);
+  const previewRowRef = useRef<HTMLDivElement>(null);
+  const previewColHRef = useRef(0);
   const urlAsidePanelRef = useRef<HTMLDivElement>(null);
   const mainPanelRef = useRef<HTMLDivElement>(null);
   const panelLayoutPersistReadyRef = useRef(false);
@@ -2888,6 +2890,48 @@ export default function App() {
     previewPlayback?.kind,
     syncPreviewPlaybackToViewport,
   ]);
+
+  // Height explosion guard: PreviewChatPanel's self-stretching column grows
+  // to the unbounded virtualized list (topPad/bottomPad spacers ~112k px for
+  // a long VOD), and in an auto-height flex row the chat's content height
+  // wins over the player column's explicit height — the whole preview card
+  // balloons and the chat fills the screen. Pin the row to the player
+  // column's content height (same fix as ChannelExplorePopup, 3a2b9d4); the
+  // chat's internal `flex-1 min-h-0 overflow-y-auto` then scrolls inside it.
+  useLayoutEffect(() => {
+    const row = previewRowRef.current;
+    const col = previewContainerRef.current;
+    if (!row || !col) return;
+    if (previewFullscreen) {
+      row.style.height = '';
+      return;
+    }
+    const h = col.offsetHeight;
+    if (h > 0) {
+      previewColHRef.current = h;
+      row.style.height = `${h}px`;
+    }
+  }, [previewFullscreen, previewOpen]);
+
+  // Keep the pin exact as the player column's content height changes (video
+  // aspect resolves, panel resize, viewport clamp). Re-attaches when the
+  // preview row mounts (App stays mounted; the row is conditional). Skipped
+  // while fullscreen so exiting fullscreen never flashes a viewport-tall row.
+  useEffect(() => {
+    const col = previewContainerRef.current;
+    if (!col || !previewOpen) return;
+    const ro = new ResizeObserver(() => {
+      if (previewFsActiveRef.current) return;
+      const row = previewRowRef.current;
+      const h = col.offsetHeight;
+      if (row && h > 0 && h !== previewColHRef.current) {
+        previewColHRef.current = h;
+        row.style.height = `${h}px`;
+      }
+    });
+    ro.observe(col);
+    return () => ro.disconnect();
+  }, [previewOpen]);
 
   const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || anyExploreVolumeMenuOpen;
 
@@ -5974,7 +6018,7 @@ export default function App() {
               </button>
             </div>
           </div>
-          <div className="flex flex-row gap-2 w-full min-h-0 items-stretch" data-preview-panel>
+          <div ref={previewRowRef} className="flex flex-row gap-2 w-full min-h-0 items-stretch" data-preview-panel>
             <div
               ref={previewContainerRef}
               tabIndex={0}

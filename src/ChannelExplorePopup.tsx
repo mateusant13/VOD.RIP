@@ -66,7 +66,7 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
-import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGate';
+import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
 import type { PreviewSessionResponse } from './types';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
@@ -979,7 +979,17 @@ export default function ChannelExplorePopup({
     const container = containerRef.current;
     if (!container || !ready) return;
     // Gate: single in-flight transition, direction from the current fullscreen element.
-    fsGateRef.current?.toggle(container);
+    const dir = fsGateRef.current?.toggle(container);
+    if (dir === 'enter') {
+      // Optimistic state: unmount the chat column and apply the fullscreen
+      // layout BEFORE the browser transition, so the chat can never be
+      // captured inside the fullscreening container during the
+      // fullscreenchange state-lag window (the 'chat swaps the whole screen'
+      // flash). A recovery effect below reverts if the request is denied.
+      setFullscreen(true);
+      setFsControlsVisible(false);
+      applyExplorePopupFullscreenPosition(container);
+    }
   }, [ready]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -1038,6 +1048,20 @@ export default function ChannelExplorePopup({
     if (!ready || fullscreen) return;
     void syncPlaybackToViewport();
   }, [ready, fullscreen, panelWidth, videoAspect, chatTotal, syncPlaybackToViewport]);
+
+  // Recovery for the optimistic fullscreen enter: if the browser denied the
+  // request (no fullscreenchange fires), revert to the windowed layout
+  // instead of leaving the popup stuck as a fullscreen overlay.
+  useEffect(() => {
+    if (!fullscreen) return;
+    const t = window.setTimeout(() => {
+      if (document.fullscreenElement !== containerRef.current) {
+        setFullscreen(false);
+        setFsControlsVisible(true);
+      }
+    }, FULLSCREEN_SETTLE_FALLBACK_MS + 100);
+    return () => window.clearTimeout(t);
+  }, [fullscreen]);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
