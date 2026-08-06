@@ -51,6 +51,20 @@ _CUE_RE = re.compile(
 )
 _WORD_TS_RE = re.compile(r"<(\d{2}):(\d{2}):(\d{2})\.(\d{3})><c>([^<]*)</c>")
 _TAG_RE = re.compile(r"<[^>]+>")
+# YouTube ASR inserts a speaker-turn marker at caption speaker changes. It
+# arrives HTML-escaped ("&gt;&gt;") in the raw payloads; strip both forms.
+_TURN_MARKER_RE = re.compile(r"(?:&gt;|>){2,}")
+
+
+def _strip_turn_markers(text: str) -> str:
+    """Remove YouTube ASR speaker-turn markers (">>" / "&gt;&gt;") from caption
+    text and collapse the whitespace they leave behind.
+
+    The marker is a cue artifact (speaker change), never spoken content, so it
+    must not reach the transcripts table or the preview subtitles panel. A cue
+    that contained only markers collapses to '' and is dropped by callers."""
+    cleaned = _TURN_MARKER_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 # --- canonical_key (identical helper in every platform adapter) ----------
@@ -126,7 +140,7 @@ def _parse_vtt(text: str) -> list[dict]:
         start = _cue_secs(*m.groups()[:4])
         end = _cue_secs(*m.groups()[4:])
         raw = " ".join(block_lines[1:])
-        cleaned = _TAG_RE.sub("", raw).replace("\n", " ").strip()
+        cleaned = _strip_turn_markers(_TAG_RE.sub("", raw).replace("\n", " "))
         if not cleaned:
             continue
         words = _vtt_words(raw, end)
@@ -188,7 +202,7 @@ def _parse_json3(text: str) -> list[dict]:
         else:
             end = next((s for s in starts[i + 1:] if s is not None), start + 2.0)
         segs = ev.get("segs") or []
-        text = "".join(str(s.get("utf8", "")) for s in segs).strip()
+        text = _strip_turn_markers("".join(str(s.get("utf8", "")) for s in segs))
         if not text:
             continue
         words = []
@@ -241,7 +255,7 @@ def _parse_srv3(text: str) -> list[dict]:
         start = float(t) / 1000.0
         d = p.get("d")
         end = start + (float(d) / 1000.0 if d else 0.0)
-        text = "".join(p.itertext()).strip()
+        text = _strip_turn_markers("".join(p.itertext()))
         if not text:
             continue
         words = []
@@ -984,6 +998,40 @@ assert _segs[0]["start_sec"] == 3.0 and _segs[0]["end_sec"] == 20.47
 assert _segs[0]["text"] == "Não sei."
 assert _segs[0]["words"] == [{"word": "sei.", "start": 3.199, "end": 20.47}]
 assert _segs[1]["text"] == "Ih."
+
+# YouTube ASR speaker-turn markers ("&gt;&gt;" / ">>") must never reach segment
+# text: stripped at parse time, whitespace collapsed, marker-only cues dropped.
+_vtt_markers = (
+    "WEBVTT\nKind: captions\nLanguage: pt\n\n"
+    "00:00:00.000 --> 00:00:04.000 align:start position:0%\n"
+    " \n&gt;&gt; E aí maranguap.\n\n"
+    "00:00:04.000 --> 00:00:08.000 align:start position:0%\n"
+    " \nvelho. &gt;&gt; Nossa, &gt;&gt; suporte.\n\n"
+    "00:00:08.000 --> 00:00:09.000 align:start position:0%\n"
+    " \n&gt;&gt;\n"
+)
+_segs_m = _parse_vtt(_vtt_markers)
+assert len(_segs_m) == 2, f"marker-only cue must be dropped, got {len(_segs_m)}"
+assert _segs_m[0]["text"] == "E aí maranguap."
+assert _segs_m[1]["text"] == "velho. Nossa, suporte."
+_json3_markers = (
+    '{"events": [{"tStartMs": 0, "dDurationMs": 4000, "segs": ['
+    '{"utf8": "&gt;&gt; "}, {"utf8": "E aí ", "tOffsetMs": 0},'
+    '{"utf8": "maranguap", "tOffsetMs": 500}]}]}'
+)
+_jm = _parse_json3(_json3_markers)
+assert _jm[0]["text"] == "E aí maranguap", _jm[0]["text"]
+assert _parse_json3(
+    '{"events": [{"tStartMs": 0, "dDurationMs": 1000, "segs": [{"utf8": "&gt;&gt;"}]}]}'
+) == [], "a marker-only json3 event must be dropped"
+_srv3_markers = (
+    '<?xml version="1.0" encoding="utf-8" ?>'
+    '<timedtext format="3"><body>'
+    '<p t="0" d="4000">&gt;&gt; oi <s t="200">tudo</s> bem</p>'
+    '</body></timedtext>'
+)
+_sm = _parse_srv3(_srv3_markers)
+assert _sm[0]["text"] == "oi tudo bem", _sm[0]["text"]
 
 _lc_sample = (
     '{"replayChatItemAction": {"videoOffsetTimeMsec": "1234", "actions": ['
