@@ -81,7 +81,10 @@ def youtube_http_status(exc: BaseException) -> int:
         return 404
     if any(
         x in low
-        for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in", "oauth")
+        for x in (
+            "cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in",
+            "oauth", "preview unavailable",  # soft-gate chain collapse — transient, not 404
+        )
     ):
         return 503
     return 500
@@ -118,6 +121,13 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
 
 assert "restricted" in youtube_user_message(RuntimeError("cookie database locked"), preview=True).lower()
 assert "restricted" in youtube_user_message(RuntimeError("Sign in to confirm you're not a bot"), preview=True).lower()
+# Transient gate collapses map to 503, definitive dead-video messages to 404 —
+# a soft "Video unavailable" must never surface as a hard 404.
+assert youtube_http_status(RuntimeError("YouTube preview unavailable for this video")) == 503
+assert youtube_http_status(RuntimeError("Sign in to confirm you're not a bot")) == 503
+assert youtube_http_status(RuntimeError("This video is unavailable")) == 404
+assert youtube_http_status(RuntimeError("This video has been removed by the uploader")) == 404
+assert youtube_http_status(RuntimeError("members-only content")) == 403
 
 
 def log_extract_fail(

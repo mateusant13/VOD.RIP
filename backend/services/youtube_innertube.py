@@ -480,20 +480,42 @@ def _streaming_url_formats(streaming: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # Last non-OK playability per video — lets callers turn a generic
-# "all clients exhausted" into the real reason ("This video is unavailable").
-# ponytail: bounded FIFO; only the last ~256 videos tracked. Upgrade path:
-# per-attempt return value plumbing through _race_profiles.
+# "all clients exhausted" into the real reason ("Video unavailable").
+# Aggregated deterministically across the parallel probe race: any
+# definitive-fatal probe wins; else any soft probe wins (see
+# _record_playability). ponytail: bounded FIFO; only the last ~256 videos
+# tracked. Upgrade path: per-attempt return value plumbing through
+# _race_profiles.
 _LAST_PLAYABILITY: dict[str, tuple[str, str, str]] = {}
 
 
 def _record_playability(
     video_id: Optional[str], status: Optional[str], reason: Optional[str], kind: str
 ) -> None:
+    """Aggregate per-probe playability verdicts deterministically.
+
+    Probes race across 7 clients in parallel and can disagree — a bot-gated
+    WEB probe reports 'Video unavailable' while ANDROID plays the same video.
+    The old last-writer-wins storage made the verdict probe-order-dependent.
+    Rule: any definitive-fatal probe wins; else any soft ('retry') probe
+    wins; 'ok' is never recorded here (callers only pass non-ok). The stored
+    (status, reason) is the first at the winning severity; a later fatal
+    probe refreshes it so user messages stay fresh.
+    """
     if not video_id:
         return
     if len(_LAST_PLAYABILITY) > 256:
         _LAST_PLAYABILITY.pop(next(iter(_LAST_PLAYABILITY)), None)
-    _LAST_PLAYABILITY[video_id] = (status or "", reason or "", kind)
+    prev = _LAST_PLAYABILITY.get(video_id)
+    if prev is None:
+        _LAST_PLAYABILITY[video_id] = (status or "", reason or "", kind)
+        return
+    _prev_status, _prev_reason, prev_kind = prev
+    if kind == "fatal" and prev_kind != "fatal":
+        # Definitive beats soft — upgrade and carry the fatal probe's message.
+        _LAST_PLAYABILITY[video_id] = (status or "", reason or "", "fatal")
+    # A soft probe never downgrades a stored fatal (and equal severities keep
+    # the first record — deterministic).
 
 
 def innertube_last_playability(video_id: Optional[str]) -> tuple[str, str, str]:
@@ -511,27 +533,63 @@ def _classify_http(status_code: int) -> FailureKind:
     return "ok"
 
 
+# Transient gate markers — the video is fine, YouTube wants proof (sign-in /
+# bot check / consent). These respond with the same generic "Video
+# unavailable" reason as dead videos, but other clients, cookies, or POT can
+# still play them, so they MUST classify SOFT (retryable).
+_SOFT_PLAYABILITY_MARKERS = (
+    "sign in to confirm",  # "Sign in to confirm you're not a bot"
+    "confirm you're not",
+    "not a bot",
+    "confirm your age",    # soft age gate — sign-in satisfies it
+    "age-gate",
+    "consent",
+    "playback on other websites has been disabled by the video owner",
+)
+
+# Definitive "video is gone / hard-blocked" markers — retrying other clients
+# or yt-dlp cannot recover these.
+_DEFINITIVE_PLAYABILITY_MARKERS = (
+    "removed by the uploader",
+    "video removed",
+    "this video has been removed",
+    "removed",
+    "private",
+    "members only",
+    "join this channel",
+    "deleted",
+    "no longer available",
+    "age-restricted",
+    "not available in your country",
+    "not available in this country",
+    "not available in your region",
+    "not available in your location",
+)
+
+
 def _classify_playability(status: Optional[str], reason: Optional[str]) -> FailureKind:
     if not status or status == "OK":
         return "ok"
     reason_l = (reason or "").lower()
-    # Permanently gone videos — retrying other clients/yt-dlp just burns 15-30s.
-    if any(
-        k in reason_l
-        for k in ("unavailable", "private", "removed", "deleted", "no longer available")
-    ):
+    # Transient gates first — a gate reason wins even when it also carries
+    # the generic "unavailable" wording the dead-video cases share.
+    if any(k in reason_l for k in _SOFT_PLAYABILITY_MARKERS):
+        return "retry"
+    # Permanently gone / hard-blocked — retrying other clients or yt-dlp just
+    # burns 15-30s. Checked before the LOGIN_REQUIRED soft rule so a private
+    # or members-only video stays fatal regardless of status.
+    if any(k in reason_l for k in _DEFINITIVE_PLAYABILITY_MARKERS):
         return "fatal"
-    if status == "LOGIN_REQUIRED" and ("age" in reason_l or "confirm your age" in reason_l):
-        return "fatal"
-    if status in ("ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"):
+    if status == "LOGIN_REQUIRED":
+        # Plain sign-in gate with no bot/consent/definitive markers — soft.
         return "retry"
     if status == "LIVE_STREAM_OFFLINE":
         return "fatal"
-    if "private" in reason_l or "removed" in reason_l or "deleted" in reason_l:
+    if status == "ERROR" and "unavailable" in reason_l:
+        # "This video is unavailable" under ERROR is the classic removed-video
+        # message — definitive (the gate variants above already returned soft).
         return "fatal"
-    if status == "UNPLAYABLE" and any(
-        k in reason_l for k in ("token", "visitor", "integrity", "bot")
-    ):
+    if status in ("ERROR", "UNPLAYABLE", "CONTENT_CHECK_REQUIRED"):
         return "retry"
     return "retry"
 
@@ -1420,13 +1478,31 @@ _prog = _formats_from_streaming_progressive({
 assert len(_prog) == 1 and _prog[0]["format_id"] == "progressive-18"
 assert _is_sabr_stream_url("https://x.googlevideo.com/videoplayback?sabr=1")
 assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
-assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "fatal"
+# "Confirm your age" is a soft sign-in age gate — the video plays after
+# confirming (unlike the hard "age-restricted" block, which is fatal).
+assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "retry"
+assert _classify_playability("LOGIN_REQUIRED", "Video unavailable") == "retry"
+assert _classify_playability(
+    "LOGIN_REQUIRED", "Sign in to confirm you're not a bot"
+) == "retry"
 assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
 assert _classify_playability("ERROR", "This video is unavailable") == "fatal"
+assert _classify_playability("ERROR", "Video removed by the uploader") == "fatal"
 assert _classify_playability("ERROR", "This video is private.") == "fatal"
-assert _classify_playability("LOGIN_REQUIRED", "Sign in to confirm you're not a bot") == "retry"
+assert _classify_playability("ERROR", "This video is age-restricted") == "fatal"
+assert _classify_playability("UNPLAYABLE", "This video is available to members only") == "fatal"
 _record_playability("abc12345678", "ERROR", "This video is unavailable", "fatal")
 assert innertube_last_playability("abc12345678") == ("ERROR", "This video is unavailable", "fatal")
+# Deterministic multi-probe aggregation: a late soft probe must not downgrade
+# a definitive fatal; a fatal after a soft upgrades the stored verdict.
+_record_playability("abc12345678", "LOGIN_REQUIRED", "Video unavailable", "retry")
+assert innertube_last_playability("abc12345678") == ("ERROR", "This video is unavailable", "fatal"), (
+    "soft probe must not overwrite a definitive fatal"
+)
+_record_playability("soft00000001", "LOGIN_REQUIRED", "Video unavailable", "retry")
+assert innertube_last_playability("soft00000001")[2] == "retry"
+_record_playability("soft00000001", "ERROR", "Video removed by the uploader", "fatal")
+assert innertube_last_playability("soft00000001") == ("ERROR", "Video removed by the uploader", "fatal")
 assert innertube_last_playability(None) == ("", "", "")
 assert innertube_last_playability("unknown0000") == ("", "", "")
 assert _profiles_for_session(None)[0].name == "WEB_SAFARI"

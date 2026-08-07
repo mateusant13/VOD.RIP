@@ -67,6 +67,41 @@ def _warm_rate_limit_check() -> bool:
 
 # Track whether POT warm completed (resets circuit breaker)
 _pot_ready: bool = False
+# Once-per-process POT readiness wait for the first cold preview click.
+_pot_wait_attempted: bool = False
+
+
+def _await_pot_readiness_once(timeout_sec: float = 2.0) -> None:
+    """Cold-start: wait briefly (once per process) for the bgutil POT server.
+
+    The POT server warms async at startup; the first preview click often
+    lands before it is ready, so WEB_SAFARI/WEB probes fail with
+    gated-looking responses. A short one-time wait gives the first click
+    POT-backed WEB probes; later clicks never pay it.
+    ponytail: 2s cap — a slow node cold start just falls through to the
+    mobile-client ladder (which needs no POT), so the wait never blocks a
+    preview past its SLA.
+    """
+    global _pot_wait_attempted
+    if _pot_wait_attempted:
+        return
+    _pot_wait_attempted = True
+    try:
+        from services.youtube_auth import pot_minting_enabled
+
+        if not pot_minting_enabled():
+            return
+        from services.youtube_pot_service import pot_service_is_ready, pot_service_ping
+
+        if pot_service_is_ready() or pot_service_ping():
+            return
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            if pot_service_ping():
+                return
+    except Exception:
+        pass
 
 
 def _maybe_reset_circuit_breaker() -> None:
@@ -548,6 +583,7 @@ def _resolve_and_cache_youtube_snapshot(
     the snapshot is stored under the exact key create_session looks up.
     Returns (vid, height, snapshot_dict) or None on failure.
     """
+    _await_pot_readiness_once()
     from services.preview.session import create_session
     from services.preview.session import resolve_stream_info
     t0 = time.monotonic()
