@@ -660,8 +660,18 @@ Run <code>npm run dev</code> for API + UI, or set <code>KICK_SERVE_UI=1</code> a
 
 
 if __name__ == "__main__":
+    import sys
     import uvicorn
+    from services.server_lifecycle import guard_api_port
+
     port = int(os.environ.get("PORT", 7897))
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
+
+    # Same first-wins guard as run.py — `python app.py` used to bypass it and
+    # double-bind (Windows SO_REUSEADDR steal) when another launcher won the port.
+    if guard_api_port(port):
+        sys.exit(0)
     print("================================================")
     print("  Kick & Twitch Downloader v2.0 (Python)")
     print(f"  Open http://localhost:{port} in your browser")

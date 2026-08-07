@@ -60,21 +60,19 @@ def main():
         sys.argv = [a for a in sys.argv if a != "--debug"]
 
     port = int(os.environ.get("PORT", "7897"))
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
 
     # dev-all.mjs releases the port before spawning us; skip duplicate work unless standalone.
     if os.environ.get("VODRIP_SKIP_PORT_RELEASE", "").strip() != "1":
-        from services.server_lifecycle import release_api_port, vodrip_api_healthy
+        from services.server_lifecycle import guard_api_port, release_api_port
 
         # First-wins: a healthy API on the port belongs to another supervisor
         # (dev-all session, tray app). An automatic restart (hub/watchdog)
         # must never kill it — that caused a murder loop where a hub-restarted
         # instance POSTed /api/exit to the dev API 0.5s after it bound.
         # VODRIP_TAKE_PORT=1 forces the old takeover behavior.
-        if os.environ.get("VODRIP_TAKE_PORT", "").strip() != "1" and vodrip_api_healthy(port):
-            print(
-                f"VOD.RIP API already running on :{port} — exiting "
-                "(set VODRIP_TAKE_PORT=1 to force takeover)"
-            )
+        if guard_api_port(port):
             sys.exit(0)
         release_api_port(port, skip_pid=os.getpid())
 

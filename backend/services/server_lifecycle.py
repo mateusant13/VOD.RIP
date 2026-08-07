@@ -338,7 +338,7 @@ def _pid_is_vodrip_api(port: int, pid: int) -> bool:
     return False
 
 
-def vodrip_api_healthy(port: int, *, timeout: float = 6.0) -> bool:
+def vodrip_api_healthy(port: int, *, timeout: float = 12.0) -> bool:
     """True when a healthy VOD.RIP API answers GET /api/info on *port*.
 
     Returns immediately when nothing is listening. While a listener exists
@@ -438,6 +438,31 @@ def release_api_port(port: int, *, skip_pid: Optional[int] = None, timeout: floa
     still = target_listeners()
     if still:
         _logger.error("Port %s still busy after shutdown attempt: %s", port, still)
+
+
+def guard_api_port(port: int) -> bool:
+    """First-wins API port guard — returns True when the caller should exit 0.
+
+    A healthy VOD.RIP API on *port* belongs to another supervisor (dev
+    server, tray app, user's own launch). Never double-bind: on Windows,
+    SO_REUSEADDR lets a second bind steal the port and silently kills the
+    first instance (observed: guarded-less ``python app.py`` died exit 1
+    with no traceback when a later run.py launch won the race).
+
+    Honors ``VODRIP_TAKE_PORT=1`` — releases the port instead (forced
+    takeover, same semantics as the old inline check in run.py). Never
+    touches unrelated listeners.
+    """
+    if os.environ.get("VODRIP_TAKE_PORT", "").strip() == "1":
+        release_api_port(port, skip_pid=os.getpid())
+        return False
+    if vodrip_api_healthy(port):
+        print(
+            f"VOD.RIP API already running on :{port} — exiting "
+            "(set VODRIP_TAKE_PORT=1 to force takeover)"
+        )
+        return True
+    return False
 
 
 def stop_api_server(

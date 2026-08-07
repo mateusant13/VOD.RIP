@@ -12,5 +12,5 @@ echo Starting server...
 start http://localhost:7897
 echo.
 
-python run.py
+python dev_server.py
 pause
