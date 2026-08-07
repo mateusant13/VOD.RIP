@@ -7,9 +7,10 @@ ms-marco-MiniLM-L-12-v2 int8 (34MB) as the pair reranker. Tokenization is the
 L2-normalized (matching the existing corpus); only the MODELS are int8.
 
 The model is loaded lazily (first semantic search) so the app boots without
-onnxruntime cost; inference is CPU-only (onnxruntime-gpu needs CUDA 13, this
-box has CUDA 12.8 — the GPU path is the torch fp16 scan in archive_db, not
-this module). Vectors are stored per transcript segment in the archive DB
+onnxruntime cost; inference stays CPU-only by design (118MB int8, ~8ms/query —
+a GPU provider would add driver/VRAM complexity for no measurable gain). The
+heavy GPU path is the torch fp16 scan in archive_db, not this module. Vectors
+are stored per transcript segment in the archive DB
 (transcript_embeddings table) and scanned with a cosine pass; no separate
 vector service.
 

@@ -2158,7 +2158,7 @@ def _transcribe_audio_source(
     # languages) or whisper (everything else — GPU slots, other languages).
     engine = _job_engine(language)
     model = _parakeet_model() if engine == "parakeet" else _current_model()
-    existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id)}
+    existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id, raw=True)}
     header, entries = _read_manifest(_manifest_path(platform, video_id))
     missing, seg_idx = _resume_plan(chunks, header, entries, existing, engine=engine)
     if len(missing) == len(chunks) and existing:
@@ -2184,6 +2184,7 @@ def _transcribe_audio_source(
     missing_set = set(missing)
     ci = 0
     n_chunks = len(chunks)
+    twin_won = False  # higher-priority twin transcribed mid-run — abort
     while ci < n_chunks:
         cs, ce = chunks[ci]
         if ci not in missing_set:
@@ -2226,12 +2227,28 @@ def _transcribe_audio_source(
                 words += len(seg["words"])
                 seg_idx += 1
             if batch_rows:
+                if _twin_transcribed_while_running(platform, video_id):
+                    # The higher-priority twin (youtube > twitch > kick)
+                    # finished mid-run — the guard evaluated at claim time
+                    # missed it. Drop the partial rows (the display
+                    # fallback then serves the twin's transcript instead of
+                    # these) and stop; the job still reports done+skipped.
+                    archive_db.delete_transcripts(platform, video_id)
+                    logger.info(
+                        "twin transcribed on a higher-priority platform while "
+                        "running — aborting %s/%s",
+                        platform, video_id,
+                    )
+                    twin_won = True
+                    break
                 archive_db.insert_transcript(platform, video_id, batch_rows, lang=lang)
             segments += len(batch_rows)
             _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
             speech_done += chunks[ci2][1] - chunks[ci2][0]
             if progress_cb:
                 progress_cb(speech_done, speech_sec, ci2 + 1, n_chunks)
+        if twin_won:
+            break
 
     # Disk hygiene: the job finished — the crash-resume manifest has served
     # its purpose. Best-effort: a failed unlink just leaves it for the next
@@ -2240,6 +2257,22 @@ def _transcribe_audio_source(
         manifest.unlink(missing_ok=True)
     except OSError:
         pass
+
+    if twin_won:
+        _ran = _thread_pin() or _effective_device()
+        return {
+            "platform": platform,
+            "video_id": video_id,
+            "model": _asr_model_name(engine),
+            "engine": engine,
+            "device": _ran[0],
+            "compute_type": _ran[1],
+            "segments": 0,
+            "words": 0,
+            "resumed_chunks": 0,
+            "wall_sec": round(time.monotonic() - t0, 3),
+            "skipped": "dedupe-transcribed",
+        }
 
     wall = time.monotonic() - t0
     # Report the device that actually ran the job (hybrid pool threads may be
@@ -2261,6 +2294,10 @@ def _transcribe_audio_source(
         "resumed_chunks": len(chunks) - len(missing),
         "wall_sec": round(wall, 3),
         "speed_x": round(speech_sec / wall, 2) if wall > 0 else 0.0,
+        # Whisper's own detection (None when the job ran with an explicit
+        # language — then the stored rows carry the explicit tag, never the
+        # detection). The done-time channel-language correction uses it.
+        "lang": detected_lang if language is None else None,
     }
     logger.info(
         "transcribe %s/%s done: %d segs, %d words, %.1f%% dead air skipped, "
@@ -2381,10 +2418,20 @@ def _claim_next_job() -> Optional[dict]:
                 (_now_iso(), _now_iso(), row["id"]),
             )
         else:
+            # Stale-reclaim CAS: the UPDATE re-checks the same stale-window
+            # condition the SELECT used, so two workers that both read the
+            # same stale 'running' row cannot both claim it — the first
+            # claim refreshes heartbeat/updated_at and the second's WHERE
+            # matches zero rows (rowcount 0 -> skip). Without the condition
+            # both UPDATEs would hit (status stays 'running' either way) and
+            # two workers would transcribe the same video.
             cur = archive_db.execute(
                 "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
-                "WHERE id = ? AND status = 'running'",
-                (_now_iso(), _now_iso(), row["id"]),
+                "WHERE id = ? AND status = 'running' "
+                "AND COALESCE(heartbeat, updated_at) < "
+                "CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ? "
+                "WHEN kind = 'chat' THEN ? ELSE ? END",
+                (_now_iso(), _now_iso(), row["id"], twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
             )
         if cur.rowcount == 1:
             return dict(row)
@@ -2464,6 +2511,19 @@ def _process_chat_job(job_id: str, platform: str, video_id: str) -> dict:
     raise ValueError(f"no retro chat API for platform {platform!r}")
 
 
+def _twin_transcribed_while_running(platform: str, video_id: str) -> bool:
+    """True when a higher-priority twin finished transcribing mid-run.
+
+    The guard transcribed_on_higher_priority_platform is evaluated at claim
+    time; this re-evaluates it right before each chunk INSERT so a twitch/
+    kick job that started while the youtube twin was still running aborts
+    instead of duplicating work. youtube itself is never blocked (it is the
+    highest priority), so the check short-circuits for it."""
+    if platform == "youtube" or platform not in archive_db._PLATFORM_TRANSCRIBE_PRIORITY:
+        return False
+    return archive_db.transcribed_on_higher_priority_platform(platform, video_id)
+
+
 def _captions_first_skip(platform: str, video_id: str) -> bool:
     """True when YouTube captions already cover the video and the user opted
     into captions-first (settings.yt_subtitles_first, default True).
@@ -2509,6 +2569,23 @@ def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
     stored = archive_db.video_channel_language(platform, video_id)
     if stored:
         return normalize_language(stored)
+    if channel:
+        # videos.channel_language is NULL for THIS video (no platform clue
+        # stamped on it yet) — fall back to the channel-language aggregation,
+        # which weighs every channel video's stored clue plus the WS-4
+        # original_language evidence. This kills the wrong-language case:
+        # whisper auto-detect (None) misfiring on a channel whose language
+        # is known elsewhere (e.g. a twitch twin with a youtube clue).
+        try:
+            from services.channel_language import aggregate_channel_language
+
+            hint = normalize_language(
+                aggregate_channel_language(platform, channel).get("language")
+            )
+        except Exception:
+            hint = None  # aggregation is best-effort — fall through to the default
+        if hint:
+            return hint
     if settings is not None:
         hint = normalize_language(getattr(settings, "asr_language", "auto"))
         if hint:
@@ -2598,17 +2675,25 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     platform, video_id, audio=audio, speech=speech, shards=shards,
                 )
 
+        resolved_lang = _resolve_job_language(platform, video_id)
         stats = transcribe_video(
             platform, video_id,
-            language=_resolve_job_language(platform, video_id),
+            language=resolved_lang,
             progress_cb=_progress, events_cb=events_cb,
         )
         archive_db.update_job(job_id, status="done", progress=1.0)
         # New transcript evidence -> re-aggregate the channel language
         # (throttled; best-effort — a failure must never fail the job).
+        # When the job ran on auto-detection and the channel's now-known
+        # family disagrees with what whisper heard, the stored rows are
+        # re-stamped (see channel_language.on_transcribe_done). An explicit
+        # job language is never overridden.
         try:
             from services.channel_language import on_transcribe_done
-            on_transcribe_done(platform, video_id)
+            on_transcribe_done(
+                platform, video_id,
+                detected_lang=stats.get("lang") if resolved_lang is None else None,
+            )
         except Exception:
             logger.debug("channel language re-aggregation failed", exc_info=True)
         if "skipped" not in stats:

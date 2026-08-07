@@ -49,15 +49,18 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>{t('Model')}</FieldCaption>
-        <input
-          type="text"
-          value={settings.whisper_model ?? ''}
-          onChange={(e) => setSettings({ ...settings, whisper_model: e.target.value })}
-          placeholder="large-v3-turbo"
-          aria-label="whisper model id"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-xs"
-        />
+        <FieldCaption
+          noWrap
+          info={t('The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.')}
+        >
+          {t('Whisper Model')}
+        </FieldCaption>
+        <span
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"
+          aria-label="whisper model id (read-only)"
+        >
+          {activeModel}
+        </span>
       </div>
       <Toggle
         label={t('YouTube subtitles first')}

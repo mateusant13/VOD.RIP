@@ -792,7 +792,19 @@ async def archive_chat_backfill(platform: str, video_id: str):
 @router.get("/api/archive/videos/{platform}/{video_id}/transcript")
 async def archive_transcript(platform: str, video_id: str):
     _require_platform(platform)
-    return {"segments": archive_db.transcript_for(platform, video_id)}
+    # Cross-platform fallback: a video with no transcript rows of its own
+    # serves its canonical twin's rows (youtube > twitch > kick), so a
+    # Twitch VOD with a transcribed YouTube mirror shows its transcript in
+    # the player's Transcript tab. source_platform/source_video_id tell the
+    # UI where the rows came from (own rows -> the requested ids).
+    src_platform, src_video_id = archive_db.transcript_source(platform, video_id) or (
+        platform, video_id
+    )
+    return {
+        "segments": archive_db.transcript_for(src_platform, src_video_id),
+        "source_platform": src_platform,
+        "source_video_id": src_video_id,
+    }
 
 
 @router.get("/api/archive/dedupe")

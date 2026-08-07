@@ -65,7 +65,9 @@ const ptBR: Record<string, string> = {
   'Recommended': 'Recomendado',
   'threads {threads} · cache {cache} MB': 'threads {threads} · cache {cache} MB',
   'Suggested for this machine': 'Sugerido para esta máquina',
-  'Model': 'Modelo',
+  'Whisper Model': 'Modelo Whisper',
+  'The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.':
+    'O modelo Whisper é gerenciado automaticamente (padrão large-v3-turbo). O id do modelo é resolvido da configuração salva — digitá-lo aqui não tinha efeito nos trabalhos.',
   'AI Models Folder': 'Pasta de modelos de IA',
   'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.':
     'Os modelos Whisper são baixados aqui. Automático escolhe o melhor disco — espaço livre primeiro, com preferência para SSD/NVMe; um HDD grande e lento só vence quando tem muito mais espaço. Um caminho personalizado (HF hub compartilhado) também funciona.',
@@ -528,7 +530,9 @@ const es: Record<string, string> = {
   'Recommended': 'Recomendado',
   'threads {threads} · cache {cache} MB': 'hilos {threads} · caché {cache} MB',
   'Suggested for this machine': 'Sugerido para esta máquina',
-  'Model': 'Modelo',
+  'Whisper Model': 'Modelo Whisper',
+  'The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.':
+    'El modelo Whisper se gestiona automáticamente (predeterminado large-v3-turbo). El id del modelo se resuelve desde la configuración guardada — escribirlo aquí no tenía efecto en los trabajos.',
   'AI Models Folder': 'Carpeta de modelos de IA',
   'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.': 'Los modelos Whisper se descargan aquí. Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio. Una ruta personalizada (HF hub compartido) también funciona.',
   'YouTube subtitles first': 'Subtítulos de YouTube primero',

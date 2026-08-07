@@ -218,12 +218,24 @@ def persist_aggregated(platform: str, channel: str) -> Optional[str]:
     return lang
 
 
-def on_transcribe_done(platform: str, video_id: str) -> Optional[str]:
+def on_transcribe_done(
+    platform: str,
+    video_id: str,
+    detected_lang: Optional[str] = None,
+) -> Optional[str]:
     """Post-transcription hook: re-aggregate the video's channel (throttled).
 
     Called by the whisper worker after a successful job — new transcript
     evidence should converge the channel language. At most one pass per
-    (platform, channel) every REAGGREGATE_MIN_GAP_SEC."""
+    (platform, channel) every REAGGREGATE_MIN_GAP_SEC.
+
+    When *detected_lang* is given (the job ran on auto-detection) and its
+    family differs from the channel's NOW-known family, the stored rows'
+    lang tags are re-stamped to the channel family: whisper misdetected
+    because the channel language was unknown at claim time, and search
+    filters must agree with the channel decision. Cheap correctness only —
+    the rows are never re-transcribed (ponytail: a real fix is a
+    re-transcribe queue keyed by channel-language flips)."""
     channel = archive_db.video_channel(platform, video_id)
     if not channel:
         return None
@@ -235,10 +247,20 @@ def on_transcribe_done(platform: str, video_id: str) -> Optional[str]:
             return None
         _last_run[key] = now
     try:
-        return persist_aggregated(platform, channel)
+        lang = persist_aggregated(platform, channel)
     except Exception:
         logger.debug("channel language aggregation failed for %s/%s", platform, channel, exc_info=True)
         return None
+    if lang and detected_lang:
+        det = normalize_language(detected_lang)
+        if det and det != lang:
+            touched = archive_db.set_transcript_lang(platform, video_id, lang)
+            logger.info(
+                "channel language %s/%s is %s but whisper detected %s — "
+                "re-stamped %d transcript rows",
+                platform, channel, lang, det, touched,
+            )
+    return lang
 
 
 def run_aggregation(platform: Optional[str] = None) -> dict:
