@@ -2,12 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import CookieBridgeSection from './CookieBridgeSection';
 
+// Not-yet-paired state: the install-flow tests exercise the waiting overlay,
+// so the fixture must never satisfy the success condition (paired + count>0).
 const STATUS = {
-  paired: true,
+  paired: false,
   enabled: true,
   platforms: {
     youtube: { count: 0, lastGrabAt: null, expiredCount: 0 },
-    kick: { count: 2, lastGrabAt: '2026-08-05T10:00:00Z', expiredCount: 0 },
+    kick: { count: 0, lastGrabAt: null, expiredCount: 0 },
   },
 };
 
@@ -133,5 +135,16 @@ describe('CookieBridgeSection extension install flow', () => {
     await screen.findByText('Show folder');
     fireEvent.click(screen.getByText('Show folder'));
     await waitFor(() => expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true));
+  });
+
+  it('open click shows the waiting overlay and Close dismisses it', async () => {
+    mockFetch();
+    render(<CookieBridgeSection />);
+    await screen.findByText('Open extensions');
+    fireEvent.click(screen.getByText('Open extensions'));
+    await screen.findByText('Waiting for cookies');
+    expect(screen.getByText(/Drop the VOD.RIP-cookies folder onto the page/)).toBeTruthy();
+    fireEvent.click(screen.getByText('Close'));
+    await waitFor(() => expect(screen.queryByText('Waiting for cookies')).not.toBeInTheDocument());
   });
 });
