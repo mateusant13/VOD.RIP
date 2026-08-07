@@ -5,10 +5,10 @@ existing importers keep working without code changes.
 """
 from services import preview  # noqa: E402
 
-# Copy all public attributes from the preview package into this module
-# so ``from services.preview_service import X`` and
-# ``from services import preview_service as ps; ps.X`` both work.
-for _attr in dir(preview):
-    if _attr.startswith("__"):
-        continue
-    globals()[_attr] = getattr(preview, _attr)
+# ponytail: lazy __getattr__ instead of an eager dir() copy — the eager copy
+# races the preview -> preview_service circular import (if services.preview.session
+# is imported first, the package is mid-init and the snapshot misses names like
+# _manager). Forwarding keeps every ``from services.preview_service import X``
+# working regardless of import order.
+def __getattr__(name: str):
+    return getattr(preview, name)
