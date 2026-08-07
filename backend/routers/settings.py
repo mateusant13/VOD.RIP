@@ -207,8 +207,6 @@ async def update_settings(update: SettingsUpdate):
         if val != (current.twitch_helix_token or ""):
             current.twitch_helix_token = val
             current.twitch_helix_token_updated_at = time.time()
-    if update.youtube_data_api_key is not None:
-        current.youtube_data_api_key = (update.youtube_data_api_key or "").strip()
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     # Auto-lift: refresh the helix token from the cookie bridge (zero manual
@@ -227,17 +225,23 @@ async def update_settings(update: SettingsUpdate):
 
 @router.get("/api/settings/official-apis-status")
 async def official_apis_status():
-    """Official-API credential + quota state for the Settings UI.
-
-    The YouTube quota counter is per-key daily usage; when degraded the UI
-    warns that the official path is bypassed until the counter resets."""
-    from services import youtube_data_api
-
+    """Official-API credential state for the Settings UI (Twitch Helix only
+    since the YouTube Data API key was removed)."""
     s = settings_mgr.get()
     return {
         "twitch_helix_token_set": bool((getattr(s, "twitch_helix_token", "") or "").strip()),
-        **youtube_data_api.quota_status(),
     }
+
+
+@router.get("/api/settings/recommended")
+async def recommended_resources():
+    """Resource defaults suggested for THIS machine: download threads + max
+    cache MB, computed from CPU threads, RAM and the cache drive's free
+    space (services.settings.recommended_resource_defaults). The Settings
+    UI exposes this as a one-click "Recommended" fill next to the fields."""
+    from services.settings import recommended_resource_defaults
+
+    return recommended_resource_defaults()
 
 
 @router.post("/api/pick-folder")

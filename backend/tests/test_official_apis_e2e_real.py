@@ -3,9 +3,8 @@
 Credential probe (READ-ONLY on the real %APPDATA%):
 - Twitch: bridge-cookies/twitch.txt auth-token line, else the
   twitch_helix_token field of the real settings.json.
-- YouTube: youtube_data_api_key in the real settings.json.
 
-When a real token/key exists the matching real API is exercised. On this
+When a real token exists the matching real API is exercised. On this
 machine neither exists, so the suite proves:
   * the full wiring with a mock token (settings -> helix service -> ingest
     -> archive DB) against a stubbed HTTP layer, and
@@ -28,7 +27,6 @@ from deps import settings_mgr
 from models.schemas import AppSettings
 from services import archive_db
 from services import twitch_helix_service as ths
-from services import youtube_data_api as yda
 from services.archive_twitch import ingest_channel_vods
 
 
@@ -58,19 +56,7 @@ def _real_twitch_token() -> str | None:
     return None
 
 
-def _real_youtube_key() -> str | None:
-    settings_path = _real_appdata() / "settings.json"
-    if not settings_path.is_file():
-        return None
-    try:
-        key = json.loads(settings_path.read_text(encoding="utf-8")).get("youtube_data_api_key") or ""
-        return key.strip() or None
-    except (OSError, ValueError):
-        return None
-
-
 _REAL_TWITCH_TOKEN = _real_twitch_token()
-_REAL_YOUTUBE_KEY = _real_youtube_key()
 
 
 @pytest.fixture(autouse=True)
@@ -198,32 +184,3 @@ def test_real_token_helix_ingest(monkeypatch):
     assert results, "real-helix ingest produced no rows"
     assert count["n"] >= 2, "helix was not actually used (fell back to GQL?)"
     assert archive_db.video_channel("twitch", results[0]["video_id"]) is not None
-
-
-# --- YouTube: Data API key path ---------------------------------------------
-
-@pytest.mark.skipif(
-    _REAL_YOUTUBE_KEY is None,
-    reason="no real YouTube Data API key on this machine — captions/search "
-    "paths are covered by unit tests (test_youtube_data_api.py)",
-)
-def test_real_youtube_key_captions():
-    """Real Data API key: captions.list + captions.download on a public video
-    with manual captions; asserts the SRT body parses into segments."""
-    s = AppSettings()
-    s.youtube_data_api_key = _REAL_YOUTUBE_KEY
-    settings_mgr.save(s)
-
-    assert yda.available(), "key configured but the Data API is not usable"
-    tracks = yda.fetch_captions(
-        "jNQXAC9IVRw",  # 'Me at the zoo' — public captions in many languages
-        prefer=("en", "pt"),
-        families=("en", "pt"),
-        max_tracks=1,
-    )
-    assert tracks, "no caption track returned for a known-captioned video"
-    track_id, lang, srt = tracks[0]
-    assert lang and srt
-    segments = yda.parse_srt(srt)
-    assert segments, "captions.download body did not parse into segments"
-    assert yda.quota_used() >= yda.COST_CAPTIONS_LIST + yda.COST_CAPTIONS_DOWNLOAD

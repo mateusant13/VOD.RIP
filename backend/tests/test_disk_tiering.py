@@ -193,6 +193,7 @@ async def test_disks_route_response(client, monkeypatch):
     monkeypatch.setattr(disk, "disk_inventory", lambda: inv)
     monkeypatch.setattr(disk_detect, "disk_inventory", lambda: inv)
     monkeypatch.setattr(disk, "biggest_fixed_drive", lambda: "I:\\")
+    monkeypatch.setattr(disk, "best_model_cache_drive", lambda: "H:\\")
     resp = await client.get("/api/disks")
     assert resp.status_code == 200
     data = resp.json()
@@ -208,6 +209,7 @@ async def test_disks_route_response(client, monkeypatch):
     }
     assert data["fastest"] == "I:\\"  # tie rank -> most free
     assert data["biggest"] == "I:\\"
+    assert data["model_cache"] == "H:\\"
 
 
 # --- data_dir() ------------------------------------------------------------

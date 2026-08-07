@@ -25,6 +25,7 @@ from services.disk_detect import (
 )
 from services.disk_hygiene import (
     active_whisper_model_id,
+    best_model_cache_drive,
     prune_inactive_whisper_models,
     whisper_cache_dir,
 )
@@ -201,13 +202,15 @@ def disk_usage() -> dict[str, int]:
 @router.get("/api/disks")
 def disks() -> dict:
     """Per-drive inventory for the Settings > Storage pickers, plus the
-    auto-pick winners: the fastest usable drive (transcripts/chat data) and
-    the biggest-free-space drive (heavy caches). PowerShell classification is
+    auto-pick winners: the fastest usable drive (transcripts/chat data), the
+    biggest-free-space drive (heavy caches) and the best-ROI drive for the
+    whisper model cache (free space AND speed). PowerShell classification is
     cached 60s; probe failures degrade to Unknown ranks."""
     return {
         "drives": disk_inventory(),
         "fastest": fastest_disk(),
         "biggest": biggest_fixed_drive() or "",
+        "model_cache": best_model_cache_drive() or "",
     }
 
 

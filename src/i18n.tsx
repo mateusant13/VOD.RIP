@@ -62,10 +62,13 @@ const ptBR: Record<string, string> = {
   'Save Settings': 'Salvar configurações',
   'Saved!': 'Salvo!',
   '● unsaved changes': '● alterações não salvas',
+  'Recommended': 'Recomendado',
+  'threads {threads} · cache {cache} MB': 'threads {threads} · cache {cache} MB',
+  'Suggested for this machine': 'Sugerido para esta máquina',
   'Model': 'Modelo',
-  'Model Cache Directory': 'Diretório de cache do modelo',
-  'Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download':
-    'O cache pode apontar para um diretório compartilhado do HF hub — modelos já baixados são reutilizados sem novo download',
+  'AI Models Folder': 'Pasta de modelos de IA',
+  'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.':
+    'Os modelos Whisper são baixados aqui. Automático escolhe o melhor disco — espaço livre primeiro, com preferência para SSD/NVMe; um HDD grande e lento só vence quando tem muito mais espaço. Um caminho personalizado (HF hub compartilhado) também funciona.',
   'YouTube subtitles first': 'Legendas do YouTube primeiro',
   'Fallback to Whisper when subtitles are unavailable':
     'Recorre ao Whisper quando as legendas não estiverem disponíveis',
@@ -92,6 +95,8 @@ const ptBR: Record<string, string> = {
     'transcrições, dados de chat e cache de pré-visualização — tem efeito após reiniciar (move o banco de dados)',
   'Auto (fastest: {drive})': 'Automático (mais rápido: {drive})',
   'Auto (fastest)': 'Automático (mais rápido)',
+  'Auto (best fit: {drive})': 'Automático (melhor custo-benefício: {drive})',
+  'Auto (best fit)': 'Automático (melhor custo-benefício)',
   'Custom ({dir})': 'Personalizado ({dir})',
   '{bytes} free': '{bytes} livres',
   '{path} — {free} free': '{path} — {free} livres',
@@ -99,7 +104,7 @@ const ptBR: Record<string, string> = {
   'auto pick: {drive}': 'escolha automática: {drive}',
   'Archive VODs': 'VODs arquivados',
   'Whisper Models': 'Modelos Whisper',
-  'Database': 'Banco de dados',
+  'App data': 'Dados do app',
   'Logs': 'Logs',
   'Preview Cache': 'Cache de pré-visualização',
   'Update Temps': 'Temporários de atualização',
@@ -118,23 +123,12 @@ const ptBR: Record<string, string> = {
   'Twitch Helix Token': 'Token Helix do Twitch',
   'auto-filled from Cookie Bridge — paste only if not using the extension':
     'preenchido automaticamente pelo Cookie Bridge — cole apenas se não usar a extensão',
-  'YouTube Data API Key': 'Chave da API de dados do YouTube',
-  'AIza… — leave empty to keep the current path':
-    'AIza… — deixe vazio para manter o caminho atual',
   '● token configured — Helix is primary for Twitch metadata':
     '● token configurado — Helix é primário para metadados do Twitch',
   '○ no token — using the public GQL path':
     '○ sem token — usando o caminho público GQL',
-  '○ no key — using the current unofficial path':
-    '○ sem chave — usando o caminho não oficial atual',
-  'quota used {used}/{limit} units today ({pct}%)':
-    'cota usada {used}/{limit} unidades hoje ({pct}%)',
-  'quota degraded — official path paused until the daily counter resets':
-    'cota degradada — caminho oficial pausado até o contador diário reiniciar',
   'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
     'Usa seu auth-token do Twitch (preenchido automaticamente pelo Cookie Bridge, ou colado) como bearer OAuth para chamadas oficiais da API Helix — metadados mais rápidos e confiáveis. Cai para a API pública automaticamente em qualquer falha.',
-  'When set, captions, video metadata and channel search go through the official YouTube Data API first (quota-aware, silent fallback to the current path). Historical chat always stays on the paced unofficial path. Get a key at console.cloud.google.com.':
-    'Quando definida, legendas, metadados de vídeo e busca de canais passam primeiro pela API oficial de dados do YouTube (ciente de cota, com fallback silencioso para o caminho atual). O chat histórico sempre permanece no caminho não oficial com ritmo controlado. Obtenha uma chave em console.cloud.google.com.',
   'Hide': 'Ocultar',
   'Show': 'Mostrar',
   'Enabled': 'Ativado',
@@ -531,9 +525,12 @@ const es: Record<string, string> = {
   'Save Settings': 'Guardar ajustes',
   'Saved!': '¡Guardado!',
   '● unsaved changes': '● cambios sin guardar',
+  'Recommended': 'Recomendado',
+  'threads {threads} · cache {cache} MB': 'hilos {threads} · caché {cache} MB',
+  'Suggested for this machine': 'Sugerido para esta máquina',
   'Model': 'Modelo',
-  'Model Cache Directory': 'Directorio de caché del modelo',
-  'Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download': 'La caché puede apuntar a un directorio compartido de HF hub — los modelos ya descargados se reutilizan sin volver a descargarse',
+  'AI Models Folder': 'Carpeta de modelos de IA',
+  'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.': 'Los modelos Whisper se descargan aquí. Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio. Una ruta personalizada (HF hub compartido) también funciona.',
   'YouTube subtitles first': 'Subtítulos de YouTube primero',
   'Fallback to Whisper when subtitles are unavailable': 'Usar Whisper cuando no haya subtítulos',
   'Captions Language': 'Idioma de subtítulos',
@@ -555,6 +552,8 @@ const es: Record<string, string> = {
   'transcripts, chat data & preview cache — takes effect after restart (moves the database)': 'transcripciones, datos de chat y caché de vista previa — surte efecto tras reiniciar (mueve la base de datos)',
   'Auto (fastest: {drive})': 'Automático (más rápido: {drive})',
   'Auto (fastest)': 'Automático (más rápido)',
+  'Auto (best fit: {drive})': 'Automático (mejor equilibrio: {drive})',
+  'Auto (best fit)': 'Automático (mejor equilibrio)',
   'Custom ({dir})': 'Personalizado ({dir})',
   '{bytes} free': '{bytes} libres',
   '{path} — {free} free': '{path} — {free} libres',
@@ -562,7 +561,7 @@ const es: Record<string, string> = {
   'auto pick: {drive}': 'elección automática: {drive}',
   'Archive VODs': 'VODs archivados',
   'Whisper Models': 'Modelos Whisper',
-  'Database': 'Base de datos',
+  'App data': 'Datos de la app',
   'Logs': 'Registros',
   'Preview Cache': 'Caché de vista previa',
   'Update Temps': 'Temporales de actualización',
@@ -580,23 +579,12 @@ const es: Record<string, string> = {
   'Twitch Helix Token': 'Token Helix de Twitch',
   'auto-filled from Cookie Bridge — paste only if not using the extension':
     'rellenado automáticamente desde Cookie Bridge — pega solo si no usas la extensión',
-  'YouTube Data API Key': 'Clave de la API de datos de YouTube',
-  'AIza… — leave empty to keep the current path':
-    'AIza… — deja vacío para mantener la ruta actual',
   '● token configured — Helix is primary for Twitch metadata':
     '● token configurado — Helix es primario para metadatos de Twitch',
   '○ no token — using the public GQL path':
     '○ sin token — usando la ruta pública GQL',
-  '○ no key — using the current unofficial path':
-    '○ sin clave — usando la ruta no oficial actual',
-  'quota used {used}/{limit} units today ({pct}%)':
-    'cuota usada {used}/{limit} unidades hoy ({pct}%)',
-  'quota degraded — official path paused until the daily counter resets':
-    'cuota degradada — ruta oficial pausada hasta que el contador diario se reinicie',
   'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
     'Usa tu auth-token de Twitch (rellenado automáticamente desde Cookie Bridge, o pegado) como bearer OAuth para llamadas oficiales de la API Helix — metadatos más rápidos y confiables. Vuelve a la API pública automáticamente ante cualquier fallo.',
-  'When set, captions, video metadata and channel search go through the official YouTube Data API first (quota-aware, silent fallback to the current path). Historical chat always stays on the paced unofficial path. Get a key at console.cloud.google.com.':
-    'Cuando está definida, los subtítulos, los metadatos de video y la búsqueda de canales pasan primero por la API oficial de datos de YouTube (consciente de cuota, con retroceso silencioso a la ruta actual). El chat histórico siempre permanece en la ruta no oficial con ritmo controlado. Obtén una clave en console.cloud.google.com.',
   'Hide': 'Ocultar',
   'Show': 'Mostrar',
   'Enabled': 'Activado',

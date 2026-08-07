@@ -45,7 +45,7 @@ function stubFetch(status: {
       : url.includes("/api/disk/cleanup")
         ? { freed_bytes: 1024 ** 3 }
         : url.includes("/api/disks")
-          ? { drives: DISKS, fastest: "I:\\" }
+          ? { drives: DISKS, fastest: "I:\\", model_cache: "I:\\" }
           : USAGE;
     return new Response(JSON.stringify(body), {
       status: 200,
@@ -138,12 +138,47 @@ describe("DiskSection", () => {
     render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
     await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
     expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
+    expect(screen.getByLabelText("ai models folder")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "transcripts, chat data & preview cache — takes effect after restart (moves the database)" })).toBeInTheDocument();
-    // Drive labels appear once per select (cache + data pickers).
-    expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(2);
-    expect(screen.getAllByRole("option", { name: "D: (402 GB free, SSD)" })).toHaveLength(2);
+    // Drive labels appear once per select (cache + data + model pickers).
+    expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(3);
+    expect(screen.getAllByRole("option", { name: "D: (402 GB free, SSD)" })).toHaveLength(3);
     expect(screen.getByRole("option", { name: "Auto (biggest free space)" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Auto (best fit: I:)" })).toBeInTheDocument();
+  });
+
+  it("selecting a model cache disk writes <drive>\\VOD.RIP-models", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    const setSettings = vi.fn();
+    render(<DiskSection settings={BASE_SETTINGS} setSettings={setSettings} />);
+    await waitFor(() => expect(screen.getByLabelText("ai models folder")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("ai models folder"), { target: { value: "D:\\VOD.RIP-models" } });
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ whisper_model_cache: "D:\\VOD.RIP-models" }));
+  });
+
+  it("selecting Auto for the model cache clears it (empty = auto)", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    const setSettings = vi.fn();
+    render(
+      <DiskSection
+        settings={{ ...BASE_SETTINGS, whisper_model_cache: "D:\\VOD.RIP-models" }}
+        setSettings={setSettings}
+      />
+    );
+    await waitFor(() => expect(screen.getByLabelText("ai models folder")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("ai models folder"), { target: { value: "" } });
+    expect(setSettings).toHaveBeenCalledWith(expect.objectContaining({ whisper_model_cache: "" }));
+  });
+
+  it("surfaces a legacy custom model cache path as a Custom option", async () => {
+    stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
+    render(
+      <DiskSection settings={{ ...BASE_SETTINGS, whisper_model_cache: "Z:\\hub" }} setSettings={() => {}} />
+    );
+    await waitFor(() => expect(screen.getByLabelText("ai models folder")).toBeInTheDocument());
+    expect(screen.getByRole("option", { name: "Custom (Z:\\hub)" })).toBeInTheDocument();
+    expect(screen.getByLabelText("ai models folder")).toHaveValue("Z:\\hub");
   });
 
   it("selecting a cache disk writes <drive>\\VOD.RIP-cache", async () => {

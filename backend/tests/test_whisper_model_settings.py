@@ -19,6 +19,7 @@ from app import app
 from deps import settings_mgr
 from models.schemas import AppSettings
 from services import archive_transcribe, disk_hygiene
+from services.settings import recommended_resource_defaults
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +100,9 @@ def test_transcribe_resolution_from_settings(monkeypatch):
 def test_transcribe_resolution_env_fallback(monkeypatch):
     monkeypatch.setenv("VODRIP_WHISPER_MODEL", "small")
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    # No usable drive -> appdata fallback (keeps the test hermetic: the real
+    # auto pick probes actual disks via best_model_cache_drive()).
+    monkeypatch.setattr("services.disk_hygiene.best_model_cache_drive", lambda: None)
     with patch("deps.settings_mgr") as mgr:
         mgr.get.return_value = SimpleNamespace(whisper_model="", whisper_model_cache="")
         assert archive_transcribe.model_name() == "small"
@@ -154,6 +158,9 @@ def test_get_model_reloads_when_device_override_flips(monkeypatch):
     broken, so _get_model must reload instead of returning it (it previously
     compared only the model name, so the retry re-ran on the corrupted
     context: cudaErrorInvalidDevice)."""
+    # _get_model resolves the cache dir; pin the ROI auto-pick to keep the
+    # test hermetic (no real-disk PowerShell probe, no real drive writes).
+    monkeypatch.setattr(disk_hygiene, "best_model_cache_drive", lambda: None)
     archive_transcribe._model = object()
     archive_transcribe._model_name = "large-v3-turbo"
     archive_transcribe._model_device = "cuda"
@@ -237,3 +244,107 @@ def test_startup_hygiene_prunes_with_settings_active(monkeypatch, tmp_path):
     assert stats.get("whisper_models") == 1024
     assert (cache / "models--Systran--faster-whisper-medium").is_dir()
     assert (cache / "models--Systran--faster-whisper-small").exists() is False
+
+
+# --- model-cache auto pick (Settings > Disk "AI Models Folder" Auto) --------
+
+def _inv(letter, free, rank):
+    return {
+        "drive": f"{letter}:\\",
+        "label": "",
+        "total_bytes": 1000 * 1024**3,
+        "free_bytes": free,
+        "media_type": "Unknown",
+        "bus_type": "Unknown",
+        "speed_rank": rank,
+    }
+
+
+def test_model_cache_score_prefers_ssd_near_ties():
+    # SSD with adequate free beats an HDD with a bit more (100+32 > 120).
+    assert disk_hygiene._model_cache_score(100 * 1024**3, 2) > disk_hygiene._model_cache_score(120 * 1024**3, 3)
+    # A large slow HDD beats a nearly-full SSD (400 > 300+64).
+    assert disk_hygiene._model_cache_score(400 * 1024**3, 3) > disk_hygiene._model_cache_score(300 * 1024**3, 1)
+    # NVMe credit > SSD credit at equal free space.
+    assert disk_hygiene._model_cache_score(50 * 1024**3, 1) > disk_hygiene._model_cache_score(50 * 1024**3, 2)
+
+
+def test_best_model_cache_drive_roi(monkeypatch):
+    monkeypatch.setattr(
+        "services.disk_detect.disk_inventory",
+        lambda: [
+            _inv("C", 5 * 1024**3, 1),    # NVMe but below the 8 GB floor
+            _inv("F", 100 * 1024**3, 2),  # SSD
+            _inv("I", 400 * 1024**3, 3),  # HDD with lots of space -> wins
+        ],
+    )
+    assert disk_hygiene.best_model_cache_drive() == "I:\\"
+
+
+def test_best_model_cache_drive_ssd_wins_near_tie(monkeypatch):
+    monkeypatch.setattr(
+        "services.disk_detect.disk_inventory",
+        lambda: [
+            _inv("D", 120 * 1024**3, 3),  # HDD, 120 GB
+            _inv("H", 100 * 1024**3, 1),  # NVMe, 100 GB -> 164 GB score
+        ],
+    )
+    assert disk_hygiene.best_model_cache_drive() == "H:\\"
+
+
+def test_best_model_cache_drive_empty(monkeypatch):
+    monkeypatch.setattr("services.disk_detect.disk_inventory", lambda: [])
+    assert disk_hygiene.best_model_cache_drive() is None
+
+
+def test_whisper_cache_dir_auto_uses_roi_drive(monkeypatch):
+    """Auto (unset setting) resolves to <best-ROI drive>\\VOD.RIP-models."""
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    monkeypatch.setattr(
+        "services.disk_detect.disk_inventory",
+        lambda: [_inv("H", 61 * 1024**3, 1)],
+    )
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache=None)
+        assert disk_hygiene.whisper_cache_dir() == Path("H:\\VOD.RIP-models")
+
+
+def test_whisper_cache_dir_explicit_beats_auto(monkeypatch):
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache="Z:/shared/hub")
+        assert disk_hygiene.whisper_cache_dir() == Path("Z:/shared/hub")
+
+
+# --- recommended resource defaults (Settings > Recommended) -----------------
+
+def test_recommended_threads_half_cores_capped_by_ram():
+    assert recommended_resource_defaults(
+        cpu_count=20, ram_bytes=32 * 1024**3, drive_total=0, drive_free=0
+    )["download_threads"] == 10  # round(20 * 0.5)
+    # RAM guard: 8 GB -> at most 4 concurrent downloaders (~2 GB each).
+    assert recommended_resource_defaults(
+        cpu_count=20, ram_bytes=8 * 1024**3, drive_total=0, drive_free=0
+    )["download_threads"] == 4
+    # Clamps: 2 min / 16 max.
+    assert recommended_resource_defaults(
+        cpu_count=2, ram_bytes=64 * 1024**3, drive_total=0, drive_free=0
+    )["download_threads"] == 2
+    assert recommended_resource_defaults(
+        cpu_count=64, ram_bytes=128 * 1024**3, drive_total=0, drive_free=0
+    )["download_threads"] == 16
+
+
+def test_recommended_cache_mb_scales_with_free_share():
+    assert recommended_resource_defaults(
+        cpu_count=20, ram_bytes=32 * 1024**3,
+        drive_total=1000 * 1024**3, drive_free=500 * 1024**3,
+    )["max_cache_mb"] == 1000  # 50% free -> 1000 MB
+    assert recommended_resource_defaults(
+        cpu_count=20, ram_bytes=32 * 1024**3,
+        drive_total=1000 * 1024**3, drive_free=10 * 1024**3,
+    )["max_cache_mb"] == 50  # 1% free -> floor
+    assert recommended_resource_defaults(
+        cpu_count=20, ram_bytes=32 * 1024**3,
+        drive_total=1000 * 1024**3, drive_free=1000 * 1024**3,
+    )["max_cache_mb"] == 2000  # 100% free -> cap

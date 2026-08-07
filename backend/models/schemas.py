@@ -138,9 +138,6 @@ class AppSettings(BaseModel):
     # auto-lift only replaces the stored token when the cookie export is
     # NEWER than this — a stale browser cookie never clobbers a manual paste.
     twitch_helix_token_updated_at: float = 0.0
-    # YouTube Data API v3 key (opt-in): routes captions/metadata/search
-    # through the official API first, quota-aware, with silent fallback.
-    youtube_data_api_key: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -185,7 +182,6 @@ class SettingsUpdate(BaseModel):
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None
     twitch_helix_token: Optional[str] = None
-    youtube_data_api_key: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):
