@@ -40,10 +40,10 @@ function UsageRow({
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2">
-        <span className="flex-1 text-xs text-zinc-300 font-mono uppercase tracking-wide truncate">
+        <span className="flex-1 text-[11px] text-zinc-300 font-mono uppercase tracking-wide truncate">
           {ROW_LABELS[category] ?? category}
         </span>
-        <span className="text-xs text-zinc-100 font-mono tabular-nums w-20 text-right">
+        <span className="text-[11px] text-zinc-100 font-mono tabular-nums w-20 text-right">
           {formatBytes(bytes)}
         </span>
         {cleanable ? (
@@ -52,7 +52,7 @@ function UsageRow({
             aria-label={`clean ${category}`}
             onClick={() => onClean(category)}
             disabled={cleaning}
-            className="bg-zinc-900 text-zinc-400 font-black uppercase px-3 py-1.5 text-xs border-2 border-zinc-700 hover:border-red-500 hover:text-red-400 shrink-0 flex items-center gap-1.5 disabled:opacity-40"
+            className="bg-zinc-900 text-zinc-400 font-black uppercase px-3 py-1.5 text-[11px] border-2 border-zinc-700 hover:border-red-500 hover:text-red-400 shrink-0 flex items-center gap-1.5 disabled:opacity-40"
           >
             {cleaning ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
             CLEAN
@@ -138,7 +138,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
   return (
     <div className="flex flex-col gap-3">
       {status?.low ? (
-        <div role="alert" className="bg-red-950 text-red-400 border-2 border-red-900 px-3 py-2 text-xs font-mono">
+        <div role="alert" className="bg-red-950 text-red-400 border-2 border-red-900 px-3 py-2 text-[11px] font-mono">
           LOW DISK SPACE — {formatBytes(status.free_bytes)} free. Run cleanups below or free space manually.
         </div>
       ) : null}
@@ -156,7 +156,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
           aria-label="heavy cache disk"
           value={cacheDir}
           onChange={(e) => setSettings({ ...settings, cache_dir: e.target.value })}
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
         >
           <option value="">Auto (biggest free space)</option>
           {cacheOptions.map((o) => (
@@ -175,7 +175,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
           aria-label="transcripts and chat data disk"
           value={dataDir}
           onChange={(e) => setSettings({ ...settings, data_dir: e.target.value })}
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
         >
           <option value="">{autoDataLabel}</option>
           {dataOptions.map((o) => (
@@ -188,13 +188,13 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
 
         <div className="flex items-center gap-2 pt-0.5 flex-wrap">
-          <span className="text-xs text-zinc-400 font-mono">
+          <span className="text-[11px] text-zinc-400 font-mono">
             {effectiveCache
               ? `${effectiveCache} — ${cacheFree != null ? `${formatBytes(cacheFree)} free` : '…'}`
               : 'using app data drive'}
           </span>
           {status?.biggest_drive ? (
-            <span className="text-xs text-zinc-400 font-mono">auto pick: {status.biggest_drive}</span>
+            <span className="text-[11px] text-zinc-400 font-mono">auto pick: {status.biggest_drive}</span>
           ) : null}
         </div>
       </div>
@@ -217,18 +217,18 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
       {usage ? (
         <div className="flex items-center gap-2">
-          <span className="flex-1 text-xs text-zinc-400 font-mono uppercase tracking-wide">Total</span>
-          <span className="text-xs text-zinc-100 font-mono tabular-nums w-20 text-right">{formatBytes(usage.total)}</span>
+          <span className="flex-1 text-[11px] text-zinc-400 font-mono uppercase tracking-wide">Total</span>
+          <span className="text-[11px] text-zinc-100 font-mono tabular-nums w-20 text-right">{formatBytes(usage.total)}</span>
           <span className="w-16 shrink-0" aria-hidden />
         </div>
       ) : null}
 
       <div className="flex items-center gap-2 pt-0.5 flex-wrap">
-        <span className="text-xs text-zinc-400 font-mono">FREE</span>
-        <span className="text-xs text-zinc-300 font-mono tabular-nums">
+        <span className="text-[11px] text-zinc-400 font-mono">FREE</span>
+        <span className="text-[11px] text-zinc-300 font-mono tabular-nums">
           {status ? formatBytes(status.free_bytes) : '…'}
         </span>
-        {lastFreed ? <span className="text-xs text-emerald-500 font-mono">{lastFreed}</span> : null}
+        {lastFreed ? <span className="text-[11px] text-emerald-500 font-mono">{lastFreed}</span> : null}
       </div>
 
       <div className="flex flex-col gap-1.5 pt-1">
@@ -249,7 +249,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
         </div>
       </div>
 
-      {error ? <div className="text-xs text-red-400 font-mono">{error}</div> : null}
+      {error ? <div className="text-[11px] text-red-400 font-mono">{error}</div> : null}
     </div>
   );
 }

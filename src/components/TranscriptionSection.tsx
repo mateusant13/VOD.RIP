@@ -53,7 +53,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           onChange={(e) => setSettings({ ...settings, whisper_model: e.target.value })}
           placeholder="large-v3-turbo"
           aria-label="whisper model id"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-sm"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-xs"
         />
       </div>
       <div className="flex flex-col gap-1.5">
@@ -69,7 +69,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           onChange={(e) => setSettings({ ...settings, whisper_model_cache: e.target.value })}
           placeholder="%APPDATA%/VOD.RIP/whisper-models"
           aria-label="whisper model cache directory"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-sm"
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-xs"
         />
       </div>
       <Toggle
@@ -91,7 +91,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
             value={settings.asr_language ?? 'auto'}
             onChange={(e) => setSettings({ ...settings, asr_language: e.target.value })}
             aria-label="default captions language"
-            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
           >
             <option value="auto">Auto-detect</option>
             <option value="pt">Portuguese (pt)</option>
@@ -105,13 +105,13 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           type="button"
           onClick={() => void onSave()}
           disabled={saving}
-          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center gap-1.5"
+          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center gap-1.5"
         >
           {saving ? <Loader2 size={13} className="animate-spin" /> : null}
           {saving ? '...' : 'Save'}
         </button>
-        <span className="text-xs text-zinc-400 font-mono">active: {activeModel}</span>
-        {msg ? <span className="text-xs text-emerald-500 font-mono">{msg}</span> : null}
+        <span className="text-[11px] text-zinc-400 font-mono">active: {activeModel}</span>
+        {msg ? <span className="text-[11px] text-emerald-500 font-mono">{msg}</span> : null}
       </div>
     </div>
   );

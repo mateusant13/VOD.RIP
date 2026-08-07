@@ -10,7 +10,6 @@ GET  /api/session/cookies/pull?platform=  — Netscape cookies.txt (text/plain)
 GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}}}
 GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
 POST /api/session/cookies/enable|disable — kill switch (consent toggle).
-GET  /api/session/cookies/extension/update.xml  — policy-install manifest.
 GET  /api/session/cookies/extension/extension.crx — the packed extension.
 GET  /api/session/cookies/extension/id — extension id from the packed key.
 """
@@ -29,8 +28,8 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from deps import settings_mgr
 from services import cookie_store
@@ -331,38 +330,13 @@ def _open_extension_manager() -> dict:
     return {"launched": False, "browser": None, "url": None}
 
 
-@router.get("/api/session/cookies/extension/update.xml")
-async def session_cookies_extension_update_xml(request: Request):
-    """Policy-install manifest consumed by Chrome/Edge ExtensionInstallForcelist."""
-    ext_id = _ext_id()
-    version = _ext_version()
-    if not ext_id or not version:
-        raise HTTPException(
-            status_code=404,
-            detail="cookie extension not installed — run scripts/install-cookie-bridge-policy.ps1",
-        )
-    codebase = (
-        str(request.base_url).rstrip("/")
-        + "/api/session/cookies/extension/extension.crx"
-    )
-    xml = (
-        "<?xml version='1.0' encoding='UTF-8'?>\n"
-        "<gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>\n"
-        f"  <app appid='{ext_id}'>\n"
-        f"    <updatecheck codebase='{codebase}' version='{version}' />\n"
-        "  </app>\n"
-        "</gupdate>\n"
-    )
-    return Response(content=xml, media_type="text/xml")
-
-
 @router.get("/api/session/cookies/extension/extension.crx")
 async def session_cookies_extension_crx():
     crx = _ext_crx_path()
     if not crx.exists():
         raise HTTPException(
             status_code=404,
-            detail="cookie extension crx not installed — run scripts/install-cookie-bridge-policy.ps1",
+            detail="cookie extension crx not installed — restart the app to refresh the drag-drop folder in Settings",
         )
     return FileResponse(crx, media_type="application/x-chrome-extension")
 
@@ -373,7 +347,7 @@ async def session_cookies_extension_id():
     if not ext_id:
         raise HTTPException(
             status_code=404,
-            detail="cookie extension key not installed — run scripts/install-cookie-bridge-policy.ps1",
+            detail="cookie extension key not installed — restart the app to refresh the drag-drop folder in Settings",
         )
     return {"extension_id": ext_id}
 

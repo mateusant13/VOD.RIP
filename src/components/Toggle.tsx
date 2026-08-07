@@ -21,7 +21,7 @@ export default function Toggle({ checked, onChange, label, info, ariaLabel }: Pr
       <span className="flex items-center gap-1.5 min-w-0">
         <label
           htmlFor={id}
-          className="text-xs font-bold uppercase tracking-wider text-zinc-300 cursor-pointer"
+          className="text-[11px] font-bold uppercase tracking-wider text-zinc-300 cursor-pointer"
         >
           {label}
         </label>

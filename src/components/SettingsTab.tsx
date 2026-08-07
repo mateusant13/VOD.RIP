@@ -61,7 +61,7 @@ function SettingsCard({
         }`}
       >
         <span
-          className={`flex items-center gap-2 min-w-0 text-xs font-bold uppercase tracking-widest ${
+          className={`flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-widest ${
             danger ? 'text-red-400' : 'text-zinc-300'
           }`}
         >
@@ -137,9 +137,9 @@ export default function SettingsTab({
               onChange={(e) => setSettings({ ...settings, download_folder: e.target.value })}
               placeholder="C:\Users\...\Downloads"
               aria-label="download folder"
-              className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm truncate focus:outline-none focus:border-white" />
+              className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs truncate focus:outline-none focus:border-white" />
             <button type="button" onClick={onPickFolder} disabled={pickingFolder}
-              className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1.5 disabled:opacity-50">
+              className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1.5 disabled:opacity-50">
               {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
               {pickingFolder ? '...' : 'Browse'}
             </button>
@@ -196,18 +196,18 @@ export default function SettingsTab({
       <SettingsCard
         icon={RefreshCw}
         title="Updates"
-        right={<span className="text-xs font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
+        right={<span className="text-[11px] font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
       >
         <div className="flex items-center gap-2 flex-wrap">
           {updateInfo ? (
             <>
-              <span className="text-xs font-mono text-emerald-400">v{updateInfo.version} available</span>
+              <span className="text-[11px] font-mono text-emerald-400">v{updateInfo.version} available</span>
               {updateInfo.release_url ? (
                 <a
                   href={updateInfo.release_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-zinc-400 hover:text-zinc-200 underline-offset-2 hover:underline text-xs font-mono"
+                  className="text-zinc-400 hover:text-zinc-200 underline-offset-2 hover:underline text-[11px] font-mono"
                 >
                   release
                 </a>
@@ -216,21 +216,21 @@ export default function SettingsTab({
                 type="button"
                 onClick={() => void onApplyUpdate()}
                 disabled={updateApplying}
-                className="text-emerald-500 hover:text-emerald-300 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-xs inline-flex items-center gap-1"
+                className="text-emerald-500 hover:text-emerald-300 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[11px] inline-flex items-center gap-1"
               >
                 {updateApplying ? <Loader2 size={12} className="animate-spin" /> : null}
                 {updateApplying ? 'installing' : 'install'}
               </button>
             </>
           ) : updateMessage ? (
-            <span className="text-xs font-mono text-zinc-400">{updateMessage}</span>
+            <span className="text-[11px] font-mono text-zinc-400">{updateMessage}</span>
           ) : null}
         </div>
         <button
           type="button"
           onClick={() => void onCheckUpdate()}
           disabled={updateChecking}
-          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center justify-center gap-1.5"
+          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center justify-center gap-1.5"
         >
           {updateChecking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
           {updateChecking ? 'Checking…' : 'Check for Updates'}
@@ -247,7 +247,7 @@ export default function SettingsTab({
         <button
           type="button"
           onClick={exit}
-          className="w-full bg-red-950 text-red-300 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-sm border-2 border-red-900 hover:border-red-500 hover:text-red-200 transition-colors"
+          className="w-full bg-red-950 text-red-300 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-200 transition-colors"
         >
           <StopCircle size={16} />
           Exit VOD.RIP
@@ -258,15 +258,15 @@ export default function SettingsTab({
       {needsCookieSetup ? null : cookieCard}
 
       {/* ── Save ────────────────────────────────────────────────── */}
-      <div className="flex flex-col gap-1.5 pt-1 sticky bottom-0 bg-zinc-950/95 backdrop-blur-sm pb-1">
+      <div className="flex flex-col gap-1.5 pt-1 pb-1">
         <button
           onClick={() => void save()}
-          className="w-full bg-zinc-100 text-black font-black uppercase py-3 flex items-center justify-center gap-2 text-sm border-2 border-zinc-100 hover:bg-zinc-300 hover:border-zinc-300 transition-colors"
+          className="w-full bg-zinc-100 text-black font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-100 hover:bg-zinc-300 hover:border-zinc-300 transition-colors"
         >
           {settingsSaved ? <><CheckCircle2 size={16} /> Saved!</> : 'Save Settings'}
         </button>
         {dirty ? (
-          <span className="text-xs font-mono text-amber-400 text-center" role="status">
+          <span className="text-[11px] font-mono text-amber-400 text-center" role="status">
             ● unsaved changes
           </span>
         ) : null}
