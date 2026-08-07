@@ -135,7 +135,7 @@ export interface OpenTwitchClipArgs {
   vodId?: string;
   offsetSec?: number;
   durationSec?: number;
-  /** User-chosen clip title (empty -> Twitch auto-titles). Becomes the local filename on download. */
+  /** User-chosen clip title (empty -> backend sends the broadcaster login for VOD clips, since Helix requires a title; live clips omit it -> Twitch auto-titles). Becomes the local filename on download. */
   title?: string;
 }
 

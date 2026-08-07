@@ -5,11 +5,13 @@ POST /api/twitch/clip calls Helix with the stored user token
 (settings.twitch_helix_token — cookie-bridge auto-lift or manual paste in
 Settings → Official APIs):
 
-- VOD clips:  POST /helix/videos/clips  {video_id, vod_offset, duration}
+- VOD clips:  POST /helix/videos/clips  ?broadcaster_id=&editor_id=&vod_id=&vod_offset=&duration=&title=
               scopes editor:manage:clips | channel:manage:clips
-              (vod_offset = seconds from video START to clip END — the same
-              END reference the frontend selection uses; duration 5..60s)
-- live clips: POST /helix/clips  {broadcaster_id}
+              (query params per the official reference — NOT a JSON body;
+              vod_offset = seconds from video START to clip END — the same
+              END reference the frontend selection uses; duration 5..60s;
+              title is required by the endpoint, blank -> broadcaster login)
+- live clips: POST /helix/clips  ?broadcaster_id=&title=
               scope clips:edit (broadcaster must be live)
 
 Success returns {ok: true, id, edit_url}; failures come back as
@@ -54,8 +56,9 @@ class TwitchClipRequest(BaseModel):
     vod_id: Optional[str] = None
     offset_sec: Optional[int] = None
     duration_sec: Optional[int] = None
-    # User-chosen clip title ("" -> omit from the Helix request so Twitch
-    # auto-titles; the title becomes the local filename on download).
+    # User-chosen clip title ("" -> Helix VOD clips default to the broadcaster
+    # login since the endpoint requires a title; live clips omit it so Twitch
+    # auto-titles). Becomes the local filename on download.
     title: Optional[str] = None
 
 
@@ -162,15 +165,23 @@ def _token_and_client() -> Dict[str, Any]:
         )
     return {
         "client_id": client_id,
+        "user_id": str((info or {}).get("user_id") or "").strip(),
         "scopes": set((info or {}).get("scopes") or []),
         "login": (info or {}).get("login"),
     }
 
 
 def _record_clip(
-    data: Dict[str, Any], login: str, req: TwitchClipRequest
+    data: Dict[str, Any],
+    login: str,
+    req: TwitchClipRequest,
+    title: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Extract id/edit_url from a successful Helix response and record history."""
+    """Extract id/edit_url from a successful Helix response and record history.
+
+    ``title`` is the effective clip title sent to Helix (VOD clips always get
+    one — blank defaults to the broadcaster login); defaults to req.title.
+    """
     rows = (data or {}).get("data") or []
     if not rows:
         return _error("clip_failed", "Twitch did not return a clip — try again in a moment")
@@ -188,7 +199,7 @@ def _record_clip(
         "vod_id": req.vod_id,
         "offset_sec": req.offset_sec,
         "duration_sec": req.duration_sec,
-        "title": req.title,
+        "title": title if title is not None else req.title,
         "url": edit_url,
         "status": "created",
     }
@@ -209,21 +220,45 @@ def _create_vod_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
             "or channel:manage:clips; paste a token with this scope in "
             "Settings → Official APIs",
         )
+    editor_id = info.get("user_id") or ""
+    if not editor_id:
+        return _error(
+            "unauthorized",
+            "Twitch token validation failed — re-authenticate or paste a fresh "
+            "token in Settings → Official APIs",
+        )
     try:
-        body: Dict[str, Any] = {
-            "video_id": str(req.vod_id),
-            # vod_offset = seconds from video START to clip END (existing
-            # END-reference semantics); duration picks the clip length 5..60s.
+        # broadcaster_id/editor_id are required query params: the channel's
+        # user id and the token user's id (editor_id must match the token).
+        users = ths._helix_get(
+            "/users", {"login": login}, client_id=info["client_id"]
+        )
+        rows = (users or {}).get("data") or []
+        broadcaster_id = str(rows[0].get("id") or "") if rows else ""
+        if not broadcaster_id:
+            return _error("not_found", "Twitch broadcaster not found")
+
+        # Official shape (dev.twitch.tv/docs/api/reference/#create-clip-from-vod):
+        # all fields are URL query params. vod_offset = seconds from video
+        # START to clip END (existing END-reference semantics); duration picks
+        # the clip length 5..60s; title is required — blank -> broadcaster
+        # login so a nameless clip still has a deterministic title.
+        params: Dict[str, Any] = {
+            "broadcaster_id": broadcaster_id,
+            "editor_id": editor_id,
+            "vod_id": str(req.vod_id),
             "vod_offset": int(req.offset_sec),
+            "title": (req.title or "").strip() or login,
         }
         if req.duration_sec is not None:
-            body["duration"] = int(req.duration_sec)
-        if req.title:
-            body["title"] = req.title
-        data = ths._helix_post("/videos/clips", body, info["client_id"])
+            params["duration"] = int(req.duration_sec)
+        title = params["title"]
+        data = ths._helix_post(
+            "/videos/clips", params=params, client_id=info["client_id"]
+        )
     except Exception as exc:
         return _helix_failure(exc)
-    return _record_clip(data, login, req)
+    return _record_clip(data, login, req, title)
 
 
 def _create_live_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
@@ -242,10 +277,14 @@ def _create_live_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
         broadcaster_id = str(rows[0].get("id") or "") if rows else ""
         if not broadcaster_id:
             return _error("not_found", "Twitch broadcaster not found")
-        body: Dict[str, Any] = {"broadcaster_id": broadcaster_id}
+        # Official shape (POST /clips): broadcaster_id (+ optional title) are
+        # URL query params, not a JSON body.
+        params: Dict[str, Any] = {"broadcaster_id": broadcaster_id}
         if req.title:
-            body["title"] = req.title
-        data = ths._helix_post("/clips", body, info["client_id"])
+            params["title"] = req.title
+        data = ths._helix_post(
+            "/clips", params=params, client_id=info["client_id"]
+        )
     except Exception as exc:
         return _helix_failure(exc)
     return _record_clip(data, login, req)
