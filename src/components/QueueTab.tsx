@@ -428,15 +428,21 @@ export default function QueueTab({
                     {new Date(c.created_at).toLocaleString()}
                   </span>
                 </div>
-                <a
-                  href={c.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
-                  title={t('Open Twitch clip editor')}
-                >
-                  <ExternalLink size={12} /> {t('Editor')}
-                </a>
+                {/^https?:\/\//.test(c.url) ? (
+                  <a
+                    href={c.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
+                    title={t('Open Twitch clip editor')}
+                  >
+                    <ExternalLink size={12} /> {t('Editor')}
+                  </a>
+                ) : (
+                  <span className="text-zinc-700 text-[10px] font-mono uppercase tracking-wider shrink-0">
+                    {t('—')}
+                  </span>
+                )}
               </div>
             ))}
           </div>
