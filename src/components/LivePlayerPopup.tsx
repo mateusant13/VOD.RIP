@@ -16,6 +16,7 @@ import {
   LIVE_PANEL_MAX_W,
   LIVE_PANEL_MIN_H,
   LIVE_PANEL_MIN_W,
+  LIVE_POPUP_ACTIVE_Z,
   panelPosAfterResize,
   startPanelResizeDrag,
 } from '../layoutUtils';
@@ -953,7 +954,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         top: position.y,
         width: size.w,
         height: size.h,
-        zIndex: 500,
+        // Active-state z: an open preview must float above the floating
+        // archive search (SEARCH_POPUP_Z); unmount on close restores order.
+        zIndex: LIVE_POPUP_ACTIVE_Z,
         boxShadow: '6px 6px 0px 0px rgba(9,9,11,0.9)',
         display: 'flex',
         flexDirection: 'column',

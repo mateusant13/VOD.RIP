@@ -2,6 +2,7 @@
 
 import { createPortal } from 'react-dom';
 import { formatHmsFull } from '../utils';
+import { LIVE_POPUP_ACTIVE_Z } from '../layoutUtils';
 import type { ReactNode } from 'react';
 
 export type NeedleGlanceState = {
@@ -40,10 +41,10 @@ export default function NeedleGlancePopup({
 
   return createPortal(
     <div
-      className={`needle-glance-popup fixed z-[500] pointer-events-none select-none ${
+      className={`needle-glance-popup fixed pointer-events-none select-none ${
         glance.dragging ? 'needle-glance-popup--drag' : 'needle-glance-popup--idle'
       }`}
-      style={{ left: popupLeft, top: popupTop }}
+      style={{ left: popupLeft, top: popupTop, zIndex: LIVE_POPUP_ACTIVE_Z }}
     >
       <div className="border-2 border-zinc-500 bg-zinc-950/95 px-3 py-2 shadow-[4px_4px_0px_0px_rgba(113,113,122,0.5)] min-w-[168px]">
         <div className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 mb-1">

@@ -76,7 +76,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
-import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -7037,7 +7037,7 @@ export default function App() {
       )}
       {archiveSearchOpen && (
         <ArchiveSearchPopup
-          zIndex={EXPLORE_POPUP_Z - 100}
+          zIndex={SEARCH_POPUP_Z}
           onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); setArchiveSearchChannel(null); }}
           onOpenHit={openArchiveHit}
           scope={archiveSearchScope ?? undefined}
@@ -7047,7 +7047,7 @@ export default function App() {
       )}
       {previewOpen && previewSearchOpen && (
         <ArchiveSearchPopup
-          zIndex={EXPLORE_POPUP_Z - 100}
+          zIndex={SEARCH_POPUP_Z}
           initialPos={previewSearchAnchorRef.current ?? undefined}
           onClose={() => setPreviewSearchOpen(false)}
           onOpenHit={openArchiveHit}

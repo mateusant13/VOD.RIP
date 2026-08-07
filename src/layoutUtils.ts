@@ -965,6 +965,14 @@ export const PANEL_MIN: PanelSize = { w: 240, h: 180 };
 export const PANEL_MAX_H_HARD = 3000;
 export const VIEWPORT_EDGE_LOCK = 40;
 export const EXPLORE_POPUP_Z = 9999;
+/** Floating archive-search panels — just under the explore stack (#explore-portal
+ *  is a fixed layer at EXPLORE_POPUP_Z - 1), so search never covers a player. */
+export const SEARCH_POPUP_Z = EXPLORE_POPUP_Z - 100;
+/** Active live preview popups (LivePlayerPopup, needle glance) float ABOVE the
+ *  floating search while open — an open search must never cover the active
+ *  preview. Popups unmount on close, so the search regains its order by itself.
+ *  Stays under the explore stack (9999+) to keep the live-vs-explore order. */
+export const LIVE_POPUP_ACTIVE_Z = EXPLORE_POPUP_Z - 50;
 export const MAX_EXPLORE_POPUPS = 5;
 export const LAYOUT_ROW_GAP_TRIPLE = 12;
 export const LAYOUT_ROW_GAP_SPLIT = 24;

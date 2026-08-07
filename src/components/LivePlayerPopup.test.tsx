@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { LivePlayerPopup } from './LivePlayerPopup';
+import { LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
 
 /**
  * jsdom does not implement the Fullscreen API (no requestFullscreen /
@@ -142,5 +143,36 @@ describe('LivePlayerPopup fullscreen', () => {
     fsElement = null;
     document.dispatchEvent(new Event('fullscreenchange'));
     await screen.findByRole('dialog', { name: 'Archive search' });
+  });
+});
+
+describe('LivePlayerPopup z-order', () => {
+  it('floats the open preview above the floating archive search panel', () => {
+    renderPopup();
+    // The popup portal is mounted synchronously with the component.
+    const popupRoot = document.querySelector('[data-live-popup]') as HTMLElement;
+    expect(popupRoot).toBeTruthy();
+    // Active-state z while open: above the search panel…
+    expect(Number(popupRoot.style.zIndex)).toBe(LIVE_POPUP_ACTIVE_Z);
+    expect(LIVE_POPUP_ACTIVE_Z).toBeGreaterThan(SEARCH_POPUP_Z);
+    // …but still under the explore stack (which owns the player overlays).
+    expect(LIVE_POPUP_ACTIVE_Z).toBeLessThan(9999);
+  });
+
+  it('closing the popup removes its layer entirely (search regains top order)', () => {
+    const onClose = vi.fn();
+    const { unmount } = render(
+      <LivePlayerPopup
+        entry={ENTRY}
+        channelName="srdogg / srdoglol"
+        onClose={onClose}
+        channelSlug="srdoglol"
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+      />,
+    );
+    expect(document.querySelector('[data-live-popup]')).toBeTruthy();
+    unmount();
+    expect(document.querySelector('[data-live-popup]')).toBeNull();
   });
 });
