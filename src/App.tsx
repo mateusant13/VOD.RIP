@@ -15,7 +15,7 @@ import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
-import { buildArchiveVodUrl, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
+import { buildArchiveVodUrl, pickLeastOpenedTarget, type ArchiveOpenTarget, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
 import { archiveVideoIdFromUrl, isNativeArchiveVideoId } from './archiveScope';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -628,6 +628,11 @@ export default function App() {
   const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
   const [localFilePopups, setLocalFilePopups] = useState<LocalFilePopupItem[]>([]);
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
+  /** Session counters: archive search hits opened per platform (0-init).
+   *  Multi-platform hits open the LEAST-used platform so playback spreads
+   *  across the mirrors of a canonical VOD (the backend balances
+   *  transcription extraction; this balances playback). */
+  const [searchOpenCounts, setSearchOpenCounts] = useState<Record<string, number>>({});
   /** Per-video scope for the archive search popup (SEARCH THIS VIDEO). */
   const [archiveSearchScope, setArchiveSearchScope] = useState<{ videoId: string; title: string } | null>(null);
   /** Channel scope (comma-joined slugs) for the archive search popup — set
@@ -646,12 +651,15 @@ export default function App() {
   const [previewSearchOpen, setPreviewSearchOpen] = useState(false);
   /** Seed position computed from the preview panel rect at open time. */
   const previewSearchAnchorRef = useRef<PanelPos | null>(null);
-  const [exploreZOrder, setExploreZOrder] = useState<Record<string, number>>({});
+  /** Monotonic z-ranks for ALL floating player popups (explore, live,
+   *  local-file). zIndex = EXPLORE_POPUP_Z + rank — the last pointer-down
+   *  wins across types, so any player can be dragged above any other. */
+  const [popupZOrder, setPopupZOrder] = useState<Record<string, number>>({});
   const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
   const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
   const explorePauseMapRef = useRef(new Map<string, () => void>());
   const exploreVolumeMenusRef = useRef(new Set<string>());
-  const exploreZCounterRef = useRef(0);
+  const popupZCounterRef = useRef(0);
   const [initialPanelLayout] = useState(loadPanelLayout);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
@@ -3035,28 +3043,33 @@ export default function App() {
     setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
   }, []);
 
-  const assignExplorePopupZ = useCallback((id: string) => {
-    exploreZCounterRef.current += 1;
-    const rank = exploreZCounterRef.current;
-    setExploreZOrder((prev) => ({ ...prev, [id]: rank }));
+  const assignPopupZ = useCallback((id: string) => {
+    popupZCounterRef.current += 1;
+    const rank = popupZCounterRef.current;
+    setPopupZOrder((prev) => ({ ...prev, [id]: rank }));
   }, []);
 
-  const bringExplorePopupToFront = useCallback((id: string) => {
-    assignExplorePopupZ(id);
-  }, [assignExplorePopupZ]);
+  const bringPopupToFront = useCallback((id: string) => {
+    assignPopupZ(id);
+  }, [assignPopupZ]);
 
-  const closeExplorePopup = useCallback((id: string) => {
-    explorePauseMapRef.current.delete(id);
-    exploreVolumeMenusRef.current.delete(id);
-    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
-    setExploreZOrder((prev) => {
+  /** Drop a closed popup's rank so the ladder map never grows unboundedly. */
+  const dropPopupZ = useCallback((id: string) => {
+    setPopupZOrder((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
       delete next[id];
       return next;
     });
-    setExplorePopups((prev) => prev.filter((p) => p.id !== id));
   }, []);
+
+  const closeExplorePopup = useCallback((id: string) => {
+    explorePauseMapRef.current.delete(id);
+    exploreVolumeMenusRef.current.delete(id);
+    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
+    dropPopupZ(id);
+    setExplorePopups((prev) => prev.filter((p) => p.id !== id));
+  }, [dropPopupZ]);
 
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
     // Synthetic watchdog ids have no real video — nothing to preview.
@@ -3091,11 +3104,11 @@ export default function App() {
       // Dedupe: bring existing popup to front instead of opening a duplicate
       const existing = prev.find((p) => p.vod.url === vod.url);
       if (existing) {
-        bringExplorePopupToFront(existing.id);
+        bringPopupToFront(existing.id);
         return prev;
       }
       const id = crypto.randomUUID();
-      assignExplorePopupZ(id);
+      assignPopupZ(id);
       const next = [...prev, { id, vod, layoutIndex: prev.length }];
       if (next.length > MAX_EXPLORE_POPUPS) {
         const dropped = next.slice(0, next.length - MAX_EXPLORE_POPUPS);
@@ -3103,7 +3116,7 @@ export default function App() {
           explorePauseMapRef.current.delete(entry.id);
           exploreVolumeMenusRef.current.delete(entry.id);
         });
-        setExploreZOrder((zPrev) => {
+        setPopupZOrder((zPrev) => {
           const zNext = { ...zPrev };
           for (const entry of dropped) delete zNext[entry.id];
           return zNext;
@@ -3112,36 +3125,47 @@ export default function App() {
       }
       return next;
     });
-  }, [pauseAllExplorePopups, assignExplorePopupZ, bringExplorePopupToFront, channelContentFilter]);
+  }, [pauseAllExplorePopups, assignPopupZ, bringPopupToFront, channelContentFilter]);
 
   /**
    * Archive search → open the hit in the explore-player flow at its offset.
    * A re-click on the same video drops the old popup and opens a fresh
    * session so the new initialTimeSec actually lands (dedupe would only
    * bring the stale one to front).
+   *
+   * `targets` = the hit's resolvable per-platform mirrors (primary first,
+   * resolved by the popup). The canonical VOD may exist on several
+   * platforms — open the LEAST-used one this session (ties → primary) so
+   * playback spreads across mirrors, mirroring the backend's extraction
+   * balancing (canonical_key priority).
    */
-  const openArchiveHit = useCallback((hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => {
+  const openArchiveHit = useCallback((hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined, targets?: ArchiveOpenTarget[]) => {
     notePreviewGesture();
     pauseAllExplorePopups();
-    const vodUrl = buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel);
-    if (hit.platform === 'youtube') {
+    const candidates = targets && targets.length > 0 ? targets : [{ platform: hit.platform, video }];
+    const chosen = pickLeastOpenedTarget(candidates, searchOpenCounts);
+    setSearchOpenCounts((prev) => ({ ...prev, [chosen.platform]: (prev[chosen.platform] ?? 0) + 1 }));
+    const videoId = chosen.video?.video_id ?? hit.video_id;
+    const channel = chosen.video?.channel ?? hit.channel ?? undefined;
+    const vodUrl = buildArchiveVodUrl(chosen.platform, videoId, channel);
+    if (chosen.platform === 'youtube') {
       warmYoutubePreview(vodUrl);
     }
     const vod: ExplorePopupVod = {
       url: vodUrl,
-      title: displayTitle({ title: video?.title, originalTitle: video?.originalTitle }) || hit.video_id,
-      platform: hit.platform,
-      durationSec: video?.duration_sec ?? 0,
+      title: displayTitle({ title: chosen.video?.title ?? video?.title, originalTitle: chosen.video?.originalTitle ?? video?.originalTitle }) || hit.video_id,
+      platform: chosen.platform,
+      durationSec: chosen.video?.duration_sec ?? video?.duration_sec ?? 0,
       platformListIndex: 0,
       isClip: false,
       initialTimeSec: hit.offset_sec,
-      videoId: hit.video_id,
-      channel: video?.channel ?? undefined,
+      videoId,
+      channel,
     };
     setExplorePopups((prev) => {
       const next = prev.filter((p) => p.vod.url !== vodUrl);
       const id = crypto.randomUUID();
-      assignExplorePopupZ(id);
+      assignPopupZ(id);
       const after = [...next, { id, vod, layoutIndex: next.length }];
       if (after.length > MAX_EXPLORE_POPUPS) {
         const dropped = after.slice(0, after.length - MAX_EXPLORE_POPUPS);
@@ -3149,7 +3173,7 @@ export default function App() {
           explorePauseMapRef.current.delete(entry.id);
           exploreVolumeMenusRef.current.delete(entry.id);
         });
-        setExploreZOrder((zPrev) => {
+        setPopupZOrder((zPrev) => {
           const zNext = { ...zPrev };
           for (const entry of dropped) delete zNext[entry.id];
           return zNext;
@@ -3158,7 +3182,7 @@ export default function App() {
       }
       return after;
     });
-  }, [pauseAllExplorePopups, assignExplorePopupZ]);
+  }, [pauseAllExplorePopups, assignPopupZ, searchOpenCounts]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -3764,6 +3788,7 @@ export default function App() {
   const openLocalFilePreview = useCallback((dl: DownloadState) => {
     if (!dl.output_file || !/\.(mp4|mkv|webm|mov|m4v)$/i.test(dl.output_file)) return;
     const id = `local_${Date.now().toString(36)}`;
+    assignPopupZ(id);
     setLocalFilePopups((prev) => [
       ...prev,
       {
@@ -3773,11 +3798,12 @@ export default function App() {
         platform: dl.platform,
       },
     ]);
-  }, []);
+  }, [assignPopupZ]);
 
   const closeLocalFilePopup = useCallback((id: string) => {
+    dropPopupZ(id);
     setLocalFilePopups((prev) => prev.filter((p) => p.id !== id));
-  }, []);
+  }, [dropPopupZ]);
 
   // ── Start download ──
 
@@ -4978,13 +5004,15 @@ export default function App() {
       return;
     }
     livePopupsRef.current = res.items;
+    assignPopupZ(String(item.id));
     setLivePopups(res.items);
-  }, []);
+  }, [assignPopupZ]);
 
   const closeLivePopup = useCallback((id: number) => {
+    dropPopupZ(String(id));
     livePopupsRef.current = livePopupsRef.current.filter((p) => p.id !== id);
     setLivePopups(livePopupsRef.current);
-  }, []);
+  }, [dropPopupZ]);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
@@ -7004,7 +7032,7 @@ export default function App() {
               key={entry.id}
               id={entry.id}
               vod={entry.vod}
-              zIndex={EXPLORE_POPUP_Z + (exploreZOrder[entry.id] ?? 0)}
+              zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
@@ -7012,7 +7040,7 @@ export default function App() {
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
-              onBringToFront={() => bringExplorePopupToFront(entry.id)}
+              onBringToFront={() => bringPopupToFront(entry.id)}
               onOpenHit={openArchiveHit}
             />
           ))}
@@ -7025,10 +7053,10 @@ export default function App() {
             <LocalFilePopup
               key={entry.id}
               item={entry}
-              zIndex={EXPLORE_POPUP_Z + 100 + i}
+              zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={i}
               onClose={() => closeLocalFilePopup(entry.id)}
-              onBringToFront={() => {}}
+              onBringToFront={() => bringPopupToFront(entry.id)}
               onOpenHit={openArchiveHit}
               savedChannels={savedChannels}
             />
@@ -7057,6 +7085,8 @@ export default function App() {
             channelSlug={channelSlug}
             vodUrl={vodUrl}
             cascadeIndex={idx}
+            zIndex={EXPLORE_POPUP_Z + (popupZOrder[String(popup.id)] ?? 0)}
+            onBringToFront={() => bringPopupToFront(String(popup.id))}
             onClose={() => closeLivePopup(popup.id)}
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}

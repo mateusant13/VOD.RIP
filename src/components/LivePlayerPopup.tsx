@@ -58,6 +58,11 @@ interface LivePlayerPopupProps {
   savedChannels?: SavedChannel[];
   /** Position cascade offset — 0 = default corner; each sibling steps 28px. */
   cascadeIndex?: number;
+  /** Shared floating-player z-ladder rank (App owns the monotonic counter).
+   *  Omitted → falls back to LIVE_POPUP_ACTIVE_Z. */
+  zIndex?: number;
+  /** App raises this popup's ladder rank on pointer-down (drag to front). */
+  onBringToFront?: () => void;
 }
 
 type DragState = {
@@ -82,7 +87,7 @@ const REPLAY_RESNAPSHOT_MS = 30_000;
  *  live entry (or surfaces the error) instead of pinning the spinner. */
 const SESSION_STALL_MS = 8_000;
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0 }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -950,15 +955,18 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       ref={popupRef}
       className="group border-2 border-zinc-700 bg-zinc-950"
       data-live-popup
+      onPointerDownCapture={onBringToFront}
       style={{
         position: 'fixed',
         left: position.x,
         top: position.y,
         width: size.w,
         height: size.h,
-        // Active-state z: an open preview must float above the floating
-        // archive search (SEARCH_POPUP_Z); unmount on close restores order.
-        zIndex: LIVE_POPUP_ACTIVE_Z,
+        // Rank from the shared floating-player ladder (App assigns at open and
+        // re-assigns on pointer-down). Omitted → classic active-state z: above
+        // the floating archive search (SEARCH_POPUP_Z); unmount on close
+        // restores order.
+        zIndex: zIndex ?? LIVE_POPUP_ACTIVE_Z,
         boxShadow: '6px 6px 0px 0px rgba(9,9,11,0.9)',
         display: 'flex',
         flexDirection: 'column',
@@ -1260,6 +1268,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         )}
       </div>
     </div>,
-    document.body,
+    // Share the #explore-portal stacking context (fixed layer at
+    // EXPLORE_POPUP_Z - 1) with explore/local-file players — otherwise a
+    // body-level z-index can never win over the portal, and cross-type
+    // bring-to-front (live vs explore) would be impossible.
+    document.getElementById('explore-portal') ?? document.body,
   );
 }
