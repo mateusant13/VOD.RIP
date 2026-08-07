@@ -33,6 +33,22 @@ export function panelResizeHandleInset(compact: boolean): number {
   return CARD_BORDER_PX + (compact ? 4 : 6);
 }
 
+/** Widest offset (px) in a computed box-shadow list — the colored band width.
+ *  platformCardShadow uses 4px compact / 6px non-compact per platform, up to
+ *  8/18px for the multi-platform default stack; the live player uses a 6px
+ *  dark shadow. The resize strips must reach this outer edge so hovering any
+ *  pixel of the band shows the resize cursor. */
+export function maxBoxShadowBandPx(boxShadow: string): number {
+  let max = 0;
+  const re = /(-?\d*\.?\d+)px/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(boxShadow)) !== null) {
+    const v = Math.abs(parseFloat(m[1]));
+    if (v > max) max = v;
+  }
+  return max;
+}
+
 function viewportContentBox(shadowPad = panelResizeHandleInset(false)): { maxW: number; maxH: number } {
   return {
     maxW: Math.max(200, window.innerWidth - VIEWPORT_EDGE_LOCK * 2 - shadowPad),
@@ -201,6 +217,11 @@ export function PanelResizeHandles({
   // box — detect that and hug the inner edge instead of straddling the border.
   const hostRef = useRef<HTMLDivElement>(null);
   const [clipsOverflow, setClipsOverflow] = useState(false);
+  // The colored band is the host's box-shadow offset — measure the REAL
+  // rendered shadow (platformCardShadow: 4/6px per platform, up to 8/18px for
+  // the multi-platform default stack; the live player uses a 6px dark shadow)
+  // so the strips always reach the band's outer edge, not just the 2px border.
+  const [bandPx, setBandPx] = useState(0);
   useLayoutEffect(() => {
     // The containing block (offsetParent) is the panel the handles are
     // positioned against — the DOM parent may be an inner scroll container.
@@ -211,37 +232,49 @@ export function PanelResizeHandles({
     const cs = getComputedStyle(host);
     const margin = parseFloat(cs.overflowClipMargin) || 0;
     setClipsOverflow(cs.overflow === 'hidden' || (cs.overflow === 'clip' && margin < CARD_BORDER_PX));
+    setBandPx(maxBoxShadowBandPx(cs.boxShadow));
   });
 
   // Cursor is applied directly per edge (not group-hover): the handle is always
   // inside its own panel, so no .group ancestor is required — fixes main panel.
   const hit = 'absolute z-50 pointer-events-auto select-none touch-none';
   const edgePad = 12;
-  // Edge strips straddle the host's border (2px out, 2px border, 2px in) so the
-  // resize cursor appears at the visible edge. Clipped hosts can't paint
-  // outside: the strip hugs the padding-box edge (border-box 0..6, still fully
-  // inside the padding box).
+  // North/west strips straddle the host's border (2px out, 2px border, 2px in)
+  // so the resize cursor appears at the visible edge — no colored band on the
+  // top/left edges. Clipped hosts can't paint outside: the strip hugs the
+  // padding-box edge (still fully inside the padding box).
   const edgeOff = clipsOverflow ? 0 : CARD_BORDER_PX + 2;
-  const cornerOff = clipsOverflow ? 0 : CARD_BORDER_PX + 2;
+  // East/south strips and corners: outer edge reaches the band's outer edge
+  // (width = 2px border-overhang + band). The e/s strips run the full panel
+  // length so the band is covered corner to corner — the corners come later
+  // in the DOM, so they paint on top and keep the diagonal cursors on the
+  // corner blocks. Clipped hosts can't paint outside: everything hugs the
+  // padding-box edge (still fully inside the padding box).
+  const bandOff = clipsOverflow ? 0 : CARD_BORDER_PX + bandPx;
+  const bandW = Math.max(bandOff, 6);
+  const cornerOff = bandOff;
+  // 16×16 for every real band (≤14px); only the 18px multi-platform default
+  // stack needs a slightly larger corner to still cover its corner block.
+  const cornerSize = Math.max(16, bandPx + 2);
 
-  const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string, sizeClass = '') => ({
+  const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string) => ({
     'data-panel-resize': true as const,
     'aria-hidden': true as const,
     onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => onPointerDown(e, edge),
     style: { ...style, touchAction: 'none' },
-    className: `${hit} ${hoverCursorClass} ${sizeClass}`.trim(),
+    className: `${hit} ${hoverCursorClass}`.trim(),
   });
 
   return (
     <div ref={hostRef} className="absolute inset-0 z-50 pointer-events-none" aria-hidden="true">
       <div {...edgeProps('n', { top: -edgeOff, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('s', { bottom: -edgeOff, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
-      <div {...edgeProps('e', { right: -edgeOff, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
+      <div {...edgeProps('s', { bottom: -bandOff, left: -bandOff, right: -bandOff, height: bandW }, 'cursor-ns-resize')} />
+      <div {...edgeProps('e', { right: -bandOff, top: -bandOff, bottom: -bandOff, width: bandW }, 'cursor-ew-resize')} />
       <div {...edgeProps('w', { left: -edgeOff, top: edgePad, bottom: edgePad, width: 6 }, 'cursor-ew-resize')} />
-      <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
-      <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff }, 'cursor-nesw-resize', 'w-4 h-4')} />
-      <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff }, 'cursor-nwse-resize', 'w-4 h-4')} />
+      <div {...edgeProps('nw', { top: -cornerOff, left: -cornerOff, width: cornerSize, height: cornerSize }, 'cursor-nwse-resize')} />
+      <div {...edgeProps('ne', { top: -cornerOff, right: -cornerOff, width: cornerSize, height: cornerSize }, 'cursor-nesw-resize')} />
+      <div {...edgeProps('sw', { bottom: -cornerOff, left: -cornerOff, width: cornerSize, height: cornerSize }, 'cursor-nesw-resize')} />
+      <div {...edgeProps('se', { bottom: -cornerOff, right: -cornerOff, width: cornerSize, height: cornerSize }, 'cursor-nwse-resize')} />
     </div>
   );
 }

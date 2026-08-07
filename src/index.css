@@ -408,6 +408,13 @@ html .text-sm {
 
 html[data-viewport="narrow"] .vod-app-shell {
   padding: 0.5rem !important;
+  /* The wrapped row can exceed the viewport height — let the shell scroll
+     instead of clipping the stacked panels. align-items: flex-start + the
+     row's auto margins keep the stack centered when it fits and top-aligned
+     when it overflows, so the first panel is never unreachable. */
+  align-items: flex-start;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 html[data-viewport="wide"] .vod-app-shell {
@@ -418,6 +425,10 @@ html[data-viewport="narrow"] .vod-layout-row {
   flex-wrap: wrap;
   justify-content: center;
   gap: 0.75rem !important;
+  /* Center when the stack fits; overflowing stacks collapse the auto margins
+     to 0 and stay top-aligned (scrollable from the top). */
+  margin-top: auto;
+  margin-bottom: auto;
 }
 
 /* WS-9: layout containment for drag-heavy surfaces. `contain: layout`
