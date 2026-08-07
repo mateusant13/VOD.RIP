@@ -21,8 +21,11 @@ Pillow>=10.0.0
 # ── Semantic search (services/archive_embed.py) ───────────────────────────
 # Local int8 ONNX models (e5-small embedder + mmarco reranker) run through
 # onnxruntime; tokenization is the `tokenizers` lib — no transformers at
-# runtime. onnxruntime-gpu is NOT used: it needs CUDA 13 (cublasLt64_13.dll),
-# the GPU scan path is torch fp16 in archive_db instead.
+# runtime. onnxruntime-gpu is NOT a dependency: the GPU paths are torch fp16
+# in archive_db (scan) and the sherpa-onnx CUDA wheel's BUNDLED onnxruntime
+# in archive_transcribe (parakeet). NVIDIA drivers are backward compatible,
+# so a CUDA-13-era driver (e.g. 610.x, CUDA 13.3) runs the CUDA-12 runtime
+# DLLs both paths need; no standalone onnxruntime-gpu wheel is required.
 onnxruntime>=1.20
 tokenizers>=0.19
 
@@ -41,8 +44,18 @@ nvidia-cuda-runtime-cu12
 # AudioSet 527 classes (laugh/clap/scream/music...). Checkpoint downloads
 # itself on first use (zenodo record 3987831).
 panns-inference>=0.1.1
-# Parakeet TDT v3 CPU lane (services/archive_transcribe.py) — sherpa-onnx
-# CPU wheel only (no Windows CUDA wheel exists). The lane is opt-in: an
-# import failure or VODRIP_PARAAKEET=0 keeps CPU lanes on whisper int8,
-# exactly as before.
+# Parakeet TDT v3 lane (services/archive_transcribe.py) — sherpa-onnx CPU
+# wheel is the baseline; CUDA wheels exist since 1.13.x and are an OPT-IN
+# upgrade on NVIDIA hosts — the lane probes the installed wheel's providers
+# at runtime and stays whisper on GPU slots when CUDA is absent, so plain
+# `pip install -r requirements.txt` keeps working on CPU machines.
+# GPU upgrade (replaces the CPU sherpa-onnx in-place; the +cuda wheel bundles
+# its own CUDA-enabled onnxruntime, so no separate onnxruntime-gpu install):
+#   pip install "sherpa-onnx==1.13.4+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
+# (cp311 win_amd64 direct: https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/main/cuda/1.13.4/sherpa_onnx-1.13.4+cuda12.cudnn9-cp311-cp311-win_amd64.whl)
+# The +cuda wheel's onnxruntime CUDA EP loads cublasLt64_12/cufft64_11/
+# curand64_10/cudnn64_9 from PATH at session create — cublas + cuda-runtime
+# are already pinned above (faster-whisper/ctranslate2), add the rest on GPU
+# hosts only (archive_transcribe._ensure_cuda_libs exposes their bin dirs):
+#   pip install nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cudnn-cu12
 sherpa-onnx>=1.13.0

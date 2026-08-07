@@ -26,15 +26,17 @@ Design decisions:
     side and restores the exclusive-GPU worker). Each pool thread is pinned
     to its slot's device at thread start, so CPU threads never compete for
     VRAM. CPU-only hosts are unchanged (WORKERS, default 2).
-  * Parakeet CPU lane: when sherpa-onnx is importable (and VODRIP_PARAAKEET
-    is not 0), CPU slots transcribe jobs whose language is in Parakeet TDT
-    v3's 25 European languages with sherpa-onnx (2.5-5.2 RTFx vs
+  * Parakeet lane: when sherpa-onnx is importable (and VODRIP_PARAAKEET is
+    not 0), slots transcribe jobs whose language is in Parakeet TDT v3's 25
+    European languages with sherpa-onnx (2.5-5.2 RTFx on CPU int8 vs
     whisper-large-v3-turbo cpu/int8 at 0.26-0.6, ~0.7 GB less RSS, no
     silence hallucination — A/B 2026-08-07). Known-other (ja, ...) and
-    unknown languages stay whisper int8; GPU slots are ALWAYS whisper
-    (Parakeet has no Windows CUDA wheel and whisper-cuda is the quality
-    leader). Model auto-downloads on first use into the sherpa cache
-    (VODRIP_SHERRPA_CACHE or a whisper-cache sibling).
+    unknown languages stay whisper. CUDA-enabled sherpa-onnx wheels
+    (>=1.13.x, see requirements.txt) let GPU slots run parakeet with
+    provider='cuda', gated on the measured free-VRAM allowance; without a
+    CUDA wheel GPU slots are whisper exactly as before. Model auto-downloads
+    on first use into the sherpa cache (VODRIP_SHERRPA_CACHE or a
+    whisper-cache sibling).
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
     cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
     so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
@@ -602,9 +604,11 @@ def _idle_close_seconds() -> float:
 def _ensure_cuda_libs() -> None:
     """Expose pip-installed NVIDIA runtime DLLs (nvidia-*-cu12 wheels) on PATH.
 
-    ctranslate2 loads cublas64_12.dll lazily at first CUDA inference; machines
-    with a CUDA-13-era driver but no full CUDA 12 toolkit otherwise fail with
-    "Library cublas64_12.dll is not found". Set VODRIP_NO_CUDA_LIBS to skip.
+    ctranslate2 loads cublas64_12.dll lazily at first CUDA inference, and the
+    sherpa-onnx +cuda wheels' bundled onnxruntime_providers_cuda.dll loads
+    cublasLt64_12/cufft64_11/curand64_10/cudnn64_9 at session create —
+    machines with a CUDA-13-era driver but no full CUDA 12 toolkit otherwise
+    fail with "Library ... is not found". Set VODRIP_NO_CUDA_LIBS to skip.
     """
     if os.environ.get("VODRIP_NO_CUDA_LIBS"):
         return
@@ -612,7 +616,7 @@ def _ensure_cuda_libs() -> None:
         import site as _site
     except Exception:
         return
-    for lib in ("cublas", "cuda_runtime"):
+    for lib in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn"):
         try:
             for root in _site.getsitepackages():
                 d = Path(root) / "nvidia" / lib / "bin"
@@ -767,7 +771,7 @@ class _ThreadModelSlot:
     def __init__(self) -> None:
         self.model: Any = None
         self.model_name: Optional[str] = None
-        self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (CPU slots)
+        self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (provider per slot pin)
 
 
 _thread_slots: dict[int, _ThreadModelSlot] = {}
@@ -890,14 +894,16 @@ def _current_model() -> Any:
     return _get_model()
 
 
-# --- Parakeet CPU lane (sherpa-onnx) --------------------------------------
+# --- Parakeet lane (sherpa-onnx) ------------------------------------------
 # A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
 # int8 on CPU runs 2.5-5.2 RTFx vs whisper large-v3-turbo cpu/int8 at
 # 0.26-0.6 (7-15x), ~0.7 GB less peak RSS, and outputs nothing on silence
-# (no hallucination). GPU lanes stay whisper: parakeet has NO Windows CUDA
-# wheel and whisper-cuda remains the quality leader. The lane is opt-in end
-# to end: sherpa-onnx missing OR VODRIP_PARAAKEET=0 -> CPU lanes are whisper
-# int8, byte-identical to the pre-parakeet worker.
+# (no hallucination). GPU: CUDA-enabled sherpa-onnx wheels exist since
+# 1.13.x (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is
+# importable, GPU slots run parakeet with provider='cuda', gated on the
+# measured free-VRAM allowance; without it they stay whisper (graceful
+# degradation — byte-identical to the pre-parakeet worker). The lane is
+# opt-in end to end: sherpa-onnx missing OR VODRIP_PARAAKEET=0 -> whisper.
 PARAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 _PARAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 _PARAAKEET_FEATURE_DIM = 128  # nemo_transducer default (80) fails — must match the model
@@ -920,11 +926,11 @@ _parakeet_last_used = 0.0
 
 
 def _parakeet_available() -> bool:
-    """True when the parakeet CPU lane can run.
+    """True when the parakeet lane can run.
 
     VODRIP_PARAAKEET=0 is a hard kill switch (no import probe). Otherwise
     the sherpa-onnx import is probed once per process and cached; an import
-    failure degrades CPU lanes to whisper int8 — exactly today's behavior."""
+    failure degrades lanes to whisper — exactly today's behavior."""
     if os.environ.get(PARAKEET_ENV, "1").strip() == "0":
         return False
     global _parakeet_ok
@@ -935,6 +941,67 @@ def _parakeet_available() -> bool:
         except Exception:
             _parakeet_ok = False
     return _parakeet_ok
+
+
+_parakeet_cuda_ok: Optional[bool] = None  # CUDA-provider probe (None = unprobed)
+
+
+def _parakeet_cuda_available() -> bool:
+    """True when the installed sherpa-onnx is a CUDA build.
+
+    The +cuda wheels (see requirements.txt) bundle onnxruntime's CUDA EP and
+    version as ``X.Y.Z+cuda<cuda-ver>.cudnn9``; the plain CPU wheels carry no
+    tag. The sherpa-onnx Python bindings expose no provider-enumeration API,
+    so the build tag is the cheap static probe and ``_load_parakeet(
+    provider='cuda')`` is the AUTHORITATIVE runtime probe — it raises unless
+    the CUDA EP actually initializes, then degrades to CPU and flips this
+    flag (ponytail: if k2-fsa ever changes the tag scheme, the construction
+    fallback still keeps behavior correct). Probed once per process and
+    cached; a probe failure means GPU slots stay whisper. Tests/self-check
+    pin ``_parakeet_cuda_ok`` directly so they never import sherpa-onnx."""
+    if not _parakeet_available():
+        return False
+    global _parakeet_cuda_ok
+    if _parakeet_cuda_ok is None:
+        try:
+            import sherpa_onnx
+
+            _parakeet_cuda_ok = bool(
+                "+cuda" in (getattr(sherpa_onnx, "__version__", "") or "")
+            )
+        except Exception:
+            _parakeet_cuda_ok = False
+    return _parakeet_cuda_ok
+
+
+# Parakeet int8 on GPU: ~0.7 GB of weights + the CUDA EP's arena. GPU slots
+# route parakeet only when the measured free-VRAM allowance (fresh cache
+# read — never re-triggers the ~60 s median probe) leaves this much free.
+_PARAKEET_GPU_VRAM_EST = int(2.0 * 1024 ** 3)
+
+
+def _parakeet_gpu_allowed() -> bool:
+    """VRAM gate for GPU-slot parakeet routing.
+
+    CUDA sherpa is a necessary but not sufficient condition: the measured
+    free-VRAM allowance must cover the parakeet footprint. Reads the CACHED
+    allowance only (a cold/stale cache reads as unknown -> 0 -> allowed): a
+    GPU slot only exists when _gpu_copies() measured >= 2 GiB free at claim
+    time, and parakeet is the SMALLER model — a lane that fit whisper fits
+    it. Unknown allowance trusting the provider probe mirrors the
+    probe-failure paths elsewhere (env cap trusted)."""
+    if not _parakeet_cuda_available():
+        return False
+    now = time.monotonic()
+    with _vram_lock:
+        fresh = (
+            _vram_free_at
+            and now - _vram_free_at < _GPU_VRAM_MEDIAN_GAP_S * _GPU_VRAM_MEDIAN_SAMPLES
+        )
+        allowance = _vram_free_bytes if fresh else 0
+    if allowance <= 0:
+        return True  # unknown/cold allowance -> trust the provider probe
+    return allowance >= _PARAKEET_GPU_VRAM_EST
 
 
 def _parakeet_cache_dir() -> Path:
@@ -1019,21 +1086,29 @@ def _parakeet_threads() -> int:
 
 
 def _slot_engine(device: str) -> str:
-    """Engine for a plan slot: 'whisper' on GPU lanes (parakeet has no
-    Windows CUDA wheel), parakeet-or-whisper on CPU lanes (import failure
-    and VODRIP_PARAAKEET=0 both fall back to whisper int8)."""
+    """Engine for a plan slot: 'parakeet' when the slot can run it (CUDA
+    slots need a CUDA-enabled sherpa-onnx, CPU slots the plain import;
+    VODRIP_PARAAKEET=0 kills both), else 'whisper'."""
     if device == "cuda":
-        return "whisper"
+        return "parakeet" if _parakeet_cuda_available() else "whisper"
     return "parakeet" if _parakeet_available() else "whisper"
 
 
 def _job_engine(language: Optional[str]) -> str:
-    """Engine for THIS job on the calling lane: 'parakeet' when the lane is
-    a CPU slot AND the job's language is in parakeet's supported set; known
-    other languages (ja, ...) and UNKNOWN language stay whisper int8 (the
-    pre-parakeet path). GPU slots are always whisper."""
+    """Engine for THIS job on the calling lane: 'parakeet' when the lane can
+    run it AND the job's language is in parakeet's supported set; known
+    other languages (ja, ...) and UNKNOWN language stay whisper. GPU slots
+    use parakeet only with CUDA sherpa present AND enough measured free
+    VRAM; CPU slots need the plain import. Without a CUDA wheel the GPU slot
+    is whisper exactly as before."""
     device, _ = _thread_pin() or _effective_device()
     if device == "cuda":
+        if (
+            _parakeet_cuda_available()
+            and _parakeet_gpu_allowed()
+            and language in _parakeet_langs()
+        ):
+            return "parakeet"
         return "whisper"
     if _parakeet_available() and language in _parakeet_langs():
         return "parakeet"
@@ -1046,13 +1121,29 @@ def _asr_model_name(engine: str) -> str:
     return PARAKEET_MODEL if engine == "parakeet" else model_name()
 
 
-def _load_parakeet() -> Any:
-    """Build one sherpa-onnx OfflineRecognizer (nemo_transducer)."""
+def _parakeet_provider() -> str:
+    """'cuda' on a CUDA-pinned slot with CUDA sherpa present, else 'cpu'.
+
+    Mirrors the whisper thread's device pin: off-pool callers and CPU slots
+    get the plain CPU provider (the int8 recognizer they always had)."""
+    device, _ = _thread_pin() or _effective_device()
+    if device == "cuda" and _parakeet_cuda_available():
+        return "cuda"
+    return "cpu"
+
+
+def _load_parakeet(provider: str = "cpu") -> Any:
+    """Build one sherpa-onnx OfflineRecognizer (nemo_transducer).
+
+    provider='cuda' on GPU slots with a CUDA-enabled sherpa-onnx (the +cuda
+    wheels bundle a CUDA onnxruntime); 'cpu' everywhere else. A CUDA load
+    failure degrades THIS recognizer to CPU and flips the cached probe, so
+    later jobs route per reality instead of failing."""
     import sherpa_onnx
 
     d = _parakeet_model_dir()
     t0 = time.monotonic()
-    rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+    kwargs = dict(
         encoder=str(d / "encoder.int8.onnx"),
         decoder=str(d / "decoder.int8.onnx"),
         joiner=str(d / "joiner.int8.onnx"),
@@ -1062,9 +1153,26 @@ def _load_parakeet() -> Any:
         feature_dim=_PARAAKEET_FEATURE_DIM,
         model_type="nemo_transducer",
     )
+    if provider != "cpu":
+        _ensure_cuda_libs()  # onnxruntime_providers_cuda.dll needs the cu12 DLLs on PATH
+        kwargs["provider"] = provider
+    try:
+        rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
+    except Exception as exc:
+        if provider == "cpu":
+            raise
+        global _parakeet_cuda_ok
+        _parakeet_cuda_ok = False
+        kwargs.pop("provider", None)
+        logger.warning(
+            "parakeet CUDA recognizer failed to load (%s) — falling back to CPU "
+            "(GPU slots will stay whisper for the rest of this process)", exc,
+        )
+        rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
+        provider = "cpu"
     logger.info(
-        "Parakeet recognizer loaded in %.1fs (threads=%d, cache=%s)",
-        time.monotonic() - t0, _parakeet_threads(), _parakeet_cache_dir(),
+        "Parakeet recognizer loaded in %.1fs (provider=%s threads=%d, cache=%s)",
+        time.monotonic() - t0, provider, _parakeet_threads(), _parakeet_cache_dir(),
     )
     return rec
 
@@ -1081,11 +1189,11 @@ def _parakeet_model() -> Any:
         if slot.parakeet is None:
             with _model_lock:
                 if slot.parakeet is None:
-                    slot.parakeet = _load_parakeet()
+                    slot.parakeet = _load_parakeet(provider=_parakeet_provider())
         return slot.parakeet
     with _model_lock:
         if _parakeet_global is None:
-            _parakeet_global = _load_parakeet()
+            _parakeet_global = _load_parakeet(provider=_parakeet_provider())
         return _parakeet_global
 
 
@@ -2154,8 +2262,9 @@ def _transcribe_audio_source(
 
     # Model load happens only now: VAD + planning are model-free, so a
     # no-speech video never pays the (large) load cost. The engine is the
-    # slot's choice for this job's language: parakeet (CPU lanes, supported
-    # languages) or whisper (everything else — GPU slots, other languages).
+    # slot's choice for this job's language: parakeet (slots with a usable
+    # sherpa — CUDA on GPU slots when CUDA sherpa + VRAM allow, int8 CPU
+    # otherwise — for supported languages) or whisper (everything else).
     engine = _job_engine(language)
     model = _parakeet_model() if engine == "parakeet" else _current_model()
     existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id)}
@@ -2633,10 +2742,13 @@ def run_worker(
     [("cpu","int8")]*cpu_slots on CUDA hosts (GPU copy + default 2 CPU
     threads), [("cpu","int8")]*2 on CPU-only hosts. Each pool thread is
     pinned to its slot by the executor initializer, so a pinned CPU thread
-    loads its model on CPU even though the box has a GPU. The shared queue
-    stays FIFO (_claim_next_job) with no duration routing: the GPU thread
-    claims the next job when it finishes one, CPU threads pick up queued
-    VODs in the meantime.
+    loads its model on CPU even though the box has a GPU. Engines are chosen
+    PER JOB: GPU slots run parakeet with provider='cuda' for parakeet
+    languages when a CUDA sherpa-onnx is installed and VRAM allows, else
+    whisper fp16; CPU slots run parakeet int8 or whisper int8 as before. The
+    shared queue stays FIFO (_claim_next_job) with no duration routing: the
+    GPU thread claims the next job when it finishes one, CPU threads pick up
+    queued VODs in the meantime.
 
     A plan of exactly one CUDA slot (VODRIP_TRANSCRIBE_WORKERS=0) is the
     legacy single-global-model path: budget 1, _infer_lock, the global
@@ -2937,17 +3049,22 @@ finally:
     else:
         os.environ[GPU_COPIES_ENV] = _saved_plan_g
 
-# parakeet CPU lane — engine routing (pure logic: the import probe is pinned
+# parakeet lane — engine routing (pure logic: the import probe is pinned
 # via the cached _parakeet_ok flag, sherpa-onnx is never imported here and
 # nothing downloads; the sherpa cache is pointed at a scratch dir with a
 # controlled tokens.txt for the intersection check).
 _saved_pok, _saved_pin = _parakeet_ok, getattr(_multi_tls, "pin", None)
 _saved_peng, _saved_pcache = _device_override, os.environ.get(PARAKEET_CACHE_ENV)
 _saved_penv = os.environ.get(PARAKEET_ENV)
+_saved_pcuda = _parakeet_cuda_ok
+_saved_pvram = (_vram_free_bytes, _vram_free_at)
 _scratch_sherpa = Path(tempfile.mkdtemp(prefix="vodrip-parakeet-selfcheck-"))
 try:
     os.environ[PARAKEET_CACHE_ENV] = str(_scratch_sherpa)  # no model dir yet
     _parakeet_ok = True
+    _parakeet_cuda_ok = True
+    _vram_free_bytes = 64 * 1024 ** 3
+    _vram_free_at = time.monotonic()
     _device_override = ("cpu", "int8")
     assert _job_engine("pt") == "parakeet", "pt routes to parakeet on a CPU lane"
     assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
@@ -2955,13 +3072,29 @@ try:
     assert _job_engine("ja") == "whisper", "known-other languages stay on whisper"
     assert _job_engine(None) == "whisper", "unknown language stays on whisper"
     _device_override = ("cuda", "float16")
-    assert _job_engine("pt") == "whisper", "GPU lanes never run parakeet"
+    assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots may run parakeet"
+    assert _job_engine("pt") == "parakeet", (
+        "GPU slot + CUDA sherpa + ample VRAM + supported lang -> parakeet"
+    )
+    assert _job_engine("ja") == "whisper", "GPU slots keep whisper for other languages"
+    _parakeet_cuda_ok = False
+    assert _slot_engine("cuda") == "whisper", (
+        "no CUDA sherpa -> GPU slots stay whisper (graceful degradation)"
+    )
+    assert _job_engine("pt") == "whisper", "GPU slot without CUDA sherpa -> whisper"
+    _parakeet_cuda_ok = True
+    _vram_free_bytes = 1 * 1024 ** 3  # tight VRAM — fresh cache read
+    assert _job_engine("pt") == "whisper", (
+        "GPU slot + CUDA sherpa but tight VRAM falls back to whisper"
+    )
+    _vram_free_bytes = 64 * 1024 ** 3
+    _parakeet_cuda_ok = True
     _device_override = ("cpu", "int8")
     os.environ[PARAKEET_ENV] = "0"
     assert _job_engine("pt") == "whisper", "VODRIP_PARAAKEET=0 kills the parakeet lane"
     os.environ.pop(PARAKEET_ENV, None)
     _parakeet_ok = False
-    assert _job_engine("pt") == "whisper", "sherpa-onnx import failure -> whisper int8"
+    assert _job_engine("pt") == "whisper", "sherpa-onnx import failure -> whisper"
     assert _parakeet_langs() == frozenset(), "import-fail lane routes no languages"
     _parakeet_ok = True
     assert _parakeet_langs() == PARAKEET_LANG_CANDIDATES, (
@@ -2991,6 +3124,8 @@ try:
     assert _ws[0] == {"word": "Negan", "start": 0.32, "end": 0.56}, _ws[0]
 finally:
     _parakeet_ok = _saved_pok
+    _parakeet_cuda_ok = _saved_pcuda
+    _vram_free_bytes, _vram_free_at = _saved_pvram
     _device_override = _saved_peng
     _multi_tls.pin = _saved_pin
     if _saved_pcache is None:
