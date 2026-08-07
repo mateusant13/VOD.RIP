@@ -9,6 +9,7 @@ from __future__ import annotations
 import builtins
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -23,17 +24,25 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("VODRIP_PARAAKEET", raising=False)
     monkeypatch.delenv("VODRIP_SHERRPA_CACHE", raising=False)
     monkeypatch.setattr(at, "_parakeet_ok", None)
+    monkeypatch.setattr(at, "_parakeet_cuda_ok", None)
     yield
     monkeypatch.setattr(at, "_parakeet_ok", None)
+    monkeypatch.setattr(at, "_parakeet_cuda_ok", None)
 
 
-def _routed(language, *, device="cpu", parakeet_ok=True):
+def _routed(language, *, device="cpu", parakeet_ok=True, cuda_ok=None, vram_free=None):
     at._parakeet_ok = parakeet_ok
+    at._parakeet_cuda_ok = cuda_ok
     at._device_override = (device, "int8" if device == "cpu" else "float16")
+    saved_vram_free, saved_vram_at = at._vram_free_bytes, at._vram_free_at
+    if vram_free is not None:
+        at._vram_free_bytes = vram_free
+        at._vram_free_at = time.monotonic()  # fresh cache -> the gate reads it
     try:
         return at._job_engine(language)
     finally:
         at._device_override = None
+        at._vram_free_bytes, at._vram_free_at = saved_vram_free, saved_vram_at
 
 
 def test_cpu_lane_routes_supported_languages_to_parakeet():
@@ -48,13 +57,47 @@ def test_known_other_and_unknown_stay_whisper():
     assert _routed("") == "whisper"
 
 
-def test_gpu_lanes_never_run_parakeet():
-    assert _routed("pt", device="cuda") == "whisper"
+GIB = 1024 ** 3
+
+
+def test_gpu_lane_routes_parakeet_with_cuda_sherpa():
+    """GPU slot + CUDA-enabled sherpa + supported lang + ample VRAM -> parakeet."""
+    assert _routed("pt", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
+    assert _routed("en", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
+    assert _routed("es", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
+
+
+def test_gpu_lane_whisper_without_cuda_sherpa():
+    """GPU slot + CPU-only sherpa -> whisper (graceful degradation, pre-parakeet path).
+
+    The unprobed cache (cuda_ok=None) probes the INSTALLED wheel at runtime,
+    so its outcome is env-dependent — pinned flags keep this hermetic; the
+    None path is covered by the module self-check and the real GPU smoke."""
+    assert _routed("pt", device="cuda", cuda_ok=False) == "whisper"
+
+
+def test_gpu_lane_vram_tight_falls_back():
+    """GPU slot + CUDA sherpa but tight measured free VRAM -> whisper."""
+    assert _routed("pt", device="cuda", cuda_ok=True, vram_free=1 * GIB) == "whisper"
+
+
+def test_gpu_lane_keeps_whisper_for_other_languages():
+    """Known-other (ja) and unknown languages stay whisper on GPU slots."""
+    assert _routed("ja", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
+    assert _routed(None, device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
+    assert _routed("", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
+
+
+def test_cpu_lane_parakeet_unaffected_by_cuda_probe():
+    """CPU routing ignores the CUDA probe entirely (int8 recognizer as before)."""
+    assert _routed("pt", device="cpu", cuda_ok=False) == "parakeet"
+    assert _routed("pt", device="cpu", cuda_ok=True) == "parakeet"
 
 
 def test_import_fail_falls_back_to_whisper():
     assert _routed("pt", parakeet_ok=False) == "whisper"
     assert at._slot_engine("cpu") == "whisper"
+    assert at._slot_engine("cuda") == "whisper"  # import fail gates the CUDA probe too
 
 
 def test_availability_probe_caches_failed_import(monkeypatch):
@@ -82,7 +125,10 @@ def test_kill_switch_disables_lane(monkeypatch):
 
 def test_slot_engine():
     at._parakeet_ok = True
+    at._parakeet_cuda_ok = True
     assert at._slot_engine("cpu") == "parakeet"
+    assert at._slot_engine("cuda") == "parakeet"
+    at._parakeet_cuda_ok = False
     assert at._slot_engine("cuda") == "whisper"
     at._parakeet_ok = False
     assert at._slot_engine("cpu") == "whisper"
