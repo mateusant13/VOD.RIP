@@ -75,6 +75,10 @@ export interface PreviewPanelPayload {
   /** Total chat rows in the archive for this video (the returned chat may
    *  be a bounded playhead window of it while the backfill runs). */
   total_rows?: number;
+  /** True when `chat` is a bounded slice of the archive, not the whole
+   *  timeline: the backfill is still running (playhead window) or the
+   *  archive exceeded the panel's row cap. The UI shows a small note. */
+  chat_truncated?: boolean;
 }
 
 /** Live YouTube captions for URL-only previews (no archive row). */
@@ -361,7 +365,18 @@ export function PreviewChatPanel({
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeRowRef = useRef<HTMLDivElement>(null);
+  /** True while the view follows the playhead (recentered on the active
+   *  row). The user scrolling >1.5 viewports away turns it off; clicking a
+   *  row or switching tabs turns it back on. State (not just a ref) so the
+   *  render window can switch between playhead-centered and scroll-riding. */
+  const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
+  followRef.current = follow;
+  /** Last user-scrolled row (round(scrollTop / rowH)) — the render window
+   *  rides this while `follow` is off, so scrolling never lands on blank
+   *  spacers. setState bails out when the row band did not change, keeping
+   *  fast wheel scrolls cheap. */
+  const [scrollAnchorIdx, setScrollAnchorIdx] = useState(0);
   const autoScrollingRef = useRef(false);
   const activeIdxRef = useRef(-1);
   const rowHRef = useRef(CHAT_ROW_H);
@@ -435,6 +450,12 @@ export function PreviewChatPanel({
   // fires.
   useEffect(() => {
     lastBackfillRef.current = null;
+  }, [payloadKey]);
+  // Video switch: a stale scroll anchor/follow state must not carry into the
+  // new list — start at the head, following the playhead again.
+  useEffect(() => {
+    setFollow(true);
+    setScrollAnchorIdx(0);
   }, [payloadKey]);
   useEffect(() => {
     const prev = lastBackfillRef.current;
@@ -574,11 +595,24 @@ export function PreviewChatPanel({
 
   // Fixed-height virtualization: window of WINDOW rows around the focus row
   // with spacer divs above/below, so scroll height stays exact (the focus
-  // row's content offset is always focusIdx * rowH).
+  // row's content offset is always focusIdx * rowH). While the user is not
+  // following (scrolled away to read), the window rides the scroll position
+  // instead — scrolling always shows real rows, never blank spacers.
   const windowStart = useMemo(() => {
     const maxStart = Math.max(0, list.length - 2 * WINDOW - 1);
+    if (qActive) {
+      // Inline search: center on the cursor row (the search effect pins
+      // scrollTop to searchIdx * rowH).
+      return Math.max(0, Math.min(focusIdx - WINDOW, maxStart));
+    }
+    if (!follow) {
+      // User-scrolled: anchor just above the viewport top so the visible
+      // band is always rendered content.
+      return Math.max(0, Math.min(scrollAnchorIdx - 8, maxStart));
+    }
+    // Follow mode: center the window on the playback-synced row.
     return Math.max(0, Math.min(focusIdx - WINDOW, maxStart));
-  }, [list.length, focusIdx]);
+  }, [list.length, focusIdx, scrollAnchorIdx, follow, qActive]);
   const windowEnd = Math.min(list.length, windowStart + 2 * WINDOW + 1);
   const slice = useMemo(() => list.slice(windowStart, windowEnd), [list, windowStart, windowEnd]);
   const topPad = windowStart * rowH;
@@ -589,7 +623,7 @@ export function PreviewChatPanel({
   // into view even when the index happens to be unchanged.
   useEffect(() => {
     prevActiveIdxRef.current = null;
-    followRef.current = true;
+    setFollow(true);
   }, [tab]);
 
   useEffect(() => {
@@ -613,19 +647,28 @@ export function PreviewChatPanel({
       autoScrollingRef.current = false;
       return;
     }
+    // Drive the render window from the scroll position: rowAtTop becomes
+    // the anchor the windowStart memo rides once the user stops following.
+    // setState bails out when the row band is unchanged, so a fast wheel
+    // scroll does not re-render per event.
+    const rowAtTop = Math.round(el.scrollTop / rowHRef.current);
+    setScrollAnchorIdx((prev) => {
+      const next = Math.max(0, rowAtTop);
+      return next === prev ? prev : next;
+    });
     // The active row's content offset is fixed (activeIdx * rowH). When the
     // user scrolls more than 1.5 viewports away from it, they are reading
     // elsewhere — stop auto-following until they click a row / switch tab.
     const activeTop = activeIdxRef.current * rowHRef.current;
     if (Math.abs(el.scrollTop - activeTop) > el.clientHeight * 1.5) {
-      followRef.current = false;
+      setFollow(false);
     }
   }, []);
 
   const handleRowAreaClick = useCallback((e: React.MouseEvent) => {
     const target = (e.target as HTMLElement).closest('[data-panel-row]') as HTMLElement | null;
     if (!target) return;
-    followRef.current = true;
+    setFollow(true);
     target.scrollIntoView({ block: 'nearest' });
   }, []);
 
@@ -754,7 +797,7 @@ export function PreviewChatPanel({
             // mid-playback at an unchanged index must still jump to the
             // row under the playhead.
             prevActiveIdxRef.current = null;
-            followRef.current = true;
+            setFollow(true);
             setOpen(true);
           }}
           className="w-7 h-full flex flex-col items-center justify-center gap-1.5 border-l-2 border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-white hover:bg-zinc-900"
@@ -1037,6 +1080,17 @@ export function PreviewChatPanel({
                 </>
               )}
             </div>
+          )}
+          {fetchState === 'done' && payload && tab === 'chat' && payload.chat_truncated && (
+            <p
+              className="text-[9px] font-mono text-zinc-600 shrink-0 px-2 pb-1 text-center"
+              data-chat-truncated
+            >
+              {t('Chat history is incomplete — {loaded} of {total} messages shown.', {
+                loaded: payload.chat.length,
+                total: payload.total_rows ?? payload.chat.length,
+              })}
+            </p>
           )}
         </div>
       )}

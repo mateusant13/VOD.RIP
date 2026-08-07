@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
 import { todayIso } from '../archiveSearchUtils';
+import { setLanguage } from '../i18n';
 import type { SavedChannel } from '../types';
 
 const ARCHIVE_VIDEOS = {
   videos: [
-    { platform: 'twitch', video_id: 'v1', channel: 'srdogg', title: 'VOD A' },
+    { platform: 'twitch', video_id: 'v1', channel: 'srdogg', title: 'VOD A', canonical_key: 'srdogg-2026-08-03' },
     { platform: 'kick', video_id: 'k1', channel: 'srdoglol', title: 'VOD B' },
-    { platform: 'youtube', video_id: 'yt1', channel: 'srdogg', title: 'VOD C' },
+    { platform: 'youtube', video_id: 'yt1', channel: 'srdogg', title: 'VOD C', canonical_key: 'srdogg-2026-08-03' },
   ],
 };
 
@@ -62,6 +63,7 @@ function searchUrlWith(fetchMock: ReturnType<typeof vi.fn>, needle: string): str
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setLanguage('en'); // the i18n module state is global — never leak a language into the next test
 });
 
 describe('ArchiveSearchPopup', () => {
@@ -243,7 +245,114 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByLabelText('YouTube')).toBeInTheDocument();
   });
 
-  it('source filter: BOTH default sends no source, STREAMER → transcript, CHAT → chat', async () => {
+  it('kind badges: transcript → speech, message → chat; title stays as-is', async () => {
+    const fetchMock = mockFetch([
+      { ...HIT, kind: 'transcript' as const },
+      { ...HIT, kind: 'message' as const, video_id: 'v2', text: 'zebra message row' },
+      { ...HIT, kind: 'title' as const, video_id: 'v3', text: 'zebra title row' },
+    ]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const speechRow = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(within(speechRow).getByText('speech')).toBeInTheDocument();
+    const messageRow = await screen.findByRole('button', { name: /zebra message row/i });
+    expect(within(messageRow).getByText('chat')).toBeInTheDocument();
+    const titleRow = await screen.findByRole('button', { name: /zebra title row/i });
+    expect(within(titleRow).getByText('title')).toBeInTheDocument();
+  });
+
+  it('result rows render a logo per platform in hit.platforms, primary first', async () => {
+    const fetchMock = mockFetch([
+      { ...HIT, platforms: ['twitch', 'youtube'] },
+      { ...HIT, video_id: 'k2', platform: 'kick', text: 'zebra kick row', platforms: ['kick'] },
+    ]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    const svgs = within(row).getAllByLabelText(/Twitch|YouTube/);
+    expect(svgs).toHaveLength(2);
+    expect(svgs[0].getAttribute('aria-label')).toBe('Twitch'); // primary first
+    expect(svgs[1].getAttribute('aria-label')).toBe('YouTube');
+    const kickRow = await screen.findByRole('button', { name: /zebra kick row/i });
+    expect(within(kickRow).getAllByLabelText('Kick')).toHaveLength(1);
+    expect(within(kickRow).queryByLabelText('Twitch')).toBeNull();
+  });
+
+  it('platform filter matches hit.platforms — mirrored hits stay visible', async () => {
+    const fetchMock = mockFetch([
+      { ...HIT, platforms: ['twitch', 'youtube'] },
+      { ...HIT, video_id: 'k2', platform: 'kick', text: 'zebra kick row', platforms: ['kick'] },
+    ]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    expect(await screen.findByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
+
+    // youtube chip: the twitch-primary hit (mirrored on youtube) still shows;
+    // the kick-only hit disappears and the count reflects the visible rows.
+    fireEvent.click(screen.getByText('youtube'));
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'platform=youtube')).toBeTruthy());
+    expect(screen.getByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: /zebra kick row/i })).toBeNull());
+    expect(screen.getByText('1 result')).toBeInTheDocument();
+  });
+
+  it('onOpenHit receives resolvable per-platform targets (primary first)', async () => {
+    const fetchMock = mockFetch([{ ...HIT, platforms: ['twitch', 'youtube'] }]);
+    const onOpenHit = vi.fn();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    expect(onOpenHit).toHaveBeenCalledTimes(1);
+    const [hitArg, videoArg, targetsArg] = onOpenHit.mock.calls[0] as [unknown, unknown, Array<{ platform: string; video: { video_id: string; title: string } | undefined }>];
+    expect(hitArg).toMatchObject({ video_id: 'v1', offset_sec: 42 });
+    // arg[1] stays the primary platform's video row (existing App contract).
+    expect(videoArg).toMatchObject({ title: 'VOD A' });
+    // arg[2] = twitch (primary) then the youtube mirror, resolved via canonical_key.
+    expect(targetsArg.map((t) => t.platform)).toEqual(['twitch', 'youtube']);
+    expect(targetsArg[1].video).toMatchObject({ video_id: 'yt1', title: 'VOD C' });
+  });
+
+  it('open degrades to the primary platform when platforms is absent', async () => {
+    const fetchMock = mockFetch([HIT]);
+    const onOpenHit = vi.fn();
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    const targetsArg = onOpenHit.mock.calls[0][2] as Array<{ platform: string; video?: { video_id: string } | undefined }>;
+    expect(targetsArg.map((t) => t.platform)).toEqual(['twitch']);
+    expect(targetsArg[0].video).toMatchObject({ video_id: 'v1' });
+  });
+
+  it('source filter + kind badges translate (pt-BR fala/ambos, es habla/ambos)', async () => {
+    const fetchMock = mockFetch([HIT]);
+    setLanguage('pt-BR');
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    expect(screen.getByRole('button', { name: 'fala' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'ambos' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
+    const input = screen.getByPlaceholderText(/PESQUISAR/);
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(within(row).getByText('fala')).toBeInTheDocument();
+    // Live language switch re-renders the same popup.
+    setLanguage('es');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'habla' })).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'ambos' })).toBeInTheDocument();
+    expect(within(row).getByText('habla')).toBeInTheDocument();
+  });
+
+  it('source filter: both default sends no source, speech → transcript, chat → chat', async () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
@@ -251,26 +360,26 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('source=');
 
-    fireEvent.click(screen.getByRole('button', { name: 'STREAMER' }));
+    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript')).toBeTruthy(),
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'CHAT' }));
+    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'BOTH' }));
+    fireEvent.click(screen.getByRole('button', { name: 'both' }));
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy(),
     );
-    // After returning to BOTH, the latest request carries no source param.
+    // After returning to both, the latest request carries no source param.
     await waitFor(() => {
       const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
       expect(urls[urls.length - 1]).not.toContain('source=');
     });
   });
 
-  it('semantic toggle: off by default, on sends semantic=1, disabled for CHAT', async () => {
+  it('semantic toggle: off by default, on sends semantic=1, disabled for chat', async () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
@@ -283,13 +392,13 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1')).toBeTruthy());
 
-    // Concept search covers transcripts only — CHAT disables the toggle.
-    fireEvent.click(screen.getByRole('button', { name: 'CHAT' }));
+    // Concept search covers transcripts only — chat disables the toggle.
+    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled());
     expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).not.toContain('semantic=');
 
     // Back to a transcript-capable source re-enables it (state preserved).
-    fireEvent.click(screen.getByRole('button', { name: 'STREAMER' }));
+    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript&semantic=1')).toBeTruthy(),
@@ -522,7 +631,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.queryByLabelText('Channel')).toBeNull();
     expect(screen.queryByText('Platform')).toBeNull();
     // Orthogonal filters stay active.
-    expect(screen.getByRole('button', { name: 'STREAMER' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'speech' })).toBeInTheDocument();
 
     const input = screen.getByPlaceholderText('SEARCH THIS VIDEO...');
     fireEvent.change(input, { target: { value: 'zebra' } });
@@ -770,6 +879,81 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByText(/end of vod/i)).toBeInTheDocument();
     // Marker line preserved at the hit offset.
     expect(screen.getByText(/Hit moment 00:42/)).toBeInTheDocument();
+  });
+
+  it('loads a truncated chat history in continuation pages — append, no duplicates, note clears', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    let chatCalls = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        chatCalls += 1;
+        const page1 = [
+          { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'first page' },
+          { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'bob', text: 'same second row' },
+          { platform: 'twitch', video_id: 'v1', offset_sec: 100, username: 'carol', text: 'boundary row' },
+        ];
+        const page2 = [
+          // The backend re-includes the equal-offset boundary row — the
+          // append must dedupe it, not render it twice.
+          { platform: 'twitch', video_id: 'v1', offset_sec: 100, username: 'carol', text: 'boundary row' },
+          { platform: 'twitch', video_id: 'v1', offset_sec: 200, username: 'dave', text: 'second page' },
+        ];
+        return new Response(
+          JSON.stringify({
+            messages: chatCalls === 1 ? page1 : page2,
+            truncated: chatCalls === 1,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    // Page 1 lands from the hit offset; the tail note says more is coming.
+    await screen.findByText('first page');
+    expect(chatCalls).toBe(1);
+    expect(screen.queryByText('second page')).toBeNull();
+    expect(screen.getByText(/Chat history continues/)).toBeInTheDocument();
+
+    // Scroll near the bottom of the mounted rows → continuation fetch
+    // anchored at the last delivered row's offset_sec (100).
+    const chatScroll = screen.getByText('first page').closest('.overflow-y-auto') as HTMLElement;
+    Object.defineProperty(chatScroll, 'scrollTop', { value: 900, configurable: true });
+    Object.defineProperty(chatScroll, 'clientHeight', { value: 100, configurable: true });
+    Object.defineProperty(chatScroll, 'scrollHeight', { value: 1000, configurable: true });
+    fireEvent.scroll(chatScroll);
+    await screen.findByText('second page');
+    expect(chatCalls).toBe(2);
+    const contUrl = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .find((u) => u.includes('/chat?') && u.includes('offset=100'));
+    expect(contUrl).toBeTruthy();
+    expect(contUrl).toContain('half=0');
+    // Appended without duplicates: the re-fetched boundary row renders once,
+    // every page's rows are present.
+    expect(screen.getAllByText('boundary row')).toHaveLength(1);
+    expect(screen.getByText('first page')).toBeInTheDocument();
+    expect(screen.getByText('same second row')).toBeInTheDocument();
+    expect(screen.getByText('second page')).toBeInTheDocument();
+    // The archive is fully loaded — the continuation note clears.
+    await waitFor(() => expect(screen.queryByText(/Chat history continues/)).toBeNull());
   });
 
   it('spam_count badge: ×N on collapsed rows, absent for single messages', async () => {

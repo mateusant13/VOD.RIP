@@ -728,11 +728,18 @@ async def archive_search_remote(
 
 
 @router.get("/api/archive/videos/{platform}/{video_id}/chat")
-async def archive_chat_window(platform: str, video_id: str, offset: float = 0.0, half: float = 30.0):
+async def archive_chat_window(
+    platform: str,
+    video_id: str,
+    offset: float = 0.0,
+    half: float = 30.0,
+    limit: int = Query(archive_db.CHAT_FROM_OFFSET_LIMIT, ge=1, le=50_000),
+):
     _require_platform(platform)
     # half > 0 → the classic ±half nearby window; half <= 0 → "from offset
-    # onward" (whole remaining history, capped — truncated reports the cut).
-    messages, truncated = archive_db.chat_window(platform, video_id, offset, half)
+    # onward" (whole remaining history, page-capped — truncated reports the
+    # cut; the popup paginates by re-fetching from the last row's offset).
+    messages, truncated = archive_db.chat_window(platform, video_id, offset, half, limit)
     return {"messages": messages, "truncated": truncated}
 
 

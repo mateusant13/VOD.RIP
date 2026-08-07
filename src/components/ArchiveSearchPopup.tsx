@@ -38,12 +38,15 @@ import {
   formatArchiveOffset,
   formatRelativeDate,
   highlightQuerySpans,
+  hitPlatforms,
   isValidDateParam,
   todayIso,
   kindLabel,
+  resolveOpenTargets,
   snippetAroundMatch,
   type ArchiveChatMessage,
   type ArchiveEnrichEntry,
+  type ArchiveOpenTarget,
   type ArchiveSearchHit,
   type ArchiveSearchResponse,
   type ArchiveSource,
@@ -59,8 +62,10 @@ import PlatformVodIcon from './PlatformVodIcon';
 interface ArchiveSearchPopupProps {
   zIndex: number;
   onClose: () => void;
-  /** Open the hit in the explore-player flow (App owns the popup stack). */
-  onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** Open the hit in the explore-player flow (App owns the popup stack).
+   *  `targets` = resolvable per-platform open targets for the hit's
+   *  canonical VOD (primary first) — App picks the least-opened platform. */
+  onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined, targets?: ArchiveOpenTarget[]) => void;
   /** When provided, clicking a hit row seeks instead of opening: the row
    *  click calls onSeekHit(hit) and a small per-row 'open' affordance still
    *  calls onOpenHit. Absent → current behavior (row click opens). */
@@ -110,10 +115,11 @@ const REMOTE_LIMIT = 20;
 const SEED_Y = 80;
 const SEED_RIGHT = 24;
 
-const platformAccent: Record<string, string> = {
-  twitch: 'text-[#9146FF]',
-  kick: 'text-[#53fc18]',
-  youtube: 'text-[#F03030]',
+/** Kind-badge display words — i18n keys (message → chat, transcript →
+ *  speech). 'title' and remote 'youtube' badges keep their raw kind values. */
+const KIND_BADGE_LABEL: Record<string, string> = {
+  message: 'chat',
+  transcript: 'speech',
 };
 
 /** PlatformVodIcon expects capitalized platform names; archive rows are lowercase. */
@@ -209,6 +215,15 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   useEffect(() => {
     setActiveIdx(-1);
   }, [hits]);
+
+  /** Platform-filtered hits. The chips drive the backend `platform` param,
+   *  but a hit matches a chip when ANY of its platforms (dedupe membership)
+   *  equals it — re-check locally so the UI contract holds even while the
+   *  backend still filters by the primary platform only. */
+  const displayHits = useMemo(() => {
+    if (platformFilter.length === 0) return hits;
+    return hits.filter((h) => hitPlatforms(h).some((p) => platformFilter.includes(p)));
+  }, [hits, platformFilter]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -533,6 +548,15 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       });
   }, [query, scopeActive, sourceFilter, platformFilter, kindFilter, remoteYtHandle]);
 
+  // Resolve the hit's per-platform open targets (primary first) and hand
+  // them to App, which picks the least-opened platform this session. arg[1]
+  // stays the primary platform's video row (existing App contract).
+  const openHit = useCallback((hit: ArchiveSearchHit, fallbackVideo: ArchiveVideoRow | undefined) => {
+    const targets = resolveOpenTargets(hit, videos);
+    const primary = targets.find((t) => t.platform === (hit.platform || '').toLowerCase());
+    onOpenHit(hit, primary?.video ?? fallbackVideo, targets);
+  }, [videos, onOpenHit]);
+
   // Remote hit → open in the player (no chat-history panel; not archived).
   const openRemoteHit = useCallback((hit: ArchiveSearchHit) => {
     if (!onOpenHit) return;
@@ -550,9 +574,75 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     if (onSeekHit) {
       onSeekHit(hit);
     } else {
-      onOpenHit(hit, video);
+      openHit(hit, video);
     }
-  }, [videos, onOpenHit, onSeekHit]);
+  }, [videos, onSeekHit, openHit]);
+
+  // ── Chat history pagination ────────────────────────────────────────────
+  /** Next page's fetch offset — the last delivered row's offset_sec (the
+   *  backend's >= boundary re-includes equal-offset rows; the append dedupes
+   *  them, so paging never duplicates or gaps). */
+  const chatOffsetRef = useRef(0);
+  /** In-flight guard: one continuation page at a time. */
+  const chatFetchingRef = useRef(false);
+  /** True until the first page lands — only it resets the scroll position. */
+  const chatFirstRef = useRef(true);
+
+  /** Fetch one page of the from-hit history (half=0). The first page
+   *  replaces the list; a truncated tail is continued from the last row's
+   *  offset_sec by the scroll handler (near-bottom). */
+  const fetchChatPage = useCallback(async (gen: number) => {
+    if (chatFetchingRef.current || !selected) return;
+    chatFetchingRef.current = true;
+    const { hit } = selected;
+    const first = chatFirstRef.current;
+    try {
+      const res = await apiGet<{ messages: ArchiveChatMessage[]; truncated?: boolean }>(
+        `/api/archive/videos/${encodeURIComponent(hit.platform)}/${encodeURIComponent(hit.video_id)}/chat`
+        + `?offset=${chatOffsetRef.current}&half=0`,
+      );
+      if (!mountedRef.current || gen !== chatGenRef.current) return;
+      const msgs = res.messages ?? [];
+      if (msgs.length > 0) {
+        chatOffsetRef.current = msgs[msgs.length - 1].offset_sec;
+      }
+      if (first) {
+        chatFirstRef.current = false;
+        setChat(msgs);
+        setChatVisibleCount(CHAT_RENDER_CHUNK);
+        if (chatScrollRef.current) chatScrollRef.current.scrollTop = 0;
+      } else {
+        // Append, dropping rows the previous page already delivered (the
+        // backend re-includes the equal-offset boundary run).
+        setChat((prev) => {
+          const seen = new Set(
+            (prev ?? []).map((m) => `${m.offset_sec}|${m.username}|${m.text}`),
+          );
+          const fresh = msgs.filter((m) => !seen.has(`${m.offset_sec}|${m.username}|${m.text}`));
+          return [...(prev ?? []), ...fresh];
+        });
+        // The near-bottom scroll that fired this fetch clamped the mounted
+        // chunk to the then-current chat length — make a chunk of the
+        // appended rows mountable right away (slice caps at the real length;
+        // further mounting stays scroll-driven).
+        setChatVisibleCount((c) => c + Math.min(msgs.length, CHAT_RENDER_CHUNK));
+      }
+      setChatTruncated(Boolean(res.truncated));
+      setChatStatus('done');
+    } catch {
+      // A failed continuation page keeps what is already loaded — the next
+      // near-bottom scroll retries it. Only the first page is a hard error.
+      if (!mountedRef.current || gen !== chatGenRef.current) return;
+      if (first) {
+        setChat([]);
+        setChatTruncated(false);
+        setChatError(t('Could not load chat history.'));
+        setChatStatus('error');
+      }
+    } finally {
+      if (gen === chatGenRef.current) chatFetchingRef.current = false;
+    }
+  }, [selected, t]);
 
   useEffect(() => {
     if (!selected) {
@@ -565,29 +655,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     const { hit } = selected;
     setChatStatus('loading');
     setChatError(null);
+    chatOffsetRef.current = hit.offset_sec;
+    chatFirstRef.current = true;
+    chatFetchingRef.current = false;
     // half=0 → the backend's "from offset onward" mode: the whole chat
-    // history from the hit to the end of the VOD (capped server-side;
-    // truncated reports a cut tail).
-    void apiGet<{ messages: ArchiveChatMessage[]; truncated?: boolean }>(
-      `/api/archive/videos/${encodeURIComponent(hit.platform)}/${encodeURIComponent(hit.video_id)}/chat`
-      + `?offset=${hit.offset_sec}&half=0`,
-    )
-      .then((res) => {
-        if (!mountedRef.current || gen !== chatGenRef.current) return;
-        setChat(res.messages ?? []);
-        setChatTruncated(Boolean(res.truncated));
-        setChatVisibleCount(CHAT_RENDER_CHUNK);
-        if (chatScrollRef.current) chatScrollRef.current.scrollTop = 0;
-        setChatStatus('done');
-      })
-      .catch(() => {
-        if (!mountedRef.current || gen !== chatGenRef.current) return;
-        setChat([]);
-        setChatTruncated(false);
-        setChatError(t('Could not load chat history.'));
-        setChatStatus('error');
-      });
-  }, [selected, retryTick]);
+    // history from the hit to the end of the VOD, page by page (a truncated
+    // tail continues from the last row's offset_sec on scroll).
+    void fetchChatPage(gen);
+  }, [selected, retryTick, fetchChatPage]);
 
   const retrySearch = useCallback(() => {
     setRetryTick((t) => t + 1);
@@ -601,11 +676,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     // Arrow/Enter navigation only while typing in the search box — other
     // controls (selects, date inputs) own their arrow keys.
     if (e.target !== inputRef.current) return;
-    const n = Math.min(hits.length, visibleCountRef.current);
+    const n = Math.min(displayHits.length, visibleCountRef.current);
     // Reveal the chunk holding the target row so the highlight is visible.
     const ensureVisible = (i: number) => {
       if (i >= visibleCountRef.current) {
-        setVisibleCount((c) => Math.min(hits.length, Math.max(c + HITS_RENDER_CHUNK, i + 1)));
+        setVisibleCount((c) => Math.min(displayHits.length, Math.max(c + HITS_RENDER_CHUNK, i + 1)));
       }
     };
     if (e.key === 'ArrowDown') {
@@ -628,9 +703,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       });
     } else if (e.key === 'Enter' && activeIdx >= 0 && activeIdx < n) {
       e.preventDefault();
-      selectHit(hits[activeIdx]);
+      selectHit(displayHits[activeIdx]);
     }
-  }, [onClose, hits, activeIdx, selectHit]);
+  }, [onClose, displayHits, activeIdx, selectHit]);
 
   return (
     <div
@@ -849,7 +924,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                       : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
                   }`}
                 >
-                  {ARCHIVE_SOURCE_LABELS[s]}
+                  {t(ARCHIVE_SOURCE_LABELS[s])}
                 </button>
               ))}
             </div>
@@ -951,15 +1026,15 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       {/* Result count + coverage note. Every hit is a partial word match
           (no row contains all query words) — say so instead of presenting
           fuzzy noise as exact. */}
-      {status === 'done' && hits.length > 0 && (
+      {status === 'done' && displayHits.length > 0 && (
         <div className="flex items-center justify-between gap-2 shrink-0">
           <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
-            {hits.length} {hits.length === 1 ? t('result') : t('results')}
+            {displayHits.length} {displayHits.length === 1 ? t('result') : t('results')}
             {remoteStatus === 'done' && remoteHits.length > 0 && (
               <span className="text-zinc-600"> · +{remoteHits.length} YouTube</span>
             )}
           </span>
-          {!hits.some((h) => !h.partial) && (
+          {!displayHits.some((h) => !h.partial) && (
             <span className="text-[9px] font-mono uppercase tracking-widest text-amber-500/80">
               {t('closest matches')}
             </span>
@@ -970,19 +1045,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       {/* ── HITS — incremental: only `visibleCount` rows are mounted; the
           scroll handler reveals the next chunk so an uncapped literal search
           stays smooth. ── */}
-      {hits.length > 0 && (
+      {displayHits.length > 0 && (
         <div
           ref={hitsScrollRef}
           onScroll={() => {
             const el = hitsScrollRef.current;
             if (!el) return;
             if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
-              setVisibleCount((c) => Math.min(hits.length, c + HITS_RENDER_CHUNK));
+              setVisibleCount((c) => Math.min(displayHits.length, c + HITS_RENDER_CHUNK));
             }
           }}
           className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1"
         >
-          {hits.slice(0, visibleCount).map((hit, idx) => {
+          {displayHits.slice(0, visibleCount).map((hit, idx) => {
             const video = videos[`${(hit.platform || '').toLowerCase()}:${hit.video_id}`];
             const relativeDate = formatRelativeDate(hit.date);
             const spans = highlightQuerySpans(hit.text, query);
@@ -1017,7 +1092,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                     ? <FileText size={10} className="text-zinc-400 shrink-0" />
                     : <MessageSquare size={10} className="text-zinc-400 shrink-0" />}
                   <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-300 shrink-0">
-                    {hit.kind}
+                    {KIND_BADGE_LABEL[hit.kind] ? t(KIND_BADGE_LABEL[hit.kind]) : hit.kind}
                   </span>
                   {hit.kind === 'transcript' && hit.lang && (
                     <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-500 shrink-0">
@@ -1029,9 +1104,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                       CTX
                     </span>
                   )}
-                  <span className={`text-[9px] font-mono uppercase tracking-widest shrink-0 ${platformAccent[hit.platform] ?? 'text-zinc-400'}`}>
-                    {hit.platform}
-                  </span>
+                  {hitPlatforms(hit).map((p) => (
+                    <PlatformVodIcon key={p} platform={PLATFORM_ICON_NAME[p] ?? p} className="w-3.5 h-3.5" />
+                  ))}
                   {hit.video_kind && hit.video_kind !== 'vod' && (
                     <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-600 border border-zinc-800 px-1 py-px shrink-0">
                       {kindLabel(hit.video_kind)}
@@ -1065,7 +1140,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 {onSeekHit && buildArchiveVodUrl(hit.platform, hit.video_id, video?.channel) && (
                   <button
                     type="button"
-                    onClick={() => onOpenHit(hit, video)}
+                    onClick={() => openHit(hit, video)}
                     title={t('Open in player')}
                     aria-label={t('Open {title} in player', { title: videoTitle(video, hit) })}
                     className="border-2 border-zinc-800 bg-zinc-900/60 hover:border-white text-zinc-400 hover:text-white px-1.5 flex items-center shrink-0"
@@ -1175,6 +1250,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 if (!el) return;
                 if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
                   setChatVisibleCount((c) => Math.min(chat.length, c + CHAT_RENDER_CHUNK));
+                  if (chatTruncated && chatStatus === 'done') {
+                    // Tail still pending: pull the next page (serialized by
+                    // chatFetchingRef, appended + deduped in fetchChatPage).
+                    void fetchChatPage(chatGenRef.current);
+                  }
                 }
               }}
               className="flex flex-col gap-0.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1"
@@ -1208,8 +1288,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 </p>
               ))}
               {chatTruncated && (
-                <p className="text-[9px] font-mono text-zinc-600 shrink-0">
-                  {t('History cut at the archive cap — showing the first {shown} of {total} messages.', { shown: Math.min(chatVisibleCount, chat.length), total: chat.length })}
+                <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-chat-truncated>
+                  {t('Chat history continues — scroll to load more ({loaded} messages loaded).', { loaded: chat.length })}
                 </p>
               )}
             </div>

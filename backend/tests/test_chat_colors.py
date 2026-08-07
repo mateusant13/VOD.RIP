@@ -159,3 +159,75 @@ def test_chat_window_from_offset_truncates_at_cap():
     rows2, truncated2 = archive_db.chat_window("youtube", "v3", 1.0, half=0)
     assert truncated2 is False
     assert len(rows2) == archive_db.CHAT_FROM_OFFSET_LIMIT
+
+
+def test_chat_window_limit_paginates_without_gaps_or_duplicates():
+    """The from-offset mode accepts an explicit `limit` and a truncated tail
+    is fully loadable by re-fetching from the last row's offset_sec: the
+    inclusive >= boundary re-includes equal-offset rows (the client dedupes
+    them), so paging never skips a mid-run boundary or re-drops rows."""
+    archive_db.insert_messages("youtube", "v9", [
+        {"offset_sec": float(i), "username": f"u{i}", "text": f"msg {i}"}
+        for i in range(120)
+    ])
+    page1, truncated1 = archive_db.chat_window("youtube", "v9", 0.0, half=0, limit=50)
+    assert truncated1 is True
+    assert len(page1) == 50
+    assert page1[0]["offset_sec"] == 0.0
+
+    page2, truncated2 = archive_db.chat_window(
+        "youtube", "v9", page1[-1]["offset_sec"], half=0, limit=50
+    )
+    assert truncated2 is True
+    assert len(page2) == 50
+    # Boundary row re-included (inclusive >=): the client dedupes it.
+    assert page2[0]["offset_sec"] == page1[-1]["offset_sec"]
+
+    page3, truncated3 = archive_db.chat_window(
+        "youtube", "v9", page2[-1]["offset_sec"], half=0, limit=50
+    )
+    assert truncated3 is False
+    assert len(page3) == 22  # rows 98..119 (98/99 re-included from page 2)
+
+    # Page 1 + the non-boundary tail of pages 2/3 cover the history exactly once.
+    all_offsets = [r["offset_sec"] for r in page1 + page2[1:] + page3[1:]]
+    assert all_offsets == [float(i) for i in range(120)]
+
+    # The +1 probe survives an explicit limit: exactly-at-cap stays clean
+    # (offset 70 → rows 70..119 = exactly 50 rows).
+    page_exact, truncated_exact = archive_db.chat_window(
+        "youtube", "v9", 70.0, half=0, limit=50
+    )
+    assert truncated_exact is False
+    assert len(page_exact) == 50
+
+    # limit is clamped to >= 1 (a 0/negative page is nonsense, not a crash).
+    tiny, tiny_trunc = archive_db.chat_window("youtube", "v9", 0.0, half=0, limit=0)
+    assert len(tiny) == 1
+    assert tiny_trunc is True
+
+
+def test_chat_window_limit_respects_same_offset_runs():
+    """A page boundary cutting through a run of messages sharing one
+    offset_sec must not lose the run's tail: the next page re-fetches from
+    the boundary offset and the run's remaining rows are all present."""
+    # 3 rows at 5.0, 3 rows at 10.0, then spaced rows — cap 4 cuts inside
+    # the 10.0 run (its rows straddle the page boundary).
+    rows = [{"offset_sec": 5.0, "username": f"u{i}", "text": f"five {i}"} for i in range(3)]
+    rows += [{"offset_sec": 10.0, "username": f"u{i}", "text": f"ten {i}"} for i in range(3)]
+    rows += [{"offset_sec": float(20 + i), "username": f"u{i}", "text": f"later {i}"} for i in range(10)]
+    archive_db.insert_messages("youtube", "v10", rows)
+    page1, truncated1 = archive_db.chat_window("youtube", "v10", 0.0, half=0, limit=4)
+    assert truncated1 is True
+    assert [r["offset_sec"] for r in page1] == [5.0, 5.0, 5.0, 10.0]
+    page2, truncated2 = archive_db.chat_window(
+        "youtube", "v10", page1[-1]["offset_sec"], half=0, limit=4
+    )
+    assert truncated2 is True
+    # Boundary row re-included (the client dedupes it); the 10.0 run's
+    # remaining two rows come back — the tail is never skipped — and the
+    # page continues past the run.
+    assert [r["offset_sec"] for r in page2] == [10.0, 10.0, 10.0, 20.0]
+    # Page 1 + page 2's non-boundary rows cover the timeline exactly once.
+    all_offsets = [r["offset_sec"] for r in page1 + page2[1:]]
+    assert all_offsets == [5.0, 5.0, 5.0, 10.0, 10.0, 10.0, 20.0]

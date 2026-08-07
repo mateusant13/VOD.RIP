@@ -1314,15 +1314,28 @@ CHAT_FROM_OFFSET_LIMIT = 5000
 
 
 def chat_window(
-    platform: str, video_id: str, offset_sec: float, half: float = 30.0
+    platform: str,
+    video_id: str,
+    offset_sec: float,
+    half: float = 30.0,
+    limit: Optional[int] = None,
 ) -> tuple[list[dict], bool]:
     """Chat rows for a video, time-ordered. Returns (rows, truncated).
 
     half > 0 → the classic ±half window around offset_sec (BETWEEN, capped at
     CHAT_WINDOW_HALF_LIMIT rows; truncated always False). half <= 0 → "from
     offset onward": every row with offset_sec >= offset_sec, capped at
-    CHAT_FROM_OFFSET_LIMIT rows — the popup's whole-history-from-hit view.
-    The +1 probe distinguishes "hit the cap exactly" from "tail cut off"."""
+    `limit` rows (default CHAT_FROM_OFFSET_LIMIT) — the popup's
+    whole-history-from-hit view. The +1 probe distinguishes "hit the cap
+    exactly" from "tail cut off".
+
+    A truncated tail is paginated by re-calling with offset_sec = the last
+    delivered row's offset_sec: the inclusive >= boundary re-returns rows
+    sharing that offset (so a page cut inside a same-offset run never skips
+    the run's tail), and the client dedupes by row identity. ponytail: if
+    archive data ever produces a run of identical offset_sec longer than the
+    page cap, this would stall (the page never advances past the run) —
+    upgrade path: keyset pagination on (offset_sec, id)."""
     if half is not None and half > 0:
         rows = query(
             """SELECT * FROM messages
@@ -1332,14 +1345,15 @@ def chat_window(
             (platform, video_id, offset_sec - half, offset_sec + half, CHAT_WINDOW_HALF_LIMIT),
         )
         return [dict(r) for r in rows], False
+    cap = CHAT_FROM_OFFSET_LIMIT if limit is None else max(1, int(limit))
     rows = query(
         """SELECT * FROM messages
            WHERE platform = ? AND video_id = ? AND offset_sec >= ?
            ORDER BY offset_sec LIMIT ?""",
-        (platform, video_id, offset_sec, CHAT_FROM_OFFSET_LIMIT + 1),
+        (platform, video_id, offset_sec, cap + 1),
     )
-    truncated = len(rows) > CHAT_FROM_OFFSET_LIMIT
-    return [dict(r) for r in rows[:CHAT_FROM_OFFSET_LIMIT]], truncated
+    truncated = len(rows) > cap
+    return [dict(r) for r in rows[:cap]], truncated
 
 
 # --- preview chat panel (WS-2) --------------------------------------------
@@ -2151,12 +2165,12 @@ def search(
         # Chat-author-only mode: every message from the chosen author(s),
         # newest video first then newest message — no text matching, no
         # per-video cap (the point is the author's whole history).
-        return _username_only_search(
+        return _attach_platforms(_username_only_search(
             fetch=max(int(limit) * 3, 3),
             platforms=platforms, video_id=video_id, channel=channel,
             kinds=kinds, date_from=date_from, date_to=date_to,
             username=username,
-        )[:int(limit)]
+        )[:int(limit)])
     if channel is None and _channel_hint_out is not None:
         hint = _channel_hint_for(raw_q)
         if hint is not None:
@@ -2368,8 +2382,8 @@ def search(
         if sem:
             sem_keys = {(h["platform"], h["video_id"]) for h in sem}
             out = (sem + [h for h in out if (h["platform"], h["video_id"]) not in sem_keys])[:limit]
-            return out
-    return out[:limit]
+            return _attach_platforms(out)
+    return _attach_platforms(out[:limit])
 
 
 def _fold_tokens(text: str) -> list[str]:
@@ -2549,6 +2563,12 @@ def _table_search(
             sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
         elif lng == "en":
             sql += " AND t.lang = 'en'"
+    if hit_kind == "transcript":
+        # Channel-language-aware exclusion: when the owning video's channel
+        # language is a known family, transcript rows of a DIFFERENT family
+        # (YouTube caption ingest historically stored en next to pt for the
+        # same segment) never surface.
+        sql += f" AND {_channel_lang_exclusion()}"
     if username:
         # Author match: case-insensitive exact on the displayed name, with
         # '@' stripped on both sides (YouTube stores @handle; Twitch/Kick
@@ -2761,6 +2781,98 @@ def _append_content_filters(
             parts.append(f"{table}.lang = 'en'")
 
 
+# --- channel-language-aware transcript filtering + cross-platform marking --
+
+# Language families the pipeline knows (mirrors channel_language.KNOWN);
+# transcript rows of a DIFFERENT family are hidden when the owning video's
+# channel language is one of these. Anything else (unknown, 'ja', 'ko', ...)
+# keeps the old all-families behavior.
+_KNOWN_CHANNEL_LANGS = ("pt", "en", "es")
+
+# Chunk size for IN-clause lookups: safely under SQLITE_MAX_VARIABLE_NUMBER
+# on every supported build (defaults range 999..250000).
+_SQLITE_IN_CHUNK = 900
+
+
+def _lang_family(lang: Optional[str]) -> Optional[str]:
+    """Family code of a lang tag ('pt-br' -> 'pt', 'en-US' -> 'en'); None when empty."""
+    if not lang:
+        return None
+    return str(lang).strip().lower().split("-")[0]
+
+
+def _channel_lang_exclusion(table: str = "t", video: str = "v") -> str:
+    """SQL fragment hiding transcript rows whose lang family differs from
+    their video's channel language, when that channel language is a known
+    family (pt/en/es). Per-row, so global searches spanning channels stay
+    correct; untagged rows and unknown channel languages flow through
+    (non-destructive — rows are hidden, never deleted). Python twin:
+    _lang_matches_channel (the semantic pass scans by embedding id, so it
+    post-filters instead of filtering SQL)."""
+    return (
+        f"({video}.channel_language IS NULL"
+        f" OR {video}.channel_language NOT IN ('pt','en','es')"
+        f" OR {table}.lang IS NULL"
+        f" OR lower(substr({table}.lang, 1, instr({table}.lang || '-', '-') - 1))"
+        f" = lower({video}.channel_language))"
+    )
+
+
+def _lang_matches_channel(lang: Optional[str], channel_language: Optional[str]) -> bool:
+    """Python twin of _channel_lang_exclusion for the semantic pass."""
+    fam = _lang_family(channel_language)
+    if fam is None or fam not in _KNOWN_CHANNEL_LANGS:
+        return True
+    if not lang:
+        return True
+    return _lang_family(lang) == fam
+
+
+def _attach_platforms(hits: list[dict]) -> list[dict]:
+    """Attach `platforms` to every hit in place: all platforms where the same
+    canonical VOD exists (dedupe group members, video_aliases overrides
+    included), always containing the hit's own platform. Hits with no
+    canonical key (orphan rows, never deduped) get [platform]. Two bounded
+    lookups (hit videos -> keys, keys -> group platforms), chunked to stay
+    under SQLite's IN-list variable limit."""
+    pairs = sorted({(h["platform"], h["video_id"]) for h in hits})
+    if not pairs:
+        return hits
+    key_by_video: dict[tuple[str, str], Optional[str]] = {}
+    for i in range(0, len(pairs), _SQLITE_IN_CHUNK):
+        chunk = pairs[i : i + _SQLITE_IN_CHUNK]
+        marks = ",".join("(?,?)" for _ in chunk)
+        params = [p for pair in chunk for p in pair]
+        for r in query(
+            f"""SELECT v.platform, v.video_id,
+                       COALESCE(a.canonical_key, v.canonical_key) AS key
+                FROM videos v
+                LEFT JOIN video_aliases a USING (platform, video_id)
+                WHERE (v.platform, v.video_id) IN ({marks})""",
+            params,
+        ):
+            key_by_video[(r["platform"], r["video_id"])] = r["key"]
+    keys = sorted({k for k in key_by_video.values() if k})
+    platforms_by_key: dict[str, list[str]] = {}
+    for i in range(0, len(keys), _SQLITE_IN_CHUNK):
+        chunk = keys[i : i + _SQLITE_IN_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for r in query(
+            f"""SELECT COALESCE(a.canonical_key, v.canonical_key) AS key, v.platform
+                FROM videos v
+                LEFT JOIN video_aliases a USING (platform, video_id)
+                WHERE COALESCE(a.canonical_key, v.canonical_key) IN ({marks})
+                ORDER BY v.platform""",
+            chunk,
+        ):
+            platforms_by_key.setdefault(r["key"], []).append(r["platform"])
+    for h in hits:
+        key = key_by_video.get((h["platform"], h["video_id"]))
+        plats = platforms_by_key.get(key) if key else None
+        h["platforms"] = plats or [h["platform"]]
+    return hits
+
+
 def _phrase_span_rows(
     q_tokens: list[str],
     fetch: int,
@@ -2810,6 +2922,9 @@ def _phrase_span_rows(
         parts, params, platforms=platforms, video_id=video_id, channel=channel,
         kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
     )
+    # Span hits are transcripts: same channel-language family exclusion as
+    # _table_search (both segments of the pair must pass the row filter).
+    parts.append(_channel_lang_exclusion())
     if parts:
         sql += " AND " + " AND ".join(parts)
     # No ORDER BY in SQL (a filesort of every matched row costs ~200ms): the
@@ -3199,6 +3314,10 @@ def _semantic_search(
         })
         if len(out) >= max(fetch * 3, 3):
             break
+    # Same channel-language family exclusion as the lexical passes; the
+    # embedding scan has no SQL row filter, so mismatched-family hits are
+    # dropped here (Python twin of _channel_lang_exclusion).
+    out = [h for h in out if _lang_matches_channel(h["lang"], h["channel_language"])]
     return out
 
 
