@@ -683,7 +683,12 @@ class PreviewManager:
                     session.session_id[:8], resolved[0][:11], prefer_height,
                 )
                 return _finalize_youtube_session(session, crop_start)
-        # ponytail: retry once with jitter when YouTube bot-gate is transient
+        # ponytail: retry once with jitter when the YouTube gate is transient —
+        # either a soft-neg marker in the exception, or a soft InnerTube
+        # playability verdict (gated probes report the same "Video unavailable"
+        # reason as dead videos, so the verdict kind — not the message — is the
+        # signal). Skip the retry while the process-wide yt_gate freeze is
+        # armed: the IP is gated, retrying just hammers it.
         for _try in range(2):
             try:
                 raw_entry, headers, platform, variant_formats, kind, yt_info = (
@@ -695,13 +700,28 @@ class PreviewManager:
                 )
                 break
             except BaseException as exc:
-                if _try == 0 and _youtube_soft_neg_error(exc):
-                    # ponytail: 30-90s made session_ready 52s+ (observed); a
-                    # short backoff still spreads retries without burning the
-                    # user's click on a dead wait. Upgrade path: honor a
-                    # Retry-After header if YouTube ever sends one.
-                    time.sleep(random.uniform(5, 15))
-                    continue
+                if _try == 0:
+                    from services.yt_gate import youtube_gate_active
+
+                    if not youtube_gate_active():
+                        soft = _youtube_soft_neg_error(exc)
+                        if not soft:
+                            from services.youtube_innertube import (
+                                extract_video_id,
+                                innertube_last_playability,
+                            )
+
+                            vid = extract_video_id(url or "")
+                            if vid:
+                                _st, _rs, _pb_kind = innertube_last_playability(vid)
+                                soft = _pb_kind == "retry"
+                        if soft:
+                            # ponytail: 30-90s made session_ready 52s+ (observed); a
+                            # short backoff still spreads retries without burning the
+                            # user's click on a dead wait. Upgrade path: honor a
+                            # Retry-After header if YouTube ever sends one.
+                            time.sleep(random.uniform(5, 15))
+                            continue
                 raise
 
         preview_audio_url: Optional[str] = None

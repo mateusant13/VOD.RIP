@@ -909,8 +909,9 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
         info = _youtube_extract_pass(url, attempt_opts)
         if info and _youtube_info_playable(info):
             return info
-        # InnerTube says the video is permanently gone (deleted/private/members) —
-        # skip the remaining passes and the 30s yt-dlp fallback grind entirely.
+        # InnerTube's definitive verdict (deleted/private/members/age/region)
+        # — skip the remaining passes and the 30s yt-dlp fallback grind.
+        # Soft verdicts (bot/consent gates) fall through to the ladder.
         _st, _rs, _kd = innertube_last_playability(vid0)
         if _kd == "fatal":
             raise RuntimeError(_rs or "This video is unavailable")
@@ -1203,12 +1204,21 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             )
 
             _pb_status, _pb_reason, _pb_kind = innertube_last_playability(_evid(url))
-            if _pb_kind != "ok" and _pb_reason:
+            # Only a DEFINITIVE verdict may replace the exception message. A
+            # soft verdict (bot/consent/age gate) must not — its reason text
+            # ("Video unavailable") matches the fatal markers below and would
+            # stamp a 300s fatal cache for a healthy, gated video.
+            if _pb_kind == "fatal" and _pb_reason:
                 exc = RuntimeError(_pb_reason)
                 box["error"] = exc
         if isinstance(exc, Exception) and _youtube_fatal_extract_error(exc):
-            with _EXTRACT_CACHE_LOCK:
-                _EXTRACT_FATAL_CACHE[key] = (time.time(), str(exc)[:300])
+            # Soft verdicts never enter the 300s fatal cache — a lifted gate
+            # must recover without waiting out the TTL. Fatal-cache only
+            # definitive failures (plus message matches when InnerTube gave
+            # no verdict at all).
+            if _pb_kind != "retry":
+                with _EXTRACT_CACHE_LOCK:
+                    _EXTRACT_FATAL_CACHE[key] = (time.time(), str(exc)[:300])
         elif isinstance(exc, Exception) and _should_neg_cache_youtube(exc, opts, _pb_kind):
             # Don't cache warm_light failures — the click's full chain may still work.
             # Don't cache when InnerTube last probed the video OK — the collapse is

@@ -11,7 +11,9 @@ from services.youtube_innertube import (
     _pick_best_audio_format,
     extract_video_id,
     innertube_extract_info,
+    innertube_last_playability,
     _parse_hls_variants,
+    _record_playability,
 )
 from services.youtube_session import YouTubeSession
 
@@ -69,6 +71,70 @@ def test_classify_http_retry_on_403():
 def test_classify_playability_login_retries():
     assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
     assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
+
+
+def test_classify_playability_transient_gates_soft():
+    """Bot/consent/sign-in gates reuse the generic 'Video unavailable' reason —
+    they must classify SOFT so the fallback ladder runs and nothing poisons
+    the 300s fatal cache."""
+    # Bot gates under any status.
+    assert _classify_playability("LOGIN_REQUIRED", "Video unavailable") == "retry"
+    assert _classify_playability("LOGIN_REQUIRED", "Sign in to confirm you're not a bot") == "retry"
+    assert _classify_playability("ERROR", "Sign in to confirm you're not a bot") == "retry"
+    assert _classify_playability("UNPLAYABLE", "This video is unavailable") == "retry"
+    # Soft age gate ("Confirm your age" — sign-in satisfies it) and consent.
+    assert _classify_playability("LOGIN_REQUIRED", "Confirm your age") == "retry"
+    assert _classify_playability("LOGIN_REQUIRED", "Please confirm your age to continue") == "retry"
+    assert _classify_playability("UNPLAYABLE", "This content requires consent") == "retry"
+    # Embed-disabled is retryable — other clients still play the video.
+    assert _classify_playability(
+        "ERROR", "Playback on other websites has been disabled by the video owner"
+    ) == "retry"
+    # Plain LOGIN_REQUIRED without bot/consent/definitive markers is soft.
+    assert _classify_playability("LOGIN_REQUIRED", None) == "retry"
+    assert _classify_playability("LOGIN_REQUIRED", "Sign in to watch this video") == "retry"
+
+
+def test_classify_playability_definitive_fatal():
+    """Genuinely gone / hard-blocked videos stay fatal."""
+    assert _classify_playability("ERROR", "This video is unavailable") == "fatal"
+    assert _classify_playability("ERROR", "This video is private.") == "fatal"
+    assert _classify_playability("LOGIN_REQUIRED", "This video is private") == "fatal"
+    assert _classify_playability("ERROR", "Video removed by the uploader") == "fatal"
+    assert _classify_playability("ERROR", "This video has been removed by the uploader") == "fatal"
+    assert _classify_playability("ERROR", "This video has been deleted") == "fatal"
+    assert _classify_playability("UNPLAYABLE", "This video is available to members only") == "fatal"
+    assert _classify_playability("LOGIN_REQUIRED", "Join this channel to get access") == "fatal"
+    assert _classify_playability("ERROR", "This video is age-restricted") == "fatal"
+    assert _classify_playability("ERROR", "Video not available in your country") == "fatal"
+    assert _classify_playability("ERROR", "Not available in this country") == "fatal"
+
+
+def test_record_playability_aggregates_deterministically():
+    """Multi-probe verdict: any definitive-fatal probe wins; a late soft probe
+    must not downgrade it (last-writer-wins is gone)."""
+    # soft first, definitive second -> fatal wins with the fatal reason.
+    _record_playability("aggtest000001", "LOGIN_REQUIRED", "Video unavailable", "retry")
+    _record_playability("aggtest000001", "ERROR", "This video is private.", "fatal")
+    assert innertube_last_playability("aggtest000001") == (
+        "ERROR", "This video is private.", "fatal"
+    )
+    # a late soft probe must not downgrade a fatal.
+    _record_playability("aggtest000001", "LOGIN_REQUIRED", "Sign in to confirm you're not a bot", "retry")
+    assert innertube_last_playability("aggtest000001") == (
+        "ERROR", "This video is private.", "fatal"
+    )
+    # fatal after soft upgrades the stored verdict.
+    _record_playability("aggtest000002", "LOGIN_REQUIRED", "Video unavailable", "retry")
+    assert innertube_last_playability("aggtest000002")[2] == "retry"
+    _record_playability("aggtest000002", "ERROR", "This video is unavailable", "fatal")
+    assert innertube_last_playability("aggtest000002") == (
+        "ERROR", "This video is unavailable", "fatal"
+    )
+    # soft-only stays soft.
+    _record_playability("aggtest000003", "LOGIN_REQUIRED", "Video unavailable", "retry")
+    _record_playability("aggtest000003", "LOGIN_REQUIRED", "Confirm your age", "retry")
+    assert innertube_last_playability("aggtest000003")[2] == "retry"
 
 
 def test_dedupe_prefers_mp4_over_webm_at_same_height():
