@@ -313,6 +313,39 @@ def get_subtitles(
     if not lang_list:
         lang_list = ["en", "pt", "es"]
 
+    # Official-API hybrid (issue #4): with a Data API key, captions go
+    # through captions.list/download first — no yt-dlp extract on the
+    # interactive path. Any failure (or no key) falls through to the
+    # unofficial yt-dlp path below; an authoritative empty track list is
+    # cached like the unofficial negative result.
+    try:
+        from services import youtube_data_api
+
+        if youtube_data_api.available():
+            tracks = youtube_data_api.fetch_captions(
+                video_id,
+                prefer=tuple(lang_list),
+                families=None,
+                one_per_family=False,
+                max_tracks=1,
+            )
+            if tracks:
+                lang, kind, srt = tracks[0]
+                segments = youtube_data_api.parse_srt(srt)
+                payload = {
+                    "url": url,
+                    "lang": lang,
+                    "source": "manual" if kind == "standard" else "auto",
+                    "has_subtitles": True,
+                    "rows": [{"offset_sec": seg["start_sec"], "text": seg["text"]} for seg in segments],
+                }
+            else:
+                payload = {"url": url, "lang": None, "source": None, "has_subtitles": False, "rows": []}
+            _subs_cache.put(video_id, payload)
+            return payload
+    except Exception as exc:
+        logger.debug("data api subtitles failed for %s, falling back: %s", url, exc)
+
     # Single-flight: concurrent requests for the same video (tab re-open,
     # retry pressed while the first fetch is still running) share one
     # extraction instead of each spawning a full yt-dlp fetch behind the

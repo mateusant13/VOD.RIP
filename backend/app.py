@@ -157,6 +157,17 @@ async def _app_lifespan(_app: FastAPI):
             except Exception:
                 logger.debug("startup chat dedupe skipped", exc_info=True)
 
+        # Official-API hybrid: lift the Twitch helix token from the cookie
+        # bridge (extension users — zero manual steps). Local I/O only,
+        # never validates against the API (lazy validation on first ingest).
+        try:
+            from services.twitch_helix_service import auto_lift_token
+
+            if auto_lift_token():
+                logger.info("twitch helix token auto-lifted from cookie bridge")
+        except Exception:
+            logger.debug("helix token auto-lift skipped", exc_info=True)
+
         # Keep FTS5 search fast as the archive grows: PRAGMA optimize merges
         # fragmented FTS index b-tree pages and refreshes stats. Cheap no-op
         # when nothing is pending; no exclusive lock (safe with live readers).

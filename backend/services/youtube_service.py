@@ -371,7 +371,19 @@ def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list
     channels: the local index only holds the newest ~100 uploads per channel,
     so old series ("vale da estranheza") are unreachable locally. Same
     guarded yt-dlp + cookie machinery as list_channel_videos_sync; returns
-    [] on any fetch failure (the router surfaces the error)."""
+    [] on any fetch failure (the router surfaces the error).
+
+    Official-API hybrid (issue #4): with a Data API key (and quota OK) the
+    search goes through search.list + a batched videos.list first; any
+    failure silently falls back to the yt-dlp path below."""
+    try:
+        from services.youtube_data_api import available as _yda_available
+        from services.youtube_data_api import search_videos as _yda_search
+
+        if _yda_available():
+            return _yda_search(handle, query, limit)
+    except Exception as exc:
+        logger.debug("data api channel search failed for %s, falling back: %s", handle, exc)
     from services.ytdlp_guard import guarded_youtube_dl_channel
     from services.youtube_session import (
         apply_ytdlp_cookie_opts,

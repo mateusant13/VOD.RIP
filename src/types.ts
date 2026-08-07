@@ -128,6 +128,11 @@ export interface AppSettings {
   /** App UI language: 'en' | 'pt-BR' | 'es'. Absent/'' = not set yet —
    * the FE seeds it from the system language on first run. */
   ui_language?: string;
+  /** Official API hybrid (issue #4): Twitch helix OAuth bearer — auto-lifted
+   * from the cookie bridge, or pasted. Empty = GQL only. */
+  twitch_helix_token?: string;
+  /** Official API hybrid (issue #4): YouTube Data API v3 key (opt-in). */
+  youtube_data_api_key?: string;
 }
 
 export interface DiskUsage {

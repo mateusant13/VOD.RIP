@@ -130,6 +130,17 @@ class AppSettings(BaseModel):
     # also picks asr_language from the same family, once, never overriding
     # an explicit user choice).
     ui_language: str = ""
+    # Official API hybrid (issue #4): Twitch helix OAuth bearer token —
+    # auto-lifted from the cookie bridge's `auth-token`, or pasted by
+    # non-extension users. Empty = GQL only (current behavior).
+    twitch_helix_token: str = ""
+    # Epoch seconds of the last token write (paste OR auto-lift). The
+    # auto-lift only replaces the stored token when the cookie export is
+    # NEWER than this — a stale browser cookie never clobbers a manual paste.
+    twitch_helix_token_updated_at: float = 0.0
+    # YouTube Data API v3 key (opt-in): routes captions/metadata/search
+    # through the official API first, quota-aware, with silent fallback.
+    youtube_data_api_key: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -173,6 +184,8 @@ class SettingsUpdate(BaseModel):
     asr_language: Optional[str] = None
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None
+    twitch_helix_token: Optional[str] = None
+    youtube_data_api_key: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):
