@@ -972,14 +972,18 @@ export const EXPLORE_POPUP_Z = 9999;
  *  player clicked afterwards comes back above the search (standard window
  *  stacking). */
 export const SEARCH_POPUP_Z = EXPLORE_POPUP_Z;
-/** Fallback z for floating popups without an explicit ladder rank (needle
- *  glance; LivePlayerPopup when rendered without a zIndex prop). Ranked
- *  players live inside #explore-portal (fixed layer at EXPLORE_POPUP_Z - 1)
- *  and get EXPLORE_POPUP_Z + rank, so this stays below the whole player
- *  stack; the archive-search popups use the same ladder and can climb above
- *  it when brought to front. */
-export const LIVE_POPUP_ACTIVE_Z = EXPLORE_POPUP_Z - 50;
 export const MAX_EXPLORE_POPUPS = 5;
+/** Z for floating popups without an explicit ladder rank (needle glance; a
+ *  LivePlayerPopup rendered without a zIndex prop). Sits ABOVE the whole
+ *  shared ladder (EXPLORE_POPUP_Z + popupZOrder rank): the needle glance is
+ *  the active trim-drag feedback and must stay visible even with a search
+ *  popup brought to front (batch-1 contract: preview popups float above the
+ *  archive search while active). ponytail: the monotonic rank counter can
+ *  grow past this constant in theory; in practice ranks are assigned only to
+ *  the handful of concurrently-open popups, and the glance is transient —
+ *  the upgrade path is a rank-aware glance z derived from the active player's
+ *  rank, not a constant. */
+export const LIVE_POPUP_ACTIVE_Z = EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS + 1;
 export const LAYOUT_ROW_GAP_TRIPLE = 12;
 export const LAYOUT_ROW_GAP_SPLIT = 24;
 export const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {

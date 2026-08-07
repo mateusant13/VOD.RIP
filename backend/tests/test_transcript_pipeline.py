@@ -250,9 +250,11 @@ def test_on_transcribe_done_explicit_language_never_rewrites():
 
 def _seed_running_job(job_id: str, platform: str, video_id: str, updated_at: str) -> None:
     archive_db.enqueue_job(job_id, "transcribe", platform, video_id)
+    # The merged claim predicate reads COALESCE(heartbeat, updated_at): the
+    # seed must stale BOTH fields, since enqueue_job stamps a fresh heartbeat.
     archive_db.execute(
-        "UPDATE archive_jobs SET status = 'running', updated_at = ? WHERE id = ?",
-        (updated_at, job_id),
+        "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? WHERE id = ?",
+        (updated_at, updated_at, job_id),
     )
 
 
