@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import {
   makeRafMoveLoop,
+  maxBoxShadowBandPx,
   startFloatingPanelDrag,
   startExplorePanelWidthResize,
   suspendPanelTransitions,
@@ -63,6 +64,29 @@ function mountDragSurface() {
   panel.style.height = '200px';
   return { handle, panel };
 }
+
+describe('maxBoxShadowBandPx', () => {
+  it('reads the widest offset from single, stacked, and absent shadows', () => {
+    // Single platform: 6px non-compact / 4px compact.
+    expect(maxBoxShadowBandPx('rgb(83, 252, 24) 6px 6px 0px 0px')).toBe(6);
+    expect(maxBoxShadowBandPx('rgb(145, 70, 255) 4px 4px 0px 0px')).toBe(4);
+    // Multi-platform default stack: 8px compact / 18px non-compact.
+    expect(
+      maxBoxShadowBandPx(
+        'rgb(83, 252, 24) 4px 4px 0px 0px, rgb(145, 70, 255) 6px 6px 0px 0px, rgb(240, 48, 48) 8px 8px 0px 0px',
+      ),
+    ).toBe(8);
+    expect(
+      maxBoxShadowBandPx(
+        'rgb(83, 252, 24) 6px 6px 0px 0px, rgb(145, 70, 255) 12px 12px 0px 0px, rgb(240, 48, 48) 18px 18px 0px 0px',
+      ),
+    ).toBe(18);
+    // Live player dark shadow + shadowless host.
+    expect(maxBoxShadowBandPx('rgba(9, 9, 11, 0.9) 6px 6px 0px 0px')).toBe(6);
+    expect(maxBoxShadowBandPx('none')).toBe(0);
+    expect(maxBoxShadowBandPx('')).toBe(0);
+  });
+});
 
 describe('makeRafMoveLoop', () => {
   it('coalesces many moves into one apply per frame, applying the latest coordinates', async () => {
