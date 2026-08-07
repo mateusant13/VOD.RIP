@@ -11,6 +11,8 @@ import {
   secToFrac,
   zoomTrimViewAround,
   clampTrimZoom,
+  maxTrimZoomForDuration,
+  resolveTimestampSeek,
   TRIM_ZOOM_MIN,
   TRIM_ZOOM_MAX,
 } from './trimUtils';
@@ -107,9 +109,65 @@ describe('clampTrimZoom', () => {
 
   it('clamps to the supported range', () => {
     expect(clampTrimZoom(0.1)).toBe(TRIM_ZOOM_MIN);
-    expect(clampTrimZoom(500)).toBe(TRIM_ZOOM_MAX);
+    expect(clampTrimZoom(99999)).toBe(TRIM_ZOOM_MAX);
     expect(clampTrimZoom(Number.NaN)).toBe(TRIM_ZOOM_MIN);
     expect(clampTrimZoom(Number.POSITIVE_INFINITY)).toBe(TRIM_ZOOM_MAX);
+  });
+
+  it('clamps to the duration-aware maximum when a duration is given', () => {
+    // 2 h VOD: ceiling is TRIM_ZOOM_MAX (7200 / 2 s min window = 3600 → capped).
+    expect(clampTrimZoom(99999, 7200)).toBe(TRIM_ZOOM_MAX);
+    // 60 s VOD: min-window cap → 30× max.
+    expect(clampTrimZoom(99999, 60)).toBe(30);
+    expect(clampTrimZoom(64, 60)).toBe(30);
+    // Unknown duration → TRIM_ZOOM_MAX ceiling.
+    expect(clampTrimZoom(99999, Number.NaN)).toBe(TRIM_ZOOM_MAX);
+    expect(clampTrimZoom(99999, 0)).toBe(TRIM_ZOOM_MAX);
+    expect(clampTrimZoom(99999, -5)).toBe(TRIM_ZOOM_MAX);
+  });
+});
+
+describe('maxTrimZoomForDuration', () => {
+  it('scales the ceiling with the duration', () => {
+    expect(maxTrimZoomForDuration(60)).toBe(30);
+    expect(maxTrimZoomForDuration(7200)).toBe(TRIM_ZOOM_MAX);
+    expect(maxTrimZoomForDuration(26371)).toBe(TRIM_ZOOM_MAX);
+    // 2 s VOD: the min window IS the full duration — no zoom.
+    expect(maxTrimZoomForDuration(2)).toBe(1);
+    expect(maxTrimZoomForDuration(0)).toBe(TRIM_ZOOM_MAX);
+    expect(maxTrimZoomForDuration(Number.NaN)).toBe(TRIM_ZOOM_MAX);
+  });
+});
+
+describe('resolveTimestampSeek', () => {
+  it('maps an in-trim chat timestamp to the same absolute time, trim untouched', () => {
+    expect(resolveTimestampSeek(3602, 1800, 5400, 26371))
+      .toEqual({ target: 3602, start: 1800, end: 5400 });
+  });
+
+  it('maps an out-of-trim chat timestamp to the absolute time, widening the trim end', () => {
+    expect(resolveTimestampSeek(20943, 1800, 5400, 26371))
+      .toEqual({ target: 20943, start: 1800, end: 20943 });
+  });
+
+  it('widens the trim start for a timestamp before the trim', () => {
+    expect(resolveTimestampSeek(1200, 1800, 5400, 26371))
+      .toEqual({ target: 1200, start: 1200, end: 5400 });
+  });
+
+  it('keeps the full-VOD trim unchanged (no trim active)', () => {
+    expect(resolveTimestampSeek(20943, 0, 26371, 26371))
+      .toEqual({ target: 20943, start: 0, end: 26371 });
+  });
+
+  it('never widens beyond the VOD duration', () => {
+    expect(resolveTimestampSeek(999999, 1800, 5400, 26371))
+      .toEqual({ target: 999999, start: 1800, end: 26371 });
+  });
+
+  it('clamps negative offsets to zero and widens the start', () => {
+    expect(resolveTimestampSeek(-5, 1800, 5400, 26371))
+      .toEqual({ target: 0, start: 0, end: 5400 });
   });
 });
 
@@ -132,10 +190,15 @@ describe('zoomWindowFromView', () => {
     expect(zoomWindowFromView(4, 1, 7200)).toEqual({ start: 5400, end: 7200 });
   });
 
-  it('clamps zoom into [1, 64]', () => {
+  it('clamps zoom into the duration-aware maximum', () => {
     expect(zoomWindowFromView(0.1, 0.5, 7200)).toEqual({ start: 0, end: 7200 });
-    const w = zoomWindowFromView(999, 0.5, 7200);
-    expect(w.end - w.start).toBeCloseTo(7200 / 64, 6);
+    // 2 h VOD: max zoom 1024 → window ≈ 7 s (0.1 % of the duration).
+    const w = zoomWindowFromView(99999, 0.5, 7200);
+    expect(w.end - w.start).toBeCloseTo(7200 / maxTrimZoomForDuration(7200), 6);
+    expect(w.end - w.start).toBeCloseTo(7200 / TRIM_ZOOM_MAX, 6);
+    // 60 s VOD: the min-window cap (2 s) limits zoom to 30×.
+    const short = zoomWindowFromView(99999, 0.5, 60);
+    expect(short.end - short.start).toBeCloseTo(2, 6);
   });
 
   it('handles zero duration', () => {

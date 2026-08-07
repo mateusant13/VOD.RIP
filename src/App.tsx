@@ -76,7 +76,7 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
-import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
+import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
 import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
@@ -2576,6 +2576,23 @@ export default function App() {
     else clampPreviewPlaybackToTrim();
     return { start, end };
   }, [vodDurationSec, seekPreviewVideo, clampPreviewPlaybackToTrim]);
+
+  // Chat/transcript/subtitle timestamp clicks ALWAYS seek the archive-absolute
+  // time — even with a trim active. seekPreviewVideo clamps to the trim window
+  // and the timeupdate clamp drags the playhead back to the boundary, so widen
+  // the trim to include the clicked offset first (resolveTimestampSeek).
+  const handlePreviewChatSeek = useCallback((offsetSec: number) => {
+    const { target, start, end } = resolveTimestampSeek(
+      offsetSec,
+      previewTrimStartRef.current,
+      previewTrimEndRef.current,
+      vodDurationSec,
+    );
+    if (start !== previewTrimStartRef.current || end !== previewTrimEndRef.current) {
+      commitPreviewTrimRange(start, end);
+    }
+    seekPreviewVideo(target);
+  }, [vodDurationSec, commitPreviewTrimRange, seekPreviewVideo]);
 
   const markUrlTrimEndpoint = useCallback((which: 'in' | 'out') => {
     lastUrlTrimEndpointRef.current = which;
@@ -6227,10 +6244,12 @@ export default function App() {
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
               // Click-to-seek: chat/transcript/event rows and the subtitle
-              // caption seek the CURRENT preview player (seekPreviewVideo
-              // clamps to the trim window and no-ops until the player is
-              // ready; the shared seekToTimestamp helper owns the dispatch).
-              onSeek={seekPreviewVideo}
+              // caption seek the CURRENT preview player. handlePreviewChatSeek
+              // widens the trim when the click falls outside it so the jump
+              // always lands on the archive-absolute offset (seekPreviewVideo
+              // no-ops until the player is ready; the shared seekToTimestamp
+              // helper owns the dispatch).
+              onSeek={handlePreviewChatSeek}
               hidden={previewFullscreen}
               // Gates only the URL-only live-captions fetch (video-first);
               // the archive payload starts at session-create so the Twitch
@@ -7072,8 +7091,8 @@ export default function App() {
           initialPos={previewSearchAnchorRef.current ?? undefined}
           onClose={() => setPreviewSearchOpen(false)}
           onOpenHit={openArchiveHit}
-          onSeekHit={previewArchiveVideoId ? (hit) => seekPreviewVideo(hit.offset_sec) : undefined}
-          onSeekOffset={previewArchiveVideoId ? (sec) => seekPreviewVideo(sec) : undefined}
+          onSeekHit={previewArchiveVideoId ? (hit) => handlePreviewChatSeek(hit.offset_sec) : undefined}
+          onSeekOffset={previewArchiveVideoId ? (sec) => handlePreviewChatSeek(sec) : undefined}
           scope={previewSearchScope}
           savedChannels={savedChannels}
         />

@@ -61,14 +61,24 @@ export interface TrimViewWindow {
 }
 
 export const TRIM_ZOOM_MIN = 1;
-export const TRIM_ZOOM_MAX = 64;
-/** Per wheel notch — ×1.25 in, ÷1.25 out (log-ish so 14h VODs stay usable). */
-export const TRIM_ZOOM_STEP = 1.25;
+/** Zoom is duration-aware up to this ceiling — 1024× shows ~7 s of a 2 h VOD. */
+export const TRIM_ZOOM_MAX = 1024;
+/** Per wheel notch — ×1.5 in, ÷1.5 out (fewer notches to deep zoom). */
+export const TRIM_ZOOM_STEP = 1.5;
+/** Smallest visible rail window (seconds) at max zoom for any duration. */
+export const TRIM_MIN_WINDOW_SEC = 2;
 
-/** Clamp a zoom level to the supported range. */
-export function clampTrimZoom(zoom: number): number {
+/** Highest zoom that still shows at least TRIM_MIN_WINDOW_SEC of a duration. */
+export function maxTrimZoomForDuration(durationSec: number): number {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return TRIM_ZOOM_MAX;
+  return Math.min(TRIM_ZOOM_MAX, Math.max(TRIM_ZOOM_MIN, durationSec / TRIM_MIN_WINDOW_SEC));
+}
+
+/** Clamp a zoom level to the supported range (duration-aware when given). */
+export function clampTrimZoom(zoom: number, durationSec?: number): number {
   if (Number.isNaN(zoom)) return TRIM_ZOOM_MIN;
-  return Math.min(TRIM_ZOOM_MAX, Math.max(TRIM_ZOOM_MIN, zoom));
+  const max = durationSec != null ? maxTrimZoomForDuration(durationSec) : TRIM_ZOOM_MAX;
+  return Math.min(max, Math.max(TRIM_ZOOM_MIN, zoom));
 }
 
 /**
@@ -83,7 +93,7 @@ export function zoomWindowFromView(
 ): TrimViewWindow {
   const dur = Math.max(0, durationSec);
   if (dur <= 0 || zoom <= TRIM_ZOOM_MIN) return { start: 0, end: dur };
-  const z = clampTrimZoom(zoom);
+  const z = clampTrimZoom(zoom, dur);
   const width = dur / z;
   const anchor = Math.max(0, Math.min(1, anchorFrac)) * dur;
   let start = anchor - width / 2;
@@ -132,7 +142,7 @@ export function zoomTrimViewAround(
     start = 0;
     end = Math.min(dur, newWidth);
   }
-  const zoom = clampTrimZoom(dur / (end - start));
+  const zoom = clampTrimZoom(dur / (end - start), dur);
   return { zoom, anchorFrac: (start + (end - start) / 2) / dur };
 }
 
@@ -152,5 +162,29 @@ export function adjustTrimEndpointByDelta(
   }
   const newEnd = Math.min(dur, Math.max(start + minLen, end + delta));
   return { start, end: newEnd };
+}
+
+/**
+ * Absolute seek target for a timestamped row click (chat history, transcript,
+ * subtitle caption) plus the trim window needed to keep it there.
+ *
+ * Rows carry archive-absolute offset_sec; the player seek clamps to the trim
+ * and the timeupdate clamp drags the playhead back to the boundary — so when
+ * the clicked offset falls OUTSIDE the trim window, widen the trim to include
+ * it before seeking. In-trim clicks pass through untouched.
+ */
+export function resolveTimestampSeek(
+  offsetSec: number,
+  trimStartSec: number,
+  trimEndSec: number,
+  vodDurationSec: number,
+): { target: number; start: number; end: number } {
+  const target = Math.max(0, Number.isFinite(offsetSec) ? offsetSec : 0);
+  const dur = Number.isFinite(vodDurationSec) && vodDurationSec > 0
+    ? vodDurationSec
+    : Math.max(trimEndSec, target, 1);
+  const start = Math.max(0, Math.min(trimStartSec, target));
+  const end = Math.min(dur, Math.max(trimEndSec, target));
+  return { target, start, end };
 }
 
