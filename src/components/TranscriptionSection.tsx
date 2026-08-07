@@ -3,6 +3,7 @@ import { Loader2 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
 import Toggle from './Toggle';
 import { apiPost } from '../hooks/useApiClient';
+import { useI18n } from '../i18n';
 import type { AppSettings } from '../types';
 
 /**
@@ -19,6 +20,7 @@ type Props = {
 export default function TranscriptionSection({ settings, setSettings, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const { t } = useI18n();
 
   const activeModel = (settings.whisper_model ?? '').trim() || 'large-v3-turbo';
 
@@ -46,7 +48,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>Model</FieldCaption>
+        <FieldCaption noWrap>{t('Model')}</FieldCaption>
         <input
           type="text"
           value={settings.whisper_model ?? ''}
@@ -59,9 +61,9 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
       <div className="flex flex-col gap-1.5">
         <FieldCaption
           noWrap
-          info="Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download"
+          info={t('Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download')}
         >
-          Model Cache Directory
+          {t('Model Cache Directory')}
         </FieldCaption>
         <input
           type="text"
@@ -73,8 +75,8 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         />
       </div>
       <Toggle
-        label="YouTube subtitles first"
-        info="Fallback to Whisper when subtitles are unavailable"
+        label={t('YouTube subtitles first')}
+        info={t('Fallback to Whisper when subtitles are unavailable')}
         checked={settings.yt_subtitles_first ?? true}
         onChange={(c) => setSettings({ ...settings, yt_subtitles_first: c })}
         ariaLabel="use youtube subtitles first"
@@ -82,9 +84,9 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
       <div className="flex flex-col gap-1.5">
         <FieldCaption
           noWrap
-          info="Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected."
+          info={t('Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.')}
         >
-          Captions Language
+          {t('Captions Language')}
         </FieldCaption>
         <div className="flex items-center gap-1.5">
           <select
@@ -93,10 +95,10 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
             aria-label="default captions language"
             className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
           >
-            <option value="auto">Auto-detect</option>
-            <option value="pt">Portuguese (pt)</option>
-            <option value="en">English (en)</option>
-            <option value="es">Spanish (es)</option>
+            <option value="auto">{t('Auto-detect')}</option>
+            <option value="pt">{t('Portuguese (pt)')}</option>
+            <option value="en">{t('English (en)')}</option>
+            <option value="es">{t('Spanish (es)')}</option>
           </select>
         </div>
       </div>
@@ -108,10 +110,10 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center gap-1.5"
         >
           {saving ? <Loader2 size={13} className="animate-spin" /> : null}
-          {saving ? '...' : 'Save'}
+          {saving ? '...' : t('Save')}
         </button>
-        <span className="text-xs text-zinc-400 font-mono">active: {activeModel}</span>
-        {msg ? <span className="text-xs text-emerald-500 font-mono">{msg}</span> : null}
+        <span className="text-xs text-zinc-400 font-mono">{t('active: {model}', { model: activeModel })}</span>
+        {msg ? <span className="text-xs text-emerald-500 font-mono">{msg === 'saved' ? t('saved') : t('save failed')}</span> : null}
       </div>
     </div>
   );

@@ -194,6 +194,11 @@ async def update_settings(update: SettingsUpdate):
             for k, v in (update.channel_asr_languages or {}).items()
             if str(k).strip()
         } or None
+    if update.ui_language is not None:
+        # 'en' | 'pt-BR' | 'es' — anything else is rejected ('' clears it
+        # so the frontend re-seeds from the system language).
+        val = (update.ui_language or "").strip()
+        current.ui_language = val if val in ("en", "pt-BR", "es") else ""
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

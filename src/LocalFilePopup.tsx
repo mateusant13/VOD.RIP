@@ -7,6 +7,7 @@ import {
 } from 'react';
 import { Search, X } from 'lucide-react';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
+import { useI18n } from './i18n';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import type { PanelSize, SavedChannel } from './types';
 import {
@@ -78,6 +79,7 @@ export default function LocalFilePopup({
   onOpenHit,
   savedChannels,
 }: Props) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   const [pos, setPos] = useState<PanelPos | null>(null);
@@ -160,7 +162,7 @@ export default function LocalFilePopup({
         </span>
         <button
           type="button"
-          title="Search the local archive (transcripts + chat)"
+          title={t('Search the local archive (transcripts + chat)')}
           onClick={() => setSearchOpen((o) => !o)}
           aria-pressed={searchOpen}
           className={`shrink-0 p-0.5 ${searchOpen ? 'text-white' : 'text-zinc-500 hover:text-white'}`}
@@ -169,7 +171,7 @@ export default function LocalFilePopup({
         </button>
         <button
           type="button"
-          title="Close"
+          title={t('Close')}
           onClick={onClose}
           className="shrink-0 text-zinc-500 hover:text-white p-0.5"
         >

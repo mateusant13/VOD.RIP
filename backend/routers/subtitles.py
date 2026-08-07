@@ -130,12 +130,37 @@ def _subtitles_opts() -> dict:
     }
 
 
+def _caption_family_pref() -> tuple[str, ...]:
+    """Caption family ranking for this machine's user.
+
+    An explicit ``asr_language`` setting wins (pt/es/en — the user picked
+    it, keep it first); 'auto'/unset falls back to the UI language family
+    (pt-BR → pt first, es → es first). Repo-wide default: pt > en > es.
+    """
+    fam = ""
+    try:
+        from deps import settings_mgr  # lazy: avoids import cycles
+
+        s = settings_mgr.get()
+        explicit = getattr(s, "asr_language", "auto") or "auto"
+        if explicit != "auto" and explicit.split("-")[0] in _SUBTITLE_FAMILY_PREF:
+            fam = explicit.split("-")[0]
+        else:
+            ui = getattr(s, "ui_language", "") or ""
+            fam = {"pt-BR": "pt", "es": "es", "en": "en"}.get(ui, "")
+    except Exception:
+        fam = ""
+    if fam:
+        rest = tuple(f for f in _SUBTITLE_FAMILY_PREF if f != fam)
+        return (fam, *rest)
+    return _SUBTITLE_FAMILY_PREF
+
+
 def _track_key(lang: str, manual_langs: set[str]) -> tuple[int, int, int]:
     """Sort key: language-family preference, exact pref code, manual first."""
     family = lang.split("-")[0]
-    fam_idx = (
-        _SUBTITLE_FAMILY_PREF.index(family) if family in _SUBTITLE_FAMILY_PREF else len(_SUBTITLE_FAMILY_PREF)
-    )
+    fam_pref = _caption_family_pref()
+    fam_idx = fam_pref.index(family) if family in fam_pref else len(fam_pref)
     exact = 0 if lang in _SUBTITLE_LANG_PREF else 1
     manual = 0 if lang in manual_langs else 1
     return (fam_idx, exact, manual)
@@ -236,17 +261,37 @@ def _fetch_subtitles(url: str, langs: list[str]) -> dict:
         raise HTTPException(status_code=502, detail=f"Could not fetch subtitles: {exc}")
 
 
+def _subtitle_langs_default() -> str:
+    """Default ``langs`` list for /api/subtitles: the UI language family
+    first (pt-BR → pt, es → es, en → en), then the other families in the
+    repo-wide order — so captions follow the UI language unless the caller
+    passes an explicit preference list."""
+    fam = ""
+    try:
+        from deps import settings_mgr  # lazy: avoids import cycles
+
+        ui = getattr(settings_mgr.get(), "ui_language", "") or ""
+        fam = {"pt-BR": "pt", "es": "es", "en": "en"}.get(ui, "")
+    except Exception:
+        fam = ""
+    if fam:
+        return ",".join([fam, *[f for f in _SUBTITLE_FAMILY_PREF if f != fam]])
+    return _SUBTITLE_LANGS_DEFAULT
+
+
 @router.get("/api/subtitles")
 def get_subtitles(
     url: str = Query(...),
-    langs: str = Query(_SUBTITLE_LANGS_DEFAULT),
+    langs: str | None = Query(None, description="comma-separated language preference list; default follows the UI language"),
 ) -> dict:
     """Captions for a URL-only YouTube video as preview-panel transcript rows.
 
-    ``langs`` is a comma-separated language preference list (default
-    en,pt,es); the best available track among them is returned — manual
-    subtitles preferred over auto-generated, pt > en > es within the app's
-    caption ordering (mirror of archive_ytdlp._CAPTION_LANG_PREF).
+    ``langs`` is a comma-separated language preference list; when omitted
+    it follows the UI language (pt first for pt-BR, es first for Spanish,
+    en otherwise — see _subtitle_langs_default). The best available track
+    among the requested families is returned — manual subtitles preferred
+    over auto-generated, and the family ranking mirrors the UI/explicit
+    caption language (see _caption_family_pref).
 
     Response: {url, lang, source: 'manual'|'auto', has_subtitles,
     rows: [{offset_sec, text}]}. ``has_subtitles`` is False when the video
@@ -264,7 +309,7 @@ def get_subtitles(
     cached = _subs_cache.get(video_id)
     if cached is not _MISS:
         return cached
-    lang_list = [lang.strip() for lang in langs.split(",") if lang.strip()]
+    lang_list = [lang.strip() for lang in (langs or _subtitle_langs_default()).split(",") if lang.strip()]
     if not lang_list:
         lang_list = ["en", "pt", "es"]
 

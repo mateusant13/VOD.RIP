@@ -6,6 +6,7 @@ import { ActiveDownloadsList } from './ActiveDownloadsList';
 import DownloadThumb from './DownloadThumb';
 import PlatformVodIcon from './PlatformVodIcon';
 import type { DownloadState } from '../types';
+import { useI18n } from '../i18n';
 import { fetchTwitchClipHistory, type TwitchClipRecord } from '../twitchClip';
 import { formatHmsFull } from '../utils';
 
@@ -65,6 +66,7 @@ export default function QueueTab({
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
   const historyAllSelected = historyDownloads.length > 0 && selectedHistoryIds?.size === historyDownloads.length;
+  const { t } = useI18n();
   const [twitchClips, setTwitchClips] = useState<TwitchClipRecord[]>([]);
   const [twitchClipsLoading, setTwitchClipsLoading] = useState(false);
   const loadTwitchClips = () => {
@@ -82,7 +84,7 @@ export default function QueueTab({
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-          History
+          {t('History')}
         </span>
         <div className="flex items-center gap-2">
           {selectedQueueIds && selectedQueueIds.size > 0 && (
@@ -91,7 +93,7 @@ export default function QueueTab({
               onClick={onBulkDeleteQueue}
               className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 font-bold uppercase tracking-wider"
             >
-              <Trash2 size={12} /> Delete {selectedQueueIds.size}
+              <Trash2 size={12} /> {t('Delete {count}', { count: selectedQueueIds.size })}
             </button>
           )}
           <button onClick={onRefresh} className="text-zinc-500 hover:text-white transition-colors">
@@ -117,7 +119,7 @@ export default function QueueTab({
               className="shrink-0"
               style={vodCheckboxStyle('#fafafa')}
             />
-            Select all
+            {t('Select all')}
           </label>
         </div>
       )}
@@ -144,7 +146,7 @@ export default function QueueTab({
         <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-              Recent
+              {t('Recent')}
             </span>
             {selectedRecentIds && selectedRecentIds.size > 0 && (
               <button
@@ -152,7 +154,7 @@ export default function QueueTab({
                 onClick={onBulkDeleteRecent}
                 className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 font-bold uppercase tracking-wider"
               >
-                <Trash2 size={12} /> Delete {selectedRecentIds.size}
+                <Trash2 size={12} /> {t('Delete {count}', { count: selectedRecentIds.size })}
               </button>
             )}
           </div>
@@ -174,7 +176,7 @@ export default function QueueTab({
                   className="shrink-0"
               style={vodCheckboxStyle('#fafafa')}
                 />
-                Select all
+                {t('Select all')}
               </label>
             </div>
           )}
@@ -201,7 +203,7 @@ export default function QueueTab({
       <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
         <div className="flex items-center justify-between">
           <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-            History
+            {t('History')}
           </span>
           {selectedHistoryIds && selectedHistoryIds.size > 0 && (
             <button
@@ -209,7 +211,7 @@ export default function QueueTab({
               onClick={onBulkDeleteHistory}
               className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 font-bold uppercase tracking-wider"
             >
-              <Trash2 size={12} /> Delete {selectedHistoryIds.size}
+              <Trash2 size={12} /> {t('Delete {count}', { count: selectedHistoryIds.size })}
             </button>
           )}
         </div>
@@ -231,14 +233,14 @@ export default function QueueTab({
                 className="shrink-0"
               style={vodCheckboxStyle('#fafafa')}
               />
-              Select all
+              {t('Select all')}
             </label>
           </div>
         )}
         <div className="flex flex-col gap-2">
           {historyDownloads.length === 0 ? (
             <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-              NO COMPLETED DOWNLOADS YET.
+              {t('NO COMPLETED DOWNLOADS YET.')}
             </div>
           ) : historyDownloads.map((dl) => {
             const checked = selectedHistoryIds?.has(dl.download_id);
@@ -282,7 +284,7 @@ export default function QueueTab({
                       <button
                         type="button"
                         onClick={() => onOpenVod(dl.url)}
-                        title="Open preview for this VOD"
+                        title={t('Open preview for this VOD')}
                         className="text-xs font-mono text-zinc-300 truncate min-w-0 text-left hover:text-white cursor-pointer"
                       >
                         {dl.title || dl.url}
@@ -303,18 +305,18 @@ export default function QueueTab({
                         type="button"
                         onClick={() => onOpenFolder(dl.output_file)}
                         className="text-zinc-400 hover:text-white flex items-center gap-1"
-                        title="Show in folder"
+                        title={t('Show in folder')}
                       >
-                        <FolderOpen size={12} /> Folder
+                        <FolderOpen size={12} /> {t('Folder')}
                       </button>
                     )}
                     <button
                       type="button"
                       onClick={() => onDeleteHistory(dl.download_id)}
                       className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
-                      title="Remove from history"
+                      title={t('Remove from history')}
                     >
-                      <Trash2 size={12} /> Delete
+                      <Trash2 size={12} /> {t('Delete')}
                     </button>
                   </div>
                 </div>
@@ -330,20 +332,20 @@ export default function QueueTab({
         <div className="flex items-center justify-between">
           <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1.5">
             <Clapperboard size={11} className="text-[#9146FF]" />
-            Twitch Clips
+            {t('Twitch Clips')}
           </span>
           <button
             type="button"
             onClick={loadTwitchClips}
             className={`text-zinc-500 hover:text-white transition-colors ${twitchClipsLoading ? 'animate-spin' : ''}`}
-            title="Refresh Twitch clip history"
+            title={t('Refresh Twitch clip history')}
           >
             <RefreshCw size={14} />
           </button>
         </div>
         {twitchClips.length === 0 ? (
           <div className="text-center text-zinc-600 font-mono text-xs py-4 border-2 border-dashed border-zinc-800">
-            NO TWITCH CLIPS YET — use the CLIP button in a Twitch preview.
+            {t('NO TWITCH CLIPS YET — use the CLIP button in a Twitch preview.')}
           </div>
         ) : (
           <div className="flex flex-col gap-2">
@@ -353,11 +355,11 @@ export default function QueueTab({
                 <div className="flex flex-col gap-0.5 min-w-0 flex-1">
                   <span className="text-xs font-mono text-zinc-300 truncate">
                     {c.channel}
-                    {c.vod_id ? ` · VOD ${c.vod_id}` : ' · live'}
+                    {c.vod_id ? ` · ${t('VOD {id}', { id: c.vod_id })}` : ` · ${t('live')}`}
                     {c.duration_sec ? ` · ${Math.round(c.duration_sec)}s` : ''}
                   </span>
                   <span className="text-[10px] font-mono text-zinc-500 truncate">
-                    {c.offset_sec != null ? `offset ${formatHmsFull(c.offset_sec)} · ` : ''}
+                    {c.offset_sec != null ? `${t('offset {time}', { time: formatHmsFull(c.offset_sec) })} · ` : ''}
                     {new Date(c.created_at).toLocaleString()}
                   </span>
                 </div>
@@ -366,9 +368,9 @@ export default function QueueTab({
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
-                  title="Open Twitch clip editor"
+                  title={t('Open Twitch clip editor')}
                 >
-                  <ExternalLink size={12} /> Editor
+                  <ExternalLink size={12} /> {t('Editor')}
                 </a>
               </div>
             ))}

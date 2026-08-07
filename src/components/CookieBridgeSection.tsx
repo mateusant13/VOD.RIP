@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Check, Copy, ExternalLink, FolderOpen, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 import InfoHint from './InfoHint';
+import { useI18n } from '../i18n';
 
 /**
  * Cookie Bridge consent + diagnostics.
@@ -70,6 +71,7 @@ export default function CookieBridgeSection({
   const [opened, setOpened] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { t } = useI18n();
 
   const refresh = useCallback(async () => {
     try {
@@ -78,11 +80,11 @@ export default function CookieBridgeSection({
       onStatusChange?.(s);
       setError(null);
     } catch {
-      setError('Cookie Bridge API unreachable.');
+      setError(t('Cookie Bridge API unreachable.'));
     }
     try {
-      const t = await apiGet<{ token: string }>('/api/session/cookies/token');
-      setToken(t.token);
+      const t_ = await apiGet<{ token: string }>('/api/session/cookies/token');
+      setToken(t_.token);
     } catch {
       /* keep last known */
     }
@@ -92,7 +94,7 @@ export default function CookieBridgeSection({
     } catch {
       setExt(null);
     }
-  }, [onStatusChange]);
+  }, [onStatusChange, t]);
 
   useEffect(() => {
     void refresh();
@@ -109,7 +111,7 @@ export default function CookieBridgeSection({
       );
       setStatus({ ...status, enabled: res.enabled });
     } catch {
-      setError('Could not toggle Cookie Bridge — backend unreachable?');
+      setError(t('Could not toggle Cookie Bridge — backend unreachable?'));
     }
     setBusy(false);
   };
@@ -124,14 +126,14 @@ export default function CookieBridgeSection({
     // open keeps the existing manual-install hint.
     const openRes = await apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null);
     if (openRes === null) {
-      setError('Could not reach the backend to open the browser tab.');
+      setError(t('Could not reach the backend to open the browser tab.'));
     } else {
       setOpened(openRes.launched);
       if (!openRes.launched) {
         setError(
           openRes.blocked
-            ? 'Browser window could not be focused — open chrome://extensions manually and drop the folder.'
-            : 'No Chromium browser found — open chrome://extensions manually and drop the folder.',
+            ? t('Browser window could not be focused — open chrome://extensions manually and drop the folder.')
+            : t('No Chromium browser found — open chrome://extensions manually and drop the folder.'),
         );
       }
     }
@@ -146,7 +148,7 @@ export default function CookieBridgeSection({
     try {
       await apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {});
     } catch {
-      setError('Extension folder not available yet.');
+      setError(t('Extension folder not available yet.'));
     }
   };
 
@@ -167,7 +169,7 @@ export default function CookieBridgeSection({
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
         <span className={`text-xs font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-400'}`}>
-          {status?.paired ? '● paired' : '○ not paired'}
+          {status?.paired ? t('● paired') : t('○ not paired')}
         </span>
         <button
           type="button"
@@ -180,15 +182,15 @@ export default function CookieBridgeSection({
           }`}
         >
           {busy ? <Loader2 size={13} className="animate-spin" /> : enabled ? <ShieldCheck size={13} /> : <ShieldOff size={13} />}
-          {enabled ? 'Enabled' : 'Disabled'}
+          {enabled ? t('Enabled') : t('Disabled')}
         </button>
       </div>
 
       <div className="flex items-start gap-1.5">
         <p className="text-xs text-zinc-300 font-mono leading-relaxed">
-          Local-only cookie sync — nothing leaves this machine.
+          {t('Local-only cookie sync — nothing leaves this machine.')}
         </p>
-        <InfoHint text="Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion." />
+        <InfoHint text={t('Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion.')} />
       </div>
 
       {error ? <p className="text-xs text-red-400 font-mono">{error}</p> : null}
@@ -200,12 +202,12 @@ export default function CookieBridgeSection({
               {PLATFORM_LABELS[platform] ?? platform}: {st.count}
               {st.lastGrabAt ? ` · ${formatGrabTime(st.lastGrabAt)}` : ''}
               {st.expiredCount > 0 ? (
-                <span className="text-amber-500"> · {st.expiredCount} expired</span>
+                <span className="text-amber-500"> · {t('{count} expired', { count: st.expiredCount })}</span>
               ) : null}
             </span>
           ))
         ) : (
-          <span className="text-zinc-400">no cookies stored</span>
+          <span className="text-zinc-400">{t('no cookies stored')}</span>
         )}
       </div>
 
@@ -224,7 +226,7 @@ export default function CookieBridgeSection({
             className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1.5 shrink-0"
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}
-            {copied ? 'Copied' : 'Copy'}
+            {copied ? t('Copied') : t('Copy')}
           </button>
         </div>
       ) : null}
@@ -239,24 +241,23 @@ export default function CookieBridgeSection({
               className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
             >
               {opening ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />}
-              Open extensions
+              {t('Open extensions')}
             </button>
             <button
               type="button"
               onClick={() => void revealFolder()}
-              title="Opens the cookie-extension folder — grab the VOD.RIP-cookies folder inside"
+              title={t('Opens the cookie-extension folder — grab the VOD.RIP-cookies folder inside')}
               className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white"
             >
               <FolderOpen size={13} />
-              Show folder
+              {t('Show folder')}
             </button>
             {ext.version ? (
               <span className="text-xs text-zinc-400 font-mono ml-auto">v{ext.version}</span>
             ) : null}
           </div>
           <p className="text-xs text-zinc-400 font-mono leading-relaxed">
-            Grab the <span className="text-zinc-200">VOD.RIP-cookies</span> folder (the one marked
-            “drag this folder above”) and drop it onto the extensions page (Developer mode ON):
+            {t('Grab the')} <span className="text-zinc-200">VOD.RIP-cookies</span>{t('folder (the one marked “drag this folder above”) and drop it onto the extensions page (Developer mode ON):')}
             <br />
             <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>
@@ -264,17 +265,17 @@ export default function CookieBridgeSection({
             <>
               <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
                 <li>
-                  Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
+                  {t('Toggle')} <span className="text-zinc-200">Developer mode</span>{t(' ON (top-right corner of the tab).')}
                 </li>
-                <li>Drop the VOD.RIP-cookies folder onto the page.</li>
-                <li>Open the extension popup on Kick or YouTube once — cookies land here.</li>
+                <li>{t('Drop the VOD.RIP-cookies folder onto the page.')}</li>
+                <li>{t('Open the extension popup on Kick or YouTube once — cookies land here.')}</li>
               </ol>
             </>
           ) : null}
         </div>
       ) : (
         <p className="text-xs text-zinc-400 font-mono">
-          Extension package not installed — restart the app to refresh it, then this flow appears here.
+          {t('Extension package not installed — restart the app to refresh it, then this flow appears here.')}
         </p>
       )}
     </div>

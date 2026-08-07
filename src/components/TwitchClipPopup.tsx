@@ -22,6 +22,7 @@ import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X } from 'lucide-react';
 import { apiDelete } from '../hooks/useApiClient';
+import { useI18n } from '../i18n';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
@@ -73,6 +74,7 @@ export default function TwitchClipPopup({
   onClose,
   onClipCreated,
 }: TwitchClipPopupProps) {
+  const { t } = useI18n();
   const win = useMemo(
     () => twitchClipWindow(playheadSec, vodDurationSec),
     [playheadSec, vodDurationSec],
@@ -167,7 +169,7 @@ export default function TwitchClipPopup({
         setLoading(false);
       } catch (err: unknown) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Could not start preview');
+          setError(err instanceof Error ? err.message : t('Could not start preview'));
           setLoading(false);
         }
       }
@@ -279,7 +281,7 @@ export default function TwitchClipPopup({
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError();
       } else {
-        setError('Preview failed — retry');
+        setError(t('Preview failed — retry'));
         setLoading(false);
       }
     });
@@ -413,7 +415,7 @@ export default function TwitchClipPopup({
       onClipCreated(res.url);
       onClose();
     } catch {
-      showClipNotice('error', 'Failed to open the Twitch clip editor');
+      showClipNotice('error', t('Failed to open the Twitch clip editor'));
     } finally {
       setClipOpening(false);
     }
@@ -427,12 +429,12 @@ export default function TwitchClipPopup({
   const createDisabled = clipOpening || windowTooShort
     || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
   const createDisabledTitle = windowTooShort
-    ? `The ${Math.round(winLen)}s window is too short to clip (min ${TWITCH_CLIP_MIN_SEC}s)`
+    ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
     : selLen > TWITCH_CLIP_MAX_SEC
-      ? `Trim the selection to ${TWITCH_CLIP_MAX_SEC}s or less`
+      ? t('Trim the selection to {max}s or less', { max: TWITCH_CLIP_MAX_SEC })
       : selLen < TWITCH_CLIP_MIN_SEC
-        ? `Select at least ${TWITCH_CLIP_MIN_SEC}s`
-        : `Open Twitch's clip editor — ${Math.round(selLen)}s ending at ${formatHmsFull(selection.end)}`;
+        ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
+        : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
 
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
@@ -481,7 +483,7 @@ export default function TwitchClipPopup({
           <TwitchLogoIcon size={12} className="text-[#9146FF] shrink-0" />
           <div className="min-w-0">
             <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-              Twitch clip
+              {t('Twitch clip')}
             </span>
             <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
               {broadcasterLogin}
@@ -492,7 +494,7 @@ export default function TwitchClipPopup({
           type="button"
           className="twitch-clip-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
           onClick={onClose}
-          title="Close"
+          title={t('Close')}
         >
           <X size={16} />
         </button>
@@ -515,7 +517,7 @@ export default function TwitchClipPopup({
         {loading && (
           <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/60 text-zinc-300 text-xs font-mono pointer-events-none">
             <Loader2 size={28} className="animate-spin text-zinc-300 mr-2" />
-            Preparing clip window…
+            {t('Preparing clip window…')}
           </div>
         )}
         {error && (
@@ -524,18 +526,18 @@ export default function TwitchClipPopup({
             <button
               type="button"
               onClick={() => { setError(null); setLoading(true); setRetryTick((t) => t + 1); }}
-              title="Retry the clip window preview"
+              title={t('Retry the clip window preview')}
               className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-red-400 border-2 border-red-800 bg-red-950/30 px-2.5 py-1 hover:border-red-500 hover:text-red-300 cursor-pointer"
             >
               <RefreshCw size={12} />
-              Retry
+              {t('Retry')}
             </button>
           </div>
         )}
         {!loading && !error && buffering && (
           <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none">
             <Loader2 size={24} className="animate-spin text-zinc-200/90 mr-2" />
-            Buffering…
+            {t('Buffering…')}
           </div>
         )}
         {/* Transport: play/pause + mute */}
@@ -548,7 +550,7 @@ export default function TwitchClipPopup({
               onClick={togglePlay}
               disabled={!ready}
               className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
-              title={playing ? 'Pause' : 'Play'}
+              title={playing ? t('Pause') : t('Play')}
             >
               {playing ? <Pause size={13} /> : <Play size={13} />}
             </button>
@@ -557,7 +559,7 @@ export default function TwitchClipPopup({
               onClick={toggleMute}
               disabled={!ready}
               className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
-              title={muted ? 'Unmute' : 'Mute'}
+              title={muted ? t('Unmute') : t('Mute')}
             >
               {muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
             </button>
@@ -572,12 +574,12 @@ export default function TwitchClipPopup({
       <div className="px-2 py-1.5 flex flex-col gap-1">
         <div className="flex items-stretch gap-2">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600 self-center">
-            Clip
+            {t('Clip')}
           </span>
           <div
             ref={railRef}
             className="relative flex-1 h-6 bg-zinc-800/80 cursor-pointer"
-            title="Drag handles to set the clip range (5–60s)"
+            title={t('Drag handles to set the clip range (5–60s)')}
             onClick={(e) => {
               if (e.target !== e.currentTarget) return;
               const rail = railRef.current;
@@ -601,7 +603,7 @@ export default function TwitchClipPopup({
             />
             <div
               role="slider"
-              aria-label="Clip start"
+              aria-label={t('Clip start')}
               aria-valuemin={win.start}
               aria-valuemax={win.end}
               aria-valuenow={selection.start}
@@ -611,7 +613,7 @@ export default function TwitchClipPopup({
             />
             <div
               role="slider"
-              aria-label="Clip end"
+              aria-label={t('Clip end')}
               aria-valuemin={win.start}
               aria-valuemax={win.end}
               aria-valuenow={selection.end}
@@ -628,14 +630,14 @@ export default function TwitchClipPopup({
           />
           <span
             className="text-[9px] font-mono w-11 shrink-0 text-right text-zinc-300 tabular-nums self-center"
-            title="Selected clip length"
+            title={t('Selected clip length')}
           >
             {formatHmsFull(selLen)}
           </span>
         </div>
         <div className="flex items-center justify-between gap-2">
           <span className="text-[8px] font-mono text-zinc-600 tabular-nums">
-            window {formatHmsFull(win.start)} – {formatHmsFull(win.end)}
+            {t('window {start} – {end}', { start: formatHmsFull(win.start), end: formatHmsFull(win.end) })}
           </span>
           <button
             type="button"
@@ -645,7 +647,7 @@ export default function TwitchClipPopup({
             title={createDisabledTitle}
           >
             {clipOpening ? <Loader2 size={12} className="animate-spin" /> : <TwitchLogoIcon size={12} />}
-            Create Twitch clip
+            {t('Create Twitch clip')}
           </button>
         </div>
         {clipNotice && (

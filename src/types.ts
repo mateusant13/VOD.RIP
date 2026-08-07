@@ -125,6 +125,9 @@ export interface AppSettings {
   asr_language?: string;
   /** Per-channel ASR override: channel slug -> 'auto' or family code. */
   channel_asr_languages?: Record<string, string> | null;
+  /** App UI language: 'en' | 'pt-BR' | 'es'. Absent/'' = not set yet —
+   * the FE seeds it from the system language on first run. */
+  ui_language?: string;
 }
 
 export interface DiskUsage {

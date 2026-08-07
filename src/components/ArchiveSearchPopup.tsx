@@ -52,6 +52,7 @@ import {
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
+import { useI18n } from '../i18n';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -131,6 +132,7 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
 }
 
 export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   // Seed exactly once from the caller-supplied anchor (else viewport top-right).
@@ -493,7 +495,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       .catch(() => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
         setHits([]);
-        setError('Archive search is unavailable — is the backend running?');
+        setError(t('Archive search is unavailable — is the backend running?'));
         setStatus('error');
       });
   }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scopeActive, scopeVideoId, everyDay, langFilter, hintDisabled, semanticOn, userFilter]);
@@ -526,7 +528,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       .catch(() => {
         if (!mountedRef.current || gen !== remoteGenRef.current) return;
         setRemoteHits([]);
-        setRemoteError('YouTube search unavailable');
+        setRemoteError(t('YouTube search unavailable'));
         setRemoteStatus('error');
       });
   }, [query, scopeActive, sourceFilter, platformFilter, kindFilter, remoteYtHandle]);
@@ -582,7 +584,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         if (!mountedRef.current || gen !== chatGenRef.current) return;
         setChat([]);
         setChatTruncated(false);
-        setChatError('Could not load chat history.');
+        setChatError(t('Could not load chat history.'));
         setChatStatus('error');
       });
   }, [selected, retryTick]);
@@ -634,7 +636,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     <div
       ref={containerRef}
       role="dialog"
-      aria-label="Archive search"
+      aria-label={t('Archive search')}
       onKeyDown={handleKeyDown}
       className={
         embedded
@@ -648,12 +650,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         onPointerDown={embedded ? undefined : onDragStart}
       >
         <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
-          Archive search
+          {t('Archive search')}
         </span>
         <button
           type="button"
           onClick={onClose}
-          title="Close (Esc)"
+          title={t('Close (Esc)')}
           className="text-zinc-500 hover:text-white p-0.5 shrink-0"
         >
           <X size={14} />
@@ -663,11 +665,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       {scope && (
         <div
           className="flex items-center gap-1.5 border border-zinc-700 border-b-yellow-300/60 bg-zinc-800/60 text-yellow-100/90 px-1.5 py-1 shrink-0 min-w-0"
-          aria-label="Searching in this video"
+          aria-label={t('Searching in this video: {title}', { title: scope.title || scope.videoId })}
         >
           <Search size={10} className="shrink-0" />
           <span className="text-[8px] font-mono uppercase tracking-widest font-bold truncate">
-            Searching in this video: {scope.title || scope.videoId}
+            {t('Searching in this video: {title}', { title: scope.title || scope.videoId })}
           </span>
         </div>
       )}
@@ -681,7 +683,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             type="text"
             value={inputQuery}
             onChange={(e) => setInputQuery(e.target.value)}
-            placeholder={scope ? 'SEARCH THIS VIDEO...' : 'SEARCH TRANSCRIPTS + CHAT...'}
+            placeholder={scope ? t('SEARCH THIS VIDEO...') : t('SEARCH TRANSCRIPTS + CHAT...')}
             className="flex-1 bg-transparent text-white font-mono placeholder:text-zinc-600 text-[11px] py-1 focus:outline-none min-w-0"
           />
           {status === 'loading' && <Loader2 size={12} className="text-zinc-500 animate-spin shrink-0" />}
@@ -695,15 +697,15 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             className="flex items-center gap-1.5 text-[8px] font-mono uppercase tracking-widest text-yellow-200/90 border border-yellow-300/40 bg-yellow-300/10 px-1.5 py-0.5 self-start"
             aria-label="Channel scope hint"
           >
-            <span className="font-bold">scoped to {channelHint}</span>
+            <span className="font-bold">{t('scoped to {channel}', { channel: channelHint })}</span>
             <button
               type="button"
               onClick={() => {
                 setChannelHint(null);
                 setHintDisabled(true);
               }}
-              title="Remove channel scope"
-              aria-label="Remove channel scope"
+              title={t('Remove channel scope')}
+              aria-label={t('Remove channel scope')}
               className="text-yellow-200/90 hover:text-white p-0.5 -m-0.5"
             >
               <X size={10} />
@@ -714,8 +716,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           <div className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500" aria-live="polite">
             <Loader2 size={10} className="animate-spin shrink-0" />
             <span>
-              Indexing {enriching.length} video{enriching.length === 1 ? '' : 's'}
-              {' '}({enriching.map((e) => (e.kind === 'transcript' ? 'transcript' : 'chat backfill')).join(', ')})
+              {enriching.length === 1
+                ? t('Indexing {count} video', { count: enriching.length })
+                : t('Indexing {count} videos', { count: enriching.length })}
+              {' '}({enriching.map((e) => (e.kind === 'transcript' ? t('transcript') : t('chat backfill'))).join(', ')})
               …
             </span>
           </div>
@@ -727,7 +731,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         {!scope && (
           <div className="flex items-center gap-1.5 min-w-0">
             <label htmlFor="archive-filter-channel" className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
-              Channel
+              {t('Channel')}
             </label>
             <select
               id="archive-filter-channel"
@@ -738,7 +742,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               }}
               className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white"
             >
-              <option value="">ALL CHANNELS</option>
+              <option value="">{t('ALL CHANNELS')}</option>
               {channelOptions.map((o) => (
                 <option key={o.label} value={o.value}>{o.label}</option>
               ))}
@@ -748,7 +752,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
           {!scope && (
             <div className="flex items-center gap-1.5 min-w-0">
-              <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Platform</span>
+              <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Platform')}</span>
               <div className="flex gap-1 flex-wrap">
                 {ARCHIVE_PLATFORMS.map((p) => (
                   <button
@@ -770,7 +774,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             </div>
           )}
           <div className="flex items-center gap-1.5 min-w-0">
-            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Kind</span>
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Kind')}</span>
             <div className="flex gap-1 flex-wrap">
               {ARCHIVE_FILTER_KINDS.map((k) => (
                 <button
@@ -791,10 +795,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           </div>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Day</span>
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Day')}</span>
           <input
             type="date"
-            aria-label="From date"
+            aria-label={t('From date')}
             value={dateFrom}
             onChange={(e) => { setDateFrom(e.target.value); setEveryDay(false); }}
             className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
@@ -802,7 +806,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           <span className="text-zinc-600 text-[9px] shrink-0">→</span>
           <input
             type="date"
-            aria-label="To date"
+            aria-label={t('To date')}
             value={dateTo}
             onChange={(e) => { setDateTo(e.target.value); setEveryDay(false); }}
             className="w-30 min-w-0 bg-zinc-900 border border-zinc-700 text-white text-[10px] font-mono px-1 py-0.5 focus:outline-none focus:border-white [color-scheme:dark]"
@@ -817,19 +821,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               if (everyDay && !dateFrom && !dateTo) setDateFrom(todayIso());
               setEveryDay((v) => !v);
             }}
-            title="Every day: ignore the date range. Off = filter by day — a start date without an end closes at today; unchecking with no dates starts from today"
+            title={t('Every day: ignore the date range. Off = filter by day — a start date without an end closes at today; unchecking with no dates starts from today')}
             className={`shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
               everyDay
                 ? 'bg-white text-black border-white'
                 : 'border-zinc-700 text-yellow-200/90 hover:border-white hover:text-white'
             }`}
           >
-            EVERY DAY
+            {t('EVERY DAY')}
           </button>
         </div>
         <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 items-center">
           <div className="flex items-center gap-1.5 min-w-0">
-            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">Source</span>
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Source')}</span>
             <div className="flex border-2 border-zinc-700">
               {ARCHIVE_SOURCES.map((s, i) => (
                 <button
@@ -858,8 +862,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               onClick={() => setSemanticOn((v) => !v)}
               title={
                 sourceFilter === 'chat'
-                  ? 'Context search covers transcripts only'
-                  : 'Context search (semantic): finds moments by meaning, not just exact words'
+                  ? t('Context search covers transcripts only')
+                  : t('Context search (semantic): finds moments by meaning, not just exact words')
               }
               className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
                 semanticOn
@@ -867,7 +871,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                   : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
               }`}
             >
-              CONTEXT
+              {t('CONTEXT')}
             </button>
             {langsPresent.size >= 2 && (
               <div className="flex gap-1 flex-wrap">
@@ -877,7 +881,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                     type="button"
                     aria-pressed={langFilter === l}
                     onClick={() => toggleLang(l)}
-                    title={`Only show ${ARCHIVE_LANG_LABELS[l]} transcript rows`}
+                    title={t('Only show {lang} transcript rows', { lang: ARCHIVE_LANG_LABELS[l] })}
                     className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors ${
                       langFilter === l
                         ? 'bg-white text-black border-white'
@@ -892,12 +896,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           </div>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">User</span>
+          <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('User')}</span>
           <input
             type="text"
-            aria-label="Chat author"
+            aria-label={t('Chat author')}
             placeholder="user1,user2…"
-            title="Chat author filter — comma-separate multiple users; leave the search box empty to list their whole history"
+            title={t('Chat author filter — comma-separate multiple users; leave the search box empty to list their whole history')}
             value={userFilter}
             onChange={(e) => setUserFilter(e.target.value)}
             spellCheck={false}
@@ -907,7 +911,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             <button
               type="button"
               onClick={() => setUserFilter('')}
-              title="Clear user filter"
+              title={t('Clear user filter')}
               className="shrink-0 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border border-zinc-700 text-zinc-400 hover:border-white hover:text-white"
             >
               ✕
@@ -925,11 +929,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           <button
             type="button"
             onClick={retrySearch}
-            title="Retry search"
+            title={t('Retry search')}
             className="shrink-0 flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
           >
             <RefreshCw size={10} />
-            Retry
+            {t('Retry')}
           </button>
         </div>
       )}
@@ -937,12 +941,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       {status === 'done' && hits.length === 0 && remoteStatus !== 'loading' && (
         <p className="text-[10px] font-mono text-zinc-500 shrink-0">
           {query.trim()
-            ? <>No results for &quot;{query}&quot; —{' '}
-              {remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
-                ? 'nothing local matches and YouTube found nothing either'
-                : 'nothing archived matches yet'}
-              .</>
-            : <>No archived messages from {userFilter.trim().split(',').map((u) => `@${u.trim()}`).join(', ')}.</>}
+            ? (remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
+                ? t('No results for "{query}" — nothing local matches and YouTube found nothing either.', { query })
+                : t('No results for "{query}" — nothing archived matches yet.', { query }))
+            : t('No archived messages from {users}.', { users: userFilter.trim().split(',').map((u) => `@${u.trim()}`).join(', ') })}
         </p>
       )}
 
@@ -952,14 +954,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       {status === 'done' && hits.length > 0 && (
         <div className="flex items-center justify-between gap-2 shrink-0">
           <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
-            {hits.length} result{hits.length === 1 ? '' : 's'}
+            {hits.length} {hits.length === 1 ? t('result') : t('results')}
             {remoteStatus === 'done' && remoteHits.length > 0 && (
               <span className="text-zinc-600"> · +{remoteHits.length} YouTube</span>
             )}
           </span>
           {!hits.some((h) => !h.partial) && (
             <span className="text-[9px] font-mono uppercase tracking-widest text-amber-500/80">
-              closest matches
+              {t('closest matches')}
             </span>
           )}
         </div>
@@ -1064,8 +1066,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                   <button
                     type="button"
                     onClick={() => onOpenHit(hit, video)}
-                    title="Open in player"
-                    aria-label={`Open ${videoTitle(video, hit)} in player`}
+                    title={t('Open in player')}
+                    aria-label={t('Open {title} in player', { title: videoTitle(video, hit) })}
                     className="border-2 border-zinc-800 bg-zinc-900/60 hover:border-white text-zinc-400 hover:text-white px-1.5 flex items-center shrink-0"
                   >
                     <ExternalLink size={10} />
@@ -1082,7 +1084,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-1.5 min-h-0 flex-none max-h-[38%]">
           <div className="flex items-center gap-1.5 shrink-0">
             <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
-              YouTube results{remoteYtHandle ? ` · @${remoteYtHandle}` : ''}
+              {t('YouTube results')}{remoteYtHandle ? ` · @${remoteYtHandle}` : ''}
               {remoteStatus === 'done' && remoteHits.length > 0 && (
                 <span className="text-zinc-600"> · {remoteHits.length}</span>
               )}
@@ -1096,7 +1098,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           )}
           {remoteStatus === 'done' && remoteHits.length === 0 && (
             <p className="text-[9px] font-mono text-zinc-600 shrink-0">
-              {remoteError ?? `No YouTube matches for "${query}"`}
+              {remoteError ?? t('No YouTube matches for "{query}"', { query })}
             </p>
           )}
           {remoteStatus === 'done' && remoteHits.length > 0 && (
@@ -1106,7 +1108,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                   key={hit.video_id}
                   type="button"
                   onClick={() => openRemoteHit(hit)}
-                  title="Open in the player — download from there"
+                  title={t('Open in the player — download from there')}
                   className="text-left border-2 border-zinc-800 bg-zinc-900/60 hover:border-zinc-500 p-1.5 flex flex-col gap-1 transition-colors"
                 >
                   <span className="flex items-center gap-1.5 min-w-0">
@@ -1126,7 +1128,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                     )}
                   </span>
                   <span className="text-[10px] text-zinc-500 break-words">
-                    @{hit.channel ?? remoteYtHandle} — click to open in the player
+                    @{hit.channel ?? remoteYtHandle} — {t('click to open in the player')}
                   </span>
                 </button>
               ))}
@@ -1140,7 +1142,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-2 min-h-0 flex-none max-h-[38%]">
           <div className="flex items-center justify-between gap-2 shrink-0">
             <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
-              Chat from hit
+              {t('Chat from hit')}
             </span>
             <span className="text-[9px] font-mono text-zinc-400 shrink-0">
               {videoTitle(selected.video, selected.hit)} @ {formatArchiveOffset(selected.hit.offset_sec)}
@@ -1149,7 +1151,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
           {chatStatus === 'loading' && (
             <div className="flex items-center gap-1.5 text-zinc-500 text-[10px] font-mono shrink-0">
               <Loader2 size={11} className="animate-spin" />
-              Loading chat history...
+              {t('Loading chat history...')}
             </div>
           )}
           {chatStatus === 'error' && (
@@ -1161,7 +1163,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 className="shrink-0 flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-red-300"
               >
                 <RefreshCw size={10} />
-                Retry
+                {t('Retry')}
               </button>
             </div>
           )}
@@ -1178,13 +1180,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               className="flex flex-col gap-0.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1"
             >
               {chat.length === 0 && (
-                <p className="text-[10px] font-mono text-zinc-500">No archived chat from this moment.</p>
+                <p className="text-[10px] font-mono text-zinc-500">{t('No archived chat from this moment.')}</p>
               )}
               {chat.length > 0 && (
                 <div className="flex items-center gap-1.5 my-0.5 shrink-0">
                   <span className="h-px flex-1 bg-yellow-300/60" />
                   <span className="text-[8px] font-mono uppercase tracking-widest text-yellow-300 bg-yellow-300/10 border border-yellow-300/40 px-1 py-px">
-                    Hit moment {formatArchiveOffset(selected.hit.offset_sec)}
+                    {t('Hit moment {offset}', { offset: formatArchiveOffset(selected.hit.offset_sec) })}
                   </span>
                   <span className="h-px flex-1 bg-yellow-300/60" />
                 </div>
@@ -1193,13 +1195,13 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 <p
                   key={`c:${m.offset_sec}:${m.username}:${m.text}`}
                   onClick={onSeekOffset ? () => seekToTimestamp(m.offset_sec, onSeekOffset) : undefined}
-                  title={onSeekOffset ? `Seek to ${formatArchiveOffset(m.offset_sec)}` : undefined}
+                  title={onSeekOffset ? t('Seek to {offset}', { offset: formatArchiveOffset(m.offset_sec) }) : undefined}
                   className={`text-[10px] leading-snug text-zinc-200 break-words ${onSeekOffset ? 'cursor-pointer select-none' : ''}`}
                 >
                   <span className="text-zinc-400 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                   <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
                   {typeof m.spam_count === 'number' && m.spam_count > 1 && (
-                    <span className="text-[9px] font-mono text-zinc-500 ml-1" title={`${m.spam_count} identical messages collapsed`}>
+                    <span className="text-[9px] font-mono text-zinc-500 ml-1" title={t('{count} identical messages collapsed', { count: m.spam_count })}>
                       ×{m.spam_count}
                     </span>
                   )}
@@ -1207,7 +1209,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               ))}
               {chatTruncated && (
                 <p className="text-[9px] font-mono text-zinc-600 shrink-0">
-                  History cut at the archive cap — showing the first {Math.min(chatVisibleCount, chat.length)} of {chat.length} messages.
+                  {t('History cut at the archive cap — showing the first {shown} of {total} messages.', { shown: Math.min(chatVisibleCount, chat.length), total: chat.length })}
                 </p>
               )}
             </div>

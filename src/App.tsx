@@ -2,6 +2,7 @@ import { memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRe
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
+import { detectSystemLanguage, langFamily, setLanguage, useI18n, type Lang } from './i18n';
 import {
   Download, Info, Play, Pause, Link2, X, Clock,
   Users, Database, Settings2, Loader2, Search,
@@ -245,6 +246,7 @@ const ChannelRow = memo(function ChannelRow({
   removePlatformFromChannel, channelContentFilter,
   setSavedChannels, setChannelDragId, setChannelDropInsertIndex,
 }: ChannelRowProps) {
+  const { t } = useI18n();
   const dropAbove = dragId != null && dropInsertIndex === index;
   const dropBelow = dragId != null && dropInsertIndex === savedChannelsLength && isLast;
   const liveEntries = liveStatus?.live.filter((e) => e.is_live && e.url) ?? [];
@@ -260,8 +262,8 @@ const ChannelRow = memo(function ChannelRow({
     >
       <button
         type="button"
-        title="Drag to reorder"
-        aria-label={`Reorder ${ch.displayName}`}
+        title={t('Drag to reorder')}
+        aria-label={t('Reorder {name}', { name: ch.displayName })}
         disabled={isEditing}
         onPointerDown={(e) => {
           if (isEditing) return;
@@ -319,22 +321,22 @@ const ChannelRow = memo(function ChannelRow({
           e.stopPropagation();
           void openLivePreview(liveEntries[0], liveEntries, ch.displayName, ch);
         } : undefined}
-        ariaLabel={`Live ${ch.displayName}`}
+        ariaLabel={t('Live {name}', { name: ch.displayName })}
       />
       <button
         type="button"
-        title="Search channel"
+        title={t('Search channel')}
         onClick={(e) => { e.stopPropagation(); onOpenChannelSearch(ch); }}
         className="text-zinc-600 hover:text-white p-0.5"
       >
         <Search size={11} />
       </button>
-      <button type="button" title="Edit"
+      <button type="button" title={t('Edit')}
         onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
         className="text-zinc-600 hover:text-white p-0.5">
         <Pencil size={11} />
       </button>
-      <button type="button" title="Reload"
+      <button type="button" title={t('Reload')}
         onClick={(e) => {
           e.stopPropagation();
           clearChannelRefreshFlight(ch.id);
@@ -344,7 +346,7 @@ const ChannelRow = memo(function ChannelRow({
         className="text-zinc-600 hover:text-white p-0.5 disabled:opacity-40">
         {ch.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
       </button>
-      <button type="button" title="Delete"
+      <button type="button" title={t('Delete')}
         onClick={(e) => { e.stopPropagation(); removeChannel(ch.id); }}
         className="text-zinc-600 hover:text-red-400 p-0.5">
         <X size={11} />
@@ -376,6 +378,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 export default function App() {
   const viewportTier = useViewportTier();
+  const { t } = useI18n();
   const [tab, setTab] = useState<Tab>('url');
 
   // URL mode
@@ -1201,29 +1204,29 @@ export default function App() {
   const seekPreviewVideoImmediate = useCallback((sec: number, force = false) => {
     const start = previewTrimStartRef.current;
     const end = previewTrimEndRef.current;
-    const t = Math.max(start, Math.min(sec, end));
+    const target = Math.max(start, Math.min(sec, end));
     if (previewYoutubeEmbedUrl) {
-      // ponytail: if the iframe API hasn't bound yet, the seekTo command is
+      // ponytail: if the iframe API hasn'target bound yet, the seekTo command is
       // dropped silently and the user thinks the seek is broken. Queue the
       // target — the effect below replays it the moment previewVideoReady
       // flips, and the slider stays in sync (optimistic UI was already set).
       if (!previewVideoReady) {
-        previewPendingSeekSecRef.current = t;
+        previewPendingSeekSecRef.current = target;
         return;
       }
       // Keep this target until YouTube reports the new position. The iframe
       // emits its old time briefly after seekTo; accepting it makes the
       // controlled scrubber jump backwards.
-      previewSeekTargetRef.current = t;
-      previewTimingRef.current?.markSeekStart(t);
-      syncPreviewTimeUi(t, true);
-      postYoutubePreviewCommand('seekTo', [t, true]);
+      previewSeekTargetRef.current = target;
+      previewTimingRef.current?.markSeekStart(target);
+      syncPreviewTimeUi(target, true);
+      postYoutubePreviewCommand('seekTo', [target, true]);
       return;
     }
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
-    previewSeekTargetRef.current = t;
-    previewTimingRef.current?.markSeekStart(t);
+    previewSeekTargetRef.current = target;
+    previewTimingRef.current?.markSeekStart(target);
     const pageUrl = previewLoadedUrlRef.current ?? url.trim();
     const youtube = detectUrlPlatform(pageUrl) === 'youtube';
     const optimistic = previewSeekOptimisticUi(
@@ -1233,13 +1236,13 @@ export default function App() {
     );
     const finishSeek = () => {
       previewSeekTargetRef.current = null;
-      syncPreviewTimeUi(t, true);
+      syncPreviewTimeUi(target, true);
     };
     const applyLocalTime = (videoTime: number) => {
       if (force || Math.abs(video.currentTime - videoTime) > 0.05) {
         video.currentTime = videoTime;
       }
-      if (optimistic) syncPreviewTimeUi(t, true);
+      if (optimistic) syncPreviewTimeUi(target, true);
     };
 
     const sid = previewSessionIdRef.current;
@@ -1260,12 +1263,12 @@ export default function App() {
       const muxStart = previewWindowHlsMuxStartRef.current;
       const muxEnd = previewWindowHlsMuxEndRef.current;
       const resumePlay = !video.paused;
-      if (isPositionInWindowHlsMux(t, muxStart, muxEnd)) {
+      if (isPositionInWindowHlsMux(target, muxStart, muxEnd)) {
         previewSeekLockedRef.current = true;
         // The slider already jumped optimistically in seekPreviewVideo.
         // applyVideoLocalSeek pauses during the seek so the decoder does not
         // play forward from the previous keyframe to the target.
-        void applyVideoLocalSeek(video, windowHlsVideoTimeSec(t, muxStart))
+        void applyVideoLocalSeek(video, windowHlsVideoTimeSec(target, muxStart))
           .then(() => {
             if (seekId !== previewSeekInflightRef.current) return;
             previewSeekLockedRef.current = false;
@@ -1287,7 +1290,7 @@ export default function App() {
         video.pause();
         setPreviewPlaying(false);
         setPreviewBuffering(true);
-        void msePlayerRef.current.seek(t).then(() => {
+        void msePlayerRef.current.seek(target).then(() => {
           if (seekId !== previewSeekInflightRef.current) return;
           previewSeekLockedRef.current = false;
           finishSeek();
@@ -1321,11 +1324,11 @@ export default function App() {
       void (async () => {
         try {
           slowSpinner = window.setTimeout(() => setPreviewBuffering(true), 800);
-          const { muxStart: newStart, muxEnd: newEnd, remuxed } = await seekYoutubeWindowHls(sid, t, apiPost, apiGet, 12_000);
+          const { muxStart: newStart, muxEnd: newEnd, remuxed } = await seekYoutubeWindowHls(sid, target, apiPost, apiGet, 12_000);
           if (seekId !== previewSeekInflightRef.current) return;
           previewWindowHlsMuxStartRef.current = newStart;
           previewWindowHlsMuxEndRef.current = newEnd;
-          const videoTime = windowHlsVideoTimeSec(t, newStart);
+          const videoTime = windowHlsVideoTimeSec(target, newStart);
           if (remuxed && previewHlsRef.current) {
             await reloadWindowHlsAtPosition(
               previewHlsRef.current,
@@ -1344,7 +1347,7 @@ export default function App() {
           if (resumePlay) void video.play().then(() => setPreviewPlaying(true)).catch(() => {});
         } catch (err: unknown) {
           if (seekId === previewSeekInflightRef.current) {
-            setError(err instanceof Error ? err.message : 'Seek failed');
+            setError(err instanceof Error ? err.message : t('Seek failed'));
             previewSeekTargetRef.current = null;
           }
         } finally {
@@ -1361,20 +1364,20 @@ export default function App() {
       && previewPlaybackKindRef.current === 'progressive'
       && !previewCachedProgressiveRef.current
       && sid
-      && t > start + 60
+      && target > start + 60
     ) {
       const clipRel = previewClipRelativeRef.current;
-      const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+      const videoTime = clipRel ? Math.max(0, Math.min(target - start, end - start)) : target;
       // Show a teaser frame at the target immediately while /refresh resolves
       // the full-window progressive URL in the background.
       applyLocalTime(videoTime);
-      previewPendingSeekSecRef.current = t;
+      previewPendingSeekSecRef.current = target;
       setPreviewBuffering(true);
       void apiPost<PreviewSessionResponse>(`/api/preview/session/${sid}/refresh`, {})
         .then((res) => {
-          // The element already played ~0.5s past t while the refresh was in
+          // The element already played ~0.5s past target while the refresh was in
           // flight. Resume the handoff from the LIVE position — re-seeking to
-          // the original t would visibly replay the same half second.
+          // the original target would visibly replay the same half second.
           const clipRelNow = previewClipRelativeRef.current;
           previewPendingSeekSecRef.current = clipRelNow ? start + video.currentTime : video.currentTime;
           if (applyPreviewSessionRefresh(res)) {
@@ -1402,7 +1405,7 @@ export default function App() {
     }
 
     const clipRel = previewClipRelativeRef.current;
-    const videoTime = clipRel ? Math.max(0, Math.min(t - start, end - start)) : t;
+    const videoTime = clipRel ? Math.max(0, Math.min(target - start, end - start)) : target;
     applyLocalTime(videoTime);
     const plat = detectUrlPlatform(pageUrl) ?? 'unknown';
     waitVideoPlayable(
@@ -1643,7 +1646,7 @@ export default function App() {
     } catch (err: any) {
       previewStartedRef.current = false;
       previewLoadedUrlRef.current = null;
-      setError(err.message || 'Preview failed');
+      setError(err.message || t('Preview failed'));
       markPreviewError(trimmedUrl, 'session');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
@@ -1709,7 +1712,7 @@ export default function App() {
       }
     } catch (err: unknown) {
       previewRetryingRef.current = false;
-      setError(err instanceof Error ? err.message : 'Preview failed');
+      setError(err instanceof Error ? err.message : t('Preview failed'));
     }
   }, [openPreview, setPreviewRetryBoth]);
 
@@ -2008,7 +2011,7 @@ export default function App() {
         apiPost,
         onRefreshing: () => setPreviewBuffering(true),
         onFatal: () => {
-          setError('Preview interrupted — try again');
+          setError(t('Preview interrupted — try again'));
           setPreviewVideoLoading(false);
           markPreviewError(previewPageUrl, 'playback');
         },
@@ -2088,7 +2091,7 @@ export default function App() {
       const markSessionGone = (reason: string) => {
         if (staleSessionFired) return;
         staleSessionFired = true;
-        const msg = 'Preview expired — refresh and try again';
+        const msg = t('Preview expired — refresh and try again');
         console.warn('[VOD.RIP preview] session gone:', reason);
         setError(msg);
         setPreviewVideoLoading(false);
@@ -2262,7 +2265,7 @@ export default function App() {
                   hls.startLoad();
                 })
                 .catch(() => {
-                  setError('Preview playback failed — try again');
+                  setError(t('Preview playback failed — try again'));
                   setPreviewVideoLoading(false);
                   previewStartedRef.current = false;
                   markPreviewError(previewPageUrl, 'playback');
@@ -2271,7 +2274,7 @@ export default function App() {
                 });
               break;
             }
-            setError('Preview playback failed — try again');
+            setError(t('Preview playback failed — try again'));
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
             markPreviewError(previewPageUrl, 'playback');
@@ -2282,7 +2285,7 @@ export default function App() {
             hls.recoverMediaError();
             break;
           default:
-            setError('Preview playback failed — try again');
+            setError(t('Preview playback failed — try again'));
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
             markPreviewError(previewPageUrl, 'playback');
@@ -2322,7 +2325,7 @@ export default function App() {
       return;
     }
 
-    setError('HLS playback is not supported in this browser');
+    setError(t('HLS playback is not supported in this browser'));
     setPreviewVideoLoading(false);
     markPreviewError(previewPageUrl, 'playback');
     };
@@ -3639,7 +3642,7 @@ export default function App() {
           }
           const end = Math.max(1, videoInfoDurationSec(info));
           if (end <= 0) {
-            setError('Could not determine video length');
+            setError(t('Could not determine video length'));
             return;
           }
           applyVideoInfoTrim(trimmed, end);
@@ -3706,7 +3709,7 @@ export default function App() {
       }
       return res.path;
     } catch (err: any) {
-      setError(err.message || 'Could not open folder picker');
+      setError(err.message || t('Could not open folder picker'));
       return null;
     } finally {
       setPickingFolder(false);
@@ -3734,7 +3737,7 @@ export default function App() {
   const openFolder = useCallback((filePath: string) => {
     if (!filePath) return;
     void apiPost('/api/open-folder', { path: filePath }).catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : 'Could not open folder';
+      const msg = err instanceof Error ? err.message : t('Could not open folder');
       setError(msg);
     });
   }, []);
@@ -3823,7 +3826,7 @@ export default function App() {
     void apiPost(`/api/download/${id}/remove`, {})
       .then(() => finishDownloadRemoval(id, true))
       .catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : 'Failed to remove download';
+        const msg = err instanceof Error ? err.message : t('Failed to remove download');
         setError(msg);
         finishDownloadRemoval(id, false);
       });
@@ -3941,7 +3944,7 @@ export default function App() {
       void refreshDownloads();
     } catch (err: unknown) {
       setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
-      setError(err instanceof Error ? err.message : 'Download failed');
+      setError(err instanceof Error ? err.message : t('Download failed'));
     }
   }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio]);
 
@@ -3964,14 +3967,14 @@ export default function App() {
         ? ` (${formatHmsFull(trimStart)} → ${formatHmsFull(trimEnd)})`
         : '';
       return {
-        title: 'Download clip?',
-        message: `Save this clip (${human})${rangeNote}. Edit the file name below if you want.`,
+        title: t('Download clip?'),
+        message: t('Save this clip ({size}){note}. Edit the file name below if you want.', { size: human, note: rangeNote }),
         defaultFilename,
       };
     }
     return {
-      title: 'Download trim?',
-      message: `Download "${title}" from ${formatHmsFull(trimStart)} to ${formatHmsFull(trimEnd)}?`,
+      title: t('Download trim?'),
+      message: t('Download "{title}" from {start} to {end}?', { title, start: formatHmsFull(trimStart), end: formatHmsFull(trimEnd) }),
       defaultFilename: '',
     };
   }, [url, videoInfo, trimStartSec, trimEndSec, previewOpen, previewTrimStart, previewTrimEnd]);
@@ -3987,7 +3990,7 @@ export default function App() {
     try {
       await apiPost(`/api/download/${id}/cancel`, {});
     } catch (err: any) {
-      setError(err.message || 'Failed to cancel download');
+      setError(err.message || t('Failed to cancel download'));
     }
     refreshDownloads();
   }, [refreshDownloads]);
@@ -3996,7 +3999,7 @@ export default function App() {
     try {
       await apiPost(`/api/download/${id}/pause`, {});
     } catch (err: any) {
-      setError(err.message || 'Failed to pause download');
+      setError(err.message || t('Failed to pause download'));
     }
     refreshDownloads();
   }, [refreshDownloads]);
@@ -4005,18 +4008,18 @@ export default function App() {
     try {
       await apiPost(`/api/download/${id}/resume`, {});
     } catch (err: any) {
-      setError(err.message || 'Failed to resume download');
+      setError(err.message || t('Failed to resume download'));
     }
     refreshDownloads();
   }, [refreshDownloads]);
 
   const handleDeleteHistory = useCallback((id: string) => {
-    if (!window.confirm('Remove this download from history? The file on disk will also be deleted.')) return;
+    if (!window.confirm(t('Remove this download from history? The file on disk will also be deleted.'))) return;
     requestDownloadRemoval(id);
   }, [requestDownloadRemoval]);
 
   const handleRemoveFromQueue = useCallback(async (id: string) => {
-    if (!window.confirm('Remove this download from the queue? Any partial file on disk will also be deleted.')) return;
+    if (!window.confirm(t('Remove this download from the queue? Any partial file on disk will also be deleted.'))) return;
     requestDownloadRemoval(id);
   }, [requestDownloadRemoval]);
 
@@ -4046,7 +4049,7 @@ export default function App() {
 
   const handleBulkDeleteRecent = useCallback(() => {
     if (selectedRecentIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedRecentIds.size} download(s) from recent? Files on disk will also be deleted.`)) return;
+    if (!window.confirm(t('Remove {count} download(s) from recent? Files on disk will also be deleted.', { count: selectedRecentIds.size }))) return;
     const ids = [...selectedRecentIds];
     setSelectedRecentIds(new Set());
     ids.forEach((id) => requestDownloadRemoval(id));
@@ -4054,7 +4057,7 @@ export default function App() {
 
   const handleBulkDeleteQueue = useCallback(() => {
     if (selectedQueueIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedQueueIds.size} download(s) from the queue? Partial files on disk will also be deleted.`)) return;
+    if (!window.confirm(t('Remove {count} download(s) from the queue? Partial files on disk will also be deleted.', { count: selectedQueueIds.size }))) return;
     const ids = [...selectedQueueIds];
     setSelectedQueueIds(new Set());
     ids.forEach((id) => requestDownloadRemoval(id));
@@ -4062,7 +4065,7 @@ export default function App() {
 
   const handleBulkDeleteHistory = useCallback(() => {
     if (selectedHistoryIds.size === 0) return;
-    if (!window.confirm(`Remove ${selectedHistoryIds.size} download(s) from history? Files on disk will also be deleted.`)) return;
+    if (!window.confirm(t('Remove {count} download(s) from history? Files on disk will also be deleted.', { count: selectedHistoryIds.size }))) return;
     const ids = [...selectedHistoryIds];
     setSelectedHistoryIds(new Set());
     ids.forEach((id) => requestDownloadRemoval(id));
@@ -4071,9 +4074,9 @@ export default function App() {
   const handleBulkDownloadChannelVods = useCallback(async () => {
     if (selectedChannelVodUrls.size === 0) return;
     const count = selectedChannelVodUrls.size;
-    if (!window.confirm(`Download ${count} selected item(s)?\n\nEach will download at source quality with no trim.`)) return;
+    if (!window.confirm(t('Download {count} selected item(s)?\n\nEach will download at source quality with no trim.', { count }))) return;
     if (!(await ensureDownloadFolder())) {
-      setError('Choose a download folder to continue.');
+      setError(t('Choose a download folder to continue.'));
       return;
     }
     setError(null);
@@ -4110,7 +4113,7 @@ export default function App() {
         });
       } catch (err: unknown) {
         setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
-        setError(err instanceof Error ? err.message : 'Failed to start download');
+        setError(err instanceof Error ? err.message : t('Failed to start download'));
         break;
       }
     }
@@ -4737,7 +4740,7 @@ export default function App() {
     const { kick, twitch, youtube } = channelLinkDraftSlugs(pendingAddChannel);
     if (!kick && !twitch && !youtube) return null;
     if (isChannelAlreadySaved(kick, twitch, savedChannels, youtube)) {
-      return 'This channel is already linked.';
+      return t('This channel is already linked.');
     }
     return null;
   }, [pendingAddChannel, savedChannels]);
@@ -4952,7 +4955,7 @@ export default function App() {
     };
     const res = appendLivePopup(livePopupsRef.current, item, MAX_LIVE_POPUPS);
     if (res.blocked) {
-      setLivePopupNotice(`Max ${MAX_LIVE_POPUPS} live players at once — close one first.`);
+      setLivePopupNotice(t('Max {n} live players at once — close one first.', { n: MAX_LIVE_POPUPS }));
       return;
     }
     livePopupsRef.current = res.items;
@@ -5030,6 +5033,23 @@ export default function App() {
       if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods' || s.channel_content_filter === 'streams') {
         setChannelContentFilter(s.channel_content_filter);
       }
+      // ── i18n: honor a saved UI language; on first run (no saved value)
+      // seed it from the system language and persist, and seed the caption
+      // language (asr_language) from the same family ONLY while it is still
+      // the default 'auto' — an explicit user choice is never overridden. ──
+      const savedLang = s.ui_language as Lang | '' | undefined;
+      if (savedLang === 'en' || savedLang === 'pt-BR' || savedLang === 'es') {
+        setLanguage(savedLang);
+      } else {
+        const detected = detectSystemLanguage();
+        setLanguage(detected);
+        const seed: Partial<AppSettings> = { ui_language: detected };
+        if (!s.asr_language || s.asr_language === 'auto') {
+          seed.asr_language = langFamily(detected);
+        }
+        setSettings((prev) => ({ ...prev, ...seed }));
+        void apiPost('/api/settings', seed).catch(() => {});
+      }
       hydrateSavedChannelsOnce(
         Array.isArray(s.saved_channels)
           ? s.saved_channels.map((ch) => normalizeSavedChannel(ch as SavedChannel))
@@ -5064,7 +5084,7 @@ export default function App() {
       setAppVersion(ver.version);
       setUpdateInfo(check.update);
       if (!check.update && force) {
-        setUpdateMessage(`You're on the latest version (v${ver.version}).`);
+        setUpdateMessage(t("You're on the latest version (v{version}).", { version: ver.version }));
       }
     } catch {
       /* packaged-only endpoints may be unavailable in dev */
@@ -5081,7 +5101,7 @@ export default function App() {
     try {
       await loadUpdateStatus(true);
     } catch (err: any) {
-      setUpdateMessage(err.message || 'Update check failed');
+      setUpdateMessage(err.message || t('Update check failed'));
     } finally {
       setUpdateChecking(false);
     }
@@ -5091,17 +5111,17 @@ export default function App() {
     if (!updateInfo) return;
     const isSetup = (updateInfo.asset_name || '').toLowerCase().includes('setup');
     const prompt = isSetup
-      ? `Install VOD.RIP v${updateInfo.version}? The installer will open and this app will close.`
-      : `Download VOD.RIP v${updateInfo.version}? The verified zip will open in Explorer — extract it over your install folder, or use Setup.exe from GitHub.`;
+      ? t('Install VOD.RIP v{version}? The installer will open and this app will close.', { version: updateInfo.version })
+      : t('Download VOD.RIP v{version}? The verified zip will open in Explorer — extract it over your install folder, or use Setup.exe from GitHub.', { version: updateInfo.version });
     if (!window.confirm(prompt)) return;
     setUpdateApplying(true);
     setUpdateMessage(null);
     try {
       const res = await apiPost<{ ok: boolean; message?: string }>('/api/update/apply', {});
-      setUpdateMessage(res.message || 'Update started');
+      setUpdateMessage(res.message || t('Update started'));
       if (!isSetup) setUpdateApplying(false);
     } catch (err: any) {
-      setUpdateMessage(err.message || 'Update failed');
+      setUpdateMessage(err.message || t('Update failed'));
       setUpdateApplying(false);
     }
   }, [updateInfo]);
@@ -5127,7 +5147,7 @@ export default function App() {
       setError(null);
       setTimeout(() => setSettingsSaved(false), 2000);
     } catch (err: any) {
-      setError(err.message || 'Failed to save settings');
+      setError(err.message || t('Failed to save settings'));
     }
   }, [
     settings,
@@ -5310,7 +5330,7 @@ export default function App() {
                 }, 300);
               }
             }}
-            placeholder={urlFetched ? 'VOD or clip link' : 'PASTE VOD OR CLIP LINK...'}
+            placeholder={urlFetched ? t('VOD or clip link') : t('PASTE VOD OR CLIP LINK...')}
             onKeyDown={(e) => e.key === 'Enter' && handleGetInfo()}
             className={urlInputClass}
           />
@@ -5329,9 +5349,9 @@ export default function App() {
             className={`w-full bg-zinc-800 text-white font-black uppercase py-3 flex items-center justify-center gap-2 transition-all duration-300 disabled:opacity-50 disabled:cursor-default border-2 border-zinc-700 ${extractBtnHoverClass}`}
           >
             {loading ? (
-              <><Loader2 size={16} className="animate-spin" /> Loading...</>
+              <><Loader2 size={16} className="animate-spin" /> {t('Loading...')}</>
             ) : (
-              <><Info size={16} strokeWidth={3} /> Extract Info</>
+              <><Info size={16} strokeWidth={3} /> {t('Extract Info')}</>
             )}
           </button>
         )}
@@ -5339,7 +5359,7 @@ export default function App() {
         {videoInfo && loading && (
           <div className="flex items-center justify-center gap-2 py-1 text-[10px] font-mono text-zinc-500">
             <Loader2 size={12} className="animate-spin" />
-            Updating…
+            {t('Updating…')}
           </div>
         )}
       </div>
@@ -5368,10 +5388,10 @@ export default function App() {
             </div>
             <div className="flex flex-col justify-center overflow-hidden w-full min-w-0 gap-0.5">
               <h3 className="font-bold truncate uppercase text-[10px] leading-tight">
-                {videoInfo.title || 'Untitled'}
+                {videoInfo.title || t('Untitled')}
               </h3>
               <p className="text-[9px] text-zinc-500 font-mono truncate">
-                {videoInfo.uploader || 'Unknown'}
+                {videoInfo.uploader || t('Unknown')}
                 {videoInfo.created_at ? ` · ${fmtDateAndAgo(videoInfo.created_at)}` : ''}
               </p>
               <div className="flex justify-between items-center gap-1 text-[9px] font-mono text-zinc-500">
@@ -5409,7 +5429,7 @@ export default function App() {
 
           <div className="grid grid-cols-2 gap-2 shrink-0">
             <div className="flex flex-col gap-0.5">
-              <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">Quality</span>
+              <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">{t('Quality')}</span>
                 <select value={quality} onChange={(e) => {
                   setQuality(e.target.value);
                   qualityUserTouchedUrlRef.current = url.trim();
@@ -5432,7 +5452,7 @@ export default function App() {
               </select>
             </div>
             <div className="flex flex-col gap-0.5">
-              <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">Est. size</span>
+              <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">{t('Est. size')}</span>
               <div className="w-full bg-zinc-950 border border-zinc-800 text-white font-mono py-1 px-1.5 text-[10px] flex items-center justify-center">
                 {formatBytes(estBytes)}
               </div>
@@ -5448,13 +5468,13 @@ export default function App() {
                 className="shrink-0"
                 style={vodCheckboxStyle(platformAccentColor(activePlatform))}
               />
-              Audio only (MP3)
+              {t('Audio only (MP3)')}
             </label>
           )}
 
           <div className="flex flex-col gap-2.5 shrink-0 py-0.5">
             <div className="flex justify-between items-center gap-2">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 shrink-0">Trim</span>
+              <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 shrink-0">{t('Trim')}</span>
               <ClipDurationAdjustButtons
                 onAdjust={adjustUrlClipDuration}
                 activeEndpoint={lastUrlTrimEndpoint}
@@ -5563,7 +5583,7 @@ export default function App() {
         className={`flex-1 min-h-0 ${platformWatchPreviewBtn(urlActionPlatform, false)} disabled:opacity-40`}
       >
         <ExternalLink size={12} className="shrink-0" />
-        Open URL
+        {t('Open URL')}
       </button>
       <button
         type="button"
@@ -5598,7 +5618,7 @@ export default function App() {
         ) : (
           <Play size={12} fill="currentColor" className="shrink-0" />
         )}
-        {previewOpen ? 'Close preview' : 'Watch preview'}
+        {previewOpen ? t('Close preview') : t('Watch preview')}
       </button>
       <button
         onClick={promptStartDownload}
@@ -5607,7 +5627,7 @@ export default function App() {
       >
         <Download size={16} strokeWidth={3} />
         <span className="inline-flex items-center">
-          <span className="tracking-widest">{currentIsClip ? 'Clip rip it' : 'VOD rip it'}</span>
+          <span className="tracking-widest">{currentIsClip ? t('Clip rip it') : t('VOD rip it')}</span>
           <span className="rip-btn-bang" aria-hidden="true">!</span>
         </span>
       </button>
@@ -5643,7 +5663,7 @@ export default function App() {
           }}
           disabled={opts.disabled}
           className={opts.buttonClassName}
-          title="Volume"
+          title={t('Volume')}
         >
           {opts.muted || opts.volume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
         </button>
@@ -5708,11 +5728,11 @@ export default function App() {
   const openPreviewTwitchClip = useCallback(async () => {
     const login = (videoInfo?.channel || '').trim();
     if (!login) {
-      showClipOpenNotice('error', 'Extract VOD info first (need the channel login)');
+      showClipOpenNotice('error', t('Extract VOD info first (need the channel login)'));
       return;
     }
     if (isClipUrl(url.trim())) {
-      showClipOpenNotice('error', 'A clip can\u2019t be clipped');
+      showClipOpenNotice('error', t('A clip can\u2019t be clipped'));
       return;
     }
     if (isLive) {
@@ -5721,7 +5741,7 @@ export default function App() {
         const res = await openTwitchClipEditor({ broadcasterLogin: login });
         showClipOpenNotice('ok', `Twitch clip editor opened — ${res.url}`);
       } catch {
-        showClipOpenNotice('error', 'Failed to open the Twitch clip editor');
+        showClipOpenNotice('error', t('Failed to open the Twitch clip editor'));
       } finally {
         setClipOpening(false);
       }
@@ -5729,7 +5749,7 @@ export default function App() {
     }
     const vodId = archiveVideoIdFromUrl(url) ?? undefined;
     if (!vodId) {
-      showClipOpenNotice('error', 'Not a Twitch VOD URL');
+      showClipOpenNotice('error', t('Not a Twitch VOD URL'));
       return;
     }
     setTwitchClipPopup({
@@ -5761,7 +5781,7 @@ export default function App() {
             {previewTrimZoom > 1 && (
               <span
                 className="block text-[7px] text-zinc-500"
-                title="Scroll on the rail to zoom"
+                title={t('Scroll on the rail to zoom')}
               >
                 ×{previewTrimZoom >= 10 ? Math.round(previewTrimZoom) : previewTrimZoom.toFixed(1)}
               </span>
@@ -5772,7 +5792,7 @@ export default function App() {
             className={`preview-needle-rail relative flex-1 ${
               previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
             }`}
-            title="Drag needles to set preview clip range"
+            title={t('Drag needles to set preview clip range')}
             onClick={(e) => {
               if (e.target !== e.currentTarget) return;
               const rail = previewNeedleRailRef.current;
@@ -5796,7 +5816,7 @@ export default function App() {
             />
             <div
               role="slider"
-              aria-label="Clip in"
+              aria-label={t('Clip in')}
               aria-valuemin={0}
               aria-valuemax={vodDurationSec}
               aria-valuenow={previewTrimStart}
@@ -5806,7 +5826,7 @@ export default function App() {
             />
             <div
               role="slider"
-              aria-label="Clip out"
+              aria-label={t('Clip out')}
               aria-valuemin={0}
               aria-valuemax={vodDurationSec}
               aria-valuenow={previewTrimEnd}
@@ -5825,7 +5845,7 @@ export default function App() {
             className={`text-[8px] font-mono w-11 shrink-0 text-right ${
               previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
             }`}
-            title="Selected clip length"
+            title={t('Selected clip length')}
           >
             {formatHmsFull(previewClipLengthSec)}
           </span>
@@ -5882,7 +5902,7 @@ export default function App() {
         />
         <span
           className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}
-          title="Selected clip length"
+          title={t('Selected clip length')}
         >
           {formatHmsFull(previewClipLengthSec)}
         </span>
@@ -5919,14 +5939,14 @@ export default function App() {
             className={previewCtrlBtn(previewFullscreen, true)}
             title={
               !videoInfo?.channel?.trim()
-                ? 'Extract VOD info first to enable Twitch clip'
+                ? t('Extract VOD info first to enable Twitch clip')
                 : isLive
-                  ? 'Open Twitch clip editor for this live stream'
-                  : 'Open the Twitch clip mini-preview at the playhead'
+                  ? t('Open Twitch clip editor for this live stream')
+                  : t('Open the Twitch clip mini-preview at the playhead')
             }
           >
             {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} />}
-            <span className="text-[9px] font-bold uppercase tracking-wider">Twitch clip</span>
+            <span className="text-[9px] font-bold uppercase tracking-wider">{t('Twitch clip')}</span>
           </button>
         )}
         {isLive && (
@@ -5948,9 +5968,9 @@ export default function App() {
               if (pos > 0 && isFinite(pos)) hls.media.currentTime = pos;
             }}
             className={previewCtrlBtn(false, true)}
-            title="Real Time — snap to live edge"
+            title={t('Real Time — snap to live edge')}
           >
-            <span className="text-[9px] font-bold tracking-wider">● LIVE</span>
+            <span className="text-[9px] font-bold tracking-wider">{t('● LIVE')}</span>
           </button>
         )}
         <PreviewQualityMenu
@@ -5971,14 +5991,14 @@ export default function App() {
           <button type="button" onClick={() => void togglePreviewFullscreen()}
             disabled={!previewVideoReady}
             className={previewCtrlBtn(false, true)}
-            title="Exit fullscreen">
+            title={t('Exit fullscreen')}>
             <Minimize2 size={18} />
           </button>
         ) : (
           <button type="button" onClick={() => void togglePreviewFullscreen()}
             disabled={!previewVideoReady}
             className={previewCtrlBtn(false, true)}
-            title="Fullscreen">
+            title={t('Fullscreen')}>
             <Maximize2 size={18} />
           </button>
         )}
@@ -6031,7 +6051,7 @@ export default function App() {
                 />
                 <div className="min-w-0">
                   <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                    {previewChannelBadge.isClip ? 'Channel clip preview' : isLive ? 'Live stream' : 'Channel VOD preview'}
+                    {previewChannelBadge.isClip ? t('Channel clip preview') : isLive ? t('Live stream') : t('Channel VOD preview')}
                   </span>
                   {!isLive && videoInfo?.title && (
                     <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
@@ -6064,7 +6084,7 @@ export default function App() {
                 type="button"
                 onClick={togglePreviewSearch}
                 aria-pressed={previewSearchOpen}
-                title="Search the local archive (transcripts + chat)"
+                title={t('Search the local archive (transcripts + chat)')}
                 className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
                   previewSearchOpen
                     ? 'bg-white text-black border-white'
@@ -6072,7 +6092,7 @@ export default function App() {
                 }`}
               >
                 <Search size={10} className="shrink-0" />
-                {previewArchiveVideoId ? 'SEARCH THIS VIDEO' : 'SEARCH ARCHIVE'}
+                {previewArchiveVideoId ? t('SEARCH THIS VIDEO') : t('SEARCH ARCHIVE')}
               </button>
               <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
                 <X size={18} />
@@ -6084,7 +6104,7 @@ export default function App() {
               ref={previewContainerRef}
               tabIndex={0}
               role="application"
-              aria-label="Trim preview player"
+              aria-label={t('Trim preview player')}
               onKeyDown={handlePreviewContainerKeyDown}
               onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
               onMouseLeave={previewFullscreen ? () => {
@@ -6118,7 +6138,7 @@ export default function App() {
                       ref={previewYoutubeIframeRef}
                       className="youtube-embed-frame pointer-events-none"
                       src={previewYoutubeEmbedUrl}
-                      title="YouTube trim preview"
+                      title={t('YouTube trim preview')}
                       allow="autoplay; encrypted-media; picture-in-picture"
                       tabIndex={-1}
                       onLoad={() => {
@@ -6154,7 +6174,7 @@ export default function App() {
                     <Loader2 size={40} className="animate-spin text-zinc-300" />
                     {!previewPlayback && (
                       <span className="text-zinc-300 text-xs font-mono">
-                        {urlPlatform === 'youtube' ? 'Starting YouTube preview…' : 'Preparing preview…'}
+                        {urlPlatform === 'youtube' ? t('Starting YouTube preview…') : t('Preparing preview…')}
                       </span>
                     )}
                   </div>
@@ -6196,7 +6216,7 @@ export default function App() {
               {previewFullscreen && (
                 <div
                   className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"
-                  title="Exit fullscreen"
+                  title={t('Exit fullscreen')}
                   onClick={() => void togglePreviewFullscreen()}
                 />
               )}
@@ -6238,7 +6258,7 @@ export default function App() {
         >
           {showUrlInSidebar && (
             <div className="flex items-center justify-between shrink-0">
-              <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">Selected VOD</span>
+              <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">{t('Selected VOD')}</span>
               <button
                 type="button"
                 onClick={() => {
@@ -6248,7 +6268,7 @@ export default function App() {
                   setPreviewChannelBadge(null);
                 }}
                 className="text-zinc-500 hover:text-white p-1"
-                title="Clear selection"
+                title={t('Clear selection')}
               >
                 <X size={14} />
               </button>
@@ -6256,7 +6276,7 @@ export default function App() {
           )}
           {showUrlInPreviewMiddle && (
             <div className="flex items-center justify-between shrink-0">
-              <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">VOD · Trim</span>
+              <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">{t('VOD · Trim')}</span>
             </div>
           )}
           <div className="flex-[2] min-h-0 overflow-hidden flex flex-col">
@@ -6287,7 +6307,7 @@ export default function App() {
             </h1>
             {!mainCardHeaderCompact && (
               <p className="text-zinc-400 text-[10px] font-mono tracking-widest uppercase mt-1">
-                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#F03030]">YouTube</span> Downloader
+                <span className="text-[#53fc18]">Kick</span> {'//'} <span className="text-[#9146FF]">Twitch</span> {'//'} <span className="text-[#F03030]">YouTube</span> {t('Downloader')}
               </p>
             )}
             {triplePanelLayout && !urlMainCompact && (
@@ -6300,7 +6320,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => { setArchiveSearchScope(null); setArchiveSearchOpen((o) => !o); }}
-              title="Search the local archive (transcripts + chat)"
+              title={t('Search the local archive (transcripts + chat)')}
               aria-pressed={archiveSearchOpen}
               className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
                 archiveSearchOpen
@@ -6309,7 +6329,7 @@ export default function App() {
               }`}
             >
               <Search size={10} className="shrink-0" />
-              SEARCH CHAT
+              {t('SEARCH CHAT')}
             </button>
             <div className="w-2 h-2 bg-[#53fc18] rounded-full animate-pulse" />
             <div className="w-2 h-2 bg-[#9146FF] rounded-full animate-pulse" style={{ animationDelay: '0.5s' }} />
@@ -6319,21 +6339,21 @@ export default function App() {
 
         {/* ── TABS ── */}
         <div className="flex w-full border-2 border-zinc-800 font-mono text-[10px] uppercase font-bold tracking-widest shrink-0">
-          {visibleTabs.map((t) => (
+          {visibleTabs.map((tabId) => (
             <button
-              key={t}
-              onClick={() => setTab(t)}
+              key={tabId}
+              onClick={() => setTab(tabId)}
               className={`flex-1 min-w-0 text-center transition-all flex items-center justify-center gap-2 ${
                 mainCardHeaderCompact ? 'py-2' : 'py-3'
               } ${
-                tab === t ? 'bg-white text-black' : 'bg-transparent text-zinc-500 hover:text-white'
+                tab === tabId ? 'bg-white text-black' : 'bg-transparent text-zinc-500 hover:text-white'
               }`}
             >
-              {t === 'url' && <Link2 size={14} className="shrink-0" />}
-              {t === 'channels' && <Users size={14} className="shrink-0" />}
-              {t === 'queue' && <Download size={14} className="shrink-0" />}
-              {t === 'settings' && <Settings2 size={14} className="shrink-0" />}
-              <span className="truncate">{t === 'url' ? 'URL' : t === 'channels' ? 'CHANNELS' : t === 'queue' ? 'HISTORY' : 'SETTINGS'}</span>
+              {tabId === 'url' && <Link2 size={14} className="shrink-0" />}
+              {tabId === 'channels' && <Users size={14} className="shrink-0" />}
+              {tabId === 'queue' && <Download size={14} className="shrink-0" />}
+              {tabId === 'settings' && <Settings2 size={14} className="shrink-0" />}
+              <span className="truncate">{tabId === 'url' ? t('URL') : tabId === 'channels' ? t('CHANNELS') : tabId === 'queue' ? t('HISTORY') : t('SETTINGS')}</span>
             </button>
           ))}
         </div>
@@ -6347,11 +6367,11 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void retryPreview()}
-                title="Retry this preview only"
+                title={t('Retry this preview only')}
                 className="ml-auto shrink-0 flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-2 py-1 text-[10px] font-bold uppercase tracking-wider"
               >
                 <RefreshCw size={12} />
-                Retry
+                {t('Retry')}
               </button>
             )}
             <button onClick={() => { setError(null); previewRetryingRef.current = false; setPreviewRetryBoth(null); }} className={`${previewRetry ? '' : 'ml-auto '}text-red-400/60 hover:text-red-400 shrink-0`}>
@@ -6381,7 +6401,7 @@ export default function App() {
             <div className="flex gap-2">
               <input type="text" value={addChannelInput}
                 onChange={(e) => setAddChannelInput(e.target.value)}
-                placeholder="KICK / TWITCH / YOUTUBE NAME OR URL..."
+                placeholder={t('KICK / TWITCH / YOUTUBE NAME OR URL...')}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddChannel()}
                 className="flex-1 bg-zinc-900 border-2 border-zinc-800 text-white font-mono placeholder:text-zinc-600 px-2 py-1.5 focus:outline-none focus:border-white uppercase text-[10px] min-h-0" />
               <button type="button" onClick={handleAddChannel}
@@ -6507,7 +6527,7 @@ export default function App() {
                                       setEnabled((v) => !v);
                                     }
                                   }}
-                                  title={chipLocked(enabled) ? 'At least one platform filter must stay on' : undefined}
+                                  title={chipLocked(enabled) ? t('At least one platform filter must stay on') : undefined}
                                   className={`flex items-center gap-1 px-2 py-0.5 border font-mono text-[10px] uppercase font-bold cursor-pointer select-none ${
                                     enabled ? '' : 'opacity-40'
                                   }`}
@@ -6548,7 +6568,7 @@ export default function App() {
                               : 'border-zinc-700 text-zinc-500 hover:text-white'
                           }`}
                         >
-                          {youtubePlatformOnly ? 'Videos' : 'VODs'}
+                          {youtubePlatformOnly ? t('Videos') : t('VODs')}
                         </button>
                         <button
                           type="button"
@@ -6559,7 +6579,7 @@ export default function App() {
                               : 'border-zinc-700 text-zinc-500 hover:text-white'
                           }`}
                         >
-                          {youtubePlatformOnly ? 'Shorts' : 'Clips'}
+                          {youtubePlatformOnly ? t('Shorts') : t('Clips')}
                         </button>
                         {youtubePlatformOnly && (
                           <button
@@ -6577,9 +6597,9 @@ export default function App() {
                       </div>
                       {channelContentFilter === 'clips' && !youtubePlatformOnly && (
                         <div className="flex flex-wrap items-center gap-1 font-mono text-[9px] uppercase w-full min-w-0 pt-0.5">
-                          <span className="text-zinc-500 shrink-0 mr-1">Range:</span>
+                          <span className="text-zinc-500 shrink-0 mr-1">{t('Range:')}</span>
                           {([
-                            { label: 'Today', days: 1 },
+                            { label: t('Today'), days: 1 },
                             { label: '1–7d', days: 7 },
                             { label: '7–14d', days: 14 },
                             { label: '14d–1mo', days: 30 },
@@ -6600,7 +6620,7 @@ export default function App() {
                               {r.label}
                             </button>
                           ))}
-                          <span className="text-zinc-500 shrink-0 ml-2 mr-1">Sort:</span>
+                          <span className="text-zinc-500 shrink-0 ml-2 mr-1">{t('Sort:')}</span>
                           <button
                             type="button"
                             onClick={() => setClipSort('date')}
@@ -6610,7 +6630,7 @@ export default function App() {
                                 : 'border-zinc-700 text-zinc-500 hover:text-white'
                             }`}
                           >
-                            Newest
+                            {t('Newest')}
                           </button>
                           <button
                             type="button"
@@ -6621,7 +6641,7 @@ export default function App() {
                                 : 'border-zinc-700 text-zinc-500 hover:text-white'
                             }`}
                           >
-                            Most Views
+                            {t('Most Views')}
                           </button>
                         </div>
                       )}
@@ -6643,9 +6663,9 @@ export default function App() {
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
-                              <span className="text-[9px] font-bold text-red-400 shrink-0">● LIVE</span>
+                              <span className="text-[9px] font-bold text-red-400 shrink-0">{t('● LIVE')}</span>
                               <span className="text-[10px] text-zinc-300 truncate">{selectedChannelFirstLiveEntry.title}</span>
-                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">LIVE</span>
+                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">{t('LIVE')}</span>
                               {selectedChannelFirstLiveEntry.viewer_count != null && (
                                 <span className="text-[9px] text-zinc-500 shrink-0">{selectedChannelFirstLiveEntry.viewer_count}w</span>
                               )}
@@ -6653,10 +6673,10 @@ export default function App() {
                           )}
                           <p className="text-center text-zinc-600 font-mono text-[10px] py-3">
                             {channelContentFilter === 'clips'
-                              ? (youtubePlatformOnly ? 'No shorts' : 'No clips')
+                              ? (youtubePlatformOnly ? t('No shorts') : t('No clips'))
                               : channelContentFilter === 'streams'
-                                ? 'No VODs'
-                                : (youtubePlatformOnly ? 'No videos' : 'No VODs')}
+                                ? t('No VODs')
+                                : (youtubePlatformOnly ? t('No videos') : t('No VODs'))}
                           </p>
                         </>
                       ) : (
@@ -6677,14 +6697,14 @@ export default function App() {
                                   className="shrink-0"
                                   style={vodCheckboxStyle('#a1a1aa')}
                                 />
-                                Select all
+                                {t('Select all')}
                               </label>
                               <button
                                 type="button"
                                 onClick={handleBulkDownloadChannelVods}
                                 className={platformBulkDownloadBtn(bulkDownloadPlatform, bulkDownloadPlatforms.size > 1)}
                               >
-                                <Download size={10} /> Download {selectedChannelVodUrls.size}
+                                <Download size={10} /> {t('Download {count}', { count: selectedChannelVodUrls.size })}
                               </button>
                             </div>
                           )}
@@ -6698,9 +6718,9 @@ export default function App() {
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
-                              <span className="text-[9px] font-bold text-red-400 shrink-0">● LIVE</span>
+                              <span className="text-[9px] font-bold text-red-400 shrink-0">{t('● LIVE')}</span>
                               <span className="text-[10px] text-zinc-300 truncate">{selectedChannelFirstLiveEntry.title}</span>
-                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">LIVE</span>
+                              <span className="text-[9px] text-zinc-500 shrink-0 ml-auto">{t('LIVE')}</span>
                               {selectedChannelFirstLiveEntry.viewer_count != null && (
                                 <span className="text-[9px] text-zinc-500 shrink-0">{selectedChannelFirstLiveEntry.viewer_count}w</span>
                               )}
@@ -6723,7 +6743,7 @@ export default function App() {
                                 role="button"
                                 tabIndex={isSyntheticYt ? -1 : 0}
                                 aria-disabled={isSyntheticYt || undefined}
-                                title={isSyntheticYt ? 'Live chat capture — no video' : undefined}
+                                title={isSyntheticYt ? t('Live chat capture — no video') : undefined}
                                 data-youtube-warm={v.platform === 'youtube' && !isMembersOnly && !isClipItem && !isShortItem ? fullUrl : undefined}
                                 onClick={() => {
                                   if (isSyntheticYt) return;
@@ -6802,7 +6822,7 @@ export default function App() {
                                   <span className="truncate flex items-center gap-1">
                                     <PlatformVodIcon platform={v.platform} />
                                     <span className="truncate">
-                                      {v.title || 'Untitled'}
+                                      {v.title || t('Untitled')}
                                       {durSec != null ? (
                                         <span className="text-zinc-500 ml-1">
                                           {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
@@ -6826,7 +6846,7 @@ export default function App() {
                                 </div>
                                 {isMembersOnly ? (
                                   <span
-                                    title="Members-only video — preview requires channel membership"
+                                    title={t('Members-only video — preview requires channel membership')}
                                     className="shrink-0 border border-amber-900 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-amber-600 flex items-center gap-0.5 cursor-not-allowed"
                                   >
                                     <Eye size={10} />
@@ -6834,7 +6854,7 @@ export default function App() {
                                   </span>
                                 ) : isSyntheticYt ? (
                                   <span
-                                    title="Live chat capture — no video"
+                                    title={t('Live chat capture — no video')}
                                     className="shrink-0 border border-zinc-800 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-0.5 cursor-not-allowed"
                                   >
                                     <Eye size={10} />
@@ -6843,7 +6863,7 @@ export default function App() {
                                 ) : (
                                 <button
                                   type="button"
-                                  title={isClipItem ? 'Preview clip' : 'Preview VOD'}
+                                  title={isClipItem ? t('Preview clip') : t('Preview VOD')}
                                   onMouseEnter={() => {
                                     if (v.platform === 'youtube' && !isClipItem) {
                                       warmYoutubePreview(fullUrl);
@@ -6862,7 +6882,7 @@ export default function App() {
                                 )}
                                 <button
                                   type="button"
-                                  title={isSyntheticYt ? 'Live chat capture — no video' : 'Open in browser'}
+                                  title={isSyntheticYt ? t('Live chat capture — no video') : t('Open in browser')}
                                   disabled={isSyntheticYt}
                                   onClick={(e) => {
                                     e.stopPropagation();
