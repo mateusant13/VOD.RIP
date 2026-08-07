@@ -1517,12 +1517,15 @@ def _transcribe_audio_source(
     # precedent).
     if speech_sec < 3.0:
         wall = time.monotonic() - t0
+        # The thread that ran this job may be CPU-pinned in the hybrid pool —
+        # report the actual device, not the global default.
+        _ran = _thread_pin() or _effective_device()
         stats = {
             "platform": platform,
             "video_id": video_id,
             "model": model_name(),
-            "device": _effective_device()[0],
-            "compute_type": _effective_device()[1],
+            "device": _ran[0],
+            "compute_type": _ran[1],
             "total_sec": round(total_sec, 3),
             "speech_sec": round(speech_sec, 3),
             "dead_air_sec": round(dead_air_sec, 3),
@@ -1626,12 +1629,15 @@ def _transcribe_audio_source(
         pass
 
     wall = time.monotonic() - t0
+    # Report the device that actually ran the job (hybrid pool threads may be
+    # CPU-pinned); falls back to the global default off-pool.
+    _ran = _thread_pin() or _effective_device()
     stats = {
         "platform": platform,
         "video_id": video_id,
         "model": model_name(),
-        "device": _effective_device()[0],
-        "compute_type": _effective_device()[1],
+        "device": _ran[0],
+        "compute_type": _ran[1],
         "total_sec": round(total_sec, 3),
         "speech_sec": round(speech_sec, 3),
         "dead_air_sec": round(dead_air_sec, 3),
