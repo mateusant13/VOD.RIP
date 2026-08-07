@@ -3441,10 +3441,12 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
     whose segment URLs point to
     ``/api/preview/hls/{sid}/resource?id=window-seg-NNN``.
 
-    When ``USE_FMP4`` is enabled, the playlist is emitted as an LL-HLS (v9)
-    fMP4 playlist: an ``#EXT-X-MAP`` init reference, ``#EXT-X-PART-INF`` /
-    ``#EXT-X-SERVER-CONTROL`` tags, and per-segment ``#EXT-X-PART`` +
-    ``#EXT-X-PRELOAD-HINT`` hints pointing at ``seg_NNN_part_*.m4s`` chunks.
+    When ``USE_FMP4`` is enabled, the playlist is emitted as an HLS v7
+    fMP4 playlist: an ``#EXT-X-MAP`` init reference plus whole-segment
+    ``#EXTINF`` entries pointing at ``seg_NNN.m4s`` files. No LL-HLS
+    ``#EXT-X-PART`` / ``#EXT-X-PRELOAD-HINT`` / ``SERVER-CONTROL`` tags are
+    emitted — the muxer produces whole segments, not partials (removed in
+    a6728b6: those tags advertised files and endpoints that don't exist).
     """
     base = f"/api/preview/hls/{session.session_id}/resource?id="
     segs = _window_hls_existing_segments(session)

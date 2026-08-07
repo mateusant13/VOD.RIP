@@ -162,8 +162,14 @@ def test_preflight_mux_adoption():
     assert f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}000" in s.resource_map
 
 
-def test_fmp4_llhls_playlist_emits_cmaf_tags():
-    """When USE_FMP4 is on, the media playlist is LL-HLS (v9) fMP4."""
+def test_fmp4_playlist_emits_map_and_no_phantom_part_tags():
+    """fMP4 media playlist: v7 + EXT-X-MAP init ref; NO LL-HLS PART hints.
+
+    The muxer emits whole .m4s segments (EXTINF), not partial segments — the
+    a6728b6-era LL-HLS tags (EXT-X-PART / PRELOAD-HINT / SERVER-CONTROL
+    CAN-BLOCK-RELOAD) advertised files and endpoints that don't exist, so the
+    playlist must NOT emit them. Regression guard for the dead-preview fix.
+    """
     s = _sess(crop_end=20.0)
     out_dir = _window_hls_dir(s)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,14 +183,20 @@ def test_fmp4_llhls_playlist_emits_cmaf_tags():
     )
     body = _build_youtube_window_hls_media_playlist(s)
     text = body.decode("utf-8")
-    assert "#EXT-X-VERSION:9" in text
+    assert "#EXT-X-VERSION:7" in text
     assert "#EXT-X-MAP:URI=" in text and "init.mp4" in text
-    assert "#EXT-X-PART-INF:PART-TARGET=" in text
-    assert "#EXT-X-SERVER-CONTROL:" in text
-    assert "#EXT-X-PART:" in text
-    assert "#EXT-X-PRELOAD-HINT:" in text
     assert f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}000" in text
+    assert f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}001" in text
     assert "#EXT-X-ENDLIST" in text
+    # Phantom LL-HLS tags must never reappear: they point at part files the
+    # muxer does not produce and endpoints it does not serve.
+    assert "#EXT-X-PART" not in text
+    assert "#EXT-X-PRELOAD-HINT" not in text
+    assert "CAN-BLOCK-RELOAD" not in text
+    # The init reference must be resolvable through the resource map
+    # (a6728b6 registered init.mp4 as its own resource id).
+    _register_youtube_window_hls_resources(s)
+    assert s.resource_map[WINDOW_HLS_INIT_RESOURCE] == f"{WINDOW_HLS_MARKER}init.mp4"
 
 
 def test_fmp4_resource_registration_maps_init_and_m4s():
