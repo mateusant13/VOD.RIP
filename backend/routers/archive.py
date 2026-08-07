@@ -611,13 +611,14 @@ async def archive_search(
     ]
     if bad_kinds:
         raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")
-    # source restricts to one content kind; channel accepts comma-separated
-    # slugs ("a,b" → IN match) but never empty segments.
+    # source restricts to one content kind ('video' = local video-title
+    # matches only); channel accepts comma-separated slugs ("a,b" → IN
+    # match) but never empty segments.
     source = (source or "both").strip().lower()
-    if source not in ("both", "chat", "transcript"):
+    if source not in ("both", "chat", "transcript", "video"):
         raise HTTPException(
             status_code=400,
-            detail="source must be one of both, chat, transcript",
+            detail="source must be one of both, chat, transcript, video",
         )
     if channel and any(not s.strip() for s in channel.split(",")):
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
@@ -758,13 +759,66 @@ async def archive_chat_window(
     offset: float = 0.0,
     half: float = 30.0,
     limit: int = Query(archive_db.CHAT_FROM_OFFSET_LIMIT, ge=1, le=50_000),
+    offsets: str | None = None,
 ):
+    """Chat for the video's whole canonical dedupe group, merged by offset.
+
+    half > 0 → the classic ±half nearby window per member, merged; truncated
+    always False. half <= 0 → "from offset onward" per member, merged by
+    offset_sec (platform order breaks equal-offset ties) and sliced to
+    `limit` rows — truncated reports the cut. Pagination is a per-platform
+    keyset: the response's `next_offsets` carries each member's last
+    delivered offset_sec, and the next request echoes them back as
+    `offsets` ("platform:sec,platform:sec"); members absent from the map
+    resume from the global `offset`. platform/video_id stay on every row so
+    the client can filter per platform. Single-platform groups behave
+    exactly like the pre-group endpoint (one member, offsets map has one
+    entry)."""
     _require_platform(platform)
-    # half > 0 → the classic ±half nearby window; half <= 0 → "from offset
-    # onward" (whole remaining history, page-capped — truncated reports the
-    # cut; the popup paginates by re-fetching from the last row's offset).
-    messages, truncated = archive_db.chat_window(platform, video_id, offset, half, limit)
-    return {"messages": messages, "truncated": truncated}
+    members = archive_db.chat_group_members(platform, video_id)
+    platforms = [m["platform"] for m in members]
+    # Per-member resume offsets ("twitch:100.5,kick:20"); unknown platforms
+    # are dropped, malformed segments ignored — absent members use `offset`.
+    resume: dict[str, float] = {}
+    if offsets:
+        for seg in offsets.split(","):
+            seg = seg.strip()
+            if ":" not in seg:
+                continue
+            p, _, raw = seg.partition(":")
+            if p in resume or p not in platforms:
+                continue
+            try:
+                resume[p] = float(raw)
+            except ValueError:
+                continue
+    order = {p: i for i, p in enumerate(platforms)}
+    if half is not None and half > 0:
+        window: list[dict] = []
+        for m in members:
+            msgs, _ = archive_db.chat_window(m["platform"], m["video_id"], offset, half, limit)
+            window.extend(msgs)
+        window.sort(key=lambda r: (r["offset_sec"], order[r["platform"]]))
+        return {"messages": window, "truncated": False, "platforms": platforms, "next_offsets": {}}
+    cap = max(1, int(limit))
+    fetched: list[dict] = []
+    truncated = False
+    for m in members:
+        msgs, cut = archive_db.chat_window(
+            m["platform"], m["video_id"], resume.get(m["platform"], offset), 0.0, cap,
+        )
+        fetched.extend(msgs)
+        truncated = truncated or cut
+    fetched.sort(key=lambda r: (r["offset_sec"], order[r["platform"]]))
+    delivered = fetched[:cap]
+    truncated = truncated or len(fetched) > cap
+    next_offsets: dict[str, float] = {}
+    for m in members:
+        own = [r for r in delivered if r["platform"] == m["platform"]]
+        next_offsets[m["platform"]] = (
+            own[-1]["offset_sec"] if own else resume.get(m["platform"], offset)
+        )
+    return {"messages": delivered, "truncated": truncated, "platforms": platforms, "next_offsets": next_offsets}
 
 
 @router.post("/api/archive/videos/{platform}/{video_id}/chat/backfill")

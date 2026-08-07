@@ -1441,6 +1441,36 @@ def chat_window(
     return [dict(r) for r in rows[:cap]], truncated
 
 
+def chat_group_members(platform: str, video_id: str) -> list[dict]:
+    """Every (platform, video_id) member of the video's canonical dedupe
+    group — the set of platforms where the same live/VOD exists (video_aliases
+    overrides included), requested video first, then the rest in dedupe-view
+    order (platform name). Videos with no canonical key (orphan rows) return
+    just the requested video, so single-platform behavior is unchanged."""
+    rows = query(
+        """SELECT v.platform, v.video_id,
+                  COALESCE(a.canonical_key, v.canonical_key) AS key
+           FROM videos v
+           LEFT JOIN video_aliases a USING (platform, video_id)
+           WHERE v.platform = ? AND v.video_id = ?""",
+        (platform, video_id),
+    )
+    if not rows or not rows[0]["key"]:
+        return [{"platform": platform, "video_id": video_id}]
+    key = rows[0]["key"]
+    members = query(
+        """SELECT v.platform, v.video_id
+           FROM videos v
+           LEFT JOIN video_aliases a USING (platform, video_id)
+           WHERE COALESCE(a.canonical_key, v.canonical_key) = ?
+           ORDER BY v.platform""",
+        (key,),
+    )
+    out = [dict(r) for r in members]
+    out.sort(key=lambda m: (m["platform"] != platform, m["platform"]))
+    return out
+
+
 # --- preview chat panel (WS-2) --------------------------------------------
 
 def has_transcript(platform: str, video_id: str) -> bool:
@@ -1560,10 +1590,12 @@ def chat_for(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
 
     Thin projection of the same messages table chat_window/insert_messages
     use; explicit ORDER BY offset_sec because live-capture inserts can land
-    out of order. The (platform, video_id, offset_sec) index serves it."""
+    out of order. The (platform, video_id, offset_sec) index serves it.
+    platform/video_id stay on every row so group-aware consumers (multi-
+    platform canonical VODs) can attribute merged rows."""
     rows = query(
-        "SELECT offset_sec, text, username, spam_count, color FROM messages "
-        "WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ?",
+        "SELECT platform, video_id, offset_sec, text, username, spam_count, color "
+        "FROM messages WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ?",
         (platform, video_id, limit),
     )
     return [dict(r) for r in rows]
@@ -1619,8 +1651,8 @@ def chat_slice_for(
     start = max(0, anchor - half)
     take = min(total - start, slice_rows)
     rows = query(
-        "SELECT offset_sec, text, username, spam_count, color FROM messages "
-        "WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ? OFFSET ?",
+        "SELECT platform, video_id, offset_sec, text, username, spam_count, color "
+        "FROM messages WHERE platform = ? AND video_id = ? ORDER BY offset_sec LIMIT ? OFFSET ?",
         (platform, video_id, take, start),
     )
     return [dict(r) for r in rows], total
@@ -2399,6 +2431,10 @@ def search(
         loops = loops[1:]
     elif source == "transcript":
         loops = loops[:1]
+    elif source == "video":
+        # Titles only: no transcript/message content passes — the video-title
+        # pass below is the whole result set.
+        loops = []
     pattern = _fuzzy_pattern(q, [t[2] for t in loops])
     if pattern is None:
         pattern = {0: " OR ".join(f'"{w}"' for w in q.split() if w) or q}
@@ -2529,10 +2565,11 @@ def search(
             merged.append(h)
     # Video-title pass: matching titles surface saved-channel uploads that
     # have no transcript/chat yet (the channel index accumulates every
-    # upload the panel has ever fetched). Included only in the "both" source
-    # (titles are neither chat nor transcript). Same normalization rule as
-    # the content tables: best title hit scores 1.0.
-    if source == "both":
+    # upload the panel has ever fetched). Included in "both" (titles are
+    # neither chat nor transcript) and alone in "video" (the dedicated
+    # title filter). Same normalization rule as the content tables: best
+    # title hit scores 1.0.
+    if source in ("both", "video"):
         title_rows = _titles_search(
             q,
             fetch,
@@ -2579,7 +2616,7 @@ def search(
         per_video[key] = per_video.get(key, 0) + 1
         h.pop("_rowid", None)
         out.append(h)
-    if semantic and source != "chat":
+    if semantic and source not in ("chat", "video"):
         # Concept pass: embedding-based hits lead, lexical follows (deduped
         # by video). Any embedding failure degrades to pure lexical.
         try:
@@ -3250,6 +3287,20 @@ _embed_query_cache: "collections.OrderedDict[tuple, object]" = collections.Order
 _rerank_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
 _EMBED_QUERY_CACHE_MAX = 64
 _RERANK_CACHE_MAX = 16
+# Session-level RESPONSE cache for the whole semantic pass: an identical
+# repeat submit (same query + every filter + limit) skips the matrix scan
+# and rerank entirely — the vector/rerank caches above only skip pieces.
+# TTL ~60s so fresh ingest stays visible; keys carry the embed/rerank
+# callables as identity stamps (same convention as the caches above), so a
+# model reload can never serve stale vectors. ponytail: a write-heavy
+# session could keep re-serving pre-write vectors for the TTL window —
+# upgrade path: stamp the key with the transcript_embeddings MAX(id) when
+# the corpus churns faster than 60s.
+_semantic_resp_cache: "collections.OrderedDict[tuple, tuple[float, list[dict]]]" = (
+    collections.OrderedDict()
+)
+_SEMANTIC_RESP_CACHE_MAX = 32
+_SEMANTIC_RESP_TTL_S = 60.0
 
 
 def _embed_matrix_paths(mx: int) -> tuple[Path, Path]:
@@ -3398,6 +3449,21 @@ def _semantic_search(
 
     from services import archive_embed  # lazy: onnxruntime stays out of boot
 
+    # Whole-pass response cache: identical params within the TTL return the
+    # previous hit list (deep-copied — callers mutate hits, e.g. the
+    # _attach_platforms pass). Key carries the model callables so a session
+    # that swaps models never reuses stale vectors.
+    resp_key = (
+        q, tuple(platforms), video_id, channel, tuple(kinds),
+        date_from, date_to, lang, fetch,
+        archive_embed.embed_query, archive_embed.rerank,
+    )
+    cached = _semantic_resp_cache.get(resp_key)
+    if cached is not None:
+        if time.monotonic() - cached[0] <= _SEMANTIC_RESP_TTL_S:
+            return [dict(h) for h in cached[1]]
+        _semantic_resp_cache.pop(resp_key, None)
+
     qkey = (q, archive_embed.embed_query)
     qv = _embed_query_cache.get(qkey)
     if qv is None:
@@ -3529,6 +3595,9 @@ def _semantic_search(
     # embedding scan has no SQL row filter, so mismatched-family hits are
     # dropped here (Python twin of _channel_lang_exclusion).
     out = [h for h in out if _lang_matches_channel(h["lang"], h["channel_language"])]
+    if len(_semantic_resp_cache) >= _SEMANTIC_RESP_CACHE_MAX:
+        _semantic_resp_cache.popitem(last=False)
+    _semantic_resp_cache[resp_key] = (time.monotonic(), [dict(h) for h in out])
     return out
 
 

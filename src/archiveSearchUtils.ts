@@ -64,7 +64,7 @@ export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
  */
 export const ARCHIVE_FILTER_KINDS = ARCHIVE_KINDS.filter((k) => k !== 'live');
 
-export const ARCHIVE_SOURCES = ['both', 'transcript', 'chat'] as const;
+export const ARCHIVE_SOURCES = ['both', 'video', 'transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
@@ -84,10 +84,12 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
 };
 
 /** i18n keys for the source-filter labels. The query PARAM values stay
- *  stable (both|transcript|chat — buildSearchUrl sends them untouched);
- *  only the display words changed (STREAMER → speech, BOTH → both). */
+ *  stable (both|video|transcript|chat — buildSearchUrl sends them
+ *  untouched); only the display words changed (STREAMER → speech, BOTH →
+ *  both). */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
   both: 'both',
+  video: 'video',
   transcript: 'speech',
   chat: 'chat',
 };
@@ -231,13 +233,30 @@ export interface ArchiveChatMessage {
   spam_count?: number;
 }
 
-/** Background indexing work kicked by a search (backend fires it lazily). */
+/** Background indexing work kicked by a search (backend fires it lazily).
+ *  Kind values are the backend's own: 'chat' = Twitch chat backfill,
+ *  'transcribe' = whisper transcription job. */
 export interface ArchiveEnrichEntry {
   platform: string;
   video_id: string;
-  kind: 'transcript' | 'chat_backfill';
+  kind: 'chat' | 'transcribe';
   channel?: string;
   title?: string;
+}
+
+/** Distinct enrichment kinds with per-kind counts, first-seen order — the
+ *  'Indexando' line shows each kind once ('retrocesso de chat (2)') instead
+ *  of one label per entry. */
+export function enrichKindCounts(
+  entries: readonly ArchiveEnrichEntry[],
+): Array<{ kind: ArchiveEnrichEntry['kind']; count: number }> {
+  const order: ArchiveEnrichEntry['kind'][] = [];
+  const counts = new Map<ArchiveEnrichEntry['kind'], number>();
+  for (const e of entries) {
+    if (!counts.has(e.kind)) order.push(e.kind);
+    counts.set(e.kind, (counts.get(e.kind) ?? 0) + 1);
+  }
+  return order.map((kind) => ({ kind, count: counts.get(kind) ?? 0 }));
 }
 
 /** GET /api/archive/search response (enriching/channel_hint always present). */
