@@ -370,6 +370,38 @@ def _transcribe_candidates(
     # Shortest-first SQL scan; final rank re-sorts by relevance in Python.
     sql += " ORDER BY v.duration_sec ASC LIMIT 50"
     rows = list(archive_db.query(sql, params))
+    # Batch the per-candidate probes (were 2 queries EACH — an N+1 of up to
+    # 100 SELECTs per search when the worker is live): transcript coverage
+    # and the latest transcribe job, both read-only filters with identical
+    # per-video semantics. Job ids are unique per video
+    # ("transcribe-<platform>-<vid>"), so per-video "latest" is well-defined.
+    vids = [r["video_id"] for r in rows]
+    try:
+        from deps import settings_mgr  # lazy: mirrors captions_cover
+
+        subtitles_first = bool(getattr(settings_mgr.get(), "yt_subtitles_first", True))
+    except Exception:
+        subtitles_first = True
+    covered: set[str] = set()
+    latest_by_vid: dict[str, dict] = {}
+    if vids:
+        if subtitles_first:
+            covered = {
+                r["video_id"] for r in archive_db.query(
+                    "SELECT DISTINCT video_id FROM transcripts "
+                    "WHERE platform='youtube' AND video_id IN ("
+                    + ",".join("?" * len(vids)) + ")",
+                    vids,
+                )
+            }
+        for r in archive_db.query(
+            "SELECT * FROM archive_jobs WHERE platform='youtube' "
+            "AND video_id IN (" + ",".join("?" * len(vids)) + ") AND kind='transcribe'",
+            vids,
+        ):
+            cur = latest_by_vid.get(r["video_id"])
+            if cur is None or r["created_at"] > cur["created_at"]:
+                latest_by_vid[r["video_id"]] = dict(r)
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_TRANSCRIBE_FAILED_FRESH_S)
     out: list[dict] = []
     for r in rows:
@@ -378,9 +410,9 @@ def _transcribe_candidates(
             continue
         if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
             continue  # file gone — whisper would fail immediately
-        if archive_db.captions_cover("youtube", vid):
+        if vid in covered:
             continue
-        latest = archive_db.latest_job("youtube", vid, kind="transcribe")
+        latest = latest_by_vid.get(vid)
         if latest and latest["status"] in ("queued", "running"):
             continue
         if latest and latest["status"] == "failed":
