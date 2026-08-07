@@ -23,8 +23,12 @@ Dedupe rule (user-mandated, cross-platform):
 
   Only Kick-exclusive content is downloaded. Downloads are best-effort:
   budget-capped (default 300 s/video — user rule), 720p, cancelled via
-  cancel_event. Failures (Cloudflare block, missing HLS source, timeout)
-  are recorded as status='failed' with the error in archive_jobs.error.
+  cancel_event. Transient failures (Cloudflare block, rate-limit, timeout)
+  get ONE retry after a short pause, then the job is REQUEUED (videos row
+  stays 'known'; archive_jobs back to 'queued') so the next ingest pass
+  retries once the gate cooldown lifts. Only terminal failures (missing HLS
+  source, ffmpeg/encoder errors, exhausted 5xx) are recorded as
+  status='failed' with the error in archive_jobs.error.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ import unicodedata
 from pathlib import Path
 from typing import Optional
 
-from services import archive_content_dedup, archive_db, kick_api_service
+from services import archive_content_dedup, archive_db, kick_api_service, kick_gate
 from services.kick_models import KickVideo
 from services.settings import _get_appdata_dir
 
@@ -48,6 +52,10 @@ logger = logging.getLogger(__name__)
 PLATFORM = "kick"
 _PRIORITY = {"youtube": 0, "twitch": 1, "kick": 2}
 _DEFAULT_BUDGET_SEC = 300.0  # user rule: never burn more than 5 min per video
+# Pause before the ONE download retry on a transient failure. Each attempt
+# keeps its own max_download_sec budget; the pause is outside the budget
+# (worst case ≈ 2×budget + 30 s for a transient-failing VOD).
+_RETRY_DELAY_SEC = 30.0
 
 
 def _enforce_retention() -> None:
@@ -232,8 +240,24 @@ def _ingest_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{v.id}.mp4"
     t0 = time.monotonic()
-    outcome = _download_with_budget(v.url or f"https://kick.com/{slug}/videos/{v.id}",
-                                    str(out_path), max_download_sec, quality)
+    url = v.url or f"https://kick.com/{slug}/videos/{v.id}"
+    outcome: dict = {}
+    # Transient failures (Cloudflare/rate-limit/timeout) get ONE retry after
+    # a short pause; each attempt keeps its own max_download_sec budget
+    # (worst case ≈ 2×budget + retry pause). While the gate is frozen a
+    # retry would only fail fast again, so it is skipped and the job is
+    # requeued directly (below).
+    for attempt in (1, 2):
+        outcome = _download_with_budget(url, str(out_path), max_download_sec, quality)
+        if outcome.get("ok"):
+            break
+        err = str(outcome.get("error", "unknown failure"))
+        transient = kick_gate.classify_transient_kick_error(err)
+        if attempt == 2 or not transient or kick_gate.kick_gate_active():
+            break
+        logger.info("archive_kick: %s transient failure (%s) — retrying in %.0fs",
+                    v.id, err, _RETRY_DELAY_SEC)
+        time.sleep(_RETRY_DELAY_SEC)
     spent = time.monotonic() - t0
 
     if outcome.get("ok"):
@@ -257,6 +281,19 @@ def _ingest_one(
         out_path.unlink(missing_ok=True)  # drop partial file
     except OSError:
         pass
+    if kick_gate.classify_transient_kick_error(err):
+        # Transient even after the retry (Cloudflare/rate-limit/timeout):
+        # requeue, never fail — the next ingest pass retries once the gate
+        # cooldown lifts. The videos row stays 'known' (metadata only), so
+        # search/dedupe do not treat the VOD as done or dead.
+        note = f"requeued: transient Kick failure: {err}"
+        _record_note(v.id, key, note)
+        archive_db.upsert_video({**base, "status": "known"})
+        archive_db.update_job(job_id, status="queued", error=note)
+        logger.warning("archive_kick: %s REQUEUED (%ds): %s", v.id, int(spent), err)
+        return {**base, "action": "requeued", "status": "known", "error": err,
+                "seconds_spent": round(spent, 1)}
+
     archive_db.upsert_video({**base, "status": "failed"})
     note = f"download failed: {err}"
     _record_note(v.id, key, note)
