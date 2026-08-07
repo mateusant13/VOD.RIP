@@ -26,6 +26,15 @@ Design decisions:
     side and restores the exclusive-GPU worker). Each pool thread is pinned
     to its slot's device at thread start, so CPU threads never compete for
     VRAM. CPU-only hosts are unchanged (WORKERS, default 2).
+  * Parakeet CPU lane: when sherpa-onnx is importable (and VODRIP_PARAAKEET
+    is not 0), CPU slots transcribe jobs whose language is in Parakeet TDT
+    v3's 25 European languages with sherpa-onnx (2.5-5.2 RTFx vs
+    whisper-large-v3-turbo cpu/int8 at 0.26-0.6, ~0.7 GB less RSS, no
+    silence hallucination — A/B 2026-08-07). Known-other (ja, ...) and
+    unknown languages stay whisper int8; GPU slots are ALWAYS whisper
+    (Parakeet has no Windows CUDA wheel and whisper-cuda is the quality
+    leader). Model auto-downloads on first use into the sherpa cache
+    (VODRIP_SHERRPA_CACHE or a whisper-cache sibling).
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
     cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
     so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
@@ -74,6 +83,8 @@ IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
 BEAM_ENV = "VODRIP_WHISPER_BEAM"
 BATCH_ENV = "VODRIP_WHISPER_BATCH"
+PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet CPU lane (whisper int8)
+PARAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"  # sherpa-onnx model cache override
 
 # --- device / compute -----------------------------------------------------
 
@@ -682,13 +693,15 @@ def _close_model_unlocked() -> None:
 
 
 def close_model() -> None:
-    """Unload the cached model, freeing its RAM. Safe mid-transcription: workers
+    """Unload the cached models, freeing RAM. Safe mid-transcription: workers
     hold a local reference, so the object lives until their last use.
 
     Also drops the cached VAD model (lazy-reloaded by the next job) and, in
-    multi-copy mode, every pool thread's model too; threads lazily reload on
-    their next job (the registry is cleared, so a fresh slot is created)."""
-    global _vad
+    multi-copy mode, every pool thread's whisper model AND parakeet
+    recognizer too (threads lazily reload on their next job — the registry
+    is cleared, so a fresh slot is created). The process-global parakeet
+    recognizer (single-model mode) is dropped as well."""
+    global _vad, _parakeet_global
     closed_any = False
     with _model_lock:
         _close_model_unlocked()
@@ -698,7 +711,17 @@ def close_model() -> None:
                 logger.info("Unloading whisper thread model")
                 del model
                 closed_any = True
+            parakeet, slot.parakeet = slot.parakeet, None
+            if parakeet is not None:
+                logger.info("Unloading parakeet thread recognizer")
+                del parakeet
+                closed_any = True
         _thread_slots.clear()
+        parakeet, _parakeet_global = _parakeet_global, None
+        if parakeet is not None:
+            logger.info("Unloading parakeet recognizer")
+            del parakeet
+            closed_any = True
     with _vad_lock:
         vad, _vad = _vad, None
         if vad is not None:
@@ -710,15 +733,16 @@ def close_model() -> None:
 
 
 def _maybe_close_idle_model() -> None:
-    """Close the model after VODRIP_WHISPER_IDLE_CLOSE seconds without use.
-
-    Applies to the process-global model only: thread models die with the
-    pool (close_model on worker shutdown)."""
-    if _model is None:
+    """Close the process-global whisper model or parakeet recognizer after
+    VODRIP_WHISPER_IDLE_CLOSE seconds without use. Thread models die with
+    the pool (close_model on worker shutdown)."""
+    idle_sec = _idle_close_seconds()
+    if _model is not None and time.monotonic() - _model_last_used > idle_sec:
+        logger.info("Model idle for %.0fs — unloading", idle_sec)
+        close_model()
         return
-    idle = time.monotonic() - _model_last_used
-    if idle > _idle_close_seconds():
-        logger.info("Model idle for %.0fs — unloading", idle)
+    if _parakeet_global is not None and time.monotonic() - _parakeet_last_used > idle_sec:
+        logger.info("Parakeet recognizer idle for %.0fs — unloading", idle_sec)
         close_model()
 
 
@@ -737,12 +761,13 @@ _multi_tls = threading.local()  # per-thread: .active, .cpu_fallback, .pin
 
 
 class _ThreadModelSlot:
-    """One pool thread's lazy model state."""
-    __slots__ = ("model", "model_name")
+    """One pool thread's lazy model state (whisper copy + parakeet recognizer)."""
+    __slots__ = ("model", "model_name", "parakeet")
 
     def __init__(self) -> None:
         self.model: Any = None
         self.model_name: Optional[str] = None
+        self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (CPU slots)
 
 
 _thread_slots: dict[int, _ThreadModelSlot] = {}
@@ -863,6 +888,290 @@ def _current_model() -> Any:
     if _in_multi_mode():
         return _thread_model()
     return _get_model()
+
+
+# --- Parakeet CPU lane (sherpa-onnx) --------------------------------------
+# A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
+# int8 on CPU runs 2.5-5.2 RTFx vs whisper large-v3-turbo cpu/int8 at
+# 0.26-0.6 (7-15x), ~0.7 GB less peak RSS, and outputs nothing on silence
+# (no hallucination). GPU lanes stay whisper: parakeet has NO Windows CUDA
+# wheel and whisper-cuda remains the quality leader. The lane is opt-in end
+# to end: sherpa-onnx missing OR VODRIP_PARAAKEET=0 -> CPU lanes are whisper
+# int8, byte-identical to the pre-parakeet worker.
+PARAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+_PARAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+_PARAAKEET_FEATURE_DIM = 128  # nemo_transducer default (80) fails — must match the model
+# Model card: 25 European languages. Intersected at runtime with the lang
+# tokens the model's tokens.txt actually carries (see _parakeet_langs), so a
+# model/cache swap missing a language falls back to whisper for that job.
+PARAKEET_LANG_CANDIDATES = frozenset({
+    "pt", "en", "es", "fr", "de", "it", "ru", "uk", "pl", "nl", "sv", "da",
+    "no", "fi", "el", "tr", "hu", "cs", "ro", "bg", "hr", "sk", "sl", "et",
+    "lv", "lt",
+})
+# A/B-measured sweet spot: 8 decode threads per lane on an i5-13600K; two
+# concurrent streams on ONE recognizer added only +18% (CPU-bound), so lanes
+# never share a recognizer — each pool thread owns its own.
+_PARAAKEET_MAX_THREADS = 8
+
+_parakeet_ok: Optional[bool] = None  # sherpa-onnx import probe (None = unprobed)
+_parakeet_global: Any = None  # process-global recognizer (single-model mode)
+_parakeet_last_used = 0.0
+
+
+def _parakeet_available() -> bool:
+    """True when the parakeet CPU lane can run.
+
+    VODRIP_PARAAKEET=0 is a hard kill switch (no import probe). Otherwise
+    the sherpa-onnx import is probed once per process and cached; an import
+    failure degrades CPU lanes to whisper int8 — exactly today's behavior."""
+    if os.environ.get(PARAKEET_ENV, "1").strip() == "0":
+        return False
+    global _parakeet_ok
+    if _parakeet_ok is None:
+        try:
+            import sherpa_onnx  # noqa: F401
+            _parakeet_ok = True
+        except Exception:
+            _parakeet_ok = False
+    return _parakeet_ok
+
+
+def _parakeet_cache_dir() -> Path:
+    """Sherpa model cache: VODRIP_SHERRPA_CACHE override, else a SIBLING of
+    the whisper cache — never inside it (the disk-hygiene sweep would prune
+    a non-whisper HF-style model dir as 'inactive')."""
+    override = os.environ.get(PARAKEET_CACHE_ENV, "").strip()
+    if override:
+        return Path(override)
+    base = _cache_dir()
+    return base.parent / "parakeet-models"
+
+
+def _parakeet_resolve_dir() -> Optional[Path]:
+    """The model dir when all four files are present locally, else None.
+
+    Accepts the files at the cache root or under the model-name subdir (the
+    hf_hub_download(local_dir=...) layout); NEVER downloads — the caller
+    decides whether a download is wanted."""
+    cache = _parakeet_cache_dir()
+    for d in (cache / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8", cache):
+        if all((d / f).is_file() for f in _PARAKEET_FILES):
+            return d
+    return None
+
+
+def _parakeet_model_dir() -> Path:
+    """Ensure the parakeet model files exist locally (auto-download on first
+    use into the sherpa cache via huggingface_hub) and return the dir."""
+    d = _parakeet_resolve_dir()
+    if d is not None:
+        return d
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as exc:
+        raise RuntimeError(
+            "Parakeet model download needs huggingface_hub — install it or "
+            "pre-seed the sherpa cache (VODRIP_SHERRPA_CACHE)"
+        ) from exc
+    target = _parakeet_cache_dir() / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    target.mkdir(parents=True, exist_ok=True)
+    for f in _PARAKEET_FILES:
+        logger.info("Downloading parakeet model file %s ...", f)
+        hf_hub_download(repo_id=PARAKEET_MODEL, filename=f, local_dir=str(target))
+    if not all((target / f).is_file() for f in _PARAKEET_FILES):
+        raise RuntimeError(f"parakeet model download incomplete in {target}")
+    return target
+
+
+def _parakeet_langs() -> frozenset[str]:
+    """Languages routed to parakeet: the candidate set intersected with the
+    lang tokens the model actually carries (<|pt|> etc. in tokens.txt).
+
+    The intersection is the runtime guard against a model/cache mismatch (a
+    swapped model missing a language falls back to whisper for it). When the
+    model isn't downloaded yet the candidate set is trusted — routing is
+    correct either way (the guard only ever narrows)."""
+    if not _parakeet_available():
+        return frozenset()
+    d = _parakeet_resolve_dir()
+    if d is not None:
+        found: set[str] = set()
+        try:
+            for line in (d / "tokens.txt").read_text(encoding="utf-8").splitlines():
+                m = re.match(r"^<\|([a-z]{2})\|>\s", line)
+                if m:
+                    found.add(m.group(1))
+        except OSError:
+            found = set()
+        if found:
+            return frozenset(PARAKEET_LANG_CANDIDATES & found)
+    return PARAKEET_LANG_CANDIDATES
+
+
+def _parakeet_threads() -> int:
+    """sherpa-onnx decode threads per CPU lane: the box's cores divided by
+    the CPU lane count, capped at the A/B-measured 8-thread sweet spot.
+    Machine-aware: a 20-thread box with the default 2 CPU lanes gets 8."""
+    lanes = max(1, _cpu_worker_ceiling() or 2)  # 0 == auto on CPU-only hosts
+    cores = os.cpu_count() or 4
+    return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes))
+
+
+def _slot_engine(device: str) -> str:
+    """Engine for a plan slot: 'whisper' on GPU lanes (parakeet has no
+    Windows CUDA wheel), parakeet-or-whisper on CPU lanes (import failure
+    and VODRIP_PARAAKEET=0 both fall back to whisper int8)."""
+    if device == "cuda":
+        return "whisper"
+    return "parakeet" if _parakeet_available() else "whisper"
+
+
+def _job_engine(language: Optional[str]) -> str:
+    """Engine for THIS job on the calling lane: 'parakeet' when the lane is
+    a CPU slot AND the job's language is in parakeet's supported set; known
+    other languages (ja, ...) and UNKNOWN language stay whisper int8 (the
+    pre-parakeet path). GPU slots are always whisper."""
+    device, _ = _thread_pin() or _effective_device()
+    if device == "cuda":
+        return "whisper"
+    if _parakeet_available() and language in _parakeet_langs():
+        return "parakeet"
+    return "whisper"
+
+
+def _asr_model_name(engine: str) -> str:
+    """The model id reported/written for a run's engine: the parakeet repo
+    id for parakeet runs, the active whisper model otherwise."""
+    return PARAKEET_MODEL if engine == "parakeet" else model_name()
+
+
+def _load_parakeet() -> Any:
+    """Build one sherpa-onnx OfflineRecognizer (nemo_transducer)."""
+    import sherpa_onnx
+
+    d = _parakeet_model_dir()
+    t0 = time.monotonic()
+    rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=str(d / "encoder.int8.onnx"),
+        decoder=str(d / "decoder.int8.onnx"),
+        joiner=str(d / "joiner.int8.onnx"),
+        tokens=str(d / "tokens.txt"),
+        num_threads=_parakeet_threads(),
+        sample_rate=SAMPLE_RATE,
+        feature_dim=_PARAAKEET_FEATURE_DIM,
+        model_type="nemo_transducer",
+    )
+    logger.info(
+        "Parakeet recognizer loaded in %.1fs (threads=%d, cache=%s)",
+        time.monotonic() - t0, _parakeet_threads(), _parakeet_cache_dir(),
+    )
+    return rec
+
+
+def _parakeet_model() -> Any:
+    """The recognizer for the current context: the calling thread's own copy
+    in multi-copy mode, else the process-global one. Mirrors _current_model;
+    creation is serialized by _model_lock (shared model dir + download);
+    inference never takes a lock (each recognizer has one owner)."""
+    global _parakeet_global, _parakeet_last_used
+    _parakeet_last_used = time.monotonic()
+    if _in_multi_mode():
+        slot = _thread_slot()
+        if slot.parakeet is None:
+            with _model_lock:
+                if slot.parakeet is None:
+                    slot.parakeet = _load_parakeet()
+        return slot.parakeet
+    with _model_lock:
+        if _parakeet_global is None:
+            _parakeet_global = _load_parakeet()
+        return _parakeet_global
+
+
+def _parakeet_words(tokens: list[str], timestamps: list[float]) -> list[dict]:
+    """Word-level items from the recognizer's per-token timestamps.
+
+    The HF-converted vocab marks word-initial pieces with a leading space
+    (the source SentencePiece ▁); the lone-space piece is a space INSIDE a
+    word ('de 10'), so a new word starts only on a piece that begins with a
+    space and is longer than one char. Word end = the last token's start
+    time (monotonic; matches whisper's word shape). Validated on real audio:
+    concatenating the pieces reconstructs result.text exactly."""
+    words: list[dict] = []
+    cur = ""
+    start: Optional[float] = None
+    end: Optional[float] = None
+    for tok, ts in zip(tokens, timestamps):
+        word_start = tok.startswith(" ") and len(tok) > 1
+        if word_start and cur:
+            words.append({
+                "word": cur,
+                "start": round(start or 0.0, 3),
+                "end": round(end or 0.0, 3),
+            })
+            cur, start = tok.lstrip(" "), ts
+        elif word_start:
+            cur, start = tok.lstrip(" "), ts
+        elif not cur:
+            cur, start = tok, ts  # stream opened mid-word (not seen in practice)
+        else:
+            cur += tok
+        end = ts
+    if cur:
+        words.append({
+            "word": cur,
+            "start": round(start or 0.0, 3),
+            "end": round(end or 0.0, 3),
+        })
+    return words
+
+
+def _transcribe_batch_parakeet(
+    rec: Any,
+    audio: "Any",
+    chunks: list[tuple[float, float]],
+    language: Optional[str],
+    *,
+    clip_offsets: Optional[list[float]] = None,
+) -> list[tuple[list[dict], Optional[str]]]:
+    """Decode [start,end] clips with the sherpa-onnx parakeet recognizer.
+
+    One OfflineStream per clip (recognizers are stateless per stream; the
+    A/B measured 2-stream concurrency at only +18% — CPU-bound — so clips
+    decode sequentially). Segments carry absolute video timestamps and the
+    same JSON shape _transcribe_batch produces: one segment per clip with
+    word-level timestamps. An empty transcript (silence -> no words — the
+    parakeet no-hallucination behavior) yields no segment for that clip.
+    ponytail: whisper splits segments on its own sentence boundaries; here
+    one VAD chunk is one segment. Upgrade path: split a segment at word
+    gaps > 1 s if the UI ever needs finer granularity."""
+    out: list[tuple[list[dict], Optional[str]]] = []
+    for i, (cs, ce) in enumerate(chunks):
+        base = 0.0 if clip_offsets is None else clip_offsets[i]
+        s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
+        clip = audio[s0:s1]
+        stream = rec.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, clip)
+        rec.decode_stream(stream)
+        res = stream.result
+        text = (res.text or "").strip()
+        if not text:
+            out.append(([], language))
+            continue
+        words = _parakeet_words(
+            getattr(res, "tokens", []) or [],
+            getattr(res, "timestamps", []) or [],
+        )
+        last_word_end = (words[-1]["end"] if words else float(ce)) + base
+        items = [{
+            "start_sec": round(cs + base, 3),
+            "end_sec": round(min(ce + base, last_word_end + 0.3), 3),
+            "text": text,
+            "words": words,
+        }]
+        out.append((items, language))
+    return out
 
 
 # --- audio decode ---------------------------------------------------------
@@ -1507,10 +1816,16 @@ def _read_manifest(path: Path) -> tuple[Optional[dict], dict[int, dict]]:
     return header, entries
 
 
-def _write_manifest_header(path: Path, chunks: list[tuple[float, float]]) -> None:
+def _write_manifest_header(
+    path: Path, chunks: list[tuple[float, float]], engine: str = "whisper"
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"chunks": chunks, "model": model_name()}) + "\n")
+        fh.write(json.dumps({
+            "chunks": chunks,
+            "model": _asr_model_name(engine),
+            "engine": engine,
+        }) + "\n")
 
 
 def _append_manifest_entry(path: Path, ci: int, first: int, count: int) -> None:
@@ -1523,14 +1838,18 @@ def _resume_plan(
     header: Optional[dict],
     entries: dict[int, dict],
     existing: set[int],
+    engine: str = "whisper",
 ) -> tuple[list[int], int]:
     """Return (chunk indices to transcribe, next free seg_idx).
 
-    Entries are trusted only when the header matches the current plan and model.
-    A chunk is also re-transcribed when any row in its recorded seg_idx range is
-    missing (manual delete / partial write), and the next free index is the
-    LOWEST gap in existing — so deleted rows are restored at their old index
-    and the seg_idx sequence stays contiguous."""
+    Entries are trusted only when the header matches the current plan, model
+    AND engine (an engine switch — parakeet <-> whisper — invalidates the
+    manifest like a model change does; pre-parakeet manifests carry no
+    'engine' key and read as whisper). A chunk is also re-transcribed when
+    any row in its recorded seg_idx range is missing (manual delete /
+    partial write), and the next free index is the LOWEST gap in existing —
+    so deleted rows are restored at their old index and the seg_idx sequence
+    stays contiguous."""
     if not chunks:
         return [], 0
     next_idx = 0
@@ -1539,7 +1858,11 @@ def _resume_plan(
     if not (header and entries):
         return list(range(len(chunks))), next_idx
     # JSON round-trip turns the plan's tuples into lists — compare shapes.
-    if [tuple(c) for c in header.get("chunks", [])] != chunks or header.get("model") != model_name():
+    if (
+        [tuple(c) for c in header.get("chunks", [])] != chunks
+        or header.get("engine", "whisper") != engine
+        or header.get("model") != _asr_model_name(engine)
+    ):
         return list(range(len(chunks))), next_idx
     missing: list[int] = []
     for ci in range(len(chunks)):
@@ -1830,11 +2153,14 @@ def _transcribe_audio_source(
         return stats
 
     # Model load happens only now: VAD + planning are model-free, so a
-    # no-speech video never pays the (large) load cost.
-    model = _current_model()
+    # no-speech video never pays the (large) load cost. The engine is the
+    # slot's choice for this job's language: parakeet (CPU lanes, supported
+    # languages) or whisper (everything else — GPU slots, other languages).
+    engine = _job_engine(language)
+    model = _parakeet_model() if engine == "parakeet" else _current_model()
     existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id)}
     header, entries = _read_manifest(_manifest_path(platform, video_id))
-    missing, seg_idx = _resume_plan(chunks, header, entries, existing)
+    missing, seg_idx = _resume_plan(chunks, header, entries, existing, engine=engine)
     if len(missing) == len(chunks) and existing:
         # Full re-run of an already-transcribed video: the manifest is gone
         # (previous run finished and cleaned it), so the old rows are stale
@@ -1870,13 +2196,14 @@ def _transcribe_audio_source(
         while ci < n_chunks and ci in missing_set and len(run) < _batch_size():
             run.append((ci, chunks[ci]))
             ci += 1
+        batch_fn = _transcribe_batch_parakeet if engine == "parakeet" else _transcribe_batch
         if sharded_audio is not None:
             batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
-            batch_out = _transcribe_batch(
+            batch_out = batch_fn(
                 model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
             )
         else:
-            batch_out = _transcribe_batch(model, audio, [c for _, c in run], language)
+            batch_out = batch_fn(model, audio, [c for _, c in run], language)
         for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
             if detected_lang is None and detected:
                 detected_lang = detected  # first batch's detection wins
@@ -1921,7 +2248,8 @@ def _transcribe_audio_source(
     stats = {
         "platform": platform,
         "video_id": video_id,
-        "model": model_name(),
+        "model": _asr_model_name(engine),
+        "engine": engine,
         "device": _ran[0],
         "compute_type": _ran[1],
         "total_sec": round(total_sec, 3),
@@ -1936,9 +2264,9 @@ def _transcribe_audio_source(
     }
     logger.info(
         "transcribe %s/%s done: %d segs, %d words, %.1f%% dead air skipped, "
-        "%.2fx realtime on %s/%s",
+        "%.2fx realtime on %s/%s (%s)",
         platform, video_id, segments, words, dead_air_pct,
-        stats["speed_x"], stats["device"], stats["compute_type"],
+        stats["speed_x"], stats["device"], stats["compute_type"], engine,
     )
     if events_cb is not None:
         # Optional enrichment stage (VODRIP_EVENTS_ENABLED=1): reuses this
@@ -2608,3 +2936,69 @@ finally:
         os.environ.pop(GPU_COPIES_ENV, None)
     else:
         os.environ[GPU_COPIES_ENV] = _saved_plan_g
+
+# parakeet CPU lane — engine routing (pure logic: the import probe is pinned
+# via the cached _parakeet_ok flag, sherpa-onnx is never imported here and
+# nothing downloads; the sherpa cache is pointed at a scratch dir with a
+# controlled tokens.txt for the intersection check).
+_saved_pok, _saved_pin = _parakeet_ok, getattr(_multi_tls, "pin", None)
+_saved_peng, _saved_pcache = _device_override, os.environ.get(PARAKEET_CACHE_ENV)
+_saved_penv = os.environ.get(PARAKEET_ENV)
+_scratch_sherpa = Path(tempfile.mkdtemp(prefix="vodrip-parakeet-selfcheck-"))
+try:
+    os.environ[PARAKEET_CACHE_ENV] = str(_scratch_sherpa)  # no model dir yet
+    _parakeet_ok = True
+    _device_override = ("cpu", "int8")
+    assert _job_engine("pt") == "parakeet", "pt routes to parakeet on a CPU lane"
+    assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
+    assert _job_engine("es") == "parakeet", "es routes to parakeet on a CPU lane"
+    assert _job_engine("ja") == "whisper", "known-other languages stay on whisper"
+    assert _job_engine(None) == "whisper", "unknown language stays on whisper"
+    _device_override = ("cuda", "float16")
+    assert _job_engine("pt") == "whisper", "GPU lanes never run parakeet"
+    _device_override = ("cpu", "int8")
+    os.environ[PARAKEET_ENV] = "0"
+    assert _job_engine("pt") == "whisper", "VODRIP_PARAAKEET=0 kills the parakeet lane"
+    os.environ.pop(PARAKEET_ENV, None)
+    _parakeet_ok = False
+    assert _job_engine("pt") == "whisper", "sherpa-onnx import failure -> whisper int8"
+    assert _parakeet_langs() == frozenset(), "import-fail lane routes no languages"
+    _parakeet_ok = True
+    assert _parakeet_langs() == PARAKEET_LANG_CANDIDATES, (
+        "the candidate set is authoritative until the model dir exists"
+    )
+    assert 1 <= _parakeet_threads() <= _PARAAKEET_MAX_THREADS, (
+        "thread budget must be positive and capped at the A/B sweet spot"
+    )
+    # tokens.txt present -> the candidate set must narrow to the model's
+    # actual lang tokens (a swapped model missing a language falls back).
+    _pd = _scratch_sherpa / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    _pd.mkdir(parents=True, exist_ok=True)
+    for _f in _PARAKEET_FILES:
+        (_pd / _f).write_text("x", encoding="utf-8")  # existence is all the resolver checks
+    (_pd / "tokens.txt").write_text(
+        "<|pt|> 0\n<|ja|> 1\n<|zh|> 2\n", encoding="utf-8"
+    )
+    assert _parakeet_langs() == {"pt"}, (
+        "routing must intersect the candidate set with the model's lang tokens"
+    )
+    # word assembly: the real vocab convention (space-prefixed word-initial
+    # pieces, lone-space piece inside a word) must produce whisper-shaped words.
+    _toks = [" N", "eg", "an", " de", " ", "1", "0", " minut", "os", ",", " né", "?"]
+    _ts = [0.32, 0.48, 0.56, 0.8, 1.04, 1.12, 1.12, 1.2, 1.28, 1.36, 2.08, 2.24]
+    _ws = _parakeet_words(_toks, _ts)
+    assert [w["word"] for w in _ws] == ["Negan", "de 10", "minutos,", "né?"], _ws
+    assert _ws[0] == {"word": "Negan", "start": 0.32, "end": 0.56}, _ws[0]
+finally:
+    _parakeet_ok = _saved_pok
+    _device_override = _saved_peng
+    _multi_tls.pin = _saved_pin
+    if _saved_pcache is None:
+        os.environ.pop(PARAKEET_CACHE_ENV, None)
+    else:
+        os.environ[PARAKEET_CACHE_ENV] = _saved_pcache
+    if _saved_penv is None:
+        os.environ.pop(PARAKEET_ENV, None)
+    else:
+        os.environ[PARAKEET_ENV] = _saved_penv
+    shutil.rmtree(_scratch_sherpa, ignore_errors=True)
