@@ -91,7 +91,10 @@ def _preview_archive_capabilities(session) -> tuple[bool, bool]:
         return False, False
     try:
         return (
-            archive_db.has_transcript(platform, video_id),
+            # transcript_available: own rows OR a canonical twin's rows —
+            # the panel serves the twin's transcript, so the flag must say
+            # the transcript exists for this video too.
+            archive_db.transcript_available(platform, video_id),
             archive_db.has_chat(platform, video_id),
         )
     except Exception:
@@ -236,7 +239,7 @@ async def preview_panel(
             }
             for r in archive_db.audio_events_for(p, video_id)
         ],
-        "has_transcript": archive_db.has_transcript(p, video_id),
+        "has_transcript": archive_db.transcript_available(p, video_id),
         "has_chat": archive_db.has_chat(p, video_id),
         "backfill": backfill,
         "backfill_progress": backfill_progress,

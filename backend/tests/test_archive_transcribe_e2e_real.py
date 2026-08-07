@@ -181,7 +181,9 @@ def _run() -> None:
     assert job["status"] == "done", f"job 1 not done: {job}"
     assert job["progress"] == 1.0, f"job 1 progress must end at 1.0: {job}"
 
-    segs = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    # raw=True: this test asserts the STORAGE contract (contiguous seg_idx,
+    # every written row) — the display read path dedupes overlapping cues.
+    segs = archive_db.transcript_for(PLATFORM, VIDEO_ID, raw=True)
     assert segs, "no transcript segments written"
     idxs = [int(s["seg_idx"]) for s in segs]
     assert idxs == list(range(len(segs))), f"seg_idx must be contiguous 0..n: {idxs}"
@@ -245,12 +247,12 @@ def _run() -> None:
     )[0]["id"]
     # FTS index entry cascades via the AFTER DELETE trigger.
     archive_db.execute("DELETE FROM transcripts WHERE id=?", (last_id,))
-    before_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    before_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID, raw=True)
     assert len(before_resume) == len(segs) - 1
 
     job2 = _enqueue_and_run("transcribe-e2e-2")
     assert job2["status"] == "done", f"job 2 not done: {job2}"
-    after_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID)
+    after_resume = archive_db.transcript_for(PLATFORM, VIDEO_ID, raw=True)
     # Every pre-existing row must be byte-identical (only the missing chunk ran).
     before_by_id = {r["id"]: r for r in before_resume}
     after_by_id = {r["id"]: r for r in after_resume}

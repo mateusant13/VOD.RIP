@@ -246,7 +246,9 @@ def _enqueue_and_run(job_id: str, video_id: str) -> dict:
 
 
 def _assert_segment_contract(video_id: str) -> list[dict]:
-    segs = archive_db.transcript_for(PLATFORM, video_id)
+    # raw=True: storage contract (contiguous seg_idx) — the display read
+    # path dedupes overlapping cues and may skip rows.
+    segs = archive_db.transcript_for(PLATFORM, video_id, raw=True)
     idxs = [int(s["seg_idx"]) for s in segs]
     assert idxs == list(range(len(segs))), f"seg_idx must be contiguous: {idxs}"
     words = [w for s in segs for w in json.loads(s["words_json"] or "[]")]

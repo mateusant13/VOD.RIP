@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import html
 import json
 import logging
 import os
@@ -354,6 +355,9 @@ def get_conn() -> sqlite3.Connection:
             _ensure_jobs_priority(_conn)
             _ensure_jobs_kind_chat(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
+            # One-time data migrations on transcripts (entity + lang backfill).
+            # Runs after the FTS rebuild so the current trigger set re-indexes.
+            _migrate_transcript_data(_conn)
             _conn.commit()
             if rebuilt:
                 # Legacy index rebuilds leave the old FTS shadow-table pages
@@ -526,6 +530,67 @@ def _ensure_lang_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(transcripts)")}
     if "lang" not in cols:
         conn.execute("ALTER TABLE transcripts ADD COLUMN lang TEXT")
+
+
+def _clean_legacy_transcript_text(text: str) -> str:
+    """Twin of archive_ytdlp._clean_caption_text for the data backfill.
+
+    Kept inline (not imported) because archive_ytdlp imports this module at
+    module level — a top-level import here would be circular; a lazy import
+    from get_conn would still run mid-import for the archive_db self-check.
+    html.unescape once, then strip '>>' speaker-turn markers exactly like
+    the ingest path so old rows converge to the same stored shape."""
+    text = html.unescape(text)
+    return re.sub(r"\s*>{2,}\s*", " ", text).strip()
+
+
+def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
+    """Idempotent one-time data migration on transcripts (batch-3).
+
+    Two steps, both naturally no-op on repeat runs:
+    1. Entity backfill: legacy rows stored caption text VERBATIM from a
+       pre-fix build — '&gt;&gt;' speaker markers, '&amp;' etc. Ingest now
+       unescapes (_clean_caption_text) but never rewrote old rows. Only
+       rows that still contain entities are touched; each UPDATE fires the
+       transcripts_ai FTS trigger so search re-indexes the cleaned text.
+    2. Lang backfill: rows with lang IS NULL get the owning video's channel
+       language family (pt/en/es) — makes the channel-family search
+       exclusion (_channel_lang_exclusion) effective for pre-lang builds
+       where every row is untagged. Unknown channel languages stay NULL.
+    """
+    # (1) entity unescape + turn-marker strip.
+    legacy = conn.execute(
+        "SELECT id, text FROM transcripts "
+        "WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'"
+    ).fetchall()
+    for r in legacy:
+        clean = _clean_legacy_transcript_text(r["text"])
+        if clean != r["text"]:
+            conn.execute(
+                "UPDATE transcripts SET text = ? WHERE id = ?", (clean, r["id"])
+            )
+    # (2) lang backfill from the video's channel language family. Only
+    # known families (pt/en/es) are stamped — the exclusion only fires for
+    # them; raw codes ('ja', ...) keep NULL so the tally never mistakes a
+    # derived tag for independent evidence.
+    conn.execute(
+        """UPDATE transcripts SET lang = (
+               SELECT lower(substr(v.channel_language, 1,
+                      instr(v.channel_language || '-', '-') - 1))
+               FROM videos v
+               WHERE v.platform = transcripts.platform
+                 AND v.video_id = transcripts.video_id
+                 AND v.channel_language IS NOT NULL AND v.channel_language != ''
+           )
+           WHERE lang IS NULL AND EXISTS (
+               SELECT 1 FROM videos v2
+               WHERE v2.platform = transcripts.platform
+                 AND v2.video_id = transcripts.video_id
+                 AND lower(substr(v2.channel_language, 1,
+                      instr(v2.channel_language || '-', '-') - 1))
+                     IN ('pt','en','es')
+           )"""
+    )
 
 
 def _ensure_spam_column(conn: sqlite3.Connection) -> None:
@@ -1412,18 +1477,62 @@ def has_chat(platform: str, video_id: str) -> bool:
     )
 
 
+# YouTube auto-caption tracks emit the same cue text twice (same words at
+# ~+10 ms and again ~+3.3 s — overlapping ASR cues) and the pre-fix ingest
+# stored them row-for-row; the display reads collapse such repeats. A legit
+# repeat of the same phrase further apart is real re-spoken content and kept.
+TRANSCRIPT_DUPE_MIN_GAP_SEC = 1.0
+
+
+def _dedupe_transcript_rows(rows: list[dict]) -> list[dict]:
+    """Drop a row whose text equals the previous KEPT row's text AND starts
+    < TRANSCRIPT_DUPE_MIN_GAP_SEC later (YouTube auto-caption overlap).
+
+    Single order-preserving pass over a time-ordered window; comparing to
+    the previous kept row collapses whole duplicate chains (0.0, 0.01, 0.02)
+    down to the first row.
+    ponytail: dedupe lives at read, not ingest — a UNIQUE(platform,
+    video_id, seg_idx) is structural but overlapping CUE text is a source
+    artifact; a real fix is deduping in _parse_vtt before insert."""
+    out: list[dict] = []
+    prev_text: Optional[str] = None
+    prev_start: Optional[float] = None
+    for r in rows:
+        start = float(r.get("start_sec") if r.get("start_sec") is not None else r.get("offset_sec") or 0.0)
+        text = r.get("text") or ""
+        if (
+            prev_text is not None
+            and text == prev_text
+            and prev_start is not None
+            and start - prev_start < TRANSCRIPT_DUPE_MIN_GAP_SEC
+        ):
+            continue
+        out.append(r)
+        prev_text = text
+        prev_start = start
+    return out
+
+
 def transcript_offsets(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
     """Transcript rows as preview-panel payload rows, time-ordered by start_sec.
 
     Same transcripts table the search/transcript_for paths read; the panel
     payload only needs (offset_sec, text) per row, so the heavy word/lang
-    columns are not selected."""
+    columns are not selected. When the video has no rows of its own, the
+    canonical twin's rows (youtube > twitch > kick) are served instead, so
+    a Twitch VOD with a transcribed YouTube mirror shows its transcript."""
     rows = query(
         "SELECT start_sec AS offset_sec, text FROM transcripts "
         "WHERE platform = ? AND video_id = ? ORDER BY start_sec LIMIT ?",
         (platform, video_id, limit),
     )
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if not out:
+        src = transcript_source(platform, video_id)
+        if src is not None and src != (platform, video_id):
+            return transcript_offsets(src[0], src[1], limit)
+        return []
+    return _dedupe_transcript_rows(out)
 
 
 def chat_for(platform: str, video_id: str, limit: int = 200_000) -> list[dict]:
@@ -1554,12 +1663,73 @@ def delete_transcripts(platform: str, video_id: str) -> int:
     return cur.rowcount
 
 
-def transcript_for(platform: str, video_id: str) -> list[dict]:
-    rows = query(
-        "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
-        (platform, video_id),
+def transcript_for(platform: str, video_id: str, *, raw: bool = False) -> list[dict]:
+    """All transcript rows for a video, seg_idx-ordered.
+
+    Default is the display shape: overlapping YouTube auto-caption
+    duplicates are dropped (see _dedupe_transcript_rows). raw=True returns
+    every stored row — the whisper resume path needs the full seg_idx set
+    so a deduped read can never make it re-insert an existing segment."""
+    rows = [
+        dict(r)
+        for r in query(
+            "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
+            (platform, video_id),
+        )
+    ]
+    return rows if raw else _dedupe_transcript_rows(rows)
+
+
+def transcript_source(platform: str, video_id: str) -> Optional[tuple[str, str]]:
+    """(src_platform, src_video_id) whose transcript rows should serve this
+    video for display: the video's own rows when present, else the best
+    canonical-group member that has rows, priority youtube > twitch > kick
+    (mirrors _PLATFORM_TRANSCRIBE_PRIORITY). None when nothing has rows.
+
+    Group resolution uses the same COALESCE(a.canonical_key, v.canonical_key)
+    LEFT JOIN as dedupe_view/_attach_platforms; a video outside any group
+    resolves to itself."""
+    if has_transcript(platform, video_id):
+        return (platform, video_id)
+    if platform not in _PLATFORM_TRANSCRIBE_PRIORITY:
+        return None
+    key = _canonical_key_for(platform, video_id)
+    if not key:
+        return None
+    best: Optional[tuple[str, str]] = None
+    best_prio = len(_PLATFORM_TRANSCRIBE_PRIORITY)
+    for v in _group_members(key):
+        p = v["platform"]
+        prio = _PLATFORM_TRANSCRIBE_PRIORITY.get(p)
+        if prio is None or prio >= best_prio:
+            continue
+        if has_transcript(p, v["video_id"]):
+            best = (p, v["video_id"])
+            best_prio = prio
+    return best
+
+
+def transcript_available(platform: str, video_id: str) -> bool:
+    """Display 'has transcript' flag: the video's own rows OR a canonical
+    twin's rows. Raw has_transcript() stays the internal guard (the
+    transcribe dedupe/skip paths need the video's OWN rows); display paths
+    use this so a Twitch VOD with a transcribed YouTube twin is not an
+    empty state."""
+    return bool(has_transcript(platform, video_id) or transcript_source(platform, video_id))
+
+
+def set_transcript_lang(platform: str, video_id: str, lang: Optional[str]) -> int:
+    """Rewrite every transcript row's lang tag for one video.
+
+    Used by the done-time channel-language correction: when the whisper
+    detection disagrees with the now-known channel language, the stored
+    rows are re-stamped so search filters agree with the channel decision.
+    Returns the number of rows touched."""
+    cur = execute(
+        "UPDATE transcripts SET lang = ? WHERE platform = ? AND video_id = ?",
+        (lang, platform, video_id),
     )
-    return [dict(r) for r in rows]
+    return cur.rowcount
 
 
 def insert_audio_events(platform: str, video_id: str, events: Iterable[dict]) -> int:
@@ -1633,6 +1803,36 @@ def dedupe_view() -> list[dict]:
 _PLATFORM_TRANSCRIBE_PRIORITY = {"youtube": 0, "twitch": 1, "kick": 2}
 
 
+def _canonical_key_for(platform: str, video_id: str) -> Optional[str]:
+    """The video's canonical key, video_aliases override included
+    (COALESCE(a.canonical_key, v.canonical_key)); None when the video row
+    is absent or has no key of its own."""
+    row = query(
+        """SELECT COALESCE(a.canonical_key, v.canonical_key) AS key
+           FROM videos v
+           LEFT JOIN video_aliases a USING (platform, video_id)
+           WHERE v.platform = ? AND v.video_id = ?""",
+        (platform, video_id),
+    )
+    return row[0]["key"] if row else None
+
+
+def _group_members(canonical_key: str) -> list[dict]:
+    """All video rows sharing a canonical key, alias overrides included
+    ({platform, video_id, channel, title, key}); [] when none."""
+    return [
+        dict(r)
+        for r in query(
+            """SELECT v.platform, v.video_id, v.channel, v.title,
+                      COALESCE(a.canonical_key, v.canonical_key) AS key
+               FROM videos v
+               LEFT JOIN video_aliases a USING (platform, video_id)
+               WHERE COALESCE(a.canonical_key, v.canonical_key) = ?""",
+            (canonical_key,),
+        )
+    ]
+
+
 def transcribed_on_higher_priority_platform(platform: str, video_id: str) -> bool:
     """True when the same canonical_key group has a member on a HIGHER-priority
     platform (youtube > twitch > kick) that already has transcript rows.
@@ -1645,25 +1845,15 @@ def transcribed_on_higher_priority_platform(platform: str, video_id: str) -> boo
     if platform not in _PLATFORM_TRANSCRIBE_PRIORITY:
         return False
     me = _PLATFORM_TRANSCRIBE_PRIORITY[platform]
-    row = query(
-        """SELECT COALESCE(a.canonical_key, v.canonical_key) AS key
-           FROM videos v
-           LEFT JOIN video_aliases a USING (platform, video_id)
-           WHERE v.platform = ? AND v.video_id = ?""",
-        (platform, video_id),
-    )
-    if not row or not row[0]["key"]:
+    key = _canonical_key_for(platform, video_id)
+    if not key:
         return False
-    key = row[0]["key"]
-    for g in dedupe_view():
-        if g["canonical_key"] != key:
+    for v in _group_members(key):
+        p = v["platform"]
+        if p == platform or p not in _PLATFORM_TRANSCRIBE_PRIORITY:
             continue
-        for v in g["videos"]:
-            p = v["platform"]
-            if p == platform or p not in _PLATFORM_TRANSCRIBE_PRIORITY:
-                continue
-            if _PLATFORM_TRANSCRIBE_PRIORITY[p] < me and has_transcript(p, v["video_id"]):
-                return True
+        if _PLATFORM_TRANSCRIBE_PRIORITY[p] < me and has_transcript(p, v["video_id"]):
+            return True
     return False
 
 
