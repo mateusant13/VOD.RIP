@@ -501,9 +501,9 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
 
 
 def _lang_group(lang: str) -> Optional[str]:
-    """Language family of a caption track code: 'pt' | 'en' | None."""
+    """Language family of a caption track code: 'pt' | 'en' | 'es' | None."""
     base = (lang or "").lower().split("-")[0]
-    return base if base in ("pt", "en") else None
+    return base if base in ("pt", "en", "es") else None
 
 
 def _best_in_group(merged: dict, group: str, fmt: str) -> Optional[tuple[str, str]]:
@@ -523,18 +523,26 @@ def _best_in_group(merged: dict, group: str, fmt: str) -> Optional[tuple[str, st
     return None
 
 
-def _pick_captions_for(info: dict, fmt: str) -> list[tuple[str, str]]:
+def _pick_captions_for(info: dict, fmt: str, *, family: Optional[str] = None) -> list[tuple[str, str]]:
     """Best auto-caption tracks for one format: [primary, secondary?].
 
     Primary keeps the old rule (pt > pt-br > en > first). Secondary is the
     best track of the OTHER language family (pt vs en) when both exist, so a
     bilingual video stores both transcripts. Single-family videos yield one
-    element; nothing serving this format yields []."""
+    element; nothing serving this format yields [].
+
+    family: restrict picks to ONE language family ('pt'/'en'/'es') — the
+    channel's effective language, so a channel known to be PT stores only pt
+    captions (the old rule stored pt AND en rows for the same segment).
+    None keeps the legacy both-families rule."""
     ac = info.get("automatic_captions") or {}
     subs = info.get("subtitles") or {}
     merged = dict(ac)
     for k, v in subs.items():
         merged.setdefault(k, v)
+    if family:
+        best = _best_in_group(merged, family, fmt)
+        return [best] if best else []
     out: list[tuple[str, str]] = []
     for lang in _CAPTION_LANG_PREF:
         for entry in merged.get(lang) or []:
@@ -597,15 +605,16 @@ def _fetch_caption(ydl: Any, info: dict) -> tuple[Optional[str], Optional[str], 
     return None, None, None
 
 
-def _fetch_captions(ydl: Any, info: dict) -> list[tuple[str, str, str]]:
+def _fetch_captions(ydl: Any, info: dict, *, family: Optional[str] = None) -> list[tuple[str, str, str]]:
     """Fetch every picked caption track (primary + secondary family).
 
     Same policy as _fetch_caption (vtt -> json3 -> srv3, 429 retry/backoff)
-    applied per track; one track per language family. Returns
+    applied per track; one track per language family. family restricts the
+    picks to one language family (see _pick_captions_for). Returns
     [(lang, fmt, payload), ...] — empty when nothing served."""
     out: list[tuple[str, str, str]] = []
     for fmt in _CAPTION_FMTS:
-        for lang, url in _pick_captions_for(info, fmt):
+        for lang, url in _pick_captions_for(info, fmt, family=family):
             if any(existing_lang == lang for existing_lang, _, _ in out):
                 continue  # one track per language family is enough
             for attempt in range(_CAPTION_RETRIES):
@@ -625,6 +634,29 @@ def _fetch_captions(ydl: Any, info: dict) -> list[tuple[str, str, str]]:
         if len(out) >= 2:
             break
     return out
+
+
+def _channel_effective_language(channel: str) -> Optional[str]:
+    """Effective language family for a YouTube channel (None = unknown).
+
+    Mirrors the channels-router read (WS-3, routers/channels.py): the
+    multi-signal aggregation with per-channel settings overrides (override >
+    original-language consensus > platform clue > transcript tally). Used to
+    restrict caption ingest to the channel's language so a known-PT channel
+    never stores en AND pt rows for the same segment; unknown channels keep
+    the legacy all-families rule."""
+    if not (channel or "").strip():
+        return None
+    from services.channel_language import aggregate_channel_language
+
+    try:
+        from deps import settings_mgr  # lazy: keeps module import light
+
+        overrides = getattr(settings_mgr.get(), "channel_asr_languages", None) or {}
+    except Exception:
+        overrides = {}
+    result = aggregate_channel_language(PLATFORM, channel, overrides=overrides)
+    return result.get("language")
 
 
 def _video_url(id_or_url: str) -> str:
@@ -709,8 +741,13 @@ def _ingest_via_data_api(video_id: str, job_id: str, report: dict) -> dict:
         "status": "known",
     })
 
+    # Channel-language-aware caption ingest: a known family stores ONLY that
+    # family (the old rule stored pt AND en rows for the same segment);
+    # unknown channels keep the legacy pt/en families.
+    eff_lang = _channel_effective_language(channel)
+    caption_families = (eff_lang,) if eff_lang in ("pt", "en", "es") else ("pt", "en")
     tracks = youtube_data_api.fetch_captions(
-        video_id, prefer=_CAPTION_LANG_PREF, families=("pt", "en")
+        video_id, prefer=_CAPTION_LANG_PREF, families=caption_families
     )
     if tracks:
         report["caption_lang"] = tracks[0][0]
@@ -815,9 +852,15 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
 
             # Auto captions -> transcript segments (vtt -> json3 -> srv3
             # fallback; failures stay non-fatal, reported as caption_error).
-            # Both language families (pt + en) are ingested when present.
+            # Channel-language-aware: a known family stores ONLY that family
+            # (the old rule stored pt AND en rows for the same segment);
+            # unknown channels keep the legacy both-families rule.
+            eff_lang = _channel_effective_language(channel)
             try:
-                tracks = _fetch_captions(ydl, info)
+                tracks = _fetch_captions(
+                    ydl, info,
+                    family=eff_lang if eff_lang in ("pt", "en", "es") else None,
+                )
                 if tracks:
                     report["caption_lang"] = tracks[0][0]
                 for lang, fmt, data in tracks:

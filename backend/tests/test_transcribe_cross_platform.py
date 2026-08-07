@@ -3,6 +3,12 @@ exists on a higher-priority platform (youtube > twitch > kick) with transcript
 rows already gets its whisper job skipped — the same canonical_key rule the
 kick download dedupe uses (archive_kick.dedupe_decision).
 
+Also covers the language-aware dedupe half of the same canonical-key family:
+search hits carry `platforms` (every platform the canonical VOD exists on),
+and transcript rows whose lang family differs from the channel's effective
+language are hidden from search when that language is known (channel-language
+restricted caption ingest stores only the channel family).
+
 Run from backend/: python -m pytest tests/test_transcribe_cross_platform.py
 """
 from __future__ import annotations
@@ -14,18 +20,21 @@ from unittest.mock import patch
 
 import pytest
 
-os.environ["VODRIP_ARCHIVE_DB"] = str(
-    Path(tempfile.mkdtemp(prefix="transcribe-cross-")) / "archive.db"
-)
+_CROSS_DB = str(Path(tempfile.mkdtemp(prefix="transcribe-cross-")) / "archive.db")
+os.environ["VODRIP_ARCHIVE_DB"] = _CROSS_DB
 
 from services import archive_db  # noqa: E402  (env must be set before import)
 from services import archive_transcribe  # noqa: E402
+from services import archive_ytdlp  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _cross_scratch_db():
+    # Force THIS module's scratch DB (not whatever the previous module left
+    # in env): get_conn() keys on the env path, so a batch run that imports
+    # another module last would otherwise rebind here and leak into it.
     prev = os.environ.get("VODRIP_ARCHIVE_DB")
-    os.environ["VODRIP_ARCHIVE_DB"] = os.environ["VODRIP_ARCHIVE_DB"]
+    os.environ["VODRIP_ARCHIVE_DB"] = _CROSS_DB
     with archive_db._lock:
         archive_db._conn = None
         archive_db._schema_ready = False
@@ -158,3 +167,172 @@ def test_process_job_youtube_not_skipped_by_kick_mirror(monkeypatch):
     assert "skipped" not in stats
     tv.assert_called_once()
     assert _job_status(job_id) == "done"
+
+
+# --- hit.platforms: every platform the canonical VOD exists on ------------
+
+def test_search_hits_carry_platforms():
+    # Two platforms sharing one canonical_key: hits on EITHER side must
+    # report both platforms, with `platform` staying the actual source.
+    _seed_video("youtube", "p-y", "ck-platforms")
+    _seed_video("twitch", "p-t", "ck-platforms")
+    archive_db.insert_transcript(
+        "youtube", "p-y",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "zebra platform probe"}],
+    )
+    archive_db.insert_messages(
+        "twitch", "p-t",
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra platform chat"}],
+    )
+    tr = next(
+        h for h in archive_db.search("zebra platform probe")
+        if h["kind"] == "transcript" and h["video_id"] == "p-y"
+    )
+    assert tr["platform"] == "youtube"
+    assert set(tr["platforms"]) == {"youtube", "twitch"}, tr["platforms"]
+    msg = next(
+        h for h in archive_db.search("zebra platform chat")
+        if h["kind"] == "message" and h["video_id"] == "p-t"
+    )
+    assert msg["platform"] == "twitch"
+    assert set(msg["platforms"]) == {"youtube", "twitch"}, msg["platforms"]
+
+
+def test_search_hits_platforms_alone_video():
+    # A video with no dedupe group gets [platform] — never an empty list.
+    _seed_video("youtube", "p-solo", "ck-solo")
+    archive_db.insert_transcript(
+        "youtube", "p-solo",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "zebra solo probe"}],
+    )
+    tr = next(
+        h for h in archive_db.search("zebra solo probe")
+        if h["kind"] == "transcript" and h["video_id"] == "p-solo"
+    )
+    assert tr["platforms"] == ["youtube"]
+
+
+# --- language-aware transcript search exclusion (non-destructive) ---------
+
+def test_search_excludes_other_family_when_channel_language_known():
+    # maranguape-style channel, effective language pt: the en-family rows
+    # the old caption ingest stored next to pt must not surface; pt rows and
+    # untagged (whisper, no detection) rows stay.
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "lg-pt", "channel": "maranguape",
+        "title": "lang mirror", "canonical_key": "ck-lg-pt",
+        "started_at": "2026-08-03T17:24:00Z", "kind": "vod",
+    })
+    archive_db.set_channel_language("youtube", "maranguape", "pt")
+    archive_db.insert_transcript(
+        "youtube", "lg-pt",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "zebra en row"}],
+        lang="en",
+    )
+    archive_db.insert_transcript(
+        "youtube", "lg-pt",
+        [{"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "zebra pt row"}],
+        lang="pt",
+    )
+    archive_db.insert_transcript(
+        "youtube", "lg-pt",
+        [{"seg_idx": 2, "start_sec": 2.0, "end_sec": 3.0, "text": "zebra untagged row"}],
+    )
+    texts = {
+        h["text"] for h in archive_db.search("zebra")
+        if h["kind"] == "transcript" and h["video_id"] == "lg-pt"
+    }
+    assert texts == {"zebra pt row", "zebra untagged row"}, (
+        f"en-family row must be hidden for a known-pt channel, got {texts}"
+    )
+
+
+def test_search_keeps_other_family_when_channel_language_unknown():
+    # Unknown channel language: non-destructive — every family surfaces
+    # (the exclusion only fires when the channel language is KNOWN).
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "lg-un", "channel": "langchan",
+        "title": "lang mirror", "canonical_key": "ck-lg-un",
+        "started_at": "2026-08-03T17:24:00Z", "kind": "vod",
+    })
+    archive_db.insert_transcript(
+        "youtube", "lg-un",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "zebra en2 row"}],
+        lang="en",
+    )
+    archive_db.insert_transcript(
+        "youtube", "lg-un",
+        [{"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "zebra pt2 row"}],
+        lang="pt",
+    )
+    texts = {
+        h["text"] for h in archive_db.search("zebra")
+        if h["kind"] == "transcript" and h["video_id"] == "lg-un"
+    }
+    assert texts == {"zebra en2 row", "zebra pt2 row"}, texts
+
+
+# --- channel-language-restricted caption ingest ---------------------------
+
+def test_pick_captions_family_restricts_to_channel_language():
+    info = {
+        "automatic_captions": {
+            "pt": [{"ext": "vtt", "url": "https://cap/pt.vtt"}],
+            "en": [{"ext": "vtt", "url": "https://cap/en.vtt"}],
+        }
+    }
+    # Known channel family: ONLY that family's track is picked — the old
+    # rule stored pt AND en rows for the same segment.
+    assert archive_ytdlp._pick_captions_for(info, "vtt", family="pt") == [
+        ("pt", "https://cap/pt.vtt")
+    ]
+    assert archive_ytdlp._pick_captions_for(info, "vtt", family="en") == [
+        ("en", "https://cap/en.vtt")
+    ]
+    # Unknown channel language: legacy rule keeps both families.
+    assert {l for l, _ in archive_ytdlp._pick_captions_for(info, "vtt")} == {"pt", "en"}
+
+
+def test_ingest_video_stores_only_channel_family_captions(monkeypatch, tmp_path):
+    # End-to-end: a channel whose effective language is pt-BR (stored as
+    # family 'pt') ingests ONLY pt captions even when the video serves en.
+    from contextlib import contextmanager
+    import io
+
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "lg-ingest-0", "channel": "titiltei",
+        "title": "lang probe", "canonical_key": "ck-lg-ingest",
+        "started_at": "2026-08-03T17:24:00Z", "kind": "vod",
+    })
+    archive_db.set_channel_language("youtube", "titiltei", "pt")
+
+    vtt = b"WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nOla mundo.\n"
+
+    class _FakeYdl:
+        def extract_info(self, url, download=False):
+            return {
+                "id": "lg-ingest", "title": "Lang Probe", "channel": "titiltei",
+                "timestamp": 1754256240, "duration": 30,
+                "automatic_captions": {
+                    "pt": [{"ext": "vtt", "url": "https://cap/pt.vtt"}],
+                    "en": [{"ext": "vtt", "url": "https://cap/en.vtt"}],
+                },
+            }
+
+        def urlopen(self, url):
+            return io.BytesIO(vtt)
+
+    @contextmanager
+    def _fake_guard(outdir, *, video_id=None):
+        yield _FakeYdl()
+
+    monkeypatch.setattr("services.youtube_data_api.available", lambda: False)
+    monkeypatch.setattr(archive_ytdlp, "_guarded_youtube_dl", _fake_guard)
+    report = archive_ytdlp.ingest_video("https://www.youtube.com/watch?v=lg-ingest")
+    assert report["video_id"] == "lg-ingest"
+    rows = archive_db.transcript_for("youtube", "lg-ingest")
+    assert rows, "captions must be ingested"
+    assert {r["lang"] for r in rows} == {"pt"}, (
+        "known-pt channel must store only pt captions, got "
+        f"{sorted({r['lang'] for r in rows})}"
+    )
