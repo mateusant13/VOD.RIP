@@ -736,6 +736,73 @@ def _youtube_remux_by_default(encoder: Optional[str]) -> bool:
 assert _youtube_remux_by_default("auto") and not _youtube_remux_by_default("libx264")
 assert _youtube_remux_by_default("copy") and not _youtube_remux_by_default("h264_nvenc")
 
+# Stall guard — a download that emits no *bytes* for this long is dead
+# (0 B/s). yt-dlp's socket_timeout bounds each attempt, but the retry storm
+# (inner HttpFD ``retries`` × outer ``fragment_retries``) plus a trickling
+# upstream can sit at 0 B/s for minutes before yt-dlp gives up; the guard
+# aborts at the next hook event with a clear message instead.
+# ponytail: heuristic — the clock resets on every byte growth, so
+# slow-but-moving links never trip it; a steady multi-KB/s crawl is bounded
+# by DownloadManager's wall-clock deadline, not by this guard.
+STALL_GUARD_NO_PROGRESS_SEC = 60.0
+STALL_GUARD_CHECK_INTERVAL_SEC = 5.0
+
+
+def _stall_guard_state(holder: dict, now: float) -> Optional[str]:
+    """Return the stall error when an armed download has made no byte
+    progress for >= ``no_progress_abort_sec``, else None (latching the
+    clock on the first armed check). Pure decision helper — tests drive it
+    with a fake holder + fake clock, no network."""
+    if holder.get("done") or holder.get("abort"):
+        return holder.get("error")
+    if not holder.get("armed"):
+        return None
+    last = holder.get("last_move_wall")
+    if last is None:
+        holder["last_move_wall"] = now
+        return None
+    if now - last >= holder.get("no_progress_abort_sec", STALL_GUARD_NO_PROGRESS_SEC):
+        holder["abort"] = True
+        holder["error"] = holder.get("error") or (
+            "download stalled — no bytes received for "
+            f"{int(holder['no_progress_abort_sec'])}s (0 B/s); "
+            "upstream unreachable"
+        )
+        return holder["error"]
+    return None
+
+
+def _make_stall_guard_hook(holder: dict, hook: Optional[Callable]) -> Callable:
+    """Wrap a yt-dlp progress hook to track byte progress and to raise
+    DownloadTimeoutError once the stall guard aborts the download.
+
+    Runs inside the yt-dlp download thread: the raise unwinds
+    ``ydl.download()`` with a clear error instead of letting the retry
+    storm hold 0 B/s for minutes. Byte growth resets the clock; 0-byte
+    retry events do not (they are the stall)."""
+    def wrapped(d: dict) -> None:
+        if d.get("status") == "downloading":
+            holder["armed"] = True
+            db = d.get("downloaded_bytes")
+            if (
+                isinstance(db, (int, float))
+                and db > 0
+                and float(db) != holder.get("last_bytes")
+            ):
+                holder["last_bytes"] = float(db)
+                holder["last_move_wall"] = time.monotonic()
+        elif d.get("status") in ("finished", "postprocessing"):
+            holder["done"] = True
+        if holder.get("abort") and d.get("status") == "downloading":
+            raise DownloadTimeoutError(
+                holder["error"] or "download stalled (0 B/s)"
+            )
+        if hook:
+            hook(d)
+
+    return wrapped
+
+
 def _build_ydl_opts(
     url: str,
     output_path: str,
@@ -761,14 +828,24 @@ def _build_ydl_opts(
         "no_warnings": True,
         "quiet": True,
         "concurrent_fragment_downloads": 8,
-        # Hardened transport: retry transient failures (extract + fragments),
-        # explicit socket timeout, and disable the throttled-rate floor —
+        # Hardened transport: bounded retries — the inner per-fragment
+        # HttpFD attempt count comes from ``retries`` and the outer
+        # fragment attempts from ``fragment_retries``; 10×10 with a 20s
+        # socket timeout was a ~40min worst-case dead window per fragment
+        # on a blackholed CDN (observed: fragments at 0.00B/s for 5+ min).
+        # Explicit per-attempt socket timeout, and no throttled-rate floor —
         # per-fragment speed measurement is unreliable with -N > 1 and the
         # default 100K floor false-aborts fast lines (yt-dlp docs).
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 3,
+        "fragment_retries": 3,
         "socket_timeout": 20,
         "throttledratelimit": 0,
+        # Stall guard config — consumed by _ydl_download's watchdog: a
+        # download that emits no *bytes* for STALL_GUARD_NO_PROGRESS_SEC
+        # aborts with a clear error instead of crawling at 0 B/s.
+        "_vodrip_stall_guard": {
+            "no_progress_abort_sec": STALL_GUARD_NO_PROGRESS_SEC,
+        },
         **_ytdlp_engine_opts(),
     }
     if audio_only:
@@ -825,6 +902,10 @@ def _build_ydl_opts(
         )
 
     if progress_hook:
+        if "_vodrip_stall_guard" in opts:
+            progress_hook = _make_stall_guard_hook(
+                opts["_vodrip_stall_guard"], progress_hook,
+            )
         opts["progress_hooks"] = [progress_hook]
 
         def _postprocessor_hook(d: dict) -> None:
@@ -950,6 +1031,17 @@ def sanitize_download_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
+_guard_probe = _build_ydl_opts(
+    "https://www.youtube.com/watch?v=x", "/tmp/out.mp4", video_encoder="auto",
+).get("_vodrip_stall_guard") or {}
+assert _guard_probe.get("no_progress_abort_sec") == STALL_GUARD_NO_PROGRESS_SEC
+assert _stall_guard_state(dict(_guard_probe, armed=False), 10 ** 6) is None
+assert _stall_guard_state(
+    dict(_guard_probe, armed=True, last_move_wall=0.0),
+    STALL_GUARD_NO_PROGRESS_SEC,
+) is not None
+
+
 def _ydl_download(
     url: str,
     opts: dict,
@@ -963,6 +1055,33 @@ def _ydl_download(
     quiet_opts.setdefault("quiet", True)
     quiet_opts.setdefault("no_warnings", True)
     quiet_opts["logger"] = _YtdlpQuietLogger()
+
+    guard = quiet_opts.get("_vodrip_stall_guard")
+    if guard is not None:
+        for key, default in (
+            ("no_progress_abort_sec", STALL_GUARD_NO_PROGRESS_SEC),
+            ("last_bytes", 0.0),
+            ("last_move_wall", None),
+            ("armed", False),
+            ("done", False),
+            ("abort", False),
+            ("error", None),
+        ):
+            guard.setdefault(key, default)
+    stall_stop = threading.Event()
+
+    def _stall_watchdog() -> None:
+        while not stall_stop.wait(STALL_GUARD_CHECK_INTERVAL_SEC):
+            if _stall_guard_state(guard, time.monotonic()):
+                return
+
+    watchdog_thread = None
+    if guard is not None:
+        watchdog_thread = threading.Thread(
+            target=_stall_watchdog, daemon=True, name="ytdlp-stall-guard",
+        )
+        watchdog_thread.start()
+
     with _silence_stderr():
         with guarded_youtube_dl(quiet_opts) as ydl:
             if register_abort:
@@ -970,6 +1089,11 @@ def _ydl_download(
             try:
                 ydl.download([url])
             finally:
+                if guard is not None:
+                    guard["done"] = True
+                if watchdog_thread is not None:
+                    stall_stop.set()
+                    watchdog_thread.join(timeout=2)
                 _check_pause_cancel(cancel_event, pause_event)
 
 def _download_twitch_clip_sync(
