@@ -60,6 +60,23 @@ async def _history(client):
     return res.json()
 
 
+# --- history: legacy /create rows are dropped -----------------------------
+
+@pytest.mark.anyio
+async def test_history_filters_legacy_create_urls(_isolated_data_dir):
+    """Pre-Helix rows (clips.twitch.tv/create → Twitch's /clips/500 error page)
+    are dropped from history; Helix-era rows survive."""
+    legacy = {"id": "old1", "status": "editor_opened", "url": "https://clips.twitch.tv/create?vodID=2536167775&broadcasterLogin=surtepi&offsetSeconds=434"}
+    live = {"id": "new1", "status": "created", "url": "https://clips.twitch.tv/ClipId123-edit"}
+    path = Path(_isolated_data_dir) / "twitch_clips.json"
+    path.write_text(json.dumps([legacy, live], ensure_ascii=False), "utf-8")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rows = await _history(client)
+
+    assert rows == [live]
+
+
 # --- VOD clips (POST /helix/videos/clips) ---------------------------------
 
 @pytest.mark.anyio

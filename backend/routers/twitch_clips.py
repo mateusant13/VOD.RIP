@@ -67,11 +67,23 @@ def _history_path() -> Path:
     return data_dir() / HISTORY_FILE
 
 
+# Legacy pre-Helix rows opened clips.twitch.tv/create unconditionally; Twitch's
+# SPA client-side-redirects that URL to its own /clips/500 error page for
+# non-logged-in sessions. Those rows are permanently dead — drop them at read.
+_LEGACY_CREATE_URL_PREFIX = "https://clips.twitch.tv/create"
+
+
 def _load_history() -> List[Dict[str, Any]]:
     try:
         raw = _history_path().read_text("utf-8")
         entries = json.loads(raw)
-        return entries if isinstance(entries, list) else []
+        if not isinstance(entries, list):
+            return []
+        return [
+            e
+            for e in entries
+            if not str(e.get("url", "")).startswith(_LEGACY_CREATE_URL_PREFIX)
+        ]
     except FileNotFoundError:
         return []
     except Exception as exc:  # ponytail: corrupt/missing history must never fail the endpoint
