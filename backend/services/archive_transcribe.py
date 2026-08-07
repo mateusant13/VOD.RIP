@@ -59,6 +59,7 @@ from services.archive_events import detect_events_video, events_enabled
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
 from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
+from services.yt_gate import gate_remaining_sec, youtube_gate_active
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
 logger = logging.getLogger(__name__)
@@ -119,15 +120,170 @@ def _cache_dir() -> Path:
 
 # --- parallelism budget ---------------------------------------------------
 
-def _clamp_cuda_copies(copies: int, free_vram_bytes: int) -> int:
-    """min(copies, max(1, free_vram // 2 GiB)) — the GPU copy budget clamp.
+# GPU lane budget (user hardware: RTX 5080 16 GiB; large-v3-turbo fp16 is
+# ~5-6 GiB, NOT the old 1-2.5 GiB estimate). The card is a SHARED tenant:
+# the desktop + the user's other ML project hold VRAM, so the measured
+# allowance at claim time decides the lane — never a static count.
+_GPU_VRAM_HEADROOM = int(2 * 1024 ** 3)   # must stay free for the tenants
+_GPU_UTIL_SECOND_COPY = 0.70              # below this, a 2nd copy may add
+_GPU_VRAM_MEDIAN_SAMPLES = 6              # reads spread over ~60 s
+_GPU_VRAM_MEDIAN_GAP_S = 10.0
 
-    Pure shape so the module self-check can pin it without a GPU: env 1 -> 1
-    (never probe), env >1 -> VRAM-capped but never below 1 copy."""
+
+def _gpu_model_vram_est() -> int:
+    """fp16 VRAM estimate (bytes) for the ACTIVE whisper model (name-prefixed).
+
+    large-v3-turbo is the default (~6 GiB); large/distil-large ~10; medium/
+    distil-medium ~5; small ~2; base ~1; tiny ~0.6. Unknown names fall back
+    to 6 GiB (the default model) — conservative for the common case."""
+    name = (model_name() or "").lower()
+    gb = 6.0  # default: large-v3-turbo
+    if name.startswith("large-v3-turbo") or name.startswith("distil-large-v3"):
+        gb = 6.0
+    elif name.startswith("large"):
+        gb = 10.0
+    elif name.startswith("medium") or name.startswith("distil-medium"):
+        gb = 5.0
+    elif name.startswith("small") or name.startswith("distil-small"):
+        gb = 2.0
+    elif name.startswith("base"):
+        gb = 1.0
+    elif name.startswith("tiny"):
+        gb = 0.6
+    return int(gb * 1024 ** 3)
+
+
+def _clamp_cuda_copies(copies: int, free_vram_bytes: int) -> int:
+    """min(copies, max(1, free_vram // (model_est + headroom))) — copy budget.
+
+    Pure shape so the module self-check can pin it without a GPU: env 1 -> 1,
+    env >1 -> VRAM-capped (never below 1; the caller's VRAM-floor gate owns
+    the 0-copies decision)."""
     if copies <= 1:
         return 1
-    vram_cap = max(1, free_vram_bytes // (2 * 1024 ** 3))
+    per_copy = _gpu_model_vram_est() + _GPU_VRAM_HEADROOM
+    vram_cap = max(1, free_vram_bytes // per_copy)
     return max(1, min(copies, vram_cap))
+
+
+_vram_free_bytes = 0
+_vram_free_at = 0.0
+_vram_lock = threading.Lock()
+
+
+def _gpu_free_vram_bytes() -> int:
+    """Free GPU VRAM in bytes — MEDIAN of reads spread over ~60 s (0 = unknown).
+
+    A single instant is a lie on a shared card: the user's other ML project
+    spikes and dips, and a spike would flap the lane decision. The first
+    call spreads _GPU_VRAM_MEDIAN_SAMPLES reads ~10 s apart and returns the
+    median; later calls (within the TTL) reuse it. Tests patch it directly
+    (mirrors _free_system_ram_bytes); probe failure (no torch / no CUDA /
+    nvidia-smi absent) -> 0 -> env cap trusted."""
+    global _vram_free_bytes, _vram_free_at
+    now = time.monotonic()
+    with _vram_lock:
+        if _vram_free_at and now - _vram_free_at < _GPU_VRAM_MEDIAN_GAP_S * _GPU_VRAM_MEDIAN_SAMPLES:
+            return _vram_free_bytes
+    samples: list[int] = []
+    for i in range(_GPU_VRAM_MEDIAN_SAMPLES):
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                break  # no CUDA — nothing to sample
+            samples.append(int(torch.cuda.mem_get_info()[0]))
+        except Exception:
+            break  # no torch — nothing to sample
+        if len(samples) >= _GPU_VRAM_MEDIAN_SAMPLES:
+            break
+        if i < _GPU_VRAM_MEDIAN_SAMPLES - 1:
+            time.sleep(_GPU_VRAM_MEDIAN_GAP_S)
+    if samples:
+        ordered = sorted(samples)
+        free = ordered[len(ordered) // 2]  # median (upper-middle for even counts)
+    else:
+        free = 0
+    with _vram_lock:
+        _vram_free_bytes = free
+        _vram_free_at = now
+    return free
+
+
+def _gpu_vram_allowance() -> int:
+    """Free VRAM the worker may use (median measurement minus a manual reserve).
+
+    ponytail: a future user setting 'reserve N GB of VRAM for other apps'
+    becomes ONE line here (`max(0, free - N GiB)`) — the lane gate consumes
+    the result, so the reserve never has to touch the decision logic."""
+    return _gpu_free_vram_bytes()
+
+
+_gpu_held_cache = False
+_gpu_held_at = 0.0
+_gpu_held_lock = threading.Lock()
+
+
+def _gpu_held_by_other() -> bool:
+    """True when nvidia-smi reports a compute app that is not this process.
+
+    The live backend / another ML project / a worktree test may already hold
+    a GPU model — stacking another on top risks evicting it. False when the
+    probe fails (nvidia-smi absent): the free-VRAM gate is still the primary
+    guard. Cached 10 s; patched directly by tests."""
+    global _gpu_held_cache, _gpu_held_at
+    now = time.monotonic()
+    with _gpu_held_lock:
+        if _gpu_held_at and now - _gpu_held_at < 10.0:
+            return _gpu_held_cache
+    held = False
+    try:
+        out = sp.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            mine = str(os.getpid())
+            held = any(
+                p.strip() and p.strip() != mine for p in out.stdout.splitlines()
+            )
+    except Exception:
+        held = False
+    with _gpu_held_lock:
+        _gpu_held_cache = held
+        _gpu_held_at = now
+    return held
+
+
+_gpu_util_cache = 0.0
+_gpu_util_at = 0.0
+_gpu_util_lock = threading.Lock()
+
+
+def _gpu_util() -> Optional[float]:
+    """Current GPU utilization 0..1 (None when unmeasurable), cached 5 s.
+
+    Second-copy decision input (a busy GPU adds nothing from another copy);
+    also reported in acceptance runs. Patched directly by tests."""
+    global _gpu_util_cache, _gpu_util_at
+    now = time.monotonic()
+    with _gpu_util_lock:
+        if _gpu_util_at and now - _gpu_util_at < 5.0:
+            return _gpu_util_cache
+    util: Optional[float] = None
+    try:
+        out = sp.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            util = float(out.stdout.strip().splitlines()[0]) / 100.0
+    except Exception:
+        util = None
+    with _gpu_util_lock:
+        _gpu_util_cache = util if util is not None else 0.0
+        _gpu_util_at = now
+    return util
 
 
 # Per-worker peak host-RAM estimates (system RAM, not VRAM). The real peak
@@ -210,33 +366,135 @@ def _ram_worker_clamp(configured: int, per_worker_est: int) -> int:
     return max(1, min(configured, usable // per_worker_est))
 
 
+# GPU capability ladder (user requirement: cards range 6 -> 32 GiB; EVERY
+# tier keeps a GPU path). Rungs keyed on the MEASURED 60 s-median free-VRAM
+# allowance, read AFTER the compute-apps check. int8 is the default
+# precision (project rule: 8 -> 16 bit only, no weird precisions); fp16 only
+# when VRAM clearly allows. (model, compute_type); None model = the user's
+# active model.
+_GPU_LADDER_RUNGS = (
+    (int(6.5 * 1024 ** 3), None, "float16"),   # active model fp16 — 8 GiB+ cards
+    (int(3.5 * 1024 ** 3), None, "int8"),      # active model int8 — 6-8 GiB sweet spot
+    (int(2.0 * 1024 ** 3), "medium", "int8"),  # entry cards (6 GiB class)
+)
+
+
+def _gpu_lane_plan() -> Optional[tuple[Optional[str], str]]:
+    """(model, compute_type) for the GPU lane, or None -> CPU lane only.
+
+    Rungs keyed on the measured 60 s-median free-VRAM allowance. Unknown
+    allowance (0 = probe failed) -> (None, 'int8') — int8 default, the
+    legacy trust-the-env path keeps working."""
+    allowance = _gpu_vram_allowance()
+    if allowance <= 0:
+        return None, "int8"
+    for threshold, model, compute_type in _GPU_LADDER_RUNGS:
+        if allowance >= threshold:
+            return model, compute_type
+    return None  # < 2 GiB — CPU lane only
+
+
 def _gpu_copies() -> int:
     """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) is a CEILING.
 
-    Clamped by free VRAM (probed via torch.cuda.mem_get_info() — torch is
-    already imported by the VAD path; probe failure degrades to trusting the
-    env cap) AND by host RAM (_GPU_COPY_RSS_EST per copy — the model lives
-    on VRAM, but audio decode + inference buffers are host-side). Never
-    below 1 when the env configures > 0; 0/absent -> auto (1 copy)."""
+    Measured at claim time (the worker's claim gate) — NEVER static. The
+    60 s-median free-VRAM allowance picks the ladder rung (fp16 -> int8 ->
+    medium int8 -> CPU); below the 2 GiB floor -> 0 copies, the CPU side of
+    the hybrid plan covers the queue. A GPU model held by another process
+    (live backend / the user's other ML project) also forces 0 — never
+    stack. A second copy only when the GPU is idle-ish (<70% util) AND the
+    allowance fits ~2x. Probe failure (no torch / no CUDA / nvidia-smi
+    absent) degrades to trusting the env cap. 0/absent -> auto (1 copy)."""
     try:
         configured = int(os.environ.get(GPU_COPIES_ENV, "1") or "1")
     except ValueError:
         return 1
     if configured <= 0:
         configured = 1  # 0 == auto (same as absent)
-    if configured == 1:
-        return 1  # exact single-copy path — no probes at all
-    free_vram = 0
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            free_vram = int(torch.cuda.mem_get_info()[0])
-    except Exception:
-        pass  # probe failed — trust the env cap
-    if free_vram > 0:
-        configured = _clamp_cuda_copies(configured, free_vram)
+    # Held check FIRST: when another process holds a GPU model the lane is
+    # forced off, so measuring the 60 s-median free VRAM would be pure waste.
+    if _gpu_held_by_other():
+        return 0  # another process holds a GPU model — don't stack
+    if _gpu_lane_plan() is None:
+        return 0  # measured median free VRAM < 2 GiB — CPU lane only
+    allowance = _gpu_vram_allowance()
+    if configured > 1:
+        util = _gpu_util()
+        if util is not None and util >= _GPU_UTIL_SECOND_COPY:
+            configured = 1  # GPU already busy — one copy is the ceiling
+    if allowance > 0:
+        configured = _clamp_cuda_copies(configured, allowance)
     return _ram_worker_clamp(configured, _GPU_COPY_RSS_EST)
+
+
+def _gpu_compute_type() -> str:
+    """The ladder rung's precision for the GPU plan slots ('float16'|'int8')."""
+    lane = _gpu_lane_plan()
+    return lane[1] if lane else "int8"
+
+
+# System CPU load clamp: when the box is already contended (user's app
+# transcoding, other agents), CPU whisper threads would only slow it down —
+# the jobs wait in SQLite and drain later. Measured via GetSystemTimes
+# (kernel32, stdlib ctypes — psutil is not a declared dependency); POSIX
+# uses os.getloadavg(). Probe failure/unknown -> False (no clamp).
+_CPU_LOAD_HIGH = 0.85          # busy fraction of ALL cores at/above this
+_CPU_LOAD_TTL_S = 15.0         # readout cache TTL (sampling sleeps ~0.2 s)
+_cpu_load_high_cache = False
+_cpu_load_at = 0.0
+_cpu_load_lock = threading.Lock()
+
+
+def _measure_cpu_load() -> float:
+    """Busy fraction of all cores over a ~0.2 s window (0 = unknown)."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                        ("dwHighDateTime", wintypes.DWORD)]
+
+        def _tot(ft: FILETIME) -> int:
+            return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+        idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+        )
+        if not ok:
+            return 0.0
+        i1, k1, u1 = _tot(idle), _tot(kernel), _tot(user)
+        time.sleep(0.2)
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+        )
+        if not ok:
+            return 0.0
+        i2, k2, u2 = _tot(idle), _tot(kernel), _tot(user)
+        busy = (k2 - k1) + (u2 - u1)
+        total = busy + (i2 - i1)
+        return busy / total if total > 0 else 0.0
+    try:
+        avg1 = os.getloadavg()[0]
+        n = os.cpu_count() or 1
+        return max(0.0, min(1.0, avg1 / n))
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def _cpu_load_high() -> bool:
+    """True when the box is already contended (cached; False if unmeasurable)."""
+    global _cpu_load_high_cache, _cpu_load_at
+    now = time.monotonic()
+    with _cpu_load_lock:
+        if _cpu_load_at and now - _cpu_load_at < _CPU_LOAD_TTL_S:
+            return _cpu_load_high_cache
+    load = _measure_cpu_load()
+    with _cpu_load_lock:
+        _cpu_load_high_cache = load >= _CPU_LOAD_HIGH
+        _cpu_load_at = now
+    return _cpu_load_high_cache
 
 
 def _cpu_worker_ceiling() -> int:
@@ -268,10 +526,24 @@ def _worker_plan() -> list[tuple[str, str]]:
     device, _ = _effective_device()
     if device == "cpu":
         workers = _cpu_worker_ceiling() or 2  # 0 == auto on CPU-only hosts
-        return [("cpu", "int8")] * _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
+        slots = _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
+        if _cpu_load_high():
+            slots = min(slots, 1)  # box contended — at most one CPU thread
+        return [("cpu", "int8")] * slots
     gpu_slots = _gpu_copies()
     cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
-    return [("cuda", "float16")] * gpu_slots + [("cpu", "int8")] * cpu_slots
+    if _cpu_load_high():
+        cpu_slots = min(cpu_slots, 1)
+    plan: list[tuple[str, str]] = [("cpu", "int8")] * cpu_slots
+    if gpu_slots:
+        # Only reach the lane ladder when the GPU lane is actually usable —
+        # a held GPU (gpu_slots 0) must never trigger the ~60 s VRAM median.
+        gpu_ct = _gpu_compute_type()  # float16 when VRAM fits, else int8
+        plan = [("cuda", gpu_ct)] * gpu_slots + plan
+    # Both sides clamped away (tight VRAM + busy box): a single CPU slot is
+    # the floor — jobs must drain eventually, one quiet thread is safer
+    # than a permanently parked worker.
+    return plan or [("cpu", "int8")]
 
 
 def _worker_budget() -> int:
@@ -300,6 +572,13 @@ _model: Any = None
 _model_name: Optional[str] = None
 _model_last_used = 0.0
 _word_ts_ok = True  # distil models have no alignment heads; flipped per process
+# GPU capability ladder pinning: run_worker resolves _gpu_lane_plan() once at
+# plan time and pins (model, compute_type) here so the GPU slots load the
+# ladder's model+precision (e.g. 'medium' int8 on entry cards) while CPU
+# slots keep the user's active model. Reset in run_worker's finally; direct
+# callers (tests/scripts) never see a stale pin.
+_worker_lane_model: Optional[str] = None
+_worker_lane_ct: Optional[str] = None
 
 
 def _idle_close_seconds() -> float:
@@ -340,7 +619,7 @@ def _get_model() -> Any:
     for *concurrent* transcribe() calls — callers serialize via _infer_lock.
     """
     global _model, _model_name, _model_last_used, _device_override, _model_device
-    name = model_name()
+    name = _worker_lane_model or model_name()
     with _model_lock:
         if (
             _model is not None
@@ -354,6 +633,8 @@ def _get_model() -> Any:
         from faster_whisper import WhisperModel
 
         device, compute_type = _effective_device()
+        if device == "cuda" and _worker_lane_ct:
+            compute_type = _worker_lane_ct  # ladder precision (int8 default)
         t0 = time.monotonic()
         logger.info(
             "Loading whisper model %r (device=%s compute_type=%s, cache=%s)...",
@@ -491,13 +772,18 @@ def _thread_pin() -> Optional[tuple[str, str]]:
     return getattr(_multi_tls, "pin", None)
 
 
-def _worker_thread_init(plan: list[tuple[str, str]]) -> None:
+def _worker_thread_init(plan: list[tuple[str, str]], lane_model: Optional[str] = None) -> None:
     """ThreadPoolExecutor initializer — pin this pool thread to its slot.
 
     Threads are created one at a time in submission order, so thread i gets
     plan[i % len(plan)] (the modulo guards a second pool in the same
-    process, whose threads keep counting past the first pool's)."""
+    process, whose threads keep counting past the first pool's). GPU-slot
+    threads also pin the ladder model (e.g. 'medium' on entry cards); CPU
+    slots keep the user's active model."""
     _multi_tls.pin = plan[next(_pool_thread_seq) % len(plan)]
+    _multi_tls.lane_model = (
+        lane_model if _multi_tls.pin and _multi_tls.pin[0] == "cuda" else None
+    )
 
 
 def _thread_slot() -> _ThreadModelSlot:
@@ -522,7 +808,7 @@ def _thread_model() -> Any:
     mode), else on _effective_device(). A thread marked cpu_fallback loads
     on CPU even when CUDA is healthy (its copy OOM'd earlier)."""
     slot = _thread_slot()
-    name = model_name()
+    name = getattr(_multi_tls, "lane_model", None) or model_name()
     if slot.model is not None and slot.model_name == name:
         return slot.model
     with _model_lock:
@@ -1673,6 +1959,47 @@ def _transcribe_audio_source(
 # --- queue worker ---------------------------------------------------------
 
 _STALE_JOB_TIMEDELTA = timedelta(minutes=30)
+# Chat-history backfills run one yt-dlp/GQL pass per video; a 13.5h VOD's
+# live-chat replay can legitimately exceed the 30min transcribe reclaim
+# window, so 'chat' jobs get a 2h grace before a dead executor is assumed.
+_CHAT_STALE_TIMEDELTA = timedelta(hours=2)
+
+# YouTube chat-backfill pacing: min gap between chat video STARTS. A single
+# worker starts ≤5/min (burst 2 requests each: extract + chat download); the
+# 3-thread pool can run up to 3 concurrently, still under the measured
+# 4-6/min per-IP limiter. Two lanes (user requirement): the interactive lane
+# (preview/download/click-chat/search/watch) NEVER consults this pace or the
+# bot gate — pacing exists only in the worker's background lane. While the
+# user is actively using the app (an 'app-activity' heartbeat stamped by the
+# app middleware) the interval grows to _YOUTUBE_CHAT_ACTIVE_INTERVAL_S so
+# background volume stays under the radar and interactive traffic is never
+# collateral damage; when the app is idle the worker ramps back to heavy
+# volume. ponytail: per-process only — cross-process pacing needs a shared
+# lock file if worker_server and the in-process worker ever overlap on one
+# box.
+_YOUTUBE_CHAT_MIN_INTERVAL_S = 12.0
+_YOUTUBE_CHAT_ACTIVE_INTERVAL_S = 30.0
+_APP_ACTIVITY_AGE_S = 60.0
+_youtube_chat_last_start = 0.0
+_youtube_chat_pace_lock = threading.Lock()
+
+
+def _youtube_chat_interval() -> float:
+    """Pacing interval: longer while the app's interactive lane is active."""
+    if archive_db.worker_live(age_s=_APP_ACTIVITY_AGE_S, tag="app-activity"):
+        return _YOUTUBE_CHAT_ACTIVE_INTERVAL_S
+    return _YOUTUBE_CHAT_MIN_INTERVAL_S
+
+
+def _pace_youtube_chat() -> None:
+    """Sleep until the pacing budget allows another YouTube chat fetch."""
+    global _youtube_chat_last_start
+    with _youtube_chat_pace_lock:
+        interval = _youtube_chat_interval()
+        wait = interval - (time.monotonic() - _youtube_chat_last_start)
+        if wait > 0:
+            time.sleep(wait)
+        _youtube_chat_last_start = time.monotonic()
 
 
 def _now_iso() -> str:
@@ -1680,20 +2007,24 @@ def _now_iso() -> str:
 
 
 def _claim_next_job() -> Optional[dict]:
-    """Atomically claim the newest queued transcribe/events job (crash-stale too).
+    """Atomically claim the newest queued transcribe/events/chat job (crash-stale too).
 
-    A 'running' job is reclaimed only if untouched for 30 min — a single
-    chunk can legitimately take that long on CPU."""
+    A 'running' job is reclaimed only if untouched past its kind's stale
+    window — 30 min for transcribe/events (a single chunk can legitimately
+    take that long on CPU), 2 h for 'chat' (a 13.5h VOD's live-chat replay
+    backfill can exceed the shorter window)."""
     now = datetime.now(timezone.utc)
-    stale_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
+    transcribe_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
+    chat_cutoff = (now - _CHAT_STALE_TIMEDELTA).isoformat(timespec="seconds")
     # String comparison is valid: both sides come from _now_iso (UTC, same width).
     rows = archive_db.query(
         """SELECT * FROM archive_jobs
-           WHERE kind IN ('transcribe','events')
-             AND (status = 'queued' OR (status = 'running' AND updated_at < ?))
+           WHERE kind IN ('transcribe','events','chat')
+             AND (status = 'queued' OR (status = 'running' AND updated_at <
+                  CASE kind WHEN 'chat' THEN ? ELSE ? END))
            ORDER BY priority DESC, created_at ASC
            LIMIT 8""",
-        (stale_cutoff,),
+        (chat_cutoff, transcribe_cutoff),
     )
     for row in rows:
         if row["status"] == "queued":
@@ -1725,6 +2056,63 @@ def _process_events_job(job_id: str, platform: str, video_id: str) -> dict:
     stats = detect_events_video(platform, video_id, progress_cb=_progress)
     archive_db.update_job(job_id, status="done", progress=1.0)
     return stats
+
+
+def _process_chat_job(job_id: str, platform: str, video_id: str) -> dict:
+    """Run one kind='chat' job (chat-history backfill) — never raises.
+
+    YouTube: the chat-only yt-dlp live-chat replay pass (no caption or
+    metadata re-fetch). Twitch: the incremental GQL backfill, seeded from
+    the deepest stored offset, tracking THIS job's row. Kick has no retro
+    chat API — chat arrives only via live capture, so a kick 'chat' job
+    fails fast (the scheduler never enqueues one)."""
+    if platform == "youtube":
+        if youtube_gate_active():
+            # Requeue, never fail: the cooldown lifts with one probe and the
+            # job drains then. A failed row would sit behind FAILED_JOB_FRESH_S.
+            archive_db.update_job(
+                job_id, status="queued",
+                error=f"youtube bot-gate cooldown active ({int(gate_remaining_sec())}s) — requeued",
+            )
+            logger.info("youtube chat job %s requeued: bot-gate cooldown", job_id)
+            return {
+                "job_id": job_id, "platform": platform, "video_id": video_id,
+                "requeued": "youtube-gate",
+            }
+        _pace_youtube_chat()
+        from services.archive_ytdlp import backfill_live_chat
+
+        result = backfill_live_chat(video_id)
+        archive_db.update_job(job_id, status="done", progress=1.0)
+        return {
+            "job_id": job_id,
+            "platform": platform,
+            "video_id": video_id,
+            "chat_messages": result.get("chat_messages", 0),
+            "chat": result.get("chat"),
+        }
+    if platform == "twitch":
+        from services.archive_scheduler import BACKFILL_MAX_MESSAGES  # noqa: PLC0415 — lazy: keeps this module opt-in light
+        from services.archive_twitch import backfill_chat
+
+        channel = (archive_db.video_channel(platform, video_id) or "").strip()
+        if not channel:
+            raise ValueError(f"no channel for twitch/{video_id} — cannot backfill chat")
+        result = backfill_chat(
+            channel, video_id,
+            max_messages=BACKFILL_MAX_MESSAGES,
+            job_id=job_id,
+            progress_cb=lambda p: archive_db.update_job(job_id, progress=min(0.999, p)),
+        )
+        archive_db.update_job(job_id, status="done", progress=1.0)
+        return {
+            "job_id": job_id,
+            "platform": platform,
+            "video_id": video_id,
+            "chat_messages": result.get("inserted", 0),
+            "chat": "replay",
+        }
+    raise ValueError(f"no retro chat API for platform {platform!r}")
 
 
 def _captions_first_skip(platform: str, video_id: str) -> bool:
@@ -1795,6 +2183,23 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
 
         if job.get("kind") == "events":
             return _process_events_job(job_id, platform, video_id)
+
+        if job.get("kind") == "chat":
+            return _process_chat_job(job_id, platform, video_id)
+
+        if platform == "youtube" and youtube_gate_active():
+            # Bot-gate cooldown: requeue (not fail) so the job drains once
+            # the freeze lifts; the gate check must precede every YouTube
+            # network hop (caption skip, dedupe, audio download).
+            archive_db.update_job(
+                job_id, status="queued",
+                error=f"youtube bot-gate cooldown active ({int(gate_remaining_sec())}s) — requeued",
+            )
+            logger.info("youtube job %s requeued: bot-gate cooldown", job_id)
+            return {
+                "job_id": job_id, "platform": platform, "video_id": video_id,
+                "requeued": "youtube-gate",
+            }
 
         if _captions_first_skip(platform, video_id):
             logger.info("captions already present for %s/%s — skipping whisper", platform, video_id)
@@ -1913,12 +2318,29 @@ def run_worker(
     plan = _pool_plan(max_workers)
     budget = len(plan)
     multi = budget > 1
-    logger.info("archive transcribe worker: plan=[%s] workers=%d",
-                ", ".join(f"{d}/{ct}" for d, ct in plan), budget)
+    # Capability-ladder pinning: the GPU lane's model+precision (e.g. the
+    # user's model int8, or 'medium' int8 on entry cards) is resolved once
+    # at claim time and pinned for this run — CPU slots keep the active
+    # model. Only when the natural plan has CUDA slots: a CPU-only plan
+    # (held GPU / tight VRAM) and the legacy max_workers path must never
+    # pay the ~60 s VRAM median for a lane they cannot use. Reset in
+    # finally so direct callers never inherit a stale pin.
+    global _worker_lane_model, _worker_lane_ct
+    _lane = (
+        _gpu_lane_plan()
+        if max_workers is None and any(d == "cuda" for d, _ in plan)
+        else None
+    )
+    _worker_lane_model = _lane[0] if _lane else None
+    _worker_lane_ct = _lane[1] if _lane else None
+    logger.info("archive transcribe worker: plan=[%s] workers=%d lane=%s",
+                ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
+                _worker_lane_model or "active-model")
     try:
         with ThreadPoolExecutor(
             max_workers=budget, thread_name_prefix="transcribe",
-            initializer=_worker_thread_init, initargs=(plan,),
+            initializer=_worker_thread_init,
+            initargs=(plan, _worker_lane_model),
         ) as pool:
             # Per-slot claim loop: each finished future frees a slot and a
             # refill claims the next job immediately. The old await-all
@@ -1954,6 +2376,8 @@ def run_worker(
                 if once and not pending:
                     break
     finally:
+        _worker_lane_model = None
+        _worker_lane_ct = None
         close_model()
 
 
@@ -1967,10 +2391,36 @@ def start_worker(**kwargs: Any) -> threading.Thread:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="VOD.RIP archive worker — drains transcribe/events/chat jobs"
+    )
+    ap.add_argument(
+        "--once", action="store_true",
+        help="exit rc 0 once the queue is drained (no pending/running jobs and "
+             "no futures in flight); default runs forever",
+    )
+    ap.add_argument(
+        "--poll-interval", type=float, default=2.0,
+        help="seconds between idle queue polls (default 2.0)",
+    )
+    args = ap.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    run_worker()
+    if args.once:
+        # Belt-and-suspenders on top of worker_server's own guard: a live
+        # worker heartbeat means someone else is draining the queue — exit
+        # rc 0 quietly instead of double-loading the whisper model.
+        from services import archive_db
+
+        if archive_db.worker_live(age_s=45):
+            logging.getLogger(__name__).info(
+                "archive worker already running — nothing to do (exit 0)"
+            )
+            raise SystemExit(0)
+    run_worker(once=args.once, poll_interval=max(0.1, args.poll_interval))
 
 # --- module self-check (pure logic — no model load, no GPU, no downloads) --
 
@@ -2023,17 +2473,22 @@ assert _missing == [0, 1, 2], "model change must invalidate stale manifest entri
 _missing, _next = _resume_plan([], None, {}, set())
 assert _missing == [] and _next == 0, "no chunks -> nothing to do"
 # worker budget: no GPU_COPIES env -> 1 copy regardless of VRAM; the VRAM
-# clamp caps copies at free_vram // 2 GiB (never below 1); CPU honors
+# clamp caps copies at free_vram // (model_est + 2 GiB headroom), never
+# below 1 (the ladder's lane gate owns the 0-copies decision); CPU honors
 # VODRIP_TRANSCRIBE_WORKERS and defaults to 2.
+_per_copy = _gpu_model_vram_est() + _GPU_VRAM_HEADROOM
 assert _clamp_cuda_copies(1, 100 << 30) == 1, "no GPU copies env -> 1 (probe skipped)"
-assert _clamp_cuda_copies(4, 10 << 30) == 4, "env within the VRAM budget passes through"
-assert _clamp_cuda_copies(8, 5 << 30) == 2, "VRAM budget clamps copies (5 GiB -> 2)"
-assert _clamp_cuda_copies(8, 1 << 30) == 1, "VRAM budget never drops below 1"
+assert _clamp_cuda_copies(4, 4 * _per_copy + 1) == 4, "env within the VRAM budget passes through"
+assert _clamp_cuda_copies(8, 2 * _per_copy + 1) == 2, "VRAM budget clamps copies"
+assert _clamp_cuda_copies(8, _per_copy - 1) == 1, "VRAM budget never drops below 1"
 _saved_override, _saved_workers = _device_override, os.environ.get(WORKERS_ENV)
 _saved_free_ram = _free_system_ram_bytes
+_saved_vram = _gpu_free_vram_bytes
+_saved_cpu = _cpu_load_high
 try:
     _device_override = ("cpu", "int8")
     _free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM clamp must not bind here
+    _cpu_load_high = lambda: False
     os.environ[WORKERS_ENV] = "4"
     assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
     os.environ.pop(WORKERS_ENV, None)
@@ -2050,6 +2505,8 @@ try:
 finally:
     _device_override = _saved_override
     _free_system_ram_bytes = _saved_free_ram
+    _gpu_free_vram_bytes = _saved_vram
+    _cpu_load_high = _saved_cpu
     if _saved_workers is None:
         os.environ.pop(WORKERS_ENV, None)
     else:
@@ -2057,13 +2514,21 @@ finally:
 # hybrid pool plan: CUDA host -> 1 GPU copy + 2 CPU threads by default;
 # WORKERS=0 disables the CPU side (the exact legacy single-model plan);
 # WORKERS=3 -> 1 GPU + 3 CPU slots. RAM is patched ample so the clamp never
-# binds; GPU_COPIES stays at its default 1 so no VRAM probe runs.
+# binds; the VRAM probe is patched per tier so the capability ladder decides
+# the GPU lane's model+precision.
 _saved_plan_ov, _saved_plan_w, _saved_plan_g = (
     _device_override, os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
 )
+_saved_plan_vram, _saved_plan_cpu = _gpu_free_vram_bytes, _cpu_load_high
+_saved_plan_held = _gpu_held_by_other
+_saved_plan_util = _gpu_util
 try:
     _device_override = ("cuda", "float16")
     _free_system_ram_bytes = lambda: 64 * 1024 ** 3
+    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM — clamp must not bind
+    _gpu_held_by_other = lambda: False
+    _gpu_util = lambda: None
+    _cpu_load_high = lambda: False
     os.environ.pop(WORKERS_ENV, None)
     os.environ.pop(GPU_COPIES_ENV, None)
     assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
@@ -2075,9 +2540,66 @@ try:
     assert _worker_plan() == [
         ("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
     ], "WORKERS=3 -> 1 GPU + 3 CPU slots"
+    # machine-aware scale-down: tight VRAM (another app holds the GPU model)
+    # -> GPU copy 0, CPU slots cover; busy box -> at most 1 CPU slot; both ->
+    # the 1-CPU-slot floor keeps the queue draining. (WORKERS back to the
+    # default 2 for these — the 3-slot plan above was a ceiling check.)
+    os.environ.pop(WORKERS_ENV, None)
+    _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3  # < 2 GiB floor
+    assert _worker_plan() == [("cpu", "int8"), ("cpu", "int8")], (
+        "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
+    )
+    # capability ladder rungs (simulated free VRAM -> lane model+precision)
+    _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
+    assert _gpu_lane_plan() == ("medium", "int8"), "2-3.5 GiB -> medium int8 entry rung"
+    _gpu_free_vram_bytes = lambda: int(5.0 * 1024 ** 3)
+    assert _gpu_lane_plan() == (None, "int8"), "3.5-6.5 GiB -> active model int8"
+    _gpu_free_vram_bytes = lambda: int(8.0 * 1024 ** 3)
+    assert _gpu_lane_plan() == (None, "float16"), ">= 6.5 GiB -> active model fp16"
+    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
+        "8 GiB tier -> fp16 GPU lane + CPU lane"
+    )
+    _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
+    assert _worker_plan() == [("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8")], (
+        "3 GiB tier -> medium int8 GPU slot + CPU lane"
+    )
+    # compute-apps guard: another process holds a GPU model -> CPU only
+    _gpu_free_vram_bytes = lambda: 16 * 1024 ** 3
+    _gpu_held_by_other = lambda: True
+    assert _worker_plan() == [("cpu", "int8"), ("cpu", "int8")], (
+        "held GPU model must drop the GPU lane (never stack)"
+    )
+    _gpu_held_by_other = lambda: False
+    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM restored
+    # busy GPU: a second copy is capped at 1 when util >= 70%
+    os.environ[GPU_COPIES_ENV] = "3"
+    _gpu_util = lambda: 0.85
+    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
+        "busy GPU caps copies at 1"
+    )
+    _gpu_util = lambda: 0.4
+    assert _worker_plan() == [
+        ("cuda", "float16"), ("cuda", "float16"), ("cuda", "float16"),
+        ("cpu", "int8"), ("cpu", "int8"),
+    ], "idle GPU + ample VRAM allows the configured 3 copies"
+    os.environ.pop(GPU_COPIES_ENV, None)
+    # contended box: at most 1 CPU slot
+    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3
+    _cpu_load_high = lambda: True
+    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8")], (
+        "contended box must keep at most 1 CPU slot"
+    )
+    _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3
+    assert _worker_plan() == [("cpu", "int8")], (
+        "tight VRAM + busy box -> 1 CPU slot floor"
+    )
 finally:
     _device_override = _saved_plan_ov
     _free_system_ram_bytes = _saved_free_ram
+    _gpu_free_vram_bytes = _saved_plan_vram
+    _cpu_load_high = _saved_plan_cpu
+    _gpu_held_by_other = _saved_plan_held
+    _gpu_util = _saved_plan_util
     if _saved_plan_w is None:
         os.environ.pop(WORKERS_ENV, None)
     else:

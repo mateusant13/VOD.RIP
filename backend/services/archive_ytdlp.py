@@ -25,6 +25,7 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -434,14 +435,13 @@ def _parse_live_chat(text: str, base_usec: Optional[float] = None) -> list[dict]
 
 # --- extraction -------------------------------------------------------------
 
-def _yt_opts(outdir: Path) -> dict:
-    return {
+def _yt_opts(outdir: Path, *, video_id: Optional[str] = None) -> dict:
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 30,
-        "extractor_args": {"youtube": {"player_client": ["android", "web_safari"]}},
         **_ytdlp_engine_opts(),
         # live_chat arrives as a subtitle entry (ext 'json'); with
         # skip_download yt-dlp never writes subtitles, so ingest_video calls
@@ -451,6 +451,53 @@ def _yt_opts(outdir: Path) -> dict:
         "subtitleslangs": ["live_chat"],
         "outtmpl": str(outdir / "%(id)s.%(ext)s"),
     }
+    _apply_youtube_session(opts, video_id=video_id)
+    return opts
+
+
+def _apply_youtube_session(opts: dict, *, video_id: Optional[str] = None) -> None:
+    """Wire the app's YouTube auth conditioning into yt-dlp opts.
+
+    Mirrors the app (ytdlp_download / live_capture / chat_sinks.yt_live):
+    one session from settings — cookies + po_token + visitor_data when
+    configured, anonymous bootstrap otherwise — feeds extractor_args and
+    the cookiefile. Never assumes cookies: anonymous is the app's own
+    fallback, and the archive path works in both modes. Any wiring failure
+    degrades to the legacy bare clients instead of dying."""
+    try:
+        from services.youtube_session import (
+            apply_ytdlp_cookie_opts,
+            ytdlp_extractor_args,
+            youtube_session_from_settings,
+        )
+
+        session = youtube_session_from_settings(video_id=video_id)
+        opts["extractor_args"] = ytdlp_extractor_args(session)
+        apply_ytdlp_cookie_opts(opts, session)
+    except Exception as exc:
+        logger.warning("youtube auth wiring unavailable — bare yt-dlp fallback: %s", exc)
+        opts.setdefault(
+            "extractor_args", {"youtube": {"player_client": ["android", "web_safari"]}}
+        )
+
+
+@contextmanager
+def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
+    """guarded_youtube_dl context that records the YouTube bot gate on failure.
+
+    Gate/rate-limit errors arm the process-wide cooldown (services.yt_gate)
+    so the worker stops hammering YouTube and requeues its jobs; the
+    exception still propagates so each caller keeps its own fail/requeue
+    contract."""
+    try:
+        with guarded_youtube_dl(_yt_opts(outdir, video_id=video_id)) as ydl:
+            yield ydl
+    except Exception as exc:
+        from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
+
+        if classify_youtube_gate_error(exc):
+            note_youtube_gate(str(exc)[:200])
+        raise
 
 
 def _lang_group(lang: str) -> Optional[str]:
@@ -622,12 +669,17 @@ def _fetch_live_chat(ydl: Any, info: dict, video_id: str) -> tuple[int, str, Opt
 
 
 def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
-    """Ingest one YouTube video: metadata + captions + best-effort live chat.
+    """Ingest one YouTube video: metadata + captions.
+
+    Chat history is NOT fetched inline anymore — the scheduler enqueues a
+    kind='chat' job right after a successful ingest and the archive worker
+    (detached, supervised) fetches it via backfill_live_chat. This keeps
+    ingest cheap and makes chat survive app close + crashes.
 
     Returns a report dict (video_id, title, channel, started_at,
     duration_sec, canonical_key, caption_lang, transcript_segments,
-    chat_messages, chat: 'replay'|'none'|'error'). Raises on metadata
-    extraction failure; caption/chat failures are reported, not raised.
+    chat_messages: 0, chat: 'none'). Raises on metadata extraction failure;
+    caption failures are reported, not raised.
     """
     url = _video_url(id_or_url)
     video_id = _video_id_from_url(url, id_or_url.strip())
@@ -650,7 +702,7 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     own_dir = temp_dir is None
     outdir = Path(tempfile.mkdtemp(prefix=f"yt-{video_id}-")) if own_dir else Path(temp_dir)
     try:
-        with guarded_youtube_dl(_yt_opts(outdir)) as ydl:
+        with _guarded_youtube_dl(outdir, video_id=video_id) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise ValueError(f"no extract info for {url}")
@@ -687,13 +739,6 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
                 "canonical_key": key or None,
                 "status": "known",
             })
-
-            # Live chat replay (best-effort; VODs have none).
-            if info.get("live_status") in ("was_live", "is_live"):
-                n, status, err = _fetch_live_chat(ydl, info, video_id)
-                report["chat_messages"] = n
-                report["chat"] = status
-                report["chat_error"] = err
 
             # Auto captions -> transcript segments (vtt -> json3 -> srv3
             # fallback; failures stay non-fatal, reported as caption_error).
@@ -758,7 +803,7 @@ def backfill_live_chat(video_id: str) -> dict:
     }
     outdir = Path(tempfile.mkdtemp(prefix=f"yt-chat-{vid}-"))
     try:
-        with guarded_youtube_dl(_yt_opts(outdir)) as ydl:
+        with _guarded_youtube_dl(outdir, video_id=vid) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise ValueError(f"no extract info for {url}")

@@ -20,8 +20,13 @@ GIB = 1024 ** 3
 
 
 def _force_cuda(monkeypatch) -> None:
+    """Idle, unheld GPU with ample VRAM: the plan's GPU lane is usable."""
     monkeypatch.setattr(at, "_device_override", ("cuda", "float16"))
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: 64 * GIB)  # ample VRAM
+    monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)       # no foreign tenant
+    monkeypatch.setattr(at, "_gpu_util", lambda: 0.1)                  # idle GPU
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)           # not contended
 
 
 def _force_cpu(monkeypatch) -> None:

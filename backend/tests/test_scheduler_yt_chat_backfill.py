@@ -1,15 +1,15 @@
 """Scheduler YouTube retro chat-backfill leg tests — _backfill_youtube_chat.
 
-No network: services.archive_ytdlp.backfill_live_chat is never called —
-the thread target _backfill_one_youtube is stubbed to record video_ids, so
-no background thread fetches anything. The archive DB is a fresh temp file
-per test (VODRIP_ARCHIVE_DB env isolation).
+No network: the leg is now a pure PRODUCER — it enqueues kind='chat' jobs
+and the archive worker does the fetching (services.archive_ytdlp.
+backfill_live_chat is never called here). The archive DB is a fresh temp
+file per test (VODRIP_ARCHIVE_DB env isolation).
 
 Covers:
-  - chat-less kind='stream' YouTube videos (non-live ids) get backfilled
+  - chat-less kind='stream' YouTube videos (non-live ids) get a 'chat' job
   - videos that already have chat rows are skipped
   - synthetic live-capture ids (youtube-live-*) are never backfilled
-  - a 'done' chat_backfill job retires the video
+  - a 'done' chat job retires the video
   - a fresh 'failed' job is skipped (< FAILED_JOB_FRESH_S), a stale one retried
 """
 
@@ -32,11 +32,9 @@ def scratch_db(monkeypatch, tmp_path):
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(tmp_path / "archive.db"))
     archive_db._conn = None
     archive_db._schema_ready = False
-    archive_scheduler._backfill_inflight.clear()
     yield
     archive_db._conn = None
     archive_db._schema_ready = False
-    archive_scheduler._backfill_inflight.clear()
 
 
 def _seed_stream(vid: str, *, chat: bool = False) -> None:
@@ -55,53 +53,53 @@ def _seed_stream(vid: str, *, chat: bool = False) -> None:
         ])
 
 
-def test_chatless_streams_backfilled(scratch_db, monkeypatch):
+def _queued_chat_video_ids() -> list:
+    return sorted(
+        j["video_id"]
+        for j in archive_db.list_jobs(limit=500)
+        if j["kind"] == "chat" and j["status"] == "queued"
+    )
+
+
+def test_chatless_streams_backfilled(scratch_db):
     _seed_stream("aaaaaaaaaaa", chat=False)
     _seed_stream("bbbbbbbbbbb", chat=True)   # has chat -> skip
     _seed_stream("youtube-live-1785955673345", chat=False)  # watchdog -> skip
-    kicked: list = []
-    monkeypatch.setattr(archive_scheduler, "_backfill_one_youtube",
-                        lambda vid: kicked.append(vid))
     archive_scheduler._backfill_youtube_chat()
-    assert kicked == ["aaaaaaaaaaa"]
+    assert _queued_chat_video_ids() == ["aaaaaaaaaaa"]
 
 
-def test_done_job_retires_video(scratch_db, monkeypatch):
+def test_done_job_retires_video(scratch_db):
     _seed_stream("aaaaaaaaaaa", chat=False)
-    archive_db.enqueue_job("yt-chat-backfill-aaaaaaaaaaa-1", "chat_backfill",
+    archive_db.enqueue_job("chat-youtube-aaaaaaaaaaa", "chat",
                            "youtube", "aaaaaaaaaaa", priority=0)
-    archive_db.update_job("yt-chat-backfill-aaaaaaaaaaa-1", status="done")
-    kicked: list = []
-    monkeypatch.setattr(archive_scheduler, "_backfill_one_youtube",
-                        lambda vid: kicked.append(vid))
+    archive_db.update_job("chat-youtube-aaaaaaaaaaa", status="done")
     archive_scheduler._backfill_youtube_chat()
-    assert kicked == []
+    assert _queued_chat_video_ids() == []
+    assert archive_db.latest_job("youtube", "aaaaaaaaaaa", kind="chat")["status"] == "done"
 
 
-def test_failed_job_fresh_skipped_stale_retried(scratch_db, monkeypatch):
+def test_failed_job_fresh_skipped_stale_retried(scratch_db):
     _seed_stream("aaaaaaaaaaa", chat=False)
     _seed_stream("bbbbbbbbbbb", chat=False)
     _seed_stream("ccccccccccc", chat=False)
-    fresh_id = "yt-chat-backfill-aaaaaaaaaaa-1"
-    archive_db.enqueue_job(fresh_id, "chat_backfill", "youtube", "aaaaaaaaaaa", priority=0)
+    fresh_id = "chat-youtube-aaaaaaaaaaa"
+    archive_db.enqueue_job(fresh_id, "chat", "youtube", "aaaaaaaaaaa", priority=0)
     archive_db.update_job(fresh_id, status="failed", error="extract error")
     archive_db.execute(
         """UPDATE archive_jobs SET updated_at = ? WHERE id = ?""",
         ("2020-01-01T00:00:00Z", fresh_id),  # stale -> retried
     )
-    stale_id = "yt-chat-backfill-bbbbbbbbbbb-1"
-    archive_db.enqueue_job(stale_id, "chat_backfill", "youtube", "bbbbbbbbbbb", priority=0)
+    stale_id = "chat-youtube-bbbbbbbbbbb"
+    archive_db.enqueue_job(stale_id, "chat", "youtube", "bbbbbbbbbbb", priority=0)
     archive_db.update_job(stale_id, status="failed", error="extract error")
-    kicked: list = []
-    monkeypatch.setattr(archive_scheduler, "_backfill_one_youtube",
-                        lambda vid: kicked.append(vid))
     archive_scheduler._backfill_youtube_chat()
-    # aaaaaaaaaaa: stale failed job -> retried; bbbbbbbbbbb: fresh failed ->
-    # skipped (still recent); ccccccccccc: no job -> backfilled.
-    assert kicked == ["aaaaaaaaaaa", "ccccccccccc"]
+    # aaaaaaaaaaa: stale failed job -> re-queued; bbbbbbbbbbb: fresh failed ->
+    # skipped (still recent); ccccccccccc: no job -> queued.
+    assert _queued_chat_video_ids() == ["aaaaaaaaaaa", "ccccccccccc"]
 
 
-def test_kind_vod_never_backfilled(scratch_db, monkeypatch):
+def test_kind_vod_never_backfilled(scratch_db):
     archive_db.upsert_video({
         "platform": "youtube",
         "video_id": "ddddddddddd",
@@ -110,8 +108,24 @@ def test_kind_vod_never_backfilled(scratch_db, monkeypatch):
         "started_at": "2026-08-01T00:00:00Z",
         "kind": "vod",  # plain upload — legitimately has no chat
     })
-    kicked: list = []
-    monkeypatch.setattr(archive_scheduler, "_backfill_one_youtube",
-                        lambda vid: kicked.append(vid))
     archive_scheduler._backfill_youtube_chat()
-    assert kicked == []
+    assert _queued_chat_video_ids() == []
+
+
+def test_enqueue_chat_job_dedupes_across_kinds(scratch_db):
+    """The shared producer guard: has_chat / queued / running / done all
+    suppress a new job; a stale failed job is re-enqueued; a live 'chat'
+    job with a synthetic id never double-queues."""
+    _seed_stream("aaaaaaaaaaa", chat=False)
+    archive_db.enqueue_job("legacy-backfill-id", "chat", "youtube",
+                           "aaaaaaaaaaa", priority=0)
+    archive_db.update_job("legacy-backfill-id", status="running")
+    assert archive_scheduler._enqueue_chat_job("youtube", "aaaaaaaaaaa") is False
+    archive_db.update_job("legacy-backfill-id", status="failed", error="x")
+    archive_db.execute(
+        """UPDATE archive_jobs SET updated_at = ? WHERE id = ?""",
+        ("2020-01-01T00:00:00Z", "legacy-backfill-id"),
+    )
+    assert archive_scheduler._enqueue_chat_job("youtube", "aaaaaaaaaaa") is True
+    # idempotent under a second call (stable PK)
+    assert archive_scheduler._enqueue_chat_job("youtube", "aaaaaaaaaaa") is False

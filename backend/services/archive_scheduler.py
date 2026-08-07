@@ -11,17 +11,18 @@ kick_scheduler_pass()):
                (live capture only — see chat_sinks/kick_pusher docstring),
                so this leg is metadata + whatever live capture already
                collected; there is no chat to backfill.
-  3. YouTube — ingest metadata + auto-captions (subtitles) + best-effort
-               live-chat replay for every saved vod/clip URL, bounded per
-               pass and with a 1h retry backoff behind the bot wall.
-  4. Chat backfill — two legs: Twitch (the only platform with a retro chat
-               API) fills chat for every chat-less saved-channel VOD, oldest
-               first, <= TWITCH_BACKFILL_MAX_INFLIGHT concurrent; YouTube
-               retro-fetches live-chat replay for chat-less streams whose
-               historical ingest crash archived captions but zero chat
-               (chat-only, no caption re-fetch). Each run is incremental
-               (seeds from the deepest stored offset) and completes at the
-               tail of Twitch's replay window.
+  3. YouTube — ingest metadata + auto-captions (subtitles) for every saved
+               vod/clip URL, bounded per pass and with a 1h retry backoff
+               behind the bot wall; chat history is enqueued as a kind='chat'
+               job (the archive worker fetches it, never inline).
+  4. Chat backfill — two legs that ENQUEUE kind='chat' jobs for the archive
+               worker: Twitch (the only platform with a retro chat API) for
+               every chat-less saved-channel VOD, oldest first; YouTube
+               chat-only live-chat replay re-fetch for chat-less streams
+               whose historical ingest crash archived captions but zero
+               chat. Each fetch is incremental (seeds from the deepest
+               stored offset); Twitch backfills self-cap at 2 concurrent
+               inside backfill_chat (per-IP GQL 429 limiter, measured).
   5. Transcribe queue — top up whisper jobs at TRANSCRIBE_PRIORITY_LOW for
                downloaded YouTube files with no captions/transcripts.
                A transcript-source search re-enqueues at
@@ -47,16 +48,12 @@ PASS_INTERVAL_SEC = 180.0
 TWITCH_INGEST_LIMIT = 100            # GQL page cap for list_channel_videos
 KICK_INGEST_LIMIT = 50
 YOUTUBE_INGEST_PER_PASS = 3          # yt-dlp extracts are slow + bot-gated
-TWITCH_BACKFILL_MAX_INFLIGHT = 2     # GQL 429-backoff is per-IP: 4 parallel
-                                     # page fetches tripped the limiter and
-                                     # collapsed throughput vs 2 (measured)
 TRANSCRIBE_QUEUE_PER_PASS = 2
-BACKFILL_MAX_MESSAGES = 100_000      # same ceiling as the search kick
+BACKFILL_MAX_MESSAGES = 100_000      # chat-backfill ceiling (worker + search kick)
 TRANSCRIBE_PRIORITY_LOW = 0
 TRANSCRIBE_PRIORITY_HIGH = 100       # transcript-source search jump-the-queue
 YOUTUBE_RETRY_BACKOFF_S = 3600.0     # bot-wall retry delay per video
 FAILED_JOB_FRESH_S = 3600.0          # don't re-run a job failed < 1h ago
-STALE_JOB_MIN = 30                   # queued/running older than this = dead executor
 
 _VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
@@ -74,8 +71,6 @@ _stop = threading.Event()
 _wake = threading.Event()
 _lock = threading.Lock()
 _thread: Optional[threading.Thread] = None
-_backfill_lock = threading.Lock()
-_backfill_inflight: set[str] = set()
 _yt_lock = threading.Lock()
 _yt_inflight: set[str] = set()  # video_ids currently being ingested
 _yt_attempted_at: dict[str, float] = {}  # video_id -> monotonic() last attempt
@@ -200,11 +195,12 @@ def _ingest_one_youtube(video_id: str) -> None:
         from services.archive_ytdlp import ingest_video
 
         report = ingest_video(video_id)
+        queued = _enqueue_chat_job("youtube", video_id)
         logger.info(
-            "scheduler yt ingest %s: %d caption segment(s), %d chat message(s)",
+            "scheduler yt ingest %s: %d caption segment(s), chat job %s",
             video_id,
             report.get("transcript_segments", 0),
-            report.get("chat_messages", 0),
+            "queued" if queued else "already covered",
         )
     except Exception as exc:  # noqa: BLE001 — bot wall / dead video
         logger.info("scheduler yt ingest %s failed (retry in 1h): %s", video_id, exc)
@@ -248,29 +244,43 @@ def _ingest_youtube(channel: dict) -> None:
         spawned += 1
 
 
-def _backfill_one(video_id: str, channel: str) -> None:
-    try:
-        from services.archive_twitch import backfill_chat
+def _enqueue_chat_job(platform: str, video_id: str) -> bool:
+    """Queue one chat-history backfill job for the archive worker.
 
-        result = backfill_chat(channel, video_id, max_messages=BACKFILL_MAX_MESSAGES)
-        logger.info(
-            "scheduler twitch backfill %s: %d message(s) in %d page(s) (%s)",
-            video_id,
-            result.get("inserted", 0),
-            result.get("pages", 0),
-            result.get("stopped"),
-        )
-    except Exception:  # noqa: BLE001
-        logger.info("scheduler twitch backfill %s failed", video_id, exc_info=True)
-    finally:
-        with _backfill_lock:
-            _backfill_inflight.discard(video_id)
-        # Bulk chat inserts fragment the FTS b-tree; merge so searches
-        # stay fast (same as the router does after every backfill).
+    Dedupe (the single guard for every producer): skip when the video
+    already has chat rows, or a 'chat' job is done/queued/running; a failed
+    job is retried only after FAILED_JOB_FRESH_S. The stable job id's PK
+    backstops a producer race (IntegrityError -> already queued). Returns
+    True when a job was enqueued."""
+    if archive_db.has_chat(platform, video_id):
+        return False
+    latest = archive_db.latest_job(platform, video_id, kind="chat")
+    if latest and latest["status"] in ("queued", "running", "done"):
+        return False
+    if latest and latest["status"] == "failed":
         try:
-            archive_db.optimize_fts()
-        except Exception:  # noqa: BLE001
-            logger.debug("fts optimize failed after backfill", exc_info=True)
+            fresh = datetime.fromisoformat(latest["updated_at"]) > (
+                datetime.now(timezone.utc) - timedelta(seconds=FAILED_JOB_FRESH_S)
+            )
+        except (TypeError, ValueError):
+            fresh = True  # unparseable — treat as fresh failure
+        if fresh:
+            return False  # failed < 1h ago — don't hammer
+    job_id = f"chat-{platform}-{video_id}"
+    try:
+        archive_db.enqueue_job(job_id, "chat", platform, video_id, priority=0)
+        return True
+    except sqlite3.IntegrityError:
+        # The row already exists (a producer race, or the stale failed job
+        # checked above). Re-queue a failed row IN PLACE so the stable job
+        # id never orphans a retry; queued/running/done rows are already
+        # covered by the dedupe above.
+        cur = archive_db.execute(
+            "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, updated_at=? "
+            "WHERE id=? AND status='failed'",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id),
+        )
+        return cur.rowcount == 1
 
 
 def _backfill_twitch_chat(channels: list) -> None:
@@ -278,15 +288,14 @@ def _backfill_twitch_chat(channels: list) -> None:
     slugs.discard("")
     if not slugs:
         return
-    with _backfill_lock:
-        free = TWITCH_BACKFILL_MAX_INFLIGHT - len(_backfill_inflight)
-    if free <= 0:
-        return
-    # Candidates = twitch VODs without a completed backfill. Videos with a
-    # failed job are candidates again after FAILED_JOB_FRESH_S (the loop
-    # below gates it): backfill_chat is incremental (seeds from the deepest
-    # stored offset), so a mid-fetch 'service error' leaves partial chat
-    # that the re-run completes instead of skipping forever.
+    # Candidates = chat-less twitch VODs of saved channels. The queue is
+    # the inflight tracker now: _enqueue_chat_job dedupes queued/running/
+    # done/fresh-failed, and the archive worker (detached, supervised)
+    # does the fetching with a per-IP concurrency cap inside backfill_chat.
+    # A failed job is a candidate again after FAILED_JOB_FRESH_S (the
+    # dedupe gates it): backfill_chat is incremental (seeds from the
+    # deepest stored offset), so a mid-fetch 'service error' leaves partial
+    # chat that the re-run completes instead of skipping forever.
     ph = ",".join("?" * len(slugs))
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = list(
@@ -300,93 +309,35 @@ def _backfill_twitch_chat(channels: list) -> None:
                  AND lower(v.channel) IN (%s)
                  AND NOT EXISTS (SELECT 1 FROM video_aliases a
                                  WHERE a.platform='twitch' AND a.video_id=v.video_id)
-                 AND NOT EXISTS (SELECT 1 FROM archive_jobs j
-                                 WHERE j.kind='chat_backfill' AND j.platform='twitch'
-                                   AND j.video_id=v.video_id AND j.status='done')
+                 AND NOT EXISTS (SELECT 1 FROM messages m
+                                 WHERE m.platform='twitch' AND m.video_id=v.video_id)
                ORDER BY (cp.priority_until IS NOT NULL) DESC, v.started_at ASC"""
             % ph,
             (now_iso,) + tuple(slugs),
         )
     )
-    now_utc = datetime.now(timezone.utc)
-    fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
-    stale_cutoff = now_utc - timedelta(minutes=STALE_JOB_MIN)
-    spawned = 0
+    enqueued = 0
     for r in rows:
-        if spawned >= free:
-            break
-        vid = r["video_id"]
-        latest = archive_db.latest_job("twitch", vid, kind="chat_backfill")
-        if latest:
-            if latest["status"] in ("queued", "running"):
-                # Fresh = an executor is on it; stale = dead executor, re-run.
-                try:
-                    if datetime.fromisoformat(latest["updated_at"]) > stale_cutoff:
-                        continue
-                except (TypeError, ValueError):
-                    continue  # unparseable — assume in flight
-            elif latest["status"] == "failed":
-                try:
-                    if datetime.fromisoformat(latest["updated_at"]) > fresh_cutoff:
-                        continue  # failed < 1h ago — don't hammer
-                except (TypeError, ValueError):
-                    continue  # unparseable — treat as fresh failure
-        with _backfill_lock:
-            if vid in _backfill_inflight:
-                continue
-            _backfill_inflight.add(vid)
-        threading.Thread(
-            target=_backfill_one, args=(vid, r["channel"]), daemon=True
-        ).start()
-        spawned += 1
-
-
-def _backfill_one_youtube(video_id: str) -> None:
-    job_id = f"yt-chat-backfill-{video_id}-{int(time.time())}"
-    try:
-        from services.archive_ytdlp import backfill_live_chat
-
-        archive_db.enqueue_job(job_id, "chat_backfill", "youtube", video_id, priority=0)
-        archive_db.update_job(job_id, status="running")
-        result = backfill_live_chat(video_id)
-        archive_db.update_job(job_id, status="done", progress=1.0)
-        logger.info(
-            "scheduler yt chat backfill %s: %d message(s) (%s)",
-            video_id, result.get("chat_messages", 0), result.get("chat"),
-        )
-    except Exception as exc:  # noqa: BLE001 — bot wall / dead video
-        logger.info("scheduler yt chat backfill %s failed: %s", video_id, exc)
-        try:
-            archive_db.update_job(job_id, status="failed", error=str(exc)[:500])
-        except Exception:  # noqa: BLE001 — bookkeeping must not mask the real error
-            logger.debug("job status update failed for %s", video_id, exc_info=True)
-    finally:
-        with _backfill_lock:
-            _backfill_inflight.discard(video_id)
-        # Bulk chat inserts fragment the FTS b-tree; merge so searches
-        # stay fast (same as the router does after every backfill).
-        try:
-            archive_db.optimize_fts()
-        except Exception:  # noqa: BLE001
-            logger.debug("fts optimize failed after backfill", exc_info=True)
+        if _enqueue_chat_job("twitch", r["video_id"]):
+            enqueued += 1
+    if enqueued:
+        logger.info("scheduler twitch chat backfill: %d video(s) queued", enqueued)
 
 
 def _backfill_youtube_chat() -> None:
-    """Retro chat backfill for chat-less YouTube streams (leg 4b).
+    """Retro chat backfill for chat-less YouTube streams (leg 4b) — producer.
 
     The historical live-chat ingest crash (authorNameTextColor as a raw
     packed-ARGB int) archived captions but ZERO chat rows for streams; the
     covered-skip in _ingest_youtube then froze them forever (chat-less
-    streams with captions never re-ingest). This leg refetches live-chat
-    replay for exactly those videos: kind='stream' (was_live), no chat
-    rows, no completed backfill job. Chat-only (no caption re-fetch) to
-    avoid extra YouTube API pressure. 'none' chat (stream with replay
-    disabled) records a done job so it is not retried forever.
+    streams with captions never re-ingest). This leg enqueues kind='chat'
+    jobs for exactly those videos: kind='stream' (was_live), no chat rows.
+    The archive worker refetches live-chat replay — chat-only, no caption
+    re-fetch (they exist already; re-fetching adds YouTube API pressure).
+    'none' chat (stream with replay disabled) records a done job so it is
+    not retried forever. Dedupe lives in _enqueue_chat_job (queued/running/
+    done/fresh-failed skipped).
     """
-    with _backfill_lock:
-        free = TWITCH_BACKFILL_MAX_INFLIGHT - len(_backfill_inflight)
-    if free <= 0:
-        return
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = list(
         archive_db.query(
@@ -399,44 +350,16 @@ def _backfill_youtube_chat() -> None:
                  AND videos.video_id NOT LIKE 'youtube-live-%'
                  AND NOT EXISTS (SELECT 1 FROM messages m
                                  WHERE m.platform='youtube' AND m.video_id=videos.video_id)
-                 AND NOT EXISTS (SELECT 1 FROM archive_jobs j
-                                 WHERE j.kind='chat_backfill' AND j.platform='youtube'
-                                   AND j.video_id=videos.video_id AND j.status='done')
                ORDER BY (cp.priority_until IS NOT NULL) DESC, videos.started_at ASC""",
             (now_iso,),
         )
     )
-    now_utc = datetime.now(timezone.utc)
-    fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
-    stale_cutoff = now_utc - timedelta(minutes=STALE_JOB_MIN)
-    spawned = 0
+    enqueued = 0
     for r in rows:
-        if spawned >= free:
-            break
-        vid = r["video_id"]
-        latest = archive_db.latest_job("youtube", vid, kind="chat_backfill")
-        if latest:
-            if latest["status"] in ("queued", "running"):
-                # Fresh = an executor is on it; stale = dead executor, re-run.
-                try:
-                    if datetime.fromisoformat(latest["updated_at"]) > stale_cutoff:
-                        continue
-                except (TypeError, ValueError):
-                    continue  # unparseable — assume in flight
-            elif latest["status"] == "failed":
-                try:
-                    if datetime.fromisoformat(latest["updated_at"]) > fresh_cutoff:
-                        continue  # failed < 1h ago — don't hammer
-                except (TypeError, ValueError):
-                    continue  # unparseable — treat as fresh failure
-        with _backfill_lock:
-            if vid in _backfill_inflight:
-                continue
-            _backfill_inflight.add(vid)
-        threading.Thread(
-            target=_backfill_one_youtube, args=(vid,), daemon=True
-        ).start()
-        spawned += 1
+        if _enqueue_chat_job("youtube", r["video_id"]):
+            enqueued += 1
+    if enqueued:
+        logger.info("scheduler yt chat backfill: %d video(s) queued", enqueued)
 
 
 # WS-4 original-title sweep: the manual channel-sync router backfills only

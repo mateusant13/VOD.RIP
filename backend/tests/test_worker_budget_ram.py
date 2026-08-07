@@ -93,13 +93,22 @@ def test_cpu_budget_floor_with_low_ram(monkeypatch):
 
 # --- _gpu_copies ------------------------------------------------------------
 
-def test_gpu_copies_default_and_env_one(monkeypatch):
+def _allow_cuda(monkeypatch, vram: int) -> None:
+    """Idle, unheld GPU with a measured free-VRAM allowance."""
     _force_cuda(monkeypatch)
-    # No env -> 1 copy, no probes (VRAM/RAM are irrelevant).
-    _set_free_ram(monkeypatch, 1 * GIB)
+    monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: vram)
+    monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)
+    monkeypatch.setattr(at, "_gpu_util", lambda: 0.1)
+
+
+def test_gpu_copies_default_and_env_one(monkeypatch):
+    # No env -> 1 copy; ample VRAM/RAM make the clamps no-ops.
+    _allow_cuda(monkeypatch, 64 * GIB)
+    _set_free_ram(monkeypatch, 64 * GIB)
     assert at._gpu_copies() == 1
-    # env = 1 -> exactly 1 even with tiny RAM.
+    # env = 1 -> exactly 1 even with tiny RAM (floor 1).
     monkeypatch.setenv(at.GPU_COPIES_ENV, "1")
+    _set_free_ram(monkeypatch, 1 * GIB)
     assert at._gpu_copies() == 1
     # env = 0 -> auto (1 copy).
     monkeypatch.setenv(at.GPU_COPIES_ENV, "0")
@@ -107,10 +116,10 @@ def test_gpu_copies_default_and_env_one(monkeypatch):
 
 
 def test_gpu_copies_host_ram_clamp_only(monkeypatch):
-    _force_cuda(monkeypatch)
+    # VRAM never binds (64 GiB allowance -> per-copy budget 8 GiB leaves the
+    # env cap alone); host-RAM clamp is the only reducer.
+    _allow_cuda(monkeypatch, 64 * GIB)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    # No CUDA visible -> VRAM probe skipped; host-RAM clamp is the only one.
     _set_free_ram(monkeypatch, 6 * GIB)
     assert at._gpu_copies() == 4  # usable 4.8 GiB // 1.0 GiB = 4
     _set_free_ram(monkeypatch, 1 * GIB)
@@ -118,22 +127,44 @@ def test_gpu_copies_host_ram_clamp_only(monkeypatch):
 
 
 def test_gpu_copies_vram_then_ram_clamp(monkeypatch):
-    _force_cuda(monkeypatch)
+    monkeypatch.setattr(at, "model_name", lambda: "large-v3-turbo")  # est 6 GiB
+    per = at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM  # 8 GiB for turbo
+    # VRAM binds first: min(8, 40 GiB // 8 GiB) = 5, host RAM ample -> 5.
+    _allow_cuda(monkeypatch, 40 * GIB)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    # VRAM binds first: min(8, 12 GiB // 2 GiB) = 6, host RAM ample -> 6.
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (12 * GIB, 24 * GIB))
     _set_free_ram(monkeypatch, 64 * GIB)
-    assert at._gpu_copies() == 6
+    assert at._gpu_copies() == 5
     # Host RAM is the binding constraint when VRAM is ample: usable
     # 4 GiB * 0.8 = 3.2 GiB // 1.0 GiB = 3.
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (40 * GIB, 48 * GIB))
+    _allow_cuda(monkeypatch, 40 * GIB)
     _set_free_ram(monkeypatch, 4 * GIB)
     assert at._gpu_copies() == 3
-    # Both clamps stacked: VRAM cap min(8, 4//2) = 2, RAM cap 6 -> 2.
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (4 * GIB, 24 * GIB))
+    # Tight VRAM: one per-copy budget fits -> floor 1, RAM ample keeps it.
+    _allow_cuda(monkeypatch, per + 1)
     _set_free_ram(monkeypatch, 8 * GIB)
-    assert at._gpu_copies() == 2
+    assert at._gpu_copies() == 1
+
+
+def test_gpu_copies_held_gpu_force_zero(monkeypatch):
+    """nvidia-smi compute-apps shows another process -> never stack."""
+    _force_cuda(monkeypatch)
+    monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(at, "_gpu_held_by_other", lambda: True)
+    monkeypatch.setattr(at, "_gpu_util", lambda: 0.1)
+    monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
+    _set_free_ram(monkeypatch, 64 * GIB)
+    assert at._gpu_copies() == 0
+
+
+def test_gpu_copies_busy_gpu_caps_at_one(monkeypatch):
+    """util >= 70% -> one copy is the ceiling, never two."""
+    _force_cuda(monkeypatch)
+    monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)
+    monkeypatch.setattr(at, "_gpu_util", lambda: 0.85)
+    monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
+    _set_free_ram(monkeypatch, 64 * GIB)
+    assert at._gpu_copies() == 1
 
 
 # --- _free_system_ram_bytes cache -------------------------------------------

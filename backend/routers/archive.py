@@ -451,7 +451,7 @@ def _maybe_enrich(
             enriching.append({
                 "platform": "twitch",
                 "video_id": r["video_id"],
-                "kind": "chat_backfill",
+                "kind": "chat",
                 "channel": r["channel"] or "",
                 "title": r["title"] or "",
             })
@@ -740,7 +740,8 @@ async def archive_chat_window(platform: str, video_id: str, offset: float = 0.0,
 async def archive_chat_backfill(platform: str, video_id: str):
     """Queue a background Twitch chat backfill for one archived VOD.
 
-    Twitch-only (Kick/YouTube chats are archived at ingest). Status words:
+    Twitch-only (Kick/YouTube chats arrive via the queue/worker — Kick has
+    no retro API; YouTube chat is enqueued at ingest). Status words:
     'queued' (task started now), 'running' (already in flight),
     'already' (chat rows exist), 'failed' (could not start)."""
     p = _require_platform(platform)
