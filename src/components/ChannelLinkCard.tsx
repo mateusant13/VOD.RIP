@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef } from 'react';
 import { X } from 'lucide-react';
 import PlatformVodIcon from './PlatformVodIcon';
+import { useI18n } from '../i18n';
 import {
   type ChannelLinkDraft,
   type ChannelLinkPlatform,
@@ -69,6 +70,7 @@ export default function ChannelLinkCard({
 }: Props) {
   const titleId = useId();
   const firstInputRef = useRef<HTMLInputElement>(null);
+  const { t } = useI18n();
   const summary = channelLinkWillAddSummary(draft);
   const canSubmit = channelLinkDraftValid(draft) && !duplicateMessage;
 
@@ -105,29 +107,29 @@ export default function ChannelLinkCard({
       <div>
         <div className="flex items-start justify-between gap-2">
           <p id={titleId} className="text-[11px] font-black uppercase text-white tracking-wide">
-            Link channel
+            {t('Link channel')}
           </p>
           <button
             type="button"
             onClick={onCancel}
-            title="Close"
-            aria-label="Close"
+            title={t('Close')}
+            aria-label={t('Close')}
             className="text-zinc-500 hover:text-white transition-colors shrink-0 -mt-0.5 -mr-0.5"
           >
             <X size={13} />
           </button>
         </div>
         <p className="text-[10px] font-mono text-zinc-500 leading-snug mt-0.5">
-          Usernames can be different on each platform. Edit them before adding.
+          {t('Usernames can be different on each platform. Edit them before adding.')}
         </p>
         {draft.detectedFrom ? (
           <p className="text-[9px] font-mono text-zinc-600 mt-1">
-            Detected from {draft.detectedFrom === 'kick' ? 'Kick' : draft.detectedFrom === 'twitch' ? 'Twitch' : 'YouTube'}
+            {t('Detected from {platform}', { platform: draft.detectedFrom === 'kick' ? 'Kick' : draft.detectedFrom === 'twitch' ? 'Twitch' : 'YouTube' })}
           </p>
         ) : null}
         {showGuessHint ? (
           <p className="text-[9px] font-mono text-zinc-600 mt-0.5">
-            Kick and Twitch were prefilled from the YouTube handle — edit or turn off if different.
+            {t('Kick and Twitch were prefilled from the YouTube handle — edit or turn off if different.')}
           </p>
         ) : null}
       </div>
@@ -158,7 +160,7 @@ export default function ChannelLinkCard({
                 type="text"
                 value={slug}
                 disabled={!enabled}
-                placeholder={row.placeholder}
+                placeholder={t(row.placeholder)}
                 onChange={(e) => patchRow(row, { [row.slugKey]: e.target.value, [row.enabledKey]: true })}
                 onFocus={() => {
                   if (!enabled) patchRow(row, { [row.enabledKey]: true });
@@ -177,7 +179,7 @@ export default function ChannelLinkCard({
                 className={`flex-1 min-w-0 bg-zinc-950 border border-zinc-800 text-white font-mono px-2 py-1 text-[10px] disabled:text-zinc-600 disabled:cursor-not-allowed focus:outline-none ${row.focusBorder}`}
               />
               {isDetected && enabled ? (
-                <span className="text-[8px] font-mono text-zinc-600 shrink-0 hidden sm:inline">from URL</span>
+                <span className="text-[8px] font-mono text-zinc-600 shrink-0 hidden sm:inline">{t('from URL')}</span>
               ) : (
                 <span className="text-[8px] font-mono text-zinc-700 shrink-0 hidden sm:inline w-12" aria-hidden />
               )}
@@ -188,10 +190,10 @@ export default function ChannelLinkCard({
 
       {summary ? (
         <p className="text-[9px] font-mono text-zinc-500">
-          Will add: <span className="text-zinc-300">{summary}</span>
+          {t('Will add: {summary}', { summary })}
         </p>
       ) : (
-        <p className="text-[9px] font-mono text-zinc-600">Select at least one platform with a username.</p>
+        <p className="text-[9px] font-mono text-zinc-600">{t('Select at least one platform with a username.')}</p>
       )}
 
       {duplicateMessage ? (
@@ -205,14 +207,14 @@ export default function ChannelLinkCard({
           disabled={!canSubmit}
           className="flex-1 bg-white text-black font-black uppercase py-1.5 text-[10px] border-2 border-white disabled:opacity-40"
         >
-          Add channel
+          {t('Add channel')}
         </button>
         <button
           type="button"
           onClick={onCancel}
           className="flex-1 border border-zinc-600 text-zinc-400 font-mono uppercase py-1.5 text-[10px] hover:text-white hover:border-zinc-500"
         >
-          Cancel
+          {t('Cancel')}
         </button>
       </div>
     </div>

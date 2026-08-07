@@ -3,6 +3,7 @@ import { Loader2, Trash2 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
 import NumberField from './NumberField';
 import { apiGet, apiPost } from '../hooks/useApiClient';
+import { useI18n } from '../i18n';
 import { formatBytes } from '../formatters';
 import type { AppSettings, DiskInfo, DiskStatus, DiskUsage, DisksResponse } from '../types';
 
@@ -35,13 +36,14 @@ function UsageRow({
   cleaning: boolean;
   onClean: (category: string) => void;
 }) {
+  const { t } = useI18n();
   const cleanable = (CLEANABLE as readonly string[]).includes(category);
   const pct = total > 0 ? Math.max(0, Math.min(100, (bytes / total) * 100)) : 0;
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2">
         <span className="flex-1 text-[11px] text-zinc-300 font-mono uppercase tracking-wide truncate">
-          {ROW_LABELS[category] ?? category}
+          {t(ROW_LABELS[category] ?? category)}
         </span>
         <span className="text-[11px] text-zinc-100 font-mono tabular-nums w-20 text-right">
           {formatBytes(bytes)}
@@ -49,13 +51,13 @@ function UsageRow({
         {cleanable ? (
           <button
             type="button"
-            aria-label={`clean ${category}`}
+            aria-label={t('clean {category}', { category })}
             onClick={() => onClean(category)}
             disabled={cleaning}
             className="bg-zinc-900 text-zinc-400 font-black uppercase px-3 py-1.5 text-[11px] border-2 border-zinc-700 hover:border-red-500 hover:text-red-400 shrink-0 flex items-center gap-1.5 disabled:opacity-40"
           >
             {cleaning ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
-            CLEAN
+            {t('CLEAN')}
           </button>
         ) : (
           <span className="w-16 shrink-0" aria-hidden />
@@ -75,6 +77,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
   const [cleaning, setCleaning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastFreed, setLastFreed] = useState<string | null>(null);
+  const { t } = useI18n();
 
   const refresh = useCallback(async () => {
     try {
@@ -101,14 +104,14 @@ export default function DiskSection({ settings, setSettings }: Props) {
     setLastFreed(null);
     try {
       const res = await apiPost<{ freed_bytes: number }>('/api/disk/cleanup', { category });
-      setLastFreed(`${ROW_LABELS[category] ?? category}: freed ${formatBytes(res.freed_bytes)}`);
+      setLastFreed(t('{label}: freed {bytes}', { label: t(ROW_LABELS[category] ?? category), bytes: formatBytes(res.freed_bytes) }));
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Cleanup failed');
     } finally {
       setCleaning(null);
     }
-  }, [refresh]);
+  }, [refresh, t]);
 
   const keepCount = settings.archive_vod_keep_count ?? 5;
   const keepValue = Number.isFinite(keepCount) ? Math.max(1, Math.min(50, keepCount)) : 5;
@@ -126,31 +129,31 @@ export default function DiskSection({ settings, setSettings }: Props) {
   const fastest = disks?.fastest ?? '';
   const formatFree = (n: number) => formatBytes(n).replace(/\.00 /, ' ');
   const driveLabel = (d: DiskInfo) =>
-    `${d.drive.replace(/\\+$/, '')} (${formatFree(d.free_bytes)} free, ${d.media_type})`;
+    `${d.drive.replace(/\\+$/, '')} (${t('{bytes} free', { bytes: formatFree(d.free_bytes) })}, ${d.media_type})`;
   const cacheOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-cache`, label: driveLabel(d) }));
   const dataOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-data`, label: driveLabel(d) }));
   const cacheCustom = cacheDir !== '' && !cacheOptions.some((o) => o.value === cacheDir);
   const dataCustom = dataDir !== '' && !dataOptions.some((o) => o.value === dataDir);
   const autoDataLabel = fastest
-    ? `Auto (fastest: ${fastest.replace(/\\+$/, '')})`
-    : 'Auto (fastest)';
+    ? t('Auto (fastest: {drive})', { drive: fastest.replace(/\\+$/, '') })
+    : t('Auto (fastest)');
 
   return (
     <div className="flex flex-col gap-3">
       {status?.low ? (
         <div role="alert" className="bg-red-950 text-red-400 border-2 border-red-900 px-3 py-2 text-[11px] font-mono">
-          LOW DISK SPACE — {formatBytes(status.free_bytes)} free. Run cleanups below or free space manually.
+          {t('LOW DISK SPACE — {free} free. Run cleanups below or free space manually.', { free: formatBytes(status.free_bytes) })}
         </div>
       ) : null}
 
       <div className="flex flex-col gap-1.5">
-        <FieldCaption noWrap>Storage</FieldCaption>
+        <FieldCaption noWrap>{t('Storage')}</FieldCaption>
 
         <FieldCaption
           noWrap
-          info="Whisper models, yt-dlp cache, preview temp & embed models — applies on Save Settings (next launch)"
+          info={t('Whisper models, yt-dlp cache, preview temp & embed models — applies on Save Settings (next launch)')}
         >
-          Heavy Cache Disk
+          {t('Heavy Cache Disk')}
         </FieldCaption>
         <select
           aria-label="heavy cache disk"
@@ -158,18 +161,18 @@ export default function DiskSection({ settings, setSettings }: Props) {
           onChange={(e) => setSettings({ ...settings, cache_dir: e.target.value })}
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
         >
-          <option value="">Auto (biggest free space)</option>
+          <option value="">{t('Auto (biggest free space)')}</option>
           {cacheOptions.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>
           ))}
-          {cacheCustom ? <option value={cacheDir}>Custom ({cacheDir})</option> : null}
+          {cacheCustom ? <option value={cacheDir}>{t('Custom ({dir})', { dir: cacheDir })}</option> : null}
         </select>
 
 
-        <FieldCaption noWrap info="transcripts, chat data & preview cache — takes effect after restart (moves the database)">
-          Transcripts &amp; Chat Data Disk
+        <FieldCaption noWrap info={t('transcripts, chat data & preview cache — takes effect after restart (moves the database)')}>
+          {t('Transcripts & Chat Data Disk')}
         </FieldCaption>
         <select
           aria-label="transcripts and chat data disk"
@@ -183,18 +186,18 @@ export default function DiskSection({ settings, setSettings }: Props) {
               {o.label}
             </option>
           ))}
-          {dataCustom ? <option value={dataDir}>Custom ({dataDir})</option> : null}
+          {dataCustom ? <option value={dataDir}>{t('Custom ({dir})', { dir: dataDir })}</option> : null}
         </select>
 
 
         <div className="flex items-center gap-2 pt-0.5 flex-wrap">
           <span className="text-[11px] text-zinc-400 font-mono">
             {effectiveCache
-              ? `${effectiveCache} — ${cacheFree != null ? `${formatBytes(cacheFree)} free` : '…'}`
-              : 'using app data drive'}
+              ? t('{path} — {free} free', { path: effectiveCache, free: cacheFree != null ? formatBytes(cacheFree) : '…' })
+              : t('using app data drive')}
           </span>
           {status?.biggest_drive ? (
-            <span className="text-[11px] text-zinc-400 font-mono">auto pick: {status.biggest_drive}</span>
+            <span className="text-[11px] text-zinc-400 font-mono">{t('auto pick: {drive}', { drive: status.biggest_drive })}</span>
           ) : null}
         </div>
       </div>
@@ -217,14 +220,14 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
       {usage ? (
         <div className="flex items-center gap-2">
-          <span className="flex-1 text-[11px] text-zinc-400 font-mono uppercase tracking-wide">Total</span>
+          <span className="flex-1 text-[11px] text-zinc-400 font-mono uppercase tracking-wide">{t('Total')}</span>
           <span className="text-[11px] text-zinc-100 font-mono tabular-nums w-20 text-right">{formatBytes(usage.total)}</span>
           <span className="w-16 shrink-0" aria-hidden />
         </div>
       ) : null}
 
       <div className="flex items-center gap-2 pt-0.5 flex-wrap">
-        <span className="text-[11px] text-zinc-400 font-mono">FREE</span>
+        <span className="text-[11px] text-zinc-400 font-mono">{t('FREE')}</span>
         <span className="text-[11px] text-zinc-300 font-mono tabular-nums">
           {status ? formatBytes(status.free_bytes) : '…'}
         </span>
@@ -232,8 +235,8 @@ export default function DiskSection({ settings, setSettings }: Props) {
       </div>
 
       <div className="flex flex-col gap-1.5 pt-1">
-        <FieldCaption noWrap info="Oldest VODs kept per platform — applies on Save Settings">
-          Archive VODs Keep
+        <FieldCaption noWrap info={t('Oldest VODs kept per platform — applies on Save Settings')}>
+          {t('Archive VODs Keep')}
         </FieldCaption>
         <div className="flex items-center gap-2">
           <div className="w-24 shrink-0">

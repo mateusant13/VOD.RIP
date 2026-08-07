@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X, AlertCircle } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
+import { useI18n } from '../i18n';
 import { openTwitchClipEditor } from '../twitchClip';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
@@ -82,6 +83,7 @@ const REPLAY_RESNAPSHOT_MS = 30_000;
 const SESSION_STALL_MS = 8_000;
 
 export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0 }: LivePlayerPopupProps) {
+  const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -291,7 +293,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       try {
         hlsCtorRef.current = (await import('hls.js')).default;
       } catch {
-        setError('HLS not supported in this browser');
+        setError(t('HLS not supported in this browser'));
         setLoading(false);
         markPreviewError();
         return null;
@@ -305,7 +307,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         video.play().catch(() => {});
         return null;
       }
-      setError('HLS not supported in this browser');
+      setError(t('HLS not supported in this browser'));
       setLoading(false);
       markPreviewError();
       return null;
@@ -431,14 +433,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             }, networkRetries * 500);
             break;
           }
-          setError('Live playback failed — try again');
+          setError(t('Live playback failed — try again'));
           setLoading(false);
           break;
         case Hls.ErrorTypes.MEDIA_ERROR:
           hls.recoverMediaError();
           break;
         default:
-          setError('Live playback failed — try again');
+          setError(t('Live playback failed — try again'));
           setLoading(false);
           break;
       }
@@ -524,7 +526,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         window.clearTimeout(stallTimer);
         if (!res) {
           if (tryAdvanceEntry()) return;
-          setError('No response from server');
+          setError(t('No response from server'));
           setLoading(false);
           markPreviewError();
           return;
@@ -578,8 +580,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           if (tryAdvanceEntry()) return;
           const stalled = err instanceof DOMException && err.name === 'AbortError';
           setError(stalled
-            ? 'Live session is taking too long to start'
-            : (err instanceof Error ? err.message : 'Failed to start live stream'));
+            ? t('Live session is taking too long to start')
+            : (err instanceof Error ? err.message : t('Failed to start live stream')));
           setLoading(false);
           markPreviewError();
         }
@@ -894,7 +896,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const openLiveTwitchClip = useCallback(async () => {
     const login = (channelSlug || '').trim();
     if (!login) {
-      showClipNotice('error', 'Channel login missing — cannot open the Twitch editor');
+      showClipNotice('error', t('Channel login missing — cannot open the Twitch editor'));
       return;
     }
     setClipOpening(true);
@@ -902,7 +904,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       const res = await openTwitchClipEditor({ broadcasterLogin: login });
       showClipNotice('ok', `Twitch clip editor opened — ${res.url}`);
     } catch {
-      showClipNotice('error', 'Failed to open the Twitch clip editor');
+      showClipNotice('error', t('Failed to open the Twitch clip editor'));
     } finally {
       setClipOpening(false);
     }
@@ -975,7 +977,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         <div className="flex items-start gap-1.5 min-w-0">
           <div className="min-w-0">
             <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-              {mode === 'live' ? 'Live stream' : 'Live replay'}
+              {mode === 'live' ? t('Live stream') : t('Live replay')}
             </span>
             <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
               {channelName}
@@ -1000,7 +1002,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             <button
               className="live-popup-link text-zinc-500 hover:text-white p-1 shrink-0"
               onClick={() => window.open(channelUrl, '_blank', 'noopener,noreferrer')}
-              title="Open channel"
+              title={t('Open channel')}
             >
               <ExternalLink size={13} />
             </button>
@@ -1018,16 +1020,16 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   ? 'bg-white text-black border-white'
                   : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
               }`}
-              title="Search the local archive (transcripts + chat)"
+              title={t('Search the local archive (transcripts + chat)')}
             >
               <Search size={10} className="shrink-0" />
-              {searchOpen ? 'CLOSE SEARCH' : 'SEARCH ARCHIVE'}
+              {searchOpen ? t('CLOSE SEARCH') : t('SEARCH ARCHIVE')}
             </button>
           )}
           <button
             className="live-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
             onClick={handleClose}
-            title="Close"
+            title={t('Close')}
           >
             <X size={16} />
           </button>
@@ -1063,7 +1065,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           <div className="absolute inset-0 z-[1] flex items-center justify-center bg-black/60 pointer-events-none">
             <Loader2 size={40} className="animate-spin text-zinc-300" />
             <span className="ml-3 text-zinc-300 text-xs font-mono">
-              {mode === 'replay' ? 'Loading replay…' : 'Loading live stream…'}
+              {mode === 'replay' ? t('Loading replay…') : t('Loading live stream…')}
             </span>
           </div>
         )}
@@ -1077,7 +1079,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               <button
                 type="button"
                 onClick={retryPreview}
-                title="Retry this live stream"
+                title={t('Retry this live stream')}
                 className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-red-400 border-2 border-red-800 bg-red-950/30 px-2.5 py-1 hover:border-red-500 hover:text-red-300 cursor-pointer"
               >
                 <RefreshCw size={12} />
@@ -1139,10 +1141,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 disabled={railDisabled}
                 onChange={(e) => handleRailChange(parseFloat(e.target.value))}
                 className={`h-1 flex-1 ${mode === 'replay' ? 'accent-blue-400' : 'accent-red-500'} ${railDisabled ? 'opacity-60' : ''}`}
-                aria-label={mode === 'replay' ? 'Seek within replay' : 'Seek back into the broadcast (replay)'}
+                aria-label={mode === 'replay' ? t('Seek within replay') : t('Seek back into the broadcast (replay)')}
                 title={mode === 'replay'
-                  ? 'Replay of the current broadcast — drag to seek'
-                  : (railDisabled ? 'Replay unavailable for this channel' : 'Drag back to watch the past part of the stream')}
+                  ? t('Replay of the current broadcast — drag to seek')
+                  : (railDisabled ? t('Replay unavailable for this channel') : t('Drag back to watch the past part of the stream'))}
               />
               <span className="w-11 shrink-0 text-right font-mono text-[9px] text-zinc-400">
                 {fmtDuration(displayTotal)}
@@ -1152,7 +1154,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               <button
                 type="button"
                 onClick={togglePlay}
-                title={paused ? 'Play' : 'Pause'}
+                title={paused ? t('Play') : t('Pause')}
                 className={transportBtn}
               >
                 {paused ? <Play size={15} /> : <Pause size={15} />}
@@ -1168,8 +1170,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   title="Volume"
                   className={transportBtn}
                 >
-                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
-                </button>
+                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}                </button>
                 {volumeMenuOpen && (
                   <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 border-2 border-zinc-600 bg-zinc-950 px-2.5 py-2 shadow-lg">
                     <button
@@ -1178,7 +1179,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                         e.stopPropagation();
                         toggleMute();
                       }}
-                      title={muted ? 'Unmute' : 'Mute'}
+                      title={muted ? t('Unmute') : t('Mute')}
                       className={transportBtn}
                     >
                       {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
@@ -1206,8 +1207,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                     className={transportBtn}
                     title={
                       !channelSlug?.trim()
-                        ? 'Channel login missing — cannot open the Twitch editor'
-                        : 'Open Twitch clip editor for this live stream'
+                        ? t('Channel login missing — cannot open the Twitch editor')
+                        : t('Open Twitch clip editor for this live stream')
                     }
                   >
                     {clipOpening ? <Loader2 size={15} className="animate-spin" /> : <TwitchLogoIcon size={14} />}
@@ -1217,7 +1218,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 <button
                   type="button"
                   onClick={() => (mode === 'replay' ? switchToLive() : snapToLiveEdge())}
-                  title={mode === 'replay' ? 'Return to live' : 'Snap to live edge'}
+                  title={mode === 'replay' ? t('Return to live') : t('Snap to live edge')}
                   className="flex items-center gap-1 border-2 border-red-800 bg-red-950/30 px-1.5 py-1 text-[9px] font-bold tracking-wider text-red-400 hover:border-red-500 hover:text-red-300"
                 >
                   <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
@@ -1240,7 +1241,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 <button
                   type="button"
                   onClick={toggleFullscreen}
-                  title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                  title={isFullscreen ? t('Exit fullscreen') : t('Fullscreen')}
                   className={transportBtn}
                 >
                   {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}

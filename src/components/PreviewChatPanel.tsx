@@ -34,6 +34,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
+import { useI18n } from '../i18n';
 import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
@@ -183,6 +184,7 @@ const ChatRow = memo(function ChatRow({
   onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
+  const { t } = useI18n();
   return (
     <div
       ref={ref}
@@ -190,7 +192,7 @@ const ChatRow = memo(function ChatRow({
       aria-current={active ? 'true' : undefined}
       style={{ height: CHAT_ROW_H }}
       onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
-      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)}` : undefined}
+      title={onSeek ? t('Seek to {offset}', { offset: formatArchiveOffset(row.offset_sec) }) : undefined}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-yellow-300/10 border-yellow-300 text-zinc-100'
@@ -232,6 +234,7 @@ const TranscriptRow = memo(function TranscriptRow({
   onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
+  const { t } = useI18n();
   return (
     <div
       ref={ref}
@@ -239,7 +242,7 @@ const TranscriptRow = memo(function TranscriptRow({
       aria-current={active ? 'true' : undefined}
       style={{ height: TRANSCRIPT_ROW_H }}
       onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
-      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)}` : undefined}
+      title={onSeek ? t('Seek to {offset}', { offset: formatArchiveOffset(row.offset_sec) }) : undefined}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-yellow-300/10 border-yellow-300 text-zinc-100'
@@ -269,8 +272,15 @@ const EventRow = memo(function EventRow({
   onSeek?: (offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
+  const { t } = useI18n();
   const durSec = Math.max(0, row.end_sec - row.offset_sec);
-  const rangeTitle = `${row.event} — ${formatArchiveOffset(row.offset_sec)} to ${formatArchiveOffset(row.end_sec)} (${durSec.toFixed(1)}s, confidence ${(row.score * 100).toFixed(0)}%)`;
+  const rangeTitle = t('{event} — {from} to {to} ({sec}s, confidence {pct}%)', {
+    event: row.event,
+    from: formatArchiveOffset(row.offset_sec),
+    to: formatArchiveOffset(row.end_sec),
+    sec: durSec.toFixed(1),
+    pct: (row.score * 100).toFixed(0),
+  });
   return (
     <div
       ref={ref}
@@ -279,7 +289,7 @@ const EventRow = memo(function EventRow({
       aria-current={active ? 'true' : undefined}
       style={{ height: TRANSCRIPT_ROW_H }}
       onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
-      title={onSeek ? `Seek to ${formatArchiveOffset(row.offset_sec)} — ${rangeTitle}` : rangeTitle}
+      title={onSeek ? t('Seek to {offset} — {range}', { offset: formatArchiveOffset(row.offset_sec), range: rangeTitle }) : rangeTitle}
       className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-amber-300/15 border-amber-300 text-amber-200'
@@ -320,6 +330,7 @@ export function PreviewChatPanel({
   maxWidth: maxWidthProp,
   onLayoutChange,
 }: PreviewChatPanelProps) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(defaultOpen);
   const [tab, setTab] = useState<PreviewPanelTab>('chat');
   const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
@@ -747,11 +758,11 @@ export function PreviewChatPanel({
             setOpen(true);
           }}
           className="w-7 h-full flex flex-col items-center justify-center gap-1.5 border-l-2 border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-white hover:bg-zinc-900"
-          title={subtitlesOnly ? 'Open preview subtitles' : 'Open preview chat panel'}
+          title={subtitlesOnly ? t('Open preview subtitles') : t('Open preview chat panel')}
         >
           {subtitlesOnly ? <Captions size={13} /> : <MessageSquare size={13} />}
           <span className="[writing-mode:vertical-rl] rotate-180 text-[8px] font-mono uppercase tracking-widest">
-            {subtitlesOnly ? 'Subs' : 'Chat'}
+            {subtitlesOnly ? t('Subs') : t('Chat')}
           </span>
         </button>
       ) : (
@@ -760,7 +771,7 @@ export function PreviewChatPanel({
             data-panel-resize-handle
             onPointerDown={onResizeStart}
             className="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize z-10 group/resize"
-            title="Resize panel"
+            title={t('Resize panel')}
           >
             <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-zinc-700 group-hover/resize:bg-zinc-500" />
           </div>
@@ -787,7 +798,7 @@ export function PreviewChatPanel({
                   }`}
                 >
                   <Icon size={10} className="shrink-0" />
-                  {label}
+                  {t(label)}
                 </button>
               ),
             )}
@@ -796,7 +807,7 @@ export function PreviewChatPanel({
               type="button"
               onClick={() => setOpen(false)}
               className="text-zinc-500 hover:text-white p-1"
-              title="Collapse panel"
+              title={t('Collapse panel')}
             >
               <ChevronRight size={14} />
             </button>
@@ -819,8 +830,8 @@ export function PreviewChatPanel({
                     setChatQuery('');
                   }
                 }}
-                placeholder="Search chat…"
-                aria-label="Search chat history"
+                placeholder={t('Search chat…')}
+                aria-label={t('Search chat history')}
                 spellCheck={false}
                 className="flex-1 min-w-0 bg-zinc-900 border border-zinc-700 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 outline-none focus:border-white placeholder:text-zinc-600"
               />
@@ -837,27 +848,27 @@ export function PreviewChatPanel({
                   <button
                     type="button"
                     onClick={() => stepSearch(-1)}
-                    title="Previous match (Shift+Enter)"
+                    title={t('Previous match (Shift+Enter)')}
                     className="text-zinc-500 hover:text-white p-0.5"
-                    aria-label="Previous match"
+                    aria-label={t('Previous match')}
                   >
                     <ChevronUp size={11} />
                   </button>
                   <button
                     type="button"
                     onClick={() => stepSearch(1)}
-                    title="Next match (Enter)"
+                    title={t('Next match (Enter)')}
                     className="text-zinc-500 hover:text-white p-0.5"
-                    aria-label="Next match"
+                    aria-label={t('Next match')}
                   >
                     <ChevronDown size={11} />
                   </button>
                   <button
                     type="button"
                     onClick={() => setChatQuery('')}
-                    title="Clear search (Esc)"
+                    title={t('Clear search (Esc)')}
                     className="text-zinc-500 hover:text-white p-0.5"
-                    aria-label="Clear chat search"
+                    aria-label={t('Clear chat search')}
                   >
                     <X size={11} />
                   </button>
@@ -875,13 +886,13 @@ export function PreviewChatPanel({
           {fetchState === 'loading' && (
             <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-500">
               <Loader2 size={13} className="animate-spin" />
-              <span className="text-[10px] font-mono">Loading panel…</span>
+              <span className="text-[10px] font-mono">{t('Loading panel…')}</span>
             </div>
           )}
           {fetchState === 'error' && (
             <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-2 px-4">
               <span className="text-red-300 text-[10px] font-mono text-center">
-                Couldn&apos;t load panel data.
+                {t("Couldn't load panel data.")}
               </span>
               <button
                 type="button"
@@ -889,7 +900,7 @@ export function PreviewChatPanel({
                 className="flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-red-300"
               >
                 <RefreshCw size={10} />
-                Retry
+                {t('Retry')}
               </button>
             </div>
           )}
@@ -897,20 +908,20 @@ export function PreviewChatPanel({
             // platform/videoId resolved empty (clip/live/channel/local-file
             // previews) — there is no archive key to fetch, so say so
             // instead of rendering a silent blank panel.
-            <EmptyState text="Chat and transcript history aren't available for this kind of preview." />
+            <EmptyState text={t("Chat and transcript history aren't available for this kind of preview.")} />
           )}
           {fetchState === 'done' && payload && tab === 'subtitles' && (
             <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col items-center justify-center gap-2 px-3 py-4">
               {subtitlesOnly && subsFetchState === 'loading' && (
                 <div className="flex flex-col items-center justify-center gap-2 text-zinc-500">
                   <Loader2 size={13} className="animate-spin" />
-                  <span className="text-[10px] font-mono">Loading subtitles…</span>
+                  <span className="text-[10px] font-mono">{t('Loading subtitles…')}</span>
                 </div>
               )}
               {subtitlesOnly && subsFetchState === 'error' && (
                 <div className="flex flex-col items-center justify-center gap-2 px-4">
                   <span className="text-red-300 text-[10px] font-mono text-center">
-                    Couldn&apos;t load subtitles.
+                    {t("Couldn't load subtitles.")}
                   </span>
                   <button
                     type="button"
@@ -924,12 +935,12 @@ export function PreviewChatPanel({
               )}
               {subtitlesOnly && subsFetchState === 'done' && (!ytSubtitles?.has_subtitles || subtitleRows.length === 0) && (
                 <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
-                  No subtitles available for this video.
+                  {t('No subtitles available for this video.')}
                 </p>
               )}
               {!subtitlesOnly && !payload.has_transcript && (
                 <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
-                  No captions for this video.
+                  {t('No captions for this video.')}
                 </p>
               )}
               {subtitleRows.length > 0 &&
@@ -948,7 +959,7 @@ export function PreviewChatPanel({
                       }
                       title={
                         onSeek
-                          ? `Seek to ${formatArchiveOffset(subtitleRows[activeSubtitleIdx].offset_sec)}`
+                          ? t('Seek to {offset}', { offset: formatArchiveOffset(subtitleRows[activeSubtitleIdx].offset_sec) })
                           : undefined
                       }
                     >
@@ -957,7 +968,7 @@ export function PreviewChatPanel({
                   </>
                 ) : (
                   <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">
-                    No caption at this moment.
+                    {t('No caption at this moment.')}
                   </p>
                 ))}
             </div>
@@ -974,16 +985,16 @@ export function PreviewChatPanel({
                 <EmptyState
                   text={
                     payload.backfill === 'running'
-                      ? 'Loading chat…'
-                      : 'No archived chat for this video.'
+                      ? t('Loading chat…')
+                      : t('No archived chat for this video.')
                   }
                 />
               )}
               {tab === 'chat' && qActive && chatList.length === 0 && (
-                <EmptyState text={`No chat messages match “${chatQuery.trim()}”.`} />
+                <EmptyState text={t('No chat messages match “{query}”.', { query: chatQuery.trim() })} />
               )}
               {tab === 'transcript' && !payload.has_transcript && timelineRows.length === 0 && (
-                <EmptyState text="No transcript for this video." />
+                <EmptyState text={t('No transcript for this video.')} />
               )}
               {list.length > 0 && (
                 <>

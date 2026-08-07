@@ -2,6 +2,7 @@ import { memo, type ReactNode } from 'react';
 import { FolderOpen, Pause, Play, StopCircle, Trash2 } from 'lucide-react';
 import { platformAccentColor, vodCheckboxStyle } from '../platformColors';
 import DownloadThumb from './DownloadThumb';
+import { useI18n } from '../i18n';
 
 export type ActiveDownloadRow = {
   download_id: string;
@@ -44,10 +45,11 @@ function ActiveDownloadsListInner({
   selectedIds,
   onToggleSelect,
 }: Props) {
+  const { t } = useI18n();
   if (downloads.length === 0) {
     return (
       <div className="text-center text-zinc-600 font-mono text-xs py-6 border-2 border-dashed border-zinc-800">
-        NO DOWNLOADS IN QUEUE.
+        {t('NO DOWNLOADS IN QUEUE.')}
       </div>
     );
   }
@@ -139,7 +141,7 @@ function ActiveDownloadsListInner({
                 />
               )}
             </div>
-            <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
+              <div className="flex justify-between items-center text-[10px] text-zinc-500 font-mono gap-2">
               <span className="truncate">{basename(dl.output_file)}</span>
               <div className="flex items-center gap-2 shrink-0">
                 {dl.output_file && !isResumable && (
@@ -147,9 +149,9 @@ function ActiveDownloadsListInner({
                     type="button"
                     onClick={() => onOpenFolder(dl.output_file)}
                     className="text-zinc-400 hover:text-white flex items-center gap-1"
-                    title="Show in folder"
+                    title={t('Show in folder')}
                   >
-                    <FolderOpen size={12} /> Folder
+                    <FolderOpen size={12} /> {t('Folder')}
                   </button>
                 )}
                 {isResumable ? (
@@ -158,17 +160,17 @@ function ActiveDownloadsListInner({
                       type="button"
                       onClick={() => onResume(dl.download_id)}
                       className="text-zinc-400 hover:text-[#53fc18] flex items-center gap-1"
-                      title="Resume download"
+                      title={t('Resume download')}
                     >
-                      <Play size={12} /> Resume
+                      <Play size={12} /> {t('Resume')}
                     </button>
                     <button
                       type="button"
                       onClick={() => onDelete(dl.download_id)}
                       className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
-                      title="Remove from queue"
+                      title={t('Remove from queue')}
                     >
-                      <Trash2 size={12} /> Delete
+                      <Trash2 size={12} /> {t('Delete')}
                     </button>
                   </>
                 ) : isPaused ? (
@@ -178,14 +180,14 @@ function ActiveDownloadsListInner({
                       onClick={() => onResume(dl.download_id)}
                       className="text-zinc-400 hover:text-white flex items-center gap-1"
                     >
-                      <Play size={12} /> Resume
+                      <Play size={12} /> {t('Resume')}
                     </button>
                     <button
                       type="button"
                       onClick={() => onCancel(dl.download_id)}
                       className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
                     >
-                      <StopCircle size={12} /> Cancel
+                      <StopCircle size={12} /> {t('Cancel')}
                     </button>
                   </>
                 ) : (
@@ -195,14 +197,14 @@ function ActiveDownloadsListInner({
                       onClick={() => onPause(dl.download_id)}
                       className="text-zinc-400 hover:text-yellow-300 flex items-center gap-1"
                     >
-                      <Pause size={12} /> Pause
+                      <Pause size={12} /> {t('Pause')}
                     </button>
                     <button
                       type="button"
                       onClick={() => onCancel(dl.download_id)}
                       className="text-zinc-500 hover:text-red-400 flex items-center gap-1"
                     >
-                      <StopCircle size={12} /> Cancel
+                      <StopCircle size={12} /> {t('Cancel')}
                     </button>
                   </>
                 )}

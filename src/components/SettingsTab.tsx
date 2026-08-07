@@ -1,6 +1,6 @@
 import { type Dispatch, type ReactNode, type SetStateAction, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, FolderOpen, HardDrive, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
+  AlertTriangle, CheckCircle2, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
@@ -11,6 +11,7 @@ import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
 import Toggle from './Toggle';
 import { apiPost } from '../hooks/useApiClient';
+import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 
 type Props = {
@@ -93,6 +94,15 @@ export default function SettingsTab({
 }: Props) {
   const [savedSig, setSavedSig] = useState(() => settingsSignature(settings));
   const dirty = settingsSignature(settings) !== savedSig;
+  const { lang, setLang, t } = useI18n();
+
+  /** Persist the language choice immediately — switching must survive a
+   *  reload even if the user never presses Save Settings. */
+  const changeLanguage = (l: Lang) => {
+    setLang(l);
+    setSettings({ ...settings, ui_language: l });
+    void apiPost('/api/settings', { ui_language: l }).catch(() => {});
+  };
 
   /** Latest Cookie Bridge status — drives card placement. Null until the
    *  first fetch resolves; the card then sits at its normal (last) spot so
@@ -106,7 +116,7 @@ export default function SettingsTab({
     cookieStatus !== null && (!cookieStatus.paired || cookieCount === 0);
 
   const cookieCard = (
-    <SettingsCard icon={ShieldCheck} title="Cookie Bridge">
+    <SettingsCard icon={ShieldCheck} title={t('Cookie Bridge')}>
       <CookieBridgeSection onStatusChange={setCookieStatus} />
     </SettingsCard>
   );
@@ -117,7 +127,7 @@ export default function SettingsTab({
   };
 
   const exit = () => {
-    if (!window.confirm('Exit VOD.RIP? All downloads will be cancelled and the app will close.')) return;
+    if (!window.confirm(t('Exit VOD.RIP? All downloads will be cancelled and the app will close.'))) return;
     onFlushPanelLayout();
     void apiPost('/api/exit', {}).catch(() => {});
   };
@@ -128,10 +138,32 @@ export default function SettingsTab({
           are detected — after that it moves to the very bottom. */}
       {needsCookieSetup ? cookieCard : null}
 
-      {/* ── General ─────────────────────────────────────────────── */}
-      <SettingsCard icon={Settings2} title="General">
+      {/* ── Language ─────────────────────────────────────────── */}
+      <SettingsCard icon={Languages} title={t('Language')}>
         <div className="flex flex-col gap-1.5">
-          <FieldCaption>Download Folder</FieldCaption>
+          <FieldCaption
+            noWrap
+            info={t('Used for the app UI. Subtitles and transcriptions follow this language unless you pick a specific one.')}
+          >
+            {t('App Language')}
+          </FieldCaption>
+          <select
+            value={lang}
+            aria-label="app language"
+            onChange={(e) => changeLanguage(e.target.value as Lang)}
+            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
+          >
+            <option value="en">English</option>
+            <option value="pt-BR">Português (Brasil)</option>
+            <option value="es">Español</option>
+          </select>
+        </div>
+      </SettingsCard>
+
+      {/* ── General ─────────────────────────────────────────────── */}
+      <SettingsCard icon={Settings2} title={t('General')}>
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption>{t('Download Folder')}</FieldCaption>
           <div className="flex gap-2">
             <input type="text" value={settings.download_folder}
               onChange={(e) => setSettings({ ...settings, download_folder: e.target.value })}
@@ -141,13 +173,13 @@ export default function SettingsTab({
             <button type="button" onClick={onPickFolder} disabled={pickingFolder}
               className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0 flex items-center gap-1.5 disabled:opacity-50">
               {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-              {pickingFolder ? '...' : 'Browse'}
+              {pickingFolder ? '...' : t('Browse')}
             </button>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2">
           <div className="flex flex-col gap-1.5">
-            <FieldCaption noWrap>Download Threads</FieldCaption>
+            <FieldCaption noWrap>{t('Download Threads')}</FieldCaption>
             <NumberField
               ariaLabel="download threads"
               value={settings.download_threads}
@@ -158,7 +190,7 @@ export default function SettingsTab({
             />
           </div>
           <div className="flex flex-col gap-1.5">
-            <FieldCaption>Max Cache (MB)</FieldCaption>
+            <FieldCaption>{t('Max Cache (MB)')}</FieldCaption>
             <NumberField
               ariaLabel="max cache mb"
               value={settings.max_cache_mb}
@@ -170,8 +202,8 @@ export default function SettingsTab({
           </div>
         </div>
         <Toggle
-          label="Warm YouTube at startup"
-          info="Pre-loads preview data for faster first play (uses ~500MB download at boot)"
+          label={t('Warm YouTube at startup')}
+          info={t('Pre-loads preview data for faster first play (uses ~500MB download at boot)')}
           checked={!settings.skip_youtube_startup_warm}
           onChange={(c) => setSettings({ ...settings, skip_youtube_startup_warm: !c })}
           ariaLabel="warm youtube at startup"
@@ -179,7 +211,7 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── Transcription ───────────────────────────────────────── */}
-      <SettingsCard icon={Mic} title="Transcription">
+      <SettingsCard icon={Mic} title={t('Transcription')}>
         <TranscriptionSection
           settings={settings}
           setSettings={setSettings}
@@ -188,20 +220,20 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── Disk & Storage ──────────────────────────────────────── */}
-      <SettingsCard icon={HardDrive} title="Disk & Storage">
+      <SettingsCard icon={HardDrive} title={t('Disk & Storage')}>
         <DiskSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
       {/* ── Updates ─────────────────────────────────────────────── */}
       <SettingsCard
         icon={RefreshCw}
-        title="Updates"
+        title={t('Updates')}
         right={<span className="text-[11px] font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
       >
         <div className="flex items-center gap-2 flex-wrap">
           {updateInfo ? (
             <>
-              <span className="text-[11px] font-mono text-emerald-400">v{updateInfo.version} available</span>
+              <span className="text-[11px] font-mono text-emerald-400">{t('v{version} available', { version: updateInfo.version })}</span>
               {updateInfo.release_url ? (
                 <a
                   href={updateInfo.release_url}
@@ -209,7 +241,7 @@ export default function SettingsTab({
                   rel="noreferrer"
                   className="text-zinc-400 hover:text-zinc-200 underline-offset-2 hover:underline text-[11px] font-mono"
                 >
-                  release
+                  {t('release')}
                 </a>
               ) : null}
               <button
@@ -219,7 +251,7 @@ export default function SettingsTab({
                 className="text-emerald-500 hover:text-emerald-300 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[11px] inline-flex items-center gap-1"
               >
                 {updateApplying ? <Loader2 size={12} className="animate-spin" /> : null}
-                {updateApplying ? 'installing' : 'install'}
+                {updateApplying ? t('installing') : t('install')}
               </button>
             </>
           ) : updateMessage ? (
@@ -233,16 +265,16 @@ export default function SettingsTab({
           className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center justify-center gap-1.5"
         >
           {updateChecking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          {updateChecking ? 'Checking…' : 'Check for Updates'}
+          {updateChecking ? t('Checking…') : t('Check for Updates')}
         </button>
       </SettingsCard>
 
       {/* ── Danger Zone ─────────────────────────────────────────── */}
       <SettingsCard
         icon={AlertTriangle}
-        title="Danger Zone"
+        title={t('Danger Zone')}
         danger
-        right={<InfoHint text="Exits VOD.RIP — cancels all downloads and closes the app." />}
+        right={<InfoHint text={t('Exits VOD.RIP — cancels all downloads and closes the app.')} />}
       >
         <button
           type="button"
@@ -250,7 +282,7 @@ export default function SettingsTab({
           className="w-full bg-red-950 text-red-300 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-200 transition-colors"
         >
           <StopCircle size={16} />
-          Exit VOD.RIP
+          {t('Exit VOD.RIP')}
         </button>
       </SettingsCard>
 
@@ -263,11 +295,11 @@ export default function SettingsTab({
           onClick={() => void save()}
           className="w-full bg-zinc-100 text-black font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-100 hover:bg-zinc-300 hover:border-zinc-300 transition-colors"
         >
-          {settingsSaved ? <><CheckCircle2 size={16} /> Saved!</> : 'Save Settings'}
+          {settingsSaved ? <><CheckCircle2 size={16} /> {t('Saved!')}</> : t('Save Settings')}
         </button>
         {dirty ? (
           <span className="text-[11px] font-mono text-amber-400 text-center" role="status">
-            ● unsaved changes
+            {t('● unsaved changes')}
           </span>
         ) : null}
       </div>

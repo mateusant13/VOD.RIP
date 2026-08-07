@@ -8,6 +8,7 @@
 
 import { type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import { useI18n } from '../i18n';
 
 
 interface DownloadConfirmDialogProps {
@@ -33,6 +34,7 @@ export default function DownloadConfirmDialog({
   onConfirm,
   onCancel,
 }: DownloadConfirmDialogProps): ReactNode {
+  const { t } = useI18n();
   if (!open) return null;
   return createPortal(
     <div
@@ -65,7 +67,7 @@ export default function DownloadConfirmDialog({
             onClick={onCancel}
             className="border-2 border-zinc-600 text-zinc-300 hover:border-white hover:text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider"
           >
-            Cancel
+            {t('Cancel')}
           </button>
           <button
             type="button"
@@ -73,7 +75,7 @@ export default function DownloadConfirmDialog({
             className="border-2 border-white bg-white text-black hover:bg-zinc-200 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider"
             style={{ boxShadow: `2px 2px 0px 0px ${accentColor}` }}
           >
-            Yes, download
+            {t('Yes, download')}
           </button>
         </div>
       </div>

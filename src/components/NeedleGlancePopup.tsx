@@ -3,6 +3,7 @@
 import { createPortal } from 'react-dom';
 import { formatHmsFull } from '../utils';
 import { LIVE_POPUP_ACTIVE_Z } from '../layoutUtils';
+import { useI18n } from '../i18n';
 import type { ReactNode } from 'react';
 
 export type NeedleGlanceState = {
@@ -24,6 +25,7 @@ export default function NeedleGlancePopup({
   glance: NeedleGlanceState | null;
   vodDurationSec: number;
 }): ReactNode {
+  const { t } = useI18n();
   if (!glance || vodDurationSec <= 0) return null;
 
   const clipLen = Math.max(1, glance.rangeEnd - glance.rangeStart);
@@ -48,19 +50,19 @@ export default function NeedleGlancePopup({
     >
       <div className="border-2 border-zinc-500 bg-zinc-950/95 px-3 py-2 shadow-[4px_4px_0px_0px_rgba(113,113,122,0.5)] min-w-[168px]">
         <div className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
-          {glance.which === 'in' ? 'Trim start' : 'Trim end'}
+          {glance.which === 'in' ? t('Trim start') : t('Trim end')}
         </div>
         <div className="text-2xl font-mono font-bold text-white tabular-nums leading-none">
           {formatHmsFull(glance.sec)}
         </div>
         <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
-          <span>Clip length</span>
+          <span>{t('Clip length')}</span>
           <span className="text-zinc-200">{formatHmsFull(clipLen)}</span>
         </div>
         {deltaLabel && (
           <div className="text-[10px] font-mono text-zinc-400 mt-0.5">
             <span className="text-white">{deltaLabel}</span>
-            {' '}from drag start
+            {' '}{t('from drag start')}
           </div>
         )}
         <div className="needle-glance-zoom-rail relative h-5 mt-2 rounded-sm bg-zinc-800 overflow-hidden">

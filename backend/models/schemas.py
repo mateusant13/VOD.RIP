@@ -125,6 +125,11 @@ class AppSettings(BaseModel):
     # (channel_asr_languages: slug -> code or 'auto').
     asr_language: str = "auto"
     channel_asr_languages: Optional[Dict[str, str]] = None
+    # App UI language: 'en' | 'pt-BR' | 'es'. '' = not set yet — the
+    # frontend seeds it from the system language on first run (the seed
+    # also picks asr_language from the same family, once, never overriding
+    # an explicit user choice).
+    ui_language: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -167,6 +172,7 @@ class SettingsUpdate(BaseModel):
     archive_smart_enrich: Optional[bool] = None
     asr_language: Optional[str] = None
     channel_asr_languages: Optional[Dict[str, str]] = None
+    ui_language: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):

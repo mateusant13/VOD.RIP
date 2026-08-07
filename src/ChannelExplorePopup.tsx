@@ -8,6 +8,7 @@ import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLin
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
+import { useI18n } from './i18n';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
@@ -154,6 +155,7 @@ export default function ChannelExplorePopup({
   onBringToFront,
   onOpenHit,
 }: ChannelExplorePopupProps) {
+  const { t } = useI18n();
   const [playback, setPlayback] = useState<{
     url: string;
     kind: 'hls' | 'progressive';
@@ -1471,7 +1473,7 @@ export default function ChannelExplorePopup({
         }}
         disabled={!ready}
         className={fs ? fsCtrlBtn : ctrlBtn(false)}
-        title="Volume"
+        title={t('Volume')}
       >
         {muted || volume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
       </button>
@@ -1536,7 +1538,7 @@ export default function ChannelExplorePopup({
       return;
     }
     if (!vodId) {
-      showClipNotice('error', 'Not a Twitch VOD URL');
+      showClipNotice('error', t('Not a Twitch VOD URL'));
       return;
     }
     setClipPopup({
@@ -1556,12 +1558,12 @@ export default function ChannelExplorePopup({
       className={fs ? fsCtrlBtn : ctrlBtn(false)}
       title={
         !vod.channel?.trim()
-          ? 'Channel login missing — cannot open the Twitch editor'
-          : 'Open the Twitch clip mini-preview at the playhead'
+          ? t('Channel login missing — cannot open the Twitch editor')
+          : t('Open the Twitch clip mini-preview at the playhead')
       }
     >
       <TwitchLogoIcon size={16} />
-      <span className="text-[8px] font-bold uppercase tracking-wider">Twitch clip</span>
+      <span className="text-[8px] font-bold uppercase tracking-wider">{t('Twitch clip')}</span>
     </button>
   );
 
@@ -1581,7 +1583,7 @@ export default function ChannelExplorePopup({
       ref={containerRef}
       tabIndex={0}
       role="application"
-      aria-label={vod.isClip ? 'Channel clip explore player' : 'Channel VOD explore player'}
+      aria-label={vod.isClip ? t('Channel clip explore player') : t('Channel VOD explore player')}
       onKeyDown={handleKeyDown}
       onPointerDownCapture={onBringToFront}
       onClick={focusPlayer}
@@ -1631,7 +1633,7 @@ export default function ChannelExplorePopup({
               </span>
               <div className="min-w-0">
                 <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 block">
-                  {vod.isClip ? 'Channel clip explore' : 'Channel VOD explore'}
+                  {vod.isClip ? t('Channel clip explore') : t('Channel VOD explore')}
                 </span>
                 <p className="text-[10px] font-bold uppercase truncate text-zinc-200 leading-tight">
                   {vod.title}
@@ -1641,7 +1643,7 @@ export default function ChannelExplorePopup({
                   {vod.channel_language ? (
                     <span
                       className="ml-1 border border-zinc-700 px-1 py-px text-[7px] font-bold uppercase tracking-wider text-zinc-400"
-                      title={`Channel language: ${vod.channel_language}`}
+                      title={t('Channel language: {lang}', { lang: vod.channel_language })}
                     >
                       {vod.channel_language}
                     </span>
@@ -1655,7 +1657,7 @@ export default function ChannelExplorePopup({
                   type="button"
                   onClick={() => setArchiveSearchOpen((o) => !o)}
                   aria-pressed={archiveSearchOpen}
-                  title="Search the local archive for this video only"
+                  title={t('Search the local archive for this video only')}
                   className={`flex items-center gap-1 border px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
                     archiveSearchOpen
                       ? 'bg-white text-black border-white'
@@ -1663,14 +1665,14 @@ export default function ChannelExplorePopup({
                   }`}
                 >
                   <Search size={10} className="shrink-0" />
-                  Search this video
+                  {t('Search this video')}
                 </button>
               )}
               <button
                 type="button"
                 onClick={() => onClose()}
                 className="text-zinc-500 hover:text-white p-0.5 shrink-0"
-                title="Close player"
+                title={t('Close player')}
               >
                 <X size={14} />
               </button>
@@ -1708,7 +1710,7 @@ export default function ChannelExplorePopup({
                 ref={youtubeIframeRef}
                 className="youtube-embed-frame pointer-events-none"
                 src={youtubeEmbed}
-                title="YouTube mini preview"
+                title={t('YouTube mini preview')}
                 allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
                 allowFullScreen
                 onLoad={() => {
@@ -1797,7 +1799,7 @@ export default function ChannelExplorePopup({
                 <button
                   type="button"
                   onClick={retryPreview}
-                  title="Retry this preview only"
+                  title={t('Retry this preview only')}
                   className="flex items-center gap-1 border border-red-400/50 hover:border-red-300 hover:bg-red-500/20 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-red-300"
                 >
                   <RefreshCw size={12} />
@@ -1811,7 +1813,7 @@ export default function ChannelExplorePopup({
               type="button"
               onClick={(e) => { e.stopPropagation(); onClose(); }}
               className="absolute top-3 right-3 z-20 text-zinc-400 hover:text-white p-2 pointer-events-auto"
-              title="Close player"
+              title={t('Close player')}
             >
               <X size={20} />
             </button>
@@ -1847,7 +1849,7 @@ export default function ChannelExplorePopup({
                   type="button"
                   onClick={() => onCarryToUrl(vod)}
                   className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                  title="Send to URL panel for rip"
+                  title={t('Send to URL panel for rip')}
                 >
                   <ArrowRightToLine size={14} />
                   URL
@@ -1860,7 +1862,7 @@ export default function ChannelExplorePopup({
                   onClick={() => void toggleFullscreen()}
                   disabled={!ready}
                   className={platformPreviewCtrlBtn(platform, false, true)}
-                  title="Fullscreen"
+                  title={t('Fullscreen')}
                 >
                   <Maximize2 size={18} />
                 </button>
@@ -1912,7 +1914,7 @@ export default function ChannelExplorePopup({
                     type="button"
                     onClick={() => onCarryToUrl(vod)}
                     className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                    title="Send to URL panel for rip"
+                    title={t('Send to URL panel for rip')}
                   >
                     <ArrowRightToLine size={14} />
                     URL
@@ -1925,7 +1927,7 @@ export default function ChannelExplorePopup({
                     onClick={() => void toggleFullscreen()}
                     disabled={!ready}
                     className={platformPreviewCtrlBtn(platform, false, true)}
-                    title="Exit fullscreen"
+                    title={t('Exit fullscreen')}
                   >
                     <Minimize2 size={18} />
                   </button>
@@ -1935,7 +1937,7 @@ export default function ChannelExplorePopup({
             </div>
             <div
               className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"
-              title="Exit fullscreen"
+              title={t('Exit fullscreen')}
               onClick={() => void toggleFullscreen()}
             />
           </>

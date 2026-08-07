@@ -173,6 +173,8 @@ describe("SettingsTab", () => {
     const last = sections[sections.length - 1];
     expect(last.textContent).toContain("Cookie Bridge");
     expect(last.textContent).not.toContain("Danger Zone");
-    expect(sections[0].textContent).toContain("General");
+    // i18n: a Language card now sits at the top, before General.
+    expect(sections[0].textContent).toContain("Language");
+    expect(sections[1].textContent).toContain("General");
   });
 });
