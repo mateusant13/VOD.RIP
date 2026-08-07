@@ -166,14 +166,14 @@ export default function CookieBridgeSection({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
-        <span className={`text-xs font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-400'}`}>
+        <span className={`text-[11px] font-mono ${status?.paired ? 'text-emerald-500' : 'text-zinc-400'}`}>
           {status?.paired ? '● paired' : '○ not paired'}
         </span>
         <button
           type="button"
           onClick={() => void toggle()}
           disabled={!status || busy}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-black uppercase border-2 transition-colors disabled:opacity-50 ${
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-black uppercase border-2 transition-colors disabled:opacity-50 ${
             enabled
               ? 'bg-emerald-950 text-emerald-400 border-emerald-900 hover:border-emerald-500'
               : 'bg-red-950 text-red-400 border-red-900 hover:border-red-500'
@@ -185,15 +185,15 @@ export default function CookieBridgeSection({
       </div>
 
       <div className="flex items-start gap-1.5">
-        <p className="text-xs text-zinc-300 font-mono leading-relaxed">
+        <p className="text-[11px] text-zinc-300 font-mono leading-relaxed">
           Local-only cookie sync — nothing leaves this machine.
         </p>
         <InfoHint text="Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion." />
       </div>
 
-      {error ? <p className="text-xs text-red-400 font-mono">{error}</p> : null}
+      {error ? <p className="text-[11px] text-red-400 font-mono">{error}</p> : null}
 
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-mono">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono">
         {Object.keys(platforms).length > 0 ? (
           Object.entries(platforms).map(([platform, st]) => (
             <span key={platform} className={st.count > 0 ? 'text-zinc-300' : 'text-zinc-400'}>
@@ -216,12 +216,12 @@ export default function CookieBridgeSection({
             readOnly
             value={token}
             onFocus={(e) => e.target.select()}
-            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-sm focus:outline-none focus:border-white"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
           />
           <button
             type="button"
             onClick={() => void copyToken()}
-            className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1.5 shrink-0"
+            className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1.5 shrink-0"
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}
             {copied ? 'Copied' : 'Copy'}
@@ -236,7 +236,7 @@ export default function CookieBridgeSection({
               type="button"
               onClick={() => void openManager()}
               disabled={opening}
-              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
+              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
             >
               {opening ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />}
               Open extensions
@@ -245,16 +245,16 @@ export default function CookieBridgeSection({
               type="button"
               onClick={() => void revealFolder()}
               title="Opens the cookie-extension folder — grab the VOD.RIP-cookies folder inside"
-              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-xs border-2 border-zinc-600 hover:border-white hover:text-white"
+              className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white"
             >
               <FolderOpen size={13} />
               Show folder
             </button>
             {ext.version ? (
-              <span className="text-xs text-zinc-400 font-mono ml-auto">v{ext.version}</span>
+              <span className="text-[11px] text-zinc-400 font-mono ml-auto">v{ext.version}</span>
             ) : null}
           </div>
-          <p className="text-xs text-zinc-400 font-mono leading-relaxed">
+          <p className="text-[11px] text-zinc-400 font-mono leading-relaxed">
             Grab the <span className="text-zinc-200">VOD.RIP-cookies</span> folder (the one marked
             “drag this folder above”) and drop it onto the extensions page (Developer mode ON):
             <br />
@@ -262,7 +262,7 @@ export default function CookieBridgeSection({
           </p>
           {opened ? (
             <>
-              <ol className="text-xs font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
+              <ol className="text-[11px] font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
                 <li>
                   Toggle <span className="text-zinc-200">Developer mode</span> ON (top-right corner of the tab).
                 </li>
@@ -273,7 +273,7 @@ export default function CookieBridgeSection({
           ) : null}
         </div>
       ) : (
-        <p className="text-xs text-zinc-400 font-mono">
+        <p className="text-[11px] text-zinc-400 font-mono">
           Extension package not installed — restart the app to refresh it, then this flow appears here.
         </p>
       )}

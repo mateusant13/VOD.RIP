@@ -15,7 +15,7 @@ export default function FieldCaption({
   return (
     <div className={`flex items-center gap-1.5 min-w-0 ${noWrap ? 'whitespace-nowrap' : ''}`}>
       <span
-        className={`text-xs font-bold uppercase tracking-wider text-zinc-400 min-w-0 ${
+        className={`text-[11px] font-bold uppercase tracking-wider text-zinc-400 min-w-0 ${
           noWrap ? 'overflow-hidden text-ellipsis' : ''
         }`}
       >
