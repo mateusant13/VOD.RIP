@@ -14,8 +14,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
+from services import kick_gate
 from services.kick_models import (
     KickChannel,
     KickVideo,
@@ -53,21 +55,77 @@ def _bridge_cookie_jar() -> Optional[Dict[str, str]]:
         return None
 
 
+# Exponential backoff on transient failures: start 1s, double, cap at 30s
+# (same constants as archive_twitch's GQL 429 backoff).
+_BACKOFF_START_SEC = 1.0
+_BACKOFF_MAX_SEC = 30.0
+_BACKOFF_MAX_ATTEMPTS = 8
+
+
+class KickGateError(RuntimeError):
+    """Kick request rejected while the Cloudflare/rate-limit gate is active."""
+
+
+class KickRateLimitError(RuntimeError):
+    """429 retries exhausted — Kick rate-limited this IP/session."""
+
+
 def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
     from curl_cffi import requests
 
     url = f"{_BASE}{path}"
-    resp = requests.get(
-        url,
-        impersonate=_IMPERSONATE,
-        headers=_headers(referer),
-        cookies=_bridge_cookie_jar(),
-        timeout=timeout,
-    )
-    if resp.status_code == 404:
-        raise ValueError(f"Kick channel not found: {referer}")
-    resp.raise_for_status()
-    return resp.json()
+    backoff = _BACKOFF_START_SEC
+    for attempt in range(1, _BACKOFF_MAX_ATTEMPTS + 1):
+        if kick_gate.kick_gate_active():
+            # Fail fast while frozen — no point hammering Cloudflare. The
+            # archive download path requeues (never fails) gated jobs.
+            raise KickGateError(
+                f"Kick requests frozen for {kick_gate.gate_remaining_sec():.0f}s "
+                "(Cloudflare/rate-limit cooldown)"
+            )
+        try:
+            resp = requests.get(
+                url,
+                impersonate=_IMPERSONATE,
+                headers=_headers(referer),
+                cookies=_bridge_cookie_jar(),
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 — curl_cffi transport errors (timeout/DNS/conn) are transient
+            if attempt >= _BACKOFF_MAX_ATTEMPTS or not kick_gate.classify_transient_kick_error(exc):
+                raise
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, _BACKOFF_MAX_SEC)
+            continue
+        if resp.status_code == 404:
+            raise ValueError(f"Kick channel not found: {referer}")
+        if resp.status_code == 403:
+            # Cloudflare classification (bot block): record the event and
+            # arm the gate cooldown; consecutive events escalate to a long
+            # freeze (kick_gate).
+            kick_gate.note_kick_gate_event(f"403 on {path}")
+            raise KickGateError(f"Kick request blocked (Cloudflare/403): {path}")
+        if resp.status_code == 429:
+            if attempt >= _BACKOFF_MAX_ATTEMPTS:
+                kick_gate.note_kick_gate_event(f"429 rate-limited on {path}")
+                raise KickRateLimitError(
+                    f"Kick rate-limited (429) after {_BACKOFF_MAX_ATTEMPTS} attempts: {path}"
+                )
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, _BACKOFF_MAX_SEC)
+            continue
+        if resp.status_code >= 500:
+            if attempt >= _BACKOFF_MAX_ATTEMPTS:
+                resp.raise_for_status()  # terminal — curl_cffi HTTPError
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, _BACKOFF_MAX_SEC)
+            continue
+        # Any other 4xx is terminal (raise_for_status keeps prior semantics).
+        if resp.status_code >= 400:
+            resp.raise_for_status()
+        kick_gate.note_kick_success()
+        return resp.json()
+    raise RuntimeError("unreachable")  # pragma: no cover — loop always returns or raises
 
 
 def verify_channel_exists(slug: str) -> None:
