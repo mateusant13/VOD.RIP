@@ -175,7 +175,11 @@ def test_interactive_kick_never_paced_or_gated(monkeypatch):
             lambda vid, offset, size: [{"contentOffsetSeconds": str(offset + 5)}],
         )
         t0 = time.monotonic()
-        out = atw.backfill_chat("somechannel", "123456789", max_messages=1)
+        # Fresh video id: test_twitch_chat_job_not_gated already left a DONE
+        # chat job on 123456789, which the kick-lane dedupe (stable id +
+        # no-chat marker) now treats as covered — this test needs a video
+        # with no job so the kick actually runs.
+        out = atw.backfill_chat("somechannel", "333333333", max_messages=1)
         elapsed = time.monotonic() - t0
         assert out["inserted"] == 1, out
         assert elapsed < 1.0, f"interactive kick must not wait on pacing, got {elapsed:.3f}s"

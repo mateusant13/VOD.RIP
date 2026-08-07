@@ -17,7 +17,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from services import archive_db, archive_twitch
-from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH
+from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH, _chat_job_guard
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["archive"])
@@ -134,16 +134,18 @@ def _kick_backfill(
     """Start a background Twitch chat backfill; returns the status word.
 
     'queued' — task started now; 'running' — already in flight;
-    'already' — chat rows exist, nothing to do; 'failed' — could not start."""
+    'already' — chat rows exist or a chat job (queued/running/done marker)
+    already covers the video, nothing to do; 'failed' — could not start."""
     if not (channel or "").strip():
         return "failed"
     with _backfill_lock:
         if video_id in _backfill_inflight:
             return "running"
-    if archive_db.query(
-        "SELECT 1 FROM messages WHERE platform='twitch' AND video_id=? LIMIT 1",
-        (video_id,),
-    ):
+    # Shared scheduler guard: has_chat / queued / running / done (the done
+    # row on a chat-less VOD is the terminal no-chat marker). retry_fresh_
+    # failed=True: an explicit kick (manual endpoint, ingest, preview) is
+    # the user asking NOW — a recently-failed row is retried, not ignored.
+    if _chat_job_guard("twitch", video_id, retry_fresh_failed=True):
         return "already"
     try:
         with _backfill_lock:
@@ -183,6 +185,12 @@ def kick_preview_backfill(
     )
     if not row or not (row[0]["channel"] or "").strip():
         return ""
+    # A chat job already covers the video (queued/running, or the done
+    # no-chat marker) — the kick would be a no-op, so don't consume the
+    # shared throttle or spawn a pointless task. retry_fresh_failed=True:
+    # opening the preview IS the user asking for chat now.
+    if _chat_job_guard("twitch", video_id, retry_fresh_failed=True):
+        return ""
     now = time.monotonic()
     with _backfill_lock:
         if now - _last_auto_kick < _AUTO_KICK_MIN_GAP_S:
@@ -215,6 +223,14 @@ def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
             return "running", _backfill_progress.get(video_id, 0.0)
     if archive_db.has_chat("twitch", video_id):
         return "done", 1.0
+    latest = archive_db.latest_job("twitch", video_id, kind="chat")
+    if latest and latest["status"] in ("queued", "running"):
+        return "running", 0.0  # a worker owns the fetch — panel stays bounded
+    if latest and latest["status"] == "done":
+        # Terminal no-chat marker: the backfill already proved the API has
+        # nothing (comments disabled / purged) — 'idle' so the panel stops
+        # polling and serves the full (empty) timeline, never re-kicking.
+        return "idle", 0.0
     row = archive_db.query(
         "SELECT channel FROM videos WHERE platform='twitch' AND video_id=?",
         (video_id,),
@@ -264,10 +280,12 @@ def _maybe_auto_backfill(
 
     Candidates are ranked by title-token relevance to q (ties → newest
     started_at first) and the top _AUTO_KICK_LIMIT are kicked. Throttled to
-    one burst per _AUTO_KICK_MIN_GAP_S; in-flight and recently-attempted
-    videos are skipped. Returns the kicked rows (video_id/channel/title) so
-    the search response can show an honest 'Indexing…' line; the pre-v2
-    caller contract (return None, chat-only) is preserved for tests.
+    one burst per _AUTO_KICK_MIN_GAP_S; in-flight, recently-attempted and
+    job-covered videos are skipped (queued/running, or the done no-chat
+    marker — _chat_job_guard, the scheduler's dedupe). Returns the kicked
+    rows (video_id/channel/title) so the search response can show an honest
+    'Indexing…' line; the pre-v2 caller contract (return None, chat-only)
+    is preserved for tests.
 
     With a video_id the scope is that single video only (a video-scoped
     search must never kick backfills for unrelated archive-wide VODs — the
@@ -320,6 +338,12 @@ def _maybe_auto_backfill(
         vid = r["video_id"]
         if not (r["channel"] or "").strip():
             continue  # nothing to backfill against without a channel
+        # Scheduler guard: a chat job already covers the video (queued /
+        # running, or the done no-chat marker on a chat-less VOD) — not a
+        # kick candidate; a fresh failure is skipped too (same anti-hammer
+        # policy as the scheduler — explicit preview/manual kicks retry).
+        if _chat_job_guard("twitch", vid):
+            continue
         with _backfill_lock:
             if vid in _backfill_inflight:
                 continue

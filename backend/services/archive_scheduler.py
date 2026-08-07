@@ -244,20 +244,25 @@ def _ingest_youtube(channel: dict) -> None:
         spawned += 1
 
 
-def _enqueue_chat_job(platform: str, video_id: str) -> bool:
-    """Queue one chat-history backfill job for the archive worker.
+def _chat_job_guard(platform: str, video_id: str, *, retry_fresh_failed: bool = False) -> bool:
+    """True when a chat backfill job already covers the video — the single
+    producer-side dedupe predicate (search auto-kick, preview kick, ingest
+    kick and the scheduler all consult it).
 
-    Dedupe (the single guard for every producer): skip when the video
-    already has chat rows, or a 'chat' job is done/queued/running; a failed
-    job is retried only after FAILED_JOB_FRESH_S. The stable job id's PK
-    backstops a producer race (IntegrityError -> already queued). Returns
-    True when a job was enqueued."""
+    Covered means: chat rows exist, a 'chat' job is queued/running/done, or
+    — unless *retry_fresh_failed* (the interactive lanes, where the user
+    asked NOW and the per-video cooldowns already bound the hammering) — a
+    job failed within FAILED_JOB_FRESH_S. A 'done' job on a chat-less video
+    is the terminal no-chat marker (comments disabled / purged): the
+    backfill already proved the API has nothing to return, so the video
+    stops being a kick candidate instead of being re-kicked every cooldown
+    forever."""
     if archive_db.has_chat(platform, video_id):
-        return False
+        return True
     latest = archive_db.latest_job(platform, video_id, kind="chat")
     if latest and latest["status"] in ("queued", "running", "done"):
-        return False
-    if latest and latest["status"] == "failed":
+        return True
+    if latest and latest["status"] == "failed" and not retry_fresh_failed:
         try:
             fresh = datetime.fromisoformat(latest["updated_at"]) > (
                 datetime.now(timezone.utc) - timedelta(seconds=FAILED_JOB_FRESH_S)
@@ -265,20 +270,41 @@ def _enqueue_chat_job(platform: str, video_id: str) -> bool:
         except (TypeError, ValueError):
             fresh = True  # unparseable — treat as fresh failure
         if fresh:
-            return False  # failed < 1h ago — don't hammer
-    job_id = f"chat-{platform}-{video_id}"
+            return True  # failed < 1h ago — don't hammer
+    return False
+
+
+def _enqueue_chat_job(
+    platform: str, video_id: str, *,
+    job_id: Optional[str] = None,
+    retry_fresh_failed: bool = False,
+) -> bool:
+    """Queue one chat-history backfill job for the archive worker.
+
+    Dedupe = _chat_job_guard (has_chat / queued / running / done /
+    fresh-failed unless *retry_fresh_failed*). *job_id* overrides the
+    default stable id 'chat-<platform>-<video_id>'; the Twitch interactive
+    kick lane keeps its own 'tw-backfill-<vid>' prefix so it never collides
+    with legacy time-based rows' ids. The stable id's PK backstops a
+    producer race (IntegrityError -> already queued). Returns True when a
+    job was enqueued."""
+    if _chat_job_guard(platform, video_id, retry_fresh_failed=retry_fresh_failed):
+        return False
+    job_id = job_id or f"chat-{platform}-{video_id}"
     try:
         archive_db.enqueue_job(job_id, "chat", platform, video_id, priority=0)
         return True
     except sqlite3.IntegrityError:
         # The row already exists (a producer race, or the stale failed job
-        # checked above). Re-queue a failed row IN PLACE so the stable job
-        # id never orphans a retry; queued/running/done rows are already
-        # covered by the dedupe above.
+        # the guard passed). Re-queue a failed row IN PLACE so the stable
+        # job id never orphans a retry; queued/running/done rows are
+        # already covered by the guard above.
         cur = archive_db.execute(
-            "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, updated_at=? "
+            "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
+            "updated_at=?, heartbeat=? "
             "WHERE id=? AND status='failed'",
-            (datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id),
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id),
         )
         return cur.rowcount == 1
 

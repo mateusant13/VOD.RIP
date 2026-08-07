@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from services import archive_db
 from services import twitch_gql_service
+from services.archive_scheduler import _enqueue_chat_job
 
 logger = logging.getLogger(__name__)
 
@@ -418,9 +419,40 @@ def backfill_chat(
     if job_id:
         job_id = str(job_id)
     else:
-        job_id = f"tw-backfill-{vid}-{int(time.time())}"
-        archive_db.enqueue_job(job_id, "chat", "twitch", vid, priority=0)
+        # Stable kick-lane job id + the shared scheduler dedupe: a repeat
+        # kick for the same video (restart, second search, preview reopen)
+        # is skipped when chat rows exist or a 'chat' job is queued/
+        # running/done, and a stale failed row is requeued in place. The
+        # old time-based id bypassed both — restarts duplicated chat rows
+        # and a same-second re-kick crashed on an uncaught IntegrityError.
+        # A done job on a chat-less VOD is the terminal no-chat marker
+        # (comments disabled / purged), so later kicks are permanent no-ops.
+        job_id = f"tw-backfill-{vid}"
+        if not _enqueue_chat_job("twitch", vid, job_id=job_id, retry_fresh_failed=True):
+            return {
+                "video_id": vid,
+                "channel": channel,
+                "inserted": 0,
+                "pages": 0,
+                "backoff_retries": 0,
+                "stopped": "already" if archive_db.has_chat("twitch", vid) else "queued",
+            }
     archive_db.update_job(job_id, status="running")
+
+    # Job-row heartbeat: every stored page refreshes the row (progress +
+    # heartbeat) in BOTH lanes. _claim_next_job reclaims a 'running' chat
+    # job whose heartbeat went stale (dead/hung executor) instead of
+    # waiting out the flat 2h window, so a wedged fetch can't hold the row
+    # for hours. The worker lane used to stamp this in its own progress_cb;
+    # backfill_chat owns it now (single touch per page).
+    user_cb = progress_cb
+
+    def _progress(p: float) -> None:
+        archive_db.update_job(job_id, progress=min(0.999, p))
+        if user_cb is not None:
+            user_cb(p)
+
+    progress_cb = _progress
 
     inserted = 0
     pages = 0

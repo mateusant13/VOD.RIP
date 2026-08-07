@@ -206,7 +206,8 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
   error      TEXT,
   priority   INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  heartbeat  TEXT
 );
 -- ponytail: the (status, priority, created_at) index is created by
 -- _ensure_jobs_priority AFTER the column migration — SCHEMA's executescript
@@ -353,6 +354,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_jobs_kind_events(_conn)
             _ensure_jobs_priority(_conn)
             _ensure_jobs_kind_chat(_conn)
+            _ensure_jobs_heartbeat_column(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -593,13 +595,14 @@ def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
              progress   REAL NOT NULL DEFAULT 0,
              error      TEXT,
              created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL
+             updated_at TEXT NOT NULL,
+             heartbeat  TEXT
            )"""
     )
     conn.execute(
-        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, created_at, updated_at) "
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, created_at, updated_at, heartbeat) "
         "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
-        "platform, video_id, status, progress, error, created_at, updated_at "
+        "platform, video_id, status, progress, error, created_at, updated_at, NULL AS heartbeat "
         "FROM archive_jobs_old"
     )
     conn.execute("DROP TABLE archive_jobs_old")
@@ -639,13 +642,14 @@ def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
              error      TEXT,
              priority   INTEGER NOT NULL DEFAULT 0,
              created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL
+             updated_at TEXT NOT NULL,
+             heartbeat  TEXT
            )"""
     )
     conn.execute(
-        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at) "
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at, heartbeat) "
         "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
-        "platform, video_id, status, progress, error, 0, created_at, updated_at "
+        "platform, video_id, status, progress, error, 0, created_at, updated_at, NULL AS heartbeat "
         "FROM archive_jobs_old"
     )
     conn.execute("DROP TABLE archive_jobs_old")
@@ -683,13 +687,14 @@ def _ensure_jobs_kind_chat(conn: sqlite3.Connection) -> None:
              error      TEXT,
              priority   INTEGER NOT NULL DEFAULT 0,
              created_at TEXT NOT NULL,
-             updated_at TEXT NOT NULL
+             updated_at TEXT NOT NULL,
+             heartbeat  TEXT
            )"""
     )
     conn.execute(
-        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at) "
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at, heartbeat) "
         "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
-        "platform, video_id, status, progress, error, 0, created_at, updated_at "
+        "platform, video_id, status, progress, error, 0, created_at, updated_at, NULL AS heartbeat "
         "FROM archive_jobs_old"
     )
     conn.execute("DROP TABLE archive_jobs_old")
@@ -699,6 +704,21 @@ def _ensure_jobs_kind_chat(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
     )
+
+
+def _ensure_jobs_heartbeat_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add archive_jobs.heartbeat (job-liveness touch).
+
+    The archive worker stamps heartbeat (via update_job) as a job makes
+    progress; _claim_next_job reclaims a 'running' chat job whose heartbeat
+    went stale instead of waiting out the flat 2h window. NULL for rows
+    that never heartbeated (pre-heartbeat builds, YouTube chat downloads
+    that touch the row only at start/end) — the reclaim falls back to
+    updated_at. Additive only; PRAGMA table_info guard makes repeated calls
+    no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
+    if "heartbeat" not in cols:
+        conn.execute("ALTER TABLE archive_jobs ADD COLUMN heartbeat TEXT")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -1762,15 +1782,16 @@ def enqueue_job(job_id: str, kind: str, platform: str, video_id: str, *, priorit
     now = _now_iso()
     execute(
         """INSERT INTO archive_jobs (id, kind, platform, video_id, status,
-           priority, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
-        (job_id, kind, platform, video_id, priority, now, now),
+           priority, created_at, updated_at, heartbeat)
+           VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+        (job_id, kind, platform, video_id, priority, now, now, now),
     )
 
 
 def update_job(job_id: str, *, status: Optional[str] = None,
                progress: Optional[float] = None, error: Optional[str] = None) -> None:
-    sets = ["updated_at = ?"]
-    params: list[Any] = [_now_iso()]
+    sets = ["updated_at = ?", "heartbeat = ?"]
+    params: list[Any] = [_now_iso(), _now_iso()]
     if status is not None:
         sets.append("status = ?")
         params.append(status)
