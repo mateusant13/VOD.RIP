@@ -362,6 +362,31 @@ def test_helix_post_sends_json_body_with_token_client(monkeypatch):
     assert out == {"data": [{"id": "c1"}]}
 
 
+def test_helix_post_query_params_no_body(monkeypatch):
+    """Clip endpoints pass their fields as URL query params (no JSON body)."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
+    captured = _patch_urlopen(monkeypatch, payload=b'{"data": [{"id": "c1"}]}')
+
+    out = ths._helix_post(
+        "/videos/clips",
+        params={"broadcaster_id": "98765", "editor_id": "42", "title": "EPIC play"},
+        client_id="app-9",
+    )
+
+    req = captured["req"]
+    hdr = {k.lower(): v for k, v in req.headers.items()}
+    assert req.full_url == (
+        "https://api.twitch.tv/helix/videos/clips"
+        "?broadcaster_id=98765&editor_id=42&title=EPIC+play"
+    )
+    assert req.get_method() == "POST"
+    assert hdr["client-id"] == "app-9"
+    assert hdr["authorization"] == "Bearer tok-123"
+    assert "content-type" not in hdr, "no JSON body -> no Content-Type header"
+    assert req.data is None
+    assert out == {"data": [{"id": "c1"}]}
+
+
 def test_helix_post_http_error_raises_helix_error_with_status(monkeypatch):
     """Helix 403 -> HelixError carrying status + raw detail (RuntimeError subclass)."""
     monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
@@ -391,11 +416,12 @@ def test_helix_get_accepts_client_id_override(monkeypatch):
 
 
 def test_token_info_returns_validate_payload(monkeypatch):
-    """oauth2/validate payload surfaces client_id + scopes for the clip router."""
+    """oauth2/validate payload surfaces client_id + user_id + scopes for the clip router."""
     monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
     payload = json.dumps({
         "client_id": "app-9",
         "login": "surtepi",
+        "user_id": "591091436",
         "scopes": ["clips:edit", "user_read"],
         "expires_in": 5000,
     }).encode("utf-8")
@@ -407,6 +433,7 @@ def test_token_info_returns_validate_payload(monkeypatch):
     hdr = {k.lower(): v for k, v in captured["req"].headers.items()}
     assert hdr["authorization"] == "Bearer tok-123"
     assert out["client_id"] == "app-9"
+    assert out["user_id"] == "591091436"
     assert out["scopes"] == ["clips:edit", "user_read"]
 
 

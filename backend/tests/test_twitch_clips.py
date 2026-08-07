@@ -44,10 +44,26 @@ def _patch_token(monkeypatch, *, available=True, scopes=("editor:manage:clips",)
     def _info():
         if not available:
             raise RuntimeError("no twitch helix token configured")
-        return {"client_id": client_id, "login": "surtepi", "scopes": list(scopes)}
+        return {
+            "client_id": client_id,
+            "user_id": "591091436",
+            "login": "surtepi",
+            "scopes": list(scopes),
+        }
 
     monkeypatch.setattr(ths, "token_info", _info)
     return _info
+
+
+def _patch_users(monkeypatch, *, user_id="98765"):
+    """Resolve broadcaster_login -> user id (GET /users), recording the call."""
+    calls = []
+    monkeypatch.setattr(
+        ths, "_helix_get",
+        lambda path, params, client_id=None: calls.append(("get", path, params, client_id))
+        or {"data": [{"id": user_id, "login": "surtepi"}]},
+    )
+    return calls
 
 
 async def _post(client, body):
@@ -64,12 +80,14 @@ async def _history(client):
 
 @pytest.mark.anyio
 async def test_vod_clip_calls_helix_and_records_history(monkeypatch, _isolated_data_dir):
-    """VOD request -> /videos/clips with END offset + duration -> {ok,id,edit_url} + history."""
+    """VOD request -> /users lookup + /videos/clips query params -> {ok,id,edit_url} + history."""
     _patch_token(monkeypatch)
-    calls = []
+    user_calls = _patch_users(monkeypatch)
+    post_calls = []
     monkeypatch.setattr(
         ths, "_helix_post",
-        lambda path, body, client_id: calls.append((path, body, client_id)) or CLIP_DATA,
+        lambda path, body=None, client_id="", params=None:
+            post_calls.append((path, body, client_id, params)) or CLIP_DATA,
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -83,10 +101,19 @@ async def test_vod_clip_calls_helix_and_records_history(monkeypatch, _isolated_d
         assert res.status_code == 200
         assert res.json() == {"ok": True, "id": "ClipId123", "edit_url": "https://clips.twitch.tv/ClipId123-edit"}
 
-        assert calls == [(
+        assert user_calls == [("get", "/users", {"login": "surtepi"}, "app-123")]
+        assert post_calls == [(
             "/videos/clips",
-            {"video_id": "2536167775", "vod_offset": 434, "duration": 30, "title": "EPIC play!"},
+            None,  # official shape: fields are URL query params, not a JSON body
             "app-123",
+            {
+                "broadcaster_id": "98765",
+                "editor_id": "591091436",
+                "vod_id": "2536167775",
+                "vod_offset": 434,
+                "duration": 30,
+                "title": "EPIC play!",
+            },
         )]
 
         rows = await _history(client)
@@ -107,11 +134,16 @@ async def test_vod_clip_calls_helix_and_records_history(monkeypatch, _isolated_d
 
 
 @pytest.mark.anyio
-async def test_blank_title_is_omitted_from_helix(monkeypatch, _isolated_data_dir):
-    """Empty/whitespace title -> no title field -> Twitch auto-titles."""
+async def test_blank_title_defaults_to_broadcaster_login(monkeypatch, _isolated_data_dir):
+    """Empty/whitespace title -> the endpoint requires one, so the broadcaster
+    login is sent (and recorded) instead of omitting the field."""
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
     calls = []
-    monkeypatch.setattr(ths, "_helix_post", lambda path, body, client_id: calls.append(body) or CLIP_DATA)
+    monkeypatch.setattr(
+        ths, "_helix_post",
+        lambda path, body=None, client_id="", params=None: calls.append(params) or CLIP_DATA,
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         res = await _post(client, {
@@ -122,9 +154,34 @@ async def test_blank_title_is_omitted_from_helix(monkeypatch, _isolated_data_dir
             "title": "   ",
         })
         assert res.status_code == 200
-        assert calls == [{"video_id": "1", "vod_offset": 60, "duration": 30}]
+        assert calls == [{
+            "broadcaster_id": "98765",
+            "editor_id": "591091436",
+            "vod_id": "1",
+            "vod_offset": 60,
+            "duration": 30,
+            "title": "surtepi",
+        }]
         rows = await _history(client)
-        assert rows[0]["title"] is None
+        assert rows[0]["title"] == "surtepi"
+
+
+@pytest.mark.anyio
+async def test_vod_clip_unknown_broadcaster_is_not_found(monkeypatch, _isolated_data_dir):
+    """Login not resolvable via /users -> not_found, no clip POST."""
+    _patch_token(monkeypatch)
+    monkeypatch.setattr(ths, "_helix_get", lambda *a, **k: {"data": []})
+    monkeypatch.setattr(ths, "_helix_post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not POST")))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await _post(client, {
+            "broadcaster_login": "nobody_xyz",
+            "vod_id": "1",
+            "offset_sec": 30,
+            "duration_sec": 30,
+        })
+        assert res.status_code == 200
+        assert res.json()["error"]["code"] == "not_found"
 
 
 @pytest.mark.anyio
@@ -205,6 +262,7 @@ async def test_invalid_token_is_unauthorized(monkeypatch, _isolated_data_dir):
 @pytest.mark.anyio
 async def test_helix_429_maps_to_rate_limited(monkeypatch, _isolated_data_dir):
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
 
     def _boom(*a, **k):
         raise ths.HelixError(429, '{"error":"Too Many Requests","status":429,"message":"rate limited"}')
@@ -226,6 +284,7 @@ async def test_helix_429_maps_to_rate_limited(monkeypatch, _isolated_data_dir):
 @pytest.mark.anyio
 async def test_helix_503_maps_to_clip_failed(monkeypatch, _isolated_data_dir):
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
 
     def _boom(*a, **k):
         raise ths.HelixError(503, '{"error":"Service Unavailable","status":503,"message":"busy"}')
@@ -258,7 +317,8 @@ async def test_live_clip_resolves_broadcaster_and_posts_clips(monkeypatch, _isol
     )
     monkeypatch.setattr(
         ths, "_helix_post",
-        lambda path, body, client_id: calls.append(("post", path, body, client_id)) or CLIP_DATA,
+        lambda path, body=None, client_id="", params=None:
+            calls.append(("post", path, body, client_id, params)) or CLIP_DATA,
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -268,7 +328,7 @@ async def test_live_clip_resolves_broadcaster_and_posts_clips(monkeypatch, _isol
 
         assert calls == [
             ("get", "/users", {"login": "surtepi"}, "app-123"),
-            ("post", "/clips", {"broadcaster_id": "98765"}, "app-123"),
+            ("post", "/clips", None, "app-123", {"broadcaster_id": "98765"}),
         ]
         rows = await _history(client)
         assert rows[0]["channel"] == "surtepi"
@@ -334,6 +394,7 @@ async def _seed_clips(client, n: int = 3) -> List[dict]:
 async def test_batch_delete_removes_selected_ids(monkeypatch, _isolated_data_dir):
     """DELETE with ids removes exactly those entries; others survive on disk."""
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
     monkeypatch.setattr(ths, "_helix_post", _distinct_clip_data())
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -358,6 +419,7 @@ async def test_batch_delete_removes_selected_ids(monkeypatch, _isolated_data_dir
 @pytest.mark.anyio
 async def test_batch_delete_unknown_ids_is_noop(monkeypatch, _isolated_data_dir):
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
     monkeypatch.setattr(ths, "_helix_post", _distinct_clip_data())
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -400,6 +462,7 @@ async def test_duration_out_of_range_rejected(_isolated_data_dir):
 @pytest.mark.anyio
 async def test_duration_at_min_boundary_accepted(monkeypatch, _isolated_data_dir):
     _patch_token(monkeypatch)
+    _patch_users(monkeypatch)
     monkeypatch.setattr(ths, "_helix_post", lambda *a, **k: CLIP_DATA)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

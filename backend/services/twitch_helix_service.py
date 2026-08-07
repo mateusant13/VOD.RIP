@@ -105,20 +105,41 @@ def _helix_get(
         raise RuntimeError(f"Twitch Helix request failed: {e}") from e
 
 
-def _helix_post(path: str, body: Dict[str, Any], client_id: str) -> Dict[str, Any]:
-    """One authenticated Helix POST with a JSON body; raises HelixError/RuntimeError."""
+def _post_url(path: str, params: Optional[Dict[str, Any]]) -> str:
+    """HELIX_API + path, with params urlencoded as the query string ('' when none)."""
+    url = f"{HELIX_API}{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    return url
+
+
+def _helix_post(
+    path: str,
+    body: Optional[Dict[str, Any]] = None,
+    client_id: str = "",
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One authenticated Helix POST; raises HelixError/RuntimeError.
+
+    Clip endpoints (POST /clips, POST /videos/clips) take their fields as
+    URL query parameters — pass them via ``params`` and leave ``body`` None.
+    ``body`` remains for any endpoint that wants a JSON payload.
+    """
     token = current_token()
     if not token:
         raise RuntimeError("no twitch helix token configured")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Client-Id": client_id,
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        f"{HELIX_API}{path}",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Client-Id": client_id,
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        _post_url(path, params),
+        data=data,
+        headers=headers,
         method="POST",
     )
     try:
@@ -297,5 +318,9 @@ assert _duration_to_sec("PT1H") is None  # ISO-8601 is not the helix wire format
 assert _duration_to_sec(None) is None
 assert _thumbnail_url("https://x/thumb0-%{width}x%{height}.jpg") == (
     "https://x/thumb0-320x180.jpg"
+)
+assert _post_url("/videos/clips", None) == f"{HELIX_API}/videos/clips"
+assert _post_url("/videos/clips", {"broadcaster_id": "1", "title": "a b"}) == (
+    f"{HELIX_API}/videos/clips?broadcaster_id=1&title=a+b"
 )
 assert _thumbnail_url(None) is None
