@@ -174,6 +174,13 @@ const ptBR: Record<string, string> = {
   'No Chromium browser found — open chrome://extensions manually and drop the folder.':
     'Nenhum navegador Chromium encontrado — abra chrome://extensions manualmente e solte a pasta.',
   'Extension folder not available yet.': 'Pasta da extensão ainda não disponível.',
+  'Waiting for cookies': 'Aguardando cookies',
+  'Waiting for cookies…': 'Aguardando cookies…',
+  'Install and enable the extension to start syncing cookies:':
+    'Instale e ative a extensão para começar a sincronizar cookies:',
+  'Cookies detected — you can close this.': 'Cookies detectados — você já pode fechar esta janela.',
+  'Still waiting — check that Developer mode is ON and that the extension popup was opened on Kick or YouTube.':
+    'Ainda esperando — verifique se o modo de desenvolvedor está ON e se o popup da extensão foi aberto no Kick ou no YouTube.',
 
   // ── Queue / History ───────────────────────────────────────
   'History': 'Histórico',
@@ -617,6 +624,13 @@ const es: Record<string, string> = {
   'Browser window could not be focused — open chrome://extensions manually and drop the folder.': 'No se pudo enfocar la ventana del navegador — abre chrome://extensions manualmente y suelta la carpeta.',
   'No Chromium browser found — open chrome://extensions manually and drop the folder.': 'No se encontró un navegador Chromium — abre chrome://extensions manualmente y suelta la carpeta.',
   'Extension folder not available yet.': 'La carpeta de la extensión aún no está disponible.',
+  'Waiting for cookies': 'Esperando cookies',
+  'Waiting for cookies…': 'Esperando cookies…',
+  'Install and enable the extension to start syncing cookies:':
+    'Instala y activa la extensión para empezar a sincronizar cookies:',
+  'Cookies detected — you can close this.': 'Cookies detectadas — ya puedes cerrar esto.',
+  'Still waiting — check that Developer mode is ON and that the extension popup was opened on Kick or YouTube.':
+    'Todavía esperando — comprueba que el modo desarrollador está activado y que el popup de la extensión se abrió en Kick o YouTube.',
   'History': 'Historial',
   'Delete {count}': 'Eliminar {count}',
   'Select all': 'Seleccionar todo',

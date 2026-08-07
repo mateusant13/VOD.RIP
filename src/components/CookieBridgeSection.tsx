@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Check, Copy, ExternalLink, FolderOpen, Loader2, ShieldCheck, ShieldOff } from 'lucide-react';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 import InfoHint from './InfoHint';
+import ExtensionWaitOverlay from './ExtensionWaitOverlay';
 import { useI18n } from '../i18n';
 
 /**
@@ -68,7 +69,7 @@ export default function CookieBridgeSection({
   const [ext, setExt] = useState<ExtSource | null>(null);
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(false);
-  const [opened, setOpened] = useState(false);
+  const [waitOpen, setWaitOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { t } = useI18n();
@@ -127,21 +128,27 @@ export default function CookieBridgeSection({
     const openRes = await apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null);
     if (openRes === null) {
       setError(t('Could not reach the backend to open the browser tab.'));
-    } else {
-      setOpened(openRes.launched);
-      if (!openRes.launched) {
-        setError(
-          openRes.blocked
-            ? t('Browser window could not be focused — open chrome://extensions manually and drop the folder.')
-            : t('No Chromium browser found — open chrome://extensions manually and drop the folder.'),
-        );
-      }
+    } else if (!openRes.launched) {
+      setError(
+        openRes.blocked
+          ? t('Browser window could not be focused — open chrome://extensions manually and drop the folder.')
+          : t('No Chromium browser found — open chrome://extensions manually and drop the folder.'),
+      );
     }
     void apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {}).catch(() => null);
-    // refresh once shortly after so freshly pushed cookies show in the counts
-    setTimeout(() => void refresh(), 5000);
+    // Waiting-mode overlay takes over from here: it polls the status endpoint
+    // and guides the user through the install until cookies land.
+    setWaitOpen(true);
     setOpening(false);
   };
+
+  const handleWaitStatus = useCallback(
+    (s: BridgeStatus) => {
+      setStatus(s);
+      onStatusChange?.(s);
+    },
+    [onStatusChange],
+  );
 
   const revealFolder = async () => {
     setError(null);
@@ -261,23 +268,19 @@ export default function CookieBridgeSection({
             <br />
             <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>
-          {opened ? (
-            <>
-              <ol className="text-[11px] font-mono text-zinc-400 list-decimal list-inside leading-relaxed">
-                <li>
-                  {t('Toggle')} <span className="text-zinc-200">Developer mode</span>{t(' ON (top-right corner of the tab).')}
-                </li>
-                <li>{t('Drop the VOD.RIP-cookies folder onto the page.')}</li>
-                <li>{t('Open the extension popup on Kick or YouTube once — cookies land here.')}</li>
-              </ol>
-            </>
-          ) : null}
         </div>
       ) : (
         <p className="text-[11px] text-zinc-400 font-mono">
           {t('Extension package not installed — restart the app to refresh it, then this flow appears here.')}
         </p>
       )}
+
+      <ExtensionWaitOverlay
+        open={waitOpen}
+        extensionDir={ext?.extension_dir ?? ''}
+        onClose={() => setWaitOpen(false)}
+        onStatus={handleWaitStatus}
+      />
     </div>
   );
 }
