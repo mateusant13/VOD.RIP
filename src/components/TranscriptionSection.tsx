@@ -7,7 +7,9 @@ import { useI18n } from '../i18n';
 import type { AppSettings } from '../types';
 
 /**
- * Transcription (Whisper) settings: model id, cache dir, subtitles-first.
+ * Transcription (Whisper) settings: model id, subtitles-first, captions
+ * language. The model CACHE lives in DiskSection (own disk picker, same
+ * disk-choice rule as cache/data drives).
  * The inline Save persists only these fields (backend applies the rest).
  */
 type Props = {
@@ -30,7 +32,6 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
     try {
       const updated = await apiPost<AppSettings>('/api/settings', {
         whisper_model: (settings.whisper_model ?? '').trim() || undefined,
-        whisper_model_cache: (settings.whisper_model_cache ?? '').trim() || null,
         yt_subtitles_first: settings.yt_subtitles_first ?? true,
         asr_language: settings.asr_language ?? 'auto',
         channel_asr_languages: settings.channel_asr_languages ?? null,
@@ -43,7 +44,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
     } finally {
       setSaving(false);
     }
-  }, [settings.whisper_model, settings.whisper_model_cache, settings.yt_subtitles_first, settings.asr_language, settings.channel_asr_languages, setSettings, onSaved]);
+  }, [settings.whisper_model, settings.yt_subtitles_first, settings.asr_language, settings.channel_asr_languages, setSettings, onSaved]);
 
   return (
     <div className="flex flex-col gap-3">
@@ -55,22 +56,6 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           onChange={(e) => setSettings({ ...settings, whisper_model: e.target.value })}
           placeholder="large-v3-turbo"
           aria-label="whisper model id"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-xs"
-        />
-      </div>
-      <div className="flex flex-col gap-1.5">
-        <FieldCaption
-          noWrap
-          info={t('Cache may point at a shared HF hub dir — already-downloaded models are reused without re-download')}
-        >
-          {t('Model Cache Directory')}
-        </FieldCaption>
-        <input
-          type="text"
-          value={settings.whisper_model_cache ?? ''}
-          onChange={(e) => setSettings({ ...settings, whisper_model_cache: e.target.value })}
-          placeholder="%APPDATA%/VOD.RIP/whisper-models"
-          aria-label="whisper model cache directory"
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 focus:outline-none focus:border-white text-xs"
         />
       </div>

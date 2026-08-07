@@ -1,6 +1,6 @@
-import { type Dispatch, type ReactNode, type SetStateAction, useState } from 'react';
+import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, FolderOpen, HardDrive, KeyRound, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
+  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, KeyRound, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
@@ -11,7 +11,7 @@ import OfficialApisSection from './OfficialApisSection';
 import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
 import Toggle from './Toggle';
-import { apiPost } from '../hooks/useApiClient';
+import { apiGet, apiPost } from '../hooks/useApiClient';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 
@@ -38,7 +38,7 @@ const SETTING_KEYS = [
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
-  'twitch_helix_token', 'youtube_data_api_key',
+  'twitch_helix_token',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
   JSON.stringify(SETTING_KEYS.map((k) => s[k] ?? null));
@@ -48,12 +48,17 @@ function SettingsCard({
   title,
   right,
   danger,
+  open,
+  onToggle,
   children,
 }: {
   icon: LucideIcon;
   title: string;
   right?: ReactNode;
   danger?: boolean;
+  /** Accordion: card content is hidden while collapsed (all start collapsed). */
+  open: boolean;
+  onToggle: () => void;
   children: ReactNode;
 }) {
   return (
@@ -63,17 +68,30 @@ function SettingsCard({
           danger ? 'border-red-900' : 'border-zinc-800'
         }`}
       >
-        <span
-          className={`flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-widest ${
-            danger ? 'text-red-400' : 'text-zinc-300'
-          }`}
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={open}
+          className="flex items-center gap-2 min-w-0 text-left flex-1"
         >
-          <Icon size={14} className="shrink-0" />
-          <span className="truncate">{title}</span>
-        </span>
+          <span
+            className={`flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-widest ${
+              danger ? 'text-red-400' : 'text-zinc-300'
+            }`}
+          >
+            <Icon size={14} className="shrink-0" />
+            <span className="truncate">{title}</span>
+          </span>
+          <ChevronDown
+            size={14}
+            className={`shrink-0 transition-transform ${open ? 'rotate-180' : ''} ${
+              danger ? 'text-red-500' : 'text-zinc-500'
+            }`}
+          />
+        </button>
         {right}
       </div>
-      <div className="p-3 flex flex-col gap-3">{children}</div>
+      {open ? <div className="p-3 flex flex-col gap-3">{children}</div> : null}
     </section>
   );
 }
@@ -98,6 +116,31 @@ export default function SettingsTab({
   const dirty = settingsSignature(settings) !== savedSig;
   const { lang, setLang, t } = useI18n();
 
+  /** Accordion: every card starts collapsed; expanding one never closes the
+   *  others (independent chevron toggles, state keyed by card id). */
+  const [openCards, setOpenCards] = useState<Record<string, boolean>>({});
+  const toggleCard = (id: string) =>
+    setOpenCards((m) => ({ ...m, [id]: !m[id] }));
+
+  /** Machine-aware resource suggestions (threads + cache MB) served by
+   *  GET /api/settings/recommended — filled via the "Recommended" button in
+   *  the General card. Null until the fetch resolves (button hidden then). */
+  const [recommended, setRecommended] = useState<{
+    download_threads: number;
+    max_cache_mb: number;
+  } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void apiGet<{ download_threads: number; max_cache_mb: number }>('/api/settings/recommended')
+      .then((r) => {
+        if (alive) setRecommended(r);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   /** Persist the language choice immediately — switching must survive a
    *  reload even if the user never presses Save Settings. */
   const changeLanguage = (l: Lang) => {
@@ -118,7 +161,12 @@ export default function SettingsTab({
     cookieStatus !== null && (!cookieStatus.paired || cookieCount === 0);
 
   const cookieCard = (
-    <SettingsCard icon={ShieldCheck} title={t('Cookie Bridge')}>
+    <SettingsCard
+      icon={ShieldCheck}
+      title={t('Cookie Bridge')}
+      open={!!openCards.cookie}
+      onToggle={() => toggleCard('cookie')}
+    >
       <CookieBridgeSection onStatusChange={setCookieStatus} />
     </SettingsCard>
   );
@@ -141,7 +189,12 @@ export default function SettingsTab({
       {needsCookieSetup ? cookieCard : null}
 
       {/* ── Language ─────────────────────────────────────────── */}
-      <SettingsCard icon={Languages} title={t('Language')}>
+      <SettingsCard
+        icon={Languages}
+        title={t('Language')}
+        open={!!openCards.language}
+        onToggle={() => toggleCard('language')}
+      >
         <div className="flex flex-col gap-1.5">
           <FieldCaption
             noWrap
@@ -163,7 +216,12 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── General ─────────────────────────────────────────────── */}
-      <SettingsCard icon={Settings2} title={t('General')}>
+      <SettingsCard
+        icon={Settings2}
+        title={t('General')}
+        open={!!openCards.general}
+        onToggle={() => toggleCard('general')}
+      >
         <div className="flex flex-col gap-1.5">
           <FieldCaption>{t('Download Folder')}</FieldCaption>
           <div className="flex gap-2">
@@ -203,6 +261,28 @@ export default function SettingsTab({
             />
           </div>
         </div>
+        {recommended ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              aria-label="recommended resource defaults"
+              title={t('Suggested for this machine')}
+              onClick={() =>
+                setSettings({
+                  ...settings,
+                  download_threads: recommended.download_threads,
+                  max_cache_mb: recommended.max_cache_mb,
+                })
+              }
+              className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-1.5 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white flex items-center gap-1.5"
+            >
+              {t('Recommended')}
+            </button>
+            <span className="text-[11px] text-zinc-500 font-mono">
+              {t('threads {threads} · cache {cache} MB', { threads: recommended.download_threads, cache: recommended.max_cache_mb })}
+            </span>
+          </div>
+        ) : null}
         <Toggle
           label={t('Warm YouTube at startup')}
           info={t('Pre-loads preview data for faster first play (uses ~500MB download at boot)')}
@@ -213,12 +293,22 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── Official API credentials ─────────────────────────── */}
-      <SettingsCard icon={KeyRound} title={t('Official API credentials')}>
+      <SettingsCard
+        icon={KeyRound}
+        title={t('Official API credentials')}
+        open={!!openCards.official}
+        onToggle={() => toggleCard('official')}
+      >
         <OfficialApisSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
       {/* ── Transcription ───────────────────────────────────────── */}
-      <SettingsCard icon={Mic} title={t('Transcription')}>
+      <SettingsCard
+        icon={Mic}
+        title={t('Transcription')}
+        open={!!openCards.transcription}
+        onToggle={() => toggleCard('transcription')}
+      >
         <TranscriptionSection
           settings={settings}
           setSettings={setSettings}
@@ -227,7 +317,12 @@ export default function SettingsTab({
       </SettingsCard>
 
       {/* ── Disk & Storage ──────────────────────────────────────── */}
-      <SettingsCard icon={HardDrive} title={t('Disk & Storage')}>
+      <SettingsCard
+        icon={HardDrive}
+        title={t('Disk & Storage')}
+        open={!!openCards.disk}
+        onToggle={() => toggleCard('disk')}
+      >
         <DiskSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
@@ -236,6 +331,8 @@ export default function SettingsTab({
         icon={RefreshCw}
         title={t('Updates')}
         right={<span className="text-[11px] font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
+        open={!!openCards.updates}
+        onToggle={() => toggleCard('updates')}
       >
         <div className="flex items-center gap-2 flex-wrap">
           {updateInfo ? (
@@ -276,24 +373,7 @@ export default function SettingsTab({
         </button>
       </SettingsCard>
 
-      {/* ── Danger Zone ─────────────────────────────────────────── */}
-      <SettingsCard
-        icon={AlertTriangle}
-        title={t('Danger Zone')}
-        danger
-        right={<InfoHint text={t('Exits VOD.RIP — cancels all downloads and closes the app.')} />}
-      >
-        <button
-          type="button"
-          onClick={exit}
-          className="w-full bg-red-950 text-red-300 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-200 transition-colors"
-        >
-          <StopCircle size={16} />
-          {t('Exit VOD.RIP')}
-        </button>
-      </SettingsCard>
-
-      {/* ── Cookie Bridge (detected → last thing the user needs) ── */}
+      {/* ── Cookie Bridge (detected → second-to-last, above Save) ── */}
       {needsCookieSetup ? null : cookieCard}
 
       {/* ── Save ────────────────────────────────────────────────── */}
@@ -310,6 +390,26 @@ export default function SettingsTab({
           </span>
         ) : null}
       </div>
+
+      {/* ── Danger Zone (deliberately last — past Save so a destructive
+          action is never one accidental click away from the rest) ── */}
+      <SettingsCard
+        icon={AlertTriangle}
+        title={t('Danger Zone')}
+        danger
+        right={<InfoHint text={t('Exits VOD.RIP — cancels all downloads and closes the app.')} />}
+        open={!!openCards.danger}
+        onToggle={() => toggleCard('danger')}
+      >
+        <button
+          type="button"
+          onClick={exit}
+          className="w-full bg-red-950 text-red-300 font-black uppercase py-2.5 flex items-center justify-center gap-2 text-xs border-2 border-red-900 hover:border-red-500 hover:text-red-200 transition-colors"
+        >
+          <StopCircle size={16} />
+          {t('Exit VOD.RIP')}
+        </button>
+      </SettingsCard>
     </div>
   );
 }

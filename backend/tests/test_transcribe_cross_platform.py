@@ -339,7 +339,6 @@ def test_ingest_video_stores_only_channel_family_captions(monkeypatch, tmp_path)
     def _fake_guard(outdir, *, video_id=None):
         yield _FakeYdl()
 
-    monkeypatch.setattr("services.youtube_data_api.available", lambda: False)
     monkeypatch.setattr(archive_ytdlp, "_guarded_youtube_dl", _fake_guard)
     report = archive_ytdlp.ingest_video("https://www.youtube.com/watch?v=lg-ingest")
     assert report["video_id"] == "lg-ingest"

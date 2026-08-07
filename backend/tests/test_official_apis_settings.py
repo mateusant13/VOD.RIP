@@ -1,9 +1,10 @@
 """Settings router roundtrip for the official-API hybrid (issue #4).
 
 In-process ASGI client (no server): token save stamps updated_at, the
-official-apis-status endpoint reports credential/quota state, and saving
-settings auto-lifts the helix token from the cookie bridge without
-clobbering a fresh manual paste.
+official-apis-status endpoint reports credential state, the recommended
+endpoint serves machine-aware resource defaults, and saving settings
+auto-lifts the helix token from the cookie bridge without clobbering a
+fresh manual paste.
 
 Run from backend/: python -m pytest tests/test_official_apis_settings.py
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient
@@ -67,16 +69,10 @@ async def test_status_endpoint_shape(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["twitch_helix_token_set"] is False
-    assert body["youtube_api_key_set"] is False
-    assert body["youtube_quota_limit"] == 10000
-    assert body["youtube_quota_used"] == 0
-    assert body["youtube_degraded"] is False
 
     await client.post("/api/settings", json={"twitch_helix_token": "tok"})
-    await client.post("/api/settings", json={"youtube_data_api_key": "AIza-x"})
     body = (await client.get("/api/settings/official-apis-status")).json()
     assert body["twitch_helix_token_set"] is True
-    assert body["youtube_api_key_set"] is True
 
 
 async def test_auto_lift_on_settings_save(client, tmp_path, monkeypatch):
@@ -108,3 +104,25 @@ async def test_auto_lift_does_not_clobber_fresh_paste(client, tmp_path, monkeypa
 
     resp = await client.post("/api/settings", json={"ui_language": "pt-BR"})
     assert resp.json()["twitch_helix_token"] == "pasted-now", "fresh paste must survive auto-lift"
+
+
+# --- /api/settings/recommended (resource defaults) -------------------------
+
+async def test_recommended_uses_host_probe(client, monkeypatch):
+    """The endpoint probes the real host (pure formulas tested separately in
+    test_whisper_model_settings.py)."""
+    monkeypatch.setattr("services.settings._probe_cpu_count", lambda: 20)
+    monkeypatch.setattr("services.settings._probe_ram_bytes", lambda: 32 * 1024**3)
+    monkeypatch.setattr(
+        "services.disk_detect.biggest_fixed_drive", lambda: "I:\\"
+    )
+    monkeypatch.setattr(
+        "services.settings.shutil.disk_usage",
+        lambda p: SimpleNamespace(total=2000 * 1024**3, free=1000 * 1024**3),
+    )
+    monkeypatch.setattr("services.disk_detect.free_space", lambda p: 1000 * 1024**3)
+    resp = await client.get("/api/settings/recommended")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["download_threads"] == 10  # round(20 * 0.5)
+    assert body["max_cache_mb"] == 1000  # 50% free -> 1000 MB

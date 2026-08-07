@@ -17,7 +17,7 @@ const CLEANABLE = ['archive_vods', 'whisper_models', 'preview_cache', 'update_te
 const ROW_LABELS: Record<string, string> = {
   archive_vods: 'Archive VODs',
   whisper_models: 'Whisper Models',
-  db: 'Database',
+  db: 'App data',
   logs: 'Logs',
   preview_cache: 'Preview Cache',
   update_temps: 'Update Temps',
@@ -123,8 +123,10 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
   // Storage pickers: one option per drive letter from /api/disks. The cache
   // pick writes <drive>\VOD.RIP-cache (same convention as the auto root);
-  // the data pick writes <drive>\VOD.RIP-data. Values that don't match any
-  // option (legacy custom paths) surface as a read-only Custom option.
+  // the data pick writes <drive>\VOD.RIP-data; the model-cache pick writes
+  // <drive>\VOD.RIP-models (own disk-choice rule — free space AND speed).
+  // Values that don't match any option (legacy custom paths) surface as a
+  // read-only Custom option.
   const drives = disks?.drives ?? [];
   const fastest = disks?.fastest ?? '';
   const formatFree = (n: number) => formatBytes(n).replace(/\.00 /, ' ');
@@ -132,11 +134,17 @@ export default function DiskSection({ settings, setSettings }: Props) {
     `${d.drive.replace(/\\+$/, '')} (${t('{bytes} free', { bytes: formatFree(d.free_bytes) })}, ${d.media_type})`;
   const cacheOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-cache`, label: driveLabel(d) }));
   const dataOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-data`, label: driveLabel(d) }));
+  const modelOptions = drives.map((d) => ({ value: `${d.drive}VOD.RIP-models`, label: driveLabel(d) }));
   const cacheCustom = cacheDir !== '' && !cacheOptions.some((o) => o.value === cacheDir);
   const dataCustom = dataDir !== '' && !dataOptions.some((o) => o.value === dataDir);
+  const modelCacheDir = settings.whisper_model_cache ?? '';
+  const modelCustom = modelCacheDir !== '' && !modelOptions.some((o) => o.value === modelCacheDir);
   const autoDataLabel = fastest
     ? t('Auto (fastest: {drive})', { drive: fastest.replace(/\\+$/, '') })
     : t('Auto (fastest)');
+  const autoModelLabel = disks?.model_cache
+    ? t('Auto (best fit: {drive})', { drive: disks.model_cache.replace(/\\+$/, '') })
+    : t('Auto (best fit)');
 
   return (
     <div className="flex flex-col gap-3">
@@ -187,6 +195,28 @@ export default function DiskSection({ settings, setSettings }: Props) {
             </option>
           ))}
           {dataCustom ? <option value={dataDir}>{t('Custom ({dir})', { dir: dataDir })}</option> : null}
+        </select>
+
+
+        <FieldCaption
+          noWrap
+          info={t('Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.')}
+        >
+          {t('AI Models Folder')}
+        </FieldCaption>
+        <select
+          aria-label="ai models folder"
+          value={modelCacheDir}
+          onChange={(e) => setSettings({ ...settings, whisper_model_cache: e.target.value })}
+          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
+        >
+          <option value="">{autoModelLabel}</option>
+          {modelOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+          {modelCustom ? <option value={modelCacheDir}>{t('Custom ({dir})', { dir: modelCacheDir })}</option> : null}
         </select>
 
 

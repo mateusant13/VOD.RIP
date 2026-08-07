@@ -206,7 +206,8 @@ def whisper_cache_dir() -> Path:
     """Resolve the whisper model cache dir.
 
     Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
-    cache_root()/whisper-models -> %APPDATA%/VOD.RIP/whisper-models. Pointing
+    best-ROI fixed drive + VOD.RIP-models (auto: free space AND speed — see
+    best_model_cache_drive) -> %APPDATA%/VOD.RIP/whisper-models. Pointing
     it at a shared HF hub dir (e.g. BrandOps' models--Systran--faster-whisper-*
     checkpoints) lets faster-whisper reuse already-downloaded models without
     any download.
@@ -221,12 +222,53 @@ def whisper_cache_dir() -> Path:
     ).strip()
     if setting:
         return Path(setting)
-    from services.settings import cache_root
-
-    root = cache_root()
-    if root is not None:
-        return root / "whisper-models"
+    drive = best_model_cache_drive()
+    if drive:
+        return Path(drive) / "VOD.RIP-models"
     return _get_appdata_dir() / "whisper-models"
+
+
+# --- model-cache auto pick (Settings > Disk "AI Models Folder" Auto) -------
+# The whisper model cache follows its own disk-choice rule: score each drive
+# by free space AND speed. Whisper models are ~1.5-3 GB each and are read a
+# few times per process, so a big-but-slow HDD is a fine home; the SSD credit
+# only wins near-ties.
+_MODEL_CACHE_MIN_FREE_BYTES = 8 * 1024**3  # room for a model + growth
+# Speed credit in GB of equivalent free space: NVMe +64 GB, SSD +32 GB. An
+# SSD with "adequate" free space (e.g. 100 GB -> 164 GB score) beats an HDD
+# with a bit more (120 GB -> 120 GB), while a large slow HDD with >X GB free
+# (X = free_ssd + credit) beats a nearly-full SSD — exactly the intended
+# tradeoff. ponytail: bus-classified credit (disk_detect._speed_rank) is a
+# heuristic; upgrade path is a measured rank (CrystalDiskMark-style small
+# benchmark, cached like _storage_layout) if bus classification ever misleads.
+_MODEL_CACHE_SSD_CREDIT = {
+    1: 64 * 1024**3,  # NVMe
+    2: 32 * 1024**3,  # SSD
+    # 3 (HDD) / 4 (Unknown): no credit
+}
+
+
+def _model_cache_score(free_bytes: int, speed_rank: int) -> int:
+    """ROI score = free bytes + speed credit (see _MODEL_CACHE_SSD_CREDIT)."""
+    return int(free_bytes) + _MODEL_CACHE_SSD_CREDIT.get(speed_rank, 0)
+
+
+def best_model_cache_drive() -> Optional[str]:
+    """Drive root (e.g. 'H:\\') of the best model-cache ROI pick: highest
+    free+speed score among drives with >= 8 GB free, ties broken by most
+    free space (the credit makes exact ties rare). None when no usable
+    drive exists (non-Windows host, probe failures)."""
+    from services.disk_detect import disk_inventory  # lazy: keeps import light
+
+    best: Optional[str] = None
+    best_score = -1
+    for item in disk_inventory():
+        if item["free_bytes"] < _MODEL_CACHE_MIN_FREE_BYTES:
+            continue
+        score = _model_cache_score(item["free_bytes"], item["speed_rank"])
+        if score > best_score:
+            best, best_score = item["drive"], score
+    return best
 
 
 def _dir_size(root: Path) -> int:

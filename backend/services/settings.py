@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -123,3 +124,120 @@ class SettingsManager:
                     except Exception:
                     # ponytail: best-effort — I/O errors only
                         pass
+
+
+# --- recommended resource defaults (Settings > Recommended) -----------------
+# Machine-aware suggestions for download_threads / max_cache_mb, served by
+# GET /api/settings/recommended and filled via the Settings UI "Recommended"
+# button. Formulas are pure given the host facts (tests inject them); the
+# route probes the real host.
+
+# Each parallel download is a yt-dlp python process + ffmpeg child; the work
+# is network/disk-bound, so half the logical cores keeps the other half for
+# the UI, preview muxing, transcription and the OS.
+_THREADS_CORES_RATIO = 0.5
+# Rough RSS per concurrent downloader (yt-dlp + ffmpeg): ~2 GB is a safe cap
+# for low-RAM boxes (an 8 GB machine gets at most 4 threads from this guard).
+_RAM_BYTES_PER_DOWNLOADER = 2 * 1024**3
+# Clamps mirror the /api/settings validation (1-16 / 50-2000).
+_THREADS_MIN, _THREADS_MAX = 2, 16
+_CACHE_MB_MIN, _CACHE_MB_MAX = 50, 2000
+# Max cache = 2000 MB when the drive is 100% free; scale linearly with the
+# free share so a nearly-full volume is never filled further (this machine's
+# disks are all >90% full, so the honest suggestion is a small cache).
+_CACHE_MB_PER_FREE_PCT = 20
+
+
+def _probe_cpu_count() -> int:
+    return os.cpu_count() or 4
+
+
+def _probe_ram_bytes() -> int:
+    """Total physical RAM in bytes. Windows: GlobalMemoryStatusEx (stdlib
+    ctypes, no psutil dep); POSIX: sysconf pages. Falls back to 8 GiB."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(st)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys)
+        except (AttributeError, OSError):
+            pass
+    elif sys.platform == "darwin":
+        try:
+            return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (ValueError, OSError):
+            pass
+    else:
+        try:
+            return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (ValueError, OSError):
+            pass
+    return 8 * 1024**3
+
+
+def _recommended_threads(cpu_count: int, ram_bytes: int) -> int:
+    """clamp(round(0.5 * logical cores), 2, 16), then RAM-guarded:
+    at least 2 GB per downloader so an 8 GB box never suggests 16."""
+    threads = max(_THREADS_MIN, min(_THREADS_MAX, round(cpu_count * _THREADS_CORES_RATIO)))
+    ram_guard = max(_THREADS_MIN, int(ram_bytes // _RAM_BYTES_PER_DOWNLOADER))
+    return max(_THREADS_MIN, min(threads, ram_guard))
+
+
+def _recommended_cache_mb(drive_total: int, drive_free: int) -> int:
+    """Free-share of the cache drive -> MB, clamped 50-2000.
+
+    drive_total/drive_free come from the drive the heavy caches auto-land on
+    (biggest fixed drive). A disk that is 100% free suggests the 2000 MB cap;
+    a disk with 2.5% free hits the 50 MB floor."""
+    pct_free = (drive_free / drive_total * 100.0) if drive_total > 0 else 100.0
+    return max(_CACHE_MB_MIN, min(_CACHE_MB_MAX, round(pct_free * _CACHE_MB_PER_FREE_PCT)))
+
+
+def recommended_resource_defaults(
+    cpu_count: Optional[int] = None,
+    ram_bytes: Optional[int] = None,
+    drive_total: Optional[int] = None,
+    drive_free: Optional[int] = None,
+) -> dict:
+    """download_threads + max_cache_mb suggested for this machine.
+
+    Pure when all four facts are passed (tests); probes the host otherwise.
+    The cache drive defaults to the biggest fixed drive — the same auto pick
+    cache_dir uses — so the cache-size suggestion matches where the cache
+    actually lands."""
+    if cpu_count is None:
+        cpu_count = _probe_cpu_count()
+    if ram_bytes is None:
+        ram_bytes = _probe_ram_bytes()
+    if drive_total is None or drive_free is None:
+        total = free = 0
+        from services.disk_detect import biggest_fixed_drive, free_space
+
+        drive = biggest_fixed_drive()
+        if drive:
+            free = free_space(drive)
+            try:
+                total = int(shutil.disk_usage(drive).total)
+            except OSError:
+                total = 0
+        drive_total, drive_free = total, free
+    return {
+        "download_threads": _recommended_threads(cpu_count, ram_bytes),
+        "max_cache_mb": _recommended_cache_mb(drive_total, drive_free),
+    }

@@ -131,8 +131,6 @@ export interface AppSettings {
   /** Official API hybrid (issue #4): Twitch helix OAuth bearer — auto-lifted
    * from the cookie bridge, or pasted. Empty = GQL only. */
   twitch_helix_token?: string;
-  /** Official API hybrid (issue #4): YouTube Data API v3 key (opt-in). */
-  youtube_data_api_key?: string;
 }
 
 export interface DiskUsage {
@@ -175,6 +173,9 @@ export interface DisksResponse {
   fastest: string;
   /** Auto pick for heavy caches: drive with the most free space. */
   biggest?: string;
+  /** Auto pick for the whisper model cache: best-ROI drive (free space AND
+   * speed; '' when none). */
+  model_cache?: string;
 }
 
 export interface UpdateInfo {

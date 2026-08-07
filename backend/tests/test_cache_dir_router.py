@@ -71,13 +71,27 @@ async def test_cache_dir_blank_returns_to_auto(client):
 # --- per-cache routing (setting wins once env is cleared) --------------------
 
 @pytest.mark.asyncio
-async def test_whisper_cache_routed_through_cache_dir(client, monkeypatch):
+async def test_whisper_cache_routed_by_own_setting(client, monkeypatch):
+    """Whisper models follow whisper_model_cache (own disk choice), NOT the
+    heavy cache_dir: the picker writes <drive>\\VOD.RIP-models and the auto
+    rule uses best_model_cache_drive()."""
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     monkeypatch.delenv("VODRIP_CACHE_DIR", raising=False)
-    resp = await client.post("/api/settings", json={"cache_dir": "D:/caches"})
+    resp = await client.post(
+        "/api/settings",
+        json={"cache_dir": "D:/caches", "whisper_model_cache": "H:/VOD.RIP-models"},
+    )
     assert resp.status_code == 200
-    assert disk_hygiene.whisper_cache_dir() == Path("D:/caches") / "whisper-models"
-    assert archive_transcribe._cache_dir() == Path("D:/caches") / "whisper-models"
+    assert disk_hygiene.whisper_cache_dir() == Path("H:/VOD.RIP-models")
+    assert archive_transcribe._cache_dir() == Path("H:/VOD.RIP-models")
+
+    # cache_dir alone must NOT move the whisper cache (falls back to auto).
+    monkeypatch.setattr("services.disk_hygiene.best_model_cache_drive", lambda: None)
+    resp = await client.post(
+        "/api/settings", json={"cache_dir": "D:/caches", "whisper_model_cache": ""}
+    )
+    assert resp.status_code == 200
+    assert disk_hygiene.whisper_cache_dir() == disk_hygiene._get_appdata_dir() / "whisper-models"
 
 
 @pytest.mark.asyncio
@@ -132,18 +146,21 @@ def test_embed_env_beats_cache_dir(monkeypatch):
 # --- probe-file acceptance ---------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_probe_file_lands_under_cache_dir(client, tmp_path, monkeypatch):
-    """Acceptance: with cache_dir persisted in a scratch settings.json, a new
-    cache write lands under it (per-cache env cleared so the setting wins)."""
+async def test_probe_file_lands_under_whisper_model_cache(client, tmp_path, monkeypatch):
+    """Acceptance: with whisper_model_cache persisted in a scratch settings
+    file, a new whisper cache write lands under it (env cleared so the
+    setting wins)."""
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     monkeypatch.delenv("VODRIP_CACHE_DIR", raising=False)
-    resp = await client.post("/api/settings", json={"cache_dir": str(tmp_path / "caches")})
+    resp = await client.post(
+        "/api/settings", json={"whisper_model_cache": str(tmp_path / "caches" / "VOD.RIP-models")}
+    )
     assert resp.status_code == 200
 
     cache = disk_hygiene.whisper_cache_dir()
-    assert cache == tmp_path / "caches" / "whisper-models"
+    assert cache == tmp_path / "caches" / "VOD.RIP-models"
     probe = cache / "probe.bin"
     probe.parent.mkdir(parents=True, exist_ok=True)  # the cache consumer creates dirs
     probe.write_bytes(b"probe")
-    assert probe.is_file(), "a cache write must land under the configured cache_dir"
-    assert (tmp_path / "caches" / "whisper-models" / "probe.bin").is_file()
+    assert probe.is_file(), "a cache write must land under the configured whisper_model_cache"
+    assert (tmp_path / "caches" / "VOD.RIP-models" / "probe.bin").is_file()
