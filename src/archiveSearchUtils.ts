@@ -7,6 +7,10 @@ export interface ArchiveSearchHit {
   /** 'title' = local video-title match; 'youtube' = remote channel-search hit. */
   kind: 'transcript' | 'message' | 'title' | 'youtube';
   platform: string;
+  /** Every platform where the same canonical VOD exists (dedupe membership),
+   *  always including `platform`. Absent on older backend responses —
+   *  consumers fall back to [platform] (see hitPlatforms). */
+  platforms?: string[];
   video_id: string;
   offset_sec: number;
   text: string;
@@ -79,11 +83,13 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
   live: 'LIVE',
 };
 
-/** UI labels for the source filter — STREAMER is the user-facing word for transcript. */
+/** i18n keys for the source-filter labels. The query PARAM values stay
+ *  stable (both|transcript|chat — buildSearchUrl sends them untouched);
+ *  only the display words changed (STREAMER → speech, BOTH → both). */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
-  both: 'BOTH',
-  transcript: 'STREAMER',
-  chat: 'CHAT',
+  both: 'both',
+  transcript: 'speech',
+  chat: 'chat',
 };
 
 /** Upper-case label for a kind value; unknown/empty stays as-is. */
@@ -91,6 +97,22 @@ export function kindLabel(kind: string | null | undefined): string {
   if (!kind) return '';
   const label = ARCHIVE_KIND_LABELS[kind as ArchiveKind];
   return label ?? String(kind);
+}
+
+/**
+ * Every platform where the hit's canonical VOD exists, PRIMARY platform
+ * first. The backend `platforms` field (dedupe membership) is optional and
+ * may arrive in dedupe-view order — normalize to primary-first, deduped,
+ * lowercase so callers can rely on the order (logo row, tie-breaks).
+ */
+export function hitPlatforms(hit: Pick<ArchiveSearchHit, 'platform' | 'platforms'>): string[] {
+  const list = Array.isArray(hit.platforms) && hit.platforms.length > 0 ? hit.platforms : [hit.platform];
+  const ordered: string[] = [];
+  for (const p of [(hit.platform || '').toLowerCase(), ...list]) {
+    const k = (p || '').toLowerCase();
+    if (k && !ordered.includes(k)) ordered.push(k);
+  }
+  return ordered;
 }
 
 /** True for a real calendar date in YYYY-MM-DD (2026-02-30 is invalid). */
@@ -330,4 +352,54 @@ export function buildArchiveVodUrl(platform: string, videoId: string, channel?: 
   if (p === 'youtube') return `https://www.youtube.com/watch?v=${id}`;
   const slug = (channel || '').trim();
   return slug ? `https://kick.com/${slug}/videos/${id}` : `https://kick.com/videos/${id}`;
+}
+
+/** One openable platform of a hit's canonical VOD — App picks among these. */
+export interface ArchiveOpenTarget {
+  platform: string;
+  video: ArchiveVideoRow | undefined;
+}
+
+/**
+ * Resolvable per-platform open targets for a hit, primary first. Sibling
+ * platforms (same canonical VOD) resolve their video row via canonical_key
+ * from the caller's video map; a sibling with no matching row is skipped
+ * (no video_id → no playable URL). The primary target always exists — its
+ * video row may be absent, in which case App falls back to hit.video_id.
+ */
+export function resolveOpenTargets(
+  hit: ArchiveSearchHit,
+  videos: Record<string, ArchiveVideoRow>,
+): ArchiveOpenTarget[] {
+  const primary = (hit.platform || '').toLowerCase();
+  const primaryVideo = videos[`${primary}:${hit.video_id}`];
+  const targets: ArchiveOpenTarget[] = [{ platform: primary, video: primaryVideo }];
+  if (!primaryVideo?.canonical_key) return targets;
+  const seen = new Set([primary]);
+  for (const p of hitPlatforms(hit)) {
+    if (seen.has(p)) continue;
+    const sibling = Object.values(videos).find(
+      (v) => (v.platform || '').toLowerCase() === p
+        && v.canonical_key && v.canonical_key === primaryVideo.canonical_key,
+    );
+    if (sibling) {
+      seen.add(p);
+      targets.push({ platform: p, video: sibling });
+    }
+  }
+  return targets;
+}
+
+/** Least-opened platform target — session playback balancing across the
+ *  mirrors of a canonical VOD (the backend balances transcription
+ *  extraction; this balances playback). Ties resolve to the earlier
+ *  candidate (primary-first order); unknown counts read as 0. */
+export function pickLeastOpenedTarget(
+  targets: readonly ArchiveOpenTarget[],
+  openCounts: Record<string, number>,
+): ArchiveOpenTarget {
+  return targets.reduce((best, t) =>
+    (openCounts[t.platform] ?? 0) < (openCounts[best.platform] ?? 0) ? t : best,
+    targets[0],
+  );
 }

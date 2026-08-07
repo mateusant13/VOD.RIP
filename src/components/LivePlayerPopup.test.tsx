@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { LivePlayerPopup } from './LivePlayerPopup';
-import { LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
+import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
 
 /**
  * jsdom does not implement the Fullscreen API (no requestFullscreen /
@@ -147,16 +147,38 @@ describe('LivePlayerPopup fullscreen', () => {
 });
 
 describe('LivePlayerPopup z-order', () => {
-  it('floats the open preview above the floating archive search panel', () => {
-    renderPopup();
+  it('applies the shared-ladder zIndex and brings itself to front on pointer down', () => {
+    const onBringToFront = vi.fn();
+    render(
+      <LivePlayerPopup
+        entry={ENTRY}
+        channelName="srdogg / srdoglol"
+        onClose={vi.fn()}
+        channelSlug="srdoglol"
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+        zIndex={EXPLORE_POPUP_Z + 3}
+        onBringToFront={onBringToFront}
+      />,
+    );
     // The popup portal is mounted synchronously with the component.
     const popupRoot = document.querySelector('[data-live-popup]') as HTMLElement;
     expect(popupRoot).toBeTruthy();
-    // Active-state z while open: above the search panel…
+    // Rank from the shared floating-player ladder wins over any fixed constant.
+    expect(Number(popupRoot.style.zIndex)).toBe(EXPLORE_POPUP_Z + 3);
+    // Pointer-down on the root (drag start) bumps the ladder rank → the popup
+    // comes to the front, above whatever it was dragged onto.
+    fireEvent.pointerDown(popupRoot);
+    expect(onBringToFront).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back above the floating archive search when no zIndex is given', () => {
+    renderPopup();
+    const popupRoot = document.querySelector('[data-live-popup]') as HTMLElement;
+    expect(popupRoot).toBeTruthy();
+    // Unranked popups keep the classic active-state z: above the search panel…
     expect(Number(popupRoot.style.zIndex)).toBe(LIVE_POPUP_ACTIVE_Z);
     expect(LIVE_POPUP_ACTIVE_Z).toBeGreaterThan(SEARCH_POPUP_Z);
-    // …but still under the explore stack (which owns the player overlays).
-    expect(LIVE_POPUP_ACTIVE_Z).toBeLessThan(9999);
   });
 
   it('closing the popup removes its layer entirely (search regains top order)', () => {

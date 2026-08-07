@@ -1957,7 +1957,7 @@ export default function ChannelExplorePopup({
           zIndex={zIndex + 50}
           onClose={() => setClipPopup(null)}
           onClipCreated={(editorUrl) =>
-            showClipNotice('ok', `Twitch clip editor opened — ${editorUrl}`)}
+            showClipNotice('ok', `Twitch clip created — ${editorUrl}`)}
         />
       )}
     </div>

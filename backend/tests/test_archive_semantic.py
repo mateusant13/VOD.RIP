@@ -52,11 +52,17 @@ def _fake_vec(texts: list[str], prefix: str) -> np.ndarray:
 
 @pytest.fixture(scope="module", autouse=True)
 def _semantic_scratch_db():
+    # Force THIS module's scratch DB at setup: get_conn() keys on the env
+    # path, so a module imported later in the batch wins the env at
+    # collection end — without this, this suite silently ran against (and
+    # _clean_slate wiped) whichever DB that was, failing its real-data
+    # assertions (e.g. test_channel_language's titiltei copy).
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
     yield
     # Restore, don't pop: module-level env sets happen at collection for ALL
     # modules, so removing the key here would KeyError later modules'
     # teardowns (test_archive_transcribe_*_real reads it back).
-    prev = os.environ.get("VODRIP_ARCHIVE_DB")
     if prev is None:
         os.environ.pop("VODRIP_ARCHIVE_DB", None)
     else:

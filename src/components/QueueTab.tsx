@@ -7,7 +7,7 @@ import DownloadThumb from './DownloadThumb';
 import PlatformVodIcon from './PlatformVodIcon';
 import type { DownloadState } from '../types';
 import { useI18n } from '../i18n';
-import { fetchTwitchClipHistory, type TwitchClipRecord } from '../twitchClip';
+import { deleteTwitchClipHistory, fetchTwitchClipHistory, type TwitchClipRecord } from '../twitchClip';
 import { formatHmsFull } from '../utils';
 
 function isPlayableLocalFile(path: string): boolean {
@@ -69,12 +69,39 @@ export default function QueueTab({
   const { t } = useI18n();
   const [twitchClips, setTwitchClips] = useState<TwitchClipRecord[]>([]);
   const [twitchClipsLoading, setTwitchClipsLoading] = useState(false);
+  const [selectedClipIds, setSelectedClipIds] = useState<Set<string>>(new Set());
+  const [clipDeleteError, setClipDeleteError] = useState<string | null>(null);
   const loadTwitchClips = () => {
     setTwitchClipsLoading(true);
     fetchTwitchClipHistory()
       .then((rows) => setTwitchClips(rows))
       .catch(() => setTwitchClips([]))
       .finally(() => setTwitchClipsLoading(false));
+  };
+  const toggleClipSelection = (id: string) => {
+    setSelectedClipIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const allClipsSelected = twitchClips.length > 0
+    && twitchClips.every((c) => selectedClipIds.has(c.id));
+  const toggleAllClips = () => {
+    setSelectedClipIds(allClipsSelected ? new Set() : new Set(twitchClips.map((c) => c.id)));
+  };
+  const handleBulkDeleteClips = async () => {
+    if (selectedClipIds.size === 0) return;
+    if (!window.confirm(t('Remove {count} Twitch clip(s) from history?', { count: selectedClipIds.size }))) return;
+    setClipDeleteError(null);
+    try {
+      await deleteTwitchClipHistory([...selectedClipIds]);
+      setSelectedClipIds(new Set());
+      loadTwitchClips();
+    } catch {
+      setClipDeleteError(t('Failed to delete Twitch clips'));
+    }
   };
   useEffect(() => {
     loadTwitchClips();
@@ -329,19 +356,49 @@ export default function QueueTab({
       </div>
 
       <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500 flex items-center gap-1.5">
             <Clapperboard size={11} className="text-[#9146FF]" />
             {t('Twitch Clips')}
           </span>
-          <button
-            type="button"
-            onClick={loadTwitchClips}
-            className={`text-zinc-500 hover:text-white transition-colors ${twitchClipsLoading ? 'animate-spin' : ''}`}
-            title={t('Refresh Twitch clip history')}
-          >
-            <RefreshCw size={14} />
-          </button>
+          <div className="flex items-center gap-2">
+            {clipDeleteError && (
+              <span className="text-[10px] font-mono text-red-400">{clipDeleteError}</span>
+            )}
+            {twitchClips.length > 0 && (
+              <label
+                className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500 cursor-pointer hover:text-zinc-300"
+                title={t('Select all clips')}
+              >
+                <input
+                  type="checkbox"
+                  checked={allClipsSelected}
+                  onChange={toggleAllClips}
+                  className="shrink-0"
+                  style={vodCheckboxStyle('#fafafa')}
+                />
+                {t('Select all')}
+              </label>
+            )}
+            {selectedClipIds.size > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleBulkDeleteClips()}
+                className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 font-bold uppercase tracking-wider"
+                title={t('Delete selected clips')}
+              >
+                <Trash2 size={12} /> {t('Delete {count}', { count: selectedClipIds.size })}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={loadTwitchClips}
+              className={`text-zinc-500 hover:text-white transition-colors ${twitchClipsLoading ? 'animate-spin' : ''}`}
+              title={t('Refresh Twitch clip history')}
+            >
+              <RefreshCw size={14} />
+            </button>
+          </div>
         </div>
         {twitchClips.length === 0 ? (
           <div className="text-center text-zinc-600 font-mono text-xs py-4 border-2 border-dashed border-zinc-800">
@@ -351,6 +408,14 @@ export default function QueueTab({
           <div className="flex flex-col gap-2">
             {twitchClips.map((c) => (
               <div key={c.id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={selectedClipIds.has(c.id)}
+                  onChange={() => toggleClipSelection(c.id)}
+                  aria-label={t('Select clip')}
+                  className="shrink-0"
+                  style={vodCheckboxStyle('#9146FF')}
+                />
                 <Clapperboard size={14} className="shrink-0 text-[#9146FF]" />
                 <div className="flex flex-col gap-0.5 min-w-0 flex-1">
                   <span className="text-xs font-mono text-zinc-300 truncate">

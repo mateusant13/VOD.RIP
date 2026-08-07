@@ -2,34 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
-  buildLiveTwitchClipEditorUrl,
-  buildTwitchClipEditorUrl,
   clampClipSelection,
   clipEditorOffsetAndDuration,
   twitchClipDurationError,
   twitchClipWindow,
 } from './twitchClip';
-
-describe('buildTwitchClipEditorUrl', () => {
-  it('positions the editor on the VOD at the clip end', () => {
-    const url = buildTwitchClipEditorUrl({
-      vodId: '2536167775',
-      broadcasterLogin: 'surtepi',
-      offsetSeconds: 434.7,
-    });
-    expect(url).toBe(
-      'https://clips.twitch.tv/create?vodID=2536167775&broadcasterLogin=surtepi&offsetSeconds=434',
-    );
-  });
-});
-
-describe('buildLiveTwitchClipEditorUrl', () => {
-  it('targets the live channel without a VOD id', () => {
-    expect(buildLiveTwitchClipEditorUrl('surtepi')).toBe(
-      'https://clips.twitch.tv/create?broadcasterLogin=surtepi',
-    );
-  });
-});
 
 describe('twitchClipDurationError', () => {
   it('accepts ranges inside the 5..60s window', () => {
@@ -137,18 +114,5 @@ describe('clipEditorOffsetAndDuration', () => {
 
   it('never produces a negative offset', () => {
     expect(clipEditorOffsetAndDuration(0, 0)).toEqual({ offsetSec: 0, durationSec: 0 });
-  });
-
-  it('matches the editor URL builder (end is the offsetSeconds value)', () => {
-    const { offsetSec, durationSec } = clipEditorOffsetAndDuration(100, 160);
-    const url = buildTwitchClipEditorUrl({
-      vodId: '2536167775',
-      broadcasterLogin: 'surtepi',
-      offsetSeconds: offsetSec,
-    });
-    expect(url).toBe(
-      `https://clips.twitch.tv/create?vodID=2536167775&broadcasterLogin=surtepi&offsetSeconds=${offsetSec}`,
-    );
-    expect(durationSec).toBe(60);
   });
 });

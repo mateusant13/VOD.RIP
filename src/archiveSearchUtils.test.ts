@@ -9,11 +9,17 @@ import {
   formatRelativeDate,
   groupChatWindow,
   highlightQuerySpans,
+  hitPlatforms,
   isValidDateParam,
   kindLabel,
+  pickLeastOpenedTarget,
+  resolveOpenTargets,
   snippetAroundMatch,
   todayIso,
   type ArchiveChatMessage,
+  type ArchiveOpenTarget,
+  type ArchiveSearchHit,
+  type ArchiveVideoRow,
 } from './archiveSearchUtils';
 
 describe('formatArchiveOffset', () => {
@@ -398,5 +404,69 @@ describe('formatRelativeDate', () => {
 
   it('defaults to the current date when no reference is given', () => {
     expect(formatRelativeDate(new Date().toISOString())).toBe('today');
+  });
+});
+
+describe('hitPlatforms', () => {
+  it('falls back to the primary platform when platforms is absent or empty', () => {
+    expect(hitPlatforms({ platform: 'twitch' })).toEqual(['twitch']);
+    expect(hitPlatforms({ platform: 'twitch', platforms: [] })).toEqual(['twitch']);
+  });
+
+  it('normalizes dedupe membership to primary-first, deduped, lowercase', () => {
+    expect(hitPlatforms({ platform: 'twitch', platforms: ['youtube', 'twitch'] })).toEqual(['twitch', 'youtube']);
+    expect(hitPlatforms({ platform: 'kick', platforms: ['youtube', 'kick', 'youtube'] })).toEqual(['kick', 'youtube']);
+    expect(hitPlatforms({ platform: 'Twitch', platforms: ['YouTube'] })).toEqual(['twitch', 'youtube']);
+  });
+});
+
+describe('resolveOpenTargets', () => {
+  const hit = (over: Partial<ArchiveSearchHit> = {}): ArchiveSearchHit => ({
+    kind: 'transcript',
+    platform: 'twitch',
+    video_id: 'v1',
+    offset_sec: 0,
+    text: 'x',
+    score: 1,
+    ...over,
+  });
+  const videos: Record<string, ArchiveVideoRow> = {
+    'twitch:v1': { platform: 'twitch', video_id: 'v1', channel: 'srdogg', title: 'VOD A', canonical_key: 'k1' },
+    'youtube:yt1': { platform: 'youtube', video_id: 'yt1', channel: 'srdogg', title: 'VOD C', canonical_key: 'k1' },
+    'kick:k1': { platform: 'kick', video_id: 'k1', channel: 'srdoglol', title: 'VOD B', canonical_key: 'k1' },
+    'twitch:orphan': { platform: 'twitch', video_id: 'orphan', title: 'NO KEY' },
+  };
+
+  it('resolves siblings via canonical_key, primary first', () => {
+    const targets = resolveOpenTargets(hit({ platforms: ['youtube', 'kick', 'twitch'] }), videos);
+    expect(targets.map((t) => t.platform)).toEqual(['twitch', 'youtube', 'kick']);
+    expect(targets[1].video?.video_id).toBe('yt1');
+    expect(targets[2].video?.video_id).toBe('k1');
+  });
+
+  it('keeps only the primary when no video map exists (graceful degradation)', () => {
+    expect(resolveOpenTargets(hit({ platforms: ['twitch', 'youtube'] }), {})).toEqual([
+      { platform: 'twitch', video: undefined },
+    ]);
+  });
+
+  it('drops siblings when the primary row lacks canonical_key', () => {
+    const targets = resolveOpenTargets(hit({ video_id: 'orphan', platforms: ['twitch', 'youtube'] }), videos);
+    expect(targets.map((t) => t.platform)).toEqual(['twitch']);
+  });
+});
+
+describe('pickLeastOpenedTarget', () => {
+  const targets: ArchiveOpenTarget[] = [
+    { platform: 'twitch', video: undefined },
+    { platform: 'youtube', video: undefined },
+    { platform: 'kick', video: undefined },
+  ];
+
+  it('picks the least-opened platform; ties resolve primary-first; unknown counts read 0', () => {
+    expect(pickLeastOpenedTarget(targets, {}).platform).toBe('twitch');
+    expect(pickLeastOpenedTarget(targets, { twitch: 3, youtube: 1, kick: 4 }).platform).toBe('youtube');
+    expect(pickLeastOpenedTarget(targets, { twitch: 3, youtube: 3, kick: 1 }).platform).toBe('kick');
+    expect(pickLeastOpenedTarget(targets, { twitch: 1, youtube: 3, kick: 1 }).platform).toBe('twitch');
   });
 });

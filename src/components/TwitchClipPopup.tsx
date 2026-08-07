@@ -1,11 +1,11 @@
 /**
  * Twitch clip mini-preview — the "Twitch clip" button on the main preview and
  * the explore popup opens this floating player on a ±60s window around the
- * click moment instead of jumping straight to Twitch's editor. The user trims
- * a 5..60s selection on the window timeline, then 'Create Twitch clip' opens
- * Twitch's editor pre-positioned on the selection END (offsetSeconds is an
- * END reference — see twitchClip.ts) and records the editor-open via the
- * existing POST /api/twitch/clip flow (no user token needed).
+ * click moment instead of jumping straight to Twitch. The user trims a 5..60s
+ * selection on the window timeline, then 'Create Twitch clip' calls the
+ * backend, which creates the clip through the official Helix API
+ * (POST /helix/videos/clips, vod_offset = selection END — see twitchClip.ts)
+ * and returns an edit_url the frontend opens in the OS default browser.
  *
  * The mini preview reuses the main preview's session machinery: one session
  * per popup with crop_start/crop_end = the window, exactly like App.tsx's
@@ -26,6 +26,7 @@ import { useI18n } from '../i18n';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
+  TWITCH_CLIP_TITLE_MAX,
   clampClipSelection,
   clipEditorOffsetAndDuration,
   openTwitchClipEditor,
@@ -97,6 +98,9 @@ export default function TwitchClipPopup({
     setLastEndpoint(which);
   }, []);
   const selLen = Math.max(0, selection.end - selection.start);
+  // User-chosen clip title — becomes the clip's Twitch title and the local
+  // filename when the clip is downloaded; empty -> Twitch auto-titles.
+  const [clipTitle, setClipTitle] = useState('');
 
   // Floating panel position (draggable via the header, like the other popups).
   const [position, setPosition] = useState(() => ({
@@ -395,7 +399,7 @@ export default function TwitchClipPopup({
     commitSelection(res);
   }, [win, commitSelection]);
 
-  // ── Final action: open Twitch's editor on the selected range (END ref) ──
+  // ── Final action: create the clip via Helix on the selected range (END ref) ──
   const createClip = useCallback(async () => {
     const sel = selectionRef.current;
     const err = twitchClipDurationError(sel.end - sel.start);
@@ -411,15 +415,20 @@ export default function TwitchClipPopup({
         vodId,
         offsetSec,
         durationSec,
+        title: clipTitle.trim(),
       });
-      onClipCreated(res.url);
-      onClose();
+      if (res.ok) {
+        onClipCreated(res.edit_url);
+        onClose();
+      } else {
+        showClipNotice('error', res.error.message);
+      }
     } catch {
       showClipNotice('error', t('Failed to open the Twitch clip editor'));
     } finally {
       setClipOpening(false);
     }
-  }, [broadcasterLogin, vodId, onClipCreated, onClose, showClipNotice]);
+  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice]);
 
   const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
   const playFrac = secToFrac(currentTime, railView) * 100;
@@ -634,6 +643,19 @@ export default function TwitchClipPopup({
           >
             {formatHmsFull(selLen)}
           </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={clipTitle}
+            onChange={(e) => setClipTitle(e.target.value)}
+            maxLength={TWITCH_CLIP_TITLE_MAX}
+            placeholder={t('Clip title (optional — used as the file name)')}
+            aria-label={t('Clip title')}
+            autoComplete="off"
+            spellCheck={false}
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-[#9146FF]"
+          />
         </div>
         <div className="flex items-center justify-between gap-2">
           <span className="text-[8px] font-mono text-zinc-600 tabular-nums">

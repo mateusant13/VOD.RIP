@@ -43,6 +43,20 @@ _DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 _THUMB_PLACEHOLDER_RE = re.compile(r"%\{width\}x%\{height\}")
 
 
+class HelixError(RuntimeError):
+    """Helix HTTP failure with the status code preserved for precise mapping.
+
+    A RuntimeError subclass so existing GQL-fallback callers keep working.
+    """
+
+    def __init__(self, status: Optional[int], message: str):
+        super().__init__(
+            f"Twitch Helix HTTP {status}: {message}" if status is not None else message
+        )
+        self.status = status
+        self.message = message
+
+
 def current_token() -> str:
     """Stored helix bearer token ('' when unset). Never validates."""
     try:
@@ -57,11 +71,15 @@ def token_available() -> bool:
     return bool(current_token())
 
 
-def _helix_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """One authenticated Helix GET; raises RuntimeError on any failure.
+def _helix_get(
+    path: str, params: Dict[str, Any], client_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """One authenticated Helix GET; raises HelixError/RuntimeError on failure.
 
     The caller (twitch_gql_service) catches and falls back to GQL, so this
     never surfaces to users — keep the error message diagnostic-only.
+    ``client_id`` defaults to the GQL client; pass the token's own client
+    (from token_info) when the endpoint must see a matching Client-Id.
     """
     token = current_token()
     if not token:
@@ -72,7 +90,7 @@ def _helix_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={
-            "Client-Id": TWITCH_GQL_CLIENT_ID,
+            "Client-Id": client_id or TWITCH_GQL_CLIENT_ID,
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         },
@@ -82,9 +100,60 @@ def _helix_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
-        raise RuntimeError(f"Twitch Helix HTTP {e.code}: {detail}") from e
+        raise HelixError(e.code, detail) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Twitch Helix request failed: {e}") from e
+
+
+def _helix_post(path: str, body: Dict[str, Any], client_id: str) -> Dict[str, Any]:
+    """One authenticated Helix POST with a JSON body; raises HelixError/RuntimeError."""
+    token = current_token()
+    if not token:
+        raise RuntimeError("no twitch helix token configured")
+    req = urllib.request.Request(
+        f"{HELIX_API}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Client-Id": client_id,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HELIX_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:200]
+        raise HelixError(e.code, detail) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Twitch Helix request failed: {e}") from e
+
+
+def token_info() -> Dict[str, Any]:
+    """Validate the stored token via id.twitch.tv/oauth2/validate.
+
+    Returns the validate payload ({client_id, login, scopes, ...}). Raises
+    HelixError(401) for an invalid/expired token and RuntimeError on network
+    failure. The clip router uses the client_id for the Client-Id header
+    (Helix requires it to match the token's app) and pre-checks scopes.
+    """
+    token = current_token()
+    if not token:
+        raise RuntimeError("no twitch helix token configured")
+    req = urllib.request.Request(
+        "https://id.twitch.tv/oauth2/validate",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HELIX_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:200]
+        raise HelixError(e.code, detail) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Twitch OAuth validate failed: {e}") from e
 
 
 def _duration_to_sec(value: Any) -> Optional[int]:

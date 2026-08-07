@@ -602,4 +602,48 @@ describe('PreviewChatPanel', () => {
     fireEvent.click(screen.getByText('LETS GO'));
     expect(onSeek).not.toHaveBeenCalled();
   });
+
+  it('scrolling moves the render window through the whole list (no blank-spacer regions)', async () => {
+    const bigChat = Array.from({ length: 600 }, (_, i) => ({
+      offset_sec: i,
+      text: `msg ${i}`,
+      username: `u${i}`,
+      spam_count: 1,
+    }));
+    mockPanelFetch({ ...PAYLOAD, chat: bigChat });
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('msg 0')).toBeTruthy());
+    // Scrolling far past the playhead row (0) must reveal rows far beyond
+    // the ±WINDOW render window: the window rides the scroll position once
+    // the user stops following (the old code pinned it to the playhead and
+    // showed blank spacers out here).
+    const listEl = document.querySelector('[data-panel-rows]') as HTMLElement;
+    // CHAT_ROW_H = 24 → row 500 sits at scrollTop 12000.
+    Object.defineProperty(listEl, 'scrollTop', { value: 12000, configurable: true });
+    Object.defineProperty(listEl, 'clientHeight', { value: 300, configurable: true });
+    // First event only consumes the stale programmatic-scroll flag (jsdom's
+    // scrollIntoView stub fires no scroll event); the second is the user's.
+    fireEvent.scroll(listEl);
+    fireEvent.scroll(listEl);
+    expect(screen.getByText('msg 500')).toBeTruthy();
+    // The far head of the list is unmounted — the window truly moved.
+    expect(screen.queryByText('msg 0')).toBeNull();
+  });
+
+  it('shows a note when the backend returned a bounded chat slice (chat_truncated)', async () => {
+    mockPanelFetch({ ...PAYLOAD, chat_truncated: true, total_rows: 1200 });
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    expect(
+      screen.getByText('Chat history is incomplete — 4 of 1200 messages shown.'),
+    ).toBeTruthy();
+    expect(document.querySelector('[data-chat-truncated]')).toBeTruthy();
+  });
+
+  it('renders no truncated note when the payload is complete', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    expect(document.querySelector('[data-chat-truncated]')).toBeNull();
+  });
 });
