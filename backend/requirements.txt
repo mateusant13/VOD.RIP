@@ -41,3 +41,8 @@ nvidia-cuda-runtime-cu12
 # AudioSet 527 classes (laugh/clap/scream/music...). Checkpoint downloads
 # itself on first use (zenodo record 3987831).
 panns-inference>=0.1.1
+# Parakeet TDT v3 CPU lane (services/archive_transcribe.py) — sherpa-onnx
+# CPU wheel only (no Windows CUDA wheel exists). The lane is opt-in: an
+# import failure or VODRIP_PARAAKEET=0 keeps CPU lanes on whisper int8,
+# exactly as before.
+sherpa-onnx>=1.13.0
