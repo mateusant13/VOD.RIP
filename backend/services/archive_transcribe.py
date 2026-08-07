@@ -1864,6 +1864,20 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             if stats.get("segments", 0) >= 50:
                 archive_db.optimize_fts()
         return stats
+    except FileNotFoundError as exc:
+        # Archive file evicted/swept (or never written) — the job can never
+        # succeed. Mark it failed with a warning, no traceback; the scheduler's
+        # fresh-failure guard then stops re-enqueuing it.
+        logger.warning(
+            "transcribe job %s skipped — %s", job_id, exc
+        )
+        archive_db.update_job(job_id, status="failed",
+                              error=f"{type(exc).__name__}: {exc}"[:400])
+        return {
+            "job_id": job_id,
+            "skipped": "archive-file-missing",
+            "error": str(exc),
+        }
     except Exception as exc:  # job-level failure — worker keeps going
         logger.exception("transcribe job %s failed", job_id)
         archive_db.update_job(job_id, status="failed",

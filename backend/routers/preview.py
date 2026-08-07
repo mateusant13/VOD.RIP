@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import sqlite3
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -384,11 +385,16 @@ def _priority_transcribe_for_preview(session) -> None:
     video_id = _preview_video_id(platform, getattr(session, "vod_url", "") or "")
     if not video_id:
         return
-    if not archive_db.query(
-        "SELECT 1 FROM videos WHERE platform = ? AND video_id = ? LIMIT 1",
+    rows = archive_db.query(
+        "SELECT archive_path FROM videos WHERE platform = ? AND video_id = ? LIMIT 1",
         (platform, video_id),
-    ):
+    )
+    if not rows:
         return  # not archived — nothing to transcribe
+    if not (rows[0]["archive_path"] or "").strip() or not Path(
+        rows[0]["archive_path"]
+    ).is_file():
+        return  # archive file evicted — whisper would fail immediately
     try:
         from deps import settings_mgr  # lazy: same pattern as routers.archive
 

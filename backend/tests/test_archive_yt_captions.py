@@ -133,6 +133,22 @@ def test_captions_first_toggle_off_runs_whisper(monkeypatch):
     assert _job_status(job_id) == "done"
 
 
+def test_missing_archive_file_skips_gracefully(monkeypatch):
+    """FileNotFoundError (archive file evicted) -> failed job + skipped marker,
+    no traceback-level error and nothing propagates out of _process_job."""
+    job_id = _seed_job("youtube", "vid-missing")
+    with patch.object(
+        archive_transcribe, "transcribe_video",
+        side_effect=FileNotFoundError(
+            f"archive file missing for youtube/vid-missing: {job_id}"),
+    ) as tv:
+        stats = archive_transcribe._process_job(
+            {"id": job_id, "platform": "youtube", "video_id": "vid-missing"})
+    assert stats["skipped"] == "archive-file-missing"
+    tv.assert_called_once()
+    assert _job_status(job_id) == "failed"
+
+
 def test_captions_first_defaults_on_when_setting_absent(monkeypatch):
     """Old settings objects lack yt_subtitles_first -> treated as True."""
     job_id = _seed_job("youtube", "vid3")
