@@ -5936,7 +5936,7 @@ export default function App() {
             type="button"
             onClick={() => void openPreviewTwitchClip()}
             disabled={clipOpening || !videoInfo?.channel?.trim()}
-            className={previewCtrlBtn(previewFullscreen, true)}
+            className={`${previewCtrlBtn(previewFullscreen, true)} flex items-center gap-1.5`}
             title={
               !videoInfo?.channel?.trim()
                 ? t('Extract VOD info first to enable Twitch clip')
@@ -5945,8 +5945,9 @@ export default function App() {
                   : t('Open the Twitch clip mini-preview at the playhead')
             }
           >
-            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} />}
-            <span className="text-[9px] font-bold uppercase tracking-wider">{t('Twitch clip')}</span>
+            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} className="shrink-0" />}
+            {/* Brand term — intentionally NOT translated (user request: literal "twitch clip"). */}
+            <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">twitch clip</span>
           </button>
         )}
         {isLive && (

@@ -1555,15 +1555,16 @@ export default function ChannelExplorePopup({
       type="button"
       onClick={() => void openExploreTwitchClip()}
       disabled={!vod.channel?.trim()}
-      className={fs ? fsCtrlBtn : ctrlBtn(false)}
+      className={`${fs ? fsCtrlBtn : ctrlBtn(false)} flex items-center gap-1.5`}
       title={
         !vod.channel?.trim()
           ? t('Channel login missing — cannot open the Twitch editor')
           : t('Open the Twitch clip mini-preview at the playhead')
       }
     >
-      <TwitchLogoIcon size={16} />
-      <span className="text-[8px] font-bold uppercase tracking-wider">{t('Twitch clip')}</span>
+      <TwitchLogoIcon size={16} className="shrink-0" />
+      {/* Brand term — intentionally NOT translated (user request: literal "twitch clip"). */}
+      <span className="text-[8px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">twitch clip</span>
     </button>
   );
 
