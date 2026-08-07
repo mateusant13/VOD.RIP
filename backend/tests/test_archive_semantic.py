@@ -90,6 +90,9 @@ def _patch_embedder(monkeypatch):
         services.archive_embed, "embed_query",
         lambda q: _fake_vec([q], "query: "),
     )
+    # Rerank is real-model (mmarco) — irrelevant to these logic tests and
+    # machine-dependent; force the cosine fallback path.
+    monkeypatch.setattr(services.archive_embed, "rerank", lambda q, texts: None)
     yield calls
 
 

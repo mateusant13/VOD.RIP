@@ -2807,6 +2807,139 @@ def missing_embedding_segments(limit: int = 0) -> list[sqlite3.Row]:
 
 _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
 
+# RAM + disk cache of the full (sorted transcript_id, vec) matrix for the
+# semantic scan. Reading the corpus blobs is the dominant cost (~80s at
+# 1.79M rows), so the matrix is persisted as <db>.embeddings.<maxid>.{ids,mat}.npy
+# next to the DB (rebuilds only when MAX(transcript_id) moves) and kept in
+# RAM for the process lifetime. COUNT(*) would scan the 2.8GB blob b-tree
+# (~21s) — MAX alone is the stamp; a deleted highest-id row leaves a stale
+# matrix row that no scope query can select (its transcript is gone), so it
+# is harmless until the next insert bumps the stamp.
+_embed_matrix_cache: Optional[tuple[tuple[str, int], object, object, object]] = None
+_embed_matrix_lock = threading.Lock()
+# One-time logged reason when the GPU scan is unavailable (diagnostic).
+_gpu_scan_fallback_logged = False
+
+
+def _embed_matrix_paths(mx: int) -> tuple[Path, Path]:
+    # Plain f-string names: with_suffix would strip the trailing mx (the
+    # last dot segment), collapsing every stamp to one clobbered file.
+    dbp = Path(_db_path())
+    stem = f".{dbp.name}.embeddings.{mx}"
+    return dbp.parent / f"{stem}.ids.npy", dbp.parent / f"{stem}.mat.npy"
+
+
+def _gpu_scan_tensor(mat: object):
+    """fp16 CUDA tensor of the matrix (one-time ~4s conversion) or None.
+
+    The scan itself is a 53ms matmul vs ~25s numpy BLAS on this corpus —
+    worth keeping the tensor alive. Any CUDA failure logs once and returns
+    None (the caller falls back to numpy)."""
+    global _gpu_scan_fallback_logged
+    exc: Optional[BaseException] = None
+    try:
+        import numpy as np
+        import torch
+
+        with torch.no_grad():
+            return torch.from_numpy(np.asarray(mat)).half().cuda()
+    except Exception as err:  # noqa: BLE001 — GPU is optional, scan degrades
+        exc = err
+    if not _gpu_scan_fallback_logged:
+        _gpu_scan_fallback_logged = True
+        import logging
+
+        logging.getLogger("vodrip.search").warning(
+            "semantic scan: GPU matmul unavailable — numpy BLAS fallback "
+            "(~25s on 1.79M segments), reason: %r",
+            exc,
+        )
+    return None
+
+
+def _embed_matrix() -> tuple[object, object, object]:
+    """(sorted transcript_ids, vec matrix, fp16 GPU tensor|None).
+
+    Lazy full-corpus cache: loads from the persisted .npy pair when present,
+    else builds + saves; the GPU tensor is derived once per matrix. The
+    caller handles an empty corpus (never None)."""
+    global _embed_matrix_cache
+    import numpy as np
+
+    mx = int(query(
+        "SELECT COALESCE(MAX(transcript_id), 0) AS mx FROM transcript_embeddings"
+    )[0]["mx"])
+    key = (str(_db_path()), mx)
+    hit = _embed_matrix_cache
+    if hit is not None and hit[0] == key:
+        return hit[1], hit[2], hit[3]
+    with _embed_matrix_lock:
+        hit = _embed_matrix_cache
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2], hit[3]
+        ids, mat = None, None
+        ids_p, mat_p = _embed_matrix_paths(mx)
+        try:
+            if ids_p.exists() and mat_p.exists():
+                ids = np.load(ids_p, mmap_mode="r")
+                mat = np.load(mat_p, mmap_mode="r")
+                # Writable copies: torch.from_numpy rejects read-only arrays
+                # (and the mmap is released so the file can rotate).
+                ids = np.array(ids, copy=True)
+                mat = np.array(mat, copy=True)
+        except Exception:
+            ids, mat = None, None
+        if ids is None:
+            rows = query(
+                "SELECT transcript_id, vec FROM transcript_embeddings "
+                "WHERE vec IS NOT NULL"
+            )
+            if rows:
+                ids_arr = np.fromiter(
+                    (r["transcript_id"] for r in rows), dtype=np.int64, count=len(rows)
+                )
+                order = np.argsort(ids_arr)
+                ids = ids_arr[order]
+                mat = np.frombuffer(
+                    b"".join(r["vec"] for r in rows), dtype="<f4"
+                ).reshape(len(rows), -1)
+                mat = np.ascontiguousarray(mat[order])
+            else:
+                ids = np.empty(0, dtype=np.int64)
+                mat = np.empty((0, 0), dtype=np.float32)
+            try:
+                np.save(ids_p, ids)
+                np.save(mat_p, mat)
+                for stale in Path(_db_path()).parent.glob(
+                    f".{Path(_db_path()).name}.embeddings.*.npy"
+                ):
+                    if str(stale) not in (str(ids_p), str(mat_p)):
+                        stale.unlink(missing_ok=True)
+            except Exception:
+                pass  # disk cache is best-effort; RAM cache still serves
+        _embed_matrix_cache = (key, ids, mat, _gpu_scan_tensor(mat))
+        return ids, mat, _embed_matrix_cache[3]
+
+
+def _matmul_scores(mat: object, qv: object, gpu: object, idx: object = None) -> object:
+    """Cosine scores for the scope slice — fp16 GPU matmul when the matrix
+    tensor is available (~53ms at 1.79M rows), numpy BLAS fallback on CPU."""
+    import numpy as np
+
+    if gpu is not None:
+        try:
+            import torch
+
+            with torch.no_grad():
+                qvg = torch.from_numpy(np.asarray(qv)).half().cuda()
+                if idx is None:
+                    return (gpu @ qvg).float().cpu().numpy()
+                return (gpu[torch.from_numpy(np.asarray(idx))] @ qvg).float().cpu().numpy()
+        except Exception:
+            pass  # transient CUDA issue — fall back to numpy this query
+    sub = mat if idx is None else np.asarray(mat)[idx]
+    return np.asarray(sub) @ np.asarray(qv)
+
 
 def _semantic_search(
     q: str,
@@ -2821,67 +2954,108 @@ def _semantic_search(
     lang: Optional[str],
 ) -> Optional[list[dict]]:
     """Concept pass over transcript embeddings: cosine scan of the filtered
-    scope, segments embedded lazily (bounded per query). Returns hits shaped
-    like _table_search rows with score = cosine (0..1) and a 'semantic' flag,
-    or None when the embedding backend is unavailable — the caller then
-    serves pure lexical results."""
-    from services import archive_embed  # lazy: torch stays out of boot
+    scope, segments embedded lazily (bounded per query), then an optional
+    mmarco rerank of the top candidates. Returns hits shaped like
+    _table_search rows with score (0..1) and a 'semantic' flag, or None when
+    the embedding backend is unavailable — the caller then serves pure
+    lexical results.
+
+    Hot path: the scope query selects ids only (no vec blobs, no text), the
+    scan is a GPU fp16 matmul over the cached matrix, and metadata is
+    fetched for just the top candidates."""
+    import numpy as np
+
+    from services import archive_embed  # lazy: onnxruntime stays out of boot
 
     qv = archive_embed.embed_query(q)
     if qv is None:
         return None
-    import numpy as np
 
     qv = np.asarray(qv).reshape(-1)  # (1, dim) -> (dim,)
 
-    sql = (
+    # Bounded lazy backfill: only when the corpus grew past the last
+    # embedded id (new transcripts always get higher ids). Full scan is
+    # gated on that cheap MAX comparison, so steady state never pays it.
+    mx_emb = int(query(
+        "SELECT COALESCE(MAX(transcript_id), 0) AS mx FROM transcript_embeddings"
+    )[0]["mx"])
+    mx_tr = int(query("SELECT COALESCE(MAX(id), 0) AS mx FROM transcripts")[0]["mx"])
+    if mx_tr > mx_emb:
+        missing = missing_embedding_segments(_EMBED_BACKFILL_CAP)
+        if missing:
+            vecs = archive_embed.embed_texts([r["text"] for r in missing], "passage: ")
+            if vecs is None:
+                return None
+            for r, v in zip(missing, vecs):
+                set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
+
+    ids, mat, gpu = _embed_matrix()
+    if len(ids) == 0:
+        return None
+
+    # Scope ids: every matching transcript that has a vector. Unfiltered
+    # searches (the common case) reuse the matrix ids — no per-query scan.
+    if not (platforms or video_id or channel or kinds or date_from or date_to or lang):
+        scope_ids = ids
+    else:
+        sql = (
+            "SELECT t.id AS id FROM transcripts t "
+            "JOIN transcript_embeddings e ON e.transcript_id = t.id "
+            "JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
+            "WHERE 1=1"
+        )
+        params: list[Any] = []
+        parts: list[str] = []
+        _append_content_filters(
+            parts, params, platforms=platforms, video_id=video_id, channel=channel,
+            kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
+        )
+        if parts:
+            sql += " AND " + " AND ".join(parts)
+        scope_ids = np.asarray([r["id"] for r in query(sql, params)], dtype=np.int64)
+
+    if len(scope_ids) == 0:
+        return None
+    if scope_ids is ids:
+        # Full-corpus scope: score the matrix directly (indexing would copy
+        # 2.8GB for zero benefit).
+        scores = _matmul_scores(mat, qv, gpu)
+    else:
+        idx = np.searchsorted(ids, scope_ids)
+        # Every scope id must exist in the matrix (scope JOINs on has-vec);
+        # a miss means a concurrent write raced the cache — degrade, the
+        # next query rebuilds.
+        if np.any(idx >= len(ids)) or np.any(
+            ids[np.minimum(idx, len(ids) - 1)] != scope_ids
+        ):
+            return None
+        scores = _matmul_scores(mat, qv, gpu, idx=idx)
+    order = np.argsort(-scores)
+    top_n = max(fetch * 2, 30)
+    cand_ids = [int(scope_ids[int(i)]) for i in order[:top_n]]
+    cand_scores = [float(scores[int(i)]) for i in order[:top_n]]
+    if not cand_ids:
+        return None
+    rows = query(
         "SELECT t.id AS transcript_id, t.platform, t.video_id, t.start_sec, "
-        "t.text, t.lang AS lang, e.vec AS vec, "
-        "v.channel, "
+        "t.text, t.lang AS lang, v.channel, "
         "COALESCE(NULLIF(v.original_title, ''), v.title) AS title, "
         "v.started_at AS date, v.kind AS video_kind, v.channel_language AS channel_language "
         "FROM transcripts t "
-        "LEFT JOIN transcript_embeddings e ON e.transcript_id = t.id "
         "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
-        "WHERE 1=1"
+        f"WHERE t.id IN ({','.join('?' * len(cand_ids))})",
+        cand_ids,
     )
-    params: list[Any] = []
-    parts: list[str] = []
-    _append_content_filters(
-        parts, params, platforms=platforms, video_id=video_id, channel=channel,
-        kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
-    )
-    if parts:
-        sql += " AND " + " AND ".join(parts)
-
-    def scope_rows() -> list[dict]:
-        return query(sql, params)
-
-    rows = scope_rows()
-    missing = [r for r in rows if r["vec"] is None]
-    if missing:
-        # Lazy backfill: embed the first _EMBED_BACKFILL_CAP missing segments
-        # inline, then re-read (bounded cost per query; a background index
-        # job is the upgrade path for cold multi-hundred-thousand archives).
-        todo = missing[:_EMBED_BACKFILL_CAP]
-        vecs = archive_embed.embed_texts([r["text"] for r in todo], "passage: ")
-        if vecs is None:
-            return None
-        for r, v in zip(todo, vecs):
-            set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
-        rows = scope_rows()
-    scored: list[tuple[float, dict]] = []
-    for r in rows:
-        if r["vec"] is None:
-            continue
-        v = np.frombuffer(r["vec"], dtype="<f4")
-        if v.shape[0] != qv.shape[0]:
-            continue
-        scored.append((float(np.dot(v, qv)), r))
-    scored.sort(key=lambda x: -x[0])
+    by_id = {r["transcript_id"]: dict(r) for r in rows}
+    cand = [by_id[i] for i in cand_ids if i in by_id]
+    cand_scores = [s for i, s in zip(cand_ids, cand_scores) if i in by_id]
+    reranked = archive_embed.rerank(q, [r["text"] for r in cand])
+    if reranked is not None:
+        cand = [c for _, c in sorted(zip(reranked, cand), key=lambda t: -t[0])]
+        cand_scores = sorted(reranked, reverse=True)
     out: list[dict] = []
     per_video: dict[tuple[str, str], int] = {}
-    for cos, r in scored:
+    for cos, r in zip(cand_scores, cand):
         key = (r["platform"], r["video_id"])
         if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
             continue

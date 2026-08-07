@@ -1,21 +1,31 @@
-"""Semantic-search embeddings for transcript segments (multilingual-e5-small).
+"""Semantic-search embeddings: local int8 ONNX models via onnxruntime.
+
+Backend (measured best on this box): multilingual-e5-small quantized to int8
+(118MB, CPU, ~8ms/query) for query + passage embeddings, and
+ms-marco-MiniLM-L-12-v2 int8 (34MB) as the pair reranker. Tokenization is the
+`tokenizers` lib — no transformers/torch at runtime. Vectors stay float32
+L2-normalized (matching the existing corpus); only the MODELS are int8.
 
 The model is loaded lazily (first semantic search) so the app boots without
-torch/transformers cost; inference is CUDA float16 on NVIDIA GPUs and CPU
-float32 otherwise — mirroring the whisper device policy (detect_gpu_vendor
-lives in archive_transcribe, so device choice is duplicated here to keep this
-module import-light). Vectors are stored per transcript segment in the
-archive DB (transcript_embeddings table) and scanned with a plain cosine
-pass; no separate vector service.
+onnxruntime cost; inference is CPU-only (onnxruntime-gpu needs CUDA 13, this
+box has CUDA 12.8 — the GPU path is the torch fp16 scan in archive_db, not
+this module). Vectors are stored per transcript segment in the archive DB
+(transcript_embeddings table) and scanned with a cosine pass; no separate
+vector service.
 
-Any failure (model missing, offline, OOM, unsupported device) returns None
-and the search degrades to lexical BM25 — semantic search is an enhancement,
-never a blocker.
+Any failure (model missing, corrupt file, OOM) returns None and the search
+degrades to lexical BM25 — semantic search is an enhancement, never a
+blocker. Model dirs live under the data-drive cache:
+cache_root()/embed-models/{e5-small-int8,mmarco-L12-int8}/ (each holds
+model.onnx + tokenizer.json).
 
 ponytail: full cosine scan over embedded segments is fine well past the
-"thousands of hours" target on this hardware (600k segments ~ 100 ms scan +
-~1 GB matrix); an ANN index (sqlite-vec / Qdrant local) is the upgrade path
-beyond tens of millions of segments.
+"thousands of hours" target on this hardware with the GPU matmul scan
+(~53ms at 1.79M segments) + RAM matrix cache in archive_db; an ANN index
+(sqlite-vec / Qdrant local) is the upgrade path beyond tens of millions of
+segments. The reranker is the English ms-marco model (verified to rank
+Brazilian-Portuguese correctly); a multilingual cross-encoder is the
+upgrade path if PT precision ever needs it.
 """
 from __future__ import annotations
 
@@ -24,10 +34,15 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-MODEL_ID = os.environ.get("VODRIP_EMBED_MODEL", "intfloat/multilingual-e5-small")
+# Env override selects the embed-model DIRECTORY under the model cache
+# (was an HF repo id when this module ran transformers — same env name).
+_EMBED_MODEL_DIR = "e5-small-int8"
+_RERANK_MODEL_DIR = "mmarco-L12-int8"
+MODEL_ID = os.environ.get("VODRIP_EMBED_MODEL", _EMBED_MODEL_DIR)
 _QUERY_PREFIX = "query: "
 _PASSAGE_PREFIX = "passage: "
 _BATCH = 128
+_MAX_TOKENS = 512
 
 
 def _cache_dir() -> Path:
@@ -45,11 +60,11 @@ def _cache_dir() -> Path:
 
 
 _lock = threading.Lock()
-_loaded: Optional[tuple] = None  # (tokenizer, model, device, dtype)
+_loaded: Optional[tuple] = None  # (session, tokenizer) for the embedder
 
 
 def _load():
-    """Lazy singleton (tokenizer, model, device). Returns None on any
+    """Lazy singleton (onnx session, tokenizer). Returns None on any
     failure — callers degrade to lexical search."""
     global _loaded
     if _loaded is not None:
@@ -58,20 +73,16 @@ def _load():
         if _loaded is not None:
             return _loaded
         try:
-            import torch
-            from transformers import AutoModel, AutoTokenizer
+            import onnxruntime as ort
+            from tokenizers import Tokenizer
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if device == "cuda" else torch.float32
-            cache = str(_cache_dir())
-            tok = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=cache)
-            model = AutoModel.from_pretrained(MODEL_ID, cache_dir=cache)
-            model.to(device)
-            if dtype == torch.float16:
-                model.half()
-            model.eval()
-            _loaded = (tok, model, device, dtype)
-        except Exception:  # offline, missing model, OOM — semantic is optional
+            d = _cache_dir() / MODEL_ID
+            sess = ort.InferenceSession(
+                str(d / "model.onnx"), providers=["CPUExecutionProvider"]
+            )
+            tok = Tokenizer.from_file(str(d / "tokenizer.json"))
+            _loaded = (sess, tok)
+        except Exception:  # missing model, corrupt file — semantic is optional
             _loaded = None
         return _loaded
 
@@ -84,24 +95,30 @@ def embed_texts(texts: list[str], prefix: str) -> Optional[object]:
     loaded = _load()
     if loaded is None or not texts:
         return None
-    tok, model, device, dtype = loaded
+    sess, tok = loaded
     try:
         import numpy as np
-        import torch
 
+        pad_id = tok.token_to_id("<pad>") or 1
+        tok.enable_padding(pad_id=pad_id, pad_token="<pad>")
+        tok.enable_truncation(max_length=_MAX_TOKENS)
         out = []
-        with torch.no_grad():
-            for i in range(0, len(texts), _BATCH):
-                enc = tok(
-                    [prefix + t for t in texts[i : i + _BATCH]],
-                    padding=True, truncation=True, max_length=512,
-                    return_tensors="pt",
-                ).to(device)
-                hidden = model(**enc).last_hidden_state
-                mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-                out.append(torch.nn.functional.normalize(pooled).float().cpu().numpy())
-        return np.vstack(out)
+        for i in range(0, len(texts), _BATCH):
+            encs = tok.encode_batch([prefix + t for t in texts[i : i + _BATCH]])
+            ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+            hidden = sess.run(
+                None,
+                {
+                    "input_ids": ids,
+                    "attention_mask": mask,
+                    "token_type_ids": np.zeros_like(ids),
+                },
+            )[0]
+            m = mask.astype(np.float32)[..., None]
+            pooled = (hidden * m).sum(1) / m.sum(1).clip(min=1e-9)
+            out.append(pooled / np.linalg.norm(pooled, axis=1, keepdims=True))
+        return np.vstack(out).astype(np.float32)
     except Exception:
         return None
 
@@ -110,12 +127,61 @@ def embed_query(q: str) -> Optional[object]:
     return embed_texts([q], _QUERY_PREFIX)
 
 
+_rerank_loaded: Optional[tuple] = None  # (session, tokenizer) | False = failed
+_rerank_lock = threading.Lock()
+
+
+def rerank(query: str, texts: list[str]) -> Optional[list[float]]:
+    """Pairwise relevance scores (0..1) of texts vs query (mmarco int8).
+
+    None on any failure — callers fall back to cosine order. The reranker
+    is optional: search works without it, just with flatter ranking."""
+    global _rerank_loaded
+    if _rerank_loaded is None:
+        with _rerank_lock:
+            if _rerank_loaded is None:
+                try:
+                    import onnxruntime as ort
+                    from tokenizers import Tokenizer
+
+                    d = _cache_dir() / _RERANK_MODEL_DIR
+                    sess = ort.InferenceSession(
+                        str(d / "model.onnx"), providers=["CPUExecutionProvider"]
+                    )
+                    tok = Tokenizer.from_file(str(d / "tokenizer.json"))
+                    tok.enable_truncation(max_length=_MAX_TOKENS)
+                    tok.enable_padding(pad_id=0, pad_token="[PAD]")  # BERT
+                    _rerank_loaded = (sess, tok)
+                except Exception:
+                    _rerank_loaded = False  # tried once, don't retry every query
+    if not _rerank_loaded or not texts or not query:
+        return None
+    sess, tok = _rerank_loaded
+    try:
+        import numpy as np
+
+        encs = tok.encode_batch([(query, t) for t in texts])
+        logits = sess.run(
+            None,
+            {
+                "input_ids": np.asarray([e.ids for e in encs], dtype=np.int64),
+                "attention_mask": np.asarray([e.attention_mask for e in encs], dtype=np.int64),
+                "token_type_ids": np.asarray([e.type_ids for e in encs], dtype=np.int64),
+            },
+        )[0].reshape(-1)
+        return (1.0 / (1.0 + np.exp(-logits))).tolist()
+    except Exception:
+        return None
+
+
 def warmup_if_indexed() -> None:
-    """Background-warm the embedding model when the archive already holds
-    vectors (the user has run a semantic search before) — the first
-    semantic query of a fresh boot then skips the ~15s transformers import
-    + model load. Archives without vectors never pay the load: semantic
-    search stays fully lazy for them (and degrades to lexical anyway)."""
+    """Background-warm the semantic-search stack when the archive already
+    holds vectors (the user has run a semantic search before): the ONNX
+    session (~2s), the full-corpus matrix (~16s mmap load) and its fp16
+    CUDA tensor (~4s) — the first semantic query of a fresh boot then
+    answers in well under a second instead of ~30-180s. Archives without
+    vectors never pay the load: semantic search stays fully lazy for them
+    (and degrades to lexical anyway)."""
     try:
         from services import archive_db  # lazy: no import cycle at boot
 
@@ -126,7 +192,15 @@ def warmup_if_indexed() -> None:
         return
     if not n:
         return
-    threading.Thread(target=_load, name="embed-warmup", daemon=True).start()
+
+    def _warm() -> None:
+        _load()
+        try:
+            archive_db._embed_matrix()  # RAM matrix + GPU tensor
+        except Exception:
+            pass  # scan stays lazy; first search pays the build
+
+    threading.Thread(target=_warm, name="embed-warmup", daemon=True).start()
 
 
 def backfill_missing(

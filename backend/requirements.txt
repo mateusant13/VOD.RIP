@@ -18,6 +18,14 @@ pywebview>=6.0.0
 pystray>=0.19.0
 Pillow>=10.0.0
 
+# ── Semantic search (services/archive_embed.py) ───────────────────────────
+# Local int8 ONNX models (e5-small embedder + mmarco reranker) run through
+# onnxruntime; tokenization is the `tokenizers` lib — no transformers at
+# runtime. onnxruntime-gpu is NOT used: it needs CUDA 13 (cublasLt64_13.dll),
+# the GPU scan path is torch fp16 in archive_db instead.
+onnxruntime>=1.20
+tokenizers>=0.19
+
 # ── Archive transcription worker (opt-in: services/archive_transcribe.py) ───
 # torch/torchaudio pinned together — a newer torchaudio DLL fails to load
 # against torch 2.7 (WinError 127 at import).

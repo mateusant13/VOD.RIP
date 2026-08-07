@@ -859,7 +859,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               title={
                 sourceFilter === 'chat'
                   ? 'Context search covers transcripts only'
-                  : 'Context search (semantic): finds moments by meaning, not just exact words — first use downloads the embed model'
+                  : 'Context search (semantic): finds moments by meaning, not just exact words'
               }
               className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
                 semanticOn

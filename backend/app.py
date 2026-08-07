@@ -123,7 +123,7 @@ async def _app_lifespan(_app: FastAPI):
 
     # Warm the semantic-search embedding model in the background (only when
     # the archive already has vectors) so the first CTX search of a fresh
-    # boot skips the ~15s transformers import + model load.
+    # boot skips the ~2s ONNX session + tokenizer load.
     try:
         from services.archive_embed import warmup_if_indexed
 
