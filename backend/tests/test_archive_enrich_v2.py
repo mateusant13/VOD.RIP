@@ -140,7 +140,7 @@ async def test_chat_enrichment_picks_relevance_matches(monkeypatch):
             "watchdog synthetic rows must be excluded from auto-backfill"
         )
         assert [e["video_id"] for e in kicked] == ["1234001", "1234002"]
-        assert all(e["kind"] == "chat_backfill" for e in kicked)
+        assert all(e["kind"] == "chat" for e in kicked)
         assert kicked[0]["title"] == "gaming review marathon"
     finally:
         release.set()

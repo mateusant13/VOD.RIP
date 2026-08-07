@@ -11,10 +11,13 @@ from services.ytdlp_guard import assert_ytdlp_safe
 import logging
 import os
 import hashlib
+import subprocess
+import sys
 import threading
-import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response
@@ -46,6 +49,57 @@ try:
     from services._version import __version__
 except ImportError:
     __version__ = "0.0.0"
+
+
+def _spawn_detached_worker() -> Optional[int]:
+    """Spawn the detached supervised archive worker (worker_server.py).
+
+    The worker must survive even a hard kill of the whole app process tree
+    (taskkill /T), so on Windows it is spawned through a short-lived
+    launcher: the launcher Popen()s worker_server.py and exits immediately,
+    orphaning it (its parent pid goes stale, so tree-walk kills never reach
+    it). POSIX uses start_new_session() (setsid) for the same effect.
+    Returns a child pid (the launcher's), or None when the spawn failed
+    (the caller falls back to the in-process worker).
+    """
+    backend_dir = Path(__file__).resolve().parent
+    if os.name == "nt":
+        launcher = (
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable] + sys.argv[1:], cwd=%r,"
+            " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,"
+            " stderr=subprocess.DEVNULL,"
+            " creationflags=subprocess.CREATE_NEW_PROCESS_GROUP"
+            " | subprocess.CREATE_NO_WINDOW, close_fds=True)\n"
+        ) % str(backend_dir)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", launcher, str(backend_dir / "worker_server.py")],
+                cwd=str(backend_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                ),
+            )
+        except Exception:
+            logger.debug("detached worker spawn failed", exc_info=True)
+            return None
+        return proc.pid
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(backend_dir / "worker_server.py")],
+            cwd=str(backend_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        logger.debug("detached worker spawn failed", exc_info=True)
+        return None
+    return proc.pid
 
 
 @asynccontextmanager
@@ -533,15 +587,65 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive scheduler start skipped", exc_info=True)
 
-    # Archive transcribe worker — whisper queue consumer. Idle thread that
-    # heartbeats every poll; the model loads only when a job exists and
-    # unloads after idle. Without it, queued transcription jobs would sit
-    # forever (worker_heartbeats was empty before this fix).
+    # Archive transcribe worker. When the queue has pending work we spawn
+    # the DETACHED supervised worker (worker_server.py): it drains
+    # transcribe/events/chat jobs, survives app close + crashes, and skips
+    # the in-process thread so the whisper model is never double-loaded.
+    # Spawn failure (or an idle queue) falls back to the in-process worker.
     try:
-        from services.archive_transcribe import start_worker
+        from services import archive_db
+        from services.archive_transcribe import start_worker as _start_inprocess_worker
 
-        start_worker()
-        logger.info("Archive transcribe worker started")
+        pending = archive_db.has_pending_jobs()
+        spawned_pid = _spawn_detached_worker() if pending else None
+        if spawned_pid is not None:
+            logger.info(
+                "Archive worker: detached supervisor spawned (pid %s) — "
+                "in-process worker skipped", spawned_pid,
+            )
+
+            def _watch_detached_worker() -> None:
+                # The detached worker exits rc 0 once the queue is drained.
+                # When its heartbeat goes stale while the app still runs,
+                # the in-process worker takes over so jobs enqueued at
+                # runtime (search kicks, channel sync) keep a consumer.
+                #
+                # Boot race: the watchdog's first poll can run before the
+                # detached supervisor+child stamp their first heartbeat.
+                # worker_server boots ~1s, child import ~2-6s, and the
+                # child's claim-time GPU-lane measurement samples free VRAM
+                # over ~60s (median, machine-aware pool) BEFORE the first
+                # heartbeat — so the grace is 120s, never 75. Require either
+                # a previously-seen heartbeat OR the grace before concluding
+                # the detached worker is gone — a single early poll must
+                # never double-start a worker.
+                start = time.monotonic()
+                seen_alive = False
+                while not _warm_shutdown.is_set():
+                    if archive_db.worker_live(age_s=45):
+                        seen_alive = True
+                    elif seen_alive or time.monotonic() - start > 120:
+                        break
+                    time.sleep(5)
+                if _warm_shutdown.is_set():
+                    return
+                try:
+                    _start_inprocess_worker()
+                    logger.info(
+                        "Detached worker exited — in-process archive worker started"
+                    )
+                except Exception:
+                    logger.debug("in-process worker start failed", exc_info=True)
+
+            threading.Thread(
+                target=_watch_detached_worker, daemon=True, name="worker-watchdog"
+            ).start()
+        else:
+            _start_inprocess_worker()
+            logger.info(
+                "Archive transcribe worker started in-process (%s)",
+                "no pending jobs — nothing to detach" if not pending else "detached spawn failed — fallback",
+            )
     except Exception:
         logger.debug("Archive transcribe worker start skipped", exc_info=True)
 
@@ -581,6 +685,44 @@ async def _app_lifespan(_app: FastAPI):
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
 
 assert_ytdlp_safe()
+
+# Two-lane activity signal (user requirement): the app's interactive lane
+# stamps an 'app-activity' heartbeat (throttled, fire-and-forget — never
+# adds latency to a request) that the detached archive worker reads to back
+# off its paced background YouTube work while the user is actively using the
+# app. When the app is closed/idle the worker ramps back to heavy volume.
+_ACTIVITY_STAMP_EVERY_S = 20.0
+_activity_last_stamp = 0.0
+_activity_stamp_lock = threading.Lock()
+
+
+def _activity_stamp_due() -> bool:
+    """Claim the next stamp slot (throttled); no I/O — safe on the event loop."""
+    global _activity_last_stamp
+    now = time.monotonic()
+    with _activity_stamp_lock:
+        if now - _activity_last_stamp < _ACTIVITY_STAMP_EVERY_S:
+            return False
+        _activity_last_stamp = now
+        return True
+
+
+def _stamp_app_activity() -> None:
+    try:
+        from services import archive_db
+
+        archive_db.worker_heartbeat("app-activity")
+    except Exception:
+        logger.debug("app-activity stamp failed", exc_info=True)
+
+
+@app.middleware("http")
+async def _app_activity_middleware(request: Request, call_next):
+    # Off the event loop: the SQLite write happens on a worker thread so a
+    # transient DB lock can never stall the interactive lane.
+    if _activity_stamp_due():
+        threading.Thread(target=_stamp_app_activity, daemon=True).start()
+    return await call_next(request)
 
 # Mount static files
 static_dir = Path(__file__).parent / "static"

@@ -11,7 +11,7 @@ Storage layout (all offsets are seconds into the stream, monotonic):
   transcripts   — word-timestamped segments (optional lang tag); FTS5
                   contentless index
   video_aliases — manual canonical_key overrides for cross-platform dedupe
-  archive_jobs  — ingest / chat_backfill / transcribe queue
+  archive_jobs  — ingest / chat / transcribe / events queue
 
 DB location: %APPDATA%/VOD.RIP/archive.db (same dir as settings.json);
 override with env VODRIP_ARCHIVE_DB (used by tests).
@@ -196,7 +196,7 @@ CREATE TABLE IF NOT EXISTS video_aliases (
 
 CREATE TABLE IF NOT EXISTS archive_jobs (
   id         TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
+  kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat','transcribe','events')),
   platform   TEXT NOT NULL,
   video_id   TEXT NOT NULL,
   status     TEXT NOT NULL DEFAULT 'queued'
@@ -351,6 +351,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_message_display_name_column(_conn)
             _ensure_jobs_kind_events(_conn)
             _ensure_jobs_priority(_conn)
+            _ensure_jobs_kind_chat(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             _conn.commit()
             if rebuilt:
@@ -571,7 +572,9 @@ def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
     """Idempotent migration: widen archive_jobs.kind CHECK to include 'events'.
 
     SQLite cannot ALTER a CHECK constraint, so the table is rebuilt
-    (rename -> create -> copy -> drop) only when the stored DDL lacks it."""
+    (rename -> create -> copy -> drop) only when the stored DDL lacks it.
+    The rebuild also normalizes legacy kind='chat_backfill' rows to 'chat'
+    (the single chat-job kind) so the pre-chat kind never re-appears."""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='archive_jobs'"
     ).fetchone()
@@ -581,7 +584,7 @@ def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE archive_jobs (
              id         TEXT PRIMARY KEY,
-             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
+             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat','transcribe','events')),
              platform   TEXT NOT NULL,
              video_id   TEXT NOT NULL,
              status     TEXT NOT NULL DEFAULT 'queued'
@@ -594,7 +597,8 @@ def _ensure_jobs_kind_events(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, created_at, updated_at) "
-        "SELECT id, kind, platform, video_id, status, progress, error, created_at, updated_at "
+        "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
+        "platform, video_id, status, progress, error, created_at, updated_at "
         "FROM archive_jobs_old"
     )
     conn.execute("DROP TABLE archive_jobs_old")
@@ -625,7 +629,7 @@ def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE archive_jobs (
              id         TEXT PRIMARY KEY,
-             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat_backfill','transcribe','events')),
+             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat','transcribe','events')),
              platform   TEXT NOT NULL,
              video_id   TEXT NOT NULL,
              status     TEXT NOT NULL DEFAULT 'queued'
@@ -639,10 +643,58 @@ def _ensure_jobs_priority(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at) "
-        "SELECT id, kind, platform, video_id, status, progress, error, 0, created_at, updated_at "
+        "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
+        "platform, video_id, status, progress, error, 0, created_at, updated_at "
         "FROM archive_jobs_old"
     )
     conn.execute("DROP TABLE archive_jobs_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
+    )
+
+
+def _ensure_jobs_kind_chat(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: switch chat jobs to the single 'chat' kind.
+
+    The pre-background-worker builds tracked chat backfills as
+    'chat_backfill'; the queue is now drained by the archive worker and
+    chat fetches use kind 'chat'. SQLite cannot ALTER a CHECK constraint,
+    so the table is rebuilt when the stored DDL lacks 'chat'. Legacy
+    'chat_backfill' rows (queued/running/done/failed) become 'chat' so
+    pending backfills are picked up by the worker instead of sitting
+    orphaned. Runs AFTER _ensure_jobs_priority, so the rebuild DDL is the
+    final shape (priority column included)."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='archive_jobs'"
+    ).fetchone()
+    if row and "'chat'" in (row[0] or ""):
+        return
+    conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
+    conn.execute(
+        """CREATE TABLE archive_jobs (
+             id         TEXT PRIMARY KEY,
+             kind       TEXT NOT NULL CHECK (kind IN ('ingest','chat','transcribe','events')),
+             platform   TEXT NOT NULL,
+             video_id   TEXT NOT NULL,
+             status     TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (status IN ('queued','running','done','failed')),
+             progress   REAL NOT NULL DEFAULT 0,
+             error      TEXT,
+             priority   INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO archive_jobs (id, kind, platform, video_id, status, progress, error, priority, created_at, updated_at) "
+        "SELECT id, CASE kind WHEN 'chat_backfill' THEN 'chat' ELSE kind END, "
+        "platform, video_id, status, progress, error, 0, created_at, updated_at "
+        "FROM archive_jobs_old"
+    )
+    conn.execute("DROP TABLE archive_jobs_old")
+    conn.execute(
+        "UPDATE archive_jobs SET kind = 'chat' WHERE kind = 'chat_backfill'"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
     )
@@ -1725,6 +1777,18 @@ def list_jobs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def has_pending_jobs() -> bool:
+    """True when any job is queued or running (a worker has real work).
+
+    The app boot uses this to decide between spawning the detached archive
+    worker and keeping the in-process one."""
+    return bool(
+        query(
+            "SELECT 1 FROM archive_jobs WHERE status IN ('queued','running') LIMIT 1"
+        )
+    )
+
+
 def latest_job(platform: str, video_id: str, kind: Optional[str] = None) -> Optional[dict]:
     """Newest archive_jobs row for a video (optionally restricted to one
     kind), or None when no job was ever enqueued. Search enrichment uses it
@@ -1938,12 +2002,15 @@ def worker_heartbeat(tag: str) -> None:
     )
 
 
-def worker_live(age_s: int = 30) -> bool:
-    """True when the transcribe worker heartbeat is younger than age_s.
+def worker_live(age_s: int = 30, tag: str = "transcribe") -> bool:
+    """True when the *tag*'s heartbeat is younger than age_s.
 
-    Both sides of the comparison are _now_iso() output (UTC, fixed width), so
-    a lexicographic compare is a valid time compare. Missing table (pre-v2
-    DB) or any SQL error means no worker has ever pinged → False."""
+    'transcribe' (default) = the archive worker owns the queue; the app's
+    interactive layer stamps 'app-activity' so the worker can back off
+    background YouTube work while the user is actively using the app. Both
+    sides of the comparison are _now_iso() output (UTC, fixed width), so a
+    lexicographic compare is a valid time compare. Missing table (pre-v2
+    DB) or any SQL error means no heartbeat has ever been stamped → False."""
     from datetime import datetime, timedelta, timezone
 
     try:
@@ -1952,8 +2019,8 @@ def worker_live(age_s: int = 30) -> bool:
         )
         return bool(
             query(
-                "SELECT 1 FROM worker_heartbeats WHERE tag = 'transcribe' AND at >= ?",
-                (cutoff,),
+                "SELECT 1 FROM worker_heartbeats WHERE tag = ? AND at >= ?",
+                (tag, cutoff),
             )
         )
     except sqlite3.Error:

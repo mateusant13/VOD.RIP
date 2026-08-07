@@ -933,6 +933,16 @@ def _collect_merged_innertube_info(
             if _is_bot_gate(data):
                 bot_hits += 1
                 if bot_hits >= 2:
+                    # IP-level bot wall: arm the process-wide YouTube gate so
+                    # the (in-process fallback) archive worker stops
+                    # hammering and requeues its YouTube jobs; interactive
+                    # requests keep failing fast and never wait on it.
+                    try:
+                        from services.yt_gate import note_youtube_gate
+
+                        note_youtube_gate("innertube LOGIN_REQUIRED bot gate")
+                    except Exception:
+                        pass
                     break
             continue
         if meta_data is None:

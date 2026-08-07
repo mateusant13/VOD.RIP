@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -179,6 +181,12 @@ def ingest_channel_vods(channel: str, limit: int = 3) -> List[dict]:
 
 # --- chat backfill ---------------------------------------------------------
 
+# Cap concurrent Twitch backfills at 2 (measured safe for the per-IP GQL
+# 429 limiter — see backfill_chat). Shared by scheduler legs, router kicks
+# and the archive worker pool.
+_BACKFILL_SEM = threading.BoundedSemaphore(2)
+
+
 def _message_row(node: dict) -> dict:
     """Map a GQL comment node to an archive messages row.
 
@@ -261,6 +269,7 @@ def _backfill_outward(
     max_messages: int,
     page_size: int,
     progress_cb: Optional[Callable[[float], None]],
+    *, interactive: bool = False,
 ) -> tuple[float, int, int, int]:
     """Playhead-first sweep for the preview backfill (Chatterino-style).
 
@@ -282,7 +291,9 @@ def _backfill_outward(
     seed = max(0.0, float(seed_offset_sec))
 
     # Phase 1 — seed page: what the viewer is about to see, in ~1 s.
-    nodes, backoff_retries = _fetch_page_with_backoff(vid, seed, page_size, backoff_retries)
+    nodes, backoff_retries = _fetch_page_with_backoff(
+        vid, seed, page_size, backoff_retries, interactive=interactive,
+    )
     pages += 1
     if nodes:
         row = archive_db.query(
@@ -312,7 +323,7 @@ def _backfill_outward(
     while lo > 0 and inserted < max_messages:
         target = max(0.0, lo - stride)
         nodes, backoff_retries = _fetch_page_with_backoff(
-            vid, target, page_size, backoff_retries
+            vid, target, page_size, backoff_retries, interactive=interactive,
         )
         pages += 1
         if not nodes:
@@ -364,6 +375,7 @@ def backfill_chat(
     page_size: int = PAGE_SIZE,
     seed_offset_sec: Optional[float] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Backfill chat for one Twitch VOD into the archive.
 
@@ -371,7 +383,9 @@ def backfill_chat(
     Stops at *max_messages*, at end of chat (a page whose nodes all sit at
     or below the last seen offset — the API clamps its window to the tail),
     or when a hard error escapes the 429 backoff loop. One archive_jobs row
-    (kind 'chat_backfill') tracks the run.
+    (kind 'chat') tracks the run; pass *job_id* to track the CALLER's
+    already-claimed job (the archive worker), otherwise one is enqueued
+    here (router/preview kicks).
 
     With *seed_offset_sec* the sweep starts at that playhead and pages
     OUTWARD (backward below the seed first, then forward from the deepest
@@ -381,6 +395,11 @@ def backfill_chat(
 
     Backoff on 429: 1s → double → cap 30s; after BACKOFF_MAX_ATTEMPTS the
     _RateLimited is re-raised so the caller can schedule a retry later.
+    Two lanes: the worker (job_id passed) is the paced background lane —
+    full 429 backoff; router/preview kicks (job_id omitted) are the
+    interactive lane — non-blocking semaphore ('busy' status when the
+    background lane holds both per-IP slots) and single-attempt fetches
+    (fail fast on a gate, no retry-loop; the scheduler re-queues later).
     """
     vid = str(video_id or "").strip()
     if not vid.isdigit():
@@ -391,8 +410,16 @@ def backfill_chat(
     page_size = max(1, min(int(page_size), PAGE_SIZE))
     max_messages = max(1, int(max_messages))
 
-    job_id = f"tw-backfill-{vid}-{int(time.time())}"
-    archive_db.enqueue_job(job_id, "chat_backfill", "twitch", vid, priority=0)
+    # Two lanes (user requirement): the archive worker always passes its
+    # already-claimed job id; router/preview kicks never do. The worker is
+    # the paced background lane; kicks are the interactive lane — they fail
+    # fast (busy/rate-limited) instead of queueing behind background work.
+    interactive = job_id is None
+    if job_id:
+        job_id = str(job_id)
+    else:
+        job_id = f"tw-backfill-{vid}-{int(time.time())}"
+        archive_db.enqueue_job(job_id, "chat", "twitch", vid, priority=0)
     archive_db.update_job(job_id, status="running")
 
     inserted = 0
@@ -412,6 +439,52 @@ def backfill_chat(
     )
     duration = float(dur_row[0]["duration_sec"] or 0.0) if dur_row else 0.0
 
+    # Per-IP GQL concurrency cap (2). The background worker blocks on the
+    # semaphore (paced by design); an interactive kick never queues behind
+    # it — non-blocking acquire, clear 'busy' status, and the job row is
+    # requeued so the worker drains it on a later pass.
+    if interactive and not _BACKFILL_SEM.acquire(blocking=False):
+        archive_db.update_job(
+            job_id, status="queued",
+            error="chat backfill busy (background backfills in flight) — worker will pick this up",
+        )
+        return {
+            "video_id": vid,
+            "channel": channel,
+            "inserted": 0,
+            "pages": 0,
+            "backoff_retries": 0,
+            "stopped": "busy",
+        }
+    if not interactive:
+        _BACKFILL_SEM.acquire()
+    try:
+        return _backfill_locked(
+            job_id, vid, channel, last_seen, duration,
+            max_messages, page_size, seed_offset_sec, progress_cb,
+            interactive=interactive,
+        )
+    finally:
+        _BACKFILL_SEM.release()
+
+
+def _backfill_locked(
+    job_id: str, vid: str, channel: str, last_seen: float, duration: float,
+    max_messages: int, page_size: int,
+    seed_offset_sec: Optional[float],
+    progress_cb: Optional[Callable[[float], None]],
+    *, interactive: bool,
+) -> Dict[str, Any]:
+    """The fetch sweep — caller MUST hold _BACKFILL_SEM.
+
+    Two lanes: the background worker (interactive=False) is paced by design
+    and retries 429 with backoff; an interactive kick (interactive=True)
+    fails fast — no retry-loop — and the job row becomes 'failed' so the
+    worker re-queues it on a later pass."""
+    inserted = 0
+    pages = 0
+    backoff_retries = 0
+
     def _finish() -> Dict[str, Any]:
         archive_db.update_job(job_id, status="done", progress=1.0)
         return {
@@ -427,6 +500,12 @@ def backfill_chat(
         # Chat already covers the whole stream (re-run or trailing error
         # after end-of-chat) — nothing left to fetch.
         return _finish()
+    # GQL 429 backoff is per-IP: parallel Twitch backfills tripped the
+    # limiter and collapsed throughput (measured: 2 parallel = max safe).
+    # The scheduler used to cap this externally (TWITCH_BACKFILL_MAX_INFLIGHT);
+    # the archive worker pool can now run several backfills at once, so the
+    # cap lives with the fetch itself. ponytail: a token-bucket per IP would
+    # be the real fix, but every VOD.RIP box is a single-IP desktop app.
     if seed_offset_sec is not None:
         # Preview kick: seed at the client's playhead (Chatterino-style) so
         # near-playhead messages arrive in the first pages. Re-runs anchor
@@ -437,10 +516,13 @@ def backfill_chat(
             max_messages,
             page_size,
             progress_cb,
+            interactive=interactive,
         )
     try:
         while inserted < max_messages:
-            nodes, backoff_retries = _fetch_page_with_backoff(vid, last_seen, page_size, backoff_retries)
+            nodes, backoff_retries = _fetch_page_with_backoff(
+                vid, last_seen, page_size, backoff_retries, interactive=interactive,
+            )
             pages += 1
             if not nodes:
                 break
@@ -482,28 +564,39 @@ def backfill_chat(
 
 
 def _fetch_page_with_backoff(
-    video_id: str, last_seen: float, page_size: int, retries: int
+    video_id: str, last_seen: float, page_size: int, retries: int,
+    *, interactive: bool = False,
 ) -> tuple[List[dict], int]:
     """One page fetch, retrying 429 (exponential, capped) and transients.
 
-    Returns (nodes, retries) — the retry tally is incremented on every
-    backoff sleep so the caller can report honest rate-limit stats.
+    Two lanes (user requirement): the background worker (interactive=False)
+    retries 429/transients with exponential jittered backoff — it is paced
+    by design and requeues on exhaustion. Interactive kicks (router/preview,
+    interactive=True) fail FAST: a single attempt, no sleep, so a gated or
+    flaky fetch never hangs the user's chat; the scheduler re-queues the
+    video on its next pass. Returns (nodes, retries) — the retry tally is
+    incremented on every backoff sleep so the caller can report honest
+    rate-limit stats.
     """
+    attempts = 1 if interactive else BACKOFF_MAX_ATTEMPTS
     backoff = BACKOFF_START_SEC
-    for attempt in range(BACKOFF_MAX_ATTEMPTS):
+    for attempt in range(attempts):
         try:
             return _post_comments_page(video_id, int(last_seen), page_size), retries
         except _RateLimited:
             retries += 1
-            if attempt + 1 >= BACKOFF_MAX_ATTEMPTS:
+            if attempt + 1 >= attempts:
                 raise
-            time.sleep(backoff)
+            # Jittered sleep: a synchronized multi-worker retry would hit the
+            # per-IP limiter in lockstep (same backoff schedule = same request
+            # wall). ±25% spreads colliding workers.
+            time.sleep(backoff + random.uniform(0.0, 0.25 * backoff))
             backoff = min(backoff * 2.0, BACKOFF_MAX_SEC)
         except _TransientError:
             retries += 1
-            if attempt + 1 >= BACKOFF_MAX_ATTEMPTS:
+            if attempt + 1 >= attempts:
                 raise
-            time.sleep(min(backoff, 5.0))
+            time.sleep(min(backoff, 5.0) + random.uniform(0.0, 0.5))
             backoff = min(backoff * 2.0, BACKOFF_MAX_SEC)
     return [], retries  # pragma: no cover — loop always returns or raises
 
