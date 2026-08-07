@@ -390,7 +390,9 @@ describe('ArchiveSearchPopup', () => {
     const toggle = screen.getByRole('button', { name: 'CONTEXT' });
     expect(toggle).not.toBeDisabled();
     fireEvent.click(toggle);
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1')).toBeTruthy());
+    // The lang filter now defaults to the UI language (en in tests), so it
+    // sits between q and semantic in the query string.
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&lang=en&semantic=1')).toBeTruthy());
 
     // Concept search covers transcripts only — chat disables the toggle.
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
@@ -401,7 +403,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript&semantic=1')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript&lang=en&semantic=1')).toBeTruthy(),
     );
   });
 
@@ -676,7 +678,7 @@ describe('ArchiveSearchPopup', () => {
 
   it('enriching status line shows when the backend kicked background work, clears when idle', async () => {
     const enrich = [
-      { platform: 'twitch', video_id: 'v2', kind: 'chat_backfill', channel: 'srdogg', title: 'VOD B' },
+      { platform: 'twitch', video_id: 'v2', kind: 'chat', channel: 'srdogg', title: 'VOD B' },
     ];
     let current = enrich;
     const fetchMock = mockFetch([], {});
@@ -780,7 +782,7 @@ describe('ArchiveSearchPopup', () => {
         return new Response(
           JSON.stringify({
             hits: [HIT],
-            enriching: [{ platform: 'twitch', video_id: 'v2', kind: 'chat_backfill', channel: 'srdogg', title: 'VOD B' }],
+            enriching: [{ platform: 'twitch', video_id: 'v2', kind: 'chat', channel: 'srdogg', title: 'VOD B' }],
             channel_hint: 'srdogg',
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
@@ -1254,5 +1256,306 @@ describe('ArchiveSearchPopup USER filter', () => {
     expect(
       await screen.findByText('No archived messages from @Scriptingkata, @AlguemAe.'),
     ).toBeInTheDocument();
+  });
+});
+
+describe('ArchiveSearchPopup batch-3', () => {
+  // The first describe's HIT is scoped to that block — batch-3 needs its own.
+  const HIT = {
+    kind: 'transcript' as const,
+    platform: 'twitch',
+    video_id: 'v1',
+    offset_sec: 42,
+    text: 'zebra stripes',
+    score: 1,
+    channel: 'srdogg',
+  };
+
+  it('video source chip: 4 chips in the row, sends source=video, disables CONTEXT, never semantic', async () => {
+    const fetchMock = mockFetch([]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const video = screen.getByRole('button', { name: 'video' });
+    expect(video).toBeInTheDocument();
+    fireEvent.click(video);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=video')).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled();
+    // Semantic never reaches the wire for video-title filters.
+    expect(searchUrls(fetchMock).every((u) => !u.includes('semantic='))).toBe(true);
+  });
+
+  it('Indexando line dedupes kinds: "chat backfill (2), transcription" each once', async () => {
+    const enrich = [
+      { platform: 'twitch', video_id: 'v1', kind: 'chat', channel: 'srdogg', title: 'VOD A' },
+      { platform: 'kick', video_id: 'k1', kind: 'chat', channel: 'srdoglol', title: 'VOD B' },
+      { platform: 'youtube', video_id: 'yt1', kind: 'transcribe', channel: 'srdogg', title: 'VOD C' },
+    ];
+    const fetchMock = mockFetch([], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [], enriching: enrich }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Indexing 3 videos \(chat backfill \(2\), transcription\)/),
+      ).toBeInTheDocument(),
+    );
+    // One label per kind — the 2 chat entries collapse into one "(2)".
+    expect(screen.getAllByText(/Indexing 3 videos/)).toHaveLength(1);
+  });
+
+  it('refresh button re-runs the search with the current filters', async () => {
+    let searchCalls = 0;
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        searchCalls += 1;
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await screen.findByRole('button', { name: /zebra stripes/i });
+    const afterFirst = searchCalls;
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh search' }));
+    await waitFor(() => expect(searchCalls).toBeGreaterThan(afterFirst));
+  });
+
+  it('Enter with no arrow-selected hit re-runs the search', async () => {
+    let searchCalls = 0;
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        searchCalls += 1;
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await screen.findByRole('button', { name: /zebra stripes/i });
+    const afterFirst = searchCalls;
+    // No ArrowDown happened → activeIdx is -1 → Enter re-runs instead of selecting.
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(searchCalls).toBeGreaterThan(afterFirst));
+  });
+
+  it('chat group: platform chips render, hide/show filters rows, last visible chip locks', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'twitch row' },
+              { platform: 'youtube', video_id: 'yt1', offset_sec: 100, username: 'bob', text: 'youtube row' },
+            ],
+            truncated: false,
+            platforms: ['twitch', 'youtube'],
+            next_offsets: { twitch: 42, youtube: 100 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    await screen.findByText('twitch row');
+    expect(screen.getByText('youtube row')).toBeInTheDocument();
+
+    // Both chips render, ALL on by default.
+    const twChip = screen.getByTitle('Show/hide twitch chat');
+    const ytChip = screen.getByTitle('Show/hide youtube chat');
+    expect(twChip).toHaveAttribute('aria-pressed', 'true');
+    expect(ytChip).toHaveAttribute('aria-pressed', 'true');
+
+    // Hide youtube → its rows disappear, twitch stays, and the last visible
+    // chip locks (min one platform).
+    fireEvent.click(ytChip);
+    expect(screen.queryByText('youtube row')).toBeNull();
+    expect(screen.getByText('twitch row')).toBeInTheDocument();
+    expect(ytChip).toHaveAttribute('aria-pressed', 'false');
+    expect(twChip).toBeDisabled();
+
+    // Re-show it.
+    fireEvent.click(ytChip);
+    expect(screen.getByText('youtube row')).toBeInTheDocument();
+  });
+
+  it('chat group continuation: page 2 echoes per-platform offsets, platform-aware dedupe', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    let chatCalls = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        chatCalls += 1;
+        const page1 = [
+          { platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'first page' },
+          { platform: 'youtube', video_id: 'yt1', offset_sec: 100, username: 'bob', text: 'boundary row' },
+        ];
+        const page2 = [
+          // twitch@100 mirrors the boundary row from another platform — the
+          // dedupe key carries the platform, so it renders separately.
+          { platform: 'twitch', video_id: 'v1', offset_sec: 100, username: 'bob', text: 'boundary row' },
+          // youtube@100 is the equal-offset re-include of page1's last row → dropped.
+          { platform: 'youtube', video_id: 'yt1', offset_sec: 100, username: 'bob', text: 'boundary row' },
+          { platform: 'youtube', video_id: 'yt1', offset_sec: 200, username: 'dave', text: 'second page' },
+        ];
+        return new Response(
+          JSON.stringify({
+            messages: chatCalls === 1 ? page1 : page2,
+            truncated: chatCalls === 1,
+            platforms: ['twitch', 'youtube'],
+            next_offsets: chatCalls === 1 ? { twitch: 42, youtube: 100 } : { twitch: 100, youtube: 200 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    await screen.findByText('first page');
+    expect(chatCalls).toBe(1);
+
+    const chatScroll = screen.getByText('first page').closest('.overflow-y-auto') as HTMLElement;
+    Object.defineProperty(chatScroll, 'scrollTop', { value: 900, configurable: true });
+    Object.defineProperty(chatScroll, 'clientHeight', { value: 100, configurable: true });
+    Object.defineProperty(chatScroll, 'scrollHeight', { value: 1000, configurable: true });
+    fireEvent.scroll(chatScroll);
+    await screen.findByText('second page');
+    expect(chatCalls).toBe(2);
+
+    // Continuation keeps the global offset AND echoes the per-member keyset.
+    const contUrl = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .find((u) => u.includes('/chat?') && u.includes('offsets='));
+    expect(contUrl).toBeTruthy();
+    expect(contUrl).toContain('offset=100');
+    expect(contUrl).toContain('half=0');
+    expect(contUrl).toContain('offsets=twitch:42');
+    // Only the first member carries the 'offsets=' prefix — the rest are
+    // comma-joined mid-list.
+    expect(contUrl).toContain('twitch:42,youtube:100');
+    // Platform-aware dedupe: youtube's equal-offset re-include dropped, the
+    // twitch mirror kept — exactly 2 boundary rows + page rows.
+    expect(screen.getAllByText('boundary row')).toHaveLength(2);
+    expect(screen.getByText('first page')).toBeInTheDocument();
+    expect(screen.getByText('second page')).toBeInTheDocument();
+  });
+
+  it('chat X button closes the chat section (selected cleared), search stays open', async () => {
+    const fetchMock = mockFetch([HIT], {});
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/search')) {
+        return new Response(JSON.stringify({ hits: [HIT], enriching: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [{ platform: 'twitch', video_id: 'v1', offset_sec: 42, username: 'alice', text: 'twitch row' }],
+            truncated: false,
+            platforms: ['twitch'],
+            next_offsets: { twitch: 42 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify(ARCHIVE_VIDEOS), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    const onClose = vi.fn();
+    render(<ArchiveSearchPopup zIndex={10} onClose={onClose} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
+    fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
+    await screen.findByText('twitch row');
+    // The chat header X clears only the chat section — the popup survives.
+    fireEvent.click(screen.getByTitle('Close'));
+    expect(screen.queryByText('Chat from hit')).toBeNull();
+    expect(screen.queryByText('twitch row')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Archive search')).toBeInTheDocument();
   });
 });

@@ -965,14 +965,19 @@ export const PANEL_MIN: PanelSize = { w: 240, h: 180 };
 export const PANEL_MAX_H_HARD = 3000;
 export const VIEWPORT_EDGE_LOCK = 40;
 export const EXPLORE_POPUP_Z = 9999;
-/** Floating archive-search panels — just under the explore stack (#explore-portal
- *  is a fixed layer at EXPLORE_POPUP_Z - 1), so search never covers a player. */
-export const SEARCH_POPUP_Z = EXPLORE_POPUP_Z - 100;
+/** Floating archive-search panels — own base of the SAME ladder players
+ *  use (SEARCH_POPUP_Z + popupZOrder rank, rank from the shared counter),
+ *  so a search popup clicked or opened via 'Search this video' lands ABOVE
+ *  any player and the two search instances stack against each other. A
+ *  player clicked afterwards comes back above the search (standard window
+ *  stacking). */
+export const SEARCH_POPUP_Z = EXPLORE_POPUP_Z;
 /** Fallback z for floating popups without an explicit ladder rank (needle
  *  glance; LivePlayerPopup when rendered without a zIndex prop). Ranked
  *  players live inside #explore-portal (fixed layer at EXPLORE_POPUP_Z - 1)
  *  and get EXPLORE_POPUP_Z + rank, so this stays below the whole player
- *  stack while still floating above the archive search. */
+ *  stack; the archive-search popups use the same ladder and can climb above
+ *  it when brought to front. */
 export const LIVE_POPUP_ACTIVE_Z = EXPLORE_POPUP_Z - 50;
 export const MAX_EXPLORE_POPUPS = 5;
 export const LAYOUT_ROW_GAP_TRIPLE = 12;

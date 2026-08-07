@@ -116,6 +116,12 @@ interface ChannelLiveStatus {
 const IS_DEV_UI = import.meta.env.DEV;
 /** Concurrent live players allowed at once (user requirement). */
 const MAX_LIVE_POPUPS = 5;
+/** Ladder IDs for the two floating archive-search popups — they share the
+ *  popupZCounterRef rank ladder with players, so a clicked search popup
+ *  climbs above every player and the two instances stack against each
+ *  other. */
+const ARCHIVE_SEARCH_POPUP_ID = 'archive-search';
+const PREVIEW_SEARCH_POPUP_ID = 'preview-search';
 
 interface LivePopupItem {
   id: number;
@@ -643,6 +649,7 @@ export default function App() {
       .filter(Boolean);
     setArchiveSearchChannel(slugs.join(',') || null);
     setArchiveSearchOpen(true);
+    bringPopupToFront(ARCHIVE_SEARCH_POPUP_ID);
   }, []);
   /** Floating archive-search popup anchored to the main preview panel
    *  (SEARCH THIS VIDEO / SEARCH ARCHIVE). Floating — never part of the
@@ -2839,6 +2846,10 @@ export default function App() {
       } else {
         previewSearchAnchorRef.current = null;
       }
+      // Fresh rank = above any player the popup anchored next to.
+      bringPopupToFront(PREVIEW_SEARCH_POPUP_ID);
+    } else {
+      dropPopupZ(PREVIEW_SEARCH_POPUP_ID);
     }
     setPreviewSearchOpen(next);
   }, [previewSearchOpen]);
@@ -6372,7 +6383,13 @@ export default function App() {
           <div className={`flex gap-1 shrink-0 ${mainCardHeaderCompact ? 'mt-1' : 'mt-2'}`}>
             <button
               type="button"
-              onClick={() => { setArchiveSearchScope(null); setArchiveSearchOpen((o) => !o); }}
+              onClick={() => {
+                setArchiveSearchScope(null);
+                const opening = !archiveSearchOpen;
+                setArchiveSearchOpen(opening);
+                if (opening) bringPopupToFront(ARCHIVE_SEARCH_POPUP_ID);
+                else dropPopupZ(ARCHIVE_SEARCH_POPUP_ID);
+              }}
               title={t('Search the local archive (transcripts + chat)')}
               aria-pressed={archiveSearchOpen}
               className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
@@ -7112,8 +7129,9 @@ export default function App() {
       )}
       {archiveSearchOpen && (
         <ArchiveSearchPopup
-          zIndex={SEARCH_POPUP_Z}
-          onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); setArchiveSearchChannel(null); }}
+          zIndex={SEARCH_POPUP_Z + (popupZOrder[ARCHIVE_SEARCH_POPUP_ID] ?? 0)}
+          onBringToFront={() => bringPopupToFront(ARCHIVE_SEARCH_POPUP_ID)}
+          onClose={() => { setArchiveSearchOpen(false); setArchiveSearchScope(null); setArchiveSearchChannel(null); dropPopupZ(ARCHIVE_SEARCH_POPUP_ID); }}
           onOpenHit={openArchiveHit}
           scope={archiveSearchScope ?? undefined}
           savedChannels={savedChannels}
@@ -7122,9 +7140,10 @@ export default function App() {
       )}
       {previewOpen && previewSearchOpen && (
         <ArchiveSearchPopup
-          zIndex={SEARCH_POPUP_Z}
+          zIndex={SEARCH_POPUP_Z + (popupZOrder[PREVIEW_SEARCH_POPUP_ID] ?? 0)}
+          onBringToFront={() => bringPopupToFront(PREVIEW_SEARCH_POPUP_ID)}
           initialPos={previewSearchAnchorRef.current ?? undefined}
-          onClose={() => setPreviewSearchOpen(false)}
+          onClose={() => { setPreviewSearchOpen(false); dropPopupZ(PREVIEW_SEARCH_POPUP_ID); }}
           onOpenHit={openArchiveHit}
           onSeekHit={previewArchiveVideoId ? (hit) => handlePreviewChatSeek(hit.offset_sec) : undefined}
           onSeekOffset={previewArchiveVideoId ? (sec) => handlePreviewChatSeek(sec) : undefined}

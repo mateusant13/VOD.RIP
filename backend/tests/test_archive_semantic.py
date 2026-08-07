@@ -166,6 +166,45 @@ def test_semantic_backfills_then_reuses(_patch_embedder):
     assert len(calls) == n
 
 
+def test_semantic_response_cache_serves_repeat_submit(_patch_embedder):
+    # The whole-pass response cache (not just the vector/rerank piece caches)
+    # must make an identical repeat submit instant: zero embedder work. The
+    # counting wrapper is installed BEFORE the first call so the cache key
+    # (which stamps the callable identity) stays stable across both calls.
+    import services.archive_embed
+
+    _add_video("sem-resp-cache", "gaveta")
+    _add_seg("sem-resp-cache", 0, "o gato felino corre")
+    orig = services.archive_embed.embed_query
+    counts = {"embed_query": 0}
+
+    def _counting(q):
+        counts["embed_query"] += 1
+        return orig(q)
+
+    services.archive_embed.embed_query = _counting
+    try:
+        first = archive_db.search("criatura peluda", semantic=True)
+        assert first and first[0]["semantic"] is True
+        n1 = counts["embed_query"]
+        assert n1 >= 1
+        second = archive_db.search("criatura peluda", semantic=True)
+        assert second == first
+        assert counts["embed_query"] == n1  # repeat submit: whole pass cached
+        # Evict the piece caches too — the response cache alone still serves
+        # (the key's callable stamps are unchanged).
+        archive_db._embed_query_cache.clear()
+        archive_db._rerank_cache.clear()
+        third = archive_db.search("criatura peluda", semantic=True)
+        assert third == first
+        assert counts["embed_query"] == n1
+        # A different query misses and re-runs the embedder.
+        archive_db.search("outra coisa", semantic=True)
+        assert counts["embed_query"] > n1
+    finally:
+        services.archive_embed.embed_query = orig
+
+
 def test_embeddings_delete_cascade(_patch_embedder):
     _add_video("sem-del", "gaveta")
     _add_seg("sem-del", 0, "cachorro late alto")

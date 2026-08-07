@@ -562,6 +562,47 @@ def test_search_source_both_is_default():
     assert len(archive_db.search("zebra", source="both")) == 4
 
 
+def _seed_video_source_fixture():
+    """Clean slate + the three filter-* videos (earlier module tests leave
+    other videos whose 'title {video_id}' titles would match a 'title'
+    query)."""
+    archive_db.execute("DELETE FROM messages")
+    archive_db.execute("DELETE FROM transcripts")
+    archive_db.execute("DELETE FROM videos")
+    _insert_video("filter-t-lubu", channel="lubu", started_at="2026-07-30T12:00:00Z", kind="vod")
+    _insert_video("filter-t-titiltei", channel="titiltei", platform="kick",
+                  started_at="2026-07-31T12:00:00Z", kind="clip")
+    _insert_video("filter-t-yt", channel="TiTiltei", platform="youtube",
+                  started_at="2026-08-01T12:00:00Z", kind="live")
+    _insert_msg("filter-t-lubu", "zebra filter word", "twitch")
+    _insert_msg("filter-t-titiltei", "zebra filter word", "kick")
+    _insert_msg("filter-t-yt", "zebra filter word", "youtube")
+    archive_db.insert_transcript(
+        "twitch", "filter-t-lubu",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "zebra filter word"}],
+    )
+
+
+def test_search_source_video_returns_only_title_hits():
+    _seed_video_source_fixture()
+    # 'video' = the dedicated title filter: only video-title matches, never
+    # the transcript/message content passes.
+    assert _hit_ids(archive_db.search("title", source="video")) == {
+        ("title", "filter-t-lubu"), ("title", "filter-t-titiltei"), ("title", "filter-t-yt"),
+    }
+    # A word that only appears in chat/transcripts never surfaces under 'video'.
+    assert archive_db.search("zebra", source="video") == []
+    # 'both' keeps including titles alongside the content tables.
+    both = archive_db.search("title", source="both")
+    assert _hit_ids(both) == {
+        ("title", "filter-t-lubu"), ("title", "filter-t-titiltei"), ("title", "filter-t-yt"),
+    }
+    # semantic is meaningless over titles: it never runs for 'video'.
+    assert _hit_ids(archive_db.search("title", source="video", semantic=True, limit=20)) == {
+        ("title", "filter-t-lubu"), ("title", "filter-t-titiltei"), ("title", "filter-t-yt"),
+    }
+
+
 def test_search_video_id_scopes_to_one_video():
     _seed_search_fixture()
     # A louder hit on ANOTHER video would outrank every scoped hit — the
@@ -644,6 +685,24 @@ async def test_search_source_router_validation_and_passthrough():
     for bad in ("streamer", "chat,transcript"):
         with pytest.raises(HTTPException) as exc:
             await archive_search(q="zebra", source=bad, limit=20)
+        assert exc.value.status_code == 400
+
+
+async def test_search_source_video_router_passthrough():
+    from fastapi import HTTPException
+    from routers.archive import archive_search
+
+    _seed_video_source_fixture()
+    resp = await archive_search(q="title", source="video", limit=20, semantic=False)
+    assert _hit_ids(resp["hits"]) == {
+        ("title", "filter-t-lubu"), ("title", "filter-t-titiltei"), ("title", "filter-t-yt"),
+    }
+    # uppercase normalized like the other sources
+    resp = await archive_search(q="title", source="VIDEO", limit=20, semantic=False)
+    assert resp["hits"] and all(h["kind"] == "title" for h in resp["hits"])
+    for bad in ("streamer", "chat,transcript", "video,chat"):
+        with pytest.raises(HTTPException) as exc:
+            await archive_search(q="title", source=bad, limit=20)
         assert exc.value.status_code == 400
 
 

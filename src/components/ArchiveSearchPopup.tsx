@@ -35,6 +35,7 @@ import {
   ARCHIVE_SOURCE_LABELS,
   buildArchiveVodUrl,
   buildSearchUrl,
+  enrichKindCounts,
   formatArchiveOffset,
   formatRelativeDate,
   highlightQuerySpans,
@@ -55,13 +56,18 @@ import {
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
-import { useI18n } from '../i18n';
+import { langFamily, useI18n } from '../i18n';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
 interface ArchiveSearchPopupProps {
   zIndex: number;
   onClose: () => void;
+  /** Floating-mode bring-to-front: the root's pointer-capture bumps the
+   *  popup's rank so a clicked search popup climbs above every player and
+   *  the second search instance (App wires this to popupZCounterRef).
+   *  Absent in embedded mode. */
+  onBringToFront?: () => void;
   /** Open the hit in the explore-player flow (App owns the popup stack).
    *  `targets` = resolvable per-platform open targets for the hit's
    *  canonical VOD (primary first) — App picks the least-opened platform. */
@@ -137,8 +143,8 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t !== 'Untitled' ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel }: ArchiveSearchPopupProps) {
-  const { t } = useI18n();
+export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel, onBringToFront }: ArchiveSearchPopupProps) {
+  const { t, lang } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   // Seed exactly once from the caller-supplied anchor (else viewport top-right).
@@ -158,8 +164,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   /** True = ignore the stored date range (default). A date pick unchecks it;
    *  re-checking keeps the stored values but search ignores them again. */
   const [everyDay, setEveryDay] = useState(true);
-  /** '' | 'pt' | 'en' — transcript language filter ('' = all). */
-  const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>('');
+  /** '' | 'pt' | 'en' — transcript language filter ('' = all). Defaults to
+   *  the app UI language; clicking the active chip again opts back into ''
+   *  (all languages). */
+  const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>(langFamily(lang) === 'pt' ? 'pt' : 'en');
   /** Chat author filter ('' = all authors); '@' tolerated, case-insensitive. */
   const [userFilter, setUserFilter] = useState('');
   const [semanticOn, setSemanticOn] = useState(false);
@@ -179,6 +187,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [chat, setChat] = useState<ArchiveChatMessage[] | null>(null);
   const [chatStatus, setChatStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [chatError, setChatError] = useState<string | null>(null);
+  /** Platforms present in the selected hit's canonical dedupe group (the
+   *  chat endpoint merges every member). [] before the first page lands. */
+  const [chatPlatforms, setChatPlatforms] = useState<string[]>([]);
+  /** Platforms hidden by the chips — ALL on by default, at least one stays
+   *  visible. */
+  const [chatHidden, setChatHidden] = useState<Set<string>>(new Set());
+  /** Fetch-path mirrors of the group state (fetchChatPage's closure must
+   *  stay stable across pages — state copies are render-only). */
+  const chatPlatformsRef = useRef<string[]>([]);
+  /** Per-platform resume offsets echoed back as `offsets=` on continuation
+   *  pages (each group member keysets independently). */
+  const chatNextOffsetsRef = useRef<Record<string, number>>({});
   /** Backend capped the from-offset history at its row limit (tail cut). */
   const [chatTruncated, setChatTruncated] = useState(false);
   /** How many chat rows are mounted — grows on scroll (long histories). */
@@ -495,7 +515,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       username: userFilter || null,
       limit: semanticOn ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
       hint: hintDisabled ? false : undefined,
-      semantic: semanticOn && sourceFilter !== 'chat',
+      // Concept search runs over transcript segments — meaningless for the
+      // chat and video-title filters.
+      semantic: semanticOn && sourceFilter !== 'chat' && sourceFilter !== 'video',
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -597,28 +619,50 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     const { hit } = selected;
     const first = chatFirstRef.current;
     try {
-      const res = await apiGet<{ messages: ArchiveChatMessage[]; truncated?: boolean }>(
+      // Multi-platform groups resume each member from its own last offset;
+      // single-platform (or first page) keeps the plain global-offset URL.
+      const groupMode = chatPlatformsRef.current.length > 1;
+      const offsetsParam =
+        groupMode && Object.keys(chatNextOffsetsRef.current).length > 0
+          ? '&offsets=' + Object.entries(chatNextOffsetsRef.current)
+              .map(([p, o]) => `${p}:${o}`).join(',')
+          : '';
+      const res = await apiGet<{
+        messages: ArchiveChatMessage[];
+        truncated?: boolean;
+        platforms?: string[];
+        next_offsets?: Record<string, number>;
+      }>(
         `/api/archive/videos/${encodeURIComponent(hit.platform)}/${encodeURIComponent(hit.video_id)}/chat`
-        + `?offset=${chatOffsetRef.current}&half=0`,
+        + `?offset=${chatOffsetRef.current}&half=0${offsetsParam}`,
       );
       if (!mountedRef.current || gen !== chatGenRef.current) return;
       const msgs = res.messages ?? [];
       if (msgs.length > 0) {
         chatOffsetRef.current = msgs[msgs.length - 1].offset_sec;
       }
+      if (res.platforms && res.platforms.length > 0) {
+        chatPlatformsRef.current = res.platforms;
+        setChatPlatforms(res.platforms);
+      }
+      if (res.next_offsets && Object.keys(res.next_offsets).length > 0) {
+        chatNextOffsetsRef.current = res.next_offsets;
+      }
       if (first) {
         chatFirstRef.current = false;
+        setChatHidden(new Set()); // ALL platforms on by default
         setChat(msgs);
         setChatVisibleCount(CHAT_RENDER_CHUNK);
         if (chatScrollRef.current) chatScrollRef.current.scrollTop = 0;
       } else {
         // Append, dropping rows the previous page already delivered (the
-        // backend re-includes the equal-offset boundary run).
+        // backend re-includes the equal-offset boundary run). The key
+        // carries the platform — two group members may share offset/user/text.
         setChat((prev) => {
           const seen = new Set(
-            (prev ?? []).map((m) => `${m.offset_sec}|${m.username}|${m.text}`),
+            (prev ?? []).map((m) => `${m.platform}|${m.offset_sec}|${m.username}|${m.text}`),
           );
-          const fresh = msgs.filter((m) => !seen.has(`${m.offset_sec}|${m.username}|${m.text}`));
+          const fresh = msgs.filter((m) => !seen.has(`${m.platform}|${m.offset_sec}|${m.username}|${m.text}`));
           return [...(prev ?? []), ...fresh];
         });
         // The near-bottom scroll that fired this fetch clamped the mounted
@@ -649,6 +693,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       setChat(null);
       setChatTruncated(false);
       setChatStatus('idle');
+      setChatPlatforms([]);
+      setChatHidden(new Set());
+      chatPlatformsRef.current = [];
+      chatNextOffsetsRef.current = {};
       return;
     }
     const gen = ++chatGenRef.current;
@@ -704,8 +752,14 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     } else if (e.key === 'Enter' && activeIdx >= 0 && activeIdx < n) {
       e.preventDefault();
       selectHit(displayHits[activeIdx]);
+    } else if (e.key === 'Enter') {
+      // No arrow-selected hit → Enter re-runs the search with the CURRENT
+      // filters (refresh affordance for a done search; typing a new query
+      // with contexto re-fires through the debounced effect).
+      e.preventDefault();
+      retrySearch();
     }
-  }, [onClose, displayHits, activeIdx, selectHit]);
+  }, [onClose, displayHits, activeIdx, selectHit, retrySearch]);
 
   return (
     <div
@@ -713,6 +767,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       role="dialog"
       aria-label={t('Archive search')}
       onKeyDown={handleKeyDown}
+      onPointerDownCapture={embedded ? undefined : onBringToFront}
       className={
         embedded
           ? 'flex flex-col gap-2 p-3 border-2 border-white bg-zinc-950 shadow-2xl w-full h-full min-h-0 overflow-hidden'
@@ -794,8 +849,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               {enriching.length === 1
                 ? t('Indexing {count} video', { count: enriching.length })
                 : t('Indexing {count} videos', { count: enriching.length })}
-              {' '}({enriching.map((e) => (e.kind === 'transcript' ? t('transcript') : t('chat backfill'))).join(', ')})
-              …
+              {' '}({enrichKindCounts(enriching)
+                .map(({ kind, count }) => {
+                  const label = kind === 'chat' ? t('chat backfill') : kind === 'transcribe' ? t('transcription') : kind;
+                  return count > 1 ? `${label} (${count})` : label;
+                })
+                .join(', ')})
             </span>
           </div>
         )}
@@ -933,10 +992,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             <button
               type="button"
               aria-pressed={semanticOn}
-              disabled={sourceFilter === 'chat'}
+              disabled={sourceFilter === 'chat' || sourceFilter === 'video'}
               onClick={() => setSemanticOn((v) => !v)}
               title={
-                sourceFilter === 'chat'
+                sourceFilter === 'chat' || sourceFilter === 'video'
                   ? t('Context search covers transcripts only')
                   : t('Context search (semantic): finds moments by meaning, not just exact words')
               }
@@ -1034,11 +1093,22 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               <span className="text-zinc-600"> · +{remoteHits.length} YouTube</span>
             )}
           </span>
-          {!displayHits.some((h) => !h.partial) && (
-            <span className="text-[9px] font-mono uppercase tracking-widest text-amber-500/80">
-              {t('closest matches')}
-            </span>
-          )}
+          <span className="flex items-center gap-1.5 shrink-0">
+            {!displayHits.some((h) => !h.partial) && (
+              <span className="text-[9px] font-mono uppercase tracking-widest text-amber-500/80">
+                {t('closest matches')}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={retrySearch}
+              title={t('Refresh search')}
+              aria-label={t('Refresh search')}
+              className="text-zinc-500 hover:text-white p-0.5 shrink-0"
+            >
+              <RefreshCw size={11} />
+            </button>
+          </span>
         </div>
       )}
 
@@ -1219,10 +1289,54 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">
               {t('Chat from hit')}
             </span>
-            <span className="text-[9px] font-mono text-zinc-400 shrink-0">
-              {videoTitle(selected.video, selected.hit)} @ {formatArchiveOffset(selected.hit.offset_sec)}
+            <span className="flex items-center gap-2 min-w-0">
+              <span className="text-[9px] font-mono text-zinc-400 shrink-0 truncate">
+                {videoTitle(selected.video, selected.hit)} @ {formatArchiveOffset(selected.hit.offset_sec)}
+              </span>
+              <button
+                type="button"
+                onClick={() => setSelected(null)}
+                title={t('Close')}
+                className="text-zinc-500 hover:text-white p-0.5 shrink-0"
+              >
+                <X size={12} />
+              </button>
             </span>
           </div>
+          {chatPlatforms.length > 1 && (
+            <div className="flex items-center gap-1 flex-wrap shrink-0" role="group" aria-label={t('Platform')}>
+              {chatPlatforms.map((p) => {
+                const visible = !chatHidden.has(p);
+                const lastVisible =
+                  visible && chatPlatforms.filter((q) => !chatHidden.has(q)).length <= 1;
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    aria-pressed={visible}
+                    disabled={lastVisible}
+                    onClick={() => {
+                      setChatHidden((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(p)) next.delete(p);
+                        else next.add(p);
+                        return next;
+                      });
+                    }}
+                    title={t('Show/hide {platform} chat', { platform: p })}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
+                      visible
+                        ? 'bg-white text-black border-white'
+                        : 'border-zinc-700 text-zinc-500 hover:border-white hover:text-white'
+                    }`}
+                  >
+                    <PlatformVodIcon platform={PLATFORM_ICON_NAME[p] ?? p} className="w-3 h-3" />
+                    {p}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           {chatStatus === 'loading' && (
             <div className="flex items-center gap-1.5 text-zinc-500 text-[10px] font-mono shrink-0">
               <Loader2 size={11} className="animate-spin" />
@@ -1242,14 +1356,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               </button>
             </div>
           )}
-          {chatStatus === 'done' && selected && chat && (
+          {chatStatus === 'done' && selected && chat && (() => {
+            // Client-side platform filter: hidden-platform rows are still
+            // fetched (pagination stays group-consistent), just not shown.
+            const visibleChat = chat.filter((m) => !chatHidden.has(m.platform));
+            return (
             <div
               ref={chatScrollRef}
               onScroll={() => {
                 const el = chatScrollRef.current;
                 if (!el) return;
                 if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
-                  setChatVisibleCount((c) => Math.min(chat.length, c + CHAT_RENDER_CHUNK));
+                  setChatVisibleCount((c) => Math.min(visibleChat.length, c + CHAT_RENDER_CHUNK));
                   if (chatTruncated && chatStatus === 'done') {
                     // Tail still pending: pull the next page (serialized by
                     // chatFetchingRef, appended + deduped in fetchChatPage).
@@ -1259,10 +1377,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               }}
               className="flex flex-col gap-0.5 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1"
             >
-              {chat.length === 0 && (
+              {visibleChat.length === 0 && (
                 <p className="text-[10px] font-mono text-zinc-500">{t('No archived chat from this moment.')}</p>
               )}
-              {chat.length > 0 && (
+              {visibleChat.length > 0 && (
                 <div className="flex items-center gap-1.5 my-0.5 shrink-0">
                   <span className="h-px flex-1 bg-yellow-300/60" />
                   <span className="text-[8px] font-mono uppercase tracking-widest text-yellow-300 bg-yellow-300/10 border border-yellow-300/40 px-1 py-px">
@@ -1271,13 +1389,16 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                   <span className="h-px flex-1 bg-yellow-300/60" />
                 </div>
               )}
-              {chat.slice(0, chatVisibleCount).map((m) => (
+              {visibleChat.slice(0, chatVisibleCount).map((m) => (
                 <p
-                  key={`c:${m.offset_sec}:${m.username}:${m.text}`}
+                  key={`c:${m.platform}:${m.offset_sec}:${m.username}:${m.text}`}
                   onClick={onSeekOffset ? () => seekToTimestamp(m.offset_sec, onSeekOffset) : undefined}
                   title={onSeekOffset ? t('Seek to {offset}', { offset: formatArchiveOffset(m.offset_sec) }) : undefined}
                   className={`text-[10px] leading-snug text-zinc-200 break-words ${onSeekOffset ? 'cursor-pointer select-none' : ''}`}
                 >
+                  {chatPlatforms.length > 1 && (
+                    <PlatformVodIcon platform={PLATFORM_ICON_NAME[m.platform] ?? m.platform} className="w-2.5 h-2.5 inline-block align-baseline mr-1 opacity-70" />
+                  )}
                   <span className="text-zinc-400 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                   <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
                   {typeof m.spam_count === 'number' && m.spam_count > 1 && (
@@ -1293,7 +1414,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 </p>
               )}
             </div>
-          )}
+            );
+          })()}
         </div>
       )}
       </div>{/* /RESULTS REGION */}
