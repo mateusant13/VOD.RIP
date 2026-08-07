@@ -28,14 +28,14 @@ const out = path.resolve(
 // --- guard: this must be OUR fork, not upstream drift --------------------
 const manifest = path.join(src, 'manifest.json');
 const bridgeModule = path.join(src, 'modules', 'cookie_bridge.mjs');
-const background = path.join(src, 'background.mjs');
+const background = path.join(src, 'background.js');
 if (!existsSync(manifest) || !existsSync(bridgeModule) || !existsSync(background)) {
   console.warn('[cookie-extension] vendor tree missing/incomplete — skipping stage');
   process.exit(0);
 }
 const bg = readFileSync(background, 'utf8');
 if (!bg.includes('cookie_bridge')) {
-  console.warn('[cookie-extension] background.mjs does not import the bridge — skipping stage');
+  console.warn('[cookie-extension] background.js does not import the bridge — skipping stage');
   process.exit(0);
 }
 
