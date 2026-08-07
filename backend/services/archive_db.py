@@ -18,6 +18,7 @@ override with env VODRIP_ARCHIVE_DB (used by tests).
 """
 from __future__ import annotations
 
+import collections
 import functools
 import json
 import logging
@@ -2144,6 +2145,23 @@ def search(
                 r["_tier"] = dist
                 by_row.setdefault(r["_rowid"], r)
         rows = list(by_row.values())
+        # When the fallback exact pattern IS the quoted phrase (single-token
+        # queries with no fuzzy expansions, e.g. "o"), the phrase pass would
+        # re-run the IDENTICAL MATCH over the same rows — mark the tier-0
+        # rows as phrase instead. Same rowids, same +50% boost, one full
+        # bm25 pass saved (~700ms on a common word). Only fires for
+        # single-token queries (multi-token OR patterns never equal the
+        # quoted full phrase), so and_rows are always empty here and the
+        # overwrite order below is unchanged.
+        phrase_is_tier0 = (
+            phrase_pattern is not None
+            and len(pattern) == 1
+            and next(iter(pattern.values())) == phrase_pattern
+        )
+        if phrase_is_tier0:
+            for r in rows:
+                r["_phrase"] = True
+                r.pop("_tier", None)  # tier rows carry _tier; phrase rows never do
         and_rows: dict[int, dict] = {}
         if and_pattern:
             try:
@@ -2153,7 +2171,7 @@ def search(
             except sqlite3.Error:
                 and_rows = {}  # pattern not parseable — degrade to phrase/fuzzy
         phrase_rows: dict[int, dict] = {}
-        if phrase_pattern:
+        if phrase_pattern and not phrase_is_tier0:
             try:
                 for r in _table_search(phrase_pattern, fetch, **base):
                     r["_phrase"] = True  # exact-phrase hit: +50% before merging
@@ -2714,7 +2732,11 @@ def _phrase_span_rows(
     )
     params: list[Any] = []
     if long_toks:
-        sql += " AND (" + " OR ".join("instr(lower(t.text), ?) > 0" for _ in long_toks) + ")"
+        # LIKE '%tok%' is exactly equivalent to instr(lower(text), tok) > 0
+        # for tokenizer-produced tokens ([^\W_]+ — never %, _): SQLite LIKE
+        # is ASCII-case-insensitive, same as its built-in lower(). Measured
+        # ~2x faster on the full-corpus scan (~0.8s vs ~1.5s at 1.8M rows).
+        sql += " AND (" + " OR ".join("t.text LIKE '%' || ? || '%'" for _ in long_toks) + ")"
         params.extend(long_toks)
     parts: list[str] = []
     _append_content_filters(
@@ -2723,12 +2745,16 @@ def _phrase_span_rows(
     )
     if parts:
         sql += " AND " + " AND ".join(parts)
-    sql += " ORDER BY t.video_id, t.seg_idx"
+    # No ORDER BY in SQL (a filesort of every matched row costs ~200ms): the
+    # per-video seg_idx sort below plus the sorted() iteration replicate the
+    # old (video_id, seg_idx) order exactly — all real video ids are ASCII,
+    # so BINARY collation == Python str order. ponytail: if non-ASCII video
+    # ids ever appear, switch back to the SQL ORDER BY.
     by_video: dict[str, list[dict]] = {}
     for r in query(sql, params):
         by_video.setdefault(r["video_id"], []).append(r)
     hits: list[dict] = []
-    for segs in by_video.values():
+    for _vid, segs in sorted(by_video.items()):
         segs.sort(key=lambda r: r["seg_idx"])
         for a, b in zip(segs, segs[1:]):
             if b["seg_idx"] != a["seg_idx"] + 1:
@@ -2819,6 +2845,18 @@ _embed_matrix_cache: Optional[tuple[tuple[str, int], object, object, object]] = 
 _embed_matrix_lock = threading.Lock()
 # One-time logged reason when the GPU scan is unavailable (diagnostic).
 _gpu_scan_fallback_logged = False
+
+# Per-process LRU caches for the semantic pass. The embed/rerank models are
+# deterministic given (query, input texts), so an identical repeated query
+# skips the ~10-100ms embed and the ~1.4s mmarco rerank entirely. Keys carry
+# the CALLABLE itself as an identity stamp: test suites monkeypatch these
+# functions per-test and a model reload swaps the session, so a stale key
+# can never serve a vector produced by a different model. Bounded by
+# maxsize; popitem(last=False) evicts the least-recently-used entry.
+_embed_query_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
+_rerank_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
+_EMBED_QUERY_CACHE_MAX = 64
+_RERANK_CACHE_MAX = 16
 
 
 def _embed_matrix_paths(mx: int) -> tuple[Path, Path]:
@@ -2967,11 +3005,16 @@ def _semantic_search(
 
     from services import archive_embed  # lazy: onnxruntime stays out of boot
 
-    qv = archive_embed.embed_query(q)
+    qkey = (q, archive_embed.embed_query)
+    qv = _embed_query_cache.get(qkey)
     if qv is None:
-        return None
-
-    qv = np.asarray(qv).reshape(-1)  # (1, dim) -> (dim,)
+        raw = archive_embed.embed_query(q)
+        if raw is None:
+            return None
+        qv = np.asarray(raw).reshape(-1).copy()  # (1, dim) -> (dim,)
+        if len(_embed_query_cache) >= _EMBED_QUERY_CACHE_MAX:
+            _embed_query_cache.popitem(last=False)
+        _embed_query_cache[qkey] = qv
 
     # Bounded lazy backfill: only when the corpus grew past the last
     # embedded id (new transcripts always get higher ids). Full scan is
@@ -3049,7 +3092,19 @@ def _semantic_search(
     by_id = {r["transcript_id"]: dict(r) for r in rows}
     cand = [by_id[i] for i in cand_ids if i in by_id]
     cand_scores = [s for i, s in zip(cand_ids, cand_scores) if i in by_id]
-    reranked = archive_embed.rerank(q, [r["text"] for r in cand])
+    # mmarco rerank of the top candidates is the semantic path's dominant
+    # cost (~1.4s at 150 pairs); identical (query, candidates) pairs are
+    # cached — the model is deterministic and transcript text is immutable
+    # per rowid (deletes cascade, updates rewrite rows).
+    rkey = (q, tuple(r["text"] for r in cand), archive_embed.rerank)
+    reranked = _rerank_cache.get(rkey)
+    if reranked is None:
+        reranked = archive_embed.rerank(q, [r["text"] for r in cand])
+        if reranked is not None:
+            reranked = tuple(reranked)
+            if len(_rerank_cache) >= _RERANK_CACHE_MAX:
+                _rerank_cache.popitem(last=False)
+            _rerank_cache[rkey] = reranked
     if reranked is not None:
         cand = [c for _, c in sorted(zip(reranked, cand), key=lambda t: -t[0])]
         cand_scores = sorted(reranked, reverse=True)
