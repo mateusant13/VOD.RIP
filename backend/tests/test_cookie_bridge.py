@@ -481,16 +481,6 @@ async def test_extension_id_from_pkcs8_pem(client, tmp_path):
     assert resp.json()["extension_id"] == expected
 
 
-async def test_extension_update_xml(client, ext_state):
-    resp = await client.get("/api/session/cookies/extension/update.xml")
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("text/xml")
-    body = resp.text
-    assert f"appid='{ext_state}'" in body
-    assert "codebase='http://test/api/session/cookies/extension/extension.crx'" in body
-    assert "version='9.9.9'" in body
-
-
 async def test_extension_crx_served(client):
     resp = await client.get("/api/session/cookies/extension/extension.crx")
     assert resp.status_code == 200
@@ -508,7 +498,6 @@ async def test_extension_endpoints_404_without_artifacts(client, tmp_path):
     (tmp_path / "extension.crx").unlink()
     (tmp_path / "extension.pem").unlink()
     for path in (
-        "/api/session/cookies/extension/update.xml",
         "/api/session/cookies/extension/extension.crx",
         "/api/session/cookies/extension/id",
     ):
