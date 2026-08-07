@@ -5786,7 +5786,11 @@ export default function App() {
       setClipOpening(true);
       try {
         const res = await openTwitchClipEditor({ broadcasterLogin: login });
-        showClipOpenNotice('ok', `Twitch clip editor opened — ${res.url}`);
+        if (res.ok) {
+          showClipOpenNotice('ok', `Twitch clip created — ${res.edit_url}`);
+        } else {
+          showClipOpenNotice('error', res.error.message);
+        }
       } catch {
         showClipOpenNotice('error', t('Failed to open the Twitch clip editor'));
       } finally {
@@ -7104,7 +7108,7 @@ export default function App() {
           zIndex={EXPLORE_POPUP_Z + 200}
           onClose={() => setTwitchClipPopup(null)}
           onClipCreated={(editorUrl) =>
-            showClipOpenNotice('ok', `Twitch clip editor opened — ${editorUrl}`)}
+            showClipOpenNotice('ok', `Twitch clip created — ${editorUrl}`)}
         />
       )}
       {archiveSearchOpen && (

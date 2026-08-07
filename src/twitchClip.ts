@@ -1,20 +1,22 @@
 /**
  * Twitch clip creation — shared helpers for the preview "CLIP" buttons.
  *
- * Creating a clip via the official Helix API needs broadcaster/editor OAuth,
- * so instead we open Twitch's own clip editor pre-positioned on the selected
- * moment (the route Chatterino uses — an internal UI route, not a stable
- * public API) in the user's default browser, where they are already logged
- * in. The backend records every editor-open into a local history file.
+ * POST /api/twitch/clip creates the clip through Twitch's official Helix API
+ * (Chatterino-style) using the stored twitch_helix_token: live clips via
+ * POST /helix/clips (clips:edit), VOD clips via POST /helix/videos/clips
+ * (editor:manage:clips | channel:manage:clips, vod_offset = clip END).
+ * On success the returned edit_url (valid 24h) is opened in the OS default
+ * browser; failures come back as {ok: false, error: {code, message}} and are
+ * surfaced by the callers.
  */
 
-import { apiGet, apiPost } from './hooks/useApiClient';
+import { apiDelete, apiGet, apiPost } from './hooks/useApiClient';
 
 export const TWITCH_CLIP_MAX_SEC = 60;
 /** Twitch's own editor rejects selections shorter than this. */
 export const TWITCH_CLIP_MIN_SEC = 5;
-
-export const TWITCH_CLIP_EDITOR_HOST = 'https://clips.twitch.tv/create';
+/** Helix clip title length limit. */
+export const TWITCH_CLIP_TITLE_MAX = 140;
 
 /**
  * Mini-preview window for the "Twitch clip" button: ±60s around the click
@@ -71,7 +73,7 @@ export function clampClipSelection(
   // Free-form (init / button nudges): clamp into the window and enforce the
   // 5s floor. No 60s cap here — the initial full-window selection may exceed
   // it; every user edit goes through the move branches below (hard 5..60) and
-  // the Create action re-checks the range before opening the editor.
+  // the Create action re-checks the range before creating the clip.
   let start = Math.max(winStart, Math.min(Math.floor(rawStart), winEnd));
   let end = Math.min(winEnd, Math.max(Math.ceil(rawEnd), start + minLen));
   if (end - start < minLen) start = Math.max(winStart, end - minLen);
@@ -79,8 +81,9 @@ export function clampClipSelection(
 }
 
 /**
- * Map a VOD-coordinate selection to the editor request: the editor's
- * offsetSeconds is a clip-END reference (see buildTwitchClipEditorUrl).
+ * Map a VOD-coordinate selection to the clip request: vod_offset is a clip-END
+ * reference (the backend passes it straight to Helix as vod_offset), duration
+ * is the selected clip length.
  */
 export function clipEditorOffsetAndDuration(
   selectionStartSec: number,
@@ -90,26 +93,6 @@ export function clipEditorOffsetAndDuration(
     offsetSec: Math.max(0, Math.floor(selectionEndSec)),
     durationSec: Math.round(Math.max(0, selectionEndSec - selectionStartSec)),
   };
-}
-
-/** Editor URL pre-positioned on a VOD moment (offset = clip END reference). */
-export function buildTwitchClipEditorUrl(opts: {
-  vodId: string;
-  broadcasterLogin: string;
-  offsetSeconds: number;
-}): string {
-  const p = new URLSearchParams({
-    vodID: opts.vodId,
-    broadcasterLogin: opts.broadcasterLogin,
-    offsetSeconds: String(Math.floor(opts.offsetSeconds)),
-  });
-  return `${TWITCH_CLIP_EDITOR_HOST}?${p.toString()}`;
-}
-
-/** Editor URL for a live broadcast — the web editor picks the recent window. */
-export function buildLiveTwitchClipEditorUrl(broadcasterLogin: string): string {
-  const p = new URLSearchParams({ broadcasterLogin });
-  return `${TWITCH_CLIP_EDITOR_HOST}?${p.toString()}`;
 }
 
 /** Error message when the selected range can't become a Twitch clip, else null. */
@@ -133,29 +116,61 @@ export interface TwitchClipRecord {
   vod_id: string | null;
   offset_sec: number | null;
   duration_sec: number | null;
+  title: string | null;
   url: string;
   status: string;
 }
+
+export interface TwitchClipError {
+  code: string;
+  message: string;
+}
+
+export type TwitchClipOpenResult =
+  | { ok: true; id: string | null; edit_url: string }
+  | { ok: false; error: TwitchClipError };
 
 export interface OpenTwitchClipArgs {
   broadcasterLogin: string;
   vodId?: string;
   offsetSec?: number;
   durationSec?: number;
+  /** User-chosen clip title (empty -> Twitch auto-titles). Becomes the local filename on download. */
+  title?: string;
 }
 
-/** Ask the backend to record + open the Twitch clip editor in the default browser. */
+/** Open a URL in the OS default browser (external window, not the WebView2). */
+function openExternal(url: string): void {
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+/**
+ * Ask the backend to create a Twitch clip via the official Helix API; on
+ * success the returned edit_url (valid 24h) is opened in the default browser.
+ */
 export async function openTwitchClipEditor(
   args: OpenTwitchClipArgs,
-): Promise<{ ok: boolean; url: string; id: string }> {
-  return apiPost<{ ok: boolean; url: string; id: string }>('/api/twitch/clip', {
+): Promise<TwitchClipOpenResult> {
+  const res = await apiPost<TwitchClipOpenResult>('/api/twitch/clip', {
     broadcaster_login: args.broadcasterLogin,
     vod_id: args.vodId ?? null,
     offset_sec: args.offsetSec ?? null,
     duration_sec: args.durationSec ?? null,
+    title: args.title ?? null,
   });
+  if (res.ok && res.edit_url) {
+    openExternal(res.edit_url);
+  }
+  return res;
 }
 
 export async function fetchTwitchClipHistory(): Promise<TwitchClipRecord[]> {
   return apiGet<TwitchClipRecord[]>('/api/twitch/clips/history');
+}
+
+/** Batch-remove clip history entries by id; returns how many were removed. */
+export async function deleteTwitchClipHistory(
+  ids: string[],
+): Promise<{ ok: boolean; removed: number }> {
+  return apiDelete<{ ok: boolean; removed: number }>('/api/twitch/clips/history', { ids });
 }

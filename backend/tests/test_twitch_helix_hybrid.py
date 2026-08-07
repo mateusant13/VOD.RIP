@@ -9,11 +9,17 @@ Run from backend/: python -m pytest tests/test_twitch_helix_hybrid.py
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from models.schemas import AppSettings
 
@@ -300,3 +306,122 @@ def test_auto_lift_disabled_bridge_is_noop(monkeypatch, tmp_path):
     monkeypatch.setattr("deps.settings_mgr", mgr)
     assert ths.auto_lift_token() is False
     assert mgr.saved == []
+
+
+# --- clip support: _helix_post / token_info / HelixError -------------------
+
+class _FakeResp:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+def _patch_urlopen(monkeypatch, payload: bytes = b'{"data": []}', http_error=None):
+    """Replace urllib.request.urlopen, capturing the built Request."""
+    captured = {}
+
+    def _urlopen(req, timeout=None):
+        captured["req"] = req
+        if http_error is not None:
+            raise http_error
+        return _FakeResp(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    return captured
+
+
+def _http_error(code: int, body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://api.twitch.tv/helix/x", code, "err", {}, io.BytesIO(body)
+    )
+
+
+def test_helix_post_sends_json_body_with_token_client(monkeypatch):
+    """POST carries Client-Id, Bearer token, JSON body; response parsed."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
+    captured = _patch_urlopen(monkeypatch, payload=b'{"data": [{"id": "c1"}]}')
+
+    out = ths._helix_post("/videos/clips", {"video_id": "1", "vod_offset": 30}, "app-9")
+
+    req = captured["req"]
+    hdr = {k.lower(): v for k, v in req.headers.items()}
+    assert req.full_url == "https://api.twitch.tv/helix/videos/clips"
+    assert req.get_method() == "POST"
+    assert hdr["client-id"] == "app-9"
+    assert hdr["authorization"] == "Bearer tok-123"
+    assert hdr["content-type"] == "application/json"
+    assert json.loads(req.data.decode("utf-8")) == {"video_id": "1", "vod_offset": 30}
+    assert out == {"data": [{"id": "c1"}]}
+
+
+def test_helix_post_http_error_raises_helix_error_with_status(monkeypatch):
+    """Helix 403 -> HelixError carrying status + raw detail (RuntimeError subclass)."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
+    _patch_urlopen(
+        monkeypatch,
+        http_error=_http_error(403, b'{"error":"Forbidden","status":403,"message":"Missing scope"}'),
+    )
+
+    with pytest.raises(ths.HelixError) as ei:
+        ths._helix_post("/videos/clips", {"video_id": "1"}, "app-9")
+    assert ei.value.status == 403
+    assert "Missing scope" in ei.value.message
+    assert isinstance(ei.value, RuntimeError), "must stay a RuntimeError for GQL-fallback callers"
+
+
+def test_helix_get_accepts_client_id_override(monkeypatch):
+    """_helix_get honors an explicit client_id (used by the clip router)."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
+    captured = _patch_urlopen(monkeypatch, payload=b'{"data": [{"id": "98765"}]}')
+
+    ths._helix_get("/users", {"login": "surtepi"}, client_id="my-app")
+
+    req = captured["req"]
+    hdr = {k.lower(): v for k, v in req.headers.items()}
+    assert hdr["client-id"] == "my-app"
+    assert hdr["authorization"] == "Bearer tok-123"
+
+
+def test_token_info_returns_validate_payload(monkeypatch):
+    """oauth2/validate payload surfaces client_id + scopes for the clip router."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("tok-123")))
+    payload = json.dumps({
+        "client_id": "app-9",
+        "login": "surtepi",
+        "scopes": ["clips:edit", "user_read"],
+        "expires_in": 5000,
+    }).encode("utf-8")
+    captured = _patch_urlopen(monkeypatch, payload=payload)
+
+    out = ths.token_info()
+
+    assert captured["req"].full_url == "https://id.twitch.tv/oauth2/validate"
+    hdr = {k.lower(): v for k, v in captured["req"].headers.items()}
+    assert hdr["authorization"] == "Bearer tok-123"
+    assert out["client_id"] == "app-9"
+    assert out["scopes"] == ["clips:edit", "user_read"]
+
+
+def test_token_info_invalid_token_raises_helix_error(monkeypatch):
+    """Expired/invalid token -> HelixError(401) -> router maps to unauthorized."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("stale")))
+    _patch_urlopen(monkeypatch, http_error=_http_error(401, b'{"status":401,"message":"invalid token"}'))
+
+    with pytest.raises(ths.HelixError) as ei:
+        ths.token_info()
+    assert ei.value.status == 401
+
+
+def test_token_info_without_token_raises_runtime_error(monkeypatch):
+    """No stored token -> RuntimeError (router pre-checks token_available first)."""
+    monkeypatch.setattr("deps.settings_mgr", _FakeMgr(_fake_settings("")))
+    with pytest.raises(RuntimeError):
+        ths.token_info()

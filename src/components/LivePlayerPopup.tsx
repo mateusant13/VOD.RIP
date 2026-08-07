@@ -897,7 +897,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
   }, []);
 
-  /** Open Twitch's clip editor for the live broadcast (web editor picks the window). */
+  /** Create a Twitch clip for the live broadcast via Helix, open the edit_url. */
   const openLiveTwitchClip = useCallback(async () => {
     const login = (channelSlug || '').trim();
     if (!login) {
@@ -907,7 +907,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     setClipOpening(true);
     try {
       const res = await openTwitchClipEditor({ broadcasterLogin: login });
-      showClipNotice('ok', `Twitch clip editor opened — ${res.url}`);
+      if (res.ok) {
+        showClipNotice('ok', `Twitch clip created — ${res.edit_url}`);
+      } else {
+        showClipNotice('error', res.error.message);
+      }
     } catch {
       showClipNotice('error', t('Failed to open the Twitch clip editor'));
     } finally {
