@@ -263,13 +263,21 @@ def _find_browser(name: str) -> Optional[Path]:
 def _drive_extension_tab() -> Optional[tuple[str, str]]:
     """Open the extensions manager in a NEW tab of a RUNNING browser.
 
-    Runs scripts/open_extension_new_tab.ps1, which drives the frontmost
-    Chromium window with keystrokes: new tab first (Ctrl+T), then navigate
-    that tab (Ctrl+L -> paste -> Enter). A command-line launch cannot be used
-    while the browser runs: chrome:// URLs are dropped by the
+    Runs scripts/open_extension_new_tab.ps1, which picks a default-profile
+    Chromium window (never another profile or incognito), brings it to the
+    foreground WITHOUT changing a visible window's state (no restore, no
+    ALT-tap), opens a NEW tab (Ctrl+T), and types the URL into the omnibox
+    (Ctrl+L -> URL -> Enter) — no clipboard round-trip. A command-line launch
+    cannot be used while the browser runs: chrome:// URLs are dropped by the
     process-singleton handoff and leave a stray blank tab (http(s) forward
     fine, chrome:// die). Keystrokes land in a brand-new tab, so the user's
     active tab is never touched.
+
+    The ps1 is the authority on process existence: exit 1 is only emitted
+    when NO Chromium browser process is running at all, so the caller may
+    spawn a fresh instance. Any running process (even one without a visible
+    window) yields exit 2 — bare-spawning then would feed the URL into the
+    singleton, which drops it.
 
     Returns (browser_name, url) when the new tab was driven, ("none", None)
     when no browser is running at all (caller may spawn a fresh instance), or
@@ -277,7 +285,9 @@ def _drive_extension_tab() -> Optional[tuple[str, str]]:
     """
     script = Path(__file__).resolve().parent.parent / "scripts" / "open_extension_new_tab.ps1"
     if not script.is_file():
-        return None
+        # Without the driver script we cannot know whether a browser process
+        # is alive — refuse to spawn blind rather than risk the stray window.
+        return ("blocked", None)
     try:
         proc = subprocess.run(
             [
@@ -306,10 +316,14 @@ def _open_extension_manager() -> dict:
     """Open the browser's extensions manager in a NEW tab, always.
 
     When a Chromium browser is running, drive it with keystrokes (new tab
-    first, then navigate — the active tab is never touched); when none is
-    running, spawn a fresh instance with the URL, which opens directly because
-    there is no process singleton to drop it. This always targets the user's
-    real browser exe — the app's own WebView2 cookie store is never involved.
+    first, then navigate — the active tab is never touched); when the ps1
+    confirms NO browser process is running, spawn a fresh instance with the
+    URL, which opens directly because there is no process singleton to drop
+    it. A bare spawn is never attempted while a browser process may be
+    alive — the ps1 reports exit 2 (blocked) for every process-without-a-
+    driveable-window case, and the driver script being missing is treated as
+    blocked, not as a license to spawn. This always targets the user's real
+    browser exe — the app's own WebView2 cookie store is never involved.
     """
     driven = _drive_extension_tab()
     if driven:

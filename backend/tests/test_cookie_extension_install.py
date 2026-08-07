@@ -126,6 +126,9 @@ def test_open_extension_manager_spawns_fresh_instance_when_none_running(monkeypa
 
     fake = type("FakePath", (), {"__str__": lambda self: "C:/Program Files/Google/Chrome/Application/chrome.exe"})()
     monkeypatch.setattr(cb, "_find_browser", lambda name: fake if name == "chrome" else None)
+    # ps1 exit 1 is ONLY emitted when no Chromium process exists at all — the
+    # ps1 is the authority on process existence (it polls for windows and
+    # distinguishes "no process" from "process without a drivable window")
     monkeypatch.setattr(cb.subprocess, "run", _fake_run(1, "none\n"))
     with patch.object(subprocess, "Popen") as popen:
         res = _open_extension_manager()
@@ -133,6 +136,25 @@ def test_open_extension_manager_spawns_fresh_instance_when_none_running(monkeypa
     # no singleton to drop the URL when nothing is running — plain spawn opens it
     assert popen.call_args.args[0] == ["C:/Program Files/Google/Chrome/Application/chrome.exe", "chrome://extensions/"]
     popen.assert_called_once()
+
+
+def test_open_extension_manager_never_spawns_while_browser_process_running(monkeypatch):
+    """Exit 2 now also means 'browser process exists but window undriveable'.
+
+    The ps1 reports 'none' + exit 2 whenever ANY Chromium process is alive
+    (background mode, hidden window, foreground-lock): bare-spawning then
+    would feed the chrome:// URL into the process singleton, which drops it
+    and leaves a stray blank window. Python must never fall through to Popen.
+    """
+    from routers import cookie_bridge as cb
+
+    fake = type("FakePath", (), {"__str__": lambda self: "C:/Program Files/Google/Chrome/Application/chrome.exe"})()
+    monkeypatch.setattr(cb, "_find_browser", lambda name: fake if name == "chrome" else None)
+    monkeypatch.setattr(cb.subprocess, "run", _fake_run(2, "none\n"))
+    with patch.object(subprocess, "Popen") as popen:
+        res = _open_extension_manager()
+    assert res == {"launched": False, "browser": None, "url": None, "blocked": True}
+    popen.assert_not_called()
 
 
 def test_open_extension_manager_blocked_when_drive_fails(monkeypatch):
@@ -172,3 +194,59 @@ def test_open_extension_manager_no_browser_returns_false(monkeypatch):
     monkeypatch.setattr(cb.subprocess, "run", _fake_run(1, "none\n"))
     res = _open_extension_manager()
     assert res == {"launched": False, "browser": None, "url": None}
+
+
+# --- driver script contract -------------------------------------------------
+# The ps1 is the authority on "is a browser process alive?" — Python only
+# bare-spawns on its exit 1. These source-level guards pin the four fixes so a
+# regression in the driver (restore of visible windows, clipboard paste,
+# wrong-profile pick, blind spawn) fails the suite.
+
+_PS1_PATH = Path(__file__).resolve().parent.parent / "scripts" / "open_extension_new_tab.ps1"
+
+
+def _ps1_source() -> str:
+    """Driver source with comment lines stripped — guards pin the CODE, not
+    the prose that explains why Set-Clipboard / SW_RESTORE were removed."""
+    return "\n".join(
+        line for line in _PS1_PATH.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def test_ps1_never_restores_or_alt_taps_visible_windows():
+    src = _ps1_source()
+    # SW_RESTORE (ShowWindow 9) must only ever be reachable behind an
+    # IsIconic() minimized check — an unconditional restore flips the
+    # window's resolution/fullscreen state. It is referenced by constant
+    # name, never as a bare literal next to a foregrounding call.
+    assert "ShowWindow($hWnd, 9)" not in src
+    assert "SW_RESTORE" in src
+    assert "IsIconic" in src
+    assert "IsWindowVisible" in src
+    # the ALT-tap trick (keybd_event VK_MENU) is gone
+    assert "keybd_event" not in src
+    assert "VK_MENU" not in src
+    # skip foregrounding entirely when the target already owns the foreground
+    assert "GetForegroundWindow() -eq $hWnd" in src
+
+
+def test_ps1_filters_default_profile_and_types_url_directly():
+    src = _ps1_source()
+    # command-line profile filter: prefer processes without --user-data-dir so
+    # the drive never lands in another profile or an incognito session
+    assert "--user-data-dir" in src
+    assert "DefaultProfile" in src
+    # URL goes through SendKeys directly — no clipboard round-trip
+    assert "Set-Clipboard" not in src
+    assert "SendWait" in src
+    assert "ConvertTo-SendKeys" in src
+
+
+def test_ps1_exit_contract_distinguishes_no_process_from_undriveable():
+    src = _ps1_source()
+    # exit 1 (caller may spawn) is only emitted when NO browser process
+    # exists; a process without a drivable window must be exit 2 (blocked)
+    assert "Test-AnyBrowserRunning" in src
+    assert "exit 1" in src
+    assert "exit 2" in src
