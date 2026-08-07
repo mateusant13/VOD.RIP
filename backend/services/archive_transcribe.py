@@ -2291,6 +2291,14 @@ _STALE_JOB_TIMEDELTA = timedelta(minutes=30)
 # live-chat replay can legitimately exceed the 30min transcribe reclaim
 # window, so 'chat' jobs get a 2h grace before a dead executor is assumed.
 _CHAT_STALE_TIMEDELTA = timedelta(hours=2)
+# Twitch chat backfills heartbeat their job row after every stored page
+# (backfill_chat's progress_cb), so a live executor's heartbeat is seconds
+# old. A running job whose heartbeat stalls past this window is a dead or
+# wedged fetch (urllib timeouts bound a single page to ~20s + the 429
+# backoff chain) — reclaim it instead of letting it hold the row for the
+# flat 2h _CHAT_STALE_TIMEDELTA. The YouTube leg never heartbeats during
+# its long yt-dlp download (heartbeat stays NULL) and keeps the 2h window.
+_CHAT_HEARTBEAT_STALE = timedelta(minutes=10)
 
 # YouTube chat-backfill pacing: min gap between chat video STARTS. A single
 # worker starts ≤5/min (burst 2 requests each: extract + chat download); the
@@ -2338,34 +2346,45 @@ def _claim_next_job() -> Optional[dict]:
     """Atomically claim the newest queued transcribe/events/chat job (crash-stale too).
 
     A 'running' job is reclaimed only if untouched past its kind's stale
-    window — 30 min for transcribe/events (a single chunk can legitimately
-    take that long on CPU), 2 h for 'chat' (a 13.5h VOD's live-chat replay
-    backfill can exceed the shorter window)."""
+    window: 30 min for transcribe/events (a single chunk can legitimately
+    take that long on CPU), 2 h for 'chat' on YouTube (a 13.5h VOD's
+    live-chat replay download heartbeats nothing mid-run). Twitch 'chat'
+    jobs heartbeat after every stored page, so a running one whose
+    heartbeat went stale past _CHAT_HEARTBEAT_STALE (10 min) is a dead or
+    wedged executor — reclaimed long before the flat 2h window; NULL
+    heartbeats (pre-heartbeat rows, YouTube) fall back to updated_at."""
     now = datetime.now(timezone.utc)
     transcribe_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
-    chat_cutoff = (now - _CHAT_STALE_TIMEDELTA).isoformat(timespec="seconds")
+    twitch_chat_cutoff = (now - _CHAT_HEARTBEAT_STALE).isoformat(timespec="seconds")
+    yt_chat_cutoff = (now - _CHAT_STALE_TIMEDELTA).isoformat(timespec="seconds")
     # String comparison is valid: both sides come from _now_iso (UTC, same width).
     rows = archive_db.query(
         """SELECT * FROM archive_jobs
            WHERE kind IN ('transcribe','events','chat')
-             AND (status = 'queued' OR (status = 'running' AND updated_at <
-                  CASE kind WHEN 'chat' THEN ? ELSE ? END))
+             AND (status = 'queued' OR (status = 'running' AND
+                  COALESCE(heartbeat, updated_at) <
+                  CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ?
+                       WHEN kind = 'chat' THEN ?
+                       ELSE ? END))
            ORDER BY priority DESC, created_at ASC
            LIMIT 8""",
-        (chat_cutoff, transcribe_cutoff),
+        (twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
     )
     for row in rows:
+        # The claim refreshes the heartbeat too: a re-claimed row must not
+        # match the stale predicate again before the new executor's first
+        # progress touch (that would let a third worker steal it mid-claim).
         if row["status"] == "queued":
             cur = archive_db.execute(
-                "UPDATE archive_jobs SET status = 'running', updated_at = ? "
+                "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
                 "WHERE id = ? AND status = 'queued'",
-                (_now_iso(), row["id"]),
+                (_now_iso(), _now_iso(), row["id"]),
             )
         else:
             cur = archive_db.execute(
-                "UPDATE archive_jobs SET status = 'running', updated_at = ? "
+                "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
                 "WHERE id = ? AND status = 'running'",
-                (_now_iso(), row["id"]),
+                (_now_iso(), _now_iso(), row["id"]),
             )
         if cur.rowcount == 1:
             return dict(row)
@@ -2426,11 +2445,13 @@ def _process_chat_job(job_id: str, platform: str, video_id: str) -> dict:
         channel = (archive_db.video_channel(platform, video_id) or "").strip()
         if not channel:
             raise ValueError(f"no channel for twitch/{video_id} — cannot backfill chat")
+        # progress_cb=None: backfill_chat stamps the job row (progress +
+        # heartbeat) after every stored page in both lanes — the worker
+        # lane's own per-page update would double-write the same row.
         result = backfill_chat(
             channel, video_id,
             max_messages=BACKFILL_MAX_MESSAGES,
             job_id=job_id,
-            progress_cb=lambda p: archive_db.update_job(job_id, progress=min(0.999, p)),
         )
         archive_db.update_job(job_id, status="done", progress=1.0)
         return {
