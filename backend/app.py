@@ -104,60 +104,82 @@ def _spawn_detached_worker() -> Optional[int]:
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    # Startup disk hygiene — sweep orphaned temp/preview/selfcheck files
-    # before any session or settings work starts (best-effort, never fatal).
-    try:
-        from services.disk_hygiene import run_startup_hygiene
-
-        run_startup_hygiene()
-    except Exception:
-        logger.debug("startup disk hygiene skipped", exc_info=True)
-
-    # Archive VOD retention — evict video files beyond the newest N per
-    # platform (DB rows/transcripts/chat stay forever). Best-effort, never
-    # fatal; runs before any session work so the UI never lists dead files.
-    try:
-        from services.archive_retention import enforce_archive_vod_retention
-
-        _retention_stats = enforce_archive_vod_retention()
-        if _retention_stats["deleted_files"]:
-            logger.info(
-                "startup archive retention: removed %d video file(s), cleared %d row(s)",
-                _retention_stats["deleted_files"],
-                _retention_stats["cleared_rows"],
-            )
-    except Exception:
-        logger.debug("startup archive retention skipped", exc_info=True)
-
-    # One-time boot cleanup: collapse exact-duplicate chat rows left behind
-    # by pre-fix multi-writer capture (watchdog live sink vs GQL backfill vs
-    # replay ingest writing the same message at the same offset, plus the
-    # yt_live post-rename full re-send). Idempotent (second run deletes
-    # nothing) and bounded; guarded so it runs at most once per boot.
-    global _chat_dedupe_done
-    if not _chat_dedupe_done:
-        _chat_dedupe_done = True
+    # Boot maintenance — disk hygiene (incl. the whisper-model prune, which
+    # recursively scans multi-GB model dirs), archive retention, chat
+    # dedupe, FTS optimize, and the embed-model warm all run on a daemon
+    # thread so the server binds in ~1-2s instead of paying 12-25s of
+    # housekeeping before first byte (measured 2026-08-07). Every step is
+    # best-effort and/or age-guarded, so racing the first requests is safe;
+    # the scheduler and worker already run post-ready as daemon threads.
+    def _boot_maintenance() -> None:
+        # Startup disk hygiene — sweep orphaned temp/preview/selfcheck files
+        # (best-effort, never fatal; age-guarded so live session dirs survive).
         try:
-            from services.archive_db import dedupe_messages
+            from services.disk_hygiene import run_startup_hygiene
 
-            _chat_dupes = dedupe_messages()
-            if _chat_dupes:
+            run_startup_hygiene()
+        except Exception:
+            logger.debug("startup disk hygiene skipped", exc_info=True)
+
+        # Archive VOD retention — evict video files beyond the newest N per
+        # platform (DB rows/transcripts/chat stay forever). Best-effort,
+        # never fatal; runs so the UI never lists dead files.
+        try:
+            from services.archive_retention import enforce_archive_vod_retention
+
+            _retention_stats = enforce_archive_vod_retention()
+            if _retention_stats["deleted_files"]:
                 logger.info(
-                    "startup chat dedupe: removed %d duplicate message row(s)",
-                    _chat_dupes,
+                    "startup archive retention: removed %d video file(s), cleared %d row(s)",
+                    _retention_stats["deleted_files"],
+                    _retention_stats["cleared_rows"],
                 )
         except Exception:
-            logger.debug("startup chat dedupe skipped", exc_info=True)
+            logger.debug("startup archive retention skipped", exc_info=True)
 
-    # Keep FTS5 search fast as the archive grows: PRAGMA optimize merges
-    # fragmented FTS index b-tree pages and refreshes stats. Cheap no-op
-    # when nothing is pending; no exclusive lock (safe with live readers).
-    try:
-        from services.archive_db import query as _adb_query
+        # One-time boot cleanup: collapse exact-duplicate chat rows left behind
+        # by pre-fix multi-writer capture (watchdog live sink vs GQL backfill vs
+        # replay ingest writing the same message at the same offset, plus the
+        # yt_live post-rename full re-send). Idempotent (second run deletes
+        # nothing) and bounded; guarded so it runs at most once per boot.
+        global _chat_dedupe_done
+        if not _chat_dedupe_done:
+            _chat_dedupe_done = True
+            try:
+                from services.archive_db import dedupe_messages
 
-        _adb_query("PRAGMA optimize")
-    except Exception:
-        logger.debug("startup fts optimize skipped", exc_info=True)
+                _chat_dupes = dedupe_messages()
+                if _chat_dupes:
+                    logger.info(
+                        "startup chat dedupe: removed %d duplicate message row(s)",
+                        _chat_dupes,
+                    )
+            except Exception:
+                logger.debug("startup chat dedupe skipped", exc_info=True)
+
+        # Keep FTS5 search fast as the archive grows: PRAGMA optimize merges
+        # fragmented FTS index b-tree pages and refreshes stats. Cheap no-op
+        # when nothing is pending; no exclusive lock (safe with live readers).
+        try:
+            from services.archive_db import query as _adb_query
+
+            _adb_query("PRAGMA optimize")
+        except Exception:
+            logger.debug("startup fts optimize skipped", exc_info=True)
+
+        # Warm the semantic-search embedding model (only when the archive
+        # already has vectors) so the first CTX search of a fresh boot skips
+        # the ~2s ONNX session + tokenizer load. Racing the embed-backfill
+        # thread's load is harmless: both hit the same module-level session
+        # cache and the loser's session is garbage-collected.
+        try:
+            from services.archive_embed import warmup_if_indexed
+
+            warmup_if_indexed()
+        except Exception:
+            logger.debug("startup embed warm skipped", exc_info=True)
+
+    threading.Thread(target=_boot_maintenance, daemon=True, name="boot-maintenance").start()
 
     # Warm the YouTube chat display-name cache: resolve a bounded batch of
     # UC channel ids (the @handle-only rows) to the names viewers see, so
@@ -174,16 +196,6 @@ async def _app_lifespan(_app: FastAPI):
             logger.debug("startup display-name warm skipped", exc_info=True)
 
     threading.Thread(target=_warm_display_names, daemon=True, name="yt-display-warm").start()
-
-    # Warm the semantic-search embedding model in the background (only when
-    # the archive already has vectors) so the first CTX search of a fresh
-    # boot skips the ~2s ONNX session + tokenizer load.
-    try:
-        from services.archive_embed import warmup_if_indexed
-
-        warmup_if_indexed()
-    except Exception:
-        logger.debug("startup embed warm skipped", exc_info=True)
 
     # Clamp dangerous settings from older builds (WPC spawns headless Chrome).
     try:
