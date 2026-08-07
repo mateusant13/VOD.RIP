@@ -59,6 +59,16 @@ class StaleGooglevideoUrl(RuntimeError):
     """Signed googlevideo URL expired (403/404/410) — re-resolve before retry."""
 
 
+class GooglevideoTruncatedBody(StaleGooglevideoUrl):
+    """googlevideo closed the body early (throttled) — the URL may still be usable.
+
+    Distinct from a genuinely expired URL: ffmpeg's reconnect/bounded-range
+    fetch can still recover a throttled URL, but it can never recover an
+    expired one. Kept a subclass so session-level fallback logic that matches
+    ``StaleGooglevideoUrl`` keeps matching it.
+    """
+
+
 # These constants are also used by ytdlp_ffmpeg and will be kept there
 # while re-exported via the shim.
 
@@ -2556,6 +2566,13 @@ _GOOGLEVIDEO_MAX_FROM_ZERO_BYTES = 16 * 1024 * 1024
 # Multi-connection fetch for large background jobs (full-VOD warm) — bounded to avoid CDN 403s.
 _GOOGLEVIDEO_PARALLEL_MIN_BYTES = 4 * 1024 * 1024
 _GOOGLEVIDEO_PARALLEL_MAX_WORKERS = 4
+# ponytail: stale-URL detection probes a 16KB span — any per-stream range cap
+# (audio ~32-160KB) clears it, while a genuinely expired URL 403s on ANY span.
+# Upgrade path: carry the per-format cap from the itag parse and probe with it.
+_GOOGLEVIDEO_STALE_PROBE_BYTES = 16 * 1024
+# Bisect depth cap: a dead URL is detected after one probe, so this only guards
+# pathological CDN behavior — never recurse past it on the same URL.
+_GOOGLEVIDEO_BISECT_MAX_DEPTH = 12
 
 
 def _range_lead_sec(url: str, byte_start: int) -> float:
@@ -2624,7 +2641,7 @@ def _fetch_googlevideo_range_once(
         # googlevideo throttled URLs close the connection mid-body (206 with a
         # short body) — a silently truncated file muxes to audio-only. Treat as
         # a failed fetch so the caller retries/bisects instead of accepting it.
-        raise StaleGooglevideoUrl(
+        raise GooglevideoTruncatedBody(
             f"googlevideo response truncated HTTP {resp.status_code} for {url[:80]}",
         )
 
@@ -2642,9 +2659,15 @@ def _fetch_googlevideo_span_resilient(
     headers: Optional[dict],
     dest: str,
     cancel_event: Optional[threading.Event] = None,
+    *,
+    _depth: int = 0,
 ) -> None:
     """Fetch a byte span; bisect on transport errors, fail fast on expired URLs."""
     b0, b1 = byte_range
+    if _depth > _GOOGLEVIDEO_BISECT_MAX_DEPTH:
+        raise StaleGooglevideoUrl(
+            f"googlevideo bisect depth exceeded for {url[:80]}"
+        ) from None
     try:
         _fetch_googlevideo_range_once(url, byte_range, headers, dest, cancel_event)
         return
@@ -2656,8 +2679,26 @@ def _fetch_googlevideo_span_resilient(
             # spans small enough to clear any cap count as genuinely expired.
             if b1 - b0 <= 64 * 1024:
                 raise StaleGooglevideoUrl(str(exc)) from exc
+            # A size-cap 403 accepts a small span; a genuinely expired URL 403s
+            # on ANY span. Probe once so dead URLs raise immediately instead of
+            # bisecting the whole span tree — every bisect level re-fetches the
+            # same expired URL (observed 5+ deep in production logs).
+            probe = f"{dest}.probe"
+            try:
+                _fetch_googlevideo_range_once(
+                    url,
+                    (b0, min(b1, b0 + _GOOGLEVIDEO_STALE_PROBE_BYTES)),
+                    headers,
+                    probe,
+                    cancel_event,
+                )
+            except Exception as probe_exc:
+                raise StaleGooglevideoUrl(str(exc)) from probe_exc
+            finally:
+                if os.path.isfile(probe):
+                    os.remove(probe)
             logger.debug(
-                "googlevideo range 403 on %d-byte span, bisecting: %s",
+                "googlevideo range 403 on %d-byte span (probe ok), bisecting: %s",
                 b1 - b0,
                 exc,
             )
@@ -2675,6 +2716,7 @@ def _fetch_googlevideo_span_resilient(
                 headers,
                 dest,
                 cancel_event,
+                _depth=_depth + 1,
             )
             _fetch_googlevideo_span_resilient(
                 url,
@@ -2682,6 +2724,7 @@ def _fetch_googlevideo_span_resilient(
                 headers,
                 part,
                 cancel_event,
+                _depth=_depth + 1,
             )
             with open(dest, "ab") as out, open(part, "rb") as src:
                 shutil.copyfileobj(src, out)
@@ -3479,11 +3522,29 @@ def _mux_dash_window_to_hls(
                 a_ss = a_future.result()
             v_input, a_input = v_local, a_local
         except Exception as exc:
+            # Never let a partial/truncated window file survive into a retry:
+            # ffmpeg would read the corrupt _v.mp4/_a.m4a ("moov atom not
+            # found") and the next mux attempt starts dirty.
+            for _partial in (v_local, a_local):
+                try:
+                    if os.path.isfile(_partial):
+                        os.remove(_partial)
+                except OSError:
+                    pass
             err = str(exc).lower()
+            if isinstance(exc, StaleGooglevideoUrl) and not isinstance(
+                exc, GooglevideoTruncatedBody
+            ):
+                # The signed URL is dead (403/404/410) — feeding it to ffmpeg
+                # only burns the mux timeout on another 403. Re-raise so the
+                # session layer re-extracts fresh googlevideo URLs and retries.
+                raise
             if isinstance(exc, StaleGooglevideoUrl) or "403" in err or "byte range" in err:
                 # ponytail: mid-VOD googlevideo range fetch often 403 — ffmpeg remote -ss
                 # with bounded ranges (googlevideo 403s open-ended Range on
-                # throttled URLs; audio caps tighter than video).
+                # throttled URLs; audio caps tighter than video). A truncated
+                # body (GooglevideoTruncatedBody) can also recover here — ffmpeg
+                # reconnects with its own bounded ranges.
                 reconnect = _ffmpeg_reconnect_args()
                 probe = ["-probesize", "8M", "-analyzeduration", "2M"]
                 v_hdr = _ffmpeg_input_headers(

@@ -65,6 +65,14 @@ class _FakeSession:
         self.vod_url = vod_url
 
 
+def _archive_file() -> str:
+    """Real file for archive_path — the preview hook skips videos whose
+    archive file is missing (evicted), so tests must point at an existing one."""
+    p = Path(tempfile.mkdtemp(prefix="ws1-arch-")) / "v.mp4"
+    p.write_bytes(b"fake media")
+    return str(p)
+
+
 def _upsert(platform: str, video_id: str, **kw) -> None:
     archive_db.upsert_video({
         "platform": platform,
@@ -72,7 +80,7 @@ def _upsert(platform: str, video_id: str, **kw) -> None:
         "channel": kw.get("channel", "chan"),
         "title": kw.get("title", "title"),
         "status": kw.get("status", "ready"),
-        "archive_path": kw.get("archive_path", "C:/__ws1__/no-file.mp4"),
+        "archive_path": kw.get("archive_path", _archive_file()),
     })
 
 
@@ -383,3 +391,16 @@ def test_preview_hook_guards():
     assert archive_db.query(
         "SELECT 1 FROM archive_jobs WHERE video_id=?", (_YT5,)
     ) == [], "the hook must respect the transcription toggle"
+
+    # archive file evicted/missing -> nothing enqueued (whisper would fail)
+    _YT6 = "evicted-vid-6"
+    archive_db.execute("DELETE FROM videos WHERE video_id=?", (_YT6,))
+    archive_db.execute("DELETE FROM transcripts WHERE video_id=?", (_YT6,))
+    _upsert("youtube", _YT6, archive_path="C:/__missing__/no-file.mp4")
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(archive_smart_enrich=True)
+        _priority_transcribe_for_preview(
+            _FakeSession("YouTube", f"https://www.youtube.com/watch?v={_YT6}"))
+    assert archive_db.query(
+        "SELECT 1 FROM archive_jobs WHERE video_id=?", (_YT6,)
+    ) == [], "a video whose archive file is missing must not get a job"

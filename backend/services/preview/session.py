@@ -3251,8 +3251,25 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
     if not _hosts_for_url(audio_url) & session.allowed_hosts:
         session.allowed_hosts.update(_hosts_for_url(audio_url))
     mux_hdrs = _merge_youtube_session_cookies(session.http_headers, session.vod_url)
+    # Stale-URL recovery: a 403 from googlevideo means the signed URL expired —
+    # retry ONLY with freshly re-extracted URLs, never the same URL twice. Two
+    # re-extract cycles max; the progressive fallback below stays last resort.
+    failed_urls: set = set()
     last_exc: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(3):  # initial mux + up to 2 fresh-URL re-extract cycles
+        if video_url in failed_urls or audio_url in failed_urls:
+            # The re-extract handed back a URL we already know is expired —
+            # re-extract again instead of burning the attempt on a dead URL.
+            if attempt >= 2:
+                break
+            _refresh_youtube_window_hls_urls(session, prefer_height=height)
+            video_url = _variant_url_for_height(session, height) or session.entry_url
+            audio_url = session.preview_audio_url or audio_url
+            mux_hdrs = _merge_youtube_session_cookies(
+                session.http_headers,
+                session.vod_url,
+            )
+            continue
         try:
             _mux_dash_window_to_hls(
                 video_url,
@@ -3279,7 +3296,8 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
             )
             _clear_youtube_window_hls_cache(session)
             out_dir.mkdir(parents=True, exist_ok=True)
-            if attempt == 0:
+            failed_urls.update(u for u in (video_url, audio_url) if u)
+            if attempt < 2:
                 _refresh_youtube_window_hls_urls(session, prefer_height=height)
                 video_url = (
                     _variant_url_for_height(session, height) or session.entry_url
@@ -3292,7 +3310,15 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
                 continue
             break
     if last_exc is not None:
-        if isinstance(last_exc, StaleGooglevideoUrl) or "403" in str(last_exc):
+        _err = str(last_exc).lower()
+        if (
+            isinstance(last_exc, StaleGooglevideoUrl)
+            or "403" in _err
+            or "moov" in _err
+            or "invalid data" in _err
+        ):
+            # moov/invalid-data = a corrupt local window file got muxed anyway;
+            # one clean retry with freshly re-extracted URLs already ran above.
             if _try_fallback_from_window_hls(session, prefer_height=height):
                 return True
         raise last_exc
