@@ -21,7 +21,15 @@ from unittest.mock import patch
 import pytest
 
 _CROSS_DB = str(Path(tempfile.mkdtemp(prefix="transcribe-cross-")) / "archive.db")
+# VODRIP_APP_DATA must point at an EMPTY scratch dir too: get_conn() runs
+# _migrate_db_to_data_dir(), which copies the DB from the appdata dir into a
+# fresh target path. If a previous module left VODRIP_APP_DATA at a real-data
+# copy (test_channel_language seeds its temp with a live-archive copy), the
+# 'fresh' scratch DB gets polluted with production rows and limit-cut searches
+# (top-N newest-first) stop surfacing this module's fixtures.
+_CROSS_APP = str(Path(tempfile.mkdtemp(prefix="transcribe-cross-app-")))
 os.environ["VODRIP_ARCHIVE_DB"] = _CROSS_DB
+os.environ["VODRIP_APP_DATA"] = _CROSS_APP
 
 from services import archive_db  # noqa: E402  (env must be set before import)
 from services import archive_transcribe  # noqa: E402
@@ -30,20 +38,25 @@ from services import archive_ytdlp  # noqa: E402
 
 @pytest.fixture(scope="module", autouse=True)
 def _cross_scratch_db():
-    # Force THIS module's scratch DB (not whatever the previous module left
-    # in env): get_conn() keys on the env path, so a batch run that imports
-    # another module last would otherwise rebind here and leak into it.
-    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    # Force THIS module's scratch DB + appdata (not whatever the previous
+    # module left in env): get_conn() keys on the env path, so a batch run
+    # that imports another module last would otherwise rebind here and leak
+    # into it; VODRIP_APP_DATA must stay on the empty scratch dir or the
+    # migration copy above pulls foreign data into the scratch DB.
+    prev_db = os.environ.get("VODRIP_ARCHIVE_DB")
+    prev_app = os.environ.get("VODRIP_APP_DATA")
     os.environ["VODRIP_ARCHIVE_DB"] = _CROSS_DB
+    os.environ["VODRIP_APP_DATA"] = _CROSS_APP
     with archive_db._lock:
         archive_db._conn = None
         archive_db._schema_ready = False
     archive_db.get_conn()
     yield
-    if prev is None:
-        os.environ.pop("VODRIP_ARCHIVE_DB", None)
-    else:
-        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    for var, prev in (("VODRIP_ARCHIVE_DB", prev_db), ("VODRIP_APP_DATA", prev_app)):
+        if prev is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = prev
     with archive_db._lock:
         archive_db._conn = None
         archive_db._schema_ready = False
