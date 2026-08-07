@@ -114,6 +114,29 @@ const ptBR: Record<string, string> = {
   'Cookie Bridge': 'Cookie Bridge',
   '● paired': '● pareado',
   '○ not paired': '○ não pareado',
+  'Official API credentials': 'Credenciais de API oficiais',
+  'Twitch Helix Token': 'Token Helix do Twitch',
+  'auto-filled from Cookie Bridge — paste only if not using the extension':
+    'preenchido automaticamente pelo Cookie Bridge — cole apenas se não usar a extensão',
+  'YouTube Data API Key': 'Chave da API de dados do YouTube',
+  'AIza… — leave empty to keep the current path':
+    'AIza… — deixe vazio para manter o caminho atual',
+  '● token configured — Helix is primary for Twitch metadata':
+    '● token configurado — Helix é primário para metadados do Twitch',
+  '○ no token — using the public GQL path':
+    '○ sem token — usando o caminho público GQL',
+  '○ no key — using the current unofficial path':
+    '○ sem chave — usando o caminho não oficial atual',
+  'quota used {used}/{limit} units today ({pct}%)':
+    'cota usada {used}/{limit} unidades hoje ({pct}%)',
+  'quota degraded — official path paused until the daily counter resets':
+    'cota degradada — caminho oficial pausado até o contador diário reiniciar',
+  'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
+    'Usa seu auth-token do Twitch (preenchido automaticamente pelo Cookie Bridge, ou colado) como bearer OAuth para chamadas oficiais da API Helix — metadados mais rápidos e confiáveis. Cai para a API pública automaticamente em qualquer falha.',
+  'When set, captions, video metadata and channel search go through the official YouTube Data API first (quota-aware, silent fallback to the current path). Historical chat always stays on the paced unofficial path. Get a key at console.cloud.google.com.':
+    'Quando definida, legendas, metadados de vídeo e busca de canais passam primeiro pela API oficial de dados do YouTube (ciente de cota, com fallback silencioso para o caminho atual). O chat histórico sempre permanece no caminho não oficial com ritmo controlado. Obtenha uma chave em console.cloud.google.com.',
+  'Hide': 'Ocultar',
+  'Show': 'Mostrar',
   'Enabled': 'Ativado',
   'Disabled': 'Desativado',
   'Local-only cookie sync — nothing leaves this machine.':
@@ -538,6 +561,29 @@ const es: Record<string, string> = {
   'Cookie Bridge': 'Cookie Bridge',
   '● paired': '● emparejado',
   '○ not paired': '○ no emparejado',
+  'Official API credentials': 'Credenciales de API oficiales',
+  'Twitch Helix Token': 'Token Helix de Twitch',
+  'auto-filled from Cookie Bridge — paste only if not using the extension':
+    'rellenado automáticamente desde Cookie Bridge — pega solo si no usas la extensión',
+  'YouTube Data API Key': 'Clave de la API de datos de YouTube',
+  'AIza… — leave empty to keep the current path':
+    'AIza… — deja vacío para mantener la ruta actual',
+  '● token configured — Helix is primary for Twitch metadata':
+    '● token configurado — Helix es primario para metadatos de Twitch',
+  '○ no token — using the public GQL path':
+    '○ sin token — usando la ruta pública GQL',
+  '○ no key — using the current unofficial path':
+    '○ sin clave — usando la ruta no oficial actual',
+  'quota used {used}/{limit} units today ({pct}%)':
+    'cuota usada {used}/{limit} unidades hoy ({pct}%)',
+  'quota degraded — official path paused until the daily counter resets':
+    'cuota degradada — ruta oficial pausada hasta que el contador diario se reinicie',
+  'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
+    'Usa tu auth-token de Twitch (rellenado automáticamente desde Cookie Bridge, o pegado) como bearer OAuth para llamadas oficiales de la API Helix — metadatos más rápidos y confiables. Vuelve a la API pública automáticamente ante cualquier fallo.',
+  'When set, captions, video metadata and channel search go through the official YouTube Data API first (quota-aware, silent fallback to the current path). Historical chat always stays on the paced unofficial path. Get a key at console.cloud.google.com.':
+    'Cuando está definida, los subtítulos, los metadatos de video y la búsqueda de canales pasan primero por la API oficial de datos de YouTube (consciente de cuota, con retroceso silencioso a la ruta actual). El chat histórico siempre permanece en la ruta no oficial con ritmo controlado. Obtén una clave en console.cloud.google.com.',
+  'Hide': 'Ocultar',
+  'Show': 'Mostrar',
   'Enabled': 'Activado',
   'Disabled': 'Desactivado',
   'Local-only cookie sync — nothing leaves this machine.': 'Sincronización de cookies solo local — nada sale de esta máquina.',

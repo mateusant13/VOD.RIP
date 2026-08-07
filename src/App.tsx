@@ -374,6 +374,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   channel_twitch_enabled: true,
   channel_youtube_enabled: true,
   channel_content_filter: 'vods',
+  twitch_helix_token: '',
+  youtube_data_api_key: '',
 };
 
 export default function App() {

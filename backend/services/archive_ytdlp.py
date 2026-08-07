@@ -668,6 +668,66 @@ def _fetch_live_chat(ydl: Any, info: dict, video_id: str) -> tuple[int, str, Opt
         return 0, "error", str(exc)
 
 
+def _ingest_via_data_api(video_id: str, job_id: str, report: dict) -> dict:
+    """Data-API-only ingest: videos.list metadata + captions.list/download.
+
+    Same report/DB contract as the yt-dlp path. Raises on ANY failure
+    (metadata or captions) — ``ingest_video`` then falls back to the full
+    yt-dlp path, so a key-only setup whose captions endpoints get
+    OAuth-rejected (403) still lands captions via the unofficial path.
+    """
+    from services import youtube_data_api  # lazy: keeps module import light
+
+    meta = youtube_data_api.video_metadata(video_id)
+    title = str(meta.get("title") or "")
+    channel = str(meta.get("channel") or "")
+    started_at = meta.get("started_at")
+    duration = meta.get("duration_sec")
+    key = _canonical_key(title, started_at)
+    report.update({
+        "video_id": video_id,
+        "title": title,
+        "channel": channel,
+        "started_at": started_at,
+        "duration_sec": duration,
+        "canonical_key": key,
+    })
+
+    # Idempotent re-ingest: drop any earlier messages/transcripts first.
+    _db_write(_clear_video_data, video_id)
+    if key:
+        _db_write(archive_db.set_alias, PLATFORM, video_id, key, note="auto")
+    _db_write(archive_db.upsert_video, {
+        "platform": PLATFORM,
+        "video_id": video_id,
+        "channel": channel or "unknown",
+        "title": title or video_id,
+        "started_at": started_at,
+        "duration_sec": duration,
+        "archive_path": None,
+        "canonical_key": key or None,
+        "status": "known",
+    })
+
+    tracks = youtube_data_api.fetch_captions(
+        video_id, prefer=_CAPTION_LANG_PREF, families=("pt", "en")
+    )
+    if tracks:
+        report["caption_lang"] = tracks[0][0]
+    for lang, _kind, srt in tracks:
+        segments = youtube_data_api.parse_srt(srt)
+        if segments:
+            _db_write(
+                archive_db.insert_transcript,
+                PLATFORM, video_id, segments,
+                lang=lang,
+            )
+            report["transcript_segments"] += len(segments)
+
+    _db_write(archive_db.update_job, job_id, status="done", progress=1.0)
+    return report
+
+
 def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     """Ingest one YouTube video: metadata + captions.
 
@@ -700,6 +760,19 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
         "caption_error": None,
     }
     own_dir = temp_dir is None
+    # Official-API hybrid (issue #4): with a Data API key (and quota OK)
+    # the metadata + caption ingest goes through videos.list +
+    # captions.list/download — no yt-dlp extract, no bot-gate exposure.
+    # Any failure (bad key, quota, OAuth-only captions) silently falls back
+    # to the full yt-dlp path below. Historical chat is never fetched here
+    # either way (the scheduler enqueues the paced unofficial chat job).
+    try:
+        from services.youtube_data_api import available as _yda_available
+
+        if _yda_available():
+            return _ingest_via_data_api(video_id, job_id, report)
+    except Exception as exc:
+        logger.info("data api ingest failed for %s — yt-dlp fallback: %s", video_id, exc)
     outdir = Path(tempfile.mkdtemp(prefix=f"yt-{video_id}-")) if own_dir else Path(temp_dir)
     try:
         with _guarded_youtube_dl(outdir, video_id=video_id) as ydl:

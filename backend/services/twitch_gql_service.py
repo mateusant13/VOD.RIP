@@ -616,12 +616,26 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
 
 
 def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Return recent VODs/highlights/uploads for a Twitch channel login."""
+    """Return recent VODs/highlights/uploads for a Twitch channel login.
+
+    Helix is PRIMARY when settings.twitch_helix_token is set (silent GQL
+    fallback on any Helix failure — issue #4); GQL only when no token.
+    """
     login = (login or "").strip().lower()
     if not login:
         return []
 
     limit = max(1, min(int(limit), 100))
+
+    # Official-API hybrid: helix first, silent GQL fallback. No token
+    # validation here — the first call exercises it (latency contract).
+    try:
+        from services.twitch_helix_service import list_channel_videos_sync as _helix_list
+
+        return _helix_list(login, limit=limit)
+    except Exception as exc:
+        logger.debug("helix list failed for %r, falling back to GQL: %s", login, exc)
+
     out: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
 
@@ -870,11 +884,50 @@ def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dic
         return None, empty_headers, []
 
 
+def _attach_playback_estimate(payload: Dict[str, Any], vid: str) -> None:
+    """Fast path: GQL playback token + usher master (~0.6s) instead of the
+    yt-dlp probe (~4.7s). Variants carry tbr/fps so enrich_info_dict needs
+    no further network. Fall back to the yt-dlp probe on any failure."""
+    try:
+        m3u8_url, m3u8_headers, formats = get_vod_playback_sync(vid)
+        master_parsed = bool(formats)
+    except Exception as exc:
+        logger.debug("fast VOD playback failed for %s, using yt-dlp probe: %s", vid, exc)
+        m3u8_url, m3u8_headers, formats = _twitch_vod_playback_for_estimate(vid)
+        master_parsed = False
+    from services.size_estimate import enrich_info_dict
+
+    enrich_info_dict(
+        payload,
+        formats=formats,
+        # Fast path already fetched+parsed the master — don't fetch it again.
+        m3u8_url=None if master_parsed else m3u8_url,
+        m3u8_headers=m3u8_headers,
+        is_clip=False,
+    )
+
+
 def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
-    """Return metadata for a single Twitch VOD via GQL (~0.5-2s)."""
+    """Return metadata for a single Twitch VOD.
+
+    Helix is PRIMARY when settings.twitch_helix_token is set (silent GQL
+    fallback on any error / rate limit / missing VOD — issue #4); GQL only
+    when no token.
+    """
     vid = _extract_video_id(url_or_id)
     if not vid:
         raise ValueError(f"Not a Twitch VOD URL or id: {url_or_id}")
+
+    # Official-API hybrid: helix first. The metadata fetch swaps, the
+    # playback estimate is shared with the GQL path below.
+    try:
+        from services.twitch_helix_service import video_metadata_sync
+
+        payload = video_metadata_sync(vid)
+        _attach_playback_estimate(payload, vid)
+        return payload
+    except Exception as exc:
+        logger.debug("helix info failed for %s, falling back to GQL: %s", vid, exc)
 
     data = _gql_request(VIDEO_INFO_QUERY, {"id": vid})
     node = data.get("video")
@@ -885,8 +938,6 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
     game = node.get("game") or {}
     login = owner.get("login") or owner.get("displayName")
     duration = node.get("lengthSeconds")
-
-    from services.size_estimate import enrich_info_dict
 
     payload = {
         "id": str(node.get("id") or vid),
@@ -903,24 +954,7 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
         "platform": "Twitch",
         "created_at": node.get("createdAt"),
     }
-    # Fast path: GQL playback token + usher master (~0.6s) instead of the
-    # yt-dlp probe (~4.7s). Variants carry tbr/fps so enrich_info_dict needs
-    # no further network. Fall back to the yt-dlp probe on any failure.
-    try:
-        m3u8_url, m3u8_headers, formats = get_vod_playback_sync(vid)
-        master_parsed = bool(formats)
-    except Exception as exc:
-        logger.debug("fast VOD playback failed for %s, using yt-dlp probe: %s", vid, exc)
-        m3u8_url, m3u8_headers, formats = _twitch_vod_playback_for_estimate(vid)
-        master_parsed = False
-    enrich_info_dict(
-        payload,
-        formats=formats,
-        # Fast path already fetched+parsed the master — don't fetch it again.
-        m3u8_url=None if master_parsed else m3u8_url,
-        m3u8_headers=m3u8_headers,
-        is_clip=False,
-    )
+    _attach_playback_estimate(payload, vid)
     return payload
 
 

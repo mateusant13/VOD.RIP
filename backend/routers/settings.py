@@ -4,6 +4,7 @@ Settings routes — GET/POST /api/settings, /api/pick-folder, /api/open-folder.
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException
 from models.schemas import AppSettings, OpenFolderRequest, SettingsUpdate
@@ -199,9 +200,44 @@ async def update_settings(update: SettingsUpdate):
         # so the frontend re-seeds from the system language).
         val = (update.ui_language or "").strip()
         current.ui_language = val if val in ("en", "pt-BR", "es") else ""
+    if update.twitch_helix_token is not None:
+        # Official-API hybrid: a save that touches the token stamps the
+        # write time so the cookie auto-lift never clobbers a fresh paste.
+        val = (update.twitch_helix_token or "").strip()
+        if val != (current.twitch_helix_token or ""):
+            current.twitch_helix_token = val
+            current.twitch_helix_token_updated_at = time.time()
+    if update.youtube_data_api_key is not None:
+        current.youtube_data_api_key = (update.youtube_data_api_key or "").strip()
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
+    # Auto-lift: refresh the helix token from the cookie bridge (zero manual
+    # steps for extension users). Never clobbers a token the save just wrote
+    # (updated_at is fresh) — fills the field only when empty or the cookie
+    # export is newer. Local I/O only, never a network call.
+    try:
+        from services.twitch_helix_service import auto_lift_token
+
+        if auto_lift_token():
+            current = settings_mgr.get()
+    except Exception:
+        logger.debug("helix token auto-lift skipped", exc_info=True)
     return current
+
+
+@router.get("/api/settings/official-apis-status")
+async def official_apis_status():
+    """Official-API credential + quota state for the Settings UI.
+
+    The YouTube quota counter is per-key daily usage; when degraded the UI
+    warns that the official path is bypassed until the counter resets."""
+    from services import youtube_data_api
+
+    s = settings_mgr.get()
+    return {
+        "twitch_helix_token_set": bool((getattr(s, "twitch_helix_token", "") or "").strip()),
+        **youtube_data_api.quota_status(),
+    }
 
 
 @router.post("/api/pick-folder")
