@@ -20,6 +20,12 @@ Design decisions:
     seconds (default 600) without use. Multi-copy mode (budget > 1 — CPU
     workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives each pool thread
     its own model so inference runs in parallel.
+  * Hybrid pool (CUDA hosts): the worker runs the GPU copy AND CPU threads
+    at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 1)
+    plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2; 0 disables the CPU
+    side and restores the exclusive-GPU worker). Each pool thread is pinned
+    to its slot's device at thread start, so CPU threads never compete for
+    VRAM. CPU-only hosts are unchanged (WORKERS, default 2).
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
     cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
     so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
@@ -44,6 +50,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -61,7 +68,7 @@ SAMPLE_RATE = 16000
 
 # Env knobs (all optional).
 LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
-WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"
+WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"  # CPU threads; 0 = GPU-only on CUDA hosts
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
 BEAM_ENV = "VODRIP_WHISPER_BEAM"
@@ -232,29 +239,58 @@ def _gpu_copies() -> int:
     return _ram_worker_clamp(configured, _GPU_COPY_RSS_EST)
 
 
-def _worker_budget() -> int:
-    """Max concurrent transcribe jobs: GPU model copies or CPU threads.
+def _cpu_worker_ceiling() -> int:
+    """VODRIP_TRANSCRIBE_WORKERS (default 2); 0 = CPU side OFF on CUDA hosts.
 
-    The env knobs are CEILINGS, never floors: VODRIP_TRANSCRIBE_WORKERS
-    (CPU, default 2) / VODRIP_TRANSCRIBE_GPU_COPIES (CUDA, default 1) cap
-    the budget, and a system-RAM clamp (_ram_worker_clamp, 20% headroom)
-    can only reduce it further. env == 1 always wins so the legacy
-    single-model path is exact; 0/absent -> auto (CPU 2, GPU 1).
+    On CUDA hosts 0 restores the exclusive-GPU worker; on CPU-only hosts 0
+    means auto (2), matching the legacy CPU budget."""
+    try:
+        workers = int(os.environ.get(WORKERS_ENV, "2") or "2")
+    except ValueError:
+        workers = 2
+    return workers if workers > 0 else 0
 
-    budget == 1 is the EXACT legacy path: one process-global model,
-    _infer_lock serializing inference. budget > 1 (opt-in GPU copies, or the
-    CPU default) gives each pool thread its own model copy so inference
-    truly runs in parallel."""
+
+def _worker_plan() -> list[tuple[str, str]]:
+    """(device, compute_type) slots for the transcribe pool.
+
+    CUDA host (not forced off): GPU copies first (VODRIP_TRANSCRIBE_GPU_COPIES,
+    default 1, VRAM+RAM clamped) then CPU threads (VODRIP_TRANSCRIBE_WORKERS,
+    default 2; 0 disables the CPU side). CPU-only host: [("cpu","int8")] *
+    WORKERS (default 2). Every CPU slot is RAM-clamped; the clamp is
+    conservative on purpose because CPU and GPU copies share the same host
+    RAM (ponytail: per-slot RSS is an estimate — if a box OOMs, lower
+    VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES).
+
+    A plan of exactly [("cuda","float16")] (gpu_slots==1 and cpu_slots==0) is
+    the legacy single-global-model path: budget 1, _infer_lock serializing
+    inference. Any other plan -> multi-copy mode (per-thread model copies)."""
     device, _ = _effective_device()
     if device == "cpu":
-        try:
-            workers = int(os.environ.get(WORKERS_ENV, "2") or "2")
-        except ValueError:
-            return 2
-        if workers <= 0:
-            workers = 2  # 0 == auto (same as absent)
-        return _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
-    return _gpu_copies()
+        workers = _cpu_worker_ceiling() or 2  # 0 == auto on CPU-only hosts
+        return [("cpu", "int8")] * _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
+    gpu_slots = _gpu_copies()
+    cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
+    return [("cuda", "float16")] * gpu_slots + [("cpu", "int8")] * cpu_slots
+
+
+def _worker_budget() -> int:
+    """Max concurrent transcribe jobs: len(_worker_plan()).
+
+    1 on a CUDA host with VODRIP_TRANSCRIBE_WORKERS=0 (the exact legacy
+    single-model path), 3 on a default hybrid CUDA host (1 GPU copy + 2 CPU
+    threads), WORKERS/GPU_COPIES ceilings and RAM clamps as before."""
+    return len(_worker_plan())
+
+
+def _pool_plan(max_workers: Optional[int]) -> list[tuple[str, str]]:
+    """The worker pool's device plan for run_worker.
+
+    max_workers overrides the natural plan for tests/launchers: all threads
+    on the effective device (legacy semantics — the budget was a raw count)."""
+    if max_workers is None:
+        return _worker_plan()
+    return [_effective_device()] * max(1, int(max_workers))
 
 
 # --- model cache ----------------------------------------------------------
@@ -411,9 +447,12 @@ def _maybe_close_idle_model() -> None:
 # the same per-thread keying CPython's threading.local uses internally.
 # Model CREATION is serialized by _model_lock (shared hub download);
 # inference never takes it. A thread whose CUDA inference OOM'd marks itself
-# cpu_fallback and reloads on CPU — only that thread degrades.
+# cpu_fallback and reloads on CPU — only that thread degrades. In hybrid
+# mode _worker_thread_init pins each pool thread to its plan slot (GPU or
+# CPU) at thread start, so a pinned CPU thread loads on CPU even though the
+# box has a GPU.
 
-_multi_tls = threading.local()  # per-thread: .active, .cpu_fallback
+_multi_tls = threading.local()  # per-thread: .active, .cpu_fallback, .pin
 
 
 class _ThreadModelSlot:
@@ -440,6 +479,27 @@ def _thread_mark_cpu_fallback() -> None:
     _multi_tls.cpu_fallback = True
 
 
+_pool_thread_seq = count()  # plan-slot index handed to each new pool thread
+
+
+def _thread_pin() -> Optional[tuple[str, str]]:
+    """The calling pool thread's pinned device slot, or None.
+
+    Set once per pool thread by _worker_thread_init at thread creation;
+    None for direct callers and the legacy single-model path (they fall
+    back to _effective_device())."""
+    return getattr(_multi_tls, "pin", None)
+
+
+def _worker_thread_init(plan: list[tuple[str, str]]) -> None:
+    """ThreadPoolExecutor initializer — pin this pool thread to its slot.
+
+    Threads are created one at a time in submission order, so thread i gets
+    plan[i % len(plan)] (the modulo guards a second pool in the same
+    process, whose threads keep counting past the first pool's)."""
+    _multi_tls.pin = plan[next(_pool_thread_seq) % len(plan)]
+
+
 def _thread_slot() -> _ThreadModelSlot:
     """The calling thread's model slot, created on first use."""
     tid = threading.get_ident()
@@ -457,8 +517,10 @@ def _thread_model() -> Any:
     """Lazy per-thread WhisperModel copy (multi-copy mode only).
 
     Mirrors _get_model's lazy load, keyed to the calling thread; creation is
-    serialized by _model_lock, inference is not. A thread marked cpu_fallback
-    loads on CPU even when CUDA is healthy (its copy OOM'd earlier)."""
+    serialized by _model_lock, inference is not. The thread loads on its
+    pinned device slot when one was set by the pool initializer (hybrid
+    mode), else on _effective_device(). A thread marked cpu_fallback loads
+    on CPU even when CUDA is healthy (its copy OOM'd earlier)."""
     slot = _thread_slot()
     name = model_name()
     if slot.model is not None and slot.model_name == name:
@@ -472,7 +534,7 @@ def _thread_model() -> Any:
         _ensure_cuda_libs()
         from faster_whisper import WhisperModel
 
-        device, compute_type = _effective_device()
+        device, compute_type = _thread_pin() or _effective_device()
         if _thread_cpu_fallback() and device == "cuda":
             device, compute_type = "cpu", "int8"
         t0 = time.monotonic()
@@ -1814,19 +1876,30 @@ def run_worker(
 ) -> None:
     """Blocking worker loop over the transcribe queue.
 
-    Parallelism budget: _worker_budget() — 1 on CUDA by default (the legacy
-    single-global-model path with _infer_lock, byte-for-byte today's
-    behavior); >1 (CPU workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives
-    each pool thread its own model copy so inference truly runs in parallel.
-    max_workers overrides the budget (used by tests/launchers).
+    Hybrid pool: the plan (_worker_plan()) is [("cuda","float16")]*gpu_slots +
+    [("cpu","int8")]*cpu_slots on CUDA hosts (GPU copy + default 2 CPU
+    threads), [("cpu","int8")]*2 on CPU-only hosts. Each pool thread is
+    pinned to its slot by the executor initializer, so a pinned CPU thread
+    loads its model on CPU even though the box has a GPU. The shared queue
+    stays FIFO (_claim_next_job) with no duration routing: the GPU thread
+    claims the next job when it finishes one, CPU threads pick up queued
+    VODs in the meantime.
+
+    A plan of exactly one CUDA slot (VODRIP_TRANSCRIBE_WORKERS=0) is the
+    legacy single-global-model path: budget 1, _infer_lock, the global
+    _current_model(). max_workers overrides the plan for tests/launchers
+    (all threads on the effective device, legacy raw-count semantics).
     """
-    device, compute_type = _effective_device()
-    budget = _worker_budget() if max_workers is None else max(1, int(max_workers))
+    plan = _pool_plan(max_workers)
+    budget = len(plan)
     multi = budget > 1
-    logger.info("archive transcribe worker: device=%s compute_type=%s workers=%d",
-                device, compute_type, budget)
+    logger.info("archive transcribe worker: plan=[%s] workers=%d",
+                ", ".join(f"{d}/{ct}" for d, ct in plan), budget)
     try:
-        with ThreadPoolExecutor(max_workers=budget, thread_name_prefix="transcribe") as pool:
+        with ThreadPoolExecutor(
+            max_workers=budget, thread_name_prefix="transcribe",
+            initializer=_worker_thread_init, initargs=(plan,),
+        ) as pool:
             # Per-slot claim loop: each finished future frees a slot and a
             # refill claims the next job immediately. The old await-all
             # barrier idled every worker behind the slowest job of the batch
@@ -1961,3 +2034,35 @@ finally:
         os.environ.pop(WORKERS_ENV, None)
     else:
         os.environ[WORKERS_ENV] = _saved_workers
+# hybrid pool plan: CUDA host -> 1 GPU copy + 2 CPU threads by default;
+# WORKERS=0 disables the CPU side (the exact legacy single-model plan);
+# WORKERS=3 -> 1 GPU + 3 CPU slots. RAM is patched ample so the clamp never
+# binds; GPU_COPIES stays at its default 1 so no VRAM probe runs.
+_saved_plan_ov, _saved_plan_w, _saved_plan_g = (
+    _device_override, os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
+)
+try:
+    _device_override = ("cuda", "float16")
+    _free_system_ram_bytes = lambda: 64 * 1024 ** 3
+    os.environ.pop(WORKERS_ENV, None)
+    os.environ.pop(GPU_COPIES_ENV, None)
+    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
+        "CUDA host defaults to 1 GPU copy + 2 CPU threads"
+    )
+    os.environ[WORKERS_ENV] = "0"
+    assert _worker_plan() == [("cuda", "float16")], "WORKERS=0 -> exclusive-GPU plan"
+    os.environ[WORKERS_ENV] = "3"
+    assert _worker_plan() == [
+        ("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
+    ], "WORKERS=3 -> 1 GPU + 3 CPU slots"
+finally:
+    _device_override = _saved_plan_ov
+    _free_system_ram_bytes = _saved_free_ram
+    if _saved_plan_w is None:
+        os.environ.pop(WORKERS_ENV, None)
+    else:
+        os.environ[WORKERS_ENV] = _saved_plan_w
+    if _saved_plan_g is None:
+        os.environ.pop(GPU_COPIES_ENV, None)
+    else:
+        os.environ[GPU_COPIES_ENV] = _saved_plan_g
