@@ -131,6 +131,7 @@
       () =>
         find([
           '[data-a-target="clip-editor"]',
+          'input[data-a-target="tw-input"]',
           'input[placeholder*="title" i]',
           'textarea[placeholder*="title" i]',
           'button[data-a-target*="publish" i]',
@@ -153,6 +154,7 @@
     // 4. Title.
     if (title) {
       const input = find([
+        'input[data-a-target="tw-input"]',
         '[data-a-target="clip-editor-title-input"]',
         'input[placeholder*="title" i]',
         'textarea[placeholder*="title" i]',
@@ -171,13 +173,18 @@
     // 5. Publish — only when a title was set (the site can reject empty titles).
     if (title) {
       const publish = await waitFor(
-        () =>
-          find([
+        () => {
+          const byText = [...document.querySelectorAll('button')].find((b) =>
+            /save clip|publish|salvar clip|publicar/i.test((b.innerText || '').trim()),
+          );
+          if (byText) return byText;
+          return find([
             '[data-a-target="clip-publish-button"]',
             'button[data-a-target*="publish" i]',
             'button[aria-label*="publish" i]',
             'button[class*="publish" i]',
-          ]),
+          ]);
+        },
         10000,
         500,
       );
