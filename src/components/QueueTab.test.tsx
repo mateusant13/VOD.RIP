@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
-import QueueTab from './QueueTab';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import QueueTab, { type ArchiveJobRow } from './QueueTab';
 import type { DownloadState } from '../types';
 
 const DL = (over: Partial<DownloadState> = {}): DownloadState => ({
@@ -28,7 +28,7 @@ function renderTab(over: { queue?: DownloadState[]; history?: DownloadState[] } 
     onOpenFolder: vi.fn(),
     onRefresh: vi.fn(),
   };
-  render(
+  const { unmount } = render(
     <QueueTab
       queueDownloads={over.queue ?? [DL()]}
       historyDownloads={over.history ?? [DL({ download_id: 'dl-2', title: 'VOD B', status: 'Completed' })]}
@@ -36,7 +36,47 @@ function renderTab(over: { queue?: DownloadState[]; history?: DownloadState[] } 
       basename={(p) => p.split('\\').pop() ?? p}
     />,
   );
-  return handlers;
+  return { ...handlers, unmount };
+}
+
+/** One GET /api/archive/jobs row. */
+const JOB = (over: Partial<ArchiveJobRow> = {}): ArchiveJobRow => ({
+  id: 'tr-1',
+  kind: 'transcribe',
+  platform: 'twitch',
+  video_id: '1001',
+  status: 'running',
+  progress: 0.42,
+  error: null,
+  created_at: '2026-08-08T00:00:00Z',
+  updated_at: '2026-08-08T00:00:01Z',
+  heartbeat: '2026-08-08T00:00:01Z',
+  title: 'My VOD',
+  ...over,
+});
+
+/** Stub fetch: jobs endpoint serves `jobs` (or 500); everything else is the
+ *  Twitch clip history (bare array — apiGet shape). */
+function mockJobsFetch(jobs: ArchiveJobRow[], status = 200) {
+  const fn = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/api/archive/jobs')) {
+      return new Response(JSON.stringify(status >= 400 ? { detail: 'boom' } : { jobs }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  vi.stubGlobal('fetch', fn);
+  return fn;
+}
+
+function jobsFetchCalls(fn: ReturnType<typeof vi.fn>) {
+  return fn.mock.calls.filter((c) => String(c[0]).includes('/api/archive/jobs'));
 }
 
 describe('QueueTab', () => {
@@ -118,5 +158,99 @@ describe('QueueTab', () => {
     renderTab({ queue: [], history: [] });
     expect(screen.getByText('NO DOWNLOADS IN QUEUE.')).toBeInTheDocument();
     expect(screen.getByText('NO COMPLETED DOWNLOADS YET.')).toBeInTheDocument();
+  });
+
+  it('polls /api/archive/jobs and renders running transcribe/chat jobs with progress', async () => {
+    vi.useFakeTimers();
+    try {
+      const fn = mockJobsFetch([
+        JOB(),
+        JOB({ id: 'ch-1', kind: 'chat', status: 'queued', progress: 0, title: '' }),
+      ]);
+      renderTab({ queue: [], history: [] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // First poll lands: kind labels, status, platform icon + title.
+      expect(String(jobsFetchCalls(fn)[0][0])).toContain('/api/archive/jobs');
+      expect(screen.getByText('Transcription')).toBeTruthy();
+      expect(screen.getByText('My VOD')).toBeTruthy();
+      expect(screen.getByText('Running')).toBeTruthy();
+      expect(screen.getByText('Chat backfill')).toBeTruthy();
+      expect(screen.getByText('Queued')).toBeTruthy();
+      // Transcribe jobs carry a progress bar + %; chat jobs do not.
+      const bar = screen.getByRole('progressbar');
+      expect(bar.getAttribute('aria-valuenow')).toBe('42');
+      expect(screen.getByText('42%')).toBeTruthy();
+      expect(screen.queryByText('0%')).toBeNull();
+      // Polls again after 3s while the tab is open.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(jobsFetchCalls(fn).length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('hides done jobs by default; the toggle reveals them', async () => {
+    vi.useFakeTimers();
+    try {
+      mockJobsFetch([
+        JOB({ id: 'tr-done', status: 'done', progress: 1 }),
+        JOB({ id: 'tr-run', status: 'running', progress: 0.2 }),
+      ]);
+      renderTab({ queue: [], history: [] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.queryByText('Done')).toBeNull();
+      fireEvent.click(screen.getByRole('checkbox'));
+      expect(screen.getByText('Done')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('survives a 500 from the jobs endpoint and retries on the next tick', async () => {
+    vi.useFakeTimers();
+    try {
+      const fn = mockJobsFetch([], 500);
+      renderTab({ queue: [], history: [] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // 500 → no section, no crash.
+      expect(screen.queryByText('Background jobs')).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(jobsFetchCalls(fn).length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('stops polling after unmount', async () => {
+    vi.useFakeTimers();
+    try {
+      const fn = mockJobsFetch([JOB()]);
+      const { unmount } = renderTab({ queue: [], history: [] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(jobsFetchCalls(fn).length).toBe(1);
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(9000);
+      });
+      expect(jobsFetchCalls(fn).length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 });

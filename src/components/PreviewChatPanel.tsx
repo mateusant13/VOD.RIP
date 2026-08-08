@@ -34,7 +34,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
-import { useI18n } from '../i18n';
+import { t, useI18n } from '../i18n';
 import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
@@ -315,10 +315,31 @@ const EventRow = memo(function EventRow({
   );
 });
 
-function EmptyState({ text }: { text: string }) {
+function EmptyState({ text, progress }: { text: string; progress?: number }) {
+  const hasProgress = progress != null && Number.isFinite(progress);
   return (
-    <div className="flex-1 min-h-0 flex items-center justify-center px-4" data-panel-empty>
+    <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-2 px-4" data-panel-empty>
       <p className="text-[10px] font-mono text-zinc-500 text-center leading-relaxed">{text}</p>
+      {hasProgress && (
+        <div
+          className="flex items-center gap-2 w-44"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress * 100)}
+          aria-label={t('progress.backfill')}
+        >
+          <div className="h-1 flex-1 rounded bg-zinc-800 overflow-hidden">
+            <div
+              className="h-full bg-[#53fc18] transition-[width] duration-300"
+              style={{ width: `${Math.min(100, Math.max(0, Math.round(progress * 100)))}%` }}
+            />
+          </div>
+          <span className="text-[9px] font-mono text-zinc-500 tabular-nums shrink-0">
+            {Math.round(progress * 100)}%
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -1030,6 +1051,9 @@ export function PreviewChatPanel({
                     payload.backfill === 'running'
                       ? t('Loading chat…')
                       : t('No archived chat for this video.')
+                  }
+                  progress={
+                    payload.backfill === 'running' ? payload.backfill_progress : undefined
                   }
                 />
               )}
