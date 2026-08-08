@@ -2959,7 +2959,7 @@ def run_worker(
                     pending[pool.submit(_process_job, job, multi=multi)] = job
 
             _refill()
-            while True:
+            while not _WORKER_STOP.is_set():
                 _maybe_close_idle_model()
                 archive_db.worker_heartbeat("transcribe")
                 if not pending:
@@ -2984,13 +2984,42 @@ def run_worker(
         close_model()
 
 
+# In-process worker lifecycle: the app lifespan starts the loop and MUST be
+# able to stop it on shutdown. Tests that boot the app via TestClient reuse
+# the same module, so an un-stopped worker would keep claiming jobs from the
+# shared test DB for the whole pytest session (and hold the _BACKFILL_SEM
+# lanes) — stop_worker() is called by the lifespan teardown.
+_WORKER_STOP = threading.Event()
+_worker_thread: Optional[threading.Thread] = None
+_worker_lock = threading.Lock()
+
+
 def start_worker(**kwargs: Any) -> threading.Thread:
     """Spawn the worker loop in a daemon thread (never blocks the caller)."""
+    global _worker_thread
+    _WORKER_STOP.clear()
     thread = threading.Thread(
         target=run_worker, kwargs=kwargs, name="archive-transcribe", daemon=True
     )
+    with _worker_lock:
+        _worker_thread = thread
     thread.start()
     return thread
+
+
+def stop_worker(*, timeout: float = 6.0) -> None:
+    """Signal the in-process worker loop to exit and wait for it.
+
+    Idempotent; safe to call when no worker was started (e.g. a detached
+    worker owns the queue instead). The running job, if any, finishes
+    first — the loop only stops claiming new work.
+    """
+    _WORKER_STOP.set()
+    with _worker_lock:
+        thread = _worker_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+    _WORKER_STOP.clear()
 
 
 # ── GPU sherpa auto-provision (mirrors youtube_ytdlp_update) ────────────

@@ -708,6 +708,12 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive chat watchdog stop failed", exc_info=True)
     try:
+        from services.archive_transcribe import stop_worker
+
+        stop_worker(timeout=6.0)
+    except Exception:
+        logger.debug("Archive transcribe worker stop failed", exc_info=True)
+    try:
         from services.shutdown_util import shutdown_downloads_and_children
 
         logger.info("API shutdown — cancelling downloads and killing ffmpeg children")

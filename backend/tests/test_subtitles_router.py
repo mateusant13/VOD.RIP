@@ -12,6 +12,7 @@ the router) never touches the real %APPDATA% DB.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from contextlib import contextmanager
 
@@ -87,6 +88,10 @@ class _FakeYdl:
         self._extract_delay = extract_delay
         self.extract_calls = 0
         self.urlopen_calls: list[str] = []
+        # The sync router runs in a Starlette threadpool worker, not the
+        # test's own thread; first urlopen identifies that worker so the
+        # 429-retry test can count only sleeps from the request thread.
+        self.handler_thread: int | None = None
 
     def extract_info(self, url, download=True):
         self.extract_calls += 1
@@ -95,6 +100,8 @@ class _FakeYdl:
         return self._info
 
     def urlopen(self, url: str):
+        if self.handler_thread is None:
+            self.handler_thread = threading.get_ident()
         self.urlopen_calls.append(url)
         try:
             got = self._payload_by_url[url]
@@ -123,6 +130,16 @@ async def client():
 def _clear_cache() -> None:
     with subtitles_router._subs_cache._lock:
         subtitles_router._subs_cache._data.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_subs_cache():
+    """Order-proof: every test shares the module-global _subs_cache and the
+    same video URL; a test that fails before its trailing _clear_cache()
+    would otherwise poison the next one ('pt' served where 'en' expected).
+    Clearing up front makes each test deterministic regardless of order."""
+    _clear_cache()
+    yield
 
 
 async def test_returns_timed_rows_for_best_lang(client, monkeypatch):
@@ -217,8 +234,17 @@ async def test_skips_merged_and_junk_codes(client, monkeypatch):
 
 
 async def test_vtt_429_retries_then_falls_back_to_json3(client, monkeypatch):
+    # Only count sleeps from the request's own threadpool worker: the patch
+    # is on the module-global `time`, so a background thread (e.g. a real
+    # preview backfill from an earlier suite) sleeping mid-test would
+    # inflate the count and make this order-dependent. The worker thread is
+    # captured by the fake on its first urlopen.
     sleeps: list[float] = []
-    monkeypatch.setattr(subtitles_router.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        subtitles_router.time, "sleep",
+        lambda sec: sleeps.append(sec)
+        if threading.get_ident() == fake.handler_thread else None,
+    )
     info = _info(auto={"pt": [
         {"ext": "vtt", "url": "http://x/pt.vtt"},
         {"ext": "json3", "url": "http://x/pt.json3"},

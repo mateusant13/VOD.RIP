@@ -7,6 +7,7 @@ chat-fetch pacing helper. DB isolation: fresh VODRIP_ARCHIVE_DB per module.
 import os
 import pathlib
 import tempfile
+import threading
 import time
 
 _DB = pathlib.Path(tempfile.mkdtemp(prefix="yt-gate-")) / "archive.db"
@@ -229,6 +230,10 @@ def test_interactive_backfill_busy_fails_fast(monkeypatch):
     interactive kick never queues behind it — non-blocking acquire, instant
     'busy' status, job row requeued for the worker."""
     _reset_gate()
+    # Order-proof: a background thread from an earlier test may still hold
+    # slots on the module-global semaphore; a fresh one makes this test
+    # deterministic regardless of what ran before it.
+    monkeypatch.setattr(atw, "_BACKFILL_SEM", threading.BoundedSemaphore(2))
     held = []
     try:
         for _ in range(2):
