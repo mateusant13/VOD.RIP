@@ -636,20 +636,6 @@ async def session_cookies_pull(platform: str):
     )
 
 
-@router.get("/api/session/cookies/status")
-async def session_cookies_status():
-    gate_sec = gate_remaining_sec()
-    return {
-        "paired": bool(_paired_token()),
-        "enabled": bool(settings_mgr.get().cookie_bridge_enabled),
-        "platforms": cookie_store.status(),
-        # YouTube bot-gate cooldown state — read-only mirror of yt_gate; the
-        # any-tab banner polls these. Gating/freeze logic stays in yt_gate.
-        "youtube_gate_active": gate_sec > 0,
-        "youtube_gate_remaining_sec": gate_sec,
-    }
-
-
 @router.get("/api/session/cookies/token")
 async def session_cookies_token():
     return {"token": _paired_token()}
