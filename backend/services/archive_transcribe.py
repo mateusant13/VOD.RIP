@@ -607,8 +607,10 @@ def _ensure_cuda_libs() -> None:
     ctranslate2 loads cublas64_12.dll lazily at first CUDA inference, and the
     sherpa-onnx +cuda wheels' bundled onnxruntime_providers_cuda.dll loads
     cublasLt64_12/cufft64_11/curand64_10/cudnn64_9 at session create —
-    machines with a CUDA-13-era driver but no full CUDA 12 toolkit otherwise
-    fail with "Library ... is not found". Set VODRIP_NO_CUDA_LIBS to skip.
+    cublasLt64_12 in turn loads nvjitlink64_12.dll, so the nvidia-nvjitlink-cu12
+    wheel's bin dir must be on PATH too. Machines with a CUDA-13-era driver but
+    no full CUDA 12 toolkit otherwise fail with "Library ... is not found".
+    Set VODRIP_NO_CUDA_LIBS to skip.
     """
     if os.environ.get("VODRIP_NO_CUDA_LIBS"):
         return
@@ -616,7 +618,7 @@ def _ensure_cuda_libs() -> None:
         import site as _site
     except Exception:
         return
-    for lib in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn"):
+    for lib in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn", "nvjitlink"):
         try:
             for root in _site.getsitepackages():
                 d = Path(root) / "nvidia" / lib / "bin"

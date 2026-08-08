@@ -56,6 +56,7 @@ panns-inference>=0.1.1
 # The +cuda wheel's onnxruntime CUDA EP loads cublasLt64_12/cufft64_11/
 # curand64_10/cudnn64_9 from PATH at session create — cublas + cuda-runtime
 # are already pinned above (faster-whisper/ctranslate2), add the rest on GPU
-# hosts only (archive_transcribe._ensure_cuda_libs exposes their bin dirs):
+# hosts only (archive_transcribe._ensure_cuda_libs exposes their bin dirs;
+# nvjitlink is pulled in transitively but is required by cublasLt at load):
 #   pip install nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cudnn-cu12
 sherpa-onnx>=1.13.0
