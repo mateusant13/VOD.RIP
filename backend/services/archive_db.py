@@ -2411,12 +2411,13 @@ def search(
     _channel_hint_out: Optional[list] = None,
     username: Optional[str] = None,
 ) -> list[dict]:
-    """BM25 across transcripts + messages. Returns unified hits ordered
-    newest-first: the owning video's started_at desc, with score desc as the
-    within-date tiebreak and NULL dates (no videos row) last; each hit
-    carries enough to seek: platform, video_id, offset_sec, plus the owning
-    video's channel/title/started_at (date), video_kind and lang
-    (transcripts: transcripts.lang; messages: None).
+    """BM25 across transcripts + messages. Returns unified hits ordered by
+    relevance: complete matches lead (exact phrase, then all-words), partial
+    (subset-of-tokens) hits follow — each group by score desc, the owning
+    video's started_at desc as the within-score tiebreak and NULL dates (no
+    videos row) last; each hit carries enough to seek: platform, video_id,
+    offset_sec, plus the owning video's channel/title/started_at (date),
+    video_kind and lang (transcripts: transcripts.lang; messages: None).
 
     Merge semantics: each table is fetched ~3x limit (no per-table cap below
     that), scores are normalized per table (divided by the batch max, so the
@@ -2461,7 +2462,14 @@ def search(
     Query tokens are fuzzy-expanded from the FTS5 vocab (exact + close
     Levenshtein matches, length-filtered, capped per token and in total);
     the expansion falls back to the exact tokens when the vocab is
-    unavailable or the query is huge."""
+    unavailable or the query is huge. Multi-token queries additionally
+    apply a relevance floor to partial hits: an OR-only row carrying none
+    of the query's rarest (lowest merged-corpus-frequency) tokens is
+    single-token noise ('vale' ~3106 rows) and is dropped, so a common
+    word can no longer flood the literal-results page; partials carrying
+    the rare token ('estranheza') survive as closest matches. Single-token
+    queries skip the floor — their phrase pass marks every exact row
+    non-partial, preserving the "every mention" literal mode."""
     if not q.strip() and not (username or "").strip():
         return []
     raw_q = q.strip()
@@ -2518,6 +2526,24 @@ def search(
     # "vale estranheza" still finds rows that say "vale da estranheza".
     q_tokens_all = re.findall(r"[^\W_]+", raw_q.casefold())
     q_tokens = [t for t in q_tokens_all if len(t) >= 3]
+    # Multi-token relevance floor: an OR-only (partial) row is only useful
+    # if it carries a DISCRIMINATIVE query token — one of the rarest in the
+    # merged corpus. Rows matching only common tokens ('vale' 3106 rows)
+    # are the recall noise that flooded literal-results pages. Tokens
+    # absent from the corpus (freq 0) can't be carried by any row and are
+    # excluded from the rarest set. Single-token queries skip the floor.
+    q_freq: dict[str, int] = {}
+    for vocab in (_load_vocab(t[2]) for t in loops):
+        if not vocab:
+            continue
+        for bucket in vocab.values():
+            for term, n in bucket:
+                q_freq[term] = q_freq.get(term, 0) + n
+    q_present = {t: q_freq[t] for t in q_tokens if q_freq.get(t, 0) > 0}
+    q_keep_tokens = (
+        {t for t, n in q_present.items() if n == min(q_present.values())}
+        if q_present and len(q_tokens) >= 2 else set()
+    )
     and_pattern = " AND ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in q_tokens) if len(q_tokens) >= 2 else None
     # Cross-segment phrase matching: multi-word queries whose tokens are
     # split across two ADJACENT transcript segments ("…vale" | "da
@@ -2627,6 +2653,14 @@ def search(
                 if or_max > 0:  # guard div-by-zero: keep raw scores if OR max is 0
                     h["score"] = h["score"] / or_max
                 h["score"] = h["score"] * 0.5 ** h.pop("_tier", 0)
+                # Multi-token relevance floor: an OR-only row carrying none
+                # of the query's rarest tokens is single-token noise — drop
+                # it instead of letting a common word flood the results
+                # page with "vale"-only mentions.
+                if q_keep_tokens:
+                    row_toks = set(re.findall(r"[^\W_]+", h["text"].casefold()))
+                    if not row_toks.intersection(q_keep_tokens):
+                        continue
             # A multi-word hit that reached only the fuzzy OR tier matched a
             # subset of the query — flag it so UIs can say "closest match".
             h["partial"] = not (phr or andf)
@@ -2656,27 +2690,29 @@ def search(
                     r["score"] = r["score"] / tmax
                 merged.append(r)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
-    # Newest-first is the primary order: the owning video's started_at desc
-    # (ISO strings — the same lexicographic order the author-history path
-    # sorts by in SQL). Score desc is the within-date tiebreak, so a hit
-    # from a newer video outranks an older video's phrase hit; relevance
-    # still decides which hits of the SAME video surface first. NULL dates
-    # (LEFT JOIN miss — no videos row) sort last so archived content never
-    # hides behind orphan rows. Within a date, normalization collapses each
-    # table's best to exactly 1.0, so two tables' best hits can TIE at 1.5
-    # after the phrase boost: ties resolve by table priority (transcripts
-    # before messages), then by raw score — raw BM25 is only comparable
-    # WITHIN a table, so it must never be the cross-table tie-break.
+    # Relevance is the primary order: complete matches (partial False —
+    # exact phrase 1.5, then all-words 1.25) lead, partial (subset-of-tokens)
+    # hits follow, score desc within each group. The owning video's
+    # started_at desc (ISO strings — the same lexicographic order the
+    # author-history path sorts by in SQL) is the within-score tiebreak, so
+    # a strong hit from an older video outranks a weak hit from a newer one.
+    # NULL dates (LEFT JOIN miss — no videos row) sort last so archived
+    # content never hides behind orphan rows. Equal scores resolve by table
+    # priority (transcripts before messages), then by raw score — raw BM25
+    # is only comparable WITHIN a table, so it must never be the
+    # cross-table tie-break.
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
     # FE's "infinite literal results" mode sends ~2000) wants EVERY match
-    # of a targeted word — the cap lifts, small/default limits keep it.
+    # of a targeted word — the cap lifts, small/default limits keep it
+    # (the multi-token relevance floor above already culled single-token
+    # noise for multi-word queries).
     cap = _HITS_PER_VIDEO_CAP if int(limit) <= _HITS_PER_VIDEO_CAP * 10 else 10**6
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
     for h in sorted(
         merged,
-        key=lambda h: (h["date"] is not None, h["date"] or "", h["score"], h.pop("_tbl", 0), h.pop("_raw", 0.0)),
+        key=lambda h: (not h["partial"], h["score"], h["date"] is not None, h["date"] or "", h.pop("_tbl", 0), h.pop("_raw", 0.0)),
         reverse=True,
     ):
         key = (h["platform"], h["video_id"])

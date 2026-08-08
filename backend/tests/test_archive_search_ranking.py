@@ -1,12 +1,16 @@
 """Multi-word ranking tests: the all-tokens AND tier, the partial-match
-flag, and the prefix-expansion gate (present tokens must not flood tier 0).
+flag, the prefix-expansion gate (present tokens must not flood tier 0),
+and the multi-token relevance floor (partials must carry a discriminative
+query token or they are dropped).
 
 Regression: "vale da estranheza" used to return only vale*/valendo/valeu
 noise at score 1.0 — the phrase was absent from the corpus and every word
 starting with the 3-char phonetic fold 'val' was treated as a distance-0
 equal match. FTS5's implicit multi-word AND semantics are now an explicit
 tier (phrase > AND > OR), OR-only hits carry partial=True, and prefix
-expansion only fires for tokens ABSENT from the corpus.
+expansion only fires for tokens ABSENT from the corpus. Results order by
+relevance (complete matches lead, score desc), and a partial that carries
+none of the query's rarest tokens is dropped instead of demoted.
 
 Run from backend/: python -m pytest tests/test_archive_search_ranking.py
 """
@@ -83,7 +87,8 @@ def scratch(monkeypatch, tmp_path):
 def test_phrase_then_and_then_partial(scratch):
     hits = db.search("vale da estranheza", limit=20)
     texts = [h.get("text", "").lower() for h in hits]
-    # Exact-phrase row first, all-words row second, vale-only noise last.
+    # Exact-phrase row first, all-words row second; both are complete
+    # matches (partial False) and lead the relevance-ordered results.
     assert texts[0].startswith("vale da estranheza")
     assert any("estranheza veio depois do vale" in t for t in texts)
     assert hits[0]["partial"] is False
@@ -91,17 +96,25 @@ def test_phrase_then_and_then_partial(scratch):
         h for h in hits if "estranheza veio depois do vale" in h.get("text", "")
     )
     assert and_row["partial"] is False, "both query words present -> exact"
-    # The vale-only distractor is now a flagged partial match, not a 1.0 tie.
-    or_row = next(h for h in hits if "valeu galera" in h.get("text", ""))
-    assert or_row["partial"] is True
-    assert or_row["score"] < hits[0]["score"]
+    # The expansion-only distractor ("valeu galera valendo" — the row holds
+    # no real query token) is DROPPED by the multi-token relevance floor,
+    # not demoted: partials must carry a discriminative query token.
+    assert not any("valeu galera" in t for t in texts), (
+        "expansion-only partial must not surface for a multi-token query"
+    )
 
 
 def test_missing_word_marks_all_partial(scratch):
-    # "estranheza" absent from the corpus -> every hit is a partial match.
+    # "estranheza" present, "fantasma" absent -> every hit is a partial
+    # match carrying the one discriminative token; the expansion-only
+    # distractor is dropped, but closest matches still surface.
     hits = db.search("estranheza fantasma", limit=20)
-    assert hits, "vale* forms still surface as closest matches"
+    assert hits, "estranheza rows still surface as closest matches"
     assert all(h["partial"] for h in hits)
+    texts = [h.get("text", "").lower() for h in hits]
+    assert all("estranheza" in t for t in texts), (
+        "only rows carrying the rare query token survive the floor"
+    )
 
 
 def test_single_word_never_partial(scratch):
@@ -111,6 +124,40 @@ def test_single_word_never_partial(scratch):
     # a dist-1 twin of "valeu") are correctly flagged as partial matches.
     assert hits[0]["partial"] is False
     assert "valeu" in hits[0].get("text", "").lower()
+
+
+def test_multi_token_floor_drops_common_token_noise(scratch):
+    """A partial matching only the COMMON query token is single-token noise
+    and is dropped; only partials carrying the rare token survive.
+
+    Regression: 'vale da estranheza' flooded the literal-results page with
+    2000 vale-only partials (corpus freq ~3106) while the real hits sat
+    buried. BM25 separates the terms, but the relevance floor is what
+    actually culls the vale-only rows for multi-word queries."""
+    import time as _t
+
+    for i in range(20):
+        db.insert_transcript(
+            "youtube", "cnoise",
+            [{"seg_idx": i, "start_sec": float(i), "end_sec": float(i) + 1.0,
+              "text": "vale a pena assistir de novo", "words": []}],
+            lang="pt",
+        )
+    db.insert_transcript(
+        "youtube", "crare",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "aquela estranheza aconteceu", "words": []}],
+        lang="pt",
+    )
+    db._load_vocab_uncached("transcripts", _t.monotonic())
+    hits = db.search("vale estranheza", limit=50)
+    texts = [h.get("text", "").lower() for h in hits]
+    assert any("estranheza aconteceu" in t for t in texts), (
+        "rare-token partial survives the floor"
+    )
+    assert not any("a pena assistir" in t for t in texts), (
+        "common-token-only partial must be dropped"
+    )
 
 
 def test_present_token_no_prefix_flood(scratch):
