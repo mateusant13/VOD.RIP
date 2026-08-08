@@ -530,6 +530,22 @@ def ytdlp_youtube_extractor_args(session: YouTubeSession, *, auto_auth: bool = T
     args: dict[str, list[str]] = {
         "player_client": ["web_safari", "ios", "android", "mweb", "tv"],
     }
+    # YouTube localizes browse/playlist metadata (titles, channel names) to
+    # the requested hl — the default is en, which translated PT channels like
+    # "Gaveta" to "Drawer". Request the app UI language family instead so
+    # channel walks and remote searches return the original-language titles.
+    # The player endpoint ignores hl (verified in youtube_innertube), so this
+    # is inert for previews/downloads. ponytail: per-channel override (hl =
+    # videos.channel_language when known) is the upgrade path for archives
+    # that mix languages.
+    try:
+        from deps import settings_mgr
+
+        ui = getattr(settings_mgr.get(), "ui_language", "") or ""
+        lang = {"pt-BR": "pt", "es": "es", "en": "en"}.get(ui, "pt")
+    except Exception:
+        lang = "pt"  # repo-wide default family (mirrors subtitles.py)
+    args["lang"] = [lang]
     try:
         args["fetch_pot"] = ["auto"] if _pot_server_available() else ["never"]
     except Exception:
