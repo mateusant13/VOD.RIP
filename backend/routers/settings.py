@@ -178,6 +178,8 @@ async def update_settings(update: SettingsUpdate):
             logger.debug("autostart update skipped", exc_info=True)
     if update.cookie_bridge_enabled is not None:
         current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
+    if update.auto_install_extension is not None:
+        current.auto_install_extension = bool(update.auto_install_extension)
     if update.entity_watch_enabled is not None:
         current.entity_watch_enabled = bool(update.entity_watch_enabled)
     if update.archive_vod_keep_count is not None:

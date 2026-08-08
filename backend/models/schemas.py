@@ -109,6 +109,10 @@ class AppSettings(BaseModel):
     start_with_windows: bool = False
     cookie_bridge_token: str = ""
     cookie_bridge_enabled: bool = True
+    # One-click cookie-extension install (Settings toggle): when ON, the
+    # first-run offer auto-installs the unpacked extension via CDP; OFF =
+    # manual drag-and-drop only. Absent on older backends -> ON (getattr).
+    auto_install_extension: bool = True
     entity_watch_enabled: bool = True
     # Archived VOD retention: keep only the newest N video FILES per platform;
     # older files are deleted but DB rows/transcripts/chat stay forever.
@@ -178,6 +182,7 @@ class SettingsUpdate(BaseModel):
     start_with_windows: Optional[bool] = None
     cookie_bridge_token: Optional[str] = None
     cookie_bridge_enabled: Optional[bool] = None
+    auto_install_extension: Optional[bool] = None
     entity_watch_enabled: Optional[bool] = None
     archive_vod_keep_count: Optional[int] = None
     whisper_model: Optional[str] = None

@@ -524,6 +524,24 @@ const ptBR: Record<string, string> = {
   'botGate.openInstructions': 'Abrir instruções',
   'botGate.installNow': 'Instalar agora',
   'botGate.dismiss': 'Dispensar',
+  // ── Cookie extension auto-install (cookieAuto.*) ──────────
+  'cookieAuto.title': 'Instale a extensão de cookies',
+  'cookieAuto.body': 'Destrava YouTube, Twitch e Kick: a extensão compartilha os cookies da sua sessão com este app, só localmente. O Chrome será fechado e reaberto uma vez durante a instalação.',
+  'cookieAuto.installNow': 'Instalar agora',
+  'cookieAuto.later': 'Depois',
+  'cookieAuto.never': 'Não mostrar novamente',
+  'cookieAuto.installing': 'Instalando… o Chrome será reiniciado rapidamente.',
+  'cookieAuto.installed': 'Extensão instalada! Abra YouTube/Twitch/Kick e capture os cookies uma vez — o app pareia automaticamente.',
+  'cookieAuto.failed': 'Falha na instalação: {error}',
+  'cookieAuto.failedGeneric': 'Falha na instalação. Tente novamente ou instale manualmente em Ajustes → Cookie Bridge.',
+  'cookieAuto.timeout': 'Instalação demorou demais — verifique o Chrome e tente novamente.',
+  'cookieAuto.retry': 'Tentar novamente',
+  'cookieAuto.close': 'Fechar',
+  'cookieAuto.toggle': 'Instalação automática da extensão',
+  'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
+  // ── Tutorial reset (tutorial.*) ───────────────────────────
+  'tutorial.button': 'Tutorial',
+  'tutorial.resetToast': 'Mensagens de tutorial reativadas',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
@@ -546,6 +564,22 @@ const en: Record<string, string> = {
   'botGate.openInstructions': 'Open instructions',
   'botGate.installNow': 'Install now',
   'botGate.dismiss': 'Dismiss',
+  'cookieAuto.title': 'Install the cookie extension',
+  'cookieAuto.body': 'Unlock YouTube, Twitch and Kick: the extension shares your browser session cookies with this app, locally only. Chrome will close and reopen once during the install.',
+  'cookieAuto.installNow': 'Install now',
+  'cookieAuto.later': 'Later',
+  'cookieAuto.never': "Don't show again",
+  'cookieAuto.installing': 'Installing… Chrome will restart briefly.',
+  'cookieAuto.installed': 'Extension installed! Open YouTube/Twitch/Kick and grab the cookies once — the app pairs automatically.',
+  'cookieAuto.failed': 'Install failed: {error}',
+  'cookieAuto.failedGeneric': 'Install failed. Try again or install manually in Settings → Cookie Bridge.',
+  'cookieAuto.timeout': 'Install timed out — check Chrome and try again.',
+  'cookieAuto.retry': 'Retry',
+  'cookieAuto.close': 'Close',
+  'cookieAuto.toggle': 'Auto-install cookie extension',
+  'cookieAuto.toggleInfo': 'Offer the one-click install when cookies are not paired yet. Turn off to install manually only.',
+  'tutorial.button': 'Tutorial',
+  'tutorial.resetToast': 'Tutorial messages re-enabled',
 }
 
 const es: Record<string, string> = {
@@ -995,6 +1029,24 @@ const es: Record<string, string> = {
   'botGate.openInstructions': 'Abrir instrucciones',
   'botGate.installNow': 'Instalar ahora',
   'botGate.dismiss': 'Descartar',
+  // ── Cookie extension auto-install (cookieAuto.*) ──────────
+  'cookieAuto.title': 'Instala la extensión de cookies',
+  'cookieAuto.body': 'Desbloquea YouTube, Twitch y Kick: la extensión comparte las cookies de tu sesión con esta app, solo localmente. Chrome se cerrará y se reabrirá una vez durante la instalación.',
+  'cookieAuto.installNow': 'Instalar ahora',
+  'cookieAuto.later': 'Después',
+  'cookieAuto.never': 'No volver a mostrar',
+  'cookieAuto.installing': 'Instalando… Chrome se reiniciará brevemente.',
+  'cookieAuto.installed': '¡Extensión instalada! Abre YouTube/Twitch/Kick y captura las cookies una vez: la app se vincula automáticamente.',
+  'cookieAuto.failed': 'Falló la instalación: {error}',
+  'cookieAuto.failedGeneric': 'Falló la instalación. Inténtalo de nuevo o instálala manualmente en Ajustes → Cookie Bridge.',
+  'cookieAuto.timeout': 'La instalación tardó demasiado: revisa Chrome e inténtalo de nuevo.',
+  'cookieAuto.retry': 'Reintentar',
+  'cookieAuto.close': 'Cerrar',
+  'cookieAuto.toggle': 'Instalación automática de la extensión',
+  'cookieAuto.toggleInfo': 'Muestra la oferta de instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
+  // ── Tutorial reset (tutorial.*) ───────────────────────────
+  'tutorial.button': 'Tutorial',
+  'tutorial.resetToast': 'Mensajes de tutorial reactivados',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so

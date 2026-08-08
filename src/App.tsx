@@ -87,6 +87,8 @@ import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGl
 import QueueTab from './components/QueueTab';
 import SettingsTab from './components/SettingsTab';
 import BotGateBanner from './components/BotGateBanner';
+import CookieInstallOffer from './components/CookieInstallOffer';
+import { isFirstTime as isFirstTimeFlag } from './lib/firstTime';
 import PreviewChatPanel from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
@@ -1093,6 +1095,24 @@ export default function App() {
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateApplying, setUpdateApplying] = useState(false);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+
+  // First-run cookie-extension install offer: probed once on mount. The modal
+  // opens only while cookies are NOT paired and the 'cookieInstall' tutorial
+  // flag is unseen; the component marks it seen on dismiss/install-success.
+  const [cookieOfferOpen, setCookieOfferOpen] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    void apiGet<{ paired: boolean }>('/api/session/cookies/status')
+      .then((s) => {
+        if (alive && !s.paired && isFirstTimeFlag('cookieInstall')) setCookieOfferOpen(true);
+      })
+      .catch(() => {
+        // Backend unreachable — never nag blind.
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const syncPreviewTimeUi = useCallback((t: number, force = false) => {
     previewCurrentTimeRef.current = t;
@@ -6083,6 +6103,13 @@ export default function App() {
     >
       {/* Any-tab YouTube bot-gate banner (dismissible; polls /cookies/status). */}
       <BotGateBanner onOpenInstructions={() => setTab('settings')} />
+      {/* First-run cookie-extension install offer (once per profile, until
+          the tutorial reset re-arms it). */}
+      <CookieInstallOffer
+        open={cookieOfferOpen}
+        toggleOn={settings.auto_install_extension !== false}
+        onClose={() => setCookieOfferOpen(false)}
+      />
       <div
         className={`vod-layout-row flex items-start max-w-full min-w-0 w-full justify-center ${
         triplePanelLayout || splitLayout

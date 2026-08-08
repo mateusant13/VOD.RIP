@@ -25,6 +25,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -346,6 +348,127 @@ def _open_extension_manager() -> dict:
     return {"launched": False, "browser": None, "url": None}
 
 
+# --- one-click auto-install (productized CookieInstallWorker flow) ----------
+# The proven mechanism: kill the browser, relaunch it with
+# --remote-debugging-port + an explicit --user-data-dir (Chrome 136+ ignores
+# the debug flag on the default profile without it), drive chrome://extensions
+# over CDP (real Input.dispatchMouseEvent clicks — synthetic .click() never
+# opens the native folder dialog), then drive the #32770 dialog 100% by
+# Win32 (WM_SETTEXT the "Pasta:" edit, BM_CLICK "Selecionar pasta"). The
+# whole automation lives in scripts/cookie_auto_install.ps1 (BCL only —
+# ClientWebSocket for CDP, Add-Type P/Invoke for the dialog); the route here
+# only spawns it in a background thread and mirrors its state in
+# _AUTO_INSTALL_STATE. Windows-only in practice (the ps1 is the driver);
+# on other platforms the route reports a clear error instead of failing blind.
+
+# {state: idle|running|done|error, installed, extension_id, error,
+#  started_at, finished_at} — mutated under _AUTO_INSTALL_LOCK.
+_AUTO_INSTALL_LOCK = threading.Lock()
+_AUTO_INSTALL_STATE = {
+    "state": "idle",
+    "installed": False,
+    "extension_id": "",
+    "error": None,
+    "started_at": None,
+    "finished_at": None,
+}
+
+def _ext_src_override() -> Optional[Path]:
+    """Env override for the unpacked extension folder (mirrors VODRIP_EXT_CRX)."""
+    override = os.environ.get("VODRIP_EXT_SRC", "").strip()
+    return Path(override) if override else None
+
+
+def _auto_install_script() -> Path:
+    return Path(__file__).resolve().parent.parent / "scripts" / "cookie_auto_install.ps1"
+
+
+def _run_auto_install_script(browser: str, extension_dir: Path, port: int = 9222) -> dict:
+    """Run scripts/cookie_auto_install.ps1; parse the trailing JSON result line.
+
+    The script prints human progress to stderr and exactly one JSON object as
+    its final stdout line. Best-effort: any failure yields an error dict, never
+    an exception (the caller reports a clean error string).
+    """
+    script = _auto_install_script()
+    if not script.is_file():
+        return {"ok": False, "installed": False, "error": "auto-install driver missing"}
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                "-ExtensionDir",
+                str(extension_dir),
+                "-Browser",
+                browser,
+                "-DebugPort",
+                str(port),
+            ],
+            capture_output=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "installed": False, "error": f"install driver failed: {exc}"}
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    result: Optional[dict] = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                result = json.loads(line)
+            except ValueError:
+                continue
+    if result is None:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        tail = err[-1] if err else f"exit {proc.returncode}"
+        return {"ok": False, "installed": False, "error": tail[-300:]}
+    if not isinstance(result.get("ok"), bool):
+        return {"ok": False, "installed": False, "error": "malformed install driver result"}
+    return result
+
+
+def _auto_install_worker(browser: str, extension_dir: Path) -> None:
+    """Background thread body — runs the ps1 and folds its result into state."""
+    try:
+        res = _run_auto_install_script(browser, extension_dir)
+    except Exception as exc:  # never let the thread die silently
+        logger.exception("cookie auto-install crashed")
+        res = {"ok": False, "installed": False, "error": f"install crashed: {exc}"}
+    with _AUTO_INSTALL_LOCK:
+        _AUTO_INSTALL_STATE["state"] = "done" if res.get("ok") else "error"
+        _AUTO_INSTALL_STATE["installed"] = bool(res.get("installed"))
+        _AUTO_INSTALL_STATE["extension_id"] = str(res.get("extension_id") or _ext_id() or "")
+        _AUTO_INSTALL_STATE["error"] = res.get("error")
+        _AUTO_INSTALL_STATE["finished_at"] = time.time()
+        logger.info("cookie auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
+
+
+def _start_auto_install(browser: str, extension_dir: Path) -> bool:
+    """Mark running + spawn the worker. Lock only guards state transitions —
+    the worker holds no lock while the ps1 runs, so a second POST can detect
+    'running' instead of blocking behind the install."""
+    with _AUTO_INSTALL_LOCK:
+        if _AUTO_INSTALL_STATE["state"] == "running":
+            return False
+        _AUTO_INSTALL_STATE.update(
+            state="running", installed=False, extension_id="", error=None,
+            started_at=time.time(), finished_at=None,
+        )
+    threading.Thread(
+        target=_auto_install_worker,
+        args=(browser, extension_dir),
+        daemon=True,
+        name="cookie-auto-install",
+    ).start()
+    return True
+
+
 @router.get("/api/session/cookies/extension/extension.crx")
 async def session_cookies_extension_crx():
     crx = _ext_crx_path()
@@ -415,6 +538,61 @@ async def session_cookies_enable():
     s.cookie_bridge_enabled = True
     settings_mgr.save(s)
     return {"enabled": True}
+
+
+@router.post("/api/session/cookies/auto-install")
+async def session_cookies_auto_install():
+    """One-click cookie-extension install (productized proven flow).
+
+    Already paired -> short-circuit without touching the browser. Otherwise
+    spawn the automation (scripts/cookie_auto_install.ps1) in a background
+    thread and return immediately — progress/result are mirrored by
+    GET /api/session/cookies/status -> auto_install while the frontend
+    shows a spinner. Never blocks the event loop: the ps1 runs in a thread.
+    """
+    if _paired_token():
+        return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
+    with _AUTO_INSTALL_LOCK:
+        if _AUTO_INSTALL_STATE["state"] == "running":
+            return {"ok": True, "started": False, "alreadyRunning": True, "state": "running"}
+    src = _ext_src_override() or _materialize_ext_src()
+    if not (src / "manifest.json").exists():
+        return {
+            "ok": False,
+            "state": "error",
+            "error": "cookie extension package not installed — restart the app to refresh it",
+        }
+    browser = next((n for n in ("chrome", "msedge", "brave") if _find_browser(n)), None)
+    if not browser:
+        return {"ok": False, "state": "error", "error": "no Chromium browser found"}
+    if not _start_auto_install(browser, src):
+        return {"ok": True, "started": False, "alreadyRunning": True, "state": "running"}
+    return {"ok": True, "started": True, "state": "running"}
+
+
+@router.get("/api/session/cookies/status")
+async def session_cookies_status():
+    gate_sec = gate_remaining_sec()
+    with _AUTO_INSTALL_LOCK:
+        ai = dict(_AUTO_INSTALL_STATE)
+    return {
+        "paired": bool(_paired_token()),
+        "enabled": bool(settings_mgr.get().cookie_bridge_enabled),
+        "platforms": cookie_store.status(),
+        # YouTube bot-gate cooldown state — read-only mirror of yt_gate; the
+        # any-tab banner polls these. Gating/freeze logic stays in yt_gate.
+        "youtube_gate_active": gate_sec > 0,
+        "youtube_gate_remaining_sec": gate_sec,
+        # One-click auto-install mirror — state: idle|running|done|error.
+        "auto_install": {
+            "state": ai["state"],
+            "installed": bool(ai["installed"]) or bool(_paired_token()),
+            "extension_id": ai["extension_id"] or _ext_id() or None,
+            "error": ai["error"],
+            "started_at": ai["started_at"],
+            "finished_at": ai["finished_at"],
+        },
+    }
 
 
 @router.post("/api/session/cookies/disable")

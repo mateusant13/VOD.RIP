@@ -12,6 +12,7 @@ import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
 import Toggle from './Toggle';
 import { apiGet, apiPost } from '../hooks/useApiClient';
+import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 
@@ -40,6 +41,7 @@ const SETTING_KEYS = [
   'asr_language',
   'cache_dir', 'data_dir',
   'twitch_helix_token',
+  'auto_install_extension',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
   JSON.stringify(SETTING_KEYS.map((k) => s[k] ?? null));
@@ -161,6 +163,14 @@ export default function SettingsTab({
   const needsCookieSetup =
     cookieStatus !== null && (!cookieStatus.paired || cookieCount === 0);
 
+  /** Tutorial reset — re-arms every first-time message (cookie offer etc.). */
+  const [tutorialToast, setTutorialToast] = useState(false);
+  const resetTutorials = () => {
+    resetFirstTimeFlags();
+    setTutorialToast(true);
+    window.setTimeout(() => setTutorialToast(false), 3000);
+  };
+
   const cookieCard = (
     <SettingsCard
       icon={ShieldCheck}
@@ -168,7 +178,28 @@ export default function SettingsTab({
       open={!!openCards.cookie}
       onToggle={() => toggleCard('cookie')}
     >
+      <Toggle
+        label={t('cookieAuto.toggle')}
+        info={t('cookieAuto.toggleInfo')}
+        checked={settings.auto_install_extension !== false}
+        onChange={(c) => setSettings({ ...settings, auto_install_extension: c })}
+        ariaLabel="auto install cookie extension"
+      />
       <CookieBridgeSection onStatusChange={setCookieStatus} />
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={resetTutorials}
+          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-1.5 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white"
+        >
+          {t('tutorial.button')}
+        </button>
+        {tutorialToast ? (
+          <span className="text-[11px] font-mono text-emerald-400" role="status">
+            {t('tutorial.resetToast')}
+          </span>
+        ) : null}
+      </div>
     </SettingsCard>
   );
 

@@ -431,6 +431,8 @@ def _rsa_pkcs8_pem() -> str:
 @pytest.fixture(autouse=True)
 def _isolated_state(monkeypatch, tmp_path):
     """Temp settings file + temp cookie DB + temp crx/pem for every test."""
+    from routers import cookie_bridge as cb
+
     original_file = settings_mgr._settings_file
     temp_file = original_file.parent / f"settings_test_{os.getpid()}.json"
     settings_mgr._settings_file = temp_file
@@ -442,6 +444,11 @@ def _isolated_state(monkeypatch, tmp_path):
     cookie_store_mod._conn = None
     cookie_store_mod._schema_ready = False
     _make_crx_and_pem(tmp_path)
+    with cb._AUTO_INSTALL_LOCK:
+        cb._AUTO_INSTALL_STATE.update(
+            state="idle", installed=False, extension_id="", error=None,
+            started_at=None, finished_at=None,
+        )
     yield tmp_path
     settings_mgr._settings_file = original_file
     if temp_file.exists():
@@ -542,6 +549,164 @@ async def test_settings_roundtrip_flag(client):
     assert resp.json()["cookie_bridge_enabled"] is False
     resp = await client.get("/api/settings")
     assert resp.json()["cookie_bridge_enabled"] is False
+
+
+async def test_settings_roundtrip_auto_install_flag(client):
+    """auto_install_extension round-trips through GET/POST /api/settings."""
+    resp = await client.get("/api/settings")
+    assert resp.json()["auto_install_extension"] is True, "default is ON"
+    resp = await client.post("/api/settings", json={"auto_install_extension": False})
+    assert resp.status_code == 200
+    assert resp.json()["auto_install_extension"] is False
+    resp = await client.get("/api/settings")
+    assert resp.json()["auto_install_extension"] is False
+
+
+async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
+    """Already-paired -> {alreadyInstalled:true} and NO automation thread."""
+    from routers import cookie_bridge as cb
+
+    resp = await client.post("/api/session/cookies", json={
+        "token": "tok-1", "cookies": [],
+    })
+    assert resp.status_code == 200
+
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["alreadyInstalled"] is True
+    assert body["installed"] is True
+    assert captured == [], "no thread may spawn when already paired"
+
+    status = (await client.get("/api/session/cookies/status")).json()
+    assert status["auto_install"]["installed"] is True
+
+
+async def test_auto_install_spawns_background_install(client, monkeypatch, tmp_path):
+    """Not paired -> returns started:true and spawns the worker thread."""
+    from routers import cookie_bridge as cb
+
+    src = tmp_path / "ext-src"
+    src.mkdir()
+    (src / "manifest.json").write_text('{"name": "x"}', encoding="utf-8")
+    monkeypatch.setattr(cb, "_materialize_ext_src", lambda: src)
+    monkeypatch.setattr(cb, "_find_browser", lambda name: Path("C:/chrome.exe") if name == "chrome" else None)
+
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True and body["started"] is True
+    assert body["state"] == "running"
+    assert len(captured) == 1, "exactly one worker thread must spawn"
+    name, kwargs = captured[0]
+    assert name == "cookie-auto-install"
+    assert kwargs["target"] is cb._auto_install_worker
+    assert kwargs["args"] == ("chrome", src)
+    assert kwargs["daemon"] is True
+
+    status = (await client.get("/api/session/cookies/status")).json()
+    assert status["auto_install"]["state"] == "running"
+
+
+async def test_auto_install_no_browser_error(client, monkeypatch, tmp_path):
+    """No Chromium found -> clear error, nothing spawned."""
+    from routers import cookie_bridge as cb
+
+    src = tmp_path / "ext-src"
+    src.mkdir()
+    (src / "manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cb, "_materialize_ext_src", lambda: src)
+    monkeypatch.setattr(cb, "_find_browser", lambda name: None)
+
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert "browser" in (body["error"] or "")
+    assert captured == []
+
+
+async def test_auto_install_missing_extension_package(client, monkeypatch, tmp_path):
+    """No manifest in the materialized folder -> error before spawning."""
+    from routers import cookie_bridge as cb
+
+    empty = tmp_path / "empty-src"
+    empty.mkdir()
+    monkeypatch.setattr(cb, "_materialize_ext_src", lambda: empty)
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    body = resp.json()
+    assert body["ok"] is False
+    assert "package" in (body["error"] or "")
+    assert captured == []
+
+
+def test_auto_install_worker_folds_result_into_state(monkeypatch):
+    """Worker maps a successful script result to done + installed."""
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(
+        cb, "_run_auto_install_script",
+        lambda browser, ext_dir: {"ok": True, "installed": True, "extension_id": "abc123"},
+    )
+    cb._auto_install_worker("chrome", Path("C:/ext"))
+    with cb._AUTO_INSTALL_LOCK:
+        assert cb._AUTO_INSTALL_STATE["state"] == "done"
+        assert cb._AUTO_INSTALL_STATE["installed"] is True
+        assert cb._AUTO_INSTALL_STATE["extension_id"] == "abc123"
+        assert cb._AUTO_INSTALL_STATE["error"] is None
+        assert cb._AUTO_INSTALL_STATE["finished_at"] is not None
+
+
+def test_auto_install_worker_reports_failure(monkeypatch):
+    """Worker maps a failing script result to error state."""
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(
+        cb, "_run_auto_install_script",
+        lambda browser, ext_dir: {"ok": False, "installed": False, "error": "dialog timeout"},
+    )
+    cb._auto_install_worker("chrome", Path("C:/ext"))
+    with cb._AUTO_INSTALL_LOCK:
+        assert cb._AUTO_INSTALL_STATE["state"] == "error"
+        assert cb._AUTO_INSTALL_STATE["installed"] is False
+        assert cb._AUTO_INSTALL_STATE["error"] == "dialog timeout"
+
+
+def test_auto_install_worker_survives_crash(monkeypatch):
+    """An exception inside the script runner never kills the thread."""
+    from routers import cookie_bridge as cb
+
+    def boom(browser, ext_dir):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cb, "_run_auto_install_script", boom)
+    cb._auto_install_worker("chrome", Path("C:/ext"))
+    with cb._AUTO_INSTALL_LOCK:
+        assert cb._AUTO_INSTALL_STATE["state"] == "error"
+        assert "boom" in (cb._AUTO_INSTALL_STATE["error"] or "")
+
+
+def _capture_thread(captured: list):
+    """threading.Thread stand-in that records (name, kwargs) without running."""
+
+    def fake_thread(*args, **kwargs):
+        captured.append((kwargs.pop("name", None), kwargs))
+        class _Fake:
+            def start(self):
+                pass
+            daemon = kwargs.get("daemon", False)
+        return _Fake()
+
+    return fake_thread
 
 
 async def test_status_shape(client):
