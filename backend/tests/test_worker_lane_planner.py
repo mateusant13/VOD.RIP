@@ -180,3 +180,70 @@ def test_gpu_held_ignores_own_pid():
 python.exe           12345 nvcuda.dll
 """
     assert _fake_tasklist(own_only, mine="12345") is False
+
+
+def test_run_worker_swaps_pool_when_gpu_frees():
+    """plan-watch turns a CPU-only worker GPU-on without restart.
+
+    _pool_plan returns CPU-only first (GPU held), then hybrid once the GPU
+    frees — run_worker must create a SECOND pool pinned to the CUDA plan
+    and drain the old one, instead of keeping the static CPU plan for the
+    life of the process."""
+    import threading
+    import time as _time
+
+    import pytest
+
+    mp = pytest.MonkeyPatch()
+    state = {"i": 0}
+    calls = []
+
+    def _fake_plan(_mw):
+        if state["i"] < 2:  # initial plan + one watch pass: CPU-only
+            state["i"] += 1
+            return [("cpu", "int8"), ("cpu", "int8")]
+        return [("cuda", "float16"), ("cpu", "int8")]  # GPU freed: hybrid
+
+    real_tpe = at.ThreadPoolExecutor
+
+    class RecordingTPE(real_tpe):
+        def __init__(self, *a, **kw):
+            calls.append((kw.get("max_workers"), kw.get("initargs")))
+            super().__init__(*a, **kw)
+
+    mp.setattr(at, "_pool_plan", _fake_plan)
+    mp.setattr(at, "ThreadPoolExecutor", RecordingTPE)
+    mp.setattr(at, "_PLAN_RECHECK_S", 0.05)
+    mp.setattr(at, "_claim_next_job", lambda: None)
+    mp.setattr(at, "_maybe_close_idle_model", lambda: None)
+    mp.setattr(at, "close_model", lambda: None)
+    mp.setattr(at, "_gpu_lane_plan", lambda: ("medium", "int8"))
+    mp.setattr(at.archive_db, "worker_heartbeat", lambda *a, **k: None)
+    try:
+        t = threading.Thread(
+            target=at.run_worker,
+            kwargs={"once": False, "poll_interval": 0.01},
+            daemon=True,
+        )
+        t.start()
+        deadline = _time.monotonic() + 5.0
+        while len(calls) < 2 and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        at._WORKER_STOP.set()
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "run_worker did not stop after _WORKER_STOP"
+    finally:
+        at._WORKER_STOP.clear()
+        mp.undo()
+
+    assert len(calls) == 2, calls
+    budget0, initargs0 = calls[0]
+    assert budget0 == 2 and initargs0[0] == [
+        ("cpu", "int8"), ("cpu", "int8"),
+    ], calls[0]
+    budget1, initargs1 = calls[1]
+    assert budget1 == 2 and initargs1[0] == [
+        ("cuda", "float16"), ("cpu", "int8"),
+    ], calls[1]
+    assert initargs1[1] == "medium"  # lane model pinned on the new pool
+    assert at._worker_lane_model is None  # finally reset the pin

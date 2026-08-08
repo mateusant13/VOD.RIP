@@ -624,6 +624,25 @@ def _pool_plan(max_workers: Optional[int]) -> list[tuple[str, str]]:
     return [_effective_device()] * max(1, int(max_workers))
 
 
+# How often the plan-watch thread re-evaluates the pool plan while the worker
+# runs (30 s sits between the 10 s held-GPU cache and the ~60 s VRAM median,
+# so a GPU that frees up is noticed within ~40 s worst case and a recheck
+# rarely pays the full median). The recheck runs in its OWN thread because
+# _worker_plan() can block ~60 s on the first VRAM median after a transition
+# (held -> free) — blocking the worker loop that long would stall heartbeats,
+# refills and job monitoring. The main loop only ever does the cheap swap.
+_PLAN_RECHECK_S = 30.0
+
+
+def _make_pool(plan: list[tuple[str, str]], lane_model: Optional[str], budget: int) -> ThreadPoolExecutor:
+    """New transcribe executor pinned to ``plan`` (threads pin per-slot)."""
+    return ThreadPoolExecutor(
+        max_workers=budget, thread_name_prefix="transcribe",
+        initializer=_worker_thread_init,
+        initargs=(plan, lane_model),
+    )
+
+
 # --- model cache ----------------------------------------------------------
 
 _model_lock = threading.Lock()
@@ -2932,6 +2951,14 @@ def run_worker(
     legacy single-global-model path: budget 1, _infer_lock, the global
     _current_model(). max_workers overrides the plan for tests/launchers
     (all threads on the effective device, legacy raw-count semantics).
+
+    DYNAMIC PLAN (natural plan only, max_workers=None): the pool plan is
+    re-evaluated every _PLAN_RECHECK_S by a daemon plan-watch thread. When
+    the GPU frees up (another app closed) or gets grabbed, the watch
+    proposes the new plan and the main loop swaps the executor: in-flight
+    jobs run out on the old pool (shutdown(wait=False)), fresh claims go to
+    the new one — a GPU that becomes free turns the worker GPU-on without a
+    restart. max_workers plans are static (tests/launchers pin them).
     """
     plan = _pool_plan(max_workers)
     budget = len(plan)
@@ -2954,12 +2981,43 @@ def run_worker(
     logger.info("archive transcribe worker: plan=[%s] workers=%d lane=%s",
                 ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
                 _worker_lane_model or "active-model")
+    # Dynamic plan re-evaluation: a GPU that frees up (or gets grabbed) is
+    # noticed within ~_PLAN_RECHECK_S and the pool is swapped. In-flight
+    # jobs finish on the OLD executor (shutdown(wait=False) lets them run
+    # out); the new executor only takes fresh claims, so no job is lost.
+    # The watch runs in a daemon thread because a recheck can block ~60 s on
+    # the VRAM median after a held->free transition — the main loop never
+    # waits for that, it only consumes the cheap proposal.
+    plan_proposal: list = []  # (new_plan, lane) published by the watch
+    _proposal_lock = threading.Lock()
+    watch_stop = threading.Event()
+
+    def _plan_watch() -> None:
+        while True:
+            if watch_stop.wait(_PLAN_RECHECK_S) or _WORKER_STOP.is_set():
+                return
+            try:
+                new_plan = _pool_plan(max_workers)
+            except Exception:
+                logger.exception("plan watch: recheck failed")  # keep old plan
+                continue
+            if new_plan == plan:
+                continue
+            _new_lane = (
+                _gpu_lane_plan()
+                if any(d == "cuda" for d, _ in new_plan)
+                else None
+            )
+            with _proposal_lock:
+                plan_proposal[:] = [new_plan, _new_lane]
+
+    watch = threading.Thread(target=_plan_watch, name="plan-watch", daemon=True)
+    if max_workers is None:
+        watch.start()
+
+    pool = _make_pool(plan, _worker_lane_model, budget)
     try:
-        with ThreadPoolExecutor(
-            max_workers=budget, thread_name_prefix="transcribe",
-            initializer=_worker_thread_init,
-            initargs=(plan, _worker_lane_model),
-        ) as pool:
+        with pool:
             # Per-slot claim loop: each finished future frees a slot and a
             # refill claims the next job immediately. The old await-all
             # barrier idled every worker behind the slowest job of the batch
@@ -2977,6 +3035,24 @@ def run_worker(
             while not _WORKER_STOP.is_set():
                 _maybe_close_idle_model()
                 archive_db.worker_heartbeat("transcribe")
+                with _proposal_lock:
+                    proposed = tuple(plan_proposal)
+                    if proposed:
+                        plan_proposal.clear()
+                if proposed:
+                    new_plan, _new_lane = proposed
+                    old_pool = pool
+                    old_pool.shutdown(wait=False)  # in-flight run out there
+                    plan, budget, multi = new_plan, len(new_plan), len(new_plan) > 1
+                    _worker_lane_model = _new_lane[0] if _new_lane else None
+                    _worker_lane_ct = _new_lane[1] if _new_lane else None
+                    pool = _make_pool(plan, _worker_lane_model, budget)
+                    logger.info(
+                        "archive transcribe worker: plan changed -> [%s] "
+                        "workers=%d lane=%s (old pool draining)",
+                        ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
+                        _worker_lane_model or "active-model",
+                    )
                 if not pending:
                     if once:
                         break
@@ -2994,6 +3070,9 @@ def run_worker(
                 if once and not pending:
                     break
     finally:
+        if max_workers is None:
+            watch_stop.set()
+            watch.join(timeout=2.0)
         _worker_lane_model = None
         _worker_lane_ct = None
         close_model()

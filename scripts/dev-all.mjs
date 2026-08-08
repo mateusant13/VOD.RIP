@@ -277,13 +277,14 @@ async function main() {
   });
 
   // Server lifespan blocks ~20-30s on startup YouTube warm (sync pre-warm of
-  // first URLs per channel) before /api/settings responds. 40s covers the
-  // worst case without leaving a hung process when the warm itself hangs.
-  for (let i = 0; i < 80; i++) {
+  // first URLs per channel) before /api/settings responds; post-reboot with a
+  // dirty volume it can take >60s. 120s covers the worst case without leaving
+  // a hung process when the warm itself hangs.
+  for (let i = 0; i < 240; i++) {
     await sleep(500);
     if (await apiHealthy(apiPort)) break;
-    if (i === 79) {
-      console.error(`[api] did not become ready on :${apiPort} within 40s`);
+    if (i === 239) {
+      console.error(`[api] did not become ready on :${apiPort} within 120s`);
       shutdown(1);
       return;
     }
