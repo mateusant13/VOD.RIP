@@ -7,7 +7,8 @@ POST /api/session/cookies  {token, cookies:[...]}  — pairing happens on the
     disabled (cookie_bridge_enabled setting).
 GET  /api/session/cookies/pull?platform=  — Netscape cookies.txt (text/plain)
     with only the keep-listed cookie names for that platform.
-GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}}}
+GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}},
+    youtube_gate_active, youtube_gate_remaining_sec} (the any-tab bot-gate banner polls these)
 GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
 POST /api/session/cookies/enable|disable — kill switch (consent toggle).
 GET  /api/session/cookies/extension/extension.crx — the packed extension.
@@ -34,6 +35,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from deps import settings_mgr
 from services import cookie_store
 from services.settings import _get_appdata_dir
+from services.yt_gate import gate_remaining_sec
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["cookie-bridge"])
@@ -458,10 +460,15 @@ async def session_cookies_pull(platform: str):
 
 @router.get("/api/session/cookies/status")
 async def session_cookies_status():
+    gate_sec = gate_remaining_sec()
     return {
         "paired": bool(_paired_token()),
         "enabled": bool(settings_mgr.get().cookie_bridge_enabled),
         "platforms": cookie_store.status(),
+        # YouTube bot-gate cooldown state — read-only mirror of yt_gate; the
+        # any-tab banner polls these. Gating/freeze logic stays in yt_gate.
+        "youtube_gate_active": gate_sec > 0,
+        "youtube_gate_remaining_sec": gate_sec,
     }
 
 

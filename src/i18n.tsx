@@ -505,6 +505,12 @@ const ptBR: Record<string, string> = {
   'Trim end': 'Fim do corte',
   'Clip length': 'Duração do clipe',
   'from drag start': 'do início do arraste',
+  // ── Bot-gate banner ───────────────────────────────────────
+  'botGate.banner': 'YouTube está limitando as requisições (bot gate). Instale a extensão de cookies para continuar.',
+  'botGate.waiting': 'aguardando ~{min} min',
+  'botGate.openInstructions': 'Abrir instruções',
+  'botGate.installNow': 'Instalar agora',
+  'botGate.dismiss': 'Dispensar',
 }
 
 const es: Record<string, string> = {
@@ -935,9 +941,25 @@ const es: Record<string, string> = {
   'Trim end': 'Fin del recorte',
   'Clip length': 'Duración del clip',
   'from drag start': 'desde el inicio del arrastre',
+  // ── Bot-gate banner ───────────────────────────────────────
+  'botGate.banner': 'YouTube está limitando las solicitudes (bot gate). Instala la extensión de cookies para continuar.',
+  'botGate.waiting': 'esperando ~{min} min',
+  'botGate.openInstructions': 'Abrir instrucciones',
+  'botGate.installNow': 'Instalar ahora',
+  'botGate.dismiss': 'Descartar',
 }
 
-const DICTS: Record<Lang, Record<string, string>> = { en: {}, 'pt-BR': ptBR, es }
+// botGate.* keys are namespaced (not English sentences), so they need
+// explicit English entries — every other key falls back to the key itself.
+const en: Record<string, string> = {
+  'botGate.banner': 'YouTube is rate-limiting requests (bot gate). Install the cookie extension to continue.',
+  'botGate.waiting': 'waiting ~{min} min',
+  'botGate.openInstructions': 'Open instructions',
+  'botGate.installNow': 'Install now',
+  'botGate.dismiss': 'Dismiss',
+}
+
+const DICTS: Record<Lang, Record<string, string>> = { en, 'pt-BR': ptBR, es }
 
 let currentLang: Lang = 'en'
 const listeners = new Set<() => void>()

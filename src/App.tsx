@@ -86,6 +86,7 @@ import ClipDurationAdjustButtons from './components/ClipDurationAdjustButtons';
 import NeedleGlancePopup, { type NeedleGlanceState } from './components/NeedleGlancePopup';
 import QueueTab from './components/QueueTab';
 import SettingsTab from './components/SettingsTab';
+import BotGateBanner from './components/BotGateBanner';
 import PreviewChatPanel from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
@@ -6080,6 +6081,8 @@ export default function App() {
         backgroundSize: 'calc(24px * var(--ui-scale)) calc(24px * var(--ui-scale))',
       }}
     >
+      {/* Any-tab YouTube bot-gate banner (dismissible; polls /cookies/status). */}
+      <BotGateBanner onOpenInstructions={() => setTab('settings')} />
       <div
         className={`vod-layout-row flex items-start max-w-full min-w-0 w-full justify-center ${
         triplePanelLayout || splitLayout
