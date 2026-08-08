@@ -176,6 +176,22 @@ def test_thread_budget_bounded():
     assert 1 <= n <= at._PARAAKEET_MAX_THREADS
 
 
+def test_cpu_auto_workers_ladder(monkeypatch):
+    """The default CPU-lane count scales with the box: 2 below 16 threads,
+    3 at 16-31, 4 at 32+ — and the env override always wins."""
+    for threads, expected in ((4, 2), (8, 2), (15, 2), (16, 3), (20, 3), (31, 3), (32, 4), (64, 4)):
+        monkeypatch.setattr("os.cpu_count", lambda: threads)
+        assert at._cpu_auto_workers() == expected, threads
+        assert at._cpu_worker_ceiling() == expected, f"no-env ceiling @ {threads}"
+    # explicit env wins over the ladder
+    monkeypatch.setattr("os.cpu_count", lambda: 64)
+    monkeypatch.setenv(at.WORKERS_ENV, "1")
+    assert at._cpu_worker_ceiling() == 1, "env override must beat the ladder"
+    monkeypatch.setenv(at.WORKERS_ENV, "0")
+    assert at._cpu_worker_ceiling() == 0, "0 keeps the exclusive-GPU meaning"
+    monkeypatch.delenv(at.WORKERS_ENV, raising=False)
+
+
 def test_ensure_cuda_libs_exposes_nvidia_dirs(tmp_path, monkeypatch):
     """The CUDA wheels' DLL dirs must land on PATH (nt: <pkg>/bin) / on
     LD_LIBRARY_PATH (POSIX: <pkg>/lib) — a CUDA-13-era driver alone has no

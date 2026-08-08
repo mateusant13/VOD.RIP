@@ -22,10 +22,11 @@ Design decisions:
     its own model so inference runs in parallel.
   * Hybrid pool (CUDA hosts): the worker runs the GPU copy AND CPU threads
     at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 1)
-    plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2; 0 disables the CPU
-    side and restores the exclusive-GPU worker). Each pool thread is pinned
-    to its slot's device at thread start, so CPU threads never compete for
-    VRAM. CPU-only hosts are unchanged (WORKERS, default 2).
+    plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2 on <16-thread boxes,
+    3 on 16–31, 4 on 32+; 0 disables the CPU side and restores the
+    exclusive-GPU worker). Each pool thread is pinned to its slot's device
+    at thread start, so CPU threads never compete for VRAM. CPU-only hosts
+    are unchanged (WORKERS, same dynamic default).
   * Parakeet lane: when sherpa-onnx is importable (and VODRIP_PARAAKEET is
     not 0), slots transcribe jobs whose language is in Parakeet TDT v3's 25
     European languages with sherpa-onnx (2.5-5.2 RTFx on CPU int8 vs
@@ -511,15 +512,36 @@ def _cpu_load_high() -> bool:
     return _cpu_load_high_cache
 
 
+def _cpu_auto_workers() -> int:
+    """Dynamic default CPU-lane count, sized to the box's threads.
+
+    Whisper int8 needs ~1 thread per lane minimum before it becomes
+    latency-bound, so the default scales with os.cpu_count(): 2 lanes below
+    16 threads, 3 at 16–31, 4 at 32+. The RAM clamp (and the contention
+    clamp when the box is busy) still caps the actual slots — this only
+    raises the ceiling that used to be a flat 2. Env override
+    (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling."""
+    threads = os.cpu_count() or 4
+    if threads >= 32:
+        return 4
+    if threads >= 16:
+        return 3
+    return 2
+
+
 def _cpu_worker_ceiling() -> int:
-    """VODRIP_TRANSCRIBE_WORKERS (default 2); 0 = CPU side OFF on CUDA hosts.
+    """VODRIP_TRANSCRIBE_WORKERS (default dynamic by CPU thread count);
+    0 = CPU side OFF on CUDA hosts.
 
     On CUDA hosts 0 restores the exclusive-GPU worker; on CPU-only hosts 0
-    means auto (2), matching the legacy CPU budget."""
+    means auto (the dynamic default), matching the legacy CPU budget."""
+    raw = os.environ.get(WORKERS_ENV, "").strip()
+    if not raw:
+        return _cpu_auto_workers()
     try:
-        workers = int(os.environ.get(WORKERS_ENV, "2") or "2")
+        workers = int(raw)
     except ValueError:
-        workers = 2
+        return _cpu_auto_workers()
     return workers if workers > 0 else 0
 
 
@@ -528,8 +550,8 @@ def _worker_plan() -> list[tuple[str, str]]:
 
     CUDA host (not forced off): GPU copies first (VODRIP_TRANSCRIBE_GPU_COPIES,
     default 1, VRAM+RAM clamped) then CPU threads (VODRIP_TRANSCRIBE_WORKERS,
-    default 2; 0 disables the CPU side). CPU-only host: [("cpu","int8")] *
-    WORKERS (default 2). Every CPU slot is RAM-clamped; the clamp is
+    dynamic CPU default; 0 disables the CPU side). CPU-only host: [("cpu","int8")] *
+    WORKERS (same dynamic default). Every CPU slot is RAM-clamped; the clamp is
     conservative on purpose because CPU and GPU copies share the same host
     RAM (ponytail: per-slot RSS is an estimate — if a box OOMs, lower
     VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES).
@@ -539,7 +561,7 @@ def _worker_plan() -> list[tuple[str, str]]:
     inference. Any other plan -> multi-copy mode (per-thread model copies)."""
     device, _ = _effective_device()
     if device == "cpu":
-        workers = _cpu_worker_ceiling() or 2  # 0 == auto on CPU-only hosts
+        workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
         slots = _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
         if _cpu_load_high():
             slots = min(slots, 1)  # box contended — at most one CPU thread
@@ -564,8 +586,9 @@ def _worker_budget() -> int:
     """Max concurrent transcribe jobs: len(_worker_plan()).
 
     1 on a CUDA host with VODRIP_TRANSCRIBE_WORKERS=0 (the exact legacy
-    single-model path), 3 on a default hybrid CUDA host (1 GPU copy + 2 CPU
-    threads), WORKERS/GPU_COPIES ceilings and RAM clamps as before."""
+    single-model path), 1 GPU copy + the dynamic CPU lane count on a
+    default hybrid CUDA host (2 lanes on <16-thread boxes, 3 on 16–31,
+    4 on 32+), WORKERS/GPU_COPIES ceilings and RAM clamps as before."""
     return len(_worker_plan())
 
 
@@ -1093,8 +1116,8 @@ def _parakeet_langs() -> frozenset[str]:
 def _parakeet_threads() -> int:
     """sherpa-onnx decode threads per CPU lane: the box's cores divided by
     the CPU lane count, capped at the A/B-measured 8-thread sweet spot.
-    Machine-aware: a 20-thread box with the default 2 CPU lanes gets 8."""
-    lanes = max(1, _cpu_worker_ceiling() or 2)  # 0 == auto on CPU-only hosts
+    Machine-aware: a 20-thread box with 3 CPU lanes gets 6."""
+    lanes = max(1, _cpu_worker_ceiling() or _cpu_auto_workers())  # 0 == auto on CPU-only hosts
     cores = os.cpu_count() or 4
     return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes))
 
@@ -2859,8 +2882,8 @@ def run_worker(
     """Blocking worker loop over the transcribe queue.
 
     Hybrid pool: the plan (_worker_plan()) is [("cuda","float16")]*gpu_slots +
-    [("cpu","int8")]*cpu_slots on CUDA hosts (GPU copy + default 2 CPU
-    threads), [("cpu","int8")]*2 on CPU-only hosts. Each pool thread is
+    [("cpu","int8")]*cpu_slots on CUDA hosts (GPU copy + dynamic CPU lanes),
+    [("cpu","int8")]*auto on CPU-only hosts. Each pool thread is
     pinned to its slot by the executor initializer, so a pinned CPU thread
     loads its model on CPU even though the box has a GPU. Engines are chosen
     PER JOB: GPU slots run parakeet with provider='cuda' for parakeet
@@ -3157,7 +3180,10 @@ try:
     os.environ[WORKERS_ENV] = "4"
     assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
     os.environ.pop(WORKERS_ENV, None)
-    assert _worker_budget() == 2, "CPU budget defaults to 2 workers"
+    assert _worker_budget() == _cpu_auto_workers(), (
+        "CPU budget must default to the thread-count ladder"
+    )
+    assert _cpu_auto_workers() >= 2, "dynamic default never below the legacy floor"
     # system-RAM clamp: 3 GiB free + 1.5 GiB/worker -> usable 2.4 GiB -> 1
     # (2 workers would use 100% of free RAM; the 20% headroom forbids it);
     # 4 GiB free -> usable 3.2 GiB -> 2; 1 GiB free -> floor 1.
@@ -3196,8 +3222,8 @@ try:
     _cpu_load_high = lambda: False
     os.environ.pop(WORKERS_ENV, None)
     os.environ.pop(GPU_COPIES_ENV, None)
-    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
-        "CUDA host defaults to 1 GPU copy + 2 CPU threads"
+    assert _worker_plan() == [("cuda", "float16")] + [("cpu", "int8")] * _cpu_auto_workers(), (
+        "CUDA host defaults to 1 GPU copy + dynamic CPU lanes"
     )
     os.environ[WORKERS_ENV] = "0"
     assert _worker_plan() == [("cuda", "float16")], "WORKERS=0 -> exclusive-GPU plan"
@@ -3208,10 +3234,10 @@ try:
     # machine-aware scale-down: tight VRAM (another app holds the GPU model)
     # -> GPU copy 0, CPU slots cover; busy box -> at most 1 CPU slot; both ->
     # the 1-CPU-slot floor keeps the queue draining. (WORKERS back to the
-    # default 2 for these — the 3-slot plan above was a ceiling check.)
+    # dynamic default for these — the 3-slot plan above was a ceiling check.)
     os.environ.pop(WORKERS_ENV, None)
     _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3  # < 2 GiB floor
-    assert _worker_plan() == [("cpu", "int8"), ("cpu", "int8")], (
+    assert _worker_plan() == [("cpu", "int8")] * _cpu_auto_workers(), (
         "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
     )
     # capability ladder rungs (simulated free VRAM -> lane model+precision)
@@ -3221,17 +3247,18 @@ try:
     assert _gpu_lane_plan() == (None, "int8"), "3.5-6.5 GiB -> active model int8"
     _gpu_free_vram_bytes = lambda: int(8.0 * 1024 ** 3)
     assert _gpu_lane_plan() == (None, "float16"), ">= 6.5 GiB -> active model fp16"
-    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
-        "8 GiB tier -> fp16 GPU lane + CPU lane"
+    _cpu_slots = [("cpu", "int8")] * _cpu_auto_workers()
+    assert _worker_plan() == [("cuda", "float16")] + _cpu_slots, (
+        "8 GiB tier -> fp16 GPU lane + dynamic CPU lanes"
     )
     _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
-    assert _worker_plan() == [("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8")], (
-        "3 GiB tier -> medium int8 GPU slot + CPU lane"
+    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+        "3 GiB tier -> medium int8 GPU slot + dynamic CPU lanes"
     )
     # compute-apps guard: another process holds a GPU model -> CPU only
     _gpu_free_vram_bytes = lambda: 16 * 1024 ** 3
     _gpu_held_by_other = lambda: True
-    assert _worker_plan() == [("cpu", "int8"), ("cpu", "int8")], (
+    assert _worker_plan() == _cpu_slots, (
         "held GPU model must drop the GPU lane (never stack)"
     )
     _gpu_held_by_other = lambda: False
@@ -3239,14 +3266,13 @@ try:
     # busy GPU: a second copy is capped at 1 when util >= 70%
     os.environ[GPU_COPIES_ENV] = "3"
     _gpu_util = lambda: 0.85
-    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], (
+    assert _worker_plan() == [("cuda", "float16")] + _cpu_slots, (
         "busy GPU caps copies at 1"
     )
     _gpu_util = lambda: 0.4
     assert _worker_plan() == [
         ("cuda", "float16"), ("cuda", "float16"), ("cuda", "float16"),
-        ("cpu", "int8"), ("cpu", "int8"),
-    ], "idle GPU + ample VRAM allows the configured 3 copies"
+    ] + _cpu_slots, "idle GPU + ample VRAM allows the configured 3 copies"
     os.environ.pop(GPU_COPIES_ENV, None)
     # contended box: at most 1 CPU slot
     _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3

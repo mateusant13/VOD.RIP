@@ -72,16 +72,16 @@ def test_cpu_budget_env_override_wins(monkeypatch):
     monkeypatch.setenv(at.WORKERS_ENV, "1")
     _set_free_ram(monkeypatch, 64 * GIB)
     assert at._worker_budget() == 1
-    # 0 -> auto (2) with the RAM clamp applied.
+    # 0 -> auto (dynamic CPU default) with the RAM clamp applied.
     monkeypatch.setenv(at.WORKERS_ENV, "0")
     _set_free_ram(monkeypatch, 3 * GIB)
-    assert at._worker_budget() == 1  # auto 2 clamped to 1 at 3 GiB free
-    # absent -> auto (2), clamped the same way.
+    assert at._worker_budget() == 1  # auto lanes clamped to 1 at 3 GiB free
+    # absent -> auto (dynamic CPU default), clamped the same way.
     monkeypatch.delenv(at.WORKERS_ENV)
     _set_free_ram(monkeypatch, 3 * GIB)
     assert at._worker_budget() == 1
     _set_free_ram(monkeypatch, 64 * GIB)
-    assert at._worker_budget() == 2  # absent + ample RAM -> default 2
+    assert at._worker_budget() == at._cpu_auto_workers()  # absent + ample RAM -> ladder
 
 
 def test_cpu_budget_floor_with_low_ram(monkeypatch):

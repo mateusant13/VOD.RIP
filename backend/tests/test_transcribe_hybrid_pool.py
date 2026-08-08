@@ -37,15 +37,17 @@ def _force_cpu(monkeypatch) -> None:
 # --- _worker_plan shapes ----------------------------------------------------
 
 def test_plan_nvidia_default_hybrid(monkeypatch):
-    """CUDA host, no env: 1 GPU copy + 2 CPU threads (the new default)."""
+    """CUDA host, no env: 1 GPU copy + the dynamic CPU lane default."""
     _force_cuda(monkeypatch)
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
     monkeypatch.delenv(at.GPU_COPIES_ENV, raising=False)
-    assert at._worker_plan() == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")]
+    assert at._worker_plan() == [("cuda", "float16")] + [
+        ("cpu", "int8"),
+    ] * at._cpu_auto_workers()
 
 
 def test_plan_gpu_copies_two(monkeypatch):
-    """GPU_COPIES=2 -> 2 GPU slots in front of the default 2 CPU slots."""
+    """GPU_COPIES=2 -> 2 GPU slots in front of the dynamic default CPU slots."""
     _force_cuda(monkeypatch)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "2")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -53,8 +55,7 @@ def test_plan_gpu_copies_two(monkeypatch):
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
     assert at._worker_plan() == [
         ("cuda", "float16"), ("cuda", "float16"),
-        ("cpu", "int8"), ("cpu", "int8"),
-    ]
+    ] + [("cpu", "int8")] * at._cpu_auto_workers()
 
 
 def test_plan_workers_zero_restores_exclusive_gpu(monkeypatch):
@@ -76,10 +77,10 @@ def test_plan_workers_three(monkeypatch):
 
 
 def test_plan_cpu_only_host(monkeypatch):
-    """GPU-less host: unchanged [cpu, cpu] (WORKERS default 2)."""
+    """GPU-less host: dynamic default CPU lanes (WORKERS unset)."""
     _force_cpu(monkeypatch)
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
-    assert at._worker_plan() == [("cpu", "int8"), ("cpu", "int8")]
+    assert at._worker_plan() == [("cpu", "int8")] * at._cpu_auto_workers()
 
 
 def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
@@ -89,7 +90,7 @@ def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     at._detect_device.cache_clear()
     try:
-        assert at._worker_plan() == [("cpu", "int8"), ("cpu", "int8")]
+        assert at._worker_plan() == [("cpu", "int8")] * at._cpu_auto_workers()
     finally:
         at._detect_device.cache_clear()
 
