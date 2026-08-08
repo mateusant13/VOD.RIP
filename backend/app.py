@@ -63,6 +63,15 @@ def _spawn_detached_worker() -> Optional[int]:
     (the caller falls back to the in-process worker).
     """
     backend_dir = Path(__file__).resolve().parent
+    if getattr(sys, "frozen", False):
+        # Packaged app: sys.executable is VOD-RIP.EXE, which cannot run
+        # `-c`/worker_server.py as a child — it would relaunch the whole
+        # GUI (single-instance guard kills it) and the watchdog would wait
+        # out its 120s grace before the in-process fallback. Skip straight
+        # to the in-process worker; the wheel-bundled worker logic runs in
+        # the same process and the ASR stack ships inside the bundle.
+        logger.debug("detached worker spawn skipped (frozen install)")
+        return None
     if os.name == "nt":
         launcher = (
             "import subprocess, sys\n"
@@ -247,9 +256,11 @@ async def _app_lifespan(_app: FastAPI):
             return
         from services.youtube_pot_service import schedule_pot_service_warm
         from services.youtube_ytdlp_update import schedule_ytdlp_update_check
+        from services.archive_transcribe import schedule_gpu_sherpa_ensure
 
         schedule_pot_service_warm()
         schedule_ytdlp_update_check()
+        schedule_gpu_sherpa_ensure()
         from services.youtube_session import warm_youtube_session
 
         warm_youtube_session()

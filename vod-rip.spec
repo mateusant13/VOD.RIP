@@ -74,6 +74,57 @@ def _bundled_bgutil_datas():
     return [(str(server_dir), "runtime/bgutil-pot/server")]
 
 
+def _asr_gpu_binaries():
+    """Bundle the on-device ASR runtime so packaged users transcribe with
+    zero commands (the answer to "users dont need to run any commands").
+
+    Ships three things the modulegraph does not follow on its own:
+      * sherpa-onnx's own onnxruntime + CUDA providers DLLs
+        (``sherpa_onnx/lib/*.dll`` — the +cuda wheel's bundled ORT CUDA EP);
+      * ctranslate2's native libs (faster-whisper's inference backend);
+      * the ``nvidia/<pkg>/bin|lib`` CUDA runtime dirs (cublas, cufft,
+        curand, cudnn, nvjitlink, cuda_runtime) so
+        ``archive_transcribe._ensure_cuda_libs`` finds them in the frozen
+        tree — it probes ``sys._MEIPASS`` (onefile) / ``sys.prefix``
+        (onedir) roots, which is exactly where these land.
+
+    CPU-only build hosts (CI without the GPU wheels) return [] — the
+    runtime probe then degrades to the CPU EP, which is the designed
+    fallback. The +cuda wheel itself is installed by the build (see
+    ``backend/requirements-gpu.txt``).
+    """
+    result = []
+    import site as _site
+
+    subdir = "bin" if os.name == "nt" else "lib"
+    for root in _site.getsitepackages():
+        root = Path(root)
+        # sherpa-onnx native runtime (onnxruntime + CUDA providers)
+        sherpa_lib = root / "sherpa_onnx" / "lib"
+        if sherpa_lib.is_dir():
+            result.append((str(sherpa_lib), "sherpa_onnx/lib"))
+        # ctranslate2 native libs (faster-whisper backend)
+        ct2 = root / "ctranslate2"
+        if ct2.is_dir():
+            for f in ct2.iterdir():
+                if f.suffix.lower() in (".dll", ".so", ".pyd"):
+                    result.append((str(f), "ctranslate2"))
+        # nvidia-*-cu12 wheels: DLLs live in nvidia/<pkg>/bin (win) or
+        # nvidia/<pkg>/lib (posix) — mirror _ensure_cuda_libs's probe.
+        nvidia_root = root / "nvidia"
+        if nvidia_root.is_dir():
+            for pkg_dir in sorted(nvidia_root.iterdir()):
+                if not pkg_dir.is_dir():
+                    continue
+                lib_dir = pkg_dir / subdir
+                if lib_dir.is_dir():
+                    result.append(
+                        (str(lib_dir), f"nvidia/{pkg_dir.name}/{subdir}")
+                    )
+    # Dedupe by (source, dest) — getsitepackages can repeat the same root.
+    return list(dict.fromkeys(result))
+
+
 def _hidden_imports():
     imports = [
         "uvicorn",
@@ -110,6 +161,14 @@ def _hidden_imports():
         "services.crash_handler",
         "services._version",
         "services.youtube_pot_service",
+        "services.archive_transcribe",
+        "faster_whisper",
+        "sherpa_onnx",
+        "ctranslate2",
+        "torch",
+        "onnxruntime",
+        "panns_inference",
+        "silero_vad",
         "models.schemas",
         "webview",
         "PIL",
@@ -146,7 +205,7 @@ a = Analysis(
         str(_BACKEND_DIR / "main.py"),
     ],
     pathex=[str(_BACKEND_DIR)],
-    binaries=_ffmpeg_binaries() + _bundled_node_binaries(),
+    binaries=_ffmpeg_binaries() + _bundled_node_binaries() + _asr_gpu_binaries(),
     datas=[
         (str(_STATIC_DIR / "index.html"), "static"),
         (str(_ICON_ICO), "."),
@@ -169,7 +228,10 @@ a = Analysis(
         "botocore",
         "matplotlib",
         "scipy",
-        "numpy",
+        # numpy deliberately NOT excluded: torch, faster-whisper,
+        # ctranslate2 and sherpa-onnx all import it at runtime, and the
+        # packaged app must ship the on-device ASR stack (see
+        # _asr_gpu_binaries + the ASR hiddenimports).
         "pandas",
     ],
     win_no_prefer_redirects=False,

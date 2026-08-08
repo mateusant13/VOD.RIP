@@ -82,7 +82,16 @@ jobs:
       - name: Install Python dependencies
         shell: bash
         run: |
-          pip install -r backend/requirements.txt
+          # The shipped app bundles GPU parakeet by default (users never
+          # run a command): Windows/Linux builds install the +cuda sherpa
+          # wheel + nvidia CUDA libs via requirements-gpu.txt so the spec's
+          # _asr_gpu_binaries() picks them up. macOS has no NVIDIA wheels —
+          # it keeps the CPU baseline and degrades to the CPU EP.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            pip install -r backend/requirements.txt
+          else
+            pip install -r backend/requirements-gpu.txt
+          fi
           pip install pyinstaller pywebview pystray Pillow
 
       - name: Install Node dependencies

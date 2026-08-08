@@ -231,3 +231,92 @@ def test_manifest_engine_change_invalidates_resume():
     pheader = {"chunks": [(0.0, 5.0)], "model": at.PARAKEET_MODEL, "engine": "parakeet"}
     missing, _ = at._resume_plan(pheader["chunks"], pheader, entries, {0}, engine="whisper")
     assert missing == [0]
+
+
+def test_gpu_autoinstall_needed_gates(monkeypatch):
+    """The boot-time GPU swap must fire ONLY on NVIDIA hosts with a CPU
+    sherpa-onnx: never on AMD/Intel, never when the lane is off, never when
+    the CUDA wheel is already installed, never behind the kill switch."""
+    monkeypatch.delenv(at.GPU_AUTOINSTALL_ENV, raising=False)
+    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.delenv(at.PARAKEET_ENV, raising=False)
+
+    class _FakeCuda:
+        __version__ = "1.13.4+cuda12.cudnn9"
+
+    class _FakeCpu:
+        __version__ = "1.13.4"
+
+    import builtins
+
+    _orig_import = builtins.__import__
+
+    def _import(name, *a, **k):
+        if name == "sherpa_onnx":
+            return _FakeCpu
+        return _orig_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    assert at._gpu_autoinstall_needed() is True
+
+    # CUDA wheel already present -> no-op
+    monkeypatch.setattr(builtins, "__import__", lambda n, *a, **k: (
+        _FakeCuda if n == "sherpa_onnx" else _orig_import(n, *a, **k)
+    ))
+    assert at._gpu_autoinstall_needed() is False
+
+    # non-NVIDIA GPU -> no-op
+    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "amd")
+    assert at._gpu_autoinstall_needed() is False
+
+    # kill switch (VODRIP_PARAAKEET=0) -> no-op even on NVIDIA
+    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setenv(at.PARAKEET_ENV, "0")
+    assert at._gpu_autoinstall_needed() is False
+
+    # explicit escape hatch wins over everything
+    monkeypatch.delenv(at.PARAKEET_ENV)
+    monkeypatch.setenv(at.GPU_AUTOINSTALL_ENV, "1")
+    assert at._gpu_autoinstall_needed() is False
+
+
+def test_gpu_autoinstall_skips_frozen(monkeypatch):
+    """Frozen installs never self-modify (read-only tree; upgrades ship via
+    the signed updater) — same posture as the yt-dlp check."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    calls = []
+
+    def _fake_install():
+        calls.append(1)
+
+    monkeypatch.setattr(at, "_gpu_autoinstall_needed", lambda: True)
+    monkeypatch.setattr(at, "_gpu_autoinstall_due", lambda: True)
+    monkeypatch.setattr(at, "sp", type("_sp", (), {"run": staticmethod(lambda *a, **k: calls.append(2))}))
+    at.maybe_ensure_gpu_sherpa()
+    assert calls == [], "frozen install must not attempt pip"
+
+
+def test_gpu_autoinstall_respects_stamp_and_installs(tmp_path, monkeypatch):
+    """Due + NVIDIA + CPU wheel -> exactly one pip run; stamp updated. Not
+    due -> zero pip runs."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(at, "_gpu_autoinstall_stamp_path", lambda: tmp_path / "stamp.txt")
+    monkeypatch.setattr(at, "_gpu_autoinstall_needed", lambda: True)
+    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    runs = []
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(at, "sp", type("_sp", (), {
+        "run": staticmethod(lambda *a, **k: (runs.append(k), _Proc())[1]),
+        "TimeoutExpired": TimeoutError,
+    }))
+    at.maybe_ensure_gpu_sherpa()
+    assert len(runs) == 1
+    assert (tmp_path / "stamp.txt").is_file()
+    # first call after the stamp write is no longer due -> no second pip
+    monkeypatch.setattr(at, "_gpu_autoinstall_due", lambda: False)
+    at.maybe_ensure_gpu_sherpa()
+    assert len(runs) == 1

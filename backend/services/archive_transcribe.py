@@ -2950,6 +2950,111 @@ def start_worker(**kwargs: Any) -> threading.Thread:
     return thread
 
 
+# ── GPU sherpa auto-provision (mirrors youtube_ytdlp_update) ────────────
+# Users never run a command: on an NVIDIA host with the CPU sherpa-onnx
+# wheel installed, the app upgrades to the +cuda wheel itself, once, at
+# boot. Frozen builds skip (the bundle pins the wheel it ships — the yt-dlp
+# self-update rule) and VODRIP_NO_GPU_AUTOINSTALL="1" is the escape hatch.
+GPU_AUTOINSTALL_ENV = "VODRIP_NO_GPU_AUTOINSTALL"
+_GPU_AUTOINSTALL_INTERVAL_SEC = 24 * 3600  # at most once a day
+_GPU_AUTOINSTALL_TIMEOUT_S = 600  # 200 MB wheel + nvidia deps over slow links
+
+
+def _gpu_autoinstall_stamp_path() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "/tmp"
+    return Path(base) / "VOD.RIP" / "gpu_sherpa_last_check.txt"
+
+
+def _gpu_autoinstall_due() -> bool:
+    path = _gpu_autoinstall_stamp_path()
+    if not path.is_file():
+        return True
+    try:
+        last = float(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return True
+    return (time.time() - last) >= _GPU_AUTOINSTALL_INTERVAL_SEC
+
+
+def _gpu_autoinstall_needed() -> bool:
+    """True when THIS host should run the +cuda wheel but has the CPU one.
+
+    Gate on the same probes the lane uses: NVIDIA GPU present, parakeet
+    lane enabled, sherpa-onnx importable, and no '+cuda' in its version.
+    A missing sherpa-onnx is NOT auto-installed (the lane is opt-in; the
+    base requirements ship the CPU wheel) — only the CPU->CUDA swap is
+    automatic, exactly the yt-dlp update posture."""
+    if os.environ.get(GPU_AUTOINSTALL_ENV, "").strip() == "1":
+        return False
+    if os.environ.get(PARAKEET_ENV, "1").strip() == "0":
+        return False
+    if detect_gpu_vendor() != "nvidia":
+        return False
+    try:
+        import sherpa_onnx
+
+        return "+cuda" not in (getattr(sherpa_onnx, "__version__", "") or "")
+    except Exception:
+        return False  # not installed / import broken — leave the lane alone
+
+
+def maybe_ensure_gpu_sherpa() -> None:
+    """Swap the CPU sherpa-onnx for the +cuda wheel on NVIDIA hosts, once a day.
+
+    No-op under a frozen install (the bundle ships its own wheel, and the
+    install tree is read-only for self-update — same rule as the yt-dlp
+    check). The upgrade happens in the background at boot; a running worker
+    keeps its in-memory recognizer until the next process start, which is
+    fine because the lane's CUDA probe runs at construction time."""
+    if getattr(sys, "frozen", False):
+        logger.debug("GPU sherpa auto-install skipped (frozen install)")
+        return
+    if not _gpu_autoinstall_due():
+        return
+    path = _gpu_autoinstall_stamp_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(time.time()), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("GPU auto-install stamp write failed: %s", exc)
+    if not _gpu_autoinstall_needed():
+        return
+    logger.info("NVIDIA GPU detected with CPU sherpa-onnx — auto-installing the CUDA wheel")
+    try:
+        proc = sp.run(
+            [
+                sys.executable, "-m", "pip", "install",
+                "sherpa-onnx==1.13.4+cuda12.cudnn9",
+                "-f", "https://k2-fsa.github.io/sherpa/onnx/cuda.html",
+                "nvidia-cufft-cu12", "nvidia-curand-cu12", "nvidia-cudnn-cu12",
+            ],
+            capture_output=True, text=True, timeout=_GPU_AUTOINSTALL_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode == 0:
+            logger.info("sherpa-onnx CUDA wheel installed — GPU slots can run parakeet")
+        else:
+            logger.debug(
+                "GPU sherpa auto-install exit %s: %s",
+                proc.returncode, (proc.stderr or "")[:300],
+            )
+    except (OSError, sp.TimeoutExpired) as exc:
+        logger.debug("GPU sherpa auto-install failed: %s", exc)
+
+
+def schedule_gpu_sherpa_ensure() -> threading.Thread:
+    """Daemon thread — never blocks API startup (mirrors the yt-dlp check)."""
+    def _run() -> None:
+        try:
+            maybe_ensure_gpu_sherpa()
+        except Exception as exc:
+            logger.debug("GPU sherpa ensure thread failed: %s", exc)
+
+    t = threading.Thread(target=_run, name="gpu-sherpa-ensure", daemon=True)
+    t.start()
+    return t
+
+
 if __name__ == "__main__":
     import argparse
 
