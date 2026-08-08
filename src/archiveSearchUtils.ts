@@ -64,7 +64,13 @@ export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
  */
 export const ARCHIVE_FILTER_KINDS = ARCHIVE_KINDS.filter((k) => k !== 'live');
 
-export const ARCHIVE_SOURCES = ['both', 'video', 'transcript', 'chat'] as const;
+/**
+ * Content sources offered as multi-select filter chips. 'both' is NOT an
+ * option anymore — every source is toggled individually and all are ON by
+ * default (the backend's default 'both' = everything). Selected set is
+ * sent comma-joined; all-three collapses to omitted (backend default).
+ */
+export const ARCHIVE_SOURCES = ['video', 'transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
@@ -84,11 +90,10 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
 };
 
 /** i18n keys for the source-filter labels. The query PARAM values stay
- *  stable (both|video|transcript|chat — buildSearchUrl sends them
- *  untouched); only the display words changed (STREAMER → speech, BOTH →
- *  both). */
+ *  stable (video|transcript|chat — buildSearchUrl joins them comma-separated
+ *  when a proper subset is selected; all-three is omitted = backend 'both');
+ *  only the display words changed (STREAMER → speech). */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
-  both: 'both',
   video: 'video',
   transcript: 'speech',
   chat: 'chat',
@@ -172,8 +177,12 @@ export interface ArchiveSearchFilterParams {
   platforms?: readonly string[] | null;
   /** Empty = all kinds; multiple join as comma-separated. */
   kinds?: readonly string[] | null;
-  /** 'both' (default) | 'chat' | 'transcript' — omitted from the URL when 'both'. */
-  source?: ArchiveSource | null;
+  /**
+   * Selected content sources (multi-select). Empty/null/undefined → all
+   * (backend default 'both'). Sent comma-joined when a proper subset is
+   * selected ("video,transcript").
+   */
+  source?: ArchiveSource[] | null;
   /** Scope the search to a single archived video id; omitted when unset. */
   videoId?: string | null;
   /** YYYY-MM-DD inclusive bounds on started_at; empty = unset. */
@@ -202,7 +211,12 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (platforms.length > 0) params.set('platform', platforms.join(','));
   const kinds = (p.kinds ?? []).filter(Boolean);
   if (kinds.length > 0) params.set('kind', kinds.join(','));
-  if (p.source && p.source !== 'both') params.set('source', p.source);
+  const sources = (p.source ?? []).filter(Boolean);
+  // All-three (or empty) = backend default 'both' — omit the param; a
+  // proper subset goes comma-joined ("video,transcript").
+  if (sources.length > 0 && sources.length < ARCHIVE_SOURCES.length) {
+    params.set('source', sources.join(','));
+  }
   if (p.videoId) params.set('video_id', p.videoId);
   const dateFrom = p.dateFrom && isValidDateParam(p.dateFrom) ? p.dateFrom : null;
   const dateTo = p.dateTo && isValidDateParam(p.dateTo) ? p.dateTo : null;

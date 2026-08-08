@@ -292,7 +292,10 @@ def _maybe_auto_backfill(
     popup's 'Indexing N videos…' line would lie about what's being
     indexed). Non-Twitch videos resolve to no candidates."""
     global _last_auto_kick
-    if source not in ("both", "chat"):
+    source_set = {s for s in source.split(",") if s}
+    if "both" in source_set or not source_set:
+        source_set = {"chat", "transcript", "video"}
+    if "chat" not in source_set:
         return []
     if platform and "twitch" not in [
         p.strip().lower() for p in platform.split(",") if p.strip()
@@ -467,7 +470,10 @@ def _maybe_enrich(
     'enriching' list ({platform, video_id, kind, channel, title}); empty
     when idle."""
     enriching: list[dict] = []
-    if source in ("both", "chat"):
+    source_set = {s for s in source.split(",") if s}
+    if "both" in source_set or not source_set:
+        source_set = {"chat", "transcript", "video"}
+    if "chat" in source_set:
         for r in _maybe_auto_backfill(
             platform=platform, channel=channel, source=source, q=q,
             video_id=video_id,
@@ -479,7 +485,7 @@ def _maybe_enrich(
                 "channel": r["channel"] or "",
                 "title": r["title"] or "",
             })
-    if source in ("both", "transcript"):
+    if "transcript" in source_set:
         for r in _transcribe_candidates(platform=platform, channel=channel, q=q):
             job_id = f"transcribe-{r['platform']}-{r['video_id']}"
             try:
@@ -611,15 +617,24 @@ async def archive_search(
     ]
     if bad_kinds:
         raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")
-    # source restricts to one content kind ('video' = local video-title
-    # matches only); channel accepts comma-separated slugs ("a,b" → IN
+    # source restricts the content kinds searched: 'both' (default) = all,
+    # or a comma-joined subset of chat/transcript/video ("video,transcript"
+    # — the FE's multi-select source chips). 'video' = local video-title
+    # matches only. channel accepts comma-separated slugs ("a,b" → IN
     # match) but never empty segments.
     source = (source or "both").strip().lower()
-    if source not in ("both", "chat", "transcript", "video"):
+    source_tokens = [s for s in source.split(",") if s]
+    if not source_tokens:
+        source_tokens = ["both"]
+    bad_sources = [s for s in source_tokens if s not in ("both", "chat", "transcript", "video")]
+    if bad_sources:
         raise HTTPException(
             status_code=400,
-            detail="source must be one of both, chat, transcript, video",
+            detail="source must be one of both, chat, transcript, video (or a comma-joined subset)",
         )
+    # Normalize: 'both' (or any mixture containing it) means everything.
+    if "both" in source_tokens:
+        source = "both"
     if channel and any(not s.strip() for s in channel.split(",")):
         raise HTTPException(status_code=400, detail="channel must be non-empty slugs")
     # username narrows to one or more chat authors — comma-separated

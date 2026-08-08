@@ -193,20 +193,26 @@ describe('buildSearchUrl', () => {
     expect(url).toBe('/api/archive/search?q=x&limit=30');
   });
 
-  it('emits source only when not both, and videoId when set', () => {
-    expect(buildSearchUrl({ query: 'x', source: 'transcript' })).toBe(
+  it('emits source as CSV subset, omits when all selected or empty, and videoId when set', () => {
+    expect(buildSearchUrl({ query: 'x', source: ['transcript'] })).toBe(
       '/api/archive/search?q=x&source=transcript&limit=30',
     );
-    expect(buildSearchUrl({ query: 'x', source: 'chat' })).toBe(
+    expect(buildSearchUrl({ query: 'x', source: ['chat'] })).toBe(
       '/api/archive/search?q=x&source=chat&limit=30',
+    );
+    // A proper subset goes comma-joined.
+    expect(buildSearchUrl({ query: 'x', source: ['video', 'chat'] })).toBe(
+      '/api/archive/search?q=x&source=video%2Cchat&limit=30',
     );
     expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
       '/api/archive/search?q=x&video_id=abc123&limit=30',
     );
-    expect(buildSearchUrl({ query: 'x', source: 'both', videoId: 'v1' })).toBe(
+    // All three selected = backend default 'both' — param omitted.
+    expect(buildSearchUrl({ query: 'x', source: ['video', 'transcript', 'chat'], videoId: 'v1' })).toBe(
       '/api/archive/search?q=x&video_id=v1&limit=30',
     );
-    expect(buildSearchUrl({ query: 'x', source: 'both', videoId: '' })).toBe(
+    // Empty selection = same default — omitted.
+    expect(buildSearchUrl({ query: 'x', source: [], videoId: '' })).toBe(
       '/api/archive/search?q=x&limit=30',
     );
   });

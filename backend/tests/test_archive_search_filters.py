@@ -562,6 +562,38 @@ def test_search_source_both_is_default():
     assert len(archive_db.search("zebra", source="both")) == 4
 
 
+def test_search_source_subset_csv():
+    """Comma-joined multi-select source restricts the content tables:
+    transcript+chat = both minus titles; a subset never leaks other kinds."""
+    _seed_video_source_fixture()
+    # 'zebra' lives in chat (3 messages) + transcripts (1) — not in titles.
+    both = archive_db.search("zebra", source="both")
+    assert len(both) == 4
+    assert _hit_ids(archive_db.search("zebra", source="transcript,chat")) == {
+        ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
+        ("message", "filter-t-yt"), ("transcript", "filter-t-lubu"),
+    }
+    # Reversed order must behave identically (set semantics).
+    assert _hit_ids(archive_db.search("zebra", source="chat,transcript")) == {
+        ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
+        ("message", "filter-t-yt"), ("transcript", "filter-t-lubu"),
+    }
+    # transcript+video: transcripts AND titles, no messages.
+    ids = _hit_ids(archive_db.search("title", source="transcript,video"))
+    assert ("title", "filter-t-lubu") in ids and ("title", "filter-t-titiltei") in ids
+    assert not any(k == "message" for k, _ in ids)
+    # chat+video with 'title': titles survive, transcripts (no 'title' word)
+    # are excluded — proves video joined the loop without leaking transcript.
+    ids = _hit_ids(archive_db.search("title", source="video,chat"))
+    assert ("title", "filter-t-lubu") in ids and ("title", "filter-t-titiltei") in ids
+    assert not any(k == "transcript" for k, _ in ids)
+    # chat+video with 'zebra': messages surface (chat is in the set), and the
+    # transcript-only row stays out.
+    ids = _hit_ids(archive_db.search("zebra", source="chat,video"))
+    assert ("message", "filter-t-lubu") in ids
+    assert not any(k == "transcript" for k, _ in ids)
+
+
 def _seed_video_source_fixture():
     """Clean slate + the three filter-* videos (earlier module tests leave
     other videos whose 'title {video_id}' titles would match a 'title'
@@ -682,7 +714,15 @@ async def test_search_source_router_validation_and_passthrough():
     assert _hit_ids(resp["hits"]) == {("transcript", "filter-t-lubu")}
     resp = await archive_search(q="zebra", source="both", limit=20, semantic=False)
     assert len(resp["hits"]) == 4
-    for bad in ("streamer", "chat,transcript"):
+    # Multi-select subset: comma-joined sources are valid and restrict the
+    # content tables — chat+transcript here equals 'both' minus titles.
+    resp = await archive_search(q="zebra", source="chat,transcript", limit=20, semantic=False)
+    assert len(resp["hits"]) == 4
+    resp = await archive_search(q="zebra", source="transcript,chat", limit=20, semantic=False)
+    assert len(resp["hits"]) == 4
+    resp = await archive_search(q="zebra", source="chat,video", limit=20, semantic=False)
+    assert len(resp["hits"]) == 3  # messages only — no transcripts, no titles
+    for bad in ("streamer", "chat,banana"):
         with pytest.raises(HTTPException) as exc:
             await archive_search(q="zebra", source=bad, limit=20)
         assert exc.value.status_code == 400
@@ -700,7 +740,10 @@ async def test_search_source_video_router_passthrough():
     # uppercase normalized like the other sources
     resp = await archive_search(q="title", source="VIDEO", limit=20, semantic=False)
     assert resp["hits"] and all(h["kind"] == "title" for h in resp["hits"])
-    for bad in ("streamer", "chat,transcript", "video,chat"):
+    # multi-select subset: video+chat keeps titles and messages, no transcripts
+    resp = await archive_search(q="title", source="video,chat", limit=20, semantic=False)
+    assert resp["hits"] and all(h["kind"] in ("title", "message") for h in resp["hits"])
+    for bad in ("streamer", "chat,banana"):
         with pytest.raises(HTTPException) as exc:
             await archive_search(q="title", source=bad, limit=20)
         assert exc.value.status_code == 400

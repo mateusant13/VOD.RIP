@@ -158,7 +158,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [channelFilter, setChannelFilter] = useState(initialChannel ?? '');
   const [platformFilter, setPlatformFilter] = useState<string[]>([]);
   const [kindFilter, setKindFilter] = useState<string[]>([]);
-  const [sourceFilter, setSourceFilter] = useState<ArchiveSource>('both');
+  /** Multi-select content sources; all three ON by default. */
+  const [sourceFilter, setSourceFilter] = useState<ArchiveSource[]>([...ARCHIVE_SOURCES]);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   /** True = ignore the stored date range (default). A date pick unchecks it;
@@ -515,9 +516,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       username: userFilter || null,
       limit: semanticOn ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
       hint: hintDisabled ? false : undefined,
-      // Concept search runs over transcript segments — meaningless for the
-      // chat and video-title filters.
-      semantic: semanticOn && sourceFilter !== 'chat' && sourceFilter !== 'video',
+      // Concept search runs over transcript segments — meaningless without
+      // the transcript source selected.
+      semantic: semanticOn && sourceFilter.includes('transcript'),
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -539,13 +540,15 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
 
   // Remote YouTube channel-title search: the local index only holds the
   // newest ~100 uploads per saved channel (the panel fetch cap), so old
-  // series are unreachable locally. Runs for "both" source only, and only
-  // when the scope resolves to a saved channel with a YouTube handle.
+  // series are unreachable locally. Runs only when every source is
+  // selected (the "both"-equivalent default), and only when the scope
+  // resolves to a saved channel with a YouTube handle.
   useEffect(() => {
     remoteGenRef.current += 1;
     const excludedPlatform = platformFilter.length > 0 && !platformFilter.includes('youtube');
     const excludedKind = kindFilter.length > 0 && !kindFilter.includes('vod');
-    if (!query || scopeActive || sourceFilter !== 'both' || excludedPlatform || excludedKind || !remoteYtHandle) {
+    const allSources = sourceFilter.length === ARCHIVE_SOURCES.length;
+    if (!query || scopeActive || !allSources || excludedPlatform || excludedKind || !remoteYtHandle) {
       setRemoteHits([]);
       setRemoteStatus('idle');
       setRemoteError(null);
@@ -965,37 +968,51 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             {t('EVERY DAY')}
           </button>
         </div>
-        <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 items-center">
+        <div className="grid grid-cols-1 gap-y-1.5 items-start">
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Source')}</span>
             <div className="flex border-2 border-zinc-700">
-              {ARCHIVE_SOURCES.map((s, i) => (
-                <button
-                  key={s}
-                  type="button"
-                  aria-pressed={sourceFilter === s}
-                  onClick={() => setSourceFilter(s)}
-                  className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
-                    i > 0 ? 'border-l-2 border-zinc-700' : ''
-                  } ${
-                    sourceFilter === s
-                      ? 'bg-white text-black'
-                      : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
-                  }`}
-                >
-                  {t(ARCHIVE_SOURCE_LABELS[s])}
-                </button>
-              ))}
+              {ARCHIVE_SOURCES.map((s, i) => {
+                const on = sourceFilter.includes(s);
+                return (
+                  <button
+                    key={s}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() =>
+                      setSourceFilter((cur) => {
+                        const next = on
+                          ? cur.filter((x) => x !== s)
+                          : [...cur, s];
+                        // Never empty out — an empty source set would
+                        // silently mean "all" on the backend (param
+                        // omitted), reading as a bug.
+                        return next.length > 0 ? next : [...ARCHIVE_SOURCES];
+                      })
+                    }
+                    className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                      i > 0 ? 'border-l-2 border-zinc-700' : ''
+                    } ${
+                      on
+                        ? 'bg-white text-black'
+                        : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
+                    }`}
+                  >
+                    {t(ARCHIVE_SOURCE_LABELS[s])}
+                  </button>
+                );
+              })}
             </div>
           </div>
-          <div className="flex items-center gap-1.5 min-w-0">
+          {/* Context toggle on its own row, separated from the source chips. */}
+          <div className="flex items-center gap-1.5 min-w-0 pt-1 mt-0.5">
             <button
               type="button"
               aria-pressed={semanticOn}
-              disabled={sourceFilter === 'chat' || sourceFilter === 'video'}
+              disabled={!sourceFilter.includes('transcript')}
               onClick={() => setSemanticOn((v) => !v)}
               title={
-                sourceFilter === 'chat' || sourceFilter === 'video'
+                !sourceFilter.includes('transcript')
                   ? t('Context search covers transcripts only')
                   : t('Context search (semantic): finds moments by meaning, not just exact words')
               }

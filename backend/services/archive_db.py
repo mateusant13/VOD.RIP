@@ -2494,14 +2494,16 @@ def search(
     if username:
         # Chat-only: transcripts/title rows have no author.
         source = "chat"
-    if source == "chat":
-        loops = loops[1:]
-    elif source == "transcript":
-        loops = loops[:1]
-    elif source == "video":
-        # Titles only: no transcript/message content passes — the video-title
-        # pass below is the whole result set.
-        loops = []
+    # Multi-select source: comma-joined subset ("video,transcript") maps to
+    # the tables that stay in the loop; "both" (or empty) = everything.
+    wanted = {s.strip() for s in source.split(",") if s.strip()} or {"both"}
+    if "both" in wanted:
+        wanted = {"chat", "transcript", "video"}
+    loops = []
+    if "transcript" in wanted:
+        loops.append(("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"))
+    if "chat" in wanted:
+        loops.append(("message", "messages_fts", "messages", "t.offset_sec", "NULL"))
     pattern = _fuzzy_pattern(q, [t[2] for t in loops])
     if pattern is None:
         pattern = {0: " OR ".join(f'"{w}"' for w in q.split() if w) or q}
@@ -2636,7 +2638,7 @@ def search(
     # neither chat nor transcript) and alone in "video" (the dedicated
     # title filter). Same normalization rule as the content tables: best
     # title hit scores 1.0.
-    if source in ("both", "video"):
+    if "video" in wanted:
         title_rows = _titles_search(
             q,
             fetch,
@@ -2683,7 +2685,7 @@ def search(
         per_video[key] = per_video.get(key, 0) + 1
         h.pop("_rowid", None)
         out.append(h)
-    if semantic and source not in ("chat", "video"):
+    if semantic and "transcript" in wanted:
         # Concept pass: embedding-based hits lead, lexical follows (deduped
         # by video). Any embedding failure degrades to pure lexical.
         try:
