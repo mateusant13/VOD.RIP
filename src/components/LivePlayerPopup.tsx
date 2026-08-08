@@ -429,13 +429,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // (resume near the current position), media error recovery, then error.
       switch (data.type) {
         case Hls.ErrorTypes.NETWORK_ERROR:
-          if (networkRetries < 2) {
+          if (networkRetries < 4) {
             networkRetries += 1;
             window.setTimeout(() => {
               if (hlsRef.current !== hls) return;
               const t = videoRef.current?.currentTime;
               hls.startLoad(t && t > 0 ? t : -1);
-            }, networkRetries * 500);
+            }, networkRetries * 1000);
             break;
           }
           setError(t('Live playback failed — try again'));
@@ -527,7 +527,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         if (vodUrl) body.vod_url = vodUrl;
 
         const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body, { signal: controller.signal });
-        if (cancelled) return;
+        if (cancelled) {
+          // StrictMode double-mount (dev) / entry switch: this mount is gone
+          // but the POST completed — delete the orphan session instead of
+          // leaking it for its 30min TTL.
+          if (res?.session_id) apiDelete(`/api/preview/session/${res.session_id}`).catch(() => {});
+          return;
+        }
         window.clearTimeout(stallTimer);
         if (!res) {
           if (tryAdvanceEntry()) return;

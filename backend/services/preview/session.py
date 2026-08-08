@@ -922,7 +922,7 @@ class PreviewManager:
                 session.allowed_hosts.update(_hosts_for_url(session.entry_url))
                 if "low_latency=" in url and not _media_playlist_is_ll(session):
                     logger.info(
-                        "live session %s: LL master has no PART-INF — falling back to non-LL",
+                        "live session %s: LL master has no PART-INF - falling back to non-LL",
                         session_id[:8],
                     )
                     non_ll = _strip_low_latency_param(url)
