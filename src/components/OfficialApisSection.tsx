@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiGet } from '../hooks/useApiClient';
 import FieldCaption from './FieldCaption';
 import { useI18n } from '../i18n';
+import { twitchOAuthAuthorizeUrl } from '../twitchClip';
 import type { AppSettings } from '../types';
 
 /**
@@ -72,6 +73,41 @@ export default function OfficialApisSection({ settings, setSettings }: Props) {
             ? t('● token configured — Helix is primary for Twitch metadata')
             : t('○ no token — using the public GQL path')}
         </p>
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption
+            noWrap
+            info={t('OAuth app Client ID for the "Get Twitch token" button — register an app at dev.twitch.tv/console/apps with OAuth Redirect URL http://localhost:7897/twitch-oauth-callback, then paste its Client ID here.')}
+          >
+            {t('Twitch Client ID')}
+          </FieldCaption>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={settings.twitch_helix_client_id ?? ''}
+              onChange={(e) => setSettings({ ...settings, twitch_helix_client_id: e.target.value })}
+              placeholder={t('optional — for the token button below')}
+              aria-label="twitch helix client id"
+              autoComplete="off"
+              className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const clientId = (settings.twitch_helix_client_id ?? '').trim();
+                if (!clientId) {
+                  // No app registered yet — send the user where they create one.
+                  window.open('https://dev.twitch.tv/console/apps', '_blank', 'noopener');
+                  return;
+                }
+                window.open(twitchOAuthAuthorizeUrl(clientId), '_blank', 'noopener');
+              }}
+              title={t('Opens the Twitch OAuth page — the token is saved automatically when you approve.')}
+              className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0"
+            >
+              {t('Get Twitch token')}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

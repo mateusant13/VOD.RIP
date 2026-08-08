@@ -147,6 +147,10 @@ class AppSettings(BaseModel):
     # auto-lift only replaces the stored token when the cookie export is
     # NEWER than this — a stale browser cookie never clobbers a manual paste.
     twitch_helix_token_updated_at: float = 0.0
+    # OAuth app Client ID used to build the "Get Twitch token" authorize URL
+    # (implicit grant, redirect to http://localhost:7897/twitch-oauth-callback).
+    # Optional: without it the token button opens the app-registration page.
+    twitch_helix_client_id: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -193,6 +197,7 @@ class SettingsUpdate(BaseModel):
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None
     twitch_helix_token: Optional[str] = None
+    twitch_helix_client_id: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):

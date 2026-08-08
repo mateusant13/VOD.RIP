@@ -7,6 +7,7 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 from models.schemas import AppSettings, OpenFolderRequest, SettingsUpdate
 
 from deps import settings_mgr, download_mgr, OS_EXECUTOR
@@ -219,6 +220,8 @@ async def update_settings(update: SettingsUpdate):
         if val != (current.twitch_helix_token or ""):
             current.twitch_helix_token = val
             current.twitch_helix_token_updated_at = time.time()
+    if update.twitch_helix_client_id is not None:
+        current.twitch_helix_client_id = (update.twitch_helix_client_id or "").strip()
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     # Auto-lift: refresh the helix token from the cookie bridge (zero manual
@@ -243,6 +246,76 @@ async def official_apis_status():
     return {
         "twitch_helix_token_set": bool((getattr(s, "twitch_helix_token", "") or "").strip()),
     }
+
+
+@router.get("/twitch-oauth-callback", response_class=HTMLResponse)
+async def twitch_oauth_callback():
+    """OAuth callback target for the "Get Twitch token" flow (implicit grant).
+
+    Twitch redirects to http://localhost:7897/twitch-oauth-callback#access_token=...
+    The token lives in the URL fragment, which never reaches the server — this
+    page's JS reads it and POSTs it to /api/settings (the same paste path).
+    """
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VOD.RIP — Twitch token</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #0e0e10; color: #efeff1;
+         font-family: system-ui, sans-serif; }
+  .card { max-width: 480px; text-align: center; padding: 32px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  p { font-size: 14px; line-height: 1.5; color: #adadb8; margin: 0; }
+  .ok { color: #38a169; font-weight: 700; }
+  .err { color: #e53e3e; font-weight: 700; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>VOD.RIP — Twitch token</h1>
+    <p id="status">Saving token…</p>
+  </div>
+<script>
+(function () {
+  var status = document.getElementById('status');
+  var params = new URLSearchParams(location.hash.replace(/^#/, ''));
+  var error = new URLSearchParams(location.search).get('error');
+  if (error) {
+    status.className = 'err';
+    status.textContent = 'Authorization failed: ' + error +
+      (new URLSearchParams(location.search).get('error_description') || '');
+    return;
+  }
+  var token = params.get('access_token');
+  if (!token) {
+    status.className = 'err';
+    status.textContent = 'No access_token in the URL. Close this tab and try again.';
+    return;
+  }
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ twitch_helix_token: token }),
+  }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var scopes = (params.get('scope') || '').split(' ');
+    var hasClipScope = scopes.indexOf('editor:manage:clips') !== -1 ||
+                       scopes.indexOf('channel:manage:clips') !== -1;
+    status.className = 'ok';
+    status.textContent = hasClipScope
+      ? 'Token saved — you can close this tab and create clips in VOD.RIP.'
+      : 'Token saved, but it lacks the clip scopes — re-run the flow and approve the clip permission.';
+  }).catch(function (err) {
+    status.className = 'err';
+    status.textContent = 'Failed to save the token (' + err.message +
+      '). Make sure VOD.RIP is running on port 7897.';
+  });
+})();
+</script>
+</body>
+</html>"""
 
 
 @router.get("/api/settings/recommended")

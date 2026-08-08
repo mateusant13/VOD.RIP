@@ -144,6 +144,33 @@ function openExternal(url: string): void {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+/** Twitch OAuth redirect target — served by the backend (reads the fragment,
+ * POSTs the token to /api/settings). Must match the app's registered
+ * redirect_uri exactly. */
+export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-callback';
+
+/** Helix scopes the token needs for VOD clips (backend VOD_CLIP_SCOPES). */
+export const TWITCH_VOD_CLIP_SCOPES = ['editor:manage:clips', 'channel:manage:clips'];
+
+/**
+ * Build the Twitch implicit-grant authorize URL for the "Get Twitch token"
+ * button. The token comes back in the URL fragment on the callback page,
+ * which saves it via /api/settings. Client-Id is derived from the token by
+ * the backend (oauth2/validate), so any registered app works.
+ */
+export function twitchOAuthAuthorizeUrl(clientId: string): string {
+  const state = crypto.getRandomValues(new Uint8Array(8))
+    .reduce((acc, b) => acc + b.toString(16).padStart(2, '0'), '');
+  const p = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: TWITCH_OAUTH_REDIRECT_URI,
+    response_type: 'token',
+    scope: TWITCH_VOD_CLIP_SCOPES.join(' '),
+    state,
+  });
+  return `https://id.twitch.tv/oauth2/authorize?${p.toString()}`;
+}
+
 /** Format VOD seconds as Twitch's ?t= syntax (1h2m3s / 2m3s / 3s). */
 function formatTwitchT(sec: number): string {
   const s = Math.max(0, Math.floor(sec));

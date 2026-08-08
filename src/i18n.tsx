@@ -132,6 +132,16 @@ const ptBR: Record<string, string> = {
     '● token configurado — Helix é primário para metadados do Twitch',
   '○ no token — using the public GQL path':
     '○ sem token — usando o caminho público GQL',
+  'Twitch Client ID':
+    'ID do Cliente Twitch',
+  'Get Twitch token':
+    'Obter token do Twitch',
+  'optional — for the token button below':
+    'opcional — para o botão de token abaixo',
+  'Opens the Twitch OAuth page — the token is saved automatically when you approve.':
+    'Abre a página OAuth do Twitch — o token é salvo automaticamente quando você aprovar.',
+  'OAuth app Client ID for the "Get Twitch token" button — register an app at dev.twitch.tv/console/apps with OAuth Redirect URL http://localhost:7897/twitch-oauth-callback, then paste its Client ID here.':
+    'ID do Cliente do app OAuth para o botão "Obter token do Twitch" — registre um app em dev.twitch.tv/console/apps com URL de Redirecionamento OAuth http://localhost:7897/twitch-oauth-callback e cole o ID do Cliente aqui.',
   'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
     'Usa seu auth-token do Twitch (preenchido automaticamente pelo Cookie Bridge, ou colado) como bearer OAuth para chamadas oficiais da API Helix — metadados mais rápidos e confiáveis. Cai para a API pública automaticamente em qualquer falha.',
   'Hide': 'Ocultar',
@@ -676,6 +686,16 @@ const es: Record<string, string> = {
     '● token configurado — Helix es primario para metadatos de Twitch',
   '○ no token — using the public GQL path':
     '○ sin token — usando la ruta pública GQL',
+  'Twitch Client ID':
+    'ID de cliente de Twitch',
+  'Get Twitch token':
+    'Obtener token de Twitch',
+  'optional — for the token button below':
+    'opcional — para el botón de token abajo',
+  'Opens the Twitch OAuth page — the token is saved automatically when you approve.':
+    'Abre la página OAuth de Twitch — el token se guarda automáticamente cuando apruebes.',
+  'OAuth app Client ID for the "Get Twitch token" button — register an app at dev.twitch.tv/console/apps with OAuth Redirect URL http://localhost:7897/twitch-oauth-callback, then paste its Client ID here.':
+    'ID de cliente del app OAuth para el botón "Obtener token de Twitch" — registra un app en dev.twitch.tv/console/apps con URL de Redirección OAuth http://localhost:7897/twitch-oauth-callback y pega aquí su ID de cliente.',
   'Uses your Twitch auth-token (auto-lifted from the Cookie Bridge, or pasted) as the OAuth bearer for official Helix API calls — faster and more reliable metadata. Falls back to the public API automatically on any failure.':
     'Usa tu auth-token de Twitch (rellenado automáticamente desde Cookie Bridge, o pegado) como bearer OAuth para llamadas oficiales de la API Helix — metadatos más rápidos y confiables. Vuelve a la API pública automáticamente ante cualquier fallo.',
   'Hide': 'Ocultar',
