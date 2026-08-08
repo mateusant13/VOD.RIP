@@ -119,6 +119,40 @@ def test_twitch_chat_job_not_gated(monkeypatch):
         _reset_gate()
 
 
+def test_claim_skips_youtube_jobs_during_gate():
+    """A gated YouTube job must NOT be claimed — claiming would requeue it
+    and the refill loop would re-claim the same row in a hot loop (~2ms/iter,
+    spamming 'requeued: bot-gate cooldown' for the whole freeze window)."""
+    _reset_gate()
+    yt_job = _seed_job("chat", "youtube", "YTF3ddYsEnc")
+    tw_job = _seed_job("chat", "twitch", "123456789")
+    yt_gate.note_youtube_gate("test", freeze_sec=60)
+    try:
+        # The twitch job (same priority, later created_at) is the one claimed.
+        claimed = at._claim_next_job()
+        assert claimed is not None and claimed["id"] == tw_job
+        row = archive_db.query(
+            "SELECT status FROM archive_jobs WHERE id = ?", (yt_job,)
+        )[0]
+        assert row["status"] == "queued", "gated youtube job must stay queued untouched"
+    finally:
+        _reset_gate()
+
+
+def test_claim_clears_when_gate_lifts():
+    """Once the gate lifts, the youtube job is claimable again."""
+    _reset_gate()
+    archive_db.execute("DELETE FROM archive_jobs")
+    yt_job = _seed_job("chat", "youtube", "YTF3ddYsEnc")
+    yt_gate.note_youtube_gate("test", freeze_sec=60)
+    try:
+        assert at._claim_next_job() is None
+    finally:
+        _reset_gate()
+    claimed = at._claim_next_job()
+    assert claimed is not None and claimed["id"] == yt_job
+
+
 def test_chat_pacing_min_interval():
     at._YOUTUBE_CHAT_MIN_INTERVAL_S = 0.15
     at._youtube_chat_last_start = 0.0

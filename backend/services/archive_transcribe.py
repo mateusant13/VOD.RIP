@@ -2566,6 +2566,14 @@ def _claim_next_job() -> Optional[dict]:
         (twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
     )
     for row in rows:
+        # Bot-gate freeze: never claim YouTube jobs while the gate is up.
+        # The processors requeue gated YouTube jobs (never fail), so a
+        # claim would flip running -> queued and the refill loop would
+        # re-claim the same row ~2 ms later — a hot loop spamming
+        # "requeued: bot-gate cooldown" for the whole freeze window.
+        # Leave them queued untouched; they drain once the gate lifts.
+        if youtube_gate_active() and row["platform"] == "youtube" and row["kind"] != "events":
+            continue
         # The claim refreshes the heartbeat too: a re-claimed row must not
         # match the stale predicate again before the new executor's first
         # progress touch (that would let a third worker steal it mid-claim).
