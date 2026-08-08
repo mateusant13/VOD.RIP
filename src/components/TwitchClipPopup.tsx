@@ -44,6 +44,7 @@ import {
   resolvePreviewPlayback,
 } from '../previewPlayerUtils';
 import { fracToSec, secToFrac, trimButtonDeltaForEndpoint } from '../trimUtils';
+import { PREVIEW_DEFAULT_VOLUME } from '../layoutUtils';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { formatHmsFull } from '../utils';
 import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
@@ -70,6 +71,9 @@ interface TwitchClipPopupProps {
   onClose: () => void;
   /** Called after the editor opened — parents reuse their clip notice. */
   onClipCreated: (editorUrl: string) => void;
+  /** Volume the popup should start at — inherited from the opening preview
+   * so opening the clip window never resets the user's volume level. */
+  initialVolume?: number;
 }
 
 export default function TwitchClipPopup({
@@ -81,8 +85,10 @@ export default function TwitchClipPopup({
   zIndex,
   onClose,
   onClipCreated,
+  initialVolume = PREVIEW_DEFAULT_VOLUME,
 }: TwitchClipPopupProps) {
   const { t } = useI18n();
+  const volumeRef = useRef(initialVolume);
   const win = useMemo(
     () => twitchClipWindow(playheadSec, vodDurationSec),
     [playheadSec, vodDurationSec],
@@ -90,9 +96,14 @@ export default function TwitchClipPopup({
   const winLen = win.end - win.start;
   const windowTooShort = winLen < TWITCH_CLIP_MIN_SEC;
 
-  const [selection, setSelection] = useState(() =>
-    clampClipSelection(win.start, win.end, win.start, win.end),
-  );
+  const [selection, setSelection] = useState(() => {
+    // Twitch clips cap at 60s — start with a 60s selection (or the whole
+    // window when it's shorter), never the full ±60s window (~120s).
+    if (winLen > TWITCH_CLIP_MAX_SEC) {
+      return { start: win.end - TWITCH_CLIP_MAX_SEC, end: win.end };
+    }
+    return clampClipSelection(win.start, win.end, win.start, win.end);
+  });
   const selectionRef = useRef(selection);
   const commitSelection = useCallback((next: { start: number; end: number }) => {
     selectionRef.current = next;
@@ -245,7 +256,7 @@ export default function TwitchClipPopup({
       setBuffering(false);
       setLoading(false);
       if (video.paused) {
-        void playPreviewWithAudio(video, setMuted, 0.1).then(() => {
+        void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
           setPlaying(!video.paused);
         });
       }
@@ -328,7 +339,7 @@ export default function TwitchClipPopup({
     const video = videoRef.current;
     if (!video || !ready) return;
     if (video.paused) {
-      void playPreviewWithAudio(video, setMuted, 0.1).then(() => {
+      void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
         setPlaying(!video.paused);
       });
     } else {

@@ -7153,6 +7153,7 @@ export default function App() {
           playheadSec={twitchClipPopup.playheadSec}
           vodDurationSec={twitchClipPopup.vodDurationSec}
           zIndex={EXPLORE_POPUP_Z + 200}
+          initialVolume={previewVolumeRef.current}
           onClose={() => setTwitchClipPopup(null)}
           onClipCreated={(editorUrl) =>
             showClipOpenNotice('ok', `Twitch clip created — ${editorUrl}`)}

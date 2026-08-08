@@ -1955,6 +1955,7 @@ export default function ChannelExplorePopup({
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
           zIndex={zIndex + 50}
+          initialVolume={volumeRef.current}
           onClose={() => setClipPopup(null)}
           onClipCreated={(editorUrl) =>
             showClipNotice('ok', `Twitch clip created — ${editorUrl}`)}
