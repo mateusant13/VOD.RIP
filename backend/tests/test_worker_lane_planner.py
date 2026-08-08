@@ -130,3 +130,53 @@ def test_vram_estimate_by_model_name():
             assert abs(est / 1024 ** 3 - gb) < 0.01, (name, est)
         finally:
             reload(at)
+
+
+def _fake_tasklist(stdout, mine="12345"):
+    """Stub sp.run so _gpu_held_by_other parses a fake tasklist payload."""
+    import pytest
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(at.os, "getpid", lambda: int(mine))
+    mp.setattr(
+        at.sp, "run",
+        lambda *a, **k: type("FakeOut", (), {
+            "returncode": 0, "stdout": stdout, "stderr": "",
+        })(),
+    )
+    try:
+        at._gpu_held_at = 0.0  # bust the 10 s cache
+        return at._gpu_held_by_other()
+    finally:
+        mp.undo()
+
+
+def test_gpu_held_ignores_wddm_processes():
+    """Windows nvidia-smi compute-apps lists every WDDM GPU touch (dwm,
+    explorer, browsers) — the gate must only count nvcuda.dll loaders."""
+    wddm_only = """Nome da imagem    Identifi M\u00f3dulos
+================= ======== ============================================
+dwm.exe              2168 [N/A]
+explorer.exe         13024 [N/A]
+chrome.exe           8168 [N/A]
+Discord.exe          20384 [N/A]
+"""
+    assert _fake_tasklist(wddm_only) is False
+
+
+def test_gpu_held_counts_cuda_loader_other_pid():
+    """A python holding nvcuda.dll (ComfyUI/BrandOps) -> held, never stack."""
+    with_cuda = """Nome da imagem    Identifi M\u00f3dulos
+================= ======== ============================================
+python.exe           27004 nvcuda.dll
+"""
+    assert _fake_tasklist(with_cuda, mine="99999") is True
+
+
+def test_gpu_held_ignores_own_pid():
+    """The worker's own nvcuda.dll load must not count as 'other'."""
+    own_only = """Nome da imagem    Identifi M\u00f3dulos
+================= ======== ============================================
+python.exe           12345 nvcuda.dll
+"""
+    assert _fake_tasklist(own_only, mine="12345") is False

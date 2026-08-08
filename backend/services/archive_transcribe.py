@@ -241,12 +241,18 @@ _gpu_held_lock = threading.Lock()
 
 
 def _gpu_held_by_other() -> bool:
-    """True when nvidia-smi reports a compute app that is not this process.
+    """True when another process holds a CUDA model on this GPU.
 
     The live backend / another ML project / a worktree test may already hold
     a GPU model — stacking another on top risks evicting it. False when the
-    probe fails (nvidia-smi absent): the free-VRAM gate is still the primary
-    guard. Cached 10 s; patched directly by tests."""
+    probe fails (tasklist absent): the free-VRAM gate is still the primary
+    guard. Cached 10 s; patched directly by tests.
+
+    Probe: `tasklist /m nvcuda.dll` — processes that LOADED the CUDA
+    runtime. nvidia-smi's compute-apps is NOT usable on Windows: it lists
+    every WDDM process that touches the GPU (dwm, explorer, browsers,
+    Discord...), tripping the gate even when no compute app runs. Loading
+    nvcuda.dll is the precise signal — real CUDA apps only."""
     global _gpu_held_cache, _gpu_held_at
     now = time.monotonic()
     with _gpu_held_lock:
@@ -255,14 +261,23 @@ def _gpu_held_by_other() -> bool:
     held = False
     try:
         out = sp.run(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
+            ["tasklist", "/m", "nvcuda.dll"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=5,
         )
         if out.returncode == 0:
             mine = str(os.getpid())
-            held = any(
-                p.strip() and p.strip() != mine for p in out.stdout.splitlines()
-            )
+            for line in out.stdout.splitlines():
+                # "python.exe  12345 nvcuda.dll" (image name may contain spaces)
+                parts = line.split()
+                if (
+                    len(parts) >= 3
+                    and parts[-1] == "nvcuda.dll"
+                    and parts[-2].isdigit()
+                    and parts[-2] != mine
+                ):
+                    held = True
+                    break
     except Exception:
         held = False
     with _gpu_held_lock:
