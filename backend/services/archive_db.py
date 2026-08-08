@@ -2550,6 +2550,16 @@ def search(
     # estranheza…"). FTS5 phrases cannot span rows, so the span pass scans
     # the transcript table directly (see _phrase_span_rows).
     span_tokens = q_tokens_all
+    # The span pass's LIKE prefilter (see _phrase_span_rows) gates on the
+    # literal long tokens, so a segment holding a dist-1 ASR variant
+    # ("da estranhesa") would be filtered out before the _tok_eq span
+    # match could see it. Expand each long token once (cached) and pass
+    # the variant map down so the prefilter admits ASR variants too.
+    span_variants = {
+        t: [term for term, _ in _expand_query(t, [t2[2] for t2 in loops])]
+        for t in span_tokens
+        if len(t) >= 4
+    }
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -2618,7 +2628,8 @@ def search(
         if hit_kind == "transcript" and len(span_tokens) >= 2:
             try:
                 span_rows = _phrase_span_rows(
-                    span_tokens, fetch, platforms=platforms,
+                    span_tokens, fetch, span_variants=span_variants,
+                    platforms=platforms,
                     video_id=video_id, channel=channel, kinds=kinds,
                     date_from=date_from, date_to=date_to, lang=lang,
                 )
@@ -2676,6 +2687,7 @@ def search(
         title_rows = _titles_search(
             q,
             fetch,
+            q_freq=q_freq,
             platforms=platforms,
             video_id=video_id,
             channel=channel,
@@ -2753,6 +2765,7 @@ def _titles_search(
     q: str,
     fetch: int,
     *,
+    q_freq: Optional[dict[str, int]] = None,
     platforms: list[str],
     video_id: Optional[str],
     channel: Optional[str],
@@ -2765,14 +2778,21 @@ def _titles_search(
     Titles are short and the videos table is small (hundreds of rows), so a
     pure-Python pass is cheaper than an FTS5 titles index. A query token
     matches when it equals a title token, is an edit-distance-1 ASR variant
-    of one (_tok_eq), or is a ≥4-char PREFIX of one ("estranh" finds
-    "ESTRANHEZA"). The reverse substring never matches: "cara"/"car" inside
-    a "caralho" query must not pull titles like "Pé na porta, I.A. na
-    cara!" — that surfaced partial=False noise at rank 1.0 above real
-    fuzzy chat hits. Score = fraction of query tokens matched. ponytail:
-    when videos grows past ~10k rows, move
-    to an FTS5 external-content titles table with a unicode61 tokenizer and
-    reuse the tier/merge machinery of the content tables."""
+    of one (_tok_eq), or is a ≥4-char SUBSTRING of one ("estranh" finds
+    "ESTRANHEZA"). Substring reach mirrors the R2 gate in
+    _token_expansions: a token PRESENT in the merged corpus is a complete
+    word, so its embedded matches ('vale' inside "valendo"/"cavaleiro")
+    are recall noise and must not surface — 'vale da estranheza' used to
+    pull "CAMPEONATO DO BOGUR VALENDO…" and "…Cavaleiro dos 7 Reinos…".
+    Only tokens ABSENT from the corpus or below _PREFIX_GATE_FREQ (partial
+    words/mishearings like "estranh") keep the substring reach; equality
+    and _tok_eq always match. The reverse substring never matches:
+    "cara"/"car" inside a "caralho" query must not pull titles like "Pé na
+    porta, I.A. na cara!" — that surfaced partial=False noise at rank 1.0
+    above real fuzzy chat hits. Score = fraction of query tokens matched.
+    ponytail: when videos grows past ~10k rows, move to an FTS5
+    external-content titles table with a unicode61 tokenizer and reuse the
+    tier/merge machinery of the content tables."""
     q_tokens = _fold_tokens(q)
     # 1-2 char tokens are substring noise in titles ("da" ⊂ "day", "mudam").
     # The content passes keep them for phrase adjacency; here they only
@@ -2780,6 +2800,7 @@ def _titles_search(
     q_tokens = [t for t in q_tokens if len(t) >= 3]
     if not q_tokens:
         return []
+    freq = q_freq or {}
     sql = ("SELECT platform, video_id, channel, title, original_title, "
            "started_at AS date, kind AS video_kind, channel_language FROM videos")
     where: list[str] = []
@@ -2819,7 +2840,16 @@ def _titles_search(
         matched = sum(
             1
             for qt in q_tokens
-            if any(tt == qt or (len(qt) >= 4 and qt in tt) or _tok_eq(tt, qt) for tt in toks)
+            if any(
+                tt == qt
+                or (
+                    len(qt) >= 4
+                    and freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                    and qt in tt
+                )
+                or _tok_eq(tt, qt)
+                for tt in toks
+            )
         )
         if not matched:
             continue
@@ -3230,6 +3260,7 @@ def _phrase_span_rows(
     q_tokens: list[str],
     fetch: int,
     *,
+    span_variants: Optional[dict[str, list[str]]] = None,
     platforms: list[str],
     video_id: Optional[str],
     channel: Optional[str],
@@ -3252,6 +3283,11 @@ def _phrase_span_rows(
     if len(q_tokens) < 2:
         return []
     long_toks = [t for t in q_tokens if len(t) >= 4]
+    if span_variants:
+        # Admit the query tokens' ASR/fuzzy variants in the prefilter: the
+        # literal LIKE gate would skip a segment whose text holds only a
+        # dist-1 twin ("estranhesa") before _tok_eq could match it below.
+        long_toks = sorted({v for t in long_toks for v in span_variants.get(t, [t])})
     sql = (
         "SELECT t.rowid AS _rowid, t.platform, t.video_id, t.seg_idx, "
         "t.start_sec AS offset_sec, t.text, t.lang AS lang, "

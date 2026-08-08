@@ -1202,6 +1202,13 @@ def test_phrase_split_with_asr_variant_token():
     _insert_transcript_pair(
         "span-vid-2", "é o tal do vale", "da estranhesa, sabe",  # 1-edit variant
     )
+    # Re-prime the vocab so the dist-1 ASR expansion ('estranheza' ->
+    # 'estranhesa') is reachable: the background rebuild is async, so a
+    # just-inserted corpus word may not be in the served snapshot yet
+    # (matches the explicit re-prime pattern of the other fuzzy tests).
+    import time as _t
+
+    archive_db._load_vocab_uncached("transcripts", _t.monotonic())
     hits = archive_db.search("vale da estranheza")
     span = next(
         (h for h in hits if h["video_id"] == "span-vid-2" and h["kind"] == "transcript"),

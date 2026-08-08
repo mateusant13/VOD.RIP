@@ -217,12 +217,41 @@ def test_title_partial_flag(scratch):
             "canonical_key": "chan-vrt2",
         }
     )
+    db.upsert_video(
+        {
+            "platform": "youtube",
+            "video_id": "vrt3",
+            "channel": "chan",
+            "title": "FIZ O VALE TILT NO CHALLENGER",
+            "canonical_key": "chan-vrt3",
+        }
+    )
+    # Make 'vale' a corpus-common word (freq > _PREFIX_GATE_FREQ), as it is
+    # in the real archive (~3106), so the title pass gates its substring
+    # reach: 'vale' ⊂ 'valendo' must not surface the BOGUR title.
+    db.insert_transcript(
+        "youtube",
+        "vrtv",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "vale " * 350, "words": []}],
+        lang="pt",
+    )
+    import time as _t
+
+    db._load_vocab_uncached("transcripts", _t.monotonic())
     hits = db.search("vale da estranheza", limit=20)
     title_hits = [h for h in hits if h["kind"] == "title"]
     assert title_hits, "titles pass still runs"
     exact = next(h for h in title_hits if "episódio" in h.get("text", ""))
-    partial = next(h for h in title_hits if "BOGUR" in h.get("text", "").upper())
     assert exact["partial"] is False
+    # 'vale' ⊂ 'valendo' is a substring leak of a complete common word: the
+    # BOGUR title drops out entirely instead of surfacing as partial.
+    assert not any("BOGUR" in h.get("text", "").upper() for h in title_hits), (
+        "present common token must not substring-match titles"
+    )
+    # A title that literally contains 'vale' still matches by equality and
+    # is correctly flagged partial (1 of 2 query tokens).
+    partial = next(h for h in title_hits if "VALE TILT" in h.get("text", "").upper())
     assert partial["partial"] is True
 
 
@@ -325,6 +354,61 @@ def test_title_prefix_and_asr_variants(scratch):
         title_texts = [h.get("text", "").lower() for h in hits if h["kind"] == "title"]
         assert any("estranheza total" in t for t in title_texts), q
         assert any("estranhesa do dia" in t for t in title_texts), q
+
+
+def test_title_present_token_gated_from_substring_matches(scratch):
+    """R2 mirror in the title pass: a COMPLETE, corpus-present token matches
+    titles only by equality / _tok_eq — never by substring ('vale' must not
+    reach "VALENDO" or "Cavaleiro"); an ABSENT partial token ("estranh")
+    keeps its substring reach into longer words.
+
+    Regression: 'vale da estranheza' surfaced "CAMPEONATO DO BOGUR VALENDO
+    75 MIL DÓLARES" ('vale' ⊂ 'valendo') and "…de O Cavaleiro dos 7 Reinos…
+    | Gaveta" ('vale' ⊂ 'cavaleiro' — a mid-word substring, not a prefix)
+    as partial title hits."""
+    db.upsert_video({
+        "platform": "youtube", "video_id": "vg1", "channel": "chan",
+        "title": "CAMPEONATO DO BOGUR VALENDO 75 MIL DÓLARES", "canonical_key": "chan-vg1",
+    })
+    db.upsert_video({
+        "platform": "youtube", "video_id": "vg2", "channel": "chan",
+        "title": "O carisma - sem spoilers - de O Cavaleiro dos 7 Reinos | Gaveta",
+        "canonical_key": "chan-vg2",
+    })
+    db.upsert_video({
+        "platform": "youtube", "video_id": "vg3", "channel": "chan",
+        "title": "FIZ O VALE TILT NO CHALLENGER", "canonical_key": "chan-vg3",
+    })
+    db.upsert_video({
+        "platform": "youtube", "video_id": "vg4", "channel": "chan",
+        "title": "ESTRANHAMENTE FELIZ", "canonical_key": "chan-vg4",
+    })
+    # 'vale' becomes a common corpus word (freq > _PREFIX_GATE_FREQ), as in
+    # the real archive (~3106); 'estranh' stays absent.
+    db.insert_transcript(
+        "youtube", "vgv",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "vale " * 350, "words": []}],
+        lang="pt",
+    )
+    import time as _t
+
+    db._load_vocab_uncached("transcripts", _t.monotonic())
+    hits = db.search("vale da estranheza", limit=20)
+    title_texts = [h.get("text", "").lower() for h in hits if h["kind"] == "title"]
+    # 'vale' ⊂ 'valendo' (prefix) and 'vale' ⊂ 'cavaleiro' (mid-word) are
+    # both substring leaks of a complete word — neither title surfaces.
+    assert not any("valendo" in t or "cavaleiro" in t for t in title_texts), (
+        "present common token must not substring-match titles"
+    )
+    # The title literally containing 'vale' still matches by equality.
+    assert any("vale tilt" in t for t in title_texts), "exact-token title survives"
+    # An absent partial token keeps substring reach.
+    hits = db.search("estranh", limit=20)
+    title_texts = [h.get("text", "").lower() for h in hits if h["kind"] == "title"]
+    assert any("estranhamente feliz" in t for t in title_texts), (
+        "absent partial token keeps substring reach"
+    )
 
 
 # --- search-first vocab reload -------------------------------------------
