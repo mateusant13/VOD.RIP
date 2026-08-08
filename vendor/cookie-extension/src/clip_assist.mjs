@@ -1,11 +1,13 @@
-// VOD.RIP clip assistant — content script for twitch.tv VOD pages.
+// VOD.RIP clip assistant — content script for Twitch pages.
 //
-// The VOD.RIP app opens https://www.twitch.tv/videos/<id>?t=<start>&vodrip_clip=1
-// (&vodrip_end, &vodrip_title) in the OS default browser. This script then:
-//   1. waits for the player and lands it on the requested start time;
-//   2. clicks the player's Clip button to open Twitch's in-site clip editor;
-//   3. fills the title input with the VOD.RIP-provided title;
-//   4. clicks Publish.
+// The VOD.RIP app opens a Twitch URL carrying vodrip_* query params
+// (vodrip_clip=1 + vodrip_start/end/title). Two flows:
+//   - clips.twitch.tv/create?vodID=...&offsetSeconds=... — the legacy editor
+//     URL opens Twitch's clip editor DIRECTLY (logged in); this script fills
+//     the title and clicks Save Clip.
+//   - twitch.tv/videos/<id>?t=... — this script waits for the player, clicks
+//     its Clip button to open the editor overlay, fills the title and clicks
+//     Publish.
 // Everything runs inside Twitch's own page, so the editor's GQL mutation uses
 // the session cookie + integrity the site itself generates — no API token
 // scopes needed (the backend Helix path needs editor:manage:clips, which the
@@ -13,18 +15,38 @@
 //
 // ponytail: the editor's DOM is Twitch's private React tree and changes without
 // notice; every selector below is a candidate list with graceful fallbacks
-// (status panel tells the user what to finish by hand). Upgrade path: map the
-// editor DOM once logged in and drive the range handles precisely; until then
-// the site's default ~90s window around the start time is used, and the panel
-// shows the requested start → end.
-(() => {
+// (status panel tells the user what to finish by hand). Upgrade path: drive
+// the range handles precisely once the live editor DOM is confirmed; until
+// then the site's default clip window around offsetSeconds is used, and the
+// panel shows the requested start → end.
+(async () => {
   if (window.top !== window) return; // the player lives in the top frame
-  const params = new URLSearchParams(location.search);
+
+  // clips.twitch.tv/create SPA-redirects (e.g. to /clips/500) and drops the
+  // query — stash the params at document_start so the flow below can still
+  // read them after the redirect.
+  if (location.hostname === 'clips.twitch.tv' && location.search.includes('vodrip_clip=1')) {
+    try {
+      sessionStorage.setItem('vodrip_clip_params', location.search);
+    } catch { /* storage blocked */ }
+  }
+
+  const rawSearch = location.hostname === 'clips.twitch.tv'
+    ? (sessionStorage.getItem('vodrip_clip_params') || location.search)
+    : location.search;
+  const params = new URLSearchParams(rawSearch.replace(/^\?/, ''));
   if (params.get('vodrip_clip') !== '1') return;
 
   const startSec = Math.max(0, Math.floor(Number(params.get('vodrip_start')) || 0));
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
   const title = (params.get('vodrip_title') || '').trim();
+
+  // document_start on clips.twitch.tv may run before <html> exists.
+  if (!document.documentElement) {
+    await new Promise((resolve) =>
+      document.addEventListener('DOMContentLoaded', resolve, { once: true }),
+    );
+  }
 
   const panel = document.createElement('div');
   panel.setAttribute('data-vodrip-clip-assist', '');
@@ -90,6 +112,76 @@
   };
 
   setStatus(`Preparando clip em ${fmtHms(startSec)}…`);
+
+  // clips.twitch.tv/create — the legacy URL opens Twitch's clip editor
+  // DIRECTLY (it reads vodID + offsetSeconds, which is the clip END) when
+  // logged in; only the title + Save Clip remain. The twitch.tv/videos/*
+  // flow below is the player route (Clip button → editor overlay).
+  if (location.hostname === 'clips.twitch.tv') {
+    (async () => {
+      const editorInput = await waitFor(
+        () =>
+          find([
+            'input[data-a-target="tw-input"]',
+            'input[placeholder*="title" i]',
+            'textarea[placeholder*="title" i]',
+          ]),
+        45000,
+        800,
+      );
+      if (!editorInput) {
+        const errorPage = /something went wrong|ocorreu um problema|algo deu errado/i.test(
+          document.body ? document.body.innerText : '',
+        );
+        setStatus(
+          errorPage
+            ? 'A Twitch redirecionou para a página de erro — você está logado na Twitch nesta aba? Faça login e tente de novo.'
+            : 'Editor não carregou — recarregue a página.',
+          'err',
+        );
+        return;
+      }
+      if (!title) {
+        setStatus('Sem título informado — preencha o título e clique em Save Clip.', 'info');
+        return;
+      }
+      setReactValue(editorInput, title);
+      setStatus(`Título preenchido: ${title}`);
+      const save = await waitFor(
+        () =>
+          [...document.querySelectorAll('button')].find((b) =>
+            /save clip|salvar clip/i.test((b.innerText || '').trim()),
+          ),
+        10000,
+        500,
+      );
+      if (!save) {
+        setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
+        return;
+      }
+      setStatus(`Salvando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
+      await sleep(1200);
+      click(save);
+      // The SPA navigates to /<slug> after the clip is created.
+      const slugUrl = await waitFor(
+        () => {
+          const m = location.pathname.match(/^\/([A-Za-z][A-Za-z0-9_-]+)$/);
+          return m ? `https://clips.twitch.tv${location.pathname}` : null;
+        },
+        20000,
+        800,
+      );
+      setStatus(
+        slugUrl
+          ? `Clip publicado ✓\n${title}\n${slugUrl}`
+          : `Clip publicado ✓\n${title}`,
+        'ok',
+      );
+    })().catch((err) => {
+      setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
+    });
+    return;
+  }
 
   (async () => {
     // 1. Player — needs real duration before we can seek.
@@ -203,4 +295,6 @@
   })().catch((err) => {
     setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
   });
-})();
+})().catch(() => {
+  /* top-level: panel setup failed — nothing useful to do */
+});

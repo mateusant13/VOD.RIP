@@ -505,9 +505,9 @@ export default function TwitchClipPopup({
       showClipNotice('error', err);
       return;
     }
-    openTwitchClipEditorInBrowser(vodId, sel.start, sel.end, clipTitle.trim() || undefined);
+    openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
-  }, [vodId, clipTitle, showClipNotice]);
+  }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
 
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;

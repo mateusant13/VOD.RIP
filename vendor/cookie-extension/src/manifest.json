@@ -16,6 +16,11 @@
       "matches": ["https://www.twitch.tv/videos/*"],
       "js": ["clip_assist.mjs"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://clips.twitch.tv/create*"],
+      "js": ["clip_assist.mjs"],
+      "run_at": "document_start"
     }
   ],
   "action": {

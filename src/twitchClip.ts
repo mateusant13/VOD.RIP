@@ -171,26 +171,18 @@ export function twitchOAuthAuthorizeUrl(clientId: string): string {
   return `https://id.twitch.tv/oauth2/authorize?${p.toString()}`;
 }
 
-/** Format VOD seconds as Twitch's ?t= syntax (1h2m3s / 2m3s / 3s). */
-function formatTwitchT(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return h ? `${h}h${pad(m)}m${pad(r)}s` : m ? `${m}m${pad(r)}s` : `${r}s`;
-}
-
 /**
- * Open Twitch's in-site clip editor at a VOD timestamp in the OS default
- * browser. Requires the VOD.RIP cookie extension: its content script
- * (vendor/cookie-extension/src/clip_assist.mjs) reads the vodrip_* query
- * params, opens the editor, lands the player on `startSec`, fills the title
- * and clicks Publish — using Twitch's own session cookie, so no Helix
- * clip scopes are needed.
+ * Open Twitch's clip editor at a VOD timestamp in the OS default browser.
+ * Uses the legacy editor URL (clips.twitch.tv/create?vodID=...&offsetSeconds=...)
+ * which mounts the clip editor DIRECTLY when logged in — offsetSeconds is the
+ * clip END (Twitch's editor anchor), the same reference the Helix path uses.
+ * The VOD.RIP cookie extension's content script (clip_assist.mjs, matches
+ * clips.twitch.tv/create) then fills the title and clicks Save Clip using
+ * Twitch's own session cookie — no Helix clip scopes needed.
  */
 export function openTwitchClipEditorInBrowser(
   vodId: string,
+  broadcasterLogin: string,
   startSec: number,
   endSec: number,
   title?: string,
@@ -202,7 +194,7 @@ export function openTwitchClipEditorInBrowser(
   });
   if (title) p.set('vodrip_title', title);
   openExternal(
-    `https://www.twitch.tv/videos/${encodeURIComponent(vodId)}?t=${formatTwitchT(startSec)}&${p.toString()}`,
+    `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`,
   );
 }
 

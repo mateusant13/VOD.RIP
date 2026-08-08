@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
   clampClipSelection,
   clipEditorOffsetAndDuration,
+  openTwitchClipEditorInBrowser,
   twitchClipDurationError,
   twitchClipWindow,
 } from './twitchClip';
@@ -114,5 +115,47 @@ describe('clipEditorOffsetAndDuration', () => {
 
   it('never produces a negative offset', () => {
     expect(clipEditorOffsetAndDuration(0, 0)).toEqual({ offsetSec: 0, durationSec: 0 });
+  });
+});
+
+describe('openTwitchClipEditorInBrowser', () => {
+  it('opens the legacy editor URL with vodrip_* params (offset = clip END)', () => {
+    const opened: string[] = [];
+    vi.spyOn(window, 'open').mockImplementation((url?: string) => {
+      opened.push(url ?? '');
+      return null;
+    });
+    try {
+      openTwitchClipEditorInBrowser('2832716983', 'titiltei', 458, 520, 'Teste VOD.RIP');
+      expect(opened).toHaveLength(1);
+      const u = new URL(opened[0]);
+      expect(u.host).toBe('clips.twitch.tv');
+      expect(u.pathname).toBe('/create');
+      expect(u.searchParams.get('vodID')).toBe('2832716983');
+      expect(u.searchParams.get('broadcasterLogin')).toBe('titiltei');
+      expect(u.searchParams.get('offsetSeconds')).toBe('520'); // clip END, not start
+      expect(u.searchParams.get('vodrip_clip')).toBe('1');
+      expect(u.searchParams.get('vodrip_start')).toBe('458');
+      expect(u.searchParams.get('vodrip_end')).toBe('520');
+      expect(u.searchParams.get('vodrip_title')).toBe('Teste VOD.RIP');
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('omits vodrip_title when no title is given', () => {
+    const opened: string[] = [];
+    vi.spyOn(window, 'open').mockImplementation((url?: string) => {
+      opened.push(url ?? '');
+      return null;
+    });
+    try {
+      openTwitchClipEditorInBrowser('2832716983', 'titiltei', 458, 520);
+      const u = new URL(opened[0]);
+      expect(u.searchParams.has('vodrip_title')).toBe(false);
+      expect(u.searchParams.get('offsetSeconds')).toBe('520');
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
