@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import threading
 import time
@@ -610,6 +611,8 @@ def _ensure_cuda_libs() -> None:
     cublasLt64_12 in turn loads nvjitlink64_12.dll, so the nvidia-nvjitlink-cu12
     wheel's bin dir must be on PATH too. Machines with a CUDA-13-era driver but
     no full CUDA 12 toolkit otherwise fail with "Library ... is not found".
+    Windows wheels ship DLLs under nvidia/<pkg>/bin (PATH); POSIX wheels ship
+    .so under nvidia/<pkg>/lib (LD_LIBRARY_PATH) — both layouts are exposed.
     Set VODRIP_NO_CUDA_LIBS to skip.
     """
     if os.environ.get("VODRIP_NO_CUDA_LIBS"):
@@ -618,12 +621,21 @@ def _ensure_cuda_libs() -> None:
         import site as _site
     except Exception:
         return
+    env_name = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+    subdir = "bin" if os.name == "nt" else "lib"
+    # Frozen (PyInstaller) builds: the wheels' DLLs are collected into the
+    # bundle, and site.getsitepackages() does not point there — sys._MEIPASS
+    # (onefile) and sys.prefix (onedir) are the bundle roots to search too.
+    roots = list(_site.getsitepackages())
+    for extra in (getattr(sys, "_MEIPASS", None), sys.prefix):
+        if extra and Path(extra) not in [Path(r) for r in roots]:
+            roots.append(str(extra))
     for lib in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn", "nvjitlink"):
         try:
-            for root in _site.getsitepackages():
-                d = Path(root) / "nvidia" / lib / "bin"
-                if d.is_dir() and str(d) not in os.environ.get("PATH", ""):
-                    os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+            for root in roots:
+                d = Path(root) / "nvidia" / lib / subdir
+                if d.is_dir() and str(d) not in os.environ.get(env_name, ""):
+                    os.environ[env_name] = str(d) + os.pathsep + os.environ.get(env_name, "")
         except Exception:
             # ponytail: best-effort — missing wheels just mean CPU fallback
             pass

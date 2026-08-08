@@ -49,14 +49,16 @@ panns-inference>=0.1.1
 # upgrade on NVIDIA hosts — the lane probes the installed wheel's providers
 # at runtime and stays whisper on GPU slots when CUDA is absent, so plain
 # `pip install -r requirements.txt` keeps working on CPU machines.
-# GPU upgrade (replaces the CPU sherpa-onnx in-place; the +cuda wheel bundles
-# its own CUDA-enabled onnxruntime, so no separate onnxruntime-gpu install):
+# NVIDIA users (any GPU >= 6 GiB VRAM): `pip install -r requirements-gpu.txt`
+# swaps in the CUDA wheel + the nvidia-*-cu12 runtime libs in one command.
+# Manual equivalent (replaces the CPU sherpa-onnx in-place; the +cuda wheel
+# bundles its own CUDA-enabled onnxruntime, so no onnxruntime-gpu install):
 #   pip install "sherpa-onnx==1.13.4+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
 # (cp311 win_amd64 direct: https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/main/cuda/1.13.4/sherpa_onnx-1.13.4+cuda12.cudnn9-cp311-cp311-win_amd64.whl)
 # The +cuda wheel's onnxruntime CUDA EP loads cublasLt64_12/cufft64_11/
-# curand64_10/cudnn64_9 from PATH at session create — cublas + cuda-runtime
-# are already pinned above (faster-whisper/ctranslate2), add the rest on GPU
-# hosts only (archive_transcribe._ensure_cuda_libs exposes their bin dirs;
-# nvjitlink is pulled in transitively but is required by cublasLt at load):
-#   pip install nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cudnn-cu12
+# curand64_10/cudnn64_9 from PATH (Windows) / LD_LIBRARY_PATH (POSIX) at
+# session create — cublas + cuda-runtime are already pinned above
+# (faster-whisper/ctranslate2); archive_transcribe._ensure_cuda_libs exposes
+# their bin/lib dirs (nvjitlink is pulled in transitively but is required by
+# cublasLt at load).
 sherpa-onnx>=1.13.0

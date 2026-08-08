@@ -176,6 +176,48 @@ def test_thread_budget_bounded():
     assert 1 <= n <= at._PARAAKEET_MAX_THREADS
 
 
+def test_ensure_cuda_libs_exposes_nvidia_dirs(tmp_path, monkeypatch):
+    """The CUDA wheels' DLL dirs must land on PATH (nt: <pkg>/bin) / on
+    LD_LIBRARY_PATH (POSIX: <pkg>/lib) — a CUDA-13-era driver alone has no
+    CUDA 12 toolkit, so onnxruntime's CUDA EP finds these DLLs via the env.
+    Both layouts are simulated; the real wheels only ship the matching one.
+    """
+    import site as _site
+
+    sp = tmp_path / "site-packages"
+    for pkg in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn", "nvjitlink"):
+        (sp / "nvidia" / pkg / "bin").mkdir(parents=True)
+        (sp / "nvidia" / pkg / "lib").mkdir(parents=True)
+    monkeypatch.setattr(_site, "getsitepackages", lambda: [str(sp)])
+    monkeypatch.delenv("VODRIP_NO_CUDA_LIBS", raising=False)
+
+    env_name = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+    subdir = "bin" if os.name == "nt" else "lib"
+    monkeypatch.setenv(env_name, "")
+    at._ensure_cuda_libs()
+    for pkg in ("cublas", "cuda_runtime", "cufft", "curand", "cudnn", "nvjitlink"):
+        expected = str(sp / "nvidia" / pkg / subdir)
+        assert expected in os.environ[env_name], (pkg, expected)
+
+    # the OTHER layout must never leak in (bin dirs are meaningless on POSIX
+    # and vice versa) — keep the env var strictly the platform's own layout
+    leaked = str(sp / "nvidia" / "cudnn" / ("lib" if os.name == "nt" else "bin"))
+    assert leaked not in os.environ[env_name]
+
+
+def test_ensure_cuda_libs_skip_flag(tmp_path, monkeypatch):
+    import site as _site
+
+    sp = tmp_path / "site-packages"
+    (sp / "nvidia" / "cudnn" / ("bin" if os.name == "nt" else "lib")).mkdir(parents=True)
+    monkeypatch.setattr(_site, "getsitepackages", lambda: [str(sp)])
+    monkeypatch.setenv("VODRIP_NO_CUDA_LIBS", "1")
+    env_name = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+    monkeypatch.setenv(env_name, "")
+    at._ensure_cuda_libs()
+    assert os.environ[env_name] == ""
+
+
 def test_manifest_engine_change_invalidates_resume():
     header = {"chunks": [(0.0, 5.0)], "model": at.model_name()}
     entries = {0: {"ci": 0, "first": 0, "count": 1}}
