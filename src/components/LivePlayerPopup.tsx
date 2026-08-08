@@ -1230,7 +1230,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                     }
                   >
                     {clipOpening ? <Loader2 size={15} className="animate-spin" /> : <TwitchLogoIcon size={14} />}
-                    <span className="text-[9px] font-bold uppercase tracking-wider">Twitch clip</span>
+                    <span className="text-[9px] font-bold uppercase tracking-wider">clip</span>
                   </button>
                 )}
                 <button

@@ -1307,7 +1307,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               {t('Chat from hit')}
             </span>
             <span className="flex items-center gap-2 min-w-0">
-              <span className="text-[9px] font-mono text-zinc-400 shrink-0 truncate">
+              <span
+                className="text-[9px] font-mono text-zinc-400 truncate"
+                title={`${videoTitle(selected.video, selected.hit)} @ ${formatArchiveOffset(selected.hit.offset_sec)}`}
+              >
                 {videoTitle(selected.video, selected.hit)} @ {formatArchiveOffset(selected.hit.offset_sec)}
               </span>
               <button

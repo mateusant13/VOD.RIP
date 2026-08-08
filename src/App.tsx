@@ -6029,8 +6029,8 @@ export default function App() {
             }
           >
             {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} className="shrink-0" />}
-            {/* Brand term — intentionally NOT translated (user request: literal "twitch clip"). */}
-            <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">twitch clip</span>
+            {/* Logo already says Twitch — label stays bare "clip" (user request). */}
+            <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
           </button>
         )}
         {isLive && (

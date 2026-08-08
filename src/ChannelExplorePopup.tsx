@@ -1563,8 +1563,8 @@ export default function ChannelExplorePopup({
       }
     >
       <TwitchLogoIcon size={16} className="shrink-0" />
-      {/* Brand term — intentionally NOT translated (user request: literal "twitch clip"). */}
-      <span className="text-[8px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">twitch clip</span>
+      {/* Logo already says Twitch — label stays bare "clip" (user request). */}
+      <span className="text-[8px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
     </button>
   );
 
