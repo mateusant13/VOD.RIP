@@ -551,6 +551,20 @@ async def test_status_shape(client):
     assert body["paired"] is False
     assert body["enabled"] is True
     assert body["platforms"] == {}
+    assert body["youtube_gate_active"] is False
+    assert body["youtube_gate_remaining_sec"] == 0
+
+
+async def test_status_reports_youtube_gate(client):
+    from services import yt_gate
+
+    yt_gate.note_youtube_gate("test arm", freeze_sec=60)
+    try:
+        body = (await client.get("/api/session/cookies/status")).json()
+        assert body["youtube_gate_active"] is True
+        assert 0 < body["youtube_gate_remaining_sec"] <= 60
+    finally:
+        yt_gate.clear_youtube_gate()
 
 
 async def test_status_shape_with_stored_cookies(client):
