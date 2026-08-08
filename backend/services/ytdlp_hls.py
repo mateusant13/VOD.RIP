@@ -2558,15 +2558,22 @@ def _googlevideo_byte_range(
         # audio-only). Pull at least the init head for video streams; audio
         # (small EBML/moov head, tight per-URL byte budget) keeps the linear
         # estimate. -t truncates at mux time and _trim_fragmented_tail removes
-        # any trailing partial fragment.
+        # any trailing partial fragment. The head cap must be a real head size
+        # (moov ~235KB + margin), NOT _INIT_PREFIX_BYTES — that 5MB prefix cap
+        # made min(clen-1, 5MB) collapse to the whole file for small VODs
+        # (clen < 5MB), silently turning every early-window trim into a
+        # full-file fetch.
         is_audio_only = bool(fmt) and (fmt.get("vcodec") in (None, "none"))
         if not is_audio_only:
-            b1 = max(b1, min(clen - 1, _INIT_PREFIX_BYTES))
+            b1 = max(b1, min(clen - 1, _INIT_HEAD_BYTES))
     if b1 <= b0:
         return None
     return b0, b1
 
 
+# moov + sample tables head for early-window trims (~235KB + margin). If a
+# stream ever has a bigger init box, the yt-dlp section fallback covers it.
+_INIT_HEAD_BYTES = 350_000
 _INIT_PREFIX_BYTES = 5_000_000
 _INIT_BOX_BYTES = 2_097_152
 # ponytail: googlevideo CDN rejects some large mid-file Range spans — split fetches

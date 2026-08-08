@@ -85,6 +85,9 @@ def test_plan_cpu_only_host(monkeypatch):
 
 def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
     """VODRIP_WHISPER_DEVICE=cpu forces the CPU plan even on a CUDA box."""
+    # test_parakeet_e2e_real.py sets WORKERS_ENV at module level; clear it so
+    # the plan length matches the auto ladder (order-independent).
+    monkeypatch.delenv(at.WORKERS_ENV, raising=False)
     monkeypatch.setenv("VODRIP_WHISPER_DEVICE", "cpu")
     monkeypatch.setattr(at, "_device_override", None)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
