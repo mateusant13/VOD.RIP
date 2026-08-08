@@ -49,6 +49,12 @@ import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
 import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
+/** Scope string for the copy chip — VOD clips need one of these (matches
+ * backend/tests test_vod_clip_missing_scope_is_rejected_before_post). */
+const VOD_CLIP_SCOPES_HINT = 'editor:manage:clips, channel:manage:clips';
+/** Token-configuration errors stay visible until dismissed — the fix lives
+ * in Settings → Official APIs, not in a 4s toast. */
+const TOKEN_ERROR_CODES = ['missing_scope', 'no_token'];
 
 interface TwitchClipPopupProps {
   /** VOD URL the mini preview plays (same session machinery as the main preview). */
@@ -133,13 +139,16 @@ export default function TwitchClipPopup({
   const [currentTime, setCurrentTime] = useState(currentTimeRef.current);
   const [retryTick, setRetryTick] = useState(0);
   const [clipOpening, setClipOpening] = useState(false);
-  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string; code?: string } | null>(null);
+  const [scopeCopied, setScopeCopied] = useState(false);
   const clipNoticeTimerRef = useRef<number | null>(null);
 
-  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string, code?: string) => {
     if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
-    setClipNotice({ kind, text });
-    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+    setClipNotice({ kind, text, code });
+    if (!code || !TOKEN_ERROR_CODES.includes(code)) {
+      clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+    }
   }, []);
 
   // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
@@ -421,7 +430,7 @@ export default function TwitchClipPopup({
         onClipCreated(res.edit_url);
         onClose();
       } else {
-        showClipNotice('error', res.error.message);
+        showClipNotice('error', res.error.message, res.error.code);
       }
     } catch {
       showClipNotice('error', t('Failed to open the Twitch clip editor'));
@@ -672,12 +681,44 @@ export default function TwitchClipPopup({
             {t('Create Twitch clip')}
           </button>
         </div>
-        {clipNotice && (
-          <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
-            clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
-          }`}>
-            <span className="truncate">{clipNotice.text}</span>
+        {clipNotice && clipNotice.code && TOKEN_ERROR_CODES.includes(clipNotice.code) ? (
+          <div className="flex flex-col gap-1.5 border-2 border-red-500/60 bg-red-950/40 px-2 py-1.5">
+            <p className="text-[9px] font-mono text-red-300 leading-relaxed">{clipNotice.text}</p>
+            <div className="flex items-center gap-1.5">
+              <code className="flex-1 min-w-0 truncate border border-zinc-700 bg-zinc-950 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200">
+                {VOD_CLIP_SCOPES_HINT}
+              </code>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(VOD_CLIP_SCOPES_HINT).then(() => {
+                    setScopeCopied(true);
+                    window.setTimeout(() => setScopeCopied(false), 1500);
+                  });
+                }}
+                className="text-[8px] font-mono uppercase tracking-wider text-zinc-300 hover:text-white border border-zinc-700 px-1.5 py-0.5 shrink-0"
+                title={t('Copy the scope string')}
+              >
+                {scopeCopied ? t('Copied') : t('Copy')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setClipNotice(null)}
+                className="text-[8px] font-mono uppercase tracking-wider text-zinc-400 hover:text-white border border-zinc-700 px-1.5 py-0.5 shrink-0"
+                title={t('Dismiss')}
+              >
+                {t('Dismiss')}
+              </button>
+            </div>
           </div>
+        ) : (
+          clipNotice && (
+            <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
+              clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+            }`}>
+              <span className="truncate">{clipNotice.text}</span>
+            </div>
+          )
         )}
       </div>
     </div>,

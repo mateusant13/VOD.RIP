@@ -114,7 +114,9 @@ def _helix_failure(exc: Exception) -> Dict[str, Any]:
     base = {
         400: "Twitch rejected the clip request — check the selection and try again",
         401: "Twitch token is invalid or expired — re-authenticate or paste a fresh token in Settings → Official APIs",
-        403: "Twitch token lacks the clip scope — see Settings → Official APIs",
+        403: "Twitch rejected the token for clip creation — it needs "
+        "editor:manage:clips or channel:manage:clips (live: clips:edit). "
+        "Paste an OAuth token with the scope in Settings → Official APIs",
         404: "Video or broadcaster not found (or VODs are disabled on the channel)",
         429: "Twitch rate limit hit — wait a moment and try again",
         422: "Twitch rejected the clip request — check the selection and try again",
@@ -216,9 +218,11 @@ def _create_vod_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
     if not (set(VOD_CLIP_SCOPES) & info["scopes"]):
         return _error(
             "missing_scope",
-            "Twitch token lacks the VOD clip scope — needs editor:manage:clips "
-            "or channel:manage:clips; paste a token with this scope in "
-            "Settings → Official APIs",
+            "Twitch token lacks the VOD clip scope (needs editor:manage:clips "
+            "or channel:manage:clips). The Cookie Bridge token is your "
+            "twitch.tv browser login — Twitch does not grant clip scopes to "
+            "it. Paste an OAuth token with editor:manage:clips or "
+            "channel:manage:clips in Settings → Official APIs",
         )
     editor_id = info.get("user_id") or ""
     if not editor_id:
@@ -268,8 +272,10 @@ def _create_live_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
     if LIVE_CLIP_SCOPE not in info["scopes"]:
         return _error(
             "missing_scope",
-            "Twitch token lacks clips:edit (needed for live clips) — paste a "
-            "token with this scope in Settings → Official APIs",
+            "Twitch token lacks clips:edit (needed for live clips). The "
+            "Cookie Bridge token is your twitch.tv browser login — Twitch "
+            "does not grant clip scopes to it. Paste an OAuth token with "
+            "clips:edit in Settings → Official APIs",
         )
     try:
         users = ths._helix_get("/users", {"login": login}, client_id=info["client_id"])
@@ -370,6 +376,8 @@ _net = _helix_failure(RuntimeError("boom"))
 assert _net["ok"] is False and _net["error"]["code"] == "network"
 assert _helix_failure(_fake_exc(401))["error"]["code"] == "unauthorized"
 assert _helix_failure(_fake_exc(403))["error"]["code"] == "missing_scope"
+_403 = _helix_failure(_fake_exc(403))["error"]["message"]
+assert "editor:manage:clips" in _403 and "Settings → Official APIs" in _403
 assert _helix_failure(_fake_exc(404))["error"]["code"] == "not_found"
 assert _helix_failure(_fake_exc(429))["error"]["code"] == "rate_limited"
 assert _helix_failure(_fake_exc(422))["error"]["code"] == "clip_failed"

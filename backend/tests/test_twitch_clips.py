@@ -234,6 +234,10 @@ async def test_vod_clip_missing_scope_is_rejected_before_post(monkeypatch, _isol
         assert body["ok"] is False
         assert body["error"]["code"] == "missing_scope"
         assert "editor:manage:clips" in body["error"]["message"]
+        assert "Cookie Bridge" in body["error"]["message"], \
+            "must explain the auto-lifted browser token cannot carry the clip scope"
+        assert "Settings → Official APIs" in body["error"]["message"], \
+            "must point to the token paste location"
         assert posted == [], "scope pre-check must run before any Helix POST"
         assert await _history(client) == []
 
@@ -363,6 +367,8 @@ async def test_live_clip_missing_scope_is_rejected(monkeypatch, _isolated_data_d
         body = res.json()
         assert body["ok"] is False and body["error"]["code"] == "missing_scope"
         assert "clips:edit" in body["error"]["message"]
+        assert "Cookie Bridge" in body["error"]["message"]
+        assert "Settings → Official APIs" in body["error"]["message"]
 
 
 @pytest.mark.anyio
