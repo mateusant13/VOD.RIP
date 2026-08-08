@@ -756,7 +756,8 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
 
             # Dedupe: YouTube is the highest-priority platform, so nothing can
             # outrank it; still record the key + alias for cross-platform dedupe.
-            # Idempotent re-ingest: drop any earlier messages/transcripts first.
+            # Idempotent re-ingest: drop re-derivable rows (transcripts,
+            # aliases) first; fetched chat is preserved (see _clear_video_data).
             _db_write(_clear_video_data, video_id)
             if key:
                 _db_write(archive_db.set_alias, PLATFORM, video_id, key, note="auto")
@@ -797,6 +798,19 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
             except Exception as exc:
                 logger.warning("captions failed for %s: %s", video_id, exc)
                 report["caption_error"] = str(exc)
+
+            # Persistent no-captions verdict: an ingest that stored zero
+            # caption segments stamps videos.captions_unavailable_at so the
+            # scheduler stops re-extracting the video every pass/boot (the
+            # in-memory 1h backoff dies with the process); a later ingest
+            # that DID store segments clears the marker, making the video
+            # a re-extract candidate again. A caption fetch error stamps
+            # too — nothing was stored, and the marker only delays the
+            # next attempt by CAPTIONS_UNAVAILABLE_FRESH_S.
+            if report["transcript_segments"] > 0:
+                _db_write(archive_db.clear_captions_unavailable, PLATFORM, video_id)
+            else:
+                _db_write(archive_db.mark_captions_unavailable, PLATFORM, video_id)
 
         try:
             _db_write(archive_db.update_job, job_id, status="done", progress=1.0)
@@ -919,13 +933,22 @@ def _db_write(fn: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _clear_video_data(video_id: str) -> None:
-    """Drop messages/transcripts/aliases for one video (idempotent re-ingest).
+    """Drop re-derivable rows for one video before a re-ingest.
 
-    FTS5 index entries cascade via the AFTER DELETE triggers on the content
+    Transcripts + aliases are re-derived from the fresh extract and must be
+    wiped so the re-ingest stores clean rows. Messages are PRESERVED when
+    the video already has chat: wiping them would make the scheduler's chat
+    leg (has_chat gate) refetch everything on every pass — a refetch loop
+    that re-pays the whole replay fetch each re-ingest. A video with no
+    chat rows loses nothing (DELETE on an empty set is a no-op). FTS5
+    index entries cascade via the AFTER DELETE triggers on the content
     tables (external-content FTS owns no row data)."""
     conn = archive_db.get_conn()
     with conn:
-        conn.execute("DELETE FROM messages WHERE platform=? AND video_id=?", (PLATFORM, video_id))
+        if not archive_db.has_chat(PLATFORM, video_id):
+            conn.execute(
+                "DELETE FROM messages WHERE platform=? AND video_id=?", (PLATFORM, video_id)
+            )
         conn.execute("DELETE FROM transcripts WHERE platform=? AND video_id=?", (PLATFORM, video_id))
         conn.execute("DELETE FROM video_aliases WHERE platform=? AND video_id=?", (PLATFORM, video_id))
 
@@ -969,10 +992,11 @@ def list_channel_videos(channel_url: str, *, tab: str = "streams", limit: int = 
 # --- WS-4 original-title backfill -------------------------------------------
 
 # Never hammer YouTube: a min gap between fetches + a cooldown for videos
-# that failed or yielded no language clue. State is in-memory (process
-# lifetime), so a permanently failing video is retried at most once per app
-# restart. ponytail: upgrade path = a videos.original_fetch_failed_at column
-# so cooldowns survive restarts and skip work across processes.
+# that failed or yielded no language clue. The cooldown is persisted in
+# videos.original_fetch_failed_at (survives restarts AND coordinates the
+# daemon sweep with the router sync in the same process); the in-memory
+# dict is kept as a fast-path cache so a same-process retry never pays a
+# SQL read.
 _ORIGINAL_MIN_GAP_S = 1.5
 _ORIGINAL_FAIL_COOLDOWN_S = 3600.0
 _original_last_fetch = 0.0
@@ -987,16 +1011,51 @@ _VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
 
 def _mark_original_failed(video_id: str) -> None:
+    now = time.monotonic()
     with _original_throttle_lock:
-        _original_failed_at[video_id] = time.monotonic()
+        _original_failed_at[video_id] = now
         if len(_original_failed_at) > 4096:
             _original_failed_at.pop(next(iter(_original_failed_at)), None)
+    # Durable stamp: the cooldown must survive restarts (a permanently
+    # failing video is otherwise re-fetched once per app restart forever).
+    # Best-effort — a DB hiccup must not crash the backfill sweep.
+    try:
+        archive_db.execute(
+            "UPDATE videos SET original_fetch_failed_at = ? "
+            "WHERE platform='youtube' AND video_id=?",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), video_id),
+        )
+    except Exception:  # noqa: BLE001 — persistence must never break the sweep
+        logger.debug("original-failed stamp failed for %s", video_id, exc_info=True)
 
 
 def _original_failed_recently(video_id: str) -> bool:
     with _original_throttle_lock:
         at = _original_failed_at.get(video_id)
-        return at is not None and (time.monotonic() - at) < _ORIGINAL_FAIL_COOLDOWN_S
+        if at is not None and (time.monotonic() - at) < _ORIGINAL_FAIL_COOLDOWN_S:
+            return True  # fast path — stamped in this process
+    # Durable check: a cooldown stamped by an earlier process (or an older
+    # pass) is honored too. SQL compare, not a dict lookup.
+    try:
+        row = archive_db.query(
+            "SELECT original_fetch_failed_at FROM videos "
+            "WHERE platform='youtube' AND video_id=?",
+            (video_id,),
+        )
+    except Exception:  # noqa: BLE001 — read must never break the sweep
+        return False
+    if not row or not row[0]["original_fetch_failed_at"]:
+        return False
+    try:
+        failed = datetime.fromisoformat(row[0]["original_fetch_failed_at"])
+    except (TypeError, ValueError):
+        return False
+    fresh = (datetime.now(timezone.utc) - failed).total_seconds() < _ORIGINAL_FAIL_COOLDOWN_S
+    if fresh:
+        # Prime the fast-path cache so a same-process retry skips the SQL.
+        with _original_throttle_lock:
+            _original_failed_at.setdefault(video_id, time.monotonic())
+    return fresh
 
 
 def _original_throttle_wait() -> None:
