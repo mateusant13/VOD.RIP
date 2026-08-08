@@ -20,7 +20,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
-import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X } from 'lucide-react';
+import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X, ExternalLink } from 'lucide-react';
 import { apiDelete } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
 import {
@@ -30,6 +30,7 @@ import {
   clampClipSelection,
   clipEditorOffsetAndDuration,
   openTwitchClipEditor,
+  openTwitchClipEditorInBrowser,
   twitchClipDurationError,
   twitchClipWindow,
 } from '../twitchClip';
@@ -454,6 +455,20 @@ export default function TwitchClipPopup({
         ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
         : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
 
+  // Same range, but driven in the OS browser by the VOD.RIP cookie extension
+  // (clip_assist.mjs content script) instead of the Helix API — works with the
+  // plain browser-login session cookie, no clip scopes needed.
+  const createInBrowser = useCallback(() => {
+    const sel = selectionRef.current;
+    const err = twitchClipDurationError(sel.end - sel.start);
+    if (err) {
+      showClipNotice('error', err);
+      return;
+    }
+    openTwitchClipEditorInBrowser(vodId, sel.start, sel.end, clipTitle.trim() || undefined);
+    showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
+  }, [vodId, clipTitle, showClipNotice]);
+
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
     if (t.closest('.twitch-clip-popup-close')) return;
@@ -670,16 +685,28 @@ export default function TwitchClipPopup({
           <span className="text-[8px] font-mono text-zinc-600 tabular-nums">
             {t('window {start} – {end}', { start: formatHmsFull(win.start), end: formatHmsFull(win.end) })}
           </span>
-          <button
-            type="button"
-            onClick={() => void createClip()}
-            disabled={createDisabled}
-            className="flex items-center gap-1.5 border-2 border-[#9146FF] bg-[#9146FF]/20 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-[#9146FF]/35 disabled:opacity-40 disabled:pointer-events-none"
-            title={createDisabledTitle}
-          >
-            {clipOpening ? <Loader2 size={12} className="animate-spin" /> : <TwitchLogoIcon size={12} />}
-            {t('Create Twitch clip')}
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={createInBrowser}
+              disabled={createDisabled}
+              className="flex items-center gap-1.5 border-2 border-zinc-700 bg-zinc-900/60 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-zinc-300 hover:border-zinc-400 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+              title={t('Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes')}
+            >
+              <ExternalLink size={12} />
+              {t('Open in browser')}
+            </button>
+            <button
+              type="button"
+              onClick={() => void createClip()}
+              disabled={createDisabled}
+              className="flex items-center gap-1.5 border-2 border-[#9146FF] bg-[#9146FF]/20 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-[#9146FF]/35 disabled:opacity-40 disabled:pointer-events-none"
+              title={createDisabledTitle}
+            >
+              {clipOpening ? <Loader2 size={12} className="animate-spin" /> : <TwitchLogoIcon size={12} />}
+              {t('Create Twitch clip')}
+            </button>
+          </div>
         </div>
         {clipNotice && clipNotice.code && TOKEN_ERROR_CODES.includes(clipNotice.code) ? (
           <div className="flex flex-col gap-1.5 border-2 border-red-500/60 bg-red-950/40 px-2 py-1.5">

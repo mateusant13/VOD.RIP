@@ -144,6 +144,41 @@ function openExternal(url: string): void {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+/** Format VOD seconds as Twitch's ?t= syntax (1h2m3s / 2m3s / 3s). */
+function formatTwitchT(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h ? `${h}h${pad(m)}m${pad(r)}s` : m ? `${m}m${pad(r)}s` : `${r}s`;
+}
+
+/**
+ * Open Twitch's in-site clip editor at a VOD timestamp in the OS default
+ * browser. Requires the VOD.RIP cookie extension: its content script
+ * (vendor/cookie-extension/src/clip_assist.mjs) reads the vodrip_* query
+ * params, opens the editor, lands the player on `startSec`, fills the title
+ * and clicks Publish — using Twitch's own session cookie, so no Helix
+ * clip scopes are needed.
+ */
+export function openTwitchClipEditorInBrowser(
+  vodId: string,
+  startSec: number,
+  endSec: number,
+  title?: string,
+): void {
+  const p = new URLSearchParams({
+    vodrip_clip: '1',
+    vodrip_start: String(Math.max(0, Math.floor(startSec))),
+    vodrip_end: String(Math.max(0, Math.ceil(endSec))),
+  });
+  if (title) p.set('vodrip_title', title);
+  openExternal(
+    `https://www.twitch.tv/videos/${encodeURIComponent(vodId)}?t=${formatTwitchT(startSec)}&${p.toString()}`,
+  );
+}
+
 /**
  * Ask the backend to create a Twitch clip via the official Helix API; on
  * success the returned edit_url (valid 24h) is opened in the default browser.

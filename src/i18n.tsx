@@ -434,6 +434,10 @@ const ptBR: Record<string, string> = {
   'Clip end': 'Fim do clipe',
   'window {start} – {end}': 'janela {start} – {end}',
   'Create Twitch clip': 'Criar clipe do Twitch',
+  'Opened in your browser — the VOD.RIP extension fills the editor and publishes':
+    'Aberto no navegador — a extensão VOD.RIP preenche o editor e publica',
+  'Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes':
+    'Abrir o editor de clipes do Twitch no seu navegador — a extensão VOD.RIP preenche o título e publica',
   'The {seconds}s window is too short to clip (min {min}s)': 'A janela de {seconds}s é curta demais para clipe (mínimo {min}s)',
   'Trim the selection to {max}s or less': 'Reduza a seleção para {max}s ou menos',
   'Select at least {min}s': 'Selecione ao menos {min}s',
@@ -943,6 +947,10 @@ const es: Record<string, string> = {
   'Clip end': 'Fin del clip',
   'window {start} – {end}': 'ventana {start} – {end}',
   'Create Twitch clip': 'Crear clip de Twitch',
+  'Opened in your browser — the VOD.RIP extension fills the editor and publishes':
+    'Abierto en el navegador — la extensión VOD.RIP rellena el editor y publica',
+  'Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes':
+    'Abrir el editor de clips de Twitch en tu navegador — la extensión VOD.RIP rellena el título y publica',
   'The {seconds}s window is too short to clip (min {min}s)': 'La ventana de {seconds}s es demasiado corta para recortar (mín. {min}s)',
   'Trim the selection to {max}s or less': 'Recorta la selección a {max}s o menos',
   'Select at least {min}s': 'Selecciona al menos {min}s',
