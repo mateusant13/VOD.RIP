@@ -69,6 +69,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from services import archive_db
 from services.archive_events import detect_events_video, events_enabled
+from services.autostart import background_mode
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
 from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
@@ -520,7 +521,13 @@ def _cpu_auto_workers() -> int:
     16 threads, 3 at 16–31, 4 at 32+. The RAM clamp (and the contention
     clamp when the box is busy) still caps the actual slots — this only
     raises the ceiling that used to be a flat 2. Env override
-    (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling."""
+    (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling.
+
+    Background (autostart) mode caps at 2 — nobody is at the keyboard, so
+    the box's threads go to the user's other work, not to extra model
+    copies; transcription just runs longer."""
+    if background_mode():
+        return 2
     threads = os.cpu_count() or 4
     if threads >= 32:
         return 4
@@ -2504,10 +2511,15 @@ _youtube_chat_pace_lock = threading.Lock()
 
 
 def _youtube_chat_interval() -> float:
-    """Pacing interval: longer while the app's interactive lane is active."""
-    if archive_db.worker_live(age_s=_APP_ACTIVITY_AGE_S, tag="app-activity"):
-        return _YOUTUBE_CHAT_ACTIVE_INTERVAL_S
-    return _YOUTUBE_CHAT_MIN_INTERVAL_S
+    """Pacing interval: longer while the app's interactive lane is active,
+    longer still in background (autostart) mode — the quota-sensitive
+    YouTube chat fetch backs off to ~2.5x the interactive gap."""
+    base = _YOUTUBE_CHAT_ACTIVE_INTERVAL_S
+    if not archive_db.worker_live(age_s=_APP_ACTIVITY_AGE_S, tag="app-activity"):
+        base = _YOUTUBE_CHAT_MIN_INTERVAL_S
+    if background_mode():
+        return base * 2.5
+    return base
 
 
 def _pace_youtube_chat() -> None:

@@ -442,8 +442,12 @@ def _make_geometry_saver(settings_mgr: SettingsManager):
 # ---------------------------------------------------------------------------
 
 
-def _launch_pywebview(port: int) -> bool:
-    """Open PyWebView with system-tray minimize-on-close behavior."""
+def _launch_pywebview(port: int, *, start_hidden: bool = False) -> bool:
+    """Open PyWebView with system-tray minimize-on-close behavior.
+
+    start_hidden (autostart boot): the window is created hidden and the
+    tray is the only entry point — the user opens the UI from the tray
+    icon; the backend + background machinery run quietly meanwhile."""
     logger = logging.getLogger("VOD.RIP")
     _set_windows_app_identity()
     icon_path = _resolve_app_icon_path()
@@ -489,6 +493,8 @@ def _launch_pywebview(port: int) -> bool:
         text_select=True,
         background_color="#0A0A0A",
     )
+    if start_hidden and "hidden" in _create_window_params:
+        kwargs["hidden"] = True
 
     wg = _sanitized_window_geometry(app_settings.window_geometry or {})
     if wg.get("width") and wg.get("height"):
@@ -564,14 +570,22 @@ def _launch_pywebview(port: int) -> bool:
     return False
 
 
-def _launch_browser_and_tray(port: int, *, webview2_missing: bool = False):
-    """Fallback UI: open the default browser + system tray icon."""
+def _launch_browser_and_tray(
+    port: int, *, webview2_missing: bool = False, open_browser: bool = True
+):
+    """Fallback UI: open the default browser + system tray icon.
+
+    open_browser=False (autostart boot): tray only — a boot-time browser
+    popup is hostile; the user opens the UI from the tray when ready."""
     import webbrowser
 
     logger = logging.getLogger("VOD.RIP")
-    logger.warning("Native window unavailable — opening in default browser")
+    if open_browser:
+        logger.warning("Native window unavailable — opening in default browser")
+    else:
+        logger.warning("Native window unavailable — tray only (autostart boot)")
 
-    if os.name == "nt" and not webview2_missing:
+    if open_browser and os.name == "nt" and not webview2_missing:
         try:
             import tkinter as tk
             from tkinter import messagebox
@@ -591,7 +605,8 @@ def _launch_browser_and_tray(port: int, *, webview2_missing: bool = False):
         # ponytail: tkinter GUI errors only — best-effort WebView2 warning dialog
             pass
 
-    webbrowser.open(f"http://127.0.0.1:{port}")
+    if open_browser:
+        webbrowser.open(f"http://127.0.0.1:{port}")
 
     from services.app_lifecycle import request_app_exit
     from services.tray_service import TrayService
@@ -634,6 +649,13 @@ def main():
     multiprocessing.freeze_support()
 
     port = int(os.environ.get("PORT", 7897))
+
+    # Autostart boot (HKCU Run key -> VOD-RIP.exe --autostart): hide the
+    # window and mark the process as background so the pacing layer runs
+    # quieter (fewer lanes, wider gaps — nobody is at the keyboard yet).
+    autostart = "--autostart" in sys.argv
+    if autostart:
+        os.environ["VODRIP_BACKGROUND"] = "1"
 
     if getattr(sys, "frozen", False):
         # onefile: bundle the cookie bridge extension out of the temp
@@ -681,6 +703,9 @@ def main():
 
     logger = logging.getLogger("VOD.RIP")
 
+    if autostart:
+        logger.info("Autostart boot — hidden to tray, quiet pacing enabled")
+
     logger.info("Starting FastAPI on 127.0.0.1:%d", port)
 
     from services.server_lifecycle import release_api_port
@@ -715,7 +740,7 @@ def main():
             logger.warning("WebView2 setup failed: %s", exc)
             webview2_ok = False
 
-    if webview2_ok and _launch_pywebview(port):
+    if webview2_ok and _launch_pywebview(port, start_hidden=autostart):
         _shutdown(port)
         sys.exit(0)
 
@@ -724,7 +749,7 @@ def main():
             from services.webview2_setup import ensure_webview2, webview2_installed
             if not webview2_installed():
                 webview2_ok = ensure_webview2()
-            if webview2_ok and _launch_pywebview(port):
+            if webview2_ok and _launch_pywebview(port, start_hidden=autostart):
                 _shutdown(port)
                 sys.exit(0)
         except Exception as exc:
@@ -732,7 +757,7 @@ def main():
             logger.warning("WebView2 retry failed: %s", exc)
             webview2_ok = False
 
-    _launch_browser_and_tray(port, webview2_missing=not webview2_ok)
+    _launch_browser_and_tray(port, webview2_missing=not webview2_ok, open_browser=not autostart)
     _shutdown(port)
     sys.exit(0)
 

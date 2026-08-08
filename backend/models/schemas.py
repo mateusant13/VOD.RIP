@@ -102,6 +102,11 @@ class AppSettings(BaseModel):
     channel_youtube_enabled: bool = True
     channel_content_filter: str = "vods"
     skip_youtube_startup_warm: bool = False
+    # Run the app at Windows boot (HKCU Run key -> VOD-RIP.exe --autostart).
+    # Autostart launches hidden-to-tray with VODRIP_BACKGROUND=1 so the
+    # background machinery (transcribe, index, chat capture) keeps working
+    # at a quieter pace; the tray icon reopens the window.
+    start_with_windows: bool = False
     cookie_bridge_token: str = ""
     cookie_bridge_enabled: bool = True
     entity_watch_enabled: bool = True
@@ -170,6 +175,7 @@ class SettingsUpdate(BaseModel):
     channel_content_filter: Optional[str] = None
     mp4_faststart: Optional[bool] = None
     skip_youtube_startup_warm: Optional[bool] = None
+    start_with_windows: Optional[bool] = None
     cookie_bridge_token: Optional[str] = None
     cookie_bridge_enabled: Optional[bool] = None
     entity_watch_enabled: Optional[bool] = None

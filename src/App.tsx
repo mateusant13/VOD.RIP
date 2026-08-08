@@ -380,6 +380,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   channel_twitch_enabled: true,
   channel_youtube_enabled: true,
   channel_content_filter: 'vods',
+  start_with_windows: false,
   twitch_helix_token: '',
 };
 

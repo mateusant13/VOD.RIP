@@ -55,7 +55,30 @@ TRANSCRIBE_PRIORITY_HIGH = 100       # transcript-source search jump-the-queue
 YOUTUBE_RETRY_BACKOFF_S = 3600.0     # bot-wall retry delay per video
 FAILED_JOB_FRESH_S = 3600.0          # don't re-run a job failed < 1h ago
 
-_VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _background() -> bool:
+    """Quiet (autostart) mode: slower pass cadence, smaller per-pass
+    budgets — the machine belongs to whoever logged in, not the archive."""
+    from services.autostart import background_mode
+
+    return background_mode()
+
+
+def _yt_ingest_budget() -> int:
+    """yt-dlp extracts per pass: 1 in background (bot-gated + slow), else 3."""
+    return 1 if _background() else YOUTUBE_INGEST_PER_PASS
+
+
+def _transcribe_budget() -> int:
+    """Transcribe enqueues per pass: 1 in background, else 2."""
+    return 1 if _background() else TRANSCRIBE_QUEUE_PER_PASS
+
+
+def _pass_interval() -> float:
+    """Seconds between scheduler passes: 6 min in background, else 3 min."""
+    return 360.0 if _background() else PASS_INTERVAL_SEC
 
 
 def _video_id_from_url(url: str) -> str:
@@ -212,15 +235,16 @@ def _ingest_one_youtube(video_id: str) -> None:
 def _ingest_youtube(channel: dict) -> None:
     if not _platform_enabled(channel, "youtube"):
         return
+    yt_budget = _yt_ingest_budget()
     with _yt_lock:
-        if len(_yt_inflight) >= YOUTUBE_INGEST_PER_PASS:
+        if len(_yt_inflight) >= yt_budget:
             return  # budget full — a later pass picks the rest
     urls = list(channel.get("vodVideos") or []) + list(channel.get("clipVideos") or [])
     if not urls:
         return
     spawned = 0
     for item in urls:
-        if spawned >= YOUTUBE_INGEST_PER_PASS:
+        if spawned >= yt_budget:
             break
         url = _entry_url(item)
         if not url or "/shorts/" in url:
@@ -447,7 +471,7 @@ def _enqueue_transcriptions() -> None:
     fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
     enqueued = 0
     for r in rows:
-        if enqueued >= TRANSCRIBE_QUEUE_PER_PASS:
+        if enqueued >= _transcribe_budget():
             break
         vid = r["video_id"]
         if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
@@ -495,7 +519,10 @@ def _run_pass() -> None:
     _enqueue_transcriptions()
 
 
-def _loop(*, interval: float = PASS_INTERVAL_SEC) -> None:
+def _loop(*, interval: Optional[float] = None) -> None:
+    # None -> the background-aware default (6 min quiet / 3 min interactive);
+    # an explicit interval (tests) wins over both.
+    cadence = _pass_interval() if interval is None else interval
     while not _stop.is_set():
         try:
             _run_pass()
@@ -503,15 +530,16 @@ def _loop(*, interval: float = PASS_INTERVAL_SEC) -> None:
             logger.exception("archive scheduler pass failed")
         if _stop.is_set():
             break
-        _wake.wait(interval)  # returns immediately on kick_scheduler_pass()
+        _wake.wait(cadence)  # returns immediately on kick_scheduler_pass()
         _wake.clear()
 
 
 # --- lifecycle --------------------------------------------------------------
 
-def start_archive_scheduler(*, interval: float = PASS_INTERVAL_SEC) -> threading.Thread:
+def start_archive_scheduler(*, interval: Optional[float] = None) -> threading.Thread:
     """Start the scheduler daemon thread (idempotent). The first pass runs
-    immediately; afterwards one pass per *interval* (or on kick)."""
+    immediately; afterwards one pass per interval (None -> background-aware
+    default: 6 min quiet / 3 min interactive) or on kick."""
     global _thread
     with _lock:
         if _thread is not None and _thread.is_alive():

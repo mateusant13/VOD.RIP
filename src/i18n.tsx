@@ -44,6 +44,9 @@ const ptBR: Record<string, string> = {
   'Warm YouTube at startup': 'Aquecer YouTube na inicialização',
   'Pre-loads preview data for faster first play (uses ~500MB download at boot)':
     'Pré-carrega dados de pré-visualização para um primeiro play mais rápido (baixa ~500MB na inicialização)',
+  'Start with Windows': 'Iniciar com o Windows',
+  'Launches hidden in the tray at boot and keeps transcribing, indexing and chat capture running quietly in the background':
+    'Inicia oculto na bandeja ao ligar o PC e mantém transcrição, indexação e captura de chat rodando em segundo plano de forma discreta',
   'Transcription': 'Transcrição',
   'Disk & Storage': 'Disco e armazenamento',
   'Updates': 'Atualizações',
@@ -515,6 +518,9 @@ const es: Record<string, string> = {
   'Max Cache (MB)': 'Máx. caché (MB)',
   'Warm YouTube at startup': 'Precalentar YouTube al inicio',
   'Pre-loads preview data for faster first play (uses ~500MB download at boot)': 'Precarga datos de vista previa para una primera reproducción más rápida (descarga ~500MB al iniciar)',
+  'Start with Windows': 'Iniciar con Windows',
+  'Launches hidden in the tray at boot and keeps transcribing, indexing and chat capture running quietly in the background':
+    'Se inicia oculto en la bandeja al encender el PC y mantiene transcripción, indexación y captura de chat funcionando silenciosamente en segundo plano',
   'Transcription': 'Transcripción',
   'Disk & Storage': 'Disco y almacenamiento',
   'Updates': 'Actualizaciones',

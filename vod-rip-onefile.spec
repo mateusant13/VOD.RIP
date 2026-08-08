@@ -183,6 +183,7 @@ def _hidden_imports():
         "services.updater",
         "services.crash_handler",
         "services._version",
+        "services.autostart",
         "services.youtube_pot_service",
         "services.archive_transcribe",
         "faster_whisper",

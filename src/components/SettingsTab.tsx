@@ -35,6 +35,7 @@ type Props = {
 /** Fields SettingsTab displays; signature change => "unsaved changes" chip. */
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
+  'start_with_windows',
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
@@ -289,6 +290,13 @@ export default function SettingsTab({
           checked={!settings.skip_youtube_startup_warm}
           onChange={(c) => setSettings({ ...settings, skip_youtube_startup_warm: !c })}
           ariaLabel="warm youtube at startup"
+        />
+        <Toggle
+          label={t('Start with Windows')}
+          info={t('Launches hidden in the tray at boot and keeps transcribing, indexing and chat capture running quietly in the background')}
+          checked={!!settings.start_with_windows}
+          onChange={(c) => setSettings({ ...settings, start_with_windows: c })}
+          ariaLabel="start with windows"
         />
       </SettingsCard>
 

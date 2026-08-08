@@ -166,6 +166,16 @@ async def update_settings(update: SettingsUpdate):
         current.mp4_faststart = bool(update.mp4_faststart)
     if update.skip_youtube_startup_warm is not None:
         current.skip_youtube_startup_warm = bool(update.skip_youtube_startup_warm)
+    if update.start_with_windows is not None:
+        current.start_with_windows = bool(update.start_with_windows)
+        try:
+            from services.autostart import set_windows_autostart
+
+            ok = set_windows_autostart(current.start_with_windows)
+            if not ok:
+                logger.warning("autostart registry update failed — setting kept, launch stays manual")
+        except Exception:
+            logger.debug("autostart update skipped", exc_info=True)
     if update.cookie_bridge_enabled is not None:
         current.cookie_bridge_enabled = bool(update.cookie_bridge_enabled)
     if update.entity_watch_enabled is not None:

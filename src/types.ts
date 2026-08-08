@@ -111,6 +111,9 @@ export interface AppSettings {
   channel_youtube_enabled?: boolean;
   channel_content_filter?: 'vods' | 'clips' | 'streams';
   skip_youtube_startup_warm?: boolean;
+  /** Run at Windows boot (HKCU Run key -> --autostart): launches
+   * hidden-to-tray with quiet pacing for background work. */
+  start_with_windows?: boolean;
   cookie_bridge_enabled?: boolean;
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
