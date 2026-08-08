@@ -348,6 +348,8 @@ def get_conn() -> sqlite3.Connection:
             _ensure_content_sha_column(_conn)
             _ensure_channel_language_column(_conn)
             _ensure_original_columns(_conn)
+            _ensure_captions_unavailable_column(_conn)
+            _ensure_original_failed_column(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
             _ensure_message_color_column(_conn)
@@ -519,6 +521,37 @@ def _ensure_original_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE videos ADD COLUMN original_title TEXT")
     if "original_language" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN original_language TEXT")
+
+
+def _ensure_captions_unavailable_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.captions_unavailable_at (no-captions marker).
+
+    Persists the "this YouTube video has no auto captions" verdict so the
+    scheduler stops re-extracting captionless videos every pass/boot (the
+    in-memory _yt_attempted_at 1h backoff dies with the process). Stamped
+    by archive_ytdlp.ingest_video when an ingest stores zero caption
+    segments; cleared on any successful caption ingest. NULL = unknown or
+    captions exist. Plain nullable TEXT (ISO UTC) — ALTER ADD COLUMN is
+    immediate and additive; PRAGMA table_info guard makes repeated calls
+    (re-imports, reloads) no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "captions_unavailable_at" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN captions_unavailable_at TEXT")
+
+
+def _ensure_original_failed_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.original_fetch_failed_at (orig-title cooldown).
+
+    Persists the WS-4 original-title backfill failure cooldown (in-memory
+    _original_failed_at in archive_ytdlp dies with the process, so a
+    permanently failing video is re-fetched once per app restart forever).
+    Stamped by archive_ytdlp._mark_original_failed; read by
+    _original_failed_recently. NULL = no recent failure. Plain nullable
+    TEXT (ISO UTC) — additive ALTER ADD COLUMN; PRAGMA table_info guard
+    makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "original_fetch_failed_at" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN original_fetch_failed_at TEXT")
 
 
 def _ensure_lang_column(conn: sqlite3.Connection) -> None:
@@ -2303,6 +2336,40 @@ def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bo
     if not subtitles_first:
         return False
     return bool(transcript_for(platform, video_id))
+
+
+def mark_captions_unavailable(platform: str, video_id: str) -> None:
+    """Stamp the no-captions marker (persistent re-extract cooldown).
+
+    Set by ingest_video when an ingest stored zero caption segments; the
+    scheduler skips re-extract while the stamp is fresh
+    (CAPTIONS_UNAVAILABLE_FRESH_S). No row (platform+video_id absent)
+    writes nothing — the marker only ever rides an existing row."""
+    execute(
+        "UPDATE videos SET captions_unavailable_at = ? WHERE platform = ? AND video_id = ?",
+        (_now_iso(), platform, video_id),
+    )
+
+
+def clear_captions_unavailable(platform: str, video_id: str) -> None:
+    """Clear the no-captions marker after a successful caption ingest.
+
+    A later ingest that DID find captions must immediately make the video
+    a re-extract candidate again (e.g. captions were added to the upload
+    after the marker was stamped)."""
+    execute(
+        "UPDATE videos SET captions_unavailable_at = NULL WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+
+
+def captions_unavailable_at(platform: str, video_id: str) -> Optional[str]:
+    """Stored no-captions marker (ISO UTC string) or None."""
+    row = query(
+        "SELECT captions_unavailable_at FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return row[0]["captions_unavailable_at"] if row else None
 
 
 def optimize_fts() -> None:

@@ -157,6 +157,19 @@ def ingest_channel_vods(channel: str, limit: int = 3) -> List[dict]:
                 f"(canonical {key}); skipped download/backfill"
             )
             archive_db.set_alias("twitch", vid, key, note)
+
+        # Re-run guard (mirrors archive_kick._ingest_one): a previously
+        # completed download is not reset by a metadata refresh. The bare
+        # base dict below would upsert archive_path=None + status='known'
+        # and upsert_video's ON CONFLICT would clobber the ready state —
+        # preserve both when the row is ready and owns a file path.
+        preserved: dict = {}
+        existing = archive_db.query(
+            "SELECT status, archive_path FROM videos WHERE platform='twitch' AND video_id=?",
+            (vid,),
+        )
+        if existing and existing[0]["status"] == "ready" and existing[0]["archive_path"]:
+            preserved = {"status": "ready", "archive_path": existing[0]["archive_path"]}
         archive_db.upsert_video({
             "platform": "twitch",
             "video_id": vid,
@@ -168,6 +181,7 @@ def ingest_channel_vods(channel: str, limit: int = 3) -> List[dict]:
             "archive_path": None,
             "canonical_key": key,
             "status": "known",
+            **preserved,
         })
         results.append({
             "video_id": vid,

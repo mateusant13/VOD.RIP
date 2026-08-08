@@ -54,6 +54,15 @@ TRANSCRIBE_PRIORITY_LOW = 0
 TRANSCRIBE_PRIORITY_HIGH = 100       # transcript-source search jump-the-queue
 YOUTUBE_RETRY_BACKOFF_S = 3600.0     # bot-wall retry delay per video
 FAILED_JOB_FRESH_S = 3600.0          # don't re-run a job failed < 1h ago
+# Re-fetch window for the per-pass Twitch GQL channel walk: a channel whose
+# last successful ingest is fresher than this is skipped for the pass (the
+# channel_snapshots table — the same table routers/channels.py consults, same
+# contract: touch after a successful non-empty fetch, skip while fresh).
+TWITCH_CHANNEL_FRESH_SEC = 600.0     # matches deps.TWITCH_CHANNEL_FRESH_SEC
+# Persistent no-captions cooldown: a video stamped captions_unavailable_at is
+# not re-extracted for this long (survives restarts; the in-memory 1h
+# _yt_attempted_at backoff remains the fast-path within a process).
+CAPTIONS_UNAVAILABLE_FRESH_S = 86400.0
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -161,10 +170,22 @@ def _ingest_twitch(channel: dict) -> None:
     slug = (channel.get("twitchSlug") or "").strip().lower()
     if not slug:
         return
+    # Snapshot gate (channels.py contract): a channel fetched within the
+    # freshness window is skipped for this pass — the scheduler runs every
+    # 180s, so without the gate every saved channel pays a GQL round-trip
+    # per pass even though Twitch VOD metadata changes slowly.
+    age = archive_db.channel_snapshot_age_sec("twitch", slug)
+    if age is not None and age < TWITCH_CHANNEL_FRESH_SEC:
+        return
     try:
         from services.archive_twitch import ingest_channel_vods
 
         rows = ingest_channel_vods(slug, limit=TWITCH_INGEST_LIMIT)
+        if rows:
+            # Same contract as channels.py: touch only after a successful
+            # NON-EMPTY fetch, so a dead/empty channel is retried on the
+            # next pass instead of being parked by an empty snapshot.
+            archive_db.touch_channel_snapshot("twitch", slug)
         logger.info("scheduler twitch ingest %s: %d VOD(s) upserted", slug, len(rows))
     except Exception as exc:  # noqa: BLE001 — GQL 429 / dead channel
         logger.info("scheduler twitch ingest %s failed: %s", slug, exc)
@@ -189,12 +210,29 @@ def _youtube_covered(video_id: str) -> bool:
     """True when the video is already ingested WITH captions/transcripts.
 
     A bare row (no captions, no transcripts) is re-ingested to retry the
-    caption fetch; a captions-covered row is left alone."""
+    caption fetch; a captions-covered row is left alone. A video whose
+    persisted no-captions marker (videos.captions_unavailable_at) is fresh
+    is ALSO left alone — the last ingest proved there is nothing to fetch,
+    and re-extracting every pass/boot (the in-memory 1h backoff dies with
+    the process) is exactly the hammering the marker exists to stop. A
+    successful caption ingest clears the marker, making the video a
+    candidate again."""
     rows = archive_db.query(
-        "SELECT 1 FROM videos WHERE platform='youtube' AND video_id=?", (video_id,)
+        "SELECT captions_unavailable_at FROM videos "
+        "WHERE platform='youtube' AND video_id=?",
+        (video_id,),
     )
     if not rows:
         return False
+    marker = rows[0]["captions_unavailable_at"]
+    if marker:
+        try:
+            if datetime.now(timezone.utc) - datetime.fromisoformat(marker) < timedelta(
+                seconds=CAPTIONS_UNAVAILABLE_FRESH_S
+            ):
+                return True  # known captionless — skip while the marker is fresh
+        except (TypeError, ValueError):
+            pass  # unparseable stamp — fall through to the caption checks
     if archive_db.captions_cover("youtube", video_id):
         return True
     return bool(
@@ -479,6 +517,7 @@ def _enqueue_transcriptions() -> None:
         if archive_db.captions_cover("youtube", vid):
             continue  # yt_subtitles_first: whisper skipped anyway
         latest = archive_db.latest_job("youtube", vid, kind="transcribe")
+        job_id = f"transcribe-youtube-{vid}"
         if latest:
             if latest["status"] in ("queued", "running"):
                 continue
@@ -488,7 +527,21 @@ def _enqueue_transcriptions() -> None:
                         continue
                 except (TypeError, ValueError):
                     continue  # unparseable — treat as fresh failure
-        job_id = f"transcribe-youtube-{vid}"
+                # Stale failed row (>= FAILED_JOB_FRESH_S old): the worker
+                # never claims 'failed' rows, so without this the job is
+                # stranded forever. Requeue IN PLACE first (mirrors the
+                # chat path in _enqueue_chat_job) so the stable job id
+                # never orphans a retry; only if the row vanished between
+                # the read and the update fall through to the INSERT.
+                now_iso = now_utc.isoformat(timespec="seconds")
+                cur = archive_db.execute(
+                    "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
+                    "updated_at=?, heartbeat=? WHERE id=? AND status='failed'",
+                    (now_iso, now_iso, job_id),
+                )
+                if cur.rowcount == 1:
+                    enqueued += 1
+                    continue
         try:
             archive_db.enqueue_job(
                 job_id, "transcribe", "youtube", vid, priority=TRANSCRIBE_PRIORITY_LOW
