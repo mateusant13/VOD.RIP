@@ -74,6 +74,11 @@ interface TwitchClipPopupProps {
   /** Volume the popup should start at — inherited from the opening preview
    * so opening the clip window never resets the user's volume level. */
   initialVolume?: number;
+  /** Session of the opening preview (same VOD, full-VOD HLS proxy): reuse it
+   * so segments already fetched hit that session's disk cache instead of
+   * re-downloading from the CDN. Skipped when trimTimeline is true (the
+   * preview HLS is a short trim, not the full VOD). */
+  reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
 }
 
 export default function TwitchClipPopup({
@@ -86,6 +91,7 @@ export default function TwitchClipPopup({
   onClose,
   onClipCreated,
   initialVolume = PREVIEW_DEFAULT_VOLUME,
+  reuseSession = null,
 }: TwitchClipPopupProps) {
   const { t } = useI18n();
   const volumeRef = useRef(initialVolume);
@@ -166,7 +172,30 @@ export default function TwitchClipPopup({
   // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
   useEffect(() => {
     let cancelled = false;
+    // Only delete the session we created — a reused parent session is owned
+    // by the opening preview and must survive the popup.
+    let ownsSession = !reuseSession?.sessionId || reuseSession.trimTimeline === true;
     (async () => {
+      if (reuseSession?.sessionId && !reuseSession.trimTimeline) {
+        // Same-VOD full-HLS session from the opening preview: adopt it so the
+        // proxy serves segments from that session's disk cache instead of
+        // re-downloading from the CDN (and skip the GQL re-resolve). Probe the
+        // master first — a stale session falls through to a fresh one.
+        const sid = reuseSession.sessionId;
+        try {
+          const probe = await fetch(`/api/preview/hls/${sid}/master.m3u8`);
+          if (!probe.ok) throw new Error(`stale session ${sid.slice(0, 8)}`);
+          if (cancelled) return;
+          sessionIdRef.current = sid;
+          // Full-VOD HLS proxy (no window mux): video time is absolute VOD time.
+          timelineOffsetRef.current = 0;
+          setPlayback({ url: `/api/preview/hls/${sid}/master.m3u8`, kind: 'hls' });
+          setLoading(false);
+          return;
+        } catch {
+          ownsSession = true; // stale/missing — fall through to a fresh session
+        }
+      }
       try {
         const res = await createPreviewSessionWithRetry({
           url,
@@ -210,11 +239,11 @@ export default function TwitchClipPopup({
       if (video) detachProgressivePreview(video);
       const sid = sessionIdRef.current;
       sessionIdRef.current = null;
-      if (sid) {
+      if (sid && ownsSession) {
         void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
       }
     };
-  }, [url, win.start, win.end, retryTick]);
+  }, [url, win.start, win.end, retryTick, reuseSession]);
 
   // ── Playback attach (HLS for Twitch VODs, progressive fallback) ──
   useEffect(() => {

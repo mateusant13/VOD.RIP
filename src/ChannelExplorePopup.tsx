@@ -183,6 +183,7 @@ export default function ChannelExplorePopup({
     vodId: string;
     playheadSec: number;
     vodDurationSec: number;
+    reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
@@ -1547,6 +1548,9 @@ export default function ChannelExplorePopup({
       vodId,
       playheadSec: currentTime,
       vodDurationSec: vod.durationSec,
+      reuseSession: sessionIdRef.current
+        ? { sessionId: sessionIdRef.current, trimTimeline: trimTimelineRef.current }
+        : null,
     });
   }, [vod.channel, vod.videoId, vod.url, vod.durationSec, currentTime, showClipNotice]);
 

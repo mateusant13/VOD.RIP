@@ -471,6 +471,7 @@ export default function App() {
     vodId: string;
     playheadSec: number;
     vodDurationSec: number;
+    reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
@@ -5841,6 +5842,9 @@ export default function App() {
       vodId,
       playheadSec: previewTimeUi,
       vodDurationSec,
+      reuseSession: previewSessionIdRef.current
+        ? { sessionId: previewSessionIdRef.current, trimTimeline: previewTrimTimelineRef.current }
+        : null,
     });
   }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, showClipOpenNotice]);
 
