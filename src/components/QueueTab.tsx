@@ -13,6 +13,37 @@ import { formatHmsFull } from '../utils';
 function isPlayableLocalFile(path: string): boolean {
   return /\.(mp4|mkv|webm|mov|m4v)$/i.test(path);
 }
+
+/** One row of GET /api/archive/jobs (progress UI). `title` is enriched by
+ *  the backend router (LEFT JOIN videos) and may be '' when the video row
+ *  is absent. */
+export interface ArchiveJobRow {
+  id: string;
+  kind: 'ingest' | 'chat' | 'transcribe' | 'events' | string;
+  platform: string;
+  video_id: string;
+  status: 'queued' | 'running' | 'done' | 'failed' | string;
+  progress: number; // 0..1
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  heartbeat: string | null;
+  title?: string;
+}
+
+/** Poll cadence for the live background-jobs section. */
+const JOBS_POLL_MS = 3000;
+/** Cap displayed rows so a long backlog never turns the tab into a wall. */
+const JOBS_MAX_ROWS = 20;
+
+/** Fetch the job queue; any failure (backend down, 500, malformed body)
+ *  returns [] so the poll loop just waits for the next tick. */
+async function fetchJobs(): Promise<ArchiveJobRow[]> {
+  const res = await fetch('/api/archive/jobs', { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) return [];
+  const data = (await res.json().catch(() => null)) as { jobs?: ArchiveJobRow[] } | null;
+  return Array.isArray(data?.jobs) ? data.jobs : [];
+}
 type Props = {
   queueDownloads: DownloadState[];
   recentDownloads?: DownloadState[];
@@ -37,6 +68,13 @@ type Props = {
   onWatchLocal?: (dl: DownloadState) => void;
   /** Click a history row's title to open that VOD in the main preview (URL tab). */
   onOpenVod?: (url: string) => void;
+};
+
+/** PlatformVodIcon expects capitalized platform names; archive jobs are lowercase. */
+const PLATFORM_ICON_NAME: Record<string, string> = {
+  youtube: 'YouTube',
+  twitch: 'Twitch',
+  kick: 'Kick',
 };
 
 export default function QueueTab({
@@ -107,6 +145,61 @@ export default function QueueTab({
     loadTwitchClips();
   }, []);
 
+  // Live background-jobs section (transcribe/chat/events): poll only while
+  // this tab is mounted, stop on unmount. Failures are silent — the next
+  // tick retries, a 500 or dead backend never crashes the tab.
+  const [jobs, setJobs] = useState<ArchiveJobRow[]>([]);
+  const [showDoneJobs, setShowDoneJobs] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const rows = await fetchJobs();
+        if (!cancelled) setJobs(rows);
+      } catch {
+        // silent retry on the next tick
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, JOBS_POLL_MS);
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const activeJobs = jobs.filter((j) => j.status !== 'done');
+  const visibleJobs = (showDoneJobs ? jobs : activeJobs).slice(0, JOBS_MAX_ROWS);
+  const showJobsSection = activeJobs.length > 0 || showDoneJobs;
+  const kindLabel = (kind: string) => {
+    switch (kind) {
+      case 'transcribe': return t('progress.kind.transcribe');
+      case 'chat': return t('progress.kind.chat');
+      case 'events': return t('progress.kind.events');
+      case 'ingest': return t('progress.kind.ingest');
+      default: return kind;
+    }
+  };
+  const statusLabel = (status: string) => {
+    switch (status) {
+      case 'queued': return t('progress.status.queued');
+      case 'running': return t('progress.status.running');
+      case 'done': return t('progress.status.done');
+      case 'failed': return t('progress.status.failed');
+      default: return status;
+    }
+  };
+  const statusClass = (status: string) => {
+    switch (status) {
+      case 'running': return 'text-[#53fc18]';
+      case 'queued': return 'text-zinc-400';
+      case 'failed': return 'text-red-400';
+      default: return 'text-zinc-500';
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -128,6 +221,82 @@ export default function QueueTab({
           </button>
         </div>
       </div>
+
+      {showJobsSection && (
+        <div className="border-t-2 border-zinc-800 pt-3 flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-500">
+              {t('progress.title')}
+            </span>
+            <label
+              className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500 cursor-pointer hover:text-zinc-300"
+              title={t('progress.showDone')}
+            >
+              <input
+                type="checkbox"
+                checked={showDoneJobs}
+                onChange={() => setShowDoneJobs((v) => !v)}
+                className="shrink-0"
+                style={vodCheckboxStyle('#fafafa')}
+              />
+              {t('progress.showDone')}
+            </label>
+          </div>
+          <div className="flex flex-col gap-2">
+            {visibleJobs.length === 0 ? (
+              <div className="text-center text-zinc-600 font-mono text-xs py-4 border-2 border-dashed border-zinc-800">
+                {t('progress.empty')}
+              </div>
+            ) : visibleJobs.map((j) => (
+              <div key={j.id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex flex-col gap-1">
+                <div className="flex justify-between items-center gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <PlatformVodIcon platform={PLATFORM_ICON_NAME[j.platform] ?? j.platform} className="w-3.5 h-3.5 shrink-0" />
+                    <span className="text-[10px] font-mono text-zinc-400 uppercase tracking-wider shrink-0">
+                      {kindLabel(j.kind)}
+                    </span>
+                    {j.title ? (
+                      <span className="text-[10px] font-mono text-zinc-300 truncate" title={j.title}>
+                        {j.title}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-mono text-zinc-600 truncate">{j.video_id}</span>
+                    )}
+                  </div>
+                  <span className={`text-[10px] font-mono shrink-0 ${statusClass(j.status)}`}>
+                    {statusLabel(j.status)}
+                  </span>
+                </div>
+                {j.kind === 'transcribe' && (j.status === 'queued' || j.status === 'running') && (
+                  <div className="flex items-center gap-2">
+                    <div
+                      className="h-1 flex-1 rounded bg-zinc-800 overflow-hidden"
+                      role="progressbar"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.round(j.progress * 100)}
+                      aria-label={t('progress.backfill')}
+                    >
+                      <div
+                        className="h-full bg-[#53fc18] transition-[width] duration-300"
+                        style={{ width: `${Math.min(100, Math.max(0, Math.round(j.progress * 100)))}%` }}
+                      />
+                    </div>
+                    <span className="text-[9px] font-mono text-zinc-500 tabular-nums shrink-0">
+                      {Math.round(j.progress * 100)}%
+                    </span>
+                  </div>
+                )}
+                {j.status === 'failed' && j.error && (
+                  <span className="text-[10px] text-red-400 font-mono truncate" title={j.error}>
+                    {j.error}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {queueDownloads.length > 0 && onToggleQueueSelection && (
         <div className="flex items-center gap-2 -mt-2">                          <label className="flex items-center gap-1.5 text-[9px] font-mono text-zinc-500 cursor-pointer hover:text-zinc-300">

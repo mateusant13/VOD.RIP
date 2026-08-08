@@ -880,7 +880,28 @@ async def archive_aliases(platform: str, video_id: str, canonical_key: str, note
 
 @router.get("/api/archive/jobs")
 async def archive_jobs(limit: int = Query(50, ge=1, le=500)):
-    return {"jobs": archive_db.list_jobs(limit)}
+    jobs = archive_db.list_jobs(limit)
+    if jobs:
+        # Progress UI (QueueTab polls this every 3s): enrich each row with
+        # the video's display title — the jobs table stores only ids, and
+        # the videos row may be absent (cleaned or never indexed). One
+        # batched lookup; a per-row N+1 on a poll would be silly. Display
+        # title prefers the WS-4 original (non-auto-translated) copy, the
+        # same rule search hits use.
+        pairs = [(j["platform"], j["video_id"]) for j in jobs]
+        placeholders = ", ".join("(?, ?)" for _ in pairs)
+        titles = {
+            (r["platform"], r["video_id"]): r["title"]
+            for r in archive_db.query(
+                "SELECT platform, video_id, "
+                "COALESCE(NULLIF(original_title, ''), title) AS title "
+                f"FROM videos WHERE (platform, video_id) IN ({placeholders})",
+                [v for p in pairs for v in p],
+            )
+        }
+        for j in jobs:
+            j["title"] = titles.get((j["platform"], j["video_id"]), "")
+    return {"jobs": jobs}
 
 
 @router.post("/api/archive/jobs")

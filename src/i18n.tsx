@@ -505,6 +505,19 @@ const ptBR: Record<string, string> = {
   'Trim end': 'Fim do corte',
   'Clip length': 'Duração do clipe',
   'from drag start': 'do início do arraste',
+  // ── Background jobs (progress.*) ──────────────────────────
+  'progress.title': 'Trabalhos em segundo plano',
+  'progress.kind.transcribe': 'Transcrição',
+  'progress.kind.chat': 'Retrocesso de chat',
+  'progress.kind.events': 'Eventos',
+  'progress.kind.ingest': 'Ingestão',
+  'progress.status.queued': 'Na fila',
+  'progress.status.running': 'Em andamento',
+  'progress.status.done': 'Concluído',
+  'progress.status.failed': 'Falhou',
+  'progress.showDone': 'Mostrar concluídos',
+  'progress.empty': 'Nenhum trabalho em segundo plano agora.',
+  'progress.backfill': 'Progresso do retrocesso',
 }
 
 const es: Record<string, string> = {
@@ -935,9 +948,40 @@ const es: Record<string, string> = {
   'Trim end': 'Fin del recorte',
   'Clip length': 'Duración del clip',
   'from drag start': 'desde el inicio del arrastre',
+  // ── Background jobs (progress.*) ──────────────────────────
+  'progress.title': 'Trabajos en segundo plano',
+  'progress.kind.transcribe': 'Transcripción',
+  'progress.kind.chat': 'Retroceso de chat',
+  'progress.kind.events': 'Eventos',
+  'progress.kind.ingest': 'Ingestión',
+  'progress.status.queued': 'En cola',
+  'progress.status.running': 'En curso',
+  'progress.status.done': 'Hecho',
+  'progress.status.failed': 'Falló',
+  'progress.showDone': 'Mostrar hechos',
+  'progress.empty': 'No hay trabajos en segundo plano ahora.',
+  'progress.backfill': 'Progreso del retroceso',
 }
 
-const DICTS: Record<Lang, Record<string, string>> = { en: {}, 'pt-BR': ptBR, es }
+const en: Record<string, string> = {
+  // Background jobs (progress.*). The `en` dict is usually implicit (keys
+  // ARE the English text), but the dotted progress.* namespace needs real
+  // English copy — the bare key would render as 'progress.title'.
+  'progress.title': 'Background jobs',
+  'progress.kind.transcribe': 'Transcription',
+  'progress.kind.chat': 'Chat backfill',
+  'progress.kind.events': 'Events',
+  'progress.kind.ingest': 'Ingest',
+  'progress.status.queued': 'Queued',
+  'progress.status.running': 'Running',
+  'progress.status.done': 'Done',
+  'progress.status.failed': 'Failed',
+  'progress.showDone': 'Show done',
+  'progress.empty': 'No background jobs right now.',
+  'progress.backfill': 'Backfill progress',
+}
+
+const DICTS: Record<Lang, Record<string, string>> = { en, 'pt-BR': ptBR, es }
 
 let currentLang: Lang = 'en'
 const listeners = new Set<() => void>()

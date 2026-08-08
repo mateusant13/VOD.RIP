@@ -541,7 +541,7 @@ describe('PreviewChatPanel', () => {
     }
   });
 
-  it('shows a loading indicator while the backfill is running, not a terminal empty state', async () => {
+  it('shows a loading indicator + backfill progress while the backfill is running, not a terminal empty state', async () => {
     mockPanelFetch({
       ...EMPTY_PAYLOAD,
       backfill: 'running',
@@ -551,6 +551,11 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('Loading chat…')).toBeTruthy());
     expect(screen.queryByText('No archived chat for this video.')).toBeNull();
+    // Thin progress bar renders the received backfill_progress (0.05 → 5%).
+    const bar = screen.getByRole('progressbar');
+    expect(bar.getAttribute('aria-valuenow')).toBe('5');
+    expect(bar.getAttribute('aria-label')).toBe('Backfill progress');
+    expect(screen.getByText('5%')).toBeTruthy();
   });
 
   it('seeks the player when a chat row is clicked (onSeek), rows show the pointer affordance', async () => {
