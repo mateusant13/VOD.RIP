@@ -108,7 +108,20 @@ export const getToken = async () => {
 
 /** POST a payload list to the bridge endpoint; throws on non-2xx. */
 export const postCookies = async (cookies) => {
-  const token = await getToken();
+  let token = await getToken();
+  // Adopt the backend's paired token if it already has one: a locally minted
+  // UUID would 403 forever once the bridge is paired (backend re-pairs on
+  // mismatch, but converging here keeps the pair stable across re-installs).
+  try {
+    const res = await fetch(`${await getApiBase()}/api/session/cookies/token`);
+    if (res.ok) {
+      const body = await res.json();
+      if (body && body.token) {
+        token = body.token;
+        await chrome.storage.local.set({ [TOKEN_KEY]: token });
+      }
+    }
+  } catch { /* app unreachable — the POST below fails identically */ }
   const res = await fetch(`${await getApiBase()}/api/session/cookies`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
