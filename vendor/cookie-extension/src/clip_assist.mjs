@@ -110,7 +110,6 @@
     }
     return null;
   };
-
   setStatus(`Preparando clip em ${fmtHms(startSec)}…`);
 
   // clips.twitch.tv/create — the legacy URL opens Twitch's clip editor
@@ -147,35 +146,54 @@
       }
       setReactValue(editorInput, title);
       setStatus(`Título preenchido: ${title}`);
+      setStatus(`Salvando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
+      // Wait for the Save button to become enabled (the editor loads the
+      // VOD frame preview first; clicking too early is a silent no-op).
       const save = await waitFor(
-        () =>
-          [...document.querySelectorAll('button')].find((b) =>
-            /save clip|salvar clip/i.test((b.innerText || '').trim()),
-          ),
-        10000,
-        500,
+        () => {
+          const b = [...document.querySelectorAll('button')].find((x) =>
+            /save clip|salvar clip/i.test((x.innerText || '').trim()),
+          );
+          return b && !b.disabled ? b : null;
+        },
+        30000,
+        800,
       );
       if (!save) {
         setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
         return;
       }
-      setStatus(`Salvando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
       await sleep(1200);
       click(save);
-      // The SPA navigates to /<slug> after the clip is created.
-      const slugUrl = await waitFor(
-        () => {
-          const m = location.pathname.match(/^\/([A-Za-z][A-Za-z0-9_-]+)$/);
-          return m ? `https://clips.twitch.tv${location.pathname}` : null;
-        },
-        20000,
-        800,
-      );
+      // Success = the SPA navigates to /<slug>, or the editor reaches its
+      // post-publish state ("Copiar Link"). /create and /clips/* are the
+      // editor itself and never a success navigation.
+      const slugRe = /^\/(?!create$)(?!clips(?:\/|$))[A-Za-z][A-Za-z0-9_-]+$/;
+      const published = await waitFor(() => {
+        if (location.pathname.match(slugRe)) return `https://clips.twitch.tv${location.pathname}`;
+        const copyBtn = [...document.querySelectorAll('button')].find((b) =>
+          /copiar link|copy link/i.test((b.innerText || '').trim()),
+        );
+        return copyBtn ? 'copy' : null;
+      }, 60000, 800);
+      if (published) {
+        let clipUrl = published === 'copy' ? '' : published;
+        try {
+          const shareInput = find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
+          if (shareInput) clipUrl = (shareInput.value || '').trim() || clipUrl;
+        } catch { /* ignore */ }
+        setStatus(
+          clipUrl
+            ? `Clip publicado ✓\n${title}\n${clipUrl}`
+            : `Clip publicado ✓\n${title}`,
+          'ok',
+        );
+        return;
+      }
       setStatus(
-        slugUrl
-          ? `Clip publicado ✓\n${title}\n${slugUrl}`
-          : `Clip publicado ✓\n${title}`,
-        'ok',
+        'Save clicado, aguardando processamento… ' +
+          (title ? `\n${title}` : '') + '\n(se não aparecer em instantes, confira se o clipe foi criado)',
+        'err',
       );
     })().catch((err) => {
       setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
@@ -193,45 +211,88 @@
       setStatus('Player não carregou — recarregue a página.', 'err');
       return;
     }
+    // 2. Player's Clip button — wait for it to be ENABLED. Twitch disables
+    // it while an ad plays or the VOD is still buffering; clicking a
+    // disabled button is a silent no-op. Localized ("Clipe") with no stable
+    // data-a-target, so match by text inside the player controls.
+    setStatus(`Player pronto — aguardando botão de clipe habilitar em ${fmtHms(startSec)}…`);
+    const clipBtn = await waitFor(
+      () => {
+        const cands = [...document.querySelectorAll('button')].filter((b) => {
+          const t = (b.innerText || '').trim();
+          return /^\s*clip/i.test(t) && b.offsetParent !== null &&
+            !b.disabled && b.getAttribute('aria-disabled') !== 'true' &&
+            !!b.closest('[data-a-target="player-controls"], [class*="player"]');
+        });
+        if (cands.length) return cands[0];
+        const byAny = [...document.querySelectorAll('button')].filter((b) =>
+          /^\s*clip/i.test((b.innerText || '').trim()) && b.offsetParent !== null &&
+          !b.disabled && b.getAttribute('aria-disabled') !== 'true',
+        );
+        if (byAny.length) return byAny[0];
+        return null;
+      },
+      120000,
+      1000,
+    );
+    if (!clipBtn) {
+      setStatus('Botão Clip não habilitou (anúncio em reprodução?) — tente de novo mais tarde.', 'err');
+      return;
+    }
     try {
       video.currentTime = startSec; // the ?t= already seeks; enforce it
     } catch {
       /* ignore seek errors — the URL hash did the work */
     }
-
-    // 2. Player's Clip button (opens the in-site editor for the VOD).
-    setStatus(`Player pronto — abrindo editor em ${fmtHms(startSec)}…`);
-    const clipBtn = await waitFor(
-      () =>
-        find([
-          '[data-a-target="player-clip-button"]',
-          'button[aria-label="Clip"]',
-          'button[aria-label*="Clip" i]',
-        ]),
-      15000,
-      500,
-    );
-    if (!clipBtn) {
-      setStatus('Botão Clip não encontrado no player.', 'err');
-      return;
-    }
+    await sleep(1500);
     click(clipBtn);
+    // Player controls listen on pointer events — fire the full sequence so
+    // the editor opens even when the site ignores synthetic `click`.
+    try {
+      const opts = { bubbles: true, cancelable: true, button: 0, view: window };
+      clipBtn.dispatchEvent(new PointerEvent('pointerdown', opts));
+      clipBtn.dispatchEvent(new PointerEvent('pointerup', opts));
+      clipBtn.dispatchEvent(new MouseEvent('mousedown', opts));
+      clipBtn.dispatchEvent(new MouseEvent('mouseup', opts));
+      clipBtn.dispatchEvent(new MouseEvent('click', opts));
+    } catch { /* older engines: click() above already ran */ }
+    await sleep(2000);
 
-    // 3. Editor overlay (any of its well-known bits is proof it opened).
+    // 3. Editor overlay — a real dialog carrying clip/title chrome, NOT
+    // just any tw-input (the search box is one and would false-positive).
     setStatus('Editor abrindo…');
-    const editor = await waitFor(
-      () =>
-        find([
-          '[data-a-target="clip-editor"]',
-          'input[data-a-target="tw-input"]',
-          'input[placeholder*="title" i]',
-          'textarea[placeholder*="title" i]',
-          'button[data-a-target*="publish" i]',
-          'button[aria-label*="publish" i]',
-        ]),
-      25000,
+    let editor = await waitFor(
+      () => {
+        const dialog = [...document.querySelectorAll('[role="dialog"]')].find((d) =>
+          /clip|t[ií]tulo|title/i.test((d.innerText || '').slice(0, 600)),
+        );
+        if (dialog) return dialog;
+        return find(['[data-a-target="clip-editor"]']);
+      },
+      10000,
       700,
     );
+    if (!editor) {
+      // The button's own aria-label advertises the shortcut: alt+x.
+      try {
+        const kd = new KeyboardEvent('keydown', { key: 'x', code: 'KeyX', altKey: true, bubbles: true });
+        const ku = new KeyboardEvent('keyup', { key: 'x', code: 'KeyX', altKey: true, bubbles: true });
+        const target = document.activeElement || document.body;
+        target.dispatchEvent(kd);
+        target.dispatchEvent(ku);
+      } catch { /* ignore */ }
+      editor = await waitFor(
+        () => {
+          const dialog = [...document.querySelectorAll('[role="dialog"]')].find((d) =>
+            /clip|t[ií]tulo|title/i.test((d.innerText || '').slice(0, 600)),
+          );
+          if (dialog) return dialog;
+          return find(['[data-a-target="clip-editor"]']);
+        },
+        15000,
+        700,
+      );
+    }
     if (!editor) {
       setStatus(
         'Não consegui abrir o editor (faça login na Twitch nesta aba e tente de novo).\nTítulo: ' +
@@ -245,13 +306,14 @@
 
     // 4. Title.
     if (title) {
-      const input = find([
-        'input[data-a-target="tw-input"]',
-        '[data-a-target="clip-editor-title-input"]',
-        'input[placeholder*="title" i]',
-        'textarea[placeholder*="title" i]',
-        'input[aria-label*="title" i]',
-      ]);
+      const input =
+        (editor.querySelector('input[data-a-target="tw-input"], [data-a-target="clip-editor-title-input"], input[placeholder*="title" i], textarea[placeholder*="title" i], input[aria-label*="title" i]')) ||
+        find([
+          '[data-a-target="clip-editor-title-input"]',
+          'input[placeholder*="title" i]',
+          'textarea[placeholder*="title" i]',
+          'input[aria-label*="title" i]',
+        ]);
       if (input) {
         setReactValue(input, title);
         setStatus(`Título preenchido: ${title}`);
@@ -266,10 +328,10 @@
     if (title) {
       const publish = await waitFor(
         () => {
-          const byText = [...document.querySelectorAll('button')].find((b) =>
+          const inEditor = [...editor.querySelectorAll('button')].find((b) =>
             /save clip|publish|salvar clip|publicar/i.test((b.innerText || '').trim()),
           );
-          if (byText) return byText;
+          if (inEditor) return inEditor;
           return find([
             '[data-a-target="clip-publish-button"]',
             'button[data-a-target*="publish" i]',
@@ -287,10 +349,36 @@
       setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
       await sleep(1200);
       click(publish);
-      setStatus(
-        `Clip publicado ✓\n${title}\n${fmtHms(startSec)} → ${fmtHms(endSec)}`,
-        'ok',
-      );
+      // Success = the editor reaches its post-publish state ("Copiar Link" /
+      // "Copy Link"), or the site navigates to /<channel>/clip/<slug>.
+      const published = await waitFor(() => {
+        const copyBtn = [...document.querySelectorAll('button')].find((b) =>
+          /copiar link|copy link/i.test((b.innerText || '').trim()),
+        );
+        if (copyBtn) return 'copy';
+        return location.pathname.match(/\/clip\//) ? 'nav' : null;
+      }, 60000, 800);
+      if (published) {
+        // The share box next to "Copiar Link" holds the clip URL.
+        let clipUrl = '';
+        try {
+          const shareInput = (editor && editor.querySelector('[data-a-target="clip-share-url"], input[readonly], textarea[readonly]')) ||
+            find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
+          if (shareInput) clipUrl = (shareInput.value || '').trim();
+        } catch { /* ignore */ }
+        if (!clipUrl) clipUrl = location.href;
+        setStatus(
+          clipUrl
+            ? `Clip publicado ✓\n${title}\n${clipUrl}`
+            : `Clip publicado ✓\n${title}`,
+          'ok',
+        );
+      } else {
+        setStatus(
+          'Publish clicado — aguardando processamento…\n' + (title || ''),
+          'err',
+        );
+      }
     }
   })().catch((err) => {
     setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
