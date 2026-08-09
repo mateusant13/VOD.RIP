@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X, AlertCircle } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
-import { openTwitchClipEditor } from '../twitchClip';
+import { clipPublicUrl, openTwitchClipEditor } from '../twitchClip';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -914,7 +914,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     try {
       const res = await openTwitchClipEditor({ broadcasterLogin: login });
       if (res.ok) {
-        showClipNotice('ok', `Twitch clip created — ${res.edit_url}`);
+        showClipNotice('ok', `Twitch clip created — ${clipPublicUrl(res.edit_url)}`);
       } else {
         showClipNotice('error', res.error.message);
       }

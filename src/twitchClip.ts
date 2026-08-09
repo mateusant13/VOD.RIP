@@ -182,23 +182,25 @@ export function openTwitchClipEditorInBrowser(
 }
 
 /**
- * Ask the backend to create a Twitch clip via the official Helix API; on
- * success the returned edit_url (valid 24h) is opened in the default browser.
+ * Ask the backend to create a Twitch clip via the official Helix API. The
+ * clip is created server-side — no browser window is opened; the caller
+ * surfaces the clip URL (see clipPublicUrl) in the app.
  */
 export async function openTwitchClipEditor(
   args: OpenTwitchClipArgs,
 ): Promise<TwitchClipOpenResult> {
-  const res = await apiPost<TwitchClipOpenResult>('/api/twitch/clip', {
+  return apiPost<TwitchClipOpenResult>('/api/twitch/clip', {
     broadcaster_login: args.broadcasterLogin,
     vod_id: args.vodId ?? null,
     offset_sec: args.offsetSec ?? null,
     duration_sec: args.durationSec ?? null,
     title: args.title ?? null,
   });
-  if (res.ok && res.edit_url) {
-    openExternal(res.edit_url);
-  }
-  return res;
+}
+
+/** Public clip URL for a Helix edit_url (drops a trailing /edit, if any). */
+export function clipPublicUrl(editUrl: string): string {
+  return editUrl ? editUrl.replace(/\/edit$/, '') : editUrl;
 }
 
 export async function fetchTwitchClipHistory(): Promise<TwitchClipRecord[]> {

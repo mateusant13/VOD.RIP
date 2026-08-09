@@ -21,7 +21,7 @@ import {
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X, ExternalLink } from 'lucide-react';
-import { apiDelete } from '../hooks/useApiClient';
+import { apiDelete, apiGet, apiPost } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
 import {
   TWITCH_CLIP_MAX_SEC,
@@ -497,13 +497,46 @@ export default function TwitchClipPopup({
 
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
   // (clip_assist.mjs content script) instead of the Helix API — works with the
-  // plain browser-login session cookie, no clip scopes needed.
-  const createInBrowser = useCallback(() => {
+  // plain browser-login session cookie, no clip scopes needed. When the
+  // extension is not paired yet, run the app's auto-installer FIRST (it
+  // stages the extension, restarts the browser, and the extension self-pairs
+  // via /api/session/cookies), then open the editor once pairing settles.
+  const createInBrowser = useCallback(async () => {
     const sel = selectionRef.current;
     const err = twitchClipDurationError(sel.end - sel.start);
     if (err) {
       showClipNotice('error', err);
       return;
+    }
+    try {
+      const status = await apiGet<{ paired: boolean }>('/api/session/cookies/status');
+      if (!status.paired) {
+        showClipNotice('error', t('Installing the VOD.RIP cookie extension — one moment…'));
+        const inst = await apiPost<{ ok: boolean; started?: boolean; alreadyInstalled?: boolean }>(
+          '/api/session/cookies/auto-install',
+          {},
+        );
+        if (!inst.ok && !inst.started && !inst.alreadyInstalled) {
+          showClipNotice('error', t('Could not install the cookie extension — open Settings → Cookies'));
+          return;
+        }
+        const deadline = Date.now() + 180_000;
+        let paired = false;
+        while (Date.now() < deadline && !paired) {
+          await new Promise((r) => setTimeout(r, 2500));
+          try {
+            paired = (await apiGet<{ paired: boolean }>('/api/session/cookies/status')).paired;
+          } catch { /* backend mid-restart during the install — keep polling */ }
+        }
+        if (!paired) {
+          showClipNotice('error', t('Extension install timed out — open Settings → Cookies'));
+          return;
+        }
+        showClipNotice('ok', t('Cookie extension ready — opening Twitch…'));
+      }
+    } catch {
+      // status/install endpoints unreachable — open the editor anyway; the
+      // page still loads (the extension just won't auto-publish).
     }
     openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));

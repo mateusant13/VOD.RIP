@@ -10,7 +10,7 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
-import { openTwitchClipEditor } from './twitchClip';
+import { clipPublicUrl, openTwitchClipEditor } from './twitchClip';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
@@ -7160,7 +7160,7 @@ export default function App() {
           initialVolume={previewVolumeRef.current}
           onClose={() => setTwitchClipPopup(null)}
           onClipCreated={(editorUrl) =>
-            showClipOpenNotice('ok', `Twitch clip created — ${editorUrl}`)}
+            showClipOpenNotice('ok', `Twitch clip created — ${clipPublicUrl(editorUrl)}`)}
         />
       )}
       {archiveSearchOpen && (

@@ -8,6 +8,7 @@ import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLin
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
+import { clipPublicUrl } from './twitchClip';
 import { useI18n } from './i18n';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
@@ -1962,7 +1963,7 @@ export default function ChannelExplorePopup({
           initialVolume={volumeRef.current}
           onClose={() => setClipPopup(null)}
           onClipCreated={(editorUrl) =>
-            showClipNotice('ok', `Twitch clip created — ${editorUrl}`)}
+            showClipNotice('ok', `Twitch clip created — ${clipPublicUrl(editorUrl)}`)}
         />
       )}
     </div>
