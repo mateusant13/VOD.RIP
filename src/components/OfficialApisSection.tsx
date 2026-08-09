@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiGet } from '../hooks/useApiClient';
 import FieldCaption from './FieldCaption';
 import { useI18n } from '../i18n';
-import { DEFAULT_TWITCH_CLIENT_ID, twitchOAuthAuthorizeUrl } from '../twitchClip';
+import { DEFAULT_TWITCH_CLIENT_ID } from '../twitchClip';
 import type { AppSettings } from '../types';
 
 /**
@@ -92,7 +92,7 @@ export default function OfficialApisSection({ settings, setSettings }: Props) {
             />
             <button
               type="button"
-              onClick={() => {
+              onClick={async () => {
                 const clientId = (settings.twitch_helix_client_id ?? '').trim()
                   || DEFAULT_TWITCH_CLIENT_ID;
                 if (!clientId) {
@@ -101,9 +101,18 @@ export default function OfficialApisSection({ settings, setSettings }: Props) {
                   window.open('https://dev.twitch.tv/console/apps', '_blank', 'noopener');
                   return;
                 }
-                window.open(twitchOAuthAuthorizeUrl(clientId), '_blank', 'noopener');
+                try {
+                  const r = await fetch('/api/twitch/oauth-flow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client_id: clientId }),
+                  });
+                  if (!r.ok) throw new Error('HTTP ' + r.status);
+                } catch (err) {
+                  console.error('oauth flow start failed', err);
+                }
               }}
-              title={t('Opens the Twitch OAuth page — the token is saved automatically when you approve.')}
+              title={t('Runs the Twitch OAuth consent in a hidden window — the token is saved automatically when you approve.')}
               className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white shrink-0"
             >
               {t('Get Twitch token')}

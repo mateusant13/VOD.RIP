@@ -301,6 +301,21 @@ def auto_lift_token() -> bool:
             return False
         if existing and mtime <= updated_at:
             return False
+        if existing:
+            # Auto-lift resurrects DEAD tokens — it must never clobber a live
+            # one. The cookie mtime is newer than any paste (the bridge sync
+            # rewrites the file continuously), so without this a valid OAuth
+            # token (with clip scopes) gets replaced by the cookie token (no
+            # clip scopes) moments after the user authorizes. Only a 401
+            # (invalid/expired) falls through to the cookie.
+            try:
+                token_info()
+                return False
+            except HelixError as exc:
+                if exc.code != 401:
+                    return False
+            except Exception:
+                return False
         settings_mgr.save(current.model_copy(update={
             "twitch_helix_token": token,
             "twitch_helix_token_updated_at": time.time(),

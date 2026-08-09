@@ -144,11 +144,6 @@ function openExternal(url: string): void {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
-/** Twitch OAuth redirect target — served by the backend (reads the fragment,
- * POSTs the token to /api/settings). Must match the app's registered
- * redirect_uri exactly. */
-export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-callback';
-
 /**
  * Official VOD.RIP OAuth app Client ID, embedded at build time so end users
  * never register their own app (same model as Chatterino's client_login).
@@ -158,32 +153,6 @@ export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-cal
  * button then falls back to the registration page.
  */
 export const DEFAULT_TWITCH_CLIENT_ID = 'lvhunanwtrdeo3luw5hq2p94ygzgjp';
-
-/** Helix scopes the token needs for VOD clips (backend VOD_CLIP_SCOPES). */
-export const TWITCH_VOD_CLIP_SCOPES = ['editor:manage:clips', 'channel:manage:clips'];
-/** Live clips need clips:edit on top (backend LIVE_CLIP_SCOPE). */
-export const TWITCH_LIVE_CLIP_SCOPE = 'clips:edit';
-/** Full clip scope set — one authorize flow covers live + VOD clips. */
-export const TWITCH_CLIP_SCOPES = [TWITCH_LIVE_CLIP_SCOPE, ...TWITCH_VOD_CLIP_SCOPES];
-
-/**
- * Build the Twitch implicit-grant authorize URL for the "Get Twitch token"
- * button. The token comes back in the URL fragment on the callback page,
- * which saves it via /api/settings. Client-Id is derived from the token by
- * the backend (oauth2/validate), so any registered app works.
- */
-export function twitchOAuthAuthorizeUrl(clientId: string): string {
-  const state = crypto.getRandomValues(new Uint8Array(8))
-    .reduce((acc, b) => acc + b.toString(16).padStart(2, '0'), '');
-  const p = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: TWITCH_OAUTH_REDIRECT_URI,
-    response_type: 'token',
-    scope: TWITCH_CLIP_SCOPES.join(' '),
-    state,
-  });
-  return `https://id.twitch.tv/oauth2/authorize?${p.toString()}`;
-}
 
 /**
  * Open Twitch's clip editor at a VOD timestamp in the OS default browser.

@@ -4,7 +4,11 @@ Settings routes — GET/POST /api/settings, /api/pick-folder, /api/open-folder.
 
 import asyncio
 import logging
+import secrets
+import subprocess
 import time
+from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
@@ -246,6 +250,42 @@ async def official_apis_status():
     return {
         "twitch_helix_token_set": bool((getattr(s, "twitch_helix_token", "") or "").strip()),
     }
+
+
+@router.post("/api/twitch/oauth-flow")
+async def start_twitch_oauth_flow(payload: dict):
+    """Launch the off-screen OAuth consent flow for the "Get Twitch token" button.
+
+    Zero flash / zero focus steal: scripts/vodrip-oauth-flow.ps1 opens a hidden
+    Chrome window on the user's real profile (alpha-0 on-screen so the renderer
+    stays live), drives the consent page via UIA (no SendKeys, no
+    BringToForeground — PostMessage Enter), and POSTs the token to /api/settings
+    itself when the callback lands. Fire-and-forget: the script's own poll waits
+    for the settings write.
+    """
+    client_id = (payload.get("client_id") or "").strip()
+    if not client_id:
+        raise HTTPException(400, "client_id is required")
+    state = secrets.token_hex(8)
+    url = "https://id.twitch.tv/oauth2/authorize?" + urlencode({
+        "client_id": client_id,
+        "redirect_uri": "http://localhost:7897/twitch-oauth-callback",
+        "response_type": "token",
+        # Keep in sync with src/twitchClip.ts TWITCH_CLIP_SCOPES.
+        "scope": "clips:edit editor:manage:clips channel:manage:clips",
+        "state": state,
+    })
+    script = Path(__file__).resolve().parent.parent.parent / "scripts" / "vodrip-oauth-flow.ps1"
+    if not script.exists():
+        raise HTTPException(500, f"oauth flow script missing: {script}")
+    current = settings_mgr.get()
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script), "-Url", url,
+         "-OrigToken", getattr(current, "twitch_helix_token", "") or ""],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return {"ok": True, "state": state}
 
 
 @router.get("/twitch-oauth-callback", response_class=HTMLResponse)
