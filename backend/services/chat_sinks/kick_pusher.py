@@ -183,7 +183,10 @@ class KickPusherSink(ChatSink):
             self._log.info("kick pusher subscribed to chat.%s (app key %s...)",
                            self.chatroom_id, self.app_key[:8])
             while not self.stop_requested():
-                frame = ws.recv_text(timeout=30.0)
+                # Pusher heartbeats every ~30s; a 30s read timeout races the
+                # heartbeat on lossy links and flaps the connection every cycle.
+                # 60s tolerates one missed heartbeat.
+                frame = ws.recv_text(timeout=60.0)
                 try:
                     ev = json.loads(frame)
                 except ValueError:
