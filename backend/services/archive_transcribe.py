@@ -2918,7 +2918,17 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             "error": str(exc),
         }
     except Exception as exc:  # job-level failure — worker keeps going
-        logger.exception("transcribe job %s failed", job_id)
+        try:
+            from yt_dlp.utils import DownloadError
+            is_expected = isinstance(exc, DownloadError)
+        except Exception:
+            is_expected = False
+        if is_expected:
+            # Age-gated / deleted / geo-blocked videos are expected yt-dlp
+            # failures — one clean line, no traceback spam.
+            logger.warning("transcribe job %s failed (yt-dlp): %s", job_id, exc)
+        else:
+            logger.exception("transcribe job %s failed", job_id)
         archive_db.update_job(job_id, status="failed",
                               error=f"{type(exc).__name__}: {exc}"[:400])
         return {"job_id": job_id, "error": str(exc)}
