@@ -362,9 +362,13 @@ def twitch_live_info(login: str) -> Optional[dict]:
     if info is None:
         import yt_dlp
 
+        from services.ytdlp_guard import ytdlp_console_logger
+
         url = f"https://www.twitch.tv/{login}"
         try:
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            with yt_dlp.YoutubeDL(
+                {"quiet": True, "no_warnings": True, "logger": ytdlp_console_logger()}
+            ) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as exc:
             logger.debug("twitch_live_info(%r) failed: %s", login, exc)
@@ -430,6 +434,8 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     Returns None with a ``reason`` key when auth is missing (bot wall).
     """
     import yt_dlp
+
+    from services.ytdlp_guard import ytdlp_console_logger
 
     live_url = (
         f"https://www.youtube.com/channel/{handle}/live"
@@ -506,6 +512,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
 
     yt_session = youtube_session_from_settings(video_id=vid)
     opts = {"quiet": True, "no_warnings": True}
+    opts["logger"] = ytdlp_console_logger()
     opts["extractor_args"] = ytdlp_extractor_args(yt_session)
     apply_ytdlp_cookie_opts(opts, yt_session)
     try:
