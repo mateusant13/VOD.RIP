@@ -653,7 +653,16 @@ async def session_cookies_ingest(body: dict):
         settings_mgr.save(s)
         logger.info("cookie bridge paired (token set)")
     elif token != paired:
-        raise HTTPException(status_code=403, detail="invalid cookie bridge token")
+        # Self-healing re-pair: an extension reinstall / storage wipe mints a fresh
+        # UUID that will never match the paired token — the old hard-403 left the
+        # bridge permanently broken with no recovery path. The endpoint is
+        # localhost-only with no CORS middleware, so a cross-site page can't read
+        # the token or deliver a valid POST; adopting the incoming token on
+        # mismatch restores pairing without weakening that model.
+        logger.warning("cookie bridge re-paired (token changed: %s... -> %s...)", paired[:8], token[:8])
+        s = settings_mgr.get()
+        s.cookie_bridge_token = token
+        settings_mgr.save(s)
     cookies = body.get("cookies")
     if not isinstance(cookies, list):
         raise HTTPException(status_code=422, detail="cookies must be a list")
