@@ -11,6 +11,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pyDir = path.join(root, "backend");
 const apiPort = Number(process.env.PORT || "7897");
 const vitePort = Number(process.env.VITE_PORT || "5173");
+const builtUi = path.join(pyDir, "static", "index.html");
+const serveBuiltUi = fs.existsSync(builtUi);
 /** Windows: prefer py -3.11 so a stale 3.10 on PATH does not run the API. */
 const pyCmd = process.env.VODRIP_PYTHON || (process.platform === "win32" ? "py" : "python");
 const pyArgsPrefix = process.env.VODRIP_PYTHON ? [] : process.platform === "win32" ? ["-3.11"] : [];
@@ -270,14 +272,8 @@ async function main() {
     console.log("        Best for shorts/simple VODs; 6h titiltei streams need npm run dev\n");
   }
 
-  console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
-  start("api", pyCmd, [...pyArgsPrefix, "run.py"], pyDir, {
-    VODRIP_SKIP_PORT_RELEASE: "1",
-    ...previewFastEnv,
-  });
-
-  // Vite is independent of the API — start it in PARALLEL instead of waiting
-  // for apiHealthy() first (the lifespan warm can hold the API ~20-120s).
+  // Vite's cold start is the long pole (~60s cold OS cache + AV scanning) —
+  // start it FIRST so it gets uncontended CPU while the API boots.
   console.log(`Open UI at    -> http://localhost:${vitePort}`);
   if (await viteHealthy(vitePort)) {
     console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
@@ -295,10 +291,20 @@ async function main() {
     start("web", process.execPath, [viteBin, "--port", String(vitePort), "--strictPort"], root);
   }
 
-  // Server lifespan blocks ~20-30s on startup YouTube warm (sync pre-warm of
-  // first URLs per channel) before /api/settings responds; post-reboot with a
-  // dirty volume it can take >60s. 120s covers the worst case without leaving
-  // a hung process when the warm itself hangs.
+  console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
+  start("api", pyCmd, [...pyArgsPrefix, "run.py"], pyDir, {
+    VODRIP_SKIP_PORT_RELEASE: "1",
+    ...previewFastEnv,
+    ...(serveBuiltUi ? { KICK_SERVE_UI: "1" } : {}),
+  });
+
+  if (serveBuiltUi) {
+    console.log(`Fast UI at   -> http://localhost:${apiPort}  (built bundle, instant — npm run build-copy to refresh)`);
+  }
+
+  // Safety net only: the lifespan now yields quickly (fast yield), so the API
+  // usually responds within ~2-3s. 120s covers post-reboot / dirty-volume
+  // worst cases without leaving a hung process when the warm itself hangs.
   for (let i = 0; i < 240; i++) {
     await sleep(500);
     if (await apiHealthy(apiPort)) break;
