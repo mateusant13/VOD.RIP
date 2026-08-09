@@ -51,6 +51,7 @@ from services.ytdlp_guard import (
 from services.ytdlp_guard import (
     guarded_youtube_dl,
 )
+from services.ytdlp_guard import ytdlp_console_logger
 
 logger = logging.getLogger(__name__)
 
@@ -3960,6 +3961,7 @@ def ytdlp_section_mux_to_ts(
     try:
         base = os.path.join(tmpdir, "clip")
         opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
+        opts["logger"] = ytdlp_console_logger()
         opts.update(
             {
                 "outtmpl": base + ".%(ext)s",

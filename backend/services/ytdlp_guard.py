@@ -109,6 +109,9 @@ _EXPECTED_YTDLP_MARKERS = (
     "sign in to confirm your age",
     "faça login para confirmar sua idade",
     "this live stream recording is not available",
+    "começará em breve",
+    "foi encerrado",
+    "não está disponível",
 )
 
 

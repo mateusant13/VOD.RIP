@@ -4529,194 +4529,205 @@ def _now_iso() -> str:
 # Idempotent: scrub leftovers first so re-import (tests, reloads) never trips.
 # FTS index entries cascade via the AFTER DELETE triggers on the content
 # tables — scrub content rows only (external-content FTS owns no row data).
-_conn_selfcheck = get_conn()
-_selfcheck_platform = "twitch"
-_selfcheck_video = "__archive_selfcheck__"
-with _lock:
-    _sc_conn = get_conn()
-    with _sc_conn:
-        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
-        _sc_conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
-        _sc_conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
-        _sc_conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
-insert_messages(
-    _selfcheck_platform,
-    _selfcheck_video,
-    [{"offset_sec": 1.0, "username": "checker", "text": "arquivo local google teste"}],
-)
-# Prime the vocab caches synchronously: the request path never builds them
-# inline anymore (cold searches serve exact tokens and rebuild in the
-# background), so the fuzzy assert below would otherwise race the background
-# thread — which loses on a real 200k-row archive and crashes import.
-_load_vocab_uncached("messages", time.monotonic())
-_load_vocab_uncached("transcripts", time.monotonic())
-# Every content assert below is scoped to the self-check video: the contract
-# is "FTS finds MY row", not "my row ranks top-N corpus-wide". Unscoped
-# asserts flip randomly on large archives (500k+ rows push the row out of
-# the result window) and would crash the backend at import.
-_hits = search("local", video_id=_selfcheck_video)
-assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in _hits), (
-    "FTS5 search must find inserted chat rows"
-)
-_selfcheck_chat, _selfcheck_truncated = chat_window(_selfcheck_platform, _selfcheck_video, 1.0)
-assert len(_selfcheck_chat) == 1
-assert _selfcheck_truncated is False
-# Bounded panel slice: playhead-centered window + honest total row count.
-_sc_slice, _sc_total = chat_slice_for(_selfcheck_platform, _selfcheck_video, 0.5)
-assert _sc_total == 1
-assert [r["offset_sec"] for r in _sc_slice] == [1.0]
-_sc_slice_head, _sc_total_head = chat_slice_for(_selfcheck_platform, _selfcheck_video, None)
-assert _sc_total_head == 1
-assert [r["offset_sec"] for r in _sc_slice_head] == [1.0]
-# Playhead past the last row clamps to the tail instead of returning nothing.
-_sc_slice_tail, _sc_total_tail = chat_slice_for(_selfcheck_platform, _selfcheck_video, 999.0)
-assert _sc_total_tail == 1
-assert [r["offset_sec"] for r in _sc_slice_tail] == [1.0]
-assert count_messages(_selfcheck_platform, _selfcheck_video) == 1
-insert_transcript(
-    _selfcheck_platform,
-    _selfcheck_video,
-    [
-        {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste vale"},
-        {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "da estranheza aconteceu"},
-    ],
-    lang="pt-br",
-)
-assert any(
-    h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
-    for h in search("transcrição", video_id=_selfcheck_video)
-), "FTS5 must find transcript segments (unicode61 tokenizer)"
-# Cross-segment phrase: tokens split across two adjacent segments must be
-# found with the exact-phrase boost (FTS5 phrases cannot span rows).
-_sc_span = next(
-    (
-        h
-        for h in search("vale da estranheza", video_id=_selfcheck_video)
-        if h["video_id"] == _selfcheck_video and h["kind"] == "transcript"
-    ),
-    None,
-)
-assert _sc_span is not None, "phrase split across adjacent segments must match"
-assert "vale da estranheza" in _sc_span["text"].casefold(), (
-    "span hit text must join both segments"
-)
-# lang contract: message hits carry lang=None; 'pt-br' normalizes to 'pt';
-# the pt filter matches tagged AND untagged (whisper) rows.
-_sc_msg_hit = next(
-    h for h in _hits
-    if h["video_id"] == _selfcheck_video and h["kind"] == "message"
-)
-assert _sc_msg_hit["lang"] is None, "message hits must carry lang=None"
-assert query(
-    "SELECT lang FROM transcripts WHERE platform=? AND video_id=?",
-    (_selfcheck_platform, _selfcheck_video),
-)[0]["lang"] == "pt", "pt-br must normalize to pt in transcripts.lang"
-assert any(
-    h["video_id"] == _selfcheck_video
-    for h in search("transcrição", lang="pt", video_id=_selfcheck_video)
-), "lang='pt' must match tagged and untagged transcript rows"
-# fuzzy expansion: a misspelled token still finds the row via the FTS5 vocab.
-assert any(
-    h["video_id"] == _selfcheck_video
-    for h in search("googl", video_id=_selfcheck_video)
-), "fuzzy expansion must match 'google' from 'googl'"
-# phonetic fold: c/k, ç/ss, ph/f, y/i and final unstressed vowels collapse;
-# the ASR/typo pairs from the failure corpus must fold equal or within the
-# Damerau budget on the folded form.
-assert _phonetic_fold("katarina") == "katarina"
-assert _phonetic_fold("catarina") == "katarina", "hard c before a folds to k"
-assert _phonetic_fold("cata") == _phonetic_fold("kata") == "kata"
-assert _damerau_levenshtein(_phonetic_fold("katarina"), _phonetic_fold("catarina"), 1) == 0
-assert _phonetic_fold("ambessa") == _phonetic_fold("ambeça") == "ambesa"
-assert _phonetic_fold("seraphine") == _phonetic_fold("serafine") == "serafini"
-assert _phonetic_fold("yasuo") == "iasu" and _phonetic_fold("aço") == "asu"
-# FTS5 unicode61 strips diacritics before indexing: 'aço' arrives in the
-# vocab as 'aco'. The c-before-vowel rule must fold the stripped forms the
-# same way ('aco' -> 'asu', 'nasco' -> 'nasu').
-assert _phonetic_fold("aco") == "asu" and _phonetic_fold("nasco") == "nasu"
-assert _phonetic_fold("shen") == "shen" and _phonetic_fold("suen") == "suen"
-assert _damerau_levenshtein("shen", "suen", 1) == 1, "h/u substitution must fit the budget"
-# The sh digraph survives the fold at word start / after consonants, so the
-# champion 'shaco' does not collapse onto the common words 'caso'/'saco'
-# (dist >= 1, not 0); after a vowel the sh is a sibilant artifact ('nasho' ->
-# 'nashu' still bridges 'nasço').
-assert _phonetic_fold("shaco") == "shasu"
-assert _damerau_levenshtein(_phonetic_fold("shaco"), _phonetic_fold("caso"), 2) == 2, (
-    "hard c keeps 'caso' ('kasu') two edits away from 'shaco' ('shasu')"
-)
-assert _phonetic_fold("nasho") == "nasu", "sibilant sh after a vowel still drops"
-assert _damerau_levenshtein("nasus", "nasu", 1) == 1, "nasho still bridges nasço/nasus"
-assert _damerau_levenshtein("asu", "sasu", 1) == 1, "prefix insertion must fit the budget"
-assert _damerau_levenshtein("aurora", "aunara", 2) == 2, "two edits must be detected"
-assert _damerau_levenshtein("abc", "acb", 1) == 1, "adjacent transposition is one edit"
-upsert_video({
-    "platform": _selfcheck_platform,
-    "video_id": _selfcheck_video,
-    "channel": "selfcheck",
-    "title": "selfcheck",
-    "canonical_key": "selfcheck-key",
-})
-set_alias(_selfcheck_platform, _selfcheck_video, "selfcheck-key")
-assert any(
-    g["canonical_key"] == "selfcheck-key" for g in dedupe_view()
-), "dedupe view must surface aliased videos"
-# spam collapse: identical consecutive rows (0 < delta <= 60 s) collapse
-# into one row; a cross-flush continuation bumps the stored row; re-sending
-# the merged row is consumed without double-counting.
-_collapse_video = "__archive_spam_selfcheck__"
-with _lock:
-    _sc_conn = get_conn()
-    with _sc_conn:
-        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
-_n = insert_messages(_selfcheck_platform, _collapse_video, [
-    {"offset_sec": 100.0 + i * 0.5, "username": "spammer", "text": "SPAM SPAM"}
-    for i in range(50)
-])
-assert _n == 50, "accepted count must include collapsed rows"
-_sc_rows = query(
-    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
-    (_selfcheck_platform, _collapse_video),
-)
-assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 50, (
-    "50 identical rows must collapse to one stored row with spam_count=50"
-)
-_n = insert_messages(_selfcheck_platform, _collapse_video,
-                     [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
-assert _n == 1, "cross-flush continuation row must be accepted"
-_sc_rows = query(
-    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
-    (_selfcheck_platform, _collapse_video),
-)
-assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
-    "cross-flush identical row must merge into the stored row (50 -> 51)"
-)
-_n = insert_messages(_selfcheck_platform, _collapse_video,
-                     [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
-_sc_rows = query(
-    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
-    (_selfcheck_platform, _collapse_video),
-)
-assert _n == 1 and len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
-    "re-sending the merged row must not double-merge (idempotent)"
-)
-_n = insert_messages(_selfcheck_platform, _collapse_video,
-                     [{"offset_sec": 126.0, "username": "spammer", "text": "different"}])
-_sc_rows = query(
-    "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
-    (_selfcheck_platform, _collapse_video),
-)
-assert _n == 1 and len(_sc_rows) == 2, "different text must not collapse"
-with _lock:
-    _sc_conn = get_conn()
-    with _sc_conn:
-        _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
+def _run_module_selfcheck() -> None:
+    _conn_selfcheck = get_conn()
+    _selfcheck_platform = "twitch"
+    _selfcheck_video = "__archive_selfcheck__"
+    with _lock:
+        _sc_conn = get_conn()
+        with _sc_conn:
+            _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
+            _sc_conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
+            _sc_conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
+            _sc_conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
+    insert_messages(
+        _selfcheck_platform,
+        _selfcheck_video,
+        [{"offset_sec": 1.0, "username": "checker", "text": "arquivo local google teste"}],
+    )
+    # Prime the vocab caches synchronously: the request path never builds them
+    # inline anymore (cold searches serve exact tokens and rebuild in the
+    # background), so the fuzzy assert below would otherwise race the background
+    # thread — which loses on a real 200k-row archive and crashes import.
+    _load_vocab_uncached("messages", time.monotonic())
+    _load_vocab_uncached("transcripts", time.monotonic())
+    # Every content assert below is scoped to the self-check video: the contract
+    # is "FTS finds MY row", not "my row ranks top-N corpus-wide". Unscoped
+    # asserts flip randomly on large archives (500k+ rows push the row out of
+    # the result window) and would crash the backend at import.
+    _hits = search("local", video_id=_selfcheck_video)
+    assert any(h["kind"] == "message" and h["video_id"] == _selfcheck_video for h in _hits), (
+        "FTS5 search must find inserted chat rows"
+    )
+    _selfcheck_chat, _selfcheck_truncated = chat_window(_selfcheck_platform, _selfcheck_video, 1.0)
+    assert len(_selfcheck_chat) == 1
+    assert _selfcheck_truncated is False
+    # Bounded panel slice: playhead-centered window + honest total row count.
+    _sc_slice, _sc_total = chat_slice_for(_selfcheck_platform, _selfcheck_video, 0.5)
+    assert _sc_total == 1
+    assert [r["offset_sec"] for r in _sc_slice] == [1.0]
+    _sc_slice_head, _sc_total_head = chat_slice_for(_selfcheck_platform, _selfcheck_video, None)
+    assert _sc_total_head == 1
+    assert [r["offset_sec"] for r in _sc_slice_head] == [1.0]
+    # Playhead past the last row clamps to the tail instead of returning nothing.
+    _sc_slice_tail, _sc_total_tail = chat_slice_for(_selfcheck_platform, _selfcheck_video, 999.0)
+    assert _sc_total_tail == 1
+    assert [r["offset_sec"] for r in _sc_slice_tail] == [1.0]
+    assert count_messages(_selfcheck_platform, _selfcheck_video) == 1
+    insert_transcript(
+        _selfcheck_platform,
+        _selfcheck_video,
+        [
+            {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "transcrição de teste vale"},
+            {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "da estranheza aconteceu"},
+        ],
+        lang="pt-br",
+    )
+    assert any(
+        h["kind"] == "transcript" and h["video_id"] == _selfcheck_video
+        for h in search("transcrição", video_id=_selfcheck_video)
+    ), "FTS5 must find transcript segments (unicode61 tokenizer)"
+    # Cross-segment phrase: tokens split across two adjacent segments must be
+    # found with the exact-phrase boost (FTS5 phrases cannot span rows).
+    _sc_span = next(
+        (
+            h
+            for h in search("vale da estranheza", video_id=_selfcheck_video)
+            if h["video_id"] == _selfcheck_video and h["kind"] == "transcript"
+        ),
+        None,
+    )
+    assert _sc_span is not None, "phrase split across adjacent segments must match"
+    assert "vale da estranheza" in _sc_span["text"].casefold(), (
+        "span hit text must join both segments"
+    )
+    # lang contract: message hits carry lang=None; 'pt-br' normalizes to 'pt';
+    # the pt filter matches tagged AND untagged (whisper) rows.
+    _sc_msg_hit = next(
+        h for h in _hits
+        if h["video_id"] == _selfcheck_video and h["kind"] == "message"
+    )
+    assert _sc_msg_hit["lang"] is None, "message hits must carry lang=None"
+    assert query(
+        "SELECT lang FROM transcripts WHERE platform=? AND video_id=?",
+        (_selfcheck_platform, _selfcheck_video),
+    )[0]["lang"] == "pt", "pt-br must normalize to pt in transcripts.lang"
+    assert any(
+        h["video_id"] == _selfcheck_video
+        for h in search("transcrição", lang="pt", video_id=_selfcheck_video)
+    ), "lang='pt' must match tagged and untagged transcript rows"
+    # fuzzy expansion: a misspelled token still finds the row via the FTS5 vocab.
+    assert any(
+        h["video_id"] == _selfcheck_video
+        for h in search("googl", video_id=_selfcheck_video)
+    ), "fuzzy expansion must match 'google' from 'googl'"
+    # phonetic fold: c/k, ç/ss, ph/f, y/i and final unstressed vowels collapse;
+    # the ASR/typo pairs from the failure corpus must fold equal or within the
+    # Damerau budget on the folded form.
+    assert _phonetic_fold("katarina") == "katarina"
+    assert _phonetic_fold("catarina") == "katarina", "hard c before a folds to k"
+    assert _phonetic_fold("cata") == _phonetic_fold("kata") == "kata"
+    assert _damerau_levenshtein(_phonetic_fold("katarina"), _phonetic_fold("catarina"), 1) == 0
+    assert _phonetic_fold("ambessa") == _phonetic_fold("ambeça") == "ambesa"
+    assert _phonetic_fold("seraphine") == _phonetic_fold("serafine") == "serafini"
+    assert _phonetic_fold("yasuo") == "iasu" and _phonetic_fold("aço") == "asu"
+    # FTS5 unicode61 strips diacritics before indexing: 'aço' arrives in the
+    # vocab as 'aco'. The c-before-vowel rule must fold the stripped forms the
+    # same way ('aco' -> 'asu', 'nasco' -> 'nasu').
+    assert _phonetic_fold("aco") == "asu" and _phonetic_fold("nasco") == "nasu"
+    assert _phonetic_fold("shen") == "shen" and _phonetic_fold("suen") == "suen"
+    assert _damerau_levenshtein("shen", "suen", 1) == 1, "h/u substitution must fit the budget"
+    # The sh digraph survives the fold at word start / after consonants, so the
+    # champion 'shaco' does not collapse onto the common words 'caso'/'saco'
+    # (dist >= 1, not 0); after a vowel the sh is a sibilant artifact ('nasho' ->
+    # 'nashu' still bridges 'nasço').
+    assert _phonetic_fold("shaco") == "shasu"
+    assert _damerau_levenshtein(_phonetic_fold("shaco"), _phonetic_fold("caso"), 2) == 2, (
+        "hard c keeps 'caso' ('kasu') two edits away from 'shaco' ('shasu')"
+    )
+    assert _phonetic_fold("nasho") == "nasu", "sibilant sh after a vowel still drops"
+    assert _damerau_levenshtein("nasus", "nasu", 1) == 1, "nasho still bridges nasço/nasus"
+    assert _damerau_levenshtein("asu", "sasu", 1) == 1, "prefix insertion must fit the budget"
+    assert _damerau_levenshtein("aurora", "aunara", 2) == 2, "two edits must be detected"
+    assert _damerau_levenshtein("abc", "acb", 1) == 1, "adjacent transposition is one edit"
+    upsert_video({
+        "platform": _selfcheck_platform,
+        "video_id": _selfcheck_video,
+        "channel": "selfcheck",
+        "title": "selfcheck",
+        "canonical_key": "selfcheck-key",
+    })
+    set_alias(_selfcheck_platform, _selfcheck_video, "selfcheck-key")
+    assert any(
+        g["canonical_key"] == "selfcheck-key" for g in dedupe_view()
+    ), "dedupe view must surface aliased videos"
+    # spam collapse: identical consecutive rows (0 < delta <= 60 s) collapse
+    # into one row; a cross-flush continuation bumps the stored row; re-sending
+    # the merged row is consumed without double-counting.
+    _collapse_video = "__archive_spam_selfcheck__"
+    with _lock:
+        _sc_conn = get_conn()
+        with _sc_conn:
+            _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
+    _n = insert_messages(_selfcheck_platform, _collapse_video, [
+        {"offset_sec": 100.0 + i * 0.5, "username": "spammer", "text": "SPAM SPAM"}
+        for i in range(50)
+    ])
+    assert _n == 50, "accepted count must include collapsed rows"
+    _sc_rows = query(
+        "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+        (_selfcheck_platform, _collapse_video),
+    )
+    assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 50, (
+        "50 identical rows must collapse to one stored row with spam_count=50"
+    )
+    _n = insert_messages(_selfcheck_platform, _collapse_video,
+                         [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
+    assert _n == 1, "cross-flush continuation row must be accepted"
+    _sc_rows = query(
+        "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+        (_selfcheck_platform, _collapse_video),
+    )
+    assert len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
+        "cross-flush identical row must merge into the stored row (50 -> 51)"
+    )
+    _n = insert_messages(_selfcheck_platform, _collapse_video,
+                         [{"offset_sec": 125.0, "username": "spammer", "text": "SPAM SPAM"}])
+    _sc_rows = query(
+        "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+        (_selfcheck_platform, _collapse_video),
+    )
+    assert _n == 1 and len(_sc_rows) == 1 and _sc_rows[0]["spam_count"] == 51, (
+        "re-sending the merged row must not double-merge (idempotent)"
+    )
+    _n = insert_messages(_selfcheck_platform, _collapse_video,
+                         [{"offset_sec": 126.0, "username": "spammer", "text": "different"}])
+    _sc_rows = query(
+        "SELECT spam_count FROM messages WHERE platform=? AND video_id=?",
+        (_selfcheck_platform, _collapse_video),
+    )
+    assert _n == 1 and len(_sc_rows) == 2, "different text must not collapse"
+    with _lock:
+        _sc_conn = get_conn()
+        with _sc_conn:
+            _sc_conn.execute("DELETE FROM messages WHERE video_id=?", (_collapse_video,))
+    
+    
+    # cleanup selfcheck rows
+    with _lock:
+        conn = get_conn()
+        with conn:
+            conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
+            conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
+            conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
+            conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
 
 
-# cleanup selfcheck rows
-with _lock:
-    conn = get_conn()
-    with conn:
-        conn.execute("DELETE FROM messages WHERE video_id=?", (_selfcheck_video,))
-        conn.execute("DELETE FROM transcripts WHERE video_id=?", (_selfcheck_video,))
-        conn.execute("DELETE FROM video_aliases WHERE video_id=?", (_selfcheck_video,))
-        conn.execute("DELETE FROM videos WHERE video_id=?", (_selfcheck_video,))
+
+
+# The DB-backed suite above (vocab loads + inserts on the REAL archive) costs
+# 25-40s and used to be paid on every app boot via routers.archive -> archive_db.
+# pytest enables it (backend/conftest.py sets VODRIP_ARCHIVE_SELFCHECK=1); the app
+# boots with it off.
+if os.environ.get("VODRIP_ARCHIVE_SELFCHECK", "0") == "1":
+    _run_module_selfcheck()

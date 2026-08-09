@@ -6,6 +6,13 @@ see tests/test_impact_selfcheck.py for what it proves.
 
 pytest_plugins = ["tests.impact_plugin"]
 
+import os
+
+# archive_db's module-level self-check (25-40s DB-backed invariants on the
+# REAL archive) is gated behind VODRIP_ARCHIVE_SELFCHECK=1 — pytest keeps it
+# on; the app boots with it off.
+os.environ.setdefault("VODRIP_ARCHIVE_SELFCHECK", "1")
+
 
 def pytest_collection_modifyitems(config, items):
     """Mark tests in ``*_real*.py`` files as ``real`` (live network/env).
