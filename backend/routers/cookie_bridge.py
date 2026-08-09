@@ -474,17 +474,20 @@ def _open_extension_manager() -> dict:
 
 
 # --- one-click auto-install (productized CookieInstallWorker flow) ----------
-# The proven mechanism: kill the browser, relaunch it with
-# --remote-debugging-port + an explicit --user-data-dir (Chrome 136+ ignores
-# the debug flag on the default profile without it), drive chrome://extensions
-# over CDP (real Input.dispatchMouseEvent clicks — synthetic .click() never
-# opens the native folder dialog), then drive the #32770 dialog 100% by
-# Win32 (WM_SETTEXT the "Pasta:" edit, BM_CLICK "Selecionar pasta"). The
-# whole automation lives in scripts/cookie_auto_install.ps1 (BCL only —
-# ClientWebSocket for CDP, Add-Type P/Invoke for the dialog); the route here
-# only spawns it in a background thread and mirrors its state in
-# _AUTO_INSTALL_STATE. Windows-only in practice (the ps1 is the driver);
-# on other platforms the route reports a clear error instead of failing blind.
+# The proven mechanism: drive the user's REAL Chrome profile entirely by UIA
+# on a hidden window — spawn chrome --new-window chrome://extensions (reuses
+# the RUNNING instance, never kills anything, so the user's session
+# survives), alpha-0 the window (renderer stays live so UIA sees the page),
+# click "Load unpacked" by automation id, drive the #32770 folder dialog by
+# Win32 (WM_SETTEXT the "Pasta:" edit, Enter / "Selecionar pasta"), verify
+# the extension card and capture its ID, close the hidden window. No CDP:
+# Chrome 151 refuses --remote-debugging-port on the real profile (the old
+# debug-instance mechanism failed with "browser did not expose the debug
+# port"). The whole automation lives in scripts/cookie_auto_install.ps1
+# (BCL only — Add-Type P/Invoke + UIAutomation); the route here only spawns
+# it in a background thread and mirrors its state in _AUTO_INSTALL_STATE.
+# Windows-only in practice (the ps1 is the driver); on other platforms the
+# route reports a clear error instead of failing blind.
 
 # {state: idle|running|done|error, installed, extension_id, error,
 #  started_at, finished_at} — mutated under _AUTO_INSTALL_LOCK.

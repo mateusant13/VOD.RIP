@@ -39,7 +39,6 @@
 
   const startSec = Math.max(0, Math.floor(Number(params.get('vodrip_start')) || 0));
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
-  const title = (params.get('vodrip_title') || '').trim();
 
   // document_start on clips.twitch.tv may run before <html> exists.
   if (!document.documentElement) {
@@ -81,6 +80,10 @@
     const pad = (n) => String(n).padStart(2, '0');
     return h ? `${h}h${pad(m)}m${pad(r)}s` : m ? `${m}m${pad(r)}s` : `${r}s`;
   };
+  // No user title -> a deterministic default so the clip still auto-publishes
+  // with zero interaction (the app's "Open in browser" button never requires
+  // a title).
+  const title = (params.get('vodrip_title') || '').trim() || `VOD.RIP ${fmtHms(startSec)}`;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   async function waitFor(fn, timeoutMs, intervalMs = 500) {
     const deadline = Date.now() + timeoutMs;
@@ -138,10 +141,6 @@
             : 'Editor não carregou — recarregue a página.',
           'err',
         );
-        return;
-      }
-      if (!title) {
-        setStatus('Sem título informado — preencha o título e clique em Save Clip.', 'info');
         return;
       }
       setReactValue(editorInput, title);
@@ -304,81 +303,75 @@
     }
     await sleep(1500); // let the editor settle
 
-    // 4. Title.
-    if (title) {
-      const input =
-        (editor.querySelector('input[data-a-target="tw-input"], [data-a-target="clip-editor-title-input"], input[placeholder*="title" i], textarea[placeholder*="title" i], input[aria-label*="title" i]')) ||
-        find([
-          '[data-a-target="clip-editor-title-input"]',
-          'input[placeholder*="title" i]',
-          'textarea[placeholder*="title" i]',
-          'input[aria-label*="title" i]',
-        ]);
-      if (input) {
-        setReactValue(input, title);
-        setStatus(`Título preenchido: ${title}`);
-      } else {
-        setStatus('Campo de título não encontrado — preencha manualmente.', 'err');
-      }
+    // 4. Title (always non-empty — the URL default covers missing vodrip_title).
+    const input =
+      (editor.querySelector('input[data-a-target="tw-input"], [data-a-target="clip-editor-title-input"], input[placeholder*="title" i], textarea[placeholder*="title" i], input[aria-label*="title" i]')) ||
+      find([
+        '[data-a-target="clip-editor-title-input"]',
+        'input[placeholder*="title" i]',
+        'textarea[placeholder*="title" i]',
+        'input[aria-label*="title" i]',
+      ]);
+    if (input) {
+      setReactValue(input, title);
+      setStatus(`Título preenchido: ${title}`);
     } else {
-      setStatus('Sem título informado — preencha o título e clique em Publish.', 'info');
+      setStatus('Campo de título não encontrado — preencha manualmente.', 'err');
     }
 
-    // 5. Publish — only when a title was set (the site can reject empty titles).
-    if (title) {
-      const publish = await waitFor(
-        () => {
-          const inEditor = [...editor.querySelectorAll('button')].find((b) =>
-            /save clip|publish|salvar clip|publicar/i.test((b.innerText || '').trim()),
-          );
-          if (inEditor) return inEditor;
-          return find([
-            '[data-a-target="clip-publish-button"]',
-            'button[data-a-target*="publish" i]',
-            'button[aria-label*="publish" i]',
-            'button[class*="publish" i]',
-          ]);
-        },
-        10000,
-        500,
+    // 5. Publish.
+    const publish = await waitFor(
+      () => {
+        const inEditor = [...editor.querySelectorAll('button')].find((b) =>
+          /save clip|publish|salvar clip|publicar/i.test((b.innerText || '').trim()),
+        );
+        if (inEditor) return inEditor;
+        return find([
+          '[data-a-target="clip-publish-button"]',
+          'button[data-a-target*="publish" i]',
+          'button[aria-label*="publish" i]',
+          'button[class*="publish" i]',
+        ]);
+      },
+      10000,
+      500,
+    );
+    if (!publish) {
+      setStatus('Botão Publish não encontrado — clique você mesmo.', 'err');
+      return;
+    }
+    setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
+    await sleep(1200);
+    click(publish);
+    // Success = the editor reaches its post-publish state ("Copiar Link" /
+    // "Copy Link"), or the site navigates to /<channel>/clip/<slug>.
+    const published = await waitFor(() => {
+      const copyBtn = [...document.querySelectorAll('button')].find((b) =>
+        /copiar link|copy link/i.test((b.innerText || '').trim()),
       );
-      if (!publish) {
-        setStatus('Botão Publish não encontrado — clique você mesmo.', 'err');
-        return;
-      }
-      setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
-      await sleep(1200);
-      click(publish);
-      // Success = the editor reaches its post-publish state ("Copiar Link" /
-      // "Copy Link"), or the site navigates to /<channel>/clip/<slug>.
-      const published = await waitFor(() => {
-        const copyBtn = [...document.querySelectorAll('button')].find((b) =>
-          /copiar link|copy link/i.test((b.innerText || '').trim()),
-        );
-        if (copyBtn) return 'copy';
-        return location.pathname.match(/\/clip\//) ? 'nav' : null;
-      }, 60000, 800);
-      if (published) {
-        // The share box next to "Copiar Link" holds the clip URL.
-        let clipUrl = '';
-        try {
-          const shareInput = (editor && editor.querySelector('[data-a-target="clip-share-url"], input[readonly], textarea[readonly]')) ||
-            find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
-          if (shareInput) clipUrl = (shareInput.value || '').trim();
-        } catch { /* ignore */ }
-        if (!clipUrl) clipUrl = location.href;
-        setStatus(
-          clipUrl
-            ? `Clip publicado ✓\n${title}\n${clipUrl}`
-            : `Clip publicado ✓\n${title}`,
-          'ok',
-        );
-      } else {
-        setStatus(
-          'Publish clicado — aguardando processamento…\n' + (title || ''),
-          'err',
-        );
-      }
+      if (copyBtn) return 'copy';
+      return location.pathname.match(/\/clip\//) ? 'nav' : null;
+    }, 60000, 800);
+    if (published) {
+      // The share box next to "Copiar Link" holds the clip URL.
+      let clipUrl = '';
+      try {
+        const shareInput = (editor && editor.querySelector('[data-a-target="clip-share-url"], input[readonly], textarea[readonly]')) ||
+          find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
+        if (shareInput) clipUrl = (shareInput.value || '').trim();
+      } catch { /* ignore */ }
+      if (!clipUrl) clipUrl = location.href;
+      setStatus(
+        clipUrl
+          ? `Clip publicado ✓\n${title}\n${clipUrl}`
+          : `Clip publicado ✓\n${title}`,
+        'ok',
+      );
+    } else {
+      setStatus(
+        'Publish clicado — aguardando processamento…\n' + (title || ''),
+        'err',
+      );
     }
   })().catch((err) => {
     setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
