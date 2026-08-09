@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any, Iterator
 from services import ytdlp_env  # noqa: F401
 
 import yt_dlp  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 _YTDLP_LOCK = threading.Lock()
 # Why no priority/bounded acquire here: a plain Lock has no priority, and a
@@ -99,11 +102,46 @@ def sanitize_ytdlp_opts(opts: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_EXPECTED_YTDLP_MARKERS = (
+    "not currently live",
+    "this video is not available",
+    "video unavailable",
+    "sign in to confirm your age",
+    "faça login para confirmar sua idade",
+    "this live stream recording is not available",
+)
+
+
+class _YtdlpConsoleLogger:
+    """yt-dlp logger that keeps REAL errors visible but drops expected
+    extractor failures (offline channel, deleted video, age gate) from the
+    console — those are normal conditions surfaced in the UI/job rows."""
+
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        logger.warning("yt-dlp: %s", msg)
+
+    def error(self, msg):
+        if any(m in str(msg).lower() for m in _EXPECTED_YTDLP_MARKERS):
+            logger.debug("yt-dlp expected error: %s", msg)
+        else:
+            logger.error("yt-dlp: %s", msg)
+
+
+def ytdlp_console_logger():
+    """A yt-dlp-compatible logger (debug/info/warning/error) for the `logger=`
+    option that filters expected extractor failures from the console."""
+    return _YtdlpConsoleLogger()
+
+
 @contextlib.contextmanager
 def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeDL]:
     """Only supported way to construct YoutubeDL — one instance at a time."""
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
+    safe.setdefault("logger", ytdlp_console_logger())
     with _YTDLP_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl
@@ -114,6 +152,7 @@ def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeD
     """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists."""
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
+    safe.setdefault("logger", ytdlp_console_logger())
     with _YTDLP_CHANNEL_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl
