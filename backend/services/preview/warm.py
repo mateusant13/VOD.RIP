@@ -848,7 +848,10 @@ _warm_bot_gate_pause_until = 0.0   # monotonic clock, checked by all warm _run t
 # them is what made startup warm crawl. Any successful resolve resets the
 # streak (it proves the IP is not gated).
 _warm_soft_neg_streak = 0
-_SOFT_NEG_PAUSE_THRESHOLD = 2
+# 3+ consecutive soft-negs = likely real bot-gate. 2 was still tripping on
+# transient innertube races during cold-network startup (observed on the
+# user's machine: extracts succeeded right after the pause fired).
+_SOFT_NEG_PAUSE_THRESHOLD = 3
 
 
 def _warm_note_soft_neg() -> bool:
