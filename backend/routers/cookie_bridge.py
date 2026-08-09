@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -241,6 +242,33 @@ def _materialize_ext_src() -> Path:
         return src
 
 
+_UPDATE_BADGE_FIX_OLD = re.compile(
+    r"const updateBadgeCounter = async \(\) => \{\n"
+    r"[^}]*?const \[tab\] = await chrome\.tabs\.query[\s\S]*?\n\};"
+)
+_UPDATE_BADGE_FIX_NEW = """const updateBadgeCounter = async () => {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) {
+      return;
+    }
+    const { id: tabId, url: urlString } = tab;
+    if (!urlString) {
+      chrome.action.setBadgeText({ tabId, text: '' });
+      return;
+    }
+    const url = new URL(urlString);
+    const cookies = await getAllCookies({
+      url: url.href,
+      partitionKey: { topLevelSite: url.origin },
+    });
+    chrome.action.setBadgeText({ tabId, text: cookies.length.toFixed() });
+  } catch {
+    // tab may have closed between query and badge write — ignore
+  }
+};"""
+
+
 def _bundle_bg_if_module(src: Path) -> None:
     """Rebundle an ESM extension background as a single classic script.
 
@@ -261,9 +289,17 @@ def _bundle_bg_if_module(src: Path) -> None:
         esbuild = Path(__file__).resolve().parents[2] / "node_modules" / "esbuild" / "bin" / "esbuild"
         if not esbuild.exists():
             return
+        bg_src_path = src / sw
+        text = bg_src_path.read_text(encoding="utf-8")
+        # Extension badge race: chrome.action.setBadgeText({tabId}) rejects with
+        # "No tab with id: N" (unhandled promise) when the tab closes between
+        # tabs.query and the badge write — the catch in the original code then
+        # re-set the badge and re-threw. Wrap the whole counter in one catch.
+        text = _UPDATE_BADGE_FIX_OLD.sub(_UPDATE_BADGE_FIX_NEW, text, count=1)
+        bg_src_path.write_text(text, encoding="utf-8")
         out = src / (sw[:-4] + ".js")
         subprocess.run(
-            ["node", str(esbuild), str(src / sw), "--bundle", "--format=iife", f"--outfile={out}"],
+            ["node", str(esbuild), str(bg_src_path), "--bundle", "--format=iife", f"--outfile={out}"],
             check=True, capture_output=True, timeout=60,
         )
         manifest["background"]["service_worker"] = out.name

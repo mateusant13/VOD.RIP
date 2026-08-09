@@ -10,27 +10,24 @@ import {
  * Update icon badge counter on active page
  */
 const updateBadgeCounter = async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) {
-    return;
-  }
-  const { id: tabId, url: urlString } = tab;
-  if (!urlString) {
-    chrome.action.setBadgeText({ tabId, text: '' });
-    return;
-  }
   try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) {
+      return;
+    }
+    const { id: tabId, url: urlString } = tab;
+    if (!urlString) {
+      chrome.action.setBadgeText({ tabId, text: '' });
+      return;
+    }
     const url = new URL(urlString);
     const cookies = await getAllCookies({
       url: url.href,
       partitionKey: { topLevelSite: url.origin },
     });
-    const text = cookies.length.toFixed();
-    chrome.action.setBadgeText({ tabId, text });
+    chrome.action.setBadgeText({ tabId, text: cookies.length.toFixed() });
   } catch {
-    // host permission not granted for this tab (only youtube/twitch/kick) —
-    // the badge stays as-is; activeTab covers the popup's own read.
-    chrome.action.setBadgeText({ tabId, text: '' });
+    // tab may have closed between query and badge write — ignore
   }
 };
 

@@ -196,6 +196,8 @@ function attachChildLogger(label, child) {
   });
 }
 
+let restartAttempts = 0;
+
 function start(label, command, args, cwd, extraEnv = {}) {
   const disableLog = process.env.VODRIP_DEVALL_DISABLE_LOG === "1";
   const stdio = disableLog ? "inherit" : ["ignore", "pipe", "pipe"];
@@ -212,7 +214,19 @@ function start(label, command, args, cwd, extraEnv = {}) {
     if (signal) return;
     if (code !== 0 && code !== null) {
       console.error(`[${label}] exited with code ${code}`);
-      shutdown(1);
+      if (label === "api" && restartAttempts < 3) {
+        // Transient crash (observed twice: API exits 1 with no traceback
+        // after ~30-60min — AV scan / memory pressure during archive ingest).
+        // Restart instead of taking the whole dev-all down.
+        restartAttempts += 1;
+        const delaySec = restartAttempts * 3;
+        console.error(
+          `[dev] API crashed — restarting in ${delaySec}s (attempt ${restartAttempts}/3)`,
+        );
+        setTimeout(() => start(label, command, args, cwd, extraEnv), delaySec * 1000);
+      } else {
+        shutdown(1);
+      }
     }
   });
   children.push(child);
