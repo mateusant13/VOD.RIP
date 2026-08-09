@@ -151,6 +151,10 @@ export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-cal
 
 /** Helix scopes the token needs for VOD clips (backend VOD_CLIP_SCOPES). */
 export const TWITCH_VOD_CLIP_SCOPES = ['editor:manage:clips', 'channel:manage:clips'];
+/** Live clips need clips:edit on top (backend LIVE_CLIP_SCOPE). */
+export const TWITCH_LIVE_CLIP_SCOPE = 'clips:edit';
+/** Full clip scope set — one authorize flow covers live + VOD clips. */
+export const TWITCH_CLIP_SCOPES = [TWITCH_LIVE_CLIP_SCOPE, ...TWITCH_VOD_CLIP_SCOPES];
 
 /**
  * Build the Twitch implicit-grant authorize URL for the "Get Twitch token"
@@ -165,7 +169,7 @@ export function twitchOAuthAuthorizeUrl(clientId: string): string {
     client_id: clientId,
     redirect_uri: TWITCH_OAUTH_REDIRECT_URI,
     response_type: 'token',
-    scope: TWITCH_VOD_CLIP_SCOPES.join(' '),
+    scope: TWITCH_CLIP_SCOPES.join(' '),
     state,
   });
   return `https://id.twitch.tv/oauth2/authorize?${p.toString()}`;

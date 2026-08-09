@@ -121,8 +121,8 @@ describe('clipEditorOffsetAndDuration', () => {
 describe('openTwitchClipEditorInBrowser', () => {
   it('opens the legacy editor URL with vodrip_* params (offset = clip END)', () => {
     const opened: string[] = [];
-    vi.spyOn(window, 'open').mockImplementation((url?: string) => {
-      opened.push(url ?? '');
+    vi.spyOn(window, 'open').mockImplementation((url?: string | URL) => {
+      opened.push(String(url ?? ''));
       return null;
     });
     try {
@@ -145,8 +145,8 @@ describe('openTwitchClipEditorInBrowser', () => {
 
   it('omits vodrip_title when no title is given', () => {
     const opened: string[] = [];
-    vi.spyOn(window, 'open').mockImplementation((url?: string) => {
-      opened.push(url ?? '');
+    vi.spyOn(window, 'open').mockImplementation((url?: string | URL) => {
+      opened.push(String(url ?? ''));
       return null;
     });
     try {
