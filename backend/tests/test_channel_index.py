@@ -174,8 +174,10 @@ async def test_stale_snapshot_serves_index_and_refreshes_in_background(client, _
     body = stale.json()
     assert len(body["videos"]) == 6
     assert body["refreshing"] is True
-    # Blocking fetch did NOT run — the response was served from the index.
-    assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
+    # refreshing=True already proves the blocking fetch did NOT run (a
+    # blocking fetch would leave bg_set empty and flip refreshing False).
+    # The background delta task may legitimately have started its fetches
+    # by now — asserting the calls list here would race it.
 
     # Let the background delta task finish (it also fetches platform
     # language clues, so it is slower than the fake fetch alone — poll

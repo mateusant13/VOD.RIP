@@ -273,6 +273,8 @@ def test_auto_lift_replaces_when_cookie_is_newer(monkeypatch, tmp_path):
     s.twitch_helix_token_updated_at = now - 7200
     mgr._s = s
     monkeypatch.setattr("deps.settings_mgr", mgr)
+    # The stored token is DEAD (validate -> 401): the newer cookie wins.
+    _patch_urlopen(monkeypatch, http_error=_http_error(401, b'{"status":401,"message":"invalid token"}'))
 
     assert ths.auto_lift_token() is True
     assert mgr.saved[-1].twitch_helix_token == "fresh-cookie-tok"

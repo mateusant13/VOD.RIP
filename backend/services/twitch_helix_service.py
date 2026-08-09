@@ -312,7 +312,7 @@ def auto_lift_token() -> bool:
                 token_info()
                 return False
             except HelixError as exc:
-                if exc.code != 401:
+                if exc.status != 401:
                     return False
             except Exception:
                 return False
