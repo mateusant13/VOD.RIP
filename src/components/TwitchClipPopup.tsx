@@ -525,7 +525,16 @@ export default function TwitchClipPopup({
         while (Date.now() < deadline && !paired) {
           await new Promise((r) => setTimeout(r, 2500));
           try {
-            paired = (await apiGet<{ paired: boolean }>('/api/session/cookies/status')).paired;
+            const st = await apiGet<{ paired: boolean; auto_install?: { state?: string } }>(
+              '/api/session/cookies/status',
+            );
+            // The extension pairs the moment it boots — BEFORE the installer
+            // reports done and closes its chrome://extensions window. Opening
+            // the editor at 'paired' alone can land the tab inside that window
+            // and lose it to the cleanup. Wait for the install to actually
+            // finish (state leaves 'running') before opening.
+            const installDone = !st.auto_install || st.auto_install.state !== 'running';
+            paired = !!st.paired && installDone;
           } catch { /* backend mid-restart during the install — keep polling */ }
         }
         if (!paired) {

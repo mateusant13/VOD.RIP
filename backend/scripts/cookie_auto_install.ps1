@@ -94,6 +94,7 @@ public static class ExtWin {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
@@ -391,6 +392,17 @@ try {
 } finally {
     if ($newWin -ne [IntPtr]::Zero) {
         try { [ExtWin]::Close($newWin) } catch { }
+        # The frontend opens the clip editor right after the route reports
+        # 'installed' — if this extensions window is still alive then, the
+        # editor tab can land inside it and die with it (silent clip loss).
+        # Report success only once the window handle is confirmed gone.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 10 -and [ExtWin]::IsWindow($newWin)) {
+            Start-Sleep -Milliseconds 300
+        }
+        if ([ExtWin]::IsWindow($newWin)) {
+            Write-ProgressLog 'auto-install: warning - extensions window did not close in 10s'
+        }
     }
     Write-Output ($result | ConvertTo-Json -Compress)
 }
