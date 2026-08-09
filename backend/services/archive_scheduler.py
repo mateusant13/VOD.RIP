@@ -572,10 +572,14 @@ def _run_pass() -> None:
     _enqueue_transcriptions()
 
 
-def _loop(*, interval: Optional[float] = None) -> None:
+def _loop(*, interval: Optional[float] = None, delay: float = 0.0) -> None:
     # None -> the background-aware default (6 min quiet / 3 min interactive);
     # an explicit interval (tests) wins over both.
     cadence = _pass_interval() if interval is None else interval
+    # Boot grace so the first seconds stay uncontended; kick_scheduler_pass()
+    # still wakes the daemon immediately regardless.
+    if delay and _stop.wait(delay):
+        return
     while not _stop.is_set():
         try:
             _run_pass()
@@ -589,9 +593,10 @@ def _loop(*, interval: Optional[float] = None) -> None:
 
 # --- lifecycle --------------------------------------------------------------
 
-def start_archive_scheduler(*, interval: Optional[float] = None) -> threading.Thread:
+def start_archive_scheduler(*, interval: Optional[float] = None, delay: float = 0.0) -> threading.Thread:
     """Start the scheduler daemon thread (idempotent). The first pass runs
-    immediately; afterwards one pass per interval (None -> background-aware
+    after `delay` seconds (boot grace) or immediately when delay=0 (current
+    behavior); afterwards one pass per interval (None -> background-aware
     default: 6 min quiet / 3 min interactive) or on kick."""
     global _thread
     with _lock:
@@ -600,7 +605,7 @@ def start_archive_scheduler(*, interval: Optional[float] = None) -> threading.Th
         _stop.clear()
         _wake.clear()
         _thread = threading.Thread(
-            target=_loop, kwargs={"interval": interval}, daemon=True,
+            target=_loop, kwargs={"interval": interval, "delay": delay}, daemon=True,
             name="archive-scheduler",
         )
         _thread.start()
