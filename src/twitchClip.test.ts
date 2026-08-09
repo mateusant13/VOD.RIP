@@ -2,12 +2,30 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
+  TWITCH_OAUTH_REDIRECT_URI,
   clampClipSelection,
   clipEditorOffsetAndDuration,
   openTwitchClipEditorInBrowser,
   twitchClipDurationError,
   twitchClipWindow,
+  twitchOAuthAuthorizeUrl,
 } from './twitchClip';
+
+describe('twitchOAuthAuthorizeUrl', () => {
+  it('builds the implicit-grant URL with the full clip scope set', () => {
+    const u = new URL(twitchOAuthAuthorizeUrl('lvhunanwtrdeo3luw5hq2p94ygzgjp'));
+    expect(u.host).toBe('id.twitch.tv');
+    expect(u.pathname).toBe('/oauth2/authorize');
+    expect(u.searchParams.get('client_id')).toBe('lvhunanwtrdeo3luw5hq2p94ygzgjp');
+    expect(u.searchParams.get('redirect_uri')).toBe(TWITCH_OAUTH_REDIRECT_URI);
+    expect(u.searchParams.get('response_type')).toBe('token');
+    const scopes = (u.searchParams.get('scope') ?? '').split(' ');
+    expect(scopes).toEqual(
+      expect.arrayContaining(['clips:edit', 'editor:manage:clips', 'channel:manage:clips']),
+    );
+    expect(u.searchParams.get('state') ?? '').not.toBe('');
+  });
+});
 
 describe('twitchClipDurationError', () => {
   it('accepts ranges inside the 5..60s window', () => {

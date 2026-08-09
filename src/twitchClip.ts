@@ -157,7 +157,7 @@ export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-cal
  * APIs for power users. Empty until the official app is created; the token
  * button then falls back to the registration page.
  */
-export const DEFAULT_TWITCH_CLIENT_ID = '';
+export const DEFAULT_TWITCH_CLIENT_ID = 'lvhunanwtrdeo3luw5hq2p94ygzgjp';
 
 /** Helix scopes the token needs for VOD clips (backend VOD_CLIP_SCOPES). */
 export const TWITCH_VOD_CLIP_SCOPES = ['editor:manage:clips', 'channel:manage:clips'];
