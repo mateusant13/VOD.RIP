@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 # At-most-once-per-boot guard for the startup chat dedupe (see lifespan).
 _chat_dedupe_done = False
 
+# Heavy boot work (live warm, yt warm, embed backfill, ASR worker boot)
+# waits this long after lifespan start so the API serves in ~2-3s and the
+# first Vite/UI window stays uncontended.
+_BOOT_WARM_GRACE_SEC = float(os.environ.get("VODRIP_BOOT_WARM_GRACE", "8"))
+_archive_worker_started = False
+
 try:
     from services._version import __version__
 except ImportError:
@@ -580,10 +586,11 @@ async def _app_lifespan(_app: FastAPI):
         hasn't reached yet.
         """
         try:
+            if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+                return  # cold live cache is handled by the router's cold-miss path
             from routers.live import warm_all_saved_channel_live_status
 
-            if not _warm_shutdown.is_set():
-                warm_all_saved_channel_live_status()
+            warm_all_saved_channel_live_status()
         except Exception:
             logger.debug("Live status warm skipped", exc_info=True)
 
@@ -592,8 +599,9 @@ async def _app_lifespan(_app: FastAPI):
     def _warm_youtube_guarded() -> None:
         """Wrap _warm_youtube so it checks shutdown before submitting to pools."""
         try:
-            if not _warm_shutdown.is_set():
-                _warm_youtube()
+            if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+                return  # cold caches are handled by each router's cold-miss path
+            _warm_youtube()
         except Exception:
             logger.exception("warm crashed")
 
@@ -610,6 +618,8 @@ async def _app_lifespan(_app: FastAPI):
 
             def _embed_backfill_guarded() -> None:
                 try:
+                    if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+                        return
                     from services.archive_embed import backfill_missing
 
                     done = backfill_missing(interrupt=_warm_shutdown, min_missing=500)
@@ -648,7 +658,7 @@ async def _app_lifespan(_app: FastAPI):
     try:
         from services.archive_scheduler import start_archive_scheduler
 
-        start_archive_scheduler()
+        start_archive_scheduler(delay=_BOOT_WARM_GRACE_SEC)
         logger.info("Archive scheduler started")
     except Exception:
         logger.debug("Archive scheduler start skipped", exc_info=True)
@@ -658,62 +668,76 @@ async def _app_lifespan(_app: FastAPI):
     # transcribe/events/chat jobs, survives app close + crashes, and skips
     # the in-process thread so the whisper model is never double-loaded.
     # Spawn failure (or an idle queue) falls back to the in-process worker.
-    try:
-        from services import archive_db
-        from services.archive_transcribe import start_worker as _start_inprocess_worker
+    # Boots on a daemon thread after the warm grace: the ASR stack import
+    # happens only in the fallback branch, so the parent process never pays
+    # the ~38s torch/ASR import when the detached path succeeds.
+    def _boot_archive_worker() -> None:
+        if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+            return
+        global _archive_worker_started
+        try:
+            from services import archive_db
 
-        pending = archive_db.has_pending_jobs()
-        spawned_pid = _spawn_detached_worker() if pending else None
-        if spawned_pid is not None:
-            logger.info(
-                "Archive worker: detached supervisor spawned (pid %s) — "
-                "in-process worker skipped", spawned_pid,
-            )
+            pending = archive_db.has_pending_jobs()
+            spawned_pid = _spawn_detached_worker() if pending else None
+            if spawned_pid is not None:
+                logger.info(
+                    "Archive worker: detached supervisor spawned (pid %s) — "
+                    "in-process worker skipped", spawned_pid,
+                )
 
-            def _watch_detached_worker() -> None:
-                # The detached worker exits rc 0 once the queue is drained.
-                # When its heartbeat goes stale while the app still runs,
-                # the in-process worker takes over so jobs enqueued at
-                # runtime (search kicks, channel sync) keep a consumer.
-                #
-                # Boot race: the watchdog's first poll can run before the
-                # detached supervisor+child stamp their first heartbeat.
-                # worker_server boots ~1s, child import ~2-6s, and the
-                # child's claim-time GPU-lane measurement samples free VRAM
-                # over ~60s (median, machine-aware pool) BEFORE the first
-                # heartbeat — so the grace is 120s, never 75. Require either
-                # a previously-seen heartbeat OR the grace before concluding
-                # the detached worker is gone — a single early poll must
-                # never double-start a worker.
-                start = time.monotonic()
-                seen_alive = False
-                while not _warm_shutdown.is_set():
-                    if archive_db.worker_live(age_s=45):
-                        seen_alive = True
-                    elif seen_alive or time.monotonic() - start > 120:
-                        break
-                    time.sleep(5)
-                if _warm_shutdown.is_set():
-                    return
-                try:
-                    _start_inprocess_worker()
-                    logger.info(
-                        "Detached worker exited — in-process archive worker started"
-                    )
-                except Exception:
-                    logger.debug("in-process worker start failed", exc_info=True)
+                def _watch_detached_worker() -> None:
+                    # The detached worker exits rc 0 once the queue is drained.
+                    # When its heartbeat goes stale while the app still runs,
+                    # the in-process worker takes over so jobs enqueued at
+                    # runtime (search kicks, channel sync) keep a consumer.
+                    #
+                    # Boot race: the watchdog's first poll can run before the
+                    # detached supervisor+child stamp their first heartbeat.
+                    # worker_server boots ~1s, child import ~2-6s, and the
+                    # child's claim-time GPU-lane measurement samples free VRAM
+                    # over ~60s (median, machine-aware pool) BEFORE the first
+                    # heartbeat — so the grace is 120s, never 75. Require either
+                    # a previously-seen heartbeat OR the grace before concluding
+                    # the detached worker is gone — a single early poll must
+                    # never double-start a worker.
+                    start = time.monotonic()
+                    seen_alive = False
+                    while not _warm_shutdown.is_set():
+                        if archive_db.worker_live(age_s=45):
+                            seen_alive = True
+                        elif seen_alive or time.monotonic() - start > 120:
+                            break
+                        time.sleep(5)
+                    if _warm_shutdown.is_set():
+                        return
+                    try:
+                        from services.archive_transcribe import start_worker as _start_inprocess_worker
 
-            threading.Thread(
-                target=_watch_detached_worker, daemon=True, name="worker-watchdog"
-            ).start()
-        else:
-            _start_inprocess_worker()
-            logger.info(
-                "Archive transcribe worker started in-process (%s)",
-                "no pending jobs — nothing to detach" if not pending else "detached spawn failed — fallback",
-            )
-    except Exception:
-        logger.debug("Archive transcribe worker start skipped", exc_info=True)
+                        _start_inprocess_worker()
+                        logger.info(
+                            "Detached worker exited — in-process archive worker started"
+                        )
+                    except Exception:
+                        logger.debug("in-process worker start failed", exc_info=True)
+
+                threading.Thread(
+                    target=_watch_detached_worker, daemon=True, name="worker-watchdog"
+                ).start()
+                _archive_worker_started = True
+            else:
+                from services.archive_transcribe import start_worker as _start_inprocess_worker
+
+                _start_inprocess_worker()
+                logger.info(
+                    "Archive transcribe worker started in-process (%s)",
+                    "no pending jobs — nothing to detach" if not pending else "detached spawn failed — fallback",
+                )
+                _archive_worker_started = True
+        except Exception:
+            logger.debug("archive worker boot skipped", exc_info=True)
+
+    threading.Thread(target=_boot_archive_worker, daemon=True, name="archive-worker-boot").start()
 
     # Entity watcher — scans new transcription segments for saved words /
     # saved channels (auto mode), once at startup then every minute.
@@ -740,9 +764,10 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive chat watchdog stop failed", exc_info=True)
     try:
-        from services.archive_transcribe import stop_worker
+        if _archive_worker_started:
+            from services.archive_transcribe import stop_worker
 
-        stop_worker(timeout=6.0)
+            stop_worker(timeout=6.0)
     except Exception:
         logger.debug("Archive transcribe worker stop failed", exc_info=True)
     try:
