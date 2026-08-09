@@ -88,10 +88,10 @@ def get_conn() -> sqlite3.Connection:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.executescript(SCHEMA)
-            conn.commit()
             _conn = conn
         if not _schema_ready:
+            # Schema init lives here (once): the connect branch above used to
+            # executescript() too, doubling the cost of the first get_conn.
             _conn.executescript(SCHEMA)
             _conn.commit()
             _schema_ready = True
@@ -337,78 +337,84 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --- module self-check (no network) ---------------------------------------
-# Contract invariants must hold on import. Runs against a throwaway DB so the
-# real archive.db is never touched.
-import tempfile  # noqa: E402
-
-_selfcheck_env = os.environ.get("VODRIP_COOKIE_DB")
-# Disk hygiene: mktemp leaked a .db per import when a process was killed
-# mid-selfcheck (~120 in %TEMP%). A TemporaryDirectory is cleaned on normal
-# exits (finally + GC); kill leftovers share the prefix and are swept by the
-# startup hygiene pass (services/disk_hygiene.py).
-_selfcheck_dir = tempfile.TemporaryDirectory(prefix="vodrip_cookie_selfcheck_")
-_tmp_db = str(Path(_selfcheck_dir.name) / "selfcheck.db")
-os.environ["VODRIP_COOKIE_DB"] = _tmp_db
-try:
-    # crypto roundtrip
-    _secret = "sup3r-s3cret-kick-token"
-    assert decrypt_token(encrypt_token(_secret)) == _secret, "crypto roundtrip must hold"
-
-    # keep-list filtering: random youtube cookies are dropped, SID is kept
-    _a, _d = upsert_cookies([
-        {"name": "SID", "domain": ".youtube.com", "path": "/", "secure": True,
-         "httpOnly": True, "value": "youtube-sid-value", "expirationDate": 1900000000},
-        {"name": "random_tracker", "domain": ".youtube.com", "value": "nope"},
-        {"name": "auth_token", "domain": ".kick.com", "value": "kick-token",
-         "httpOnly": True, "secure": True},
-        {"name": "auth-token", "domain": ".twitch.tv", "value": "twitch-token"},
-        {"name": "SID", "domain": "evil-youtube.com.evil.example", "value": "phish"},
-    ])
-    assert _a == 3 and _d == 2, f"keep-list filter must drop 2 of 5, got accepted={_a} dropped={_d}"
-    _y = list_cookies("youtube")
-    assert [c["name"] for c in _y] == ["SID"], f"youtube keep-list must hold only SID, got {_y}"
-    assert _y[0]["value"] == "youtube-sid-value", "decrypted value must round-trip"
-
-    # netscape serialization: httpOnly prefix + flags
-    _txt = pull_netscape("kick")
-    assert _txt.startswith("# Netscape HTTP Cookie File"), "netscape header required"
-    assert "#HttpOnly_.kick.com\tTRUE\t/\tTRUE\t0\tauth_token\tkick-token" in _txt, (
-        "httpOnly cookie must serialize with #HttpOnly_ prefix"
-    )
-    _t = pull_netscape("twitch")
-    assert "auth-token\ttwitch-token" in _t.replace("#HttpOnly_", ""), "twitch pull must contain auth-token"
-    assert "random_tracker" not in pull_netscape("youtube"), "dropped cookies must never appear"
-
-    # platform mapping boundaries
-    assert platform_for_domain("kick.com") == "kick"
-    assert platform_for_domain(".youtube.com") == "youtube"
-    assert platform_for_domain("www.twitch.tv") == "twitch"
-    assert platform_for_domain("notyoutube.com") is None
-    assert platform_for_domain("evil.example") is None
-finally:
-    clear()
-    # Close the selfcheck connection BEFORE deleting its DB — on Windows an
-    # open sqlite handle blocks the unlink. (This ordering bug is exactly
-    # what leaked the old mktemp .db files into %TEMP%.)
-    if _conn is not None:
+# Module self-check (no network): contract invariants must hold on import.
+# Runs against a throwaway DB so the real archive.db is never touched. Gated
+# behind VODRIP_COOKIE_SELFCHECK=1 (pytest sets it in backend/conftest.py):
+# the suite costs ~1.2s (crypto + sqlite schema) and used to be paid on every
+# app boot via deps -> download_manager -> youtube_auth -> cookie_store.
+if os.environ.get("VODRIP_COOKIE_SELFCHECK", "0") == "1":
+    # --- module self-check (no network) ---------------------------------------
+    # Contract invariants must hold on import. Runs against a throwaway DB so the
+    # real archive.db is never touched.
+    import tempfile  # noqa: E402
+    
+    _selfcheck_env = os.environ.get("VODRIP_COOKIE_DB")
+    # Disk hygiene: mktemp leaked a .db per import when a process was killed
+    # mid-selfcheck (~120 in %TEMP%). A TemporaryDirectory is cleaned on normal
+    # exits (finally + GC); kill leftovers share the prefix and are swept by the
+    # startup hygiene pass (services/disk_hygiene.py).
+    _selfcheck_dir = tempfile.TemporaryDirectory(prefix="vodrip_cookie_selfcheck_")
+    _tmp_db = str(Path(_selfcheck_dir.name) / "selfcheck.db")
+    os.environ["VODRIP_COOKIE_DB"] = _tmp_db
+    try:
+        # crypto roundtrip
+        _secret = "sup3r-s3cret-kick-token"
+        assert decrypt_token(encrypt_token(_secret)) == _secret, "crypto roundtrip must hold"
+    
+        # keep-list filtering: random youtube cookies are dropped, SID is kept
+        _a, _d = upsert_cookies([
+            {"name": "SID", "domain": ".youtube.com", "path": "/", "secure": True,
+             "httpOnly": True, "value": "youtube-sid-value", "expirationDate": 1900000000},
+            {"name": "random_tracker", "domain": ".youtube.com", "value": "nope"},
+            {"name": "auth_token", "domain": ".kick.com", "value": "kick-token",
+             "httpOnly": True, "secure": True},
+            {"name": "auth-token", "domain": ".twitch.tv", "value": "twitch-token"},
+            {"name": "SID", "domain": "evil-youtube.com.evil.example", "value": "phish"},
+        ])
+        assert _a == 3 and _d == 2, f"keep-list filter must drop 2 of 5, got accepted={_a} dropped={_d}"
+        _y = list_cookies("youtube")
+        assert [c["name"] for c in _y] == ["SID"], f"youtube keep-list must hold only SID, got {_y}"
+        assert _y[0]["value"] == "youtube-sid-value", "decrypted value must round-trip"
+    
+        # netscape serialization: httpOnly prefix + flags
+        _txt = pull_netscape("kick")
+        assert _txt.startswith("# Netscape HTTP Cookie File"), "netscape header required"
+        assert "#HttpOnly_.kick.com\tTRUE\t/\tTRUE\t0\tauth_token\tkick-token" in _txt, (
+            "httpOnly cookie must serialize with #HttpOnly_ prefix"
+        )
+        _t = pull_netscape("twitch")
+        assert "auth-token\ttwitch-token" in _t.replace("#HttpOnly_", ""), "twitch pull must contain auth-token"
+        assert "random_tracker" not in pull_netscape("youtube"), "dropped cookies must never appear"
+    
+        # platform mapping boundaries
+        assert platform_for_domain("kick.com") == "kick"
+        assert platform_for_domain(".youtube.com") == "youtube"
+        assert platform_for_domain("www.twitch.tv") == "twitch"
+        assert platform_for_domain("notyoutube.com") is None
+        assert platform_for_domain("evil.example") is None
+    finally:
+        clear()
+        # Close the selfcheck connection BEFORE deleting its DB — on Windows an
+        # open sqlite handle blocks the unlink. (This ordering bug is exactly
+        # what leaked the old mktemp .db files into %TEMP%.)
+        if _conn is not None:
+            try:
+                _conn.close()
+            except sqlite3.Error:
+                pass
+        _conn = None
+        _schema_ready = False
         try:
-            _conn.close()
-        except sqlite3.Error:
+            os.unlink(_tmp_db)
+        except OSError:
             pass
-    _conn = None
-    _schema_ready = False
-    try:
-        os.unlink(_tmp_db)
-    except OSError:
-        pass
-    if _selfcheck_env is None:
-        os.environ.pop("VODRIP_COOKIE_DB", None)
-    else:
-        os.environ["VODRIP_COOKIE_DB"] = _selfcheck_env
-    # Drop the connection that points at the deleted temp DB — the next
-    # get_conn() (the real app path) must open a fresh one on the real file.
-    try:
-        _selfcheck_dir.cleanup()
-    except OSError:
-        pass
+        if _selfcheck_env is None:
+            os.environ.pop("VODRIP_COOKIE_DB", None)
+        else:
+            os.environ["VODRIP_COOKIE_DB"] = _selfcheck_env
+        # Drop the connection that points at the deleted temp DB — the next
+        # get_conn() (the real app path) must open a fresh one on the real file.
+        try:
+            _selfcheck_dir.cleanup()
+        except OSError:
+            pass

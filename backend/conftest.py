@@ -12,6 +12,8 @@ import os
 # REAL archive) is gated behind VODRIP_ARCHIVE_SELFCHECK=1 — pytest keeps it
 # on; the app boots with it off.
 os.environ.setdefault("VODRIP_ARCHIVE_SELFCHECK", "1")
+# cookie_store's module self-check (~1.2s) is gated the same way.
+os.environ.setdefault("VODRIP_COOKIE_SELFCHECK", "1")
 
 
 def pytest_collection_modifyitems(config, items):

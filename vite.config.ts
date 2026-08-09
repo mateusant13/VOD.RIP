@@ -34,12 +34,12 @@ export default defineConfig({
         target: `http://127.0.0.1:${API_PORT}`,
         changeOrigin: true,
         configure(proxy) {
-          // The API takes ~5-20s to import before binding (4.7s warm, more on
-          // a cold page cache); the UI polls /api immediately on load, so a
-          // transient ECONNREFUSED at boot is expected — not "not running".
-          // Stay quiet during the boot window, then report real failures
-          // (deduped — the UI polls every few seconds).
-          const bootGraceMs = 30_000;
+          // The API binds in ~2s warm (~5-10s on a cold page cache / first
+          // boot of the day); the UI polls /api immediately on load, so a
+          // transient ECONNREFUSED during that window is expected — not
+          // "not running". Stay quiet for the first 15s, then report real
+          // failures (deduped — the UI polls every few seconds).
+          const bootGraceMs = 15_000;
           const startedAt = Date.now();
           let graceLogged = false;
           let lastWarnedAt = 0;

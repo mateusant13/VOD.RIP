@@ -11,8 +11,6 @@ from typing import Any, Iterator
 
 from services import ytdlp_env  # noqa: F401
 
-import yt_dlp  # noqa: E402
-
 logger = logging.getLogger(__name__)
 
 _YTDLP_LOCK = threading.Lock()
