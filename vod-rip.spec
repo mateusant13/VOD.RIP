@@ -23,6 +23,24 @@ _ICON_ICNS = _ASSETS_DIR / "icon.icns"
 _IS_WIN = sys.platform == "win32"
 _IS_MAC = sys.platform == "darwin"
 
+# Pull the canonical version out of services/_version.py — the same file the
+# Python entry point reads — so the Windows version resource and the macOS
+# CFBundleVersion stay in lock-step with what the user sees in the UI. Parse
+# it with a tiny regex rather than `import` (PyInstaller's spec runs before
+# sys.path is wired up).
+_spec_version = "1.0.0"
+_version_py = _BACKEND_DIR / "services" / "_version.py"
+if _version_py.is_file():
+    try:
+        _m = re.search(
+            r'__version__\s*=\s*["\']([^"\']+)["\']',
+            _version_py.read_text(encoding="utf-8", errors="replace"),
+        )
+        if _m:
+            _spec_version = _m.group(1)
+    except Exception:
+        _spec_version = "1.0.0"
+
 
 def _ffmpeg_binaries():
     if not _EXTERNAL_DIR.is_dir():
@@ -265,9 +283,60 @@ _exe_kwargs = dict(
 )
 if _IS_WIN and _ICON_ICO.is_file():
     _exe_kwargs["icon"] = str(_ICON_ICO)
-    _version_file = _ASSETS_DIR / "version_info.py"
-    if _version_file.is_file():
-        _exe_kwargs["version"] = str(_version_file)
+    # Windows version resource, generated from _spec_version (single source
+    # of truth) instead of a static version_info.py that drifts out of sync
+    # on version bumps. AV heuristics treat a self-consistent FileVersion /
+    # ProductName as a mark of a real product; a stale or absent resource is
+    # a classic PyInstaller false-positive signal. Best-effort: a resource
+    # problem must never fail the build.
+    try:
+        from PyInstaller.utils.win32.versioninfo import (
+            FixedFileInfo,
+            StringFileInfo,
+            StringStruct,
+            StringTable,
+            VarFileInfo,
+            VarStruct,
+            VSVersionInfo,
+        )
+
+        _v = tuple(int(x) for x in _spec_version.split("."))
+        _v = (_v + (0, 0, 0, 0))[:4]
+        _ver_str = ".".join(map(str, _v))
+        _exe_kwargs["version"] = VSVersionInfo(
+            ffi=FixedFileInfo(
+                filevers=_v,
+                prodvers=_v,
+                mask=0x3F,
+                flags=0x0,
+                OS=0x40004,
+                fileType=0x1,
+                subtype=0x0,
+                date=(0, 0),
+            ),
+            kids=[
+                StringFileInfo(
+                    [
+                        StringTable(
+                            "040904B0",
+                            [
+                                StringStruct("CompanyName", "VOD.RIP"),
+                                StringStruct("FileDescription", "VOD.RIP — Kick & Twitch VOD downloader"),
+                                StringStruct("FileVersion", _ver_str),
+                                StringStruct("InternalName", "VOD.RIP"),
+                                StringStruct("LegalCopyright", "Copyright (c) mateusant13"),
+                                StringStruct("OriginalFilename", "VOD-RIP.EXE"),
+                                StringStruct("ProductName", "VOD.RIP"),
+                                StringStruct("ProductVersion", _ver_str),
+                            ],
+                        )
+                    ]
+                ),
+                VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+            ],
+        )
+    except Exception:
+        pass
 
 exe = EXE(pyz, a.scripts, [], **_exe_kwargs)
 
@@ -283,22 +352,6 @@ coll = COLLECT(
 )
 if _IS_MAC:
     _bundle_icon = str(_ICON_ICNS) if _ICON_ICNS.is_file() else None
-    # Pull the canonical version out of services/_version.py — the same file
-    # the Python entry point reads — so CFBundleVersion stays in lock-step
-    # with what the user sees in the UI. Parse it with a tiny regex rather
-    # than `import` (PyInstaller's spec runs before sys.path is wired up).
-    _spec_version = "1.0.0"
-    _version_py = _BACKEND_DIR / "services" / "_version.py"
-    if _version_py.is_file():
-        try:
-            _m = re.search(
-                r'__version__\s*=\s*["\']([^"\']+)["\']',
-                _version_py.read_text(encoding="utf-8", errors="replace"),
-            )
-            if _m:
-                _spec_version = _m.group(1)
-        except Exception:
-            _spec_version = "1.0.0"
     app = BUNDLE(
         coll,
         name="VOD.RIP.app",

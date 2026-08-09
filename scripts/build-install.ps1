@@ -93,6 +93,12 @@ if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Forc
 robocopy $DistDir $InstallDir /E /COPY:DAT /DCOPY:DAT /NFL /NDL /NP /MT:16 /R:2 /W:2 | Out-Null
 if ($LASTEXITCODE -gt 7) { Fail "robocopy failed ($LASTEXITCODE)" }
 
+# Mark-of-the-Web hygiene: SmartScreen keys off Zone.Identifier for downloads,
+# and a freshly installed app should never carry it (e.g. when the repo or a
+# previous install came from a downloaded zip). Cheap, idempotent, local.
+Get-ChildItem -Path $InstallDir -Recurse -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+
 # --- smoke test -------------------------------------------------------------
 if ($SkipSmoke) {
     Write-Host "`n[4/4] smoke test skipped (-SkipSmoke)" -ForegroundColor Yellow
