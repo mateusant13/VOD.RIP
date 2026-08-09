@@ -30,10 +30,16 @@ $procs = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorActio
 Write-Host ("Processos Chrome: " + $procs.Count)
 if ($procs.Count -gt 0) {
   $esc = [regex]::Escape($ud)
-  $alt = @($procs | Where-Object { $_.CommandLine -match '--user-data-dir=' -and $_.CommandLine -notmatch $esc })
+  # consultgpt MCP runs its own headless Chrome with disposable profiles under
+  # %USERPROFILE%\.consultgpt\chatgpt_profiles\ — never touches the user's
+  # profile; excluding them avoids false PERFIL_ANORMAL every time MCP is hot.
+  $escCp = [regex]::Escape((Join-Path $env:USERPROFILE '.consultgpt'))
+  $alt = @($procs | Where-Object { $_.CommandLine -match '--user-data-dir=' -and $_.CommandLine -notmatch $esc -and $_.CommandLine -notmatch $escCp })
   $cdp = @($procs | Where-Object { $_.CommandLine -match '--remote-debugging-port' })
+  $cdpReal = @($cdp | Where-Object { $_.CommandLine -match $esc -and $_.CommandLine -notmatch $escCp })
   if ($alt.Count -gt 0) { $problems += "$($alt.Count) processo(s) com user-data-dir ALTERNATIVO (junction/perfil copiado)" }
-  if ($cdp.Count -gt 0)  { $problems += "$($cdp.Count) processo(s) com --remote-debugging-port (CDP em perfil real revoga a conta Google)" }
+  if ($cdpReal.Count -gt 0) { $notes += "$($cdpReal.Count) processo(s) com CDP no perfil REAL - esperado durante o auto-install da extensao (scripts/cookie_auto_install.ps1); aguardar concluir" }
+  if ($cdp.Count -gt $cdpReal.Count) { $problems += "$($cdp.Count - $cdpReal.Count) processo(s) com --remote-debugging-port fora do perfil real" }
 }
 
 # --- 2) Conta Google no perfil Default ---

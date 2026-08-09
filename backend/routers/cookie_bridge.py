@@ -216,6 +216,7 @@ def _materialize_ext_src() -> Path:
         if not notes.exists():
             notes.write_text(_DRAG_NOTE_TEXT, encoding="utf-8")
         if manifest.exists() and crx.exists() and crx.stat().st_mtime <= manifest.stat().st_mtime:
+            _bundle_bg_if_module(src)
             return src
         raw = crx.read_bytes()
         zip_start = raw.find(b"PK\x03\x04", 12)
@@ -234,9 +235,42 @@ def _materialize_ext_src() -> Path:
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(zf.read(name))
+        _bundle_bg_if_module(src)
         return src
     except (OSError, KeyError, zipfile.BadZipFile):
         return src
+
+
+def _bundle_bg_if_module(src: Path) -> None:
+    """Rebundle an ESM extension background as a single classic script.
+
+    Chrome 151 fails MV3 module service workers shipped by the packed crx
+    (card shows "Service worker registration failed. Status code: 10" on the
+    '"service_worker": "... .mjs"' line). Re-bundling to one plain
+    background.js (no imports, no "type": "module") removes module loading
+    from registration entirely. Idempotent: skips once the manifest is
+    adjusted.
+    """
+    try:
+        manifest_path = src / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        bg = manifest.get("background") or {}
+        sw = bg.get("service_worker") or ""
+        if not sw.endswith(".mjs") or bg.get("type") != "module":
+            return
+        esbuild = Path(__file__).resolve().parents[2] / "node_modules" / "esbuild" / "bin" / "esbuild"
+        if not esbuild.exists():
+            return
+        out = src / (sw[:-4] + ".js")
+        subprocess.run(
+            ["node", str(esbuild), str(src / sw), "--bundle", "--format=iife", f"--outfile={out}"],
+            check=True, capture_output=True, timeout=60,
+        )
+        manifest["background"]["service_worker"] = out.name
+        manifest["background"].pop("type", None)
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    except (OSError, KeyError, ValueError, subprocess.SubprocessError):
+        return
 
 
 _BROWSER_RELS = {

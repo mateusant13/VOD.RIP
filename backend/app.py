@@ -366,27 +366,59 @@ async def _app_lifespan(_app: FastAPI):
             len(first_urls),
         )
 
+        # Pre-warm the anonymous YouTube session BEFORE the extract pool: the
+        # two workers would otherwise race each other on the single-flight
+        # bootstrap and both stall waiting for it. This call is the leader, so
+        # the extracts join its event and find the cache warm. Bounded: ~3x6s
+        # worst case as leader, <=14s as follower — never blocks API readiness
+        # (we run on the yt-warm daemon thread, after _lifespan_ready).
+        from services.youtube_session import bootstrap_anonymous_session
+
+        try:
+            bootstrap_anonymous_session()
+        except Exception:
+            logger.debug("STARTUP_SYNC_WARM: anonymous session bootstrap skipped", exc_info=True)
+
         from concurrent.futures import ThreadPoolExecutor
+
+        # Cap wall-clock per URL at ~15s: on a degraded network the light
+        # extract alone can take 60s+, which pushed the startup wave to ~70s.
+        # The abandoned thread keeps running in the background and still
+        # lands its caches if it finishes.
+        _SYNC_WARM_URL_CAP_SEC = 15.0
 
         def _warm_one(item: tuple[str, str]) -> None:
             u, ch_key = item
-            try:
-                t0 = _tm.time()
-                # warm_youtube_resolve_only does InnerTube fast pass + prog head
-                # warm + session snapshot build. The snapshot is what makes the
-                # click path skip the ~5s extract + variant-build + master work;
-                # the prog head warm serves the first 2 MiB from local disk so
-                # the browser's canplay path doesn't hit googlevideo cold.
-                warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
-                with _WARMED_URLS_LOCK:
-                    _WARMED_URLS.add(u)
-                logger.info(
-                    "STARTUP_SYNC_WARM: %s done in %.1fs",
+            done = threading.Event()
+
+            def _run() -> None:
+                try:
+                    t0 = _tm.time()
+                    # warm_youtube_resolve_only does InnerTube fast pass + prog head
+                    # warm + session snapshot build. The snapshot is what makes the
+                    # click path skip the ~5s extract + variant-build + master work;
+                    # the prog head warm serves the first 2 MiB from local disk so
+                    # the browser's canplay path doesn't hit googlevideo cold.
+                    warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
+                    with _WARMED_URLS_LOCK:
+                        _WARMED_URLS.add(u)
+                    logger.info(
+                        "STARTUP_SYNC_WARM: %s done in %.1fs",
+                        u[:50],
+                        _tm.time() - t0,
+                    )
+                except Exception as exc:
+                    logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
+                finally:
+                    done.set()
+
+            threading.Thread(target=_run, daemon=True, name="yt-sync-warm-url").start()
+            if not done.wait(_SYNC_WARM_URL_CAP_SEC):
+                logger.warning(
+                    "STARTUP_SYNC_WARM: %s still running after %.0fs — moving on",
                     u[:50],
-                    _tm.time() - t0,
+                    _SYNC_WARM_URL_CAP_SEC,
                 )
-            except Exception as exc:
-                logger.warning("STARTUP_SYNC_WARM: %s failed: %s", u[:50], exc)
 
         # ponytail: 2 workers to avoid tripping YouTube bot-gate on startup
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-sync-warm") as pool:

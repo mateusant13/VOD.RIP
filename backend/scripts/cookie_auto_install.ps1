@@ -413,8 +413,15 @@ try {
     Stop-BrowserProcesses $Browser
 
     Write-ProgressLog "auto-install: launching debug instance on :$DebugPort"
-    $launchArgs = "--remote-debugging-port=$DebugPort --remote-allow-origins=* --user-data-dir=`"$userData`" --no-first-run --no-default-browser-check $($binfo.url)"
-    [void](Start-Process -FilePath $exe -ArgumentList $launchArgs)
+    # PS 5.1 Start-Process re-quotes arguments and BREAKS quoted values that
+    # contain spaces (the "User Data" profile path lands truncated, opening a
+    # GHOST profile). ProcessStartInfo passes the CommandLine verbatim to
+    # CreateProcess, so the quoting survives. Quote only the user-data-dir arg.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.UseShellExecute = $false
+    $psi.Arguments = "--remote-debugging-port=$DebugPort --remote-allow-origins=* `"--user-data-dir=$userData`" --no-first-run --no-default-browser-check $($binfo.url)"
+    [void][System.Diagnostics.Process]::Start($psi)
 
     if (-not (Wait-CdpPort $DebugPort 25)) { throw 'browser did not expose the debug port' }
     $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/json" -TimeoutSec 5 -ErrorAction Stop)

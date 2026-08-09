@@ -276,6 +276,25 @@ async function main() {
     ...previewFastEnv,
   });
 
+  // Vite is independent of the API — start it in PARALLEL instead of waiting
+  // for apiHealthy() first (the lifespan warm can hold the API ~20-120s).
+  console.log(`Open UI at    -> http://localhost:${vitePort}`);
+  if (await viteHealthy(vitePort)) {
+    console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
+    console.log("(Ctrl+C stops API only; existing Vite keeps running)\n");
+  } else {
+    await ensurePortFree(vitePort, "Vite");
+    console.log("(Ctrl+C stops both)\n");
+
+    const viteBin = path.join(root, "node_modules", "vite", "bin", "vite.js");
+    if (!fs.existsSync(viteBin)) {
+      console.error("[web] vite not installed — run npm install first");
+      shutdown(1);
+      return;
+    }
+    start("web", process.execPath, [viteBin, "--port", String(vitePort), "--strictPort"], root);
+  }
+
   // Server lifespan blocks ~20-30s on startup YouTube warm (sync pre-warm of
   // first URLs per channel) before /api/settings responds; post-reboot with a
   // dirty volume it can take >60s. 120s covers the worst case without leaving
@@ -289,24 +308,6 @@ async function main() {
       return;
     }
   }
-
-  console.log(`Open UI at    -> http://localhost:${vitePort}`);
-  if (await viteHealthy(vitePort)) {
-    console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
-    console.log("(Ctrl+C stops API only; existing Vite keeps running)\n");
-    return;
-  }
-
-  await ensurePortFree(vitePort, "Vite");
-  console.log("(Ctrl+C stops both)\n");
-
-  const viteBin = path.join(root, "node_modules", "vite", "bin", "vite.js");
-  if (!fs.existsSync(viteBin)) {
-    console.error("[web] vite not installed — run npm install first");
-    shutdown(1);
-    return;
-  }
-  start("web", process.execPath, [viteBin, "--port", String(vitePort), "--strictPort"], root);
 }
 
 main().catch((err) => {
