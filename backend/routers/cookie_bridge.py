@@ -268,6 +268,56 @@ _UPDATE_BADGE_FIX_NEW = """const updateBadgeCounter = async () => {
   }
 };"""
 
+_GUARD_PATCH_OLD = re.compile(r"\nconst updateBadgeCounter = async \(\) => \{\n")
+_GUARD_PATCH_NEW = """
+
+// Defensive: never surface an uncaught error in the SW console. Every known
+// failure mode has its own try/catch; this is the last net for browser
+// quirks and extension-API throws (degrades to a yellow warning instead of
+// the red "background.js:0" unhandled error).
+self.addEventListener('unhandledrejection', (e) => {
+  e.preventDefault();
+  console.warn('[vodrip] unhandled rejection (non-fatal):', e.reason);
+});
+self.addEventListener('error', (e) => {
+  e.preventDefault();
+  console.warn('[vodrip] uncaught error (non-fatal):', e.error || e.message);
+});
+
+const updateBadgeCounter = async () => {
+"""
+
+_NOTIF_CALLBACK_OLD = re.compile(
+    r"chrome\.notifications\.create\('updated', \{\n[\s\S]*?\n    \}\);"
+)
+_NOTIF_CALLBACK_NEW = """    chrome.notifications.create('updated', {
+      type: 'basic',
+      title: 'VOD RIP Get Cookies',
+      message: `Updated from ${previousVersion} to ${currentVersion}`,
+      iconUrl: '/images/icon128.png',
+    }, () => { /* consume chrome.runtime.lastError (icon missing on some builds) */ });"""
+
+_ONMESSAGE_FIX_OLD = re.compile(
+    r"chrome\.runtime\.onMessage\.addListener\(async \(message, sender, sendResponse\) => \{\n"
+    r"[\s\S]*?\n\}\);"
+)
+_ONMESSAGE_FIX_NEW = """chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+  const { type, target, data } = message || {};
+  if (target !== 'background') return;
+  if (type === 'save') {
+    const { text, name, format, saveAs } = data || {};
+    try {
+      await saveToFile(text, name, format, saveAs);
+      sendResponse('done');
+    } catch (err) {
+      console.warn('[vodrip] save failed:', err);
+      sendResponse('error');
+    }
+    return true;
+  }
+  return true;
+});"""
+
 
 def _bundle_bg_if_module(src: Path) -> None:
     """Rebundle an ESM extension background as a single classic script.
@@ -296,6 +346,11 @@ def _bundle_bg_if_module(src: Path) -> None:
         # tabs.query and the badge write — the catch in the original code then
         # re-set the badge and re-threw. Wrap the whole counter in one catch.
         text = _UPDATE_BADGE_FIX_OLD.sub(_UPDATE_BADGE_FIX_NEW, text, count=1)
+        # SW console hygiene: catch-all guard, notifications lastError consumer,
+        # and a try/catch around the save handler (all async listeners).
+        text = _GUARD_PATCH_OLD.sub(_GUARD_PATCH_NEW, text, count=1)
+        text = _NOTIF_CALLBACK_OLD.sub(_NOTIF_CALLBACK_NEW, text, count=1)
+        text = _ONMESSAGE_FIX_OLD.sub(_ONMESSAGE_FIX_NEW, text, count=1)
         bg_src_path.write_text(text, encoding="utf-8")
         out = src / (sw[:-4] + ".js")
         subprocess.run(

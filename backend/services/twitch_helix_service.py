@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -307,6 +309,111 @@ def auto_lift_token() -> bool:
     except Exception as exc:
         logger.debug("helix token auto-lift skipped: %s", exc)
         return False
+
+
+# --- token maintenance watch -------------------------------------------------
+# The browser auth-token rotates with the user's session and disappears when
+# the user logs out. Every 9 minutes (user-requested cadence): refresh the
+# stored helix token from the freshest cookie (auto_lift), and when the
+# auth-token cookie is missing entirely, open twitch.tv in an off-screen
+# window so the logged-in browser session re-issues it (the extension bridge
+# pushes it back on load; the next pass re-lifts it).
+TOKEN_WATCH_INTERVAL_S = 540.0  # 9 min
+
+_stop = threading.Event()
+_watch_thread: Optional[threading.Thread] = None
+_watch_lock = threading.Lock()
+
+
+def _auth_token_missing() -> bool:
+    try:
+        from services import cookie_store
+
+        return not any(
+            c["name"] == "auth-token" for c in cookie_store.list_cookies("twitch")
+        )
+    except Exception:
+        return False
+
+
+def _open_twitch_offscreen(hold_seconds: int = 4) -> None:
+    """Re-issue the session cookie by loading twitch.tv in an off-screen window."""
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "open_url_offscreen.ps1"
+    )
+    if not script.is_file():
+        logger.warning(
+            "open_url_offscreen.ps1 missing — cannot re-issue the twitch cookie"
+        )
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                "-Url",
+                "https://www.twitch.tv/",
+                "-HoldSeconds",
+                str(hold_seconds),
+            ],
+            capture_output=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("twitch off-screen open failed", exc_info=True)
+
+
+def _token_watch_loop(delay: float = 0.0) -> None:
+    # Boot grace before the first pass — the extension bridge needs a moment
+    # to push the initial cookie batch.
+    if delay and _stop.wait(delay):
+        return
+    while not _stop.is_set():
+        try:
+            auto_lift_token()  # stored token follows the freshest cookie
+            if _auth_token_missing():
+                # session cookie gone (logout/rotation) — re-issue off-screen
+                _open_twitch_offscreen()
+                auto_lift_token()
+        except Exception:
+            logger.debug("twitch token watch pass failed", exc_info=True)
+        if _stop.wait(TOKEN_WATCH_INTERVAL_S):
+            return
+
+
+def start_token_watch(*, delay: float = 540.0) -> Optional[threading.Thread]:
+    """Daemon thread (idempotent) — keeps the helix token fresh every 9 min.
+
+    delay=None uses the interval as the boot grace (the first pass runs one
+    interval after boot, matching the extension heartbeat); tests pass a
+    small delay to observe a pass immediately.
+    """
+    global _watch_thread
+    with _watch_lock:
+        if _watch_thread is not None and _watch_thread.is_alive():
+            return _watch_thread
+        _watch_thread = threading.Thread(
+            target=_token_watch_loop,
+            kwargs={"delay": delay},
+            daemon=True,
+            name="twitch-token-watch",
+        )
+        _watch_thread.start()
+        return _watch_thread
+
+
+def stop_token_watch(timeout: float = 5.0) -> None:
+    """Stop the watch thread (idempotent)."""
+    global _watch_thread
+    _stop.set()
+    if _watch_thread is not None:
+        _watch_thread.join(timeout=timeout)
+        _watch_thread = None
 
 
 # --- module self-check (pure parsing — no I/O, no network) -----------------

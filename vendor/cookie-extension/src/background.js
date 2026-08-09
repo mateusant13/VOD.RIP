@@ -6,6 +6,19 @@ import {
   postCookies,
 } from './modules/cookie_bridge.mjs';
 
+// Defensive: never surface an uncaught error in the SW console. Every known
+// failure mode has its own try/catch; this is the last net for browser
+// quirks and extension-API throws (degrades to a yellow warning instead of
+// the red "background.js:0 (função anônima)" unhandled error).
+self.addEventListener('unhandledrejection', (e) => {
+  e.preventDefault();
+  console.warn('[vodrip] unhandled rejection (non-fatal):', e.reason);
+});
+self.addEventListener('error', (e) => {
+  e.preventDefault();
+  console.warn('[vodrip] uncaught error (non-fatal):', e.error || e.message);
+});
+
 /**
  * Update icon badge counter on active page
  */
@@ -93,7 +106,7 @@ chrome.runtime.onInstalled.addListener(({ previousVersion, reason }) => {
       title: 'VOD RIP Get Cookies',
       message: `Updated from ${previousVersion} to ${currentVersion}`,
       iconUrl: '/images/icon128.png',
-    });
+    }, () => { /* consume chrome.runtime.lastError (icon missing on some builds) */ });
   }
 });
 
@@ -109,8 +122,13 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
   if (target !== 'background') return;
   if (type === 'save') {
     const { text, name, format, saveAs } = data || {};
-    await saveToFile(text, name, format, saveAs);
-    sendResponse('done');
+    try {
+      await saveToFile(text, name, format, saveAs);
+      sendResponse('done');
+    } catch (err) {
+      console.warn('[vodrip] save failed:', err);
+      sendResponse('error');
+    }
     return true;
   }
   return true;
