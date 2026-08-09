@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Iterator
@@ -113,24 +114,31 @@ _EXPECTED_YTDLP_MARKERS = (
 )
 
 
+_YTDLP_VIDEO_PREFIX_RE = re.compile(r"^\[[a-z0-9:_-]+\] [A-Za-z0-9_-]{6,}: ", re.I)
+
+
 class _YtdlpConsoleLogger:
     """yt-dlp logger that keeps REAL errors visible but drops expected
     extractor failures (offline channel, deleted video, age gate) from the
     console — those are normal conditions surfaced in the UI/job rows.
-    Identical warnings (e.g. the EJS "no JS runtime" note, repeated on every
-    extract) are logged once."""
+    Warnings are deduped process-wide on the NORMALIZED message (video-id
+    prefix stripped), so per-video repeats of the same environmental note
+    (EJS "no JS runtime", GVS PO token, SABR/DRM skips) log once."""
+
+    _seen_warnings: set[str] = set()  # class-level: shared across instances
 
     def __init__(self) -> None:
-        self._seen_warnings: set[str] = set()
+        pass
 
     def debug(self, msg):
         pass
 
     def warning(self, msg):
         text = str(msg)
-        if text in self._seen_warnings:
+        norm = _YTDLP_VIDEO_PREFIX_RE.sub("", text, count=1)
+        if norm in self._seen_warnings:
             return
-        self._seen_warnings.add(text)
+        self._seen_warnings.add(norm)
         logger.warning("yt-dlp: %s", text)
 
     def error(self, msg):
@@ -146,23 +154,50 @@ def ytdlp_console_logger():
     return _YtdlpConsoleLogger()
 
 
+import functools as _functools
+import shutil as _shutil
+
+
+@_functools.lru_cache(maxsize=1)
+def ytdlp_js_runtimes() -> dict[str, dict]:
+    """Enable locally-available JS runtimes for yt-dlp's n-challenge solver.
+
+    yt-dlp 2026.07.04 enables only deno by default; with no JS runtime the
+    YouTube extractor warns on EVERY extract that formats may be missing
+    (n-challenge unsolved). Node ships with any dev setup — enabling it
+    recovers those formats. Deno stays first when installed (yt-dlp priority).
+    """
+    return {name: {} for name in ("deno", "node", "bun") if _shutil.which(name)}
+
+
+    """A yt-dlp-compatible logger (debug/info/warning/error) for the `logger=`
+    option that filters expected extractor failures from the console."""
+    return _YtdlpConsoleLogger()
+
+
 @contextlib.contextmanager
-def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeDL]:
+def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[Any]:
     """Only supported way to construct YoutubeDL — one instance at a time."""
+    import yt_dlp  # lazy: keeps yt-dlp (~0.5s) off the app import path
+
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
     safe.setdefault("logger", ytdlp_console_logger())
+    safe.setdefault("js_runtimes", ytdlp_js_runtimes())
     with _YTDLP_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl
 
 
 @contextlib.contextmanager
-def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[yt_dlp.YoutubeDL]:
+def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[Any]:
     """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists."""
+    import yt_dlp  # lazy
+
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
     safe.setdefault("logger", ytdlp_console_logger())
+    safe.setdefault("js_runtimes", ytdlp_js_runtimes())
     with _YTDLP_CHANNEL_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl

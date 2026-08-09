@@ -513,6 +513,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     yt_session = youtube_session_from_settings(video_id=vid)
     opts = {"quiet": True, "no_warnings": True}
     opts["logger"] = ytdlp_console_logger()
+    opts["js_runtimes"] = ytdlp_js_runtimes()
     opts["extractor_args"] = ytdlp_extractor_args(yt_session)
     apply_ytdlp_cookie_opts(opts, yt_session)
     try:

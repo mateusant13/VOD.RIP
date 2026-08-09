@@ -266,9 +266,10 @@ def _make_ydl(tmpdir: str, video_id: str, log: logging.Logger):
         apply_ytdlp_cookie_opts(opts, yt_session)
     except Exception as exc:
         log.warning("yt chat: auth wiring unavailable, using anonymous yt-dlp: %s", exc)
-    from services.ytdlp_guard import ytdlp_console_logger
+    from services.ytdlp_guard import ytdlp_console_logger, ytdlp_js_runtimes
 
     opts["logger"] = ytdlp_console_logger()
+    opts["js_runtimes"] = ytdlp_js_runtimes()
     return yt_dlp.YoutubeDL(opts)
 
 

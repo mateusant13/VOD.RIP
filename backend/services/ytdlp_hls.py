@@ -51,7 +51,7 @@ from services.ytdlp_guard import (
 from services.ytdlp_guard import (
     guarded_youtube_dl,
 )
-from services.ytdlp_guard import ytdlp_console_logger
+from services.ytdlp_guard import ytdlp_console_logger, ytdlp_js_runtimes
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +463,7 @@ def youtube_preview_ytdl_opts(
     found = _find_ffmpeg()
     if found:
         opts["ffmpeg_location"] = found
+    opts["js_runtimes"] = ytdlp_js_runtimes()
     return opts
 
 
@@ -3962,6 +3963,7 @@ def ytdlp_section_mux_to_ts(
         base = os.path.join(tmpdir, "clip")
         opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
         opts["logger"] = ytdlp_console_logger()
+        opts["js_runtimes"] = ytdlp_js_runtimes()
         opts.update(
             {
                 "outtmpl": base + ".%(ext)s",
