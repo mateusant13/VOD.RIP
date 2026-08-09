@@ -149,6 +149,16 @@ function openExternal(url: string): void {
  * redirect_uri exactly. */
 export const TWITCH_OAUTH_REDIRECT_URI = 'http://localhost:7897/twitch-oauth-callback';
 
+/**
+ * Official VOD.RIP OAuth app Client ID, embedded at build time so end users
+ * never register their own app (same model as Chatterino's client_login).
+ * The registered redirect URI (localhost:7897) is identical on every machine,
+ * so one app serves all users. Overridable per-user via Settings → Official
+ * APIs for power users. Empty until the official app is created; the token
+ * button then falls back to the registration page.
+ */
+export const DEFAULT_TWITCH_CLIENT_ID = '';
+
 /** Helix scopes the token needs for VOD clips (backend VOD_CLIP_SCOPES). */
 export const TWITCH_VOD_CLIP_SCOPES = ['editor:manage:clips', 'channel:manage:clips'];
 /** Live clips need clips:edit on top (backend LIVE_CLIP_SCOPE). */

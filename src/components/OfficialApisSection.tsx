@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiGet } from '../hooks/useApiClient';
 import FieldCaption from './FieldCaption';
 import { useI18n } from '../i18n';
-import { twitchOAuthAuthorizeUrl } from '../twitchClip';
+import { DEFAULT_TWITCH_CLIENT_ID, twitchOAuthAuthorizeUrl } from '../twitchClip';
 import type { AppSettings } from '../types';
 
 /**
@@ -85,7 +85,7 @@ export default function OfficialApisSection({ settings, setSettings }: Props) {
               type="text"
               value={settings.twitch_helix_client_id ?? ''}
               onChange={(e) => setSettings({ ...settings, twitch_helix_client_id: e.target.value })}
-              placeholder={t('optional — for the token button below')}
+              placeholder={t('advanced: your own OAuth app — otherwise the built-in app is used')}
               aria-label="twitch helix client id"
               autoComplete="off"
               className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
@@ -93,9 +93,11 @@ export default function OfficialApisSection({ settings, setSettings }: Props) {
             <button
               type="button"
               onClick={() => {
-                const clientId = (settings.twitch_helix_client_id ?? '').trim();
+                const clientId = (settings.twitch_helix_client_id ?? '').trim()
+                  || DEFAULT_TWITCH_CLIENT_ID;
                 if (!clientId) {
-                  // No app registered yet — send the user where they create one.
+                  // No app configured yet (dev builds) — send the user where
+                  // they create one.
                   window.open('https://dev.twitch.tv/console/apps', '_blank', 'noopener');
                   return;
                 }
