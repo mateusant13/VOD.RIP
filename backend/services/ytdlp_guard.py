@@ -118,13 +118,22 @@ _EXPECTED_YTDLP_MARKERS = (
 class _YtdlpConsoleLogger:
     """yt-dlp logger that keeps REAL errors visible but drops expected
     extractor failures (offline channel, deleted video, age gate) from the
-    console — those are normal conditions surfaced in the UI/job rows."""
+    console — those are normal conditions surfaced in the UI/job rows.
+    Identical warnings (e.g. the EJS "no JS runtime" note, repeated on every
+    extract) are logged once."""
+
+    def __init__(self) -> None:
+        self._seen_warnings: set[str] = set()
 
     def debug(self, msg):
         pass
 
     def warning(self, msg):
-        logger.warning("yt-dlp: %s", msg)
+        text = str(msg)
+        if text in self._seen_warnings:
+            return
+        self._seen_warnings.add(text)
+        logger.warning("yt-dlp: %s", text)
 
     def error(self, msg):
         if any(m in str(msg).lower() for m in _EXPECTED_YTDLP_MARKERS):

@@ -761,7 +761,7 @@ def kickoff_youtube_full_mux_warm(
                         and time.monotonic() >= _warm_bot_gate_pause_until
                     ):
                         _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                        logger.warning("YouTube bot-gate detected (2 consecutive soft-negatives); warm paused 10min")
+                        logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
                 logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
                 return
             _warm_note_success()
@@ -834,7 +834,13 @@ _FULL_WARM_EXECUTOR = _TPE(max_workers=1, thread_name_prefix="yt-full-warm")
 _ANON_PROBE_EXECUTOR = _TPE(max_workers=2, thread_name_prefix="yt-anon")
 _ANON_PROBE_HEAD_START_SEC = 2.0
 _full_warm_backoff_until = 0.0
-_FULL_WARM_BACKOFF_SEC = 600.0
+# Research (2026-08): YouTube's "sign in to confirm you're not a bot" check has
+# no official duration; community reports say it clears in hours (IP-level 403
+# blocks: 12-24h). 10min was too short — the warm kept re-hitting the gate and
+# re-triggering. 2h covers the mild gate while a false positive recovers
+# within a session. Only prefetch warm paths consult this pause; interactive
+# previews (create_session -> resolve_stream_info) resolve directly.
+_FULL_WARM_BACKOFF_SEC = 7200.0
 _warm_bot_gate_pause_until = 0.0   # monotonic clock, checked by all warm _run to fast-skip on YouTube bot-gate
 # Bot-gate pause requires 2+ CONSECUTIVE soft-negative failures. A single
 # soft-neg (e.g. the innertube race exhausting under degraded network) is a
@@ -886,7 +892,7 @@ def _enqueue_full_warm(
                     _full_warm_backoff_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
                     if time.monotonic() >= _warm_bot_gate_pause_until:
                         _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                        logger.warning("YouTube bot-gate detected (2 consecutive soft-negatives); warm paused 10min")
+                        logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
         finally:
             _full_warm_queued.discard(url)
 
@@ -927,7 +933,7 @@ def warm_youtube_preview_resolve(
                 and time.monotonic() >= _warm_bot_gate_pause_until
             ):
                 _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                logger.warning("YouTube bot-gate detected (2 consecutive soft-negatives); warm paused 10min")
+                logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         if reraise:
             raise
@@ -993,7 +999,7 @@ def warm_youtube_resolve_only(
                 and time.monotonic() >= _warm_bot_gate_pause_until
             ):
                 _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                logger.warning("YouTube bot-gate detected (2 consecutive soft-negatives); warm paused 10min")
+                logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
         from services.ytdlp_hls import _youtube_fatal_extract_error
 
         if not _youtube_fatal_extract_error(exc):

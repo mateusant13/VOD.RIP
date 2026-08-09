@@ -227,7 +227,7 @@ def _youtube_prog_head_warm(
             global _warm_bot_gate_pause_until
             if time.monotonic() >= _warm_bot_gate_pause_until:
                 _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                logger.warning("YouTube bot-gate detected; warm paused 10min")
+                logger.warning(f"YouTube bot-gate detected; warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
         logger.debug("prog head warm resolve failed %s: %s", vid, exc)
         return False
     from services.youtube_innertube import _dedupe_youtube_formats
