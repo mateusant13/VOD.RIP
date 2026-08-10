@@ -168,8 +168,8 @@ def test_semantic_backfills_then_reuses(_patch_embedder):
 
 
 def test_semantic_response_cache_serves_repeat_submit(_patch_embedder):
-    # The whole-pass response cache (not just the vector/rerank piece caches)
-    # must make an identical repeat submit instant: zero embedder work. The
+    # The whole-pass response cache (not just the vector piece cache) must
+    # make an identical repeat submit instant: zero embedder work. The
     # counting wrapper is installed BEFORE the first call so the cache key
     # (which stamps the callable identity) stays stable across both calls.
     import services.archive_embed
@@ -192,10 +192,9 @@ def test_semantic_response_cache_serves_repeat_submit(_patch_embedder):
         second = archive_db.search("criatura peluda", semantic=True)
         assert second == first
         assert counts["embed_query"] == n1  # repeat submit: whole pass cached
-        # Evict the piece caches too — the response cache alone still serves
-        # (the key's callable stamps are unchanged).
+        # Evict the piece cache too — the response cache alone still serves
+        # (the key's callable stamp is unchanged).
         archive_db._embed_query_cache.clear()
-        archive_db._rerank_cache.clear()
         third = archive_db.search("criatura peluda", semantic=True)
         assert third == first
         assert counts["embed_query"] == n1

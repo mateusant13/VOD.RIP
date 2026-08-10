@@ -617,24 +617,39 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     # known families (pt/en/es) are stamped — the exclusion only fires for
     # them; raw codes ('ja', ...) keep NULL so the tally never mistakes a
     # derived tag for independent evidence.
-    conn.execute(
-        """UPDATE transcripts SET lang = (
-               SELECT lower(substr(v.channel_language, 1,
-                      instr(v.channel_language || '-', '-') - 1))
-               FROM videos v
-               WHERE v.platform = transcripts.platform
-                 AND v.video_id = transcripts.video_id
+    # The UPDATE itself takes SQLite's write lock for its whole scan, so
+    # it is gated behind a reader-only EXISTS probe: on a current corpus
+    # (every lang already stamped) no write lock is ever taken — a fresh
+    # backend process used to hold a multi-minute write lock on connect,
+    # stalling the archive worker and every other writer on the DB.
+    need_lang = conn.execute(
+        """SELECT 1 FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
+               SELECT 1 FROM videos v
+               WHERE v.platform = t.platform AND v.video_id = t.video_id
                  AND v.channel_language IS NOT NULL AND v.channel_language != ''
-           )
-           WHERE lang IS NULL AND EXISTS (
-               SELECT 1 FROM videos v2
-               WHERE v2.platform = transcripts.platform
-                 AND v2.video_id = transcripts.video_id
-                 AND lower(substr(v2.channel_language, 1,
-                      instr(v2.channel_language || '-', '-') - 1))
-                     IN ('pt','en','es')
-           )"""
-    )
+                 AND lower(substr(v.channel_language, 1,
+                      instr(v.channel_language || '-', '-') - 1)) IN ('pt','en','es')
+           ) LIMIT 1"""
+    ).fetchone()
+    if need_lang is not None:
+        conn.execute(
+            """UPDATE transcripts SET lang = (
+                   SELECT lower(substr(v.channel_language, 1,
+                          instr(v.channel_language || '-', '-') - 1))
+                   FROM videos v
+                   WHERE v.platform = transcripts.platform
+                     AND v.video_id = transcripts.video_id
+                     AND v.channel_language IS NOT NULL AND v.channel_language != ''
+               )
+               WHERE lang IS NULL AND EXISTS (
+                   SELECT 1 FROM videos v2
+                   WHERE v2.platform = transcripts.platform
+                     AND v2.video_id = transcripts.video_id
+                     AND lower(substr(v2.channel_language, 1,
+                          instr(v2.channel_language || '-', '-') - 1))
+                         IN ('pt','en','es')
+               )"""
+        )
 
 
 def _ensure_spam_column(conn: sqlite3.Connection) -> None:
@@ -1576,6 +1591,63 @@ def has_chat(platform: str, video_id: str) -> bool:
 TRANSCRIPT_DUPE_MIN_GAP_SEC = 1.0
 
 
+def _collapse_transcript_dupes(hits: list[dict]) -> list[dict]:
+    """Drop transcript hits that repeat the same moment of the same video:
+    identical (offset, text) rows (duplicate caption rows in the archive —
+    re-fetched VTTs re-inserted instead of upserting), one caption that is
+    a substring of another at the same offset (whisper split artifacts —
+    the longer caption survives), or identical text < 1s later (YouTube
+    caption overlap, same rule as _dedupe_transcript_rows).
+
+    The search merge only dedupes by per-video cap, so duplicate caption
+    rows used to eat cap slots and show the same sentence twice in a row.
+    Preserves the input order of the survivors."""
+    by_video: dict[tuple[str, str], list[dict]] = {}
+    for h in hits:
+        if h.get("hit_kind") == "transcript" or h.get("kind") == "transcript":
+            by_video.setdefault((h["platform"], h["video_id"]), []).append(h)
+    if not by_video:
+        return hits
+    dropped: set[int] = set()
+    for video_hits in by_video.values():
+        video_hits.sort(key=lambda h: float(h.get("offset_sec") or 0.0))
+        kept: list[dict] = []
+        for h in video_hits:
+            text = str(h.get("text") or "")
+            off = float(h.get("offset_sec") or 0.0)
+            if (
+                kept
+                and text
+                and text == str(kept[-1].get("text") or "")
+                and off - float(kept[-1].get("offset_sec") or 0.0)
+                < TRANSCRIPT_DUPE_MIN_GAP_SEC
+            ):
+                dropped.add(id(h))
+                continue
+            # Same-moment (≤50ms) caption pair where one text is a
+            # substring of the other: whisper emitted the same sentence
+            # twice, once truncated. Keep the longer caption, whichever
+            # row arrives first.
+            replaced_idx: Optional[int] = None
+            for k_idx, k in enumerate(kept):
+                if abs(float(k.get("offset_sec") or 0.0) - off) < 0.05:
+                    kt = str(k.get("text") or "")
+                    if text == kt or (text and kt and (text in kt or kt in text)):
+                        replaced_idx = -1 if len(text) <= len(kt) else k_idx
+                        break
+            if replaced_idx == -1:
+                dropped.add(id(h))
+                continue
+            if replaced_idx is not None:
+                dropped.add(id(kept[replaced_idx]))
+                kept[replaced_idx] = h  # in-place: keeps the time order
+                continue
+            kept.append(h)
+    if not dropped:
+        return hits
+    return [h for h in hits if id(h) not in dropped]
+
+
 def _dedupe_transcript_rows(rows: list[dict]) -> list[dict]:
     """Drop a row whose text equals the previous KEPT row's text AND starts
     < TRANSCRIPT_DUPE_MIN_GAP_SEC later (YouTube auto-caption overlap).
@@ -2396,6 +2468,11 @@ def optimize_fts() -> None:
 # --- search ---------------------------------------------------------------
 
 _HITS_PER_VIDEO_CAP = 3  # dedupe ceiling: never let one video flood a result page
+# Lifted per-video cap for large-limit "every match" batches: not unlimited —
+# a single video's chat can hold 1900+ repeated rows ('cellbit' 3948 hits),
+# and the user wants a bounded, varied page, not one video's whole timeline.
+# 60 rows per video keeps the top of a 300-row literal page to ~5 videos.
+_LITERAL_PER_VIDEO_CAP = 60
 _PHRASE_BOOST = 1.5      # exact-phrase matches get +50% before the cross-table merge
 # All-query-tokens-present (any order/position) matches rank between exact
 # phrase (1.5) and the tier-0 OR noise floor (1.0). This is FTS5's implicit
@@ -2420,6 +2497,24 @@ _QUERY_TOKENS_EXPAND_CAP = 64
 # FULL token count, so a title matching only the first few of a huge query
 # keeps ranking as noise.
 _TITLES_MAX_TOKENS = 16
+# Repetitive-row downweight: rows that repeat the same 1-2 tokens 4+ times
+# ('CELLBIT CELLBIT CELLBIT CELLBIT', 'LO CELLBIT LO CELLBIT') are hype/
+# autocaption spam, not signal — they dominated single-token result pages
+# (score 1.5, partial=False, first page) because the exact-phrase tier
+# ranks every row carrying the word identically. 1.5 → 0.3 sinks them below
+# every real phrase hit while keeping them findable. Rows with ≥3 distinct
+# tokens (real sentences) are untouched.
+_SPAM_DOWNWEIGHT = 0.2
+_SPAM_MIN_TOKENS = 4
+_SPAM_MAX_UNIQUE_TOKENS = 2
+
+
+def _spam_penalty(text: str) -> float:
+    """1.0 for real content, _SPAM_DOWNWEIGHT for repeated-token spam."""
+    toks = re.findall(r"[^\W_]+", str(text or "").casefold())
+    if len(toks) < _SPAM_MIN_TOKENS or len(set(toks)) > _SPAM_MAX_UNIQUE_TOKENS:
+        return 1.0
+    return _SPAM_DOWNWEIGHT
 
 
 def search(
@@ -2456,13 +2551,16 @@ def search(
     hits get a +50% score boost before the cross-table merge (phrase pass
     runs first, then the fuzzy OR pass, unioned by rowid — phrase wins).
 
-    Query understanding: when no explicit channel is given and the query has
-    ≥2 tokens whose FIRST token case-insensitively matches a known
-    videos.channel slug, the channel filter is applied implicitly and that
-    token is stripped from the query. The whole pass only runs when a
-    _channel_hint_out list is passed (None = feature off, e.g. a UI that
-    dismissed the hint); the matched slug (as stored in the DB) is appended
-    to the box and the search router surfaces it as channel_hint.
+    Query understanding: when no explicit channel is given and the query's
+    FIRST token case-insensitively matches a known videos.channel slug, the
+    channel filter is applied implicitly. For ≥2-token queries the slug
+    token is stripped from the query; a single-token query keeps its token
+    (a bare channel search scopes to the channel while still matching the
+    name inside its content — 'gaveta' no longer means 'drawer' archive-
+    wide). The whole pass only runs when a _channel_hint_out list is passed
+    (None = feature off, e.g. a UI that dismissed the hint); the matched
+    slug (as stored in the DB) is appended to the box and the search router
+    surfaces it as channel_hint.
 
     Filters: platform exact; channel exact or comma-separated slug list
     ("a,b" → IN clause, empty segments dropped, case-insensitive); kind is a
@@ -2565,9 +2663,16 @@ def search(
     # Multi-token relevance floor: an OR-only (partial) row is only useful
     # if it carries a DISCRIMINATIVE query token — one of the rarest in the
     # merged corpus. Rows matching only common tokens ('vale' 3106 rows)
-    # are the recall noise that flooded literal-results pages. Tokens
-    # absent from the corpus (freq 0) can't be carried by any row and are
-    # excluded from the rarest set. Single-token queries skip the floor.
+    # are the recall noise that flooded literal-results pages.
+    # A token ABSENT from the vocab snapshot (freq 0 — rare words, typos,
+    # accented spellings the diacritic-stripped fts5vocab keys by) is the
+    # rarest possible signal, and its rows ARE reachable through the fuzzy
+    # tiers ('estranheza' → 'estranha' tier 2) — so absent tokens join the
+    # keep set together with their vocabulary expansions, instead of
+    # letting a common sibling token define the floor ('vale da
+    # estranheza' on a corpus lacking 'estranheza' used to keep 'VALE VALE'
+    # rows and drop every genuine 'estranha' match — inverted floor).
+    # Single-token queries skip the floor.
     q_freq: dict[str, int] = {}
     for vocab in (_load_vocab(t[2]) for t in loops):
         if not vocab:
@@ -2575,11 +2680,23 @@ def search(
         for bucket in vocab.values():
             for term, n in bucket:
                 q_freq[term] = q_freq.get(term, 0) + n
-    q_present = {t: q_freq[t] for t in q_tokens if q_freq.get(t, 0) > 0}
-    q_keep_tokens = (
-        {t for t, n in q_present.items() if n == min(q_present.values())}
-        if q_present and len(q_tokens) >= 2 else set()
-    )
+    q_keep_tokens: set[str] = set()
+    if len(q_tokens) >= 2:
+        q_absent = [t for t in q_tokens if q_freq.get(t, 0) == 0]
+        q_present = {t: q_freq[t] for t in q_tokens if q_freq.get(t, 0) > 0}
+        if q_absent:
+            # Absent tokens (freq 0) are the rarest signal; their rows only
+            # surface through fuzzy expansions, so they (and their variants,
+            # added below) define the floor. Present tokens below the
+            # chat-spam gate are genuinely discriminative too and survive
+            # alongside ('estranheza fantasma' must keep estranheza rows);
+            # common present tokens ('vale' ~3106) stay out or the floor
+            # loses its bite on corpora where the rare word is the absent one.
+            q_keep_tokens = set(q_absent) | {
+                t for t, n in q_present.items() if n <= _SUPPRESS_DIST1_FREQ
+            }
+        elif q_present:
+            q_keep_tokens = {t for t, n in q_present.items() if n == min(q_present.values())}
     # Tiered OR pattern (exact/fuzzy expansions + native prefix reach for
     # partial words) — see _fuzzy_pattern. The fallback quotes every raw
     # token (embedded quotes escaped) so a query like 'a"b' can never build
@@ -2619,6 +2736,15 @@ def search(
             for t in span_tokens
             if len(t) >= 4
         }
+        # Floor coverage for vocab-absent tokens: their rows only surface
+        # through fuzzy expansions ('estranheza' → 'estranha'), so the
+        # keep set must admit those variants — otherwise the floor drops
+        # exactly the typo/ASR matches the tiers were built to find.
+        if q_keep_tokens:
+            missing = [t for t in q_keep_tokens if q_freq.get(t, 0) == 0]
+            for t in missing:
+                for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq):
+                    q_keep_tokens.add(term)
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -2691,7 +2817,12 @@ def search(
         # Span pass: the exact phrase split across two adjacent segments.
         # Row scores are re-based to the batch max so they normalize to 1.0
         # and receive the same +50% phrase boost as within-row hits.
-        if hit_kind == "transcript" and len(span_tokens) >= 2:
+        # Skipped when the within-segment phrase pass already matched: the
+        # span scan is a full-table LIKE pass (~1-4s on 1.8M rows) that
+        # only ADDS split-case recall — when the exact phrase exists in
+        # single segments the user already has real hits, so the scan is
+        # pure redundant cost ('vale da estranheza' was 15s → ~5s).
+        if hit_kind == "transcript" and len(span_tokens) >= 2 and not phrase_rows:
             try:
                 span_rows = _phrase_span_rows(
                     span_tokens, fetch, span_variants=span_variants,
@@ -2738,6 +2869,10 @@ def search(
                     row_toks = set(re.findall(r"[^\W_]+", h["text"].casefold()))
                     if not row_toks.intersection(q_keep_tokens):
                         continue
+            # Repetitive-token rows (hype/autocaption spam) are not
+            # signal even when they contain the exact query word — sink
+            # them below every real phrase hit.
+            h["score"] *= _spam_penalty(h["text"])
             # A multi-word hit that reached only the fuzzy OR tier matched a
             # subset of the query — flag it so UIs can say "closest match".
             h["partial"] = not (phr or andf)
@@ -2762,11 +2897,13 @@ def search(
             date_to=date_to,
         )
         if title_rows:
-            tmax = max(r["score"] for r in title_rows)
-            for r in title_rows:
-                if tmax > 0:
-                    r["score"] = r["score"] / tmax
-                merged.append(r)
+            # No ÷tmax normalization: a title matching only a common token
+            # of a 4-word query ('quem foi que gritou' → "foi") used to
+            # normalize to 1.0 and outrank every genuine partial content
+            # hit. Score stays matched/len(q_tokens) with partial flagged,
+            # so a 1.0 means a full title match and the global merge sorts
+            # the rest (a "foi"-only title ranks at 0.25 with the partials).
+            merged.extend(title_rows)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
     # Relevance is the primary order: complete matches (partial False —
     # exact phrase 1.5, then all-words 1.25) lead, partial (subset-of-tokens)
@@ -2779,13 +2916,22 @@ def search(
     # priority (transcripts before messages), then by raw score — raw BM25
     # is only comparable WITHIN a table, so it must never be the
     # cross-table tie-break.
+    # Duplicate/overlapping transcript rows (re-fetched VTTs, whisper split
+    # artifacts) collapse BEFORE the cap, so one video's caption dups never
+    # eat the page or the per-video slots.
+    merged = _collapse_transcript_dupes(merged)
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
-    # FE's "infinite literal results" mode sends ~2000) wants EVERY match
-    # of a targeted word — the cap lifts, small/default limits keep it
-    # (the multi-token relevance floor above already culled single-token
-    # noise for multi-word queries).
-    cap = _HITS_PER_VIDEO_CAP if int(limit) <= _HITS_PER_VIDEO_CAP * 10 else 10**6
+    # FE's "infinite literal results" mode sends ~2000) wants every match
+    # of a targeted word — the cap lifts but stays bounded so one video's
+    # chat can't take the whole page; small/default limits keep the tight
+    # cap (the multi-token relevance floor above already culled
+    # single-token noise for multi-word queries).
+    cap = (
+        _HITS_PER_VIDEO_CAP
+        if int(limit) <= _HITS_PER_VIDEO_CAP * 10
+        else _LITERAL_PER_VIDEO_CAP
+    )
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
     for h in sorted(
@@ -3494,6 +3640,21 @@ def missing_embedding_segments(limit: int = 0) -> list[sqlite3.Row]:
 
 
 _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
+# Hard time budget for the semantic pass. The 300s wedge that killed the
+# listener was a RAM blow-up: the matrix used to be copied out of its mmap
+# (2.8GB) and converted to an fp16 GPU tensor (another 1.4GB this box
+# cannot allocate) — swap thrash froze the process. The matrix now stays
+# mmap'd, so a phase is bounded by disk read speed (~5-10s cold, ~1-2s
+# warm); the budget is the second layer: it degrades to pure lexical when
+# it expires BETWEEN phases (a running numpy op cannot be cancelled).
+# 12s lets a fully cold first pass (model load ~2.5s + first matrix scan
+# page-faulting 2.8GB) complete instead of silently dropping the concept
+# tier on the user's very first semantic search.
+_SEMANTIC_TIME_BUDGET_S = 12.0
+# Semantic candidate pool cap: bounds the candidates query and the
+# per-candidate metadata fetch. The top ~3x fetch get output; the rest of
+# the pool is headroom for the per-video cap.
+_SEMANTIC_RERANK_CAND_CAP = 60
 
 # RAM + disk cache of the full (sorted transcript_id, vec) matrix for the
 # semantic scan. Reading the corpus blobs is the dominant cost (~80s at
@@ -3503,31 +3664,31 @@ _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
 # (~21s) — MAX alone is the stamp; a deleted highest-id row leaves a stale
 # matrix row that no scope query can select (its transcript is gone), so it
 # is harmless until the next insert bumps the stamp.
-_embed_matrix_cache: Optional[tuple[tuple[str, int, Optional[str]], object, object, object]] = None
+_embed_matrix_cache: Optional[tuple[tuple[str, int, Optional[str]], object, object]] = None
 _embed_matrix_lock = threading.Lock()
-# One-time logged reason when the GPU scan is unavailable (diagnostic).
-_gpu_scan_fallback_logged = False
 
-# Per-process LRU caches for the semantic pass. The embed/rerank models are
-# deterministic given (query, input texts), so an identical repeated query
-# skips the ~10-100ms embed and the ~1.4s mmarco rerank entirely. Keys carry
-# the CALLABLE itself as an identity stamp: test suites monkeypatch these
-# functions per-test and a model reload swaps the session, so a stale key
-# can never serve a vector produced by a different model. Bounded by
-# maxsize; popitem(last=False) evicts the least-recently-used entry.
+# Per-process LRU cache for the semantic pass. The embed model is
+# deterministic given a query, so an identical repeated query skips the
+# ~2s cold embed. Keys carry the CALLABLE itself as an identity stamp:
+# test suites monkeypatch it per-test and a model reload swaps the
+# session, so a stale key can never serve a vector produced by a different
+# model. Bounded by maxsize; popitem(last=False) evicts the
+# least-recently-used entry.
+# (The mmarco cross-encoder rerank used to run here too — it was removed:
+# English-trained, it reordered good pt-BR cosine rankings into junk,
+# e.g. 0.974 'estratagema magnam' over 0.28 'queimada estranha'. The
+# multilingual e5 cosine order stands.)
 _embed_query_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
-_rerank_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
 _EMBED_QUERY_CACHE_MAX = 64
-_RERANK_CACHE_MAX = 16
 # Session-level RESPONSE cache for the whole semantic pass: an identical
 # repeat submit (same query + every filter + limit) skips the matrix scan
-# and rerank entirely — the vector/rerank caches above only skip pieces.
-# TTL ~60s so fresh ingest stays visible; keys carry the embed/rerank
-# callables as identity stamps (same convention as the caches above), so a
-# model reload can never serve stale vectors. ponytail: a write-heavy
-# session could keep re-serving pre-write vectors for the TTL window —
-# upgrade path: stamp the key with the transcript_embeddings MAX(id) when
-# the corpus churns faster than 60s.
+# entirely — the vector cache above only skips the embed piece. TTL ~60s
+# so fresh ingest stays visible; keys carry the embed callable as an
+# identity stamp (same convention as the cache above), so a model reload
+# can never serve stale vectors. ponytail: a write-heavy session could
+# keep re-serving pre-write vectors for the TTL window — upgrade path:
+# stamp the key with the transcript_embeddings MAX(id) when the corpus
+# churns faster than 60s.
 _semantic_resp_cache: "collections.OrderedDict[tuple, tuple[float, list[dict]]]" = (
     collections.OrderedDict()
 )
@@ -3543,39 +3704,17 @@ def _embed_matrix_paths(mx: int) -> tuple[Path, Path]:
     return dbp.parent / f"{stem}.ids.npy", dbp.parent / f"{stem}.mat.npy"
 
 
-def _gpu_scan_tensor(mat: object):
-    """fp16 CUDA tensor of the matrix (one-time ~4s conversion) or None.
+def _embed_matrix() -> tuple[object, object]:
+    """(sorted transcript_ids, vec matrix) — lazy full-corpus cache.
 
-    The scan itself is a 53ms matmul vs ~25s numpy BLAS on this corpus —
-    worth keeping the tensor alive. Any CUDA failure logs once and returns
-    None (the caller falls back to numpy)."""
-    global _gpu_scan_fallback_logged
-    exc: Optional[BaseException] = None
-    try:
-        import numpy as np
-        import torch
-
-        with torch.no_grad():
-            return torch.from_numpy(np.asarray(mat)).half().cuda()
-    except Exception as err:  # noqa: BLE001 — GPU is optional, scan degrades
-        exc = err
-    if not _gpu_scan_fallback_logged:
-        _gpu_scan_fallback_logged = True
-        import logging
-
-        logging.getLogger("vodrip.search").warning(
-            "semantic scan: GPU matmul unavailable — numpy BLAS fallback "
-            "(~25s on 1.79M segments), reason: %r",
-            exc,
-        )
-    return None
-
-
-def _embed_matrix() -> tuple[object, object, object]:
-    """(sorted transcript_ids, vec matrix, fp16 GPU tensor|None).
-
-    Lazy full-corpus cache: loads from the persisted .npy pair when present,
-    else builds + saves; the GPU tensor is derived once per matrix. The
+    Loads from the persisted .npy pair when present, else builds + saves.
+    The matrix stays MMAP'd: a RAM copy of the 2.8GB corpus is exactly
+    what wedged the frozen build (MemoryError thrash → the listener hung
+    past 300s), and numpy matmul reads the mapped pages lazily (~0.8s warm
+    on 1.83M rows — the GPU tensor it used to build needed a 1.4GB fp16
+    copy this box cannot allocate). The mmap pins the .npy file until the
+    cache is replaced; the stale-file cleanup skips the live pair and any
+    unlink of a file this process still maps raises, which is caught. The
     caller handles an empty corpus (never None)."""
     global _embed_matrix_cache
     import numpy as np
@@ -3591,21 +3730,17 @@ def _embed_matrix() -> tuple[object, object, object]:
     key = (str(_db_path()), mx, archive_embed.embed_fingerprint())
     hit = _embed_matrix_cache
     if hit is not None and hit[0] == key:
-        return hit[1], hit[2], hit[3]
+        return hit[1], hit[2]
     with _embed_matrix_lock:
         hit = _embed_matrix_cache
         if hit is not None and hit[0] == key:
-            return hit[1], hit[2], hit[3]
+            return hit[1], hit[2]
         ids, mat = None, None
         ids_p, mat_p = _embed_matrix_paths(mx)
         try:
             if ids_p.exists() and mat_p.exists():
                 ids = np.load(ids_p, mmap_mode="r")
                 mat = np.load(mat_p, mmap_mode="r")
-                # Writable copies: torch.from_numpy rejects read-only arrays
-                # (and the mmap is released so the file can rotate).
-                ids = np.array(ids, copy=True)
-                mat = np.array(mat, copy=True)
         except Exception:
             ids, mat = None, None
         if ids is None:
@@ -3636,26 +3771,16 @@ def _embed_matrix() -> tuple[object, object, object]:
                         stale.unlink(missing_ok=True)
             except Exception:
                 pass  # disk cache is best-effort; RAM cache still serves
-        _embed_matrix_cache = (key, ids, mat, _gpu_scan_tensor(mat))
-        return ids, mat, _embed_matrix_cache[3]
+        _embed_matrix_cache = (key, ids, mat)
+        return ids, mat
 
 
-def _matmul_scores(mat: object, qv: object, gpu: object, idx: object = None) -> object:
-    """Cosine scores for the scope slice — fp16 GPU matmul when the matrix
-    tensor is available (~53ms at 1.79M rows), numpy BLAS fallback on CPU."""
+def _matmul_scores(mat: object, qv: object, idx: object = None) -> object:
+    """Cosine scores for the scope slice — numpy BLAS over the mmap'd
+    matrix (read-only matmul is fine; ~0.8s at 1.79M rows when the pages
+    are warm)."""
     import numpy as np
 
-    if gpu is not None:
-        try:
-            import torch
-
-            with torch.no_grad():
-                qvg = torch.from_numpy(np.asarray(qv)).half().cuda()
-                if idx is None:
-                    return (gpu @ qvg).float().cpu().numpy()
-                return (gpu[torch.from_numpy(np.asarray(idx))] @ qvg).float().cpu().numpy()
-        except Exception:
-            pass  # transient CUDA issue — fall back to numpy this query
     sub = mat if idx is None else np.asarray(mat)[idx]
     return np.asarray(sub) @ np.asarray(qv)
 
@@ -3780,21 +3905,29 @@ def _semantic_search(
 
     from services import archive_embed  # lazy: onnxruntime stays out of boot
 
+    # Time budget: the pass must never wedge the request path on a slow
+    # box. Checked between phases only (numpy ops cannot be cancelled); an
+    # expired deadline degrades to pure lexical instead of returning a
+    # half-ranked result. NOT cached — the next attempt may succeed warm.
+    deadline = time.monotonic() + _SEMANTIC_TIME_BUDGET_S
+
+    def _over_budget() -> bool:
+        return time.monotonic() > deadline
+
     # Whole-pass response cache: identical params within the TTL return the
     # previous hit list (deep-copied — callers mutate hits, e.g. the
-    # _attach_platforms pass). Key carries the model callables AND their
-    # file fingerprints, so a session that swaps models (or re-exports a
-    # model file) never reuses stale vectors or stale ranking.
+    # _attach_platforms pass). Key carries the model callable AND its file
+    # fingerprint, so a session that swaps models (or re-exports a model
+    # file) never reuses stale vectors.
     efp = archive_embed.embed_fingerprint()
-    rfp = archive_embed.rerank_fingerprint()
     # Query spelling is corrected against the corpus vocab before embedding
     # (deterministic given q, so the cache stays effective on repeat
     # submits; both the raw and corrected forms ride in the key).
     q_embed = _semantic_query_text(q)
     resp_key = (
         q, q_embed, tuple(platforms), video_id, channel, tuple(kinds),
-        date_from, date_to, lang, fetch, efp, rfp,
-        archive_embed.embed_query, archive_embed.rerank,
+        date_from, date_to, lang, fetch, efp,
+        archive_embed.embed_query,
     )
     cached = _semantic_resp_cache.get(resp_key)
     if cached is not None:
@@ -3805,6 +3938,8 @@ def _semantic_search(
     qkey = (q_embed, efp, archive_embed.embed_query)
     qv = _embed_query_cache.get(qkey)
     if qv is None:
+        if _over_budget():
+            return None
         raw = archive_embed.embed_query(q_embed)
         if raw is None:
             return None
@@ -3846,14 +3981,20 @@ def _semantic_search(
     else:
         missing = []
     if missing:
+        if _over_budget():
+            return None
         vecs = archive_embed.embed_texts([r["text"] for r in missing], "passage: ")
         if vecs is None:
             return None
         for r, v in zip(missing, vecs):
             set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
 
-    ids, mat, gpu = _embed_matrix()
+    if _over_budget():
+        return None
+    ids, mat = _embed_matrix()
     if len(ids) == 0:
+        return None
+    if _over_budget():
         return None
 
     # Scope ids: every matching transcript that has a vector. Unfiltered
@@ -3861,6 +4002,8 @@ def _semantic_search(
     if not (platforms or video_id or channel or kinds or date_from or date_to or lang):
         scope_ids = ids
     else:
+        if _over_budget():
+            return None
         sql = (
             "SELECT t.id AS id FROM transcripts t "
             "JOIN transcript_embeddings e ON e.transcript_id = t.id "
@@ -3882,7 +4025,7 @@ def _semantic_search(
     if scope_ids is ids:
         # Full-corpus scope: score the matrix directly (indexing would copy
         # 2.8GB for zero benefit).
-        scores = _matmul_scores(mat, qv, gpu)
+        scores = _matmul_scores(mat, qv)
     else:
         idx = np.searchsorted(ids, scope_ids)
         # Every scope id must exist in the matrix (scope JOINs on has-vec);
@@ -3892,9 +4035,11 @@ def _semantic_search(
             ids[np.minimum(idx, len(ids) - 1)] != scope_ids
         ):
             return None
-        scores = _matmul_scores(mat, qv, gpu, idx=idx)
+        scores = _matmul_scores(mat, qv, idx=idx)
+    if _over_budget():
+        return None
     order = np.argsort(-scores)
-    top_n = max(fetch * 2, 30)
+    top_n = min(max(fetch * 2, 30), _SEMANTIC_RERANK_CAND_CAP)
     cand_ids = [int(scope_ids[int(i)]) for i in order[:top_n]]
     cand_scores = [float(scores[int(i)]) for i in order[:top_n]]
     if not cand_ids:
@@ -3921,22 +4066,12 @@ def _semantic_search(
             cand.append(r)
             keep.append(s)
     cand_scores = keep
-    # mmarco rerank of the top candidates is the semantic path's dominant
-    # cost (~1.4s at 150 pairs); identical (query, candidates) pairs are
-    # cached — the model is deterministic and transcript text is immutable
-    # per rowid (deletes cascade, updates rewrite rows).
-    rkey = (q_embed, rfp, tuple(r["text"] for r in cand), archive_embed.rerank)
-    reranked = _rerank_cache.get(rkey)
-    if reranked is None:
-        reranked = archive_embed.rerank(q_embed, [r["text"] for r in cand])
-        if reranked is not None:
-            reranked = tuple(reranked)
-            if len(_rerank_cache) >= _RERANK_CACHE_MAX:
-                _rerank_cache.popitem(last=False)
-            _rerank_cache[rkey] = reranked
-    if reranked is not None:
-        cand = [c for _, c in sorted(zip(reranked, cand), key=lambda t: -t[0])]
-        cand_scores = sorted(reranked, reverse=True)
+    # Candidate order IS the cosine order: the mmarco cross-encoder rerank
+    # used to reorder these, but it is English-trained — on pt-BR queries
+    # it ranked junk above real matches ('estratagema magnam' 0.974 over
+    # 'queimada estranha' 0.28 for 'estranheza'; for 'vale da estranheza'
+    # it demoted 0.90 cosine hits to 0.26). The multilingual e5 cosine
+    # ranking stands as-is.
     out: list[dict] = []
     per_video: dict[tuple[str, str], int] = {}
     for cos, r in zip(cand_scores, cand):
@@ -3965,6 +4100,10 @@ def _semantic_search(
     # embedding scan has no SQL row filter, so mismatched-family hits are
     # dropped here (Python twin of _channel_lang_exclusion).
     out = [h for h in out if _lang_matches_channel(h["lang"], h["channel_language"])]
+    # Duplicate caption rows (re-fetched VTTs) embed identically and used
+    # to rank as repeated hits ('Esther fênix' twice at 0.619 for
+    # 'estranheza') — collapse them like the lexical merge does.
+    out = _collapse_transcript_dupes(out)
     if len(_semantic_resp_cache) >= _SEMANTIC_RESP_CACHE_MAX:
         _semantic_resp_cache.popitem(last=False)
     _semantic_resp_cache[resp_key] = (time.monotonic(), [dict(h) for h in out])
@@ -3993,11 +4132,14 @@ def _videos_stamp() -> tuple[int, Optional[str]]:
 def _channel_hint_for(q: str) -> Optional[str]:
     """First-token channel slug match, or None.
 
-    Fires only for queries with ≥2 tokens (a bare channel query would strip
-    itself to nothing). Returns the slug exactly as stored in videos.channel
-    so the UI can render a canonical chip."""
+    Fires for ≥2-token queries (scope + strip the leading slug) and for
+    single-token queries that ARE a channel slug (scope only — the caller
+    keeps the token, so 'gaveta' matches 'gaveta' inside the Gaveta
+    channel's content instead of every drawer mention in the archive).
+    Returns the slug exactly as stored in videos.channel so the UI can
+    render a canonical chip."""
     tokens = q.split()
-    if len(tokens) < 2:
+    if not tokens:
         return None
     first = tokens[0].lower()
     global _channel_slug_cache
