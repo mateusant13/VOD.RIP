@@ -640,12 +640,13 @@ def test_search_video_id_scopes_to_one_video():
     # A louder hit on ANOTHER video would outrank every scoped hit — the
     # video_id filter must exclude it at SQL level, not by post-filtering.
     # The louder video is the NEWEST, so under newest-first ordering its
-    # 4-zebra message leads the unscoped result page.
+    # zebra message leads the unscoped result page (phrase rows tie at
+    # 1.5; the newest-first date tiebreak wins).
     _insert_video("filter-t-louder", channel="louder",
                   started_at="2026-08-02T12:00:00Z", kind="vod")
     archive_db.insert_messages(
         "twitch", "filter-t-louder",
-        [{"offset_sec": 1.0, "username": "u", "text": "zebra zebra zebra zebra"}],
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra em alta hoje"}],
     )
     try:
         # Newest-first: the louder hit (newest video) leads the page; the

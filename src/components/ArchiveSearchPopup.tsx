@@ -105,9 +105,11 @@ function defaultPopupHeight(): number {
   return Math.min(Math.round(window.innerHeight * 0.88), 760);
 }
 const SEARCH_DEBOUNCE_MS = 250;
-/** Literal-word searches return every match (the backend caps at 5000) —
- *  the list renders incrementally, so a huge result set stays smooth. */
-const SEARCH_LIMIT_LITERAL = 2000;
+/** Literal-word searches page through matches; 300 rows (5 videos × 60,
+ *  bounded server-side) is a full scroll of variety — the old 2000 flooded
+ *  the page with one video's repeated chat and took 20s+ under load. The
+ *  list renders incrementally, so even this stays smooth. */
+const SEARCH_LIMIT_LITERAL = 300;
 /** Semantic (embedding) search stays tight — it is expensive per candidate. */
 const SEARCH_LIMIT_SEMANTIC = 30;
 /** How many hits render per scroll batch. */
@@ -479,6 +481,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     // Empty query is still a valid search when the chat-author filter is
     // set: the backend returns that author's whole history, newest first.
     if (!query && !userFilter.trim()) {
+      searchGenRef.current += 1;
+      setStatus('idle');
+      setHits([]);
+      setVisibleCount(HITS_RENDER_CHUNK);
+      setEnriching([]);
+      setError(null);
+      return;
+    }
+    // A 1-char query is a keystroke mid-word, not a search: firing it
+    // sends a 300-row request for 'o' (millions of matches, seconds of
+    // latency) that the next keystroke immediately cancels. Wait for ≥2
+    // chars (the author-history path above stays untouched).
+    if (query.trim().length < 2 && !userFilter.trim()) {
       searchGenRef.current += 1;
       setStatus('idle');
       setHits([]);
