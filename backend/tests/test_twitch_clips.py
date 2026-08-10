@@ -505,3 +505,46 @@ async def test_bad_login_rejected(_isolated_data_dir):
         assert res.status_code == 422
         rows = await _history(client)
         assert rows == []
+
+
+# --- debugging event sink (clip flow replay) ------------------------------
+
+@pytest.mark.anyio
+async def test_clip_events_sink_roundtrip(_isolated_data_dir):
+    """POST /api/debug/clip-events appends a timestamped JSON line to
+    <data_dir>/clip-events.log; GET reads it back in order."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "ext_start",
+                  "data": {"hostname": "clips.twitch.tv", "startSec": 300}},
+        )
+        assert r.status_code == 200 and r.json()["ok"] is True
+        r = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "app", "event": "browser_open",
+                  "data": {"url": "https://clips.twitch.tv/create?x=1"}},
+        )
+        assert r.status_code == 200
+        rows = (await client.get("/api/debug/clip-events")).json()
+        assert len(rows) == 2
+        assert rows[0]["src"] == "ext" and rows[0]["event"] == "ext_start"
+        assert rows[0]["startSec"] == 300  # data flattened into the line
+        assert rows[1]["event"] == "browser_open"
+        assert rows[0]["ts"] and rows[1]["ts"]
+        assert (_isolated_data_dir / "clip-events.log").exists()
+
+
+@pytest.mark.anyio
+async def test_clip_events_sink_validates(_isolated_data_dir):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        bad_src = await client.post("/api/debug/clip-events", json={"src": "nope", "event": "x"})
+        assert bad_src.status_code == 422
+        bad_event = await client.post("/api/debug/clip-events", json={"src": "ext", "event": ""})
+        assert bad_event.status_code == 422
+        big = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "x", "data": {"blob": "y" * 9000}},
+        )
+        assert big.status_code == 422
+        assert (await client.get("/api/debug/clip-events")).json() == []

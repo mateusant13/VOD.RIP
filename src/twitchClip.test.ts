@@ -188,6 +188,9 @@ describe('openTwitchClipEditorInBrowser', () => {
       expect(u.searchParams.get('vodrip_start')).toBe('458');
       expect(u.searchParams.get('vodrip_end')).toBe('520');
       expect(u.searchParams.get('vodrip_title')).toBe('Teste VOD.RIP');
+      // Browser path is the user's explicit choice — the Twitch tab stays
+      // open after the flow (the extension's closeAfterFlow honors this).
+      expect(u.searchParams.get('vodrip_close')).toBe('0');
     } finally {
       vi.restoreAllMocks();
     }

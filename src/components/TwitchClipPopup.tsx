@@ -32,6 +32,7 @@ import {
   initialClipSelection,
   openTwitchClipEditor,
   openTwitchClipEditorInBrowser,
+  reportClipEvent,
   twitchClipDurationError,
   twitchClipWindow,
 } from '../twitchClip';
@@ -546,6 +547,13 @@ export default function TwitchClipPopup({
       // status/install endpoints unreachable — open the editor anyway; the
       // page still loads (the extension just won't auto-publish).
     }
+    reportClipEvent('create_clicked', {
+      method: 'browser',
+      startSec: sel.start,
+      endSec: sel.end,
+      durationSec: sel.end - sel.start,
+      title: clipTitle.trim() || null,
+    });
     openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
   }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
@@ -558,6 +566,13 @@ export default function TwitchClipPopup({
       showClipNotice('error', err);
       return;
     }
+    reportClipEvent('create_clicked', {
+      method: 'api',
+      startSec: sel.start,
+      endSec: sel.end,
+      durationSec: sel.end - sel.start,
+      title: clipTitle.trim() || null,
+    });
     const { offsetSec, durationSec } = clipEditorOffsetAndDuration(sel.start, sel.end);
     setClipOpening(true);
     try {
@@ -577,11 +592,15 @@ export default function TwitchClipPopup({
         || res.error.code === 'unauthorized'
       ) {
         // The Helix token can't clip via Helix (missing, scope-less, or
-        // invalid/expired) — fall back to the browser editor + VOD.RIP
-        // extension, which publish with the session cookie and the exact
-        // selection + title. The clip still gets created, zero interaction.
-        showClipNotice('ok', t('This token can\'t clip via Helix — using the browser editor instead'));
-        void createInBrowser();
+        // invalid/expired). The "Create Twitch clip" button is BACKEND-ONLY
+        // by design — never open a browser window behind the user's back;
+        // the explicit browser path is the "Open in browser" button. Surface
+        // the token problem (the scope-copy hint renders for these codes).
+        showClipNotice(
+          'error',
+          t('This token can\'t clip via Helix — use "Open in browser" or paste a token with clip scopes'),
+          res.error.code,
+        );
       } else {
         showClipNotice('error', res.error.message, res.error.code);
       }
@@ -590,7 +609,7 @@ export default function TwitchClipPopup({
     } finally {
       setClipOpening(false);
     }
-  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice, createInBrowser]);
+  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice]);
 
   const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
   const playFrac = secToFrac(currentTime, railView) * 100;

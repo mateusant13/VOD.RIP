@@ -19,6 +19,17 @@ export const TWITCH_CLIP_MIN_SEC = 5;
 export const TWITCH_CLIP_TITLE_MAX = 140;
 
 /**
+ * Debugging event sequence for the clip flow: every step of a clip attempt
+ * (app UI, Helix API, browser cookie extension) appends a timestamped JSON
+ * line to the backend's clip-events log so the attempt can be replayed end
+ * to end — see GET /api/debug/clip-events. Fire-and-forget: logging must
+ * never affect the flow.
+ */
+export function reportClipEvent(event: string, data: Record<string, unknown> = {}): void {
+  void apiPost('/api/debug/clip-events', { src: 'app', event, data }).catch(() => {});
+}
+
+/**
  * Mini-preview window for the "Twitch clip" button: ±60s around the click
  * moment, clamped to the VOD edges (shorter at the edges is fine). Unknown
  * duration (<=0) leaves the upper edge unclamped — the backend clamps the
@@ -215,11 +226,16 @@ export function openTwitchClipEditorInBrowser(
     vodrip_clip: '1',
     vodrip_start: String(Math.max(0, Math.floor(startSec))),
     vodrip_end: String(Math.max(0, Math.ceil(endSec))),
+    // The browser path is the user's explicit choice ("Open in browser") —
+    // keep the Twitch tab open after the flow so the editor + published clip
+    // stay visible. Default (absent) is close, per the window rule.
+    vodrip_close: '0',
   });
   if (title) p.set('vodrip_title', title);
-  openExternal(
-    `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`,
-  );
+  const url =
+    `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
+  reportClipEvent('browser_open', { url, startSec, endSec, title: title ?? null });
+  openExternal(url);
 }
 
 /**
@@ -230,13 +246,21 @@ export function openTwitchClipEditorInBrowser(
 export async function openTwitchClipEditor(
   args: OpenTwitchClipArgs,
 ): Promise<TwitchClipOpenResult> {
-  return apiPost<TwitchClipOpenResult>('/api/twitch/clip', {
+  const body = {
     broadcaster_login: args.broadcasterLogin,
     vod_id: args.vodId ?? null,
     offset_sec: args.offsetSec ?? null,
     duration_sec: args.durationSec ?? null,
     title: args.title ?? null,
-  });
+  };
+  reportClipEvent('api_request', body);
+  const res = await apiPost<TwitchClipOpenResult>('/api/twitch/clip', body);
+  if (res.ok) {
+    reportClipEvent('api_success', { id: res.id, edit_url: res.edit_url });
+  } else {
+    reportClipEvent('api_error', { code: res.error.code, message: res.error.message });
+  }
+  return res;
 }
 
 /** Public clip URL for a Helix edit_url (drops a trailing /edit, if any). */

@@ -87,12 +87,35 @@
     (document.title || '').replace(/\s*-\s*Twitch\s*$/i, '').trim() ||
     'Clip';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // Debugging event sequence: every flow step is POSTed to the app's
+  // clip-events sink (same API base as the cookie bridge) so a clip attempt
+  // can be replayed end to end from the app log. Fire-and-forget — logging
+  // must never break the flow. The dynamic import stays lazy so a bridge
+  // module failure can't take the clip flow down with it.
+  const note = (event, data = {}) => {
+    try {
+      import('./modules/cookie_bridge.mjs')
+        .then(({ getApiBase }) => getApiBase())
+        .then((base) =>
+          fetch(base + '/api/debug/clip-events', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ src: 'ext', event, data }),
+          }).catch(() => {}),
+        )
+        .catch(() => {});
+    } catch { /* ignore */ }
+  };
   // User window rule: after the flow ends (success OR failure) the editor
   // tab closes itself. The BACKGROUND holds the delay: content-script
   // timers freeze in hidden/throttled tabs (Chrome Memory Saver), so the
   // close message is sent immediately and the service worker waits.
   // vodrip_close=0 keeps the tab open. Default: close.
   const closeAfterFlow = (delayMs = 1200) => {
+    note('ext_close', {
+      mode: (params.get('vodrip_close') || '1') === '0' ? 'stay-open' : 'close',
+      delayMs,
+    });
     if ((params.get('vodrip_close') || '1') === '0') {
       // Stay-open mode: still stop the preview video so the tab is idle
       // (the looping editor preview was the GPU hog).
@@ -106,6 +129,14 @@
       try { window.close(); } catch { /* ignore */ }
     }
   };
+  note('ext_start', {
+    hostname: location.hostname,
+    startSec,
+    endSec,
+    title,
+    diag: params.get('vodrip_diag') === '1',
+    closeMode: (params.get('vodrip_close') || '1') === '0' ? 'stay-open' : 'close',
+  });
   // React-fiber access lives in the page's MAIN world: content scripts
   // (isolated world) CANNOT see the __reactFiber$ expando React puts on DOM
   // nodes, and inline script tags get blocked by the page CSP/Trusted Types
@@ -208,6 +239,13 @@
     // cannot see the __reactFiber$ expando); the helper polls the
     // valuetext and reports what the editor ACTUALLY accepted.
     const res = await rangeViaMainWorld(startSec, endSec);
+    note('ext_range', {
+      ok: !!res.ok,
+      targetStart: startSec,
+      targetEnd: endSec,
+      valuetext: res.ok ? (res.valuetext || null) : null,
+      reason: res.ok ? null : (res.reason || null),
+    });
     if (!res.ok) {
       const reason = res.reason || 'falha';
       setStatus(
@@ -387,6 +425,7 @@
         const errorPage = /something went wrong|ocorreu um problema|algo deu errado/i.test(
           document.body ? document.body.innerText : '',
         );
+        note('ext_error', { step: 'editor-input', reason: errorPage ? 'twitch-error-page' : 'not-loaded' });
         setStatus(
           errorPage
             ? 'A Twitch redirecionou para a página de erro — você está logado na Twitch nesta aba? Faça login e tente de novo.'
@@ -396,6 +435,7 @@
         return;
       }
       setReactValue(editorInput, title);
+      note('ext_title', { title, flow: 'create' });
       setStatus(`Título preenchido: ${title}`);
       const rangeErr = await setEditorRange(document, startSec, endSec);
       if (rangeErr) {
@@ -420,10 +460,12 @@
         800,
       );
       if (!save) {
+        note('ext_error', { step: 'save-btn', reason: 'missing' });
         setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
         closeAfterFlow();
         return;
       }
+      note('ext_save_clicked', { startSec, endSec, title });
       await sleep(1200);
       click(save);
       // Success = the SPA navigates to /<slug>, or the editor reaches its
@@ -443,6 +485,7 @@
           const shareInput = find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
           if (shareInput) clipUrl = (shareInput.value || '').trim() || clipUrl;
         } catch { /* ignore */ }
+        note('ext_published', { url: clipUrl || null, via: published === 'copy' ? 'copy-link' : 'navigation' });
         setStatus(
           clipUrl
             ? `Clip publicado ✓\n${title}\n${clipUrl}`
@@ -459,6 +502,7 @@
       );
       closeAfterFlow(2000);
     })().catch((err) => {
+      note('ext_error', { step: 'crash', msg: (err && err.message ? err.message : String(err)) });
       setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
     });
     return;
@@ -500,6 +544,7 @@
       1000,
     );
     if (!clipBtn) {
+      note('ext_error', { step: 'clip-btn', reason: 'never-enabled' });
       setStatus('Botão Clip não habilitou (anúncio em reprodução?) — tente de novo mais tarde.', 'err');
       closeAfterFlow(2000);
       return;
@@ -559,6 +604,7 @@
       );
     }
     if (!editor) {
+      note('ext_error', { step: 'editor-dialog', reason: 'missing' });
       setStatus(
         'Não consegui abrir o editor (faça login na Twitch nesta aba e tente de novo).\nTítulo: ' +
           (title || '(vazio)') +
@@ -590,8 +636,10 @@
       ]);
     if (input) {
       setReactValue(input, title);
+      note('ext_title', { title, flow: 'videos' });
       setStatus(`Título preenchido: ${title}`);
     } else {
+      note('ext_error', { step: 'title-input', reason: 'missing' });
       setStatus('Campo de título não encontrado — preencha manualmente.', 'err');
     }
 
@@ -613,10 +661,12 @@
       500,
     );
     if (!publish) {
+      note('ext_error', { step: 'publish-btn', reason: 'missing' });
       setStatus('Botão Publish não encontrado — clique você mesmo.', 'err');
       closeAfterFlow();
       return;
     }
+    note('ext_publish_clicked', { startSec, endSec, title });
     setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
     await sleep(1200);
     click(publish);
@@ -638,6 +688,7 @@
         if (shareInput) clipUrl = (shareInput.value || '').trim();
       } catch { /* ignore */ }
       if (!clipUrl) clipUrl = location.href;
+      note('ext_published', { url: clipUrl, via: published === 'copy' ? 'copy-link' : 'navigation' });
       setStatus(
         clipUrl
           ? `Clip publicado ✓\n${title}\n${clipUrl}`

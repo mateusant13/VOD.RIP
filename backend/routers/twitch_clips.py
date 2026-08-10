@@ -66,6 +66,85 @@ class TwitchClipHistoryDeleteRequest(BaseModel):
     ids: List[str]
 
 
+class ClipEventBody(BaseModel):
+    """One step of the clip flow's debugging event sequence.
+
+    src: 'app' (React UI), 'ext' (browser cookie extension content script) or
+    'api' (this backend). Every step gets a server-side timestamp; the app and
+    the extension POST their steps here so a clip attempt can be replayed end
+    to end from <data_dir>/clip-events.log (see GET /api/debug/clip-events).
+    """
+
+    src: str = "app"
+    event: str
+    data: Dict[str, Any] = {}
+
+
+CLIP_EVENTS_FILE = "clip-events.log"
+CLIP_EVENTS_KEEP = 2000  # lines retained after the size cap kicks in
+CLIP_EVENTS_MAX_BYTES = 1_000_000
+
+
+def _append_clip_event(src: str, event: str, data: Dict[str, Any]) -> None:
+    """Append one JSON line to the clip event log. Best-effort: a full disk or
+    log failure must never break the clip flow itself."""
+    try:
+        path = data_dir() / CLIP_EVENTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "src": src,
+                "event": event,
+                **data,
+            },
+            ensure_ascii=False,
+        )
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        # ponytail: rotation = truncate to the tail once the file passes the
+        # cap; upgrade path: proper log rotation if this ever ships to users.
+        if path.stat().st_size > CLIP_EVENTS_MAX_BYTES:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if len(lines) > CLIP_EVENTS_KEEP:
+                path.write_text(
+                    "\n".join(lines[-CLIP_EVENTS_KEEP:]) + "\n", encoding="utf-8"
+                )
+    except Exception as exc:  # logging must never fail the request
+        logger.warning("clip event log write failed: %s", exc)
+
+
+def _create_clip(req: TwitchClipRequest, login: str) -> Dict[str, Any]:
+    """VOD/live dispatch + API event-sequence logging (outcome truth for the
+    clip flow replay: which params reached Helix and what came back)."""
+    result = (
+        _create_vod_clip(req, login)
+        if req.vod_id is not None
+        else _create_live_clip(req, login)
+    )
+    common = {
+        "broadcaster_login": login,
+        "vod_id": req.vod_id,
+        "offset_sec": req.offset_sec,
+        "duration_sec": req.duration_sec,
+        "title": req.title,
+    }
+    if result.get("ok"):
+        _append_clip_event(
+            "api",
+            "api_clip_success",
+            {**common, "id": result.get("id"), "edit_url": result.get("edit_url")},
+        )
+    else:
+        err = result.get("error") or {}
+        _append_clip_event(
+            "api",
+            "api_clip_error",
+            {**common, "code": err.get("code"), "message": err.get("message")},
+        )
+    return result
+
+
 def _history_path() -> Path:
     return data_dir() / HISTORY_FILE
 
@@ -321,6 +400,37 @@ def delete_twitch_clips_history(
     return {"ok": True, "removed": removed}
 
 
+@router.post("/api/debug/clip-events")
+def post_clip_event(body: ClipEventBody) -> Dict[str, Any]:
+    """Event-sequence sink for the clip flow (app UI + browser extension POST
+    their steps here; timestamps are added server-side). Localhost-only app,
+    append-only log — validation is a sanity guard, not an auth boundary."""
+    if body.src not in ("app", "ext", "api"):
+        raise HTTPException(status_code=422, detail="invalid src")
+    if not body.event or len(body.event) > 120:
+        raise HTTPException(status_code=422, detail="invalid event")
+    if not isinstance(body.data, dict) or len(json.dumps(body.data)) > 8000:
+        raise HTTPException(status_code=422, detail="data too large")
+    _append_clip_event(body.src, body.event, body.data)
+    return {"ok": True}
+
+
+@router.get("/api/debug/clip-events")
+def get_clip_events(limit: int = 200) -> List[Dict[str, Any]]:
+    """Read back the last N clip events (debugging helper)."""
+    try:
+        lines = (data_dir() / CLIP_EVENTS_FILE).read_text("utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in lines[-max(1, min(limit, CLIP_EVENTS_KEEP)):]:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue  # a corrupt line must not hide the rest
+    return out
+
+
 @router.post("/api/twitch/clip")
 def create_twitch_clip(req: TwitchClipRequest) -> Dict[str, Any]:
     login = (req.broadcaster_login or "").strip()
@@ -356,7 +466,7 @@ def create_twitch_clip(req: TwitchClipRequest) -> Dict[str, Any]:
                     f"{TWITCH_CLIP_MIN_SEC}..{TWITCH_CLIP_MAX_SEC}"
                 ),
             )
-        return _create_vod_clip(req, login)
+        return _create_clip(req, login)
 
     # Live stream: Helix clips the current broadcast's recent window.
     if req.offset_sec is not None or req.duration_sec is not None:
@@ -364,7 +474,7 @@ def create_twitch_clip(req: TwitchClipRequest) -> Dict[str, Any]:
             status_code=422,
             detail="offset/duration only valid with vod_id",
         )
-    return _create_live_clip(req, login)
+    return _create_clip(req, login)
 
 
 # --- module self-check (error mapping — no I/O, no network) ---------------
