@@ -8,6 +8,7 @@ import random
 import re
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin
 
@@ -31,6 +32,14 @@ actual BANDWIDTH when fetched.  (ponytail: no realtime m3u8 parse for
 bandwidth — probes are cheap enough.)
 '''
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+
+
+class TwitchVodUnavailable(RuntimeError):
+    """No Twitch VOD playback path worked (sub-only / geo-restricted / removed).
+
+    Raised instead of silently falling into a slow yt-dlp extract that would
+    reproduce the same failure — the caller surfaces it immediately.
+    """
 
 CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9eba8f91d88"
 CLIP_ACCESS_TOKEN_HASH = "993d9a5131f15a37bd16f32342c44ed1e0b1a9b968c6afdb662d2cddd595f6c5"
@@ -388,28 +397,54 @@ def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str
     created_at = video_data.get("createdAt") or ""
 
     is_highlight = broadcast_type == "HIGHLIGHT"
-    is_upload = broadcast_type == "UPLOAD"
 
     def _variant_url(res_key: str) -> str:
         if is_highlight:
             return f"{domain}/{vod_special_id}/{res_key}/highlight-{vod_id}.m3u8"
         return f"{domain}/{vod_special_id}/{res_key}/index-dvr.m3u8"
 
-    variants: List[Dict[str, Any]] = []
-    for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES:
-        url = _variant_url(res_key)
+    # Candidate URLs: the standard path first, then the upload-non-partner
+    # path (needs channel_login + vod_id) — probed in ONE parallel pass.
+    candidates: List[Tuple[str, int, int, int, str]] = [
+        (res_key, height, fps, tbr, _variant_url(res_key))
+        for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES
+    ]
+    if channel_login and not is_highlight:
+        candidates.extend(
+            (
+                res_key,
+                height,
+                fps,
+                tbr,
+                f"{domain}/{channel_login}/{vod_id}/{vod_special_id}/{res_key}/index-dvr.m3u8",
+            )
+            for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES
+        )
+
+    def _responsive(url: str) -> bool:
         try:
             req = urllib.request.Request(url, headers={
                 "Referer": "https://www.twitch.tv/",
                 "Origin": "https://www.twitch.tv",
             })
             with urllib.request.urlopen(req, timeout=10) as r:
-                body = r.read(65536)
-            if r.status != 200 or not body:
-                continue
+                return r.status == 200 and bool(r.read(65536))
         except (urllib.error.HTTPError, urllib.error.URLError, OSError):
-            continue
+            return False
 
+    # ponytail: the old loop probed up to 14 URLs SEQUENTIALLY with 10s
+    # timeouts — a sub-only VOD drained 70-140s behind the play button.
+    # Parallel probe caps the drain at ~10s while every responsive tier is
+    # still returned (quality selection preserved).
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+        ok_flags = list(pool.map(_responsive, [c[4] for c in candidates]))
+
+    variants: List[Dict[str, Any]] = []
+    seen_heights: set = set()
+    for (res_key, height, fps, tbr, url), ok in zip(candidates, ok_flags):
+        if not ok or height in seen_heights:
+            continue
+        seen_heights.add(height)
         variants.append({
             "url": url,
             "height": height,
@@ -421,38 +456,12 @@ def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str
             "acodec": "mp4a.40.2",
             "ext": "mp4",
         })
-        # Keep probing — user benefits from quality selection
 
     if not variants:
-        # Try the upload-non-partner path (needs channel_login + vod_id)
-        if channel_login and not is_highlight:
-            for res_key, height, fps, tbr in _RESOLUTION_CANDIDATES:
-                url = f"{domain}/{channel_login}/{vod_id}/{vod_special_id}/{res_key}/index-dvr.m3u8"
-                try:
-                    req = urllib.request.Request(url, headers={
-                        "Referer": "https://www.twitch.tv/",
-                        "Origin": "https://www.twitch.tv",
-                    })
-                    with urllib.request.urlopen(req, timeout=10) as r:
-                        body = r.read(65536)
-                    if r.status != 200 or not body:
-                        continue
-                except (urllib.error.HTTPError, urllib.error.URLError, OSError):
-                    continue
-                variants.append({
-                    "url": url,
-                    "height": height,
-                    "width": int(height * 16 / 9) if height else 0,
-                    "tbr": tbr,
-                    "fps": fps,
-                    "protocol": "m3u8_native",
-                    "vcodec": "h264",
-                    "acodec": "mp4a.40.2",
-                    "ext": "mp4",
-                })
-
-    if not variants:
-        raise RuntimeError(f"No cloudfront variant responded for VOD {vod_id}")
+        raise TwitchVodUnavailable(
+            f"Twitch VOD {vod_id} has no playable stream — it is sub-only, "
+            "geo-restricted, or removed (log in with Twitch cookies and retry)"
+        )
 
     return variants
 
@@ -533,7 +542,10 @@ def _extract_video_id(url_or_id: str) -> Optional[str]:
         return None
     if re.fullmatch(r"\d+", raw):
         return raw
-    m = re.search(r"twitch\.tv/videos/(\d+)", raw, re.I)
+    # Accept both twitch.tv/videos/{id} and the channel-prefixed form
+    # twitch.tv/{channel}/videos/{id} (the latter is what browser share
+    # buttons and the acceptance timing URL use).
+    m = re.search(r"twitch\.tv/(?:[^/]+/)?videos/(\d+)", raw, re.I)
     if m:
         return m.group(1)
     return None

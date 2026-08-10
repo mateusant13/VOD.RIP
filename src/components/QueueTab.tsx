@@ -66,8 +66,10 @@ type Props = {
   onToggleRecentSelection?: (id: string) => void;
   onBulkDeleteRecent?: () => void;
   onWatchLocal?: (dl: DownloadState) => void;
-  /** Click a history row's title to open that VOD in the main preview (URL tab). */
-  onOpenVod?: (url: string) => void;
+  /** Click a history row's title to open that VOD in the main preview (URL tab).
+   *  The optional hint lets the caller skip the redundant /api/info/video
+   *  re-extract when the row already carries title metadata. */
+  onOpenVod?: (url: string, hint?: { title?: string; durationSec?: number; skipNetwork?: boolean }) => void;
   /** Download a Twitch clip from the clip-history row (enqueues via /api/download/clip). */
   onDownloadClip?: (clip: TwitchClipRecord) => void;
 };
@@ -482,7 +484,7 @@ export default function QueueTab({
                     {onOpenVod ? (
                       <button
                         type="button"
-                        onClick={() => onOpenVod(dl.url)}
+                        onClick={() => onOpenVod(dl.url, { title: dl.title || undefined, skipNetwork: true })}
                         title={t('Open preview for this VOD')}
                         className="text-xs font-mono text-zinc-300 truncate min-w-0 text-left hover:text-white cursor-pointer"
                       >

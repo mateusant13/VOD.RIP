@@ -123,7 +123,10 @@ describe('QueueTab', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: 'VOD H' }));
-    expect(onOpenVod).toHaveBeenCalledWith('https://www.twitch.tv/videos/7');
+    expect(onOpenVod).toHaveBeenCalledWith('https://www.twitch.tv/videos/7', {
+      title: 'VOD H',
+      skipNetwork: true,
+    });
   });
 
   it('playable history row offers a watch button that fires onWatchLocal', () => {

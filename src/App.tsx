@@ -1595,7 +1595,10 @@ export default function App() {
       const oldSid = previewSessionId;
       destroyPreviewPlayer();
       if (oldSid) {
-        try { await apiDelete(`/api/preview/session/${oldSid}`); } catch { /* ignore */ }
+        // Fire-and-forget: awaiting this DELETE serialized a 1-11s HTTP
+        // round-trip before the new session create — the first frame waited
+        // on it. The old session TTLs out anyway if the delete is slow.
+        void apiDelete(`/api/preview/session/${oldSid}`).catch(() => {});
       }
       const playerCap = measurePlayerHeightCap(
         previewContainerRef.current ?? previewPanelRef.current,
@@ -2144,10 +2147,11 @@ export default function App() {
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 12,
-        // Play-first: start playback once ~6 s are buffered instead of waiting
-        // for 20 s. Window-HLS keeps a larger buffer because the chunk is muxed.
-        maxBufferLength: dashSegTimeline ? 60 : 6,
-        maxMaxBufferLength: dashSegTimeline ? 180 : 12,
+        // Play-first: start playback once ~3 s are buffered instead of waiting
+        // for 20 s (6 s delayed first frame on slow Twitch CDN fetches).
+        // Window-HLS keeps a larger buffer because the chunk is muxed.
+        maxBufferLength: dashSegTimeline ? 60 : 3,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 6,
         startFragPrefetch: true,
         capLevelToPlayerSize: !youtubePreview,
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,
@@ -5288,8 +5292,8 @@ export default function App() {
   }, [fetchVideoInfo]);
 
   /** History-row click → same flow as a channel-list pick (auto-opens the preview). */
-  const handleOpenVodFromHistory = useCallback((vodUrl: string) => {
-    selectVod(vodUrl);
+  const handleOpenVodFromHistory = useCallback((vodUrl: string, hint?: FetchVideoInfoHint) => {
+    selectVod(vodUrl, undefined, hint);
   }, [selectVod]);
 
   const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
