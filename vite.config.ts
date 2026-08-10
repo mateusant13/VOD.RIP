@@ -29,6 +29,10 @@ export default defineConfig({
     host: true,
     port: 5173,
     strictPort: true,
+    // No server.warmup here: Vite warms clientFiles SEQUENTIALLY (measured
+    // ~10s/file under AV scan → 10-15min for this graph), blocking first
+    // requests the whole time. dev-all.mjs prewarms source files with
+    // parallel first-touch reads instead — transforms then cost 1-24ms.
     proxy: {
       "/api": {
         target: `http://127.0.0.1:${API_PORT}`,

@@ -160,6 +160,39 @@ function truncateIfLarge(filePath) {
   }
 }
 
+/**
+ * Touch every app source file once (parallel). A cold first-touch costs up to
+ * ~13s/file (cold OS page cache + AV scan-on-open); reading each file here
+ * while Vite/API boot warms the OS cache AND the AV scanner's per-file cache,
+ * so the browser's first module requests hit warm files (measured 1-24ms
+ * transforms). The reads are throwaway — Vite's transform pass is unchanged.
+ * ponytail: parallelism is capped implicitly by Defender's scan queue; if a
+ * future machine still shows cold first-touches, pre-transform via Vite's
+ * `server.warmup` instead (already configured in vite.config.ts).
+ */
+async function prewarmSourceFiles() {
+  const srcDir = path.join(root, "src");
+  const files = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(p);
+      else if (/\.(ts|tsx|css)$/.test(entry.name)) files.push(p);
+    }
+  };
+  walk(srcDir);
+  if (files.length === 0) return;
+  const t0 = Date.now();
+  await Promise.all(files.map((f) => fs.promises.readFile(f).catch(() => null)));
+  console.log(`[dev] prewarmed ${files.length} source files in ${Date.now() - t0}ms`);
+}
+
 function attachChildLogger(label, child) {
   const logDir = path.join(root, "tmp");
   try {
@@ -287,8 +320,10 @@ async function main() {
   }
 
   // Vite's cold start is the long pole (~60s cold OS cache + AV scanning) —
-  // start it FIRST so it gets uncontended CPU while the API boots.
-  console.log(`Open UI at    -> http://localhost:${vitePort}`);
+  // start it FIRST so it gets uncontended CPU while the API boots. Prewarm
+  // source files in parallel (see prewarmSourceFiles) and only announce the
+  // URL once the first browser load would be fast.
+  const prewarm = prewarmSourceFiles();
   if (await viteHealthy(vitePort)) {
     console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
     console.log("(Ctrl+C stops API only; existing Vite keeps running)\n");
@@ -311,6 +346,40 @@ async function main() {
     ...previewFastEnv,
     ...(serveBuiltUi ? { KICK_SERVE_UI: "1" } : {}),
   });
+
+  await prewarm;
+
+  // Warm the first-load HTTP paths (HTML pipeline + entry + the one-time
+  // Tailwind CSS compile, ~10s+ cold) so the browser's first requests hit
+  // Vite's in-memory transform cache instead of paying cold costs. Run
+  // SEQUENTIALLY in browser order (html → entry → css): parallel first
+  // requests can race Vite's import analysis and leave a module stuck
+  // "loading" in the graph, hanging every later request for it. The rest of
+  // the graph transforms fast because prewarmSourceFiles already touched
+  // every source file (measured 1-24ms transforms once OS-warm).
+  for (let i = 0; i < 240 && !(await viteHealthy(vitePort)); i++) {
+    await sleep(500);
+  }
+  const warmTargets = [
+    `http://127.0.0.1:${vitePort}/`,
+    `http://127.0.0.1:${vitePort}/src/main.tsx`,
+    `http://127.0.0.1:${vitePort}/src/index.css`,
+  ];
+  console.log("[dev] warming first-load modules\u2026");
+  for (const u of warmTargets) {
+    await new Promise((resolve) => {
+      const req = http.get(u, (res) => {
+        res.resume();
+        res.on("end", resolve);
+      });
+      req.on("error", () => resolve());
+      req.setTimeout(180000, () => {
+        req.destroy();
+        resolve();
+      });
+    });
+  }
+  console.log(`Open UI at    -> http://localhost:${vitePort}`);
 
   if (serveBuiltUi) {
     console.log(`Fast UI at   -> http://localhost:${apiPort}  (built bundle, instant — npm run build-copy to refresh)`);
