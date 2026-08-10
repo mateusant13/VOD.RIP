@@ -174,13 +174,27 @@ public static class ExtWin {
     var sw = System.Diagnostics.Stopwatch.StartNew();
     while (sw.ElapsedMilliseconds < timeoutMs) {
       try {
+        // Match by automation id FIRST: the browser toolbar's page-reload
+        // button is ALSO named "Recarregar"/"Reload" (view_1003) and comes
+        // before the extension card's dev-reload-button in the a11y tree —
+        // a name-first match reloaded the extensions PAGE instead of the
+        // extension (silent no-op, proven live 2026-08-10: version never
+        // changed after "reload"). Ids are unique; names are not.
+        if (autoId.Length > 0) {
+          var byId = win.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+          foreach (AutomationElement b in byId) {
+            if ((b.Current.AutomationId ?? "") == autoId) {
+              var inv = b.GetCurrentPattern(InvokePattern.Pattern) as InvokePattern;
+              if (inv != null) { inv.Invoke(); return "CLICKED:" + (b.Current.Name ?? ""); }
+            }
+          }
+        }
         var btns = win.FindAll(TreeScope.Descendants,
           new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
         foreach (AutomationElement b in btns) {
           var nm = b.Current.Name ?? "";
-          var id = b.Current.AutomationId ?? "";
-          if ((namePart.Length > 0 && nm.IndexOf(namePart, StringComparison.OrdinalIgnoreCase) >= 0) ||
-              (autoId.Length > 0 && id == autoId)) {
+          if (namePart.Length > 0 && nm.IndexOf(namePart, StringComparison.OrdinalIgnoreCase) >= 0) {
             var inv = b.GetCurrentPattern(InvokePattern.Pattern) as InvokePattern;
             if (inv != null) { inv.Invoke(); return "CLICKED:" + nm; }
           }
