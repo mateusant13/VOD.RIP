@@ -922,20 +922,6 @@ def require_hls_crop(req, platform: str) -> None:
         raise HTTPException(status_code=400, detail="crop_end must be after crop_start")
 
 
-def trim_estimated_bytes(meta: dict, crop_start: Optional[float], crop_end: Optional[float]) -> Optional[int]:
-    """Scale full-VOD byte estimate to the requested trim window."""
-    estimated = meta.get("estimated_bytes")
-    if not estimated:
-        return None
-    duration = meta.get("duration")
-    if crop_start is None or crop_end is None or not duration or duration <= 0:
-        return int(estimated)
-    clip_sec = float(crop_end) - float(crop_start)
-    if clip_sec <= 0:
-        return int(estimated)
-    return int(int(estimated) * clip_sec / float(duration))
-
-
 async def fetch_queue_meta(url: str, platform: str) -> dict:
     """Best-effort metadata fetch so the queue UI can show VOD info."""
     import asyncio
