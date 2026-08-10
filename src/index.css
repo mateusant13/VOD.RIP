@@ -1,4 +1,14 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
+
+/* Scope Tailwind v4's content scan to real sources: `source(none)` turns off
+   the automatic whole-project scan (respecting .gitignore it walks backend/,
+   scripts/, vendor/, dist/, … ≈450 files), leaving only the explicit `@source`
+   rules below — index.html + src/. All utility classes are literal strings in
+   src (platformStyle.ts helpers return static classes), so nothing is dropped.
+   ponytail: ceiling — new non-ts/tsx content (e.g. a src/*.html template or a
+   css file using @apply) must add its own `@source` line here. */
+@source "../index.html";
+@source "./**/*.{ts,tsx}";
 
 @theme {
   --color-kick: #53fc18;
