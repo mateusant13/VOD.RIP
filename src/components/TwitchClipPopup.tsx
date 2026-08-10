@@ -469,39 +469,59 @@ export default function TwitchClipPopup({
       return;
     }
     try {
-      const status = await apiGet<{ paired: boolean }>('/api/session/cookies/status');
+      const status = await apiGet<{
+        paired: boolean;
+        platforms?: { twitch?: { lastGrabAt?: string | null } };
+      }>('/api/session/cookies/status');
       if (!status.paired) {
-        showClipNotice('error', t('Installing the VOD.RIP cookie extension — one moment…'));
-        const inst = await apiPost<{ ok: boolean; started?: boolean; alreadyInstalled?: boolean }>(
-          '/api/session/cookies/auto-install',
-          {},
-        );
-        if (!inst.ok && !inst.started && !inst.alreadyInstalled) {
-          showClipNotice('error', t('Could not install the cookie extension — open Settings → Cookies'));
-          return;
+        // The bridge token can be empty while the extension is installed and
+        // running (the pair lives in the extension's storage; the backend
+        // re-pairs on the extension's next cookie push — its 10-min heartbeat).
+        // The editor clip is published by the extension's content script using
+        // the PAGE session cookie, so a de-paired-but-active extension still
+        // completes the clip. Only run the auto-installer when the extension
+        // is demonstrably inactive (no Twitch cookie push in ~11 min) — the
+        // chrome://extensions window it opens is pure noise for an extension
+        // that is already loaded.
+        const lastGrab = status.platforms?.twitch?.lastGrabAt;
+        const extActive =
+          !!lastGrab && Date.now() - new Date(lastGrab).getTime() < 11 * 60_000;
+        if (!extActive) {
+          showClipNotice('error', t('Installing the VOD.RIP cookie extension — one moment…'));
+          const inst = await apiPost<{ ok: boolean; started?: boolean; alreadyInstalled?: boolean }>(
+            '/api/session/cookies/auto-install',
+            {},
+          );
+          if (!inst.ok && !inst.started && !inst.alreadyInstalled) {
+            showClipNotice('error', t('Could not install the cookie extension — open Settings → Cookies'));
+            return;
+          }
+          // The extension's service worker pushes cookies on install/startup
+          // and on a 10-minute alarm; give the re-pair room so a running-but-
+          // quiet extension never dead-ends into "timed out".
+          const deadline = Date.now() + 700_000;
+          let paired = false;
+          while (Date.now() < deadline && !paired) {
+            await new Promise((r) => setTimeout(r, 2500));
+            try {
+              const st = await apiGet<{ paired: boolean; auto_install?: { state?: string } }>(
+                '/api/session/cookies/status',
+              );
+              // The extension pairs the moment it boots — BEFORE the installer
+              // reports done and closes its chrome://extensions window. Opening
+              // the editor at 'paired' alone can land the tab inside that window
+              // and lose it to the cleanup. Wait for the install to actually
+              // finish (state leaves 'running') before opening.
+              const installDone = !st.auto_install || st.auto_install.state !== 'running';
+              paired = !!st.paired && installDone;
+            } catch { /* backend mid-restart during the install — keep polling */ }
+          }
+          if (!paired) {
+            showClipNotice('error', t('Extension install timed out — open Settings → Cookies'));
+            return;
+          }
+          showClipNotice('ok', t('Cookie extension ready — opening Twitch…'));
         }
-        const deadline = Date.now() + 180_000;
-        let paired = false;
-        while (Date.now() < deadline && !paired) {
-          await new Promise((r) => setTimeout(r, 2500));
-          try {
-            const st = await apiGet<{ paired: boolean; auto_install?: { state?: string } }>(
-              '/api/session/cookies/status',
-            );
-            // The extension pairs the moment it boots — BEFORE the installer
-            // reports done and closes its chrome://extensions window. Opening
-            // the editor at 'paired' alone can land the tab inside that window
-            // and lose it to the cleanup. Wait for the install to actually
-            // finish (state leaves 'running') before opening.
-            const installDone = !st.auto_install || st.auto_install.state !== 'running';
-            paired = !!st.paired && installDone;
-          } catch { /* backend mid-restart during the install — keep polling */ }
-        }
-        if (!paired) {
-          showClipNotice('error', t('Extension install timed out — open Settings → Cookies'));
-          return;
-        }
-        showClipNotice('ok', t('Cookie extension ready — opening Twitch…'));
       }
     } catch {
       // status/install endpoints unreachable — open the editor anyway; the

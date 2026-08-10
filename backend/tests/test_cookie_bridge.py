@@ -585,6 +585,70 @@ async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
     assert status["auto_install"]["installed"] is True
 
 
+async def test_auto_install_skips_when_extension_active_but_depaired(client, monkeypatch):
+    """De-paired (no bridge token) but extension demonstrably active (fresh
+    Twitch cookie push) -> alreadyInstalled WITHOUT spawning the installer:
+    the extension re-pairs on its own 10-min heartbeat, so chrome://extensions
+    must never open for an extension that is already loaded."""
+    from routers import cookie_bridge as cb
+    from services import cookie_store
+
+    accepted, dropped = cookie_store.upsert_cookies([
+        {"name": "auth-token", "domain": ".twitch.tv", "value": "twitch-token", "path": "/"},
+    ])
+    assert accepted == 1 and dropped == 0
+
+    status = (await client.get("/api/session/cookies/status")).json()
+    assert status["paired"] is False, "no bridge token -> not paired"
+    assert status["platforms"]["twitch"]["count"] == 1
+
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["alreadyInstalled"] is True
+    assert body["installed"] is True
+    assert captured == [], "no automation thread when the extension is already active"
+
+
+async def test_auto_install_spawns_when_extension_inactive(client, monkeypatch, tmp_path):
+    """De-paired AND no fresh cookie push (extension never seen/quiet for
+    >11 min) -> the real installer still runs."""
+    from routers import cookie_bridge as cb
+    from services import cookie_store
+
+    src = tmp_path / "ext-src"
+    src.mkdir()
+    (src / "manifest.json").write_text('{"name": "x"}', encoding="utf-8")
+    monkeypatch.setattr(cb, "_materialize_ext_src", lambda: src)
+    monkeypatch.setattr(cb, "_find_browser", lambda name: Path("C:/chrome.exe") if name == "chrome" else None)
+
+    # A stale push (>11 min old) must NOT satisfy the "active" heuristic.
+    import time as _t
+    stale = _t.time() - 12 * 60
+    with cookie_store._lock:
+        conn = cookie_store.get_conn()
+        conn.execute(
+            """INSERT INTO session_cookies
+               (platform, name, domain, path, secure, http_only,
+                value_enc, expires, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(platform, name, domain) DO UPDATE SET updated_at=excluded.updated_at""",
+            ("twitch", "auth-token", ".twitch.tv", "/", 1, 1,
+             cookie_store.encrypt_token("twitch-token"), None,
+             _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(stale))),
+        )
+
+    captured: list = []
+    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    assert resp.json()["started"] is True
+    assert len(captured) == 1, "stale push must still run the installer"
+
+
 async def test_auto_install_spawns_background_install(client, monkeypatch, tmp_path):
     """Not paired -> returns started:true and spawns the worker thread."""
     from routers import cookie_bridge as cb

@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -680,6 +681,24 @@ async def session_cookies_auto_install():
     """
     if _paired_token():
         return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
+    # Extension running but bridge de-paired (token emptied while the extension
+    # kept pushing): the extension re-pairs on its next cookie push (10-minute
+    # heartbeat), so opening chrome://extensions now is pure noise. Skip the
+    # driver when the last Twitch push is fresh — the frontend polls status and
+    # proceeds once the pair lands. Best-effort: any parse error falls through
+    # to the real installer.
+    try:
+        twitch = (cookie_store.status().get("twitch") or {})
+        last_grab = (twitch.get("lastGrabAt") or "").strip()
+        if last_grab:
+            try:
+                age = time.time() - datetime.fromisoformat(last_grab.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                age = float("inf")
+            if age < 11 * 60:
+                return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
+    except Exception:
+        pass
     with _AUTO_INSTALL_LOCK:
         if _AUTO_INSTALL_STATE["state"] == "running":
             return {"ok": True, "started": False, "alreadyRunning": True, "state": "running"}
