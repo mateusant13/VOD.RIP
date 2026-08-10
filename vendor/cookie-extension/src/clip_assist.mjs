@@ -81,6 +81,20 @@
     const pad = (n) => String(n).padStart(2, '0');
     return `${m}:${pad(r)}`;
   };
+  // Ground-truth editor position: the playback-time display the user
+  // identified (strong "17:00 / 1:30" inside the player controls). Unlike
+  // the slider valuetext (window-relative 0..90s), this shows the
+  // VOD-absolute position the editor is actually at — a "17:00 / 1:30"
+  // here means the window sits at 17:00 of the VOD, NOT a 17-minute
+  // duration. Always read + log it when attempting a clip.
+  const playbackTimeText = () => {
+    try {
+      const el = [...document.querySelectorAll('main strong')].find((x) =>
+        /^\s*\d+:\d{2}\s*\/\s*\d+:\d{2}\s*$/.test((x.textContent || '').trim()),
+      );
+      return el ? el.textContent.trim() : null;
+    } catch { return null; }
+  };
   // No user title -> the VOD/live title (twitch.tv/videos pages set
   // document.title to "<stream title> - Twitch" server-side). NEVER a
   // "VOD.RIP …" default — the user requires the live's title verbatim.
@@ -166,6 +180,7 @@
     startSec,
     endSec,
     title,
+    playback: playbackTimeText(),
     diag: params.get('vodrip_diag') === '1',
     closeMode: (params.get('vodrip_close') || '1') === '0' ? 'stay-open' : 'close',
   });
@@ -288,6 +303,7 @@
       targetStart: startSec,
       targetEnd: endSec,
       durSec,
+      playback: playbackTimeText(),
       valuetext: res.ok ? (res.valuetext || null) : null,
       reason: res.ok ? null : (res.reason || null),
     });
@@ -439,6 +455,9 @@
       const values = inputs.map((i) => i.value || '').filter(Boolean);
       census.push('input-values: ' + (values.join(' | ') || '(none)'));
       census.push('doc-title: ' + document.title);
+      // The playback-time strong the user identified ("17:00 / 1:30") — the
+      // VOD-absolute position; always surfaced in the diag census.
+      census.push('playback-strong: ' + (playbackTimeText() || '(none)'));
       // Sink the census so Main can read the REAL editor DOM from the app
       // log (GET /api/debug/clip-events) after the user opens the diag URL.
       // Truncate each line: the backend rejects data > 8KB, and the panel
