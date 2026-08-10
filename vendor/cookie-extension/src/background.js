@@ -3,6 +3,7 @@ import saveToFile from './modules/save_to_file.mjs';
 import {
   BRIDGE_DOMAINS,
   createDebouncedPush,
+  getApiBase,
   postCookies,
 } from './modules/cookie_bridge.mjs';
 
@@ -256,6 +257,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
   return undefined; // not ours — leave the channel to other listeners
+});
+
+// Clip-assist note/record relay: the content script (clip_assist.mjs) cannot
+// POST to the local backend directly — its fetch from clips.twitch.tv /
+// twitch.tv/videos is cross-origin to http://127.0.0.1 and the browser kills
+// it on the CORS preflight. The service worker fetches with the extension's
+// own origin + host_permission http://127.0.0.1/* — no preflight at all —
+// so the clip flow's debug notes and published-clip records are relayed
+// through here. Fire-and-forget both ways: never returns true, never
+// touches sendResponse (the async legacy listener makes that channel
+// unreliable anyway).
+chrome.runtime.onMessage.addListener((message) => {
+  if (!message || !message.type) return;
+  if (message.type === 'vodrip_note') {
+    const { event, data } = message;
+    if (!event) return;
+    (async () => {
+      const res = await fetch(`${await getApiBase()}/api/debug/clip-events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ src: 'ext', event, data: data || {} }),
+      });
+      if (!res.ok) console.warn('[vodrip] note relay failed:', res.status);
+    })().catch(() => { /* backend offline — logging is best-effort */ });
+    return;
+  }
+  if (message.type === 'vodrip_record') {
+    const payload = message.payload || {};
+    (async () => {
+      const res = await fetch(`${await getApiBase()}/api/twitch/clips/record`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) console.warn('[vodrip] record relay failed:', res.status);
+    })().catch(() => { /* backend offline — next publish retries */ });
+  }
 });
 
 // Clip-assist self-close: the content script (clip_assist.mjs) asks the

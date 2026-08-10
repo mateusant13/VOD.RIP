@@ -547,6 +547,44 @@ async def test_clip_events_sink_validates(_isolated_data_dir):
         assert big.status_code == 422
         assert (await client.get("/api/debug/clip-events")).json() == []
 
+
+@pytest.mark.anyio
+async def test_clip_endpoints_answer_cors_preflight(_isolated_data_dir):
+    """The clip-assist content script POSTs JSON from https://clips.twitch.tv to
+    the localhost app — cross-origin, so the browser blocks the POST unless
+    OPTIONS answers with the allow headers (this was the root cause of zero
+    ext_* events reaching the sink). Both direct-POST endpoints must also
+    carry ACAO on the response so the caller's fetch resolves."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        paths = ("/api/debug/clip-events", "/api/twitch/clips/record")
+        for path in paths:
+            r = await client.options(
+                path,
+                headers={
+                    "Origin": "https://clips.twitch.tv",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            assert r.status_code == 200, path
+            assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+            assert "content-type" in (r.headers.get("access-control-allow-headers") or "").lower()
+            assert "post" in (r.headers.get("access-control-allow-methods") or "").lower()
+        # POST responses must carry ACAO too, or the request lands but the
+        # content-script fetch rejects on the CORS response check.
+        r = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "ext_start", "data": {"cors": True}},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+        r = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeCorsSlug123"},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+
 # --- browser-path clip record (extension posts the published URL) ---------
 
 @pytest.mark.anyio

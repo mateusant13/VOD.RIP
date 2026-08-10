@@ -93,26 +93,27 @@
   // Debugging event sequence: every flow step is POSTed to the app's
   // clip-events sink (same API base as the cookie bridge) so a clip attempt
   // can be replayed end to end from the app log. Fire-and-forget — logging
-  // must never break the flow. The dynamic import stays lazy so a bridge
-  // module failure can't take the clip flow down with it.
+  // must never break the flow. The POST runs in the BACKGROUND service
+  // worker, NOT here: a direct fetch from this content script is
+  // cross-origin (clips.twitch.tv -> http://127.0.0.1) and the browser
+  // kills it on the CORS preflight (the backend had no CORS middleware —
+  // that is why zero ext_* events ever reached the sink). The worker
+  // fetches with the extension's own origin + host_permission
+  // http://127.0.0.1/* — no preflight at all.
   const note = (event, data = {}) => {
     try {
-      import('./modules/cookie_bridge.mjs')
-        .then(({ getApiBase }) => getApiBase())
-        .then((base) =>
-          fetch(base + '/api/debug/clip-events', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ src: 'ext', event, data }),
-          }).catch(() => {}),
-        )
-        .catch(() => {});
+      const p = chrome.runtime.sendMessage({ type: 'vodrip_note', event, data });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch { /* ignore */ }
   };
   // The published clip is recorded into the app's clip history (so the app
   // shows a download button for it). Fire-and-forget, same posture as note();
   // the Helix path records history server-side, this is the browser path's
-  // equivalent — Twitch's site published it, the backend never saw it.
+  // equivalent — Twitch's site published it, the backend never saw it. The
+  // POST is relayed through the BACKGROUND for the same CORS reason as
+  // note() (this content script's direct fetch is cross-origin and dies on
+  // preflight; the one 13:40Z record that landed predates that block or was
+  // a fluke — the identical fetch shape as note() cannot be relied on).
   const recordPublishedClip = (clipUrl) => {
     try {
       const path = (() => {
@@ -128,23 +129,18 @@
       const vodMatch = (location.pathname || '').match(/^\/videos\/(\d+)/);
       const start = Number(params.get('vodrip_start')) || 0;
       const end = Number(params.get('vodrip_end')) || 0;
-      import('./modules/cookie_bridge.mjs')
-        .then(({ getApiBase }) => getApiBase())
-        .then((base) =>
-          fetch(base + '/api/twitch/clips/record', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              url: clipUrl,
-              title,
-              channel: ch,
-              vod_id: params.get('vodID') || (vodMatch ? vodMatch[1] : undefined),
-              offset_sec: end > 0 ? Math.floor(end) : undefined,
-              duration_sec: end > start ? Math.round(end - start) : undefined,
-            }),
-          }).catch(() => {}),
-        )
-        .catch(() => {});
+      const p = chrome.runtime.sendMessage({
+        type: 'vodrip_record',
+        payload: {
+          url: clipUrl,
+          title,
+          channel: ch,
+          vod_id: params.get('vodID') || (vodMatch ? vodMatch[1] : undefined),
+          offset_sec: end > 0 ? Math.floor(end) : undefined,
+          duration_sec: end > start ? Math.round(end - start) : undefined,
+        },
+      });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch { /* ignore */ }
   };
   // User window rule: after the flow ends (success OR failure) the editor
@@ -448,6 +444,13 @@
       const values = inputs.map((i) => i.value || '').filter(Boolean);
       census.push('input-values: ' + (values.join(' | ') || '(none)'));
       census.push('doc-title: ' + document.title);
+      // Sink the census so Main can read the REAL editor DOM from the app
+      // log (GET /api/debug/clip-events) after the user opens the diag URL.
+      // Truncate each line: the backend rejects data > 8KB, and the panel
+      // keeps the full text for UIA reads.
+      note('ext_diag', {
+        census: census.map((l) => (l.length > 240 ? l.slice(0, 240) + '…' : l)),
+      });
       setStatus('DIAG CENSUS\n' + census.join('\n'), 'info');
       // GPU: the looping editor preview is the hog — stop it right away.
       try { document.querySelector('video')?.pause(); } catch { /* ignore */ }
@@ -492,39 +495,48 @@
       note('ext_title', { title, flow: 'create' });
       setStatus(`Título preenchido: ${title}`);
       const rangeErr = await setEditorRange(document, startSec, endSec, durSec);
+      let manualFallback = false;
       if (rangeErr) {
+        // NEVER a silent failure: the panel tells the user exactly what to
+        // drag/save, the tab STAYS OPEN (no closeAfterFlow), and the publish
+        // watcher below still records the clip when the user clicks Save.
+        manualFallback = true;
+        note('ext_range_fallback', { reason: rangeErr, startSec, endSec, len: endSec - startSec });
         setStatus(
-          `Clique de ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${rangeErr}) — nada foi salvo. Ajuste o trecho no editor e salve você mesmo.`,
+          'Não consegui ajustar o trecho automaticamente.\n' +
+            `Arraste o clipe no editor para ${fmtHms(startSec)}–${fmtHms(endSec)} ` +
+            `(Clique de ${Math.round(endSec - startSec)}s) e clique em Save — o VOD.RIP detecta e registra.`,
           'err',
         );
-        closeAfterFlow(2000);
-        return;
+      } else {
+        setStatus(`Salvando clique de ${Math.round(endSec - startSec)}s…`);
+        // Wait for the Save button to become enabled (the editor loads the
+        // VOD frame preview first; clicking too early is a silent no-op).
+        const save = await waitFor(
+          () => {
+            const b = [...document.querySelectorAll('button')].find((x) =>
+              /save clip|salvar clip/i.test((x.innerText || '').trim()),
+            );
+            return b && !b.disabled ? b : null;
+          },
+          30000,
+          800,
+        );
+        if (!save) {
+          note('ext_error', { step: 'save-btn', reason: 'missing' });
+          setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
+          closeAfterFlow();
+          return;
+        }
+        note('ext_save_clicked', { startSec, endSec, title });
+        await sleep(1200);
+        click(save);
       }
-      setStatus(`Salvando clique de ${Math.round(endSec - startSec)}s…`);
-      // Wait for the Save button to become enabled (the editor loads the
-      // VOD frame preview first; clicking too early is a silent no-op).
-      const save = await waitFor(
-        () => {
-          const b = [...document.querySelectorAll('button')].find((x) =>
-            /save clip|salvar clip/i.test((x.innerText || '').trim()),
-          );
-          return b && !b.disabled ? b : null;
-        },
-        30000,
-        800,
-      );
-      if (!save) {
-        note('ext_error', { step: 'save-btn', reason: 'missing' });
-        setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
-        closeAfterFlow();
-        return;
-      }
-      note('ext_save_clicked', { startSec, endSec, title });
-      await sleep(1200);
-      click(save);
       // Success = the SPA navigates to /<slug>, or the editor reaches its
       // post-publish state ("Copiar Link"). /create and /clips/* are the
-      // editor itself and never a success navigation.
+      // editor itself and never a success navigation. Runs for the
+      // auto-clicked Save AND the manual fallback's user-clicked Save —
+      // either way the published clip must be recorded.
       const slugRe = /^\/(?!create$)(?!clips(?:\/|$))[A-Za-z][A-Za-z0-9_-]+$/;
       const published = await waitFor(() => {
         if (location.pathname.match(slugRe)) return `https://clips.twitch.tv${location.pathname}`;
@@ -532,7 +544,7 @@
           /copiar link|copy link/i.test((b.innerText || '').trim()),
         );
         return copyBtn ? 'copy' : null;
-      }, 60000, 800);
+      }, manualFallback ? 90000 : 60000, 800);
       if (published) {
         let clipUrl = published === 'copy' ? '' : published;
         try {
@@ -548,6 +560,16 @@
           'ok',
         );
         closeAfterFlow(1500);
+        return;
+      }
+      if (manualFallback) {
+        setStatus(
+          'Ainda não detectei o clipe publicado.\n' +
+            `Arraste o clipe no editor para ${fmtHms(startSec)}–${fmtHms(endSec)} ` +
+            `(Clique de ${Math.round(endSec - startSec)}s) e clique em Save — o VOD.RIP detecta e registra.`,
+          'err',
+        );
+        closeAfterFlow(8000);
         return;
       }
       setStatus(
