@@ -23,16 +23,30 @@
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `
 #     cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" `
 #     [-Browser chrome|msedge|brave] [-DebugPort 9222] [-DryRun]
+#   cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" -ReloadOnly `
+#     [-ExpectedVersion 0.8.3] [-Browser chrome|msedge|brave] [-DryRun]
+#
+# -ReloadOnly: the extension is already installed UNPACKED but may be running
+# stale code (Chrome does NOT hot-reload a loaded folder on file change, and
+# the plain auto-install short-circuits with "already present, nothing to
+# do"). This mode clicks the card's Reload button on the hidden
+# chrome://extensions window instead, so the service worker re-registers
+# from the folder on disk in place — the browser keeps its extension id,
+# permissions and every user tab. -ExpectedVersion, when given, reports
+# whether the card text contains that version string after the reload.
 #
 # stdout: exactly ONE JSON line (the result), human progress goes to stderr:
 #   {"ok":true,"installed":true,"extension_id":"...","error":null}
+#   {"ok":true,"reloaded":true,"extension_id":"...","version_found":true,"error":null}
 # DryRun prints the resolved plan without touching the browser.
 
 param(
     [string]$ExtensionDir,
     [string]$Browser = 'chrome',
     [int]$DebugPort = 9222,  # kept for CLI compat; the UIA path needs no CDP
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$ReloadOnly,
+    [string]$ExpectedVersion = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,7 +87,10 @@ if (-not (Test-Path -LiteralPath $manifest)) {
 if ($DryRun) {
     Write-Output (@{
         ok = $true; dryRun = $true; browser = $Browser; browser_exe = $exe
-        mechanism = 'uia-hidden-window'; extension_dir = $ExtensionDir
+        mechanism = if ($ReloadOnly) { 'uia-hidden-window-reload' } else { 'uia-hidden-window' }
+        reloadOnly = [bool]$ReloadOnly
+        extension_dir = $ExtensionDir
+        expected_version = $ExpectedVersion
     } | ConvertTo-Json -Compress)
     exit 0
 }
@@ -333,7 +350,38 @@ try {
 
     # Already installed? The card text contains the extension name.
     $page = [ExtWin]::DumpText($newWin)
-    if ($page -match [regex]::Escape($EXT_NAME)) {
+    if ($ReloadOnly) {
+        # In-place reload of the running unpacked extension: click the card's
+        # Reload button (dev mode). The service worker re-registers from the
+        # folder on disk WITHOUT removing/re-adding, so the browser keeps its
+        # extension id, permissions and the user's tabs untouched.
+        if ($page -notmatch [regex]::Escape($EXT_NAME)) {
+            throw "extension not installed ('$EXT_NAME' not found) - run the normal auto-install first"
+        }
+        $r = [ExtWin]::ClickButton($newWin, 'Recarregar', 'dev-reload-button', 15000, $false)
+        Write-ProgressLog "auto-install: reload button -> $r"
+        if ($r -eq 'NOT_FOUND') {
+            $r2 = [ExtWin]::ClickButton($newWin, 'Reload', 'reload', 8000, $false)
+            Write-ProgressLog "auto-install: reload fallback -> $r2"
+            if ($r2 -eq 'NOT_FOUND') { throw 'reload button never appeared (developer mode off?)' }
+        }
+        # Wait for the card to come back after the reload (SW re-registers).
+        $found = $false
+        for ($i = 0; $i -lt 40; $i++) {
+            if ([ExtWin]::DumpText($newWin) -match [regex]::Escape($EXT_NAME)) { $found = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $found) { throw 'extension card did not reappear after reload' }
+        $result.ok = $true
+        $result.reloaded = $true
+        $result.installed = $true
+        $idm = [regex]::Match([ExtWin]::DumpText($newWin), 'ID:\s*([a-z0-9]{32})')
+        if ($idm.Success) { $result.extension_id = $idm.Groups[1].Value }
+        if ($ExpectedVersion) {
+            $result.version_found = ([ExtWin]::DumpText($newWin) -match [regex]::Escape($ExpectedVersion))
+            Write-ProgressLog "auto-install: expected version '$ExpectedVersion' found: $($result.version_found)"
+        }
+    } elseif ($page -match [regex]::Escape($EXT_NAME)) {
         Write-ProgressLog 'auto-install: extension already present, nothing to do'
         $result.ok = $true
         $result.installed = $true
