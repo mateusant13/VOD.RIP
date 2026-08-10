@@ -23,18 +23,59 @@ export const TWITCH_CLIP_TITLE_MAX = 140;
  * moment, clamped to the VOD edges (shorter at the edges is fine). Unknown
  * duration (<=0) leaves the upper edge unclamped — the backend clamps the
  * session crop to the real extracted length anyway.
+ *
+ * When `anchor` is a valid range (end > start) — the user's typed trim from
+ * the opening preview — the window centres on the anchor's midpoint instead
+ * of the playhead, so the trim lands inside the mini-preview.
  */
 export function twitchClipWindow(
   playheadSec: number,
   vodDurationSec: number,
+  anchor?: { start: number; end: number },
 ): { start: number; end: number } {
   const dur = Number.isFinite(vodDurationSec) && vodDurationSec > 0
     ? vodDurationSec
     : Number.POSITIVE_INFINITY;
+  const anchorValid = !!anchor && anchor.end > anchor.start;
+  const center = anchorValid ? (anchor.start + anchor.end) / 2 : playheadSec;
   return {
-    start: Math.max(0, playheadSec - TWITCH_CLIP_MAX_SEC),
-    end: Math.min(dur, playheadSec + TWITCH_CLIP_MAX_SEC),
+    start: Math.max(0, center - TWITCH_CLIP_MAX_SEC),
+    end: Math.min(dur, center + TWITCH_CLIP_MAX_SEC),
   };
+}
+
+/**
+ * Initial clip selection for the mini-preview. With a valid `anchor` (the
+ * user's typed trim range) the selection IS the anchor, clamped into the
+ * window, with its length forced into [TWITCH_CLIP_MIN_SEC, TWITCH_CLIP_MAX_SEC]
+ * — an over-long anchor keeps its END pinned (start = end − 60, matching the
+ * END-reference semantics of Helix vod_offset), an under-long one grows from
+ * its start. Without an anchor, replicate the default: the last 60s of the
+ * window, or the whole window when it's shorter.
+ */
+export function initialClipSelection(
+  win: { start: number; end: number },
+  anchor?: { start: number; end: number },
+): { start: number; end: number } {
+  if (anchor && anchor.end > anchor.start) {
+    let start = Math.max(win.start, Math.min(anchor.start, win.end));
+    let end = Math.max(win.start, Math.min(anchor.end, win.end));
+    if (end - start > TWITCH_CLIP_MAX_SEC) {
+      // Keep the END anchored (clip END = Helix vod_offset).
+      start = end - TWITCH_CLIP_MAX_SEC;
+    } else if (end - start < TWITCH_CLIP_MIN_SEC) {
+      // Grow from the start first; at the window edge, pull the start back.
+      end = Math.min(win.end, Math.max(win.start, start + TWITCH_CLIP_MIN_SEC));
+      if (end - start < TWITCH_CLIP_MIN_SEC) {
+        start = Math.max(win.start, end - TWITCH_CLIP_MIN_SEC);
+      }
+    }
+    return { start, end };
+  }
+  if (win.end - win.start > TWITCH_CLIP_MAX_SEC) {
+    return { start: win.end - TWITCH_CLIP_MAX_SEC, end: win.end };
+  }
+  return clampClipSelection(win.start, win.end, win.start, win.end);
 }
 
 /**

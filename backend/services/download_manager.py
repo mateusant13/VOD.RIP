@@ -657,6 +657,18 @@ class DownloadManager:
             finally:
                 stall_stop.set()
                 with self._lock:
+                    # Zombie-row guard: a worker that exits WITHOUT a terminal
+                    # status (BaseException escape like SystemExit/KeyboardInterrupt,
+                    # or thread death) would leave the persisted queue entry at
+                    # "Finalising… 99/100%" forever — the in-memory row is popped
+                    # below but the queue entry survives and get_active_and_history
+                    # revives it as non-terminal (no worker, no SSE, no cancel
+                    # event). Mark it Failed so the _DONE_STATUSES branch below
+                    # persists it to history and removes the queue entry.
+                    if state.status not in _DONE_STATUSES and state.status != "Paused":
+                        state.status = "Failed"
+                        state.error = "Download worker exited unexpectedly"
+                        state.progress = min(state.progress, 99)
                     final_state = (
                         self._downloads.get(download_id)
                         or DownloadState(

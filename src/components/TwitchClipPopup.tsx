@@ -29,6 +29,7 @@ import {
   TWITCH_CLIP_TITLE_MAX,
   clampClipSelection,
   clipEditorOffsetAndDuration,
+  initialClipSelection,
   openTwitchClipEditor,
   openTwitchClipEditorInBrowser,
   twitchClipDurationError,
@@ -48,6 +49,7 @@ import { PREVIEW_DEFAULT_VOLUME } from '../layoutUtils';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { formatHmsFull } from '../utils';
 import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
+import EditableHmsTime from './EditableHmsTime';
 import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
@@ -63,10 +65,15 @@ interface TwitchClipPopupProps {
   url: string;
   broadcasterLogin: string;
   vodId: string;
-  /** VOD time of the click — the ±60s window is centred here. */
+  /** VOD time of the click — the ±60s window is centred here (unless
+   * anchorRange is set, which takes precedence). */
   playheadSec: number;
   /** VOD length; <=0/unknown → the upper window edge is unclamped. */
   vodDurationSec: number;
+  /** The opening preview's typed trim range (H:M:S fields). When valid
+   * (end > start), the popup window centres on it and the initial clip
+   * selection IS the trim — the clip comes from where the user pointed. */
+  anchorRange?: { start: number; end: number };
   /** VOD/live title — the clip title defaults to it (the user requires the
    * live's title verbatim, never a "VOD.RIP …" default). */
   vodTitle?: string;
@@ -90,6 +97,7 @@ export default function TwitchClipPopup({
   vodId,
   playheadSec,
   vodDurationSec,
+  anchorRange,
   vodTitle,
   zIndex,
   onClose,
@@ -100,20 +108,13 @@ export default function TwitchClipPopup({
   const { t } = useI18n();
   const volumeRef = useRef(initialVolume);
   const win = useMemo(
-    () => twitchClipWindow(playheadSec, vodDurationSec),
-    [playheadSec, vodDurationSec],
+    () => twitchClipWindow(playheadSec, vodDurationSec, anchorRange),
+    [playheadSec, vodDurationSec, anchorRange],
   );
   const winLen = win.end - win.start;
   const windowTooShort = winLen < TWITCH_CLIP_MIN_SEC;
 
-  const [selection, setSelection] = useState(() => {
-    // Twitch clips cap at 60s — start with a 60s selection (or the whole
-    // window when it's shorter), never the full ±60s window (~120s).
-    if (winLen > TWITCH_CLIP_MAX_SEC) {
-      return { start: win.end - TWITCH_CLIP_MAX_SEC, end: win.end };
-    }
-    return clampClipSelection(win.start, win.end, win.start, win.end);
-  });
+  const [selection, setSelection] = useState(() => initialClipSelection(win, anchorRange));
   const selectionRef = useRef(selection);
   const commitSelection = useCallback((next: { start: number; end: number }) => {
     selectionRef.current = next;
@@ -455,6 +456,23 @@ export default function TwitchClipPopup({
     commitSelection(res);
   }, [win, commitSelection]);
 
+  // Editable H:M:S inputs for the selection: committing either end pins the
+  // other and enforces the 5..60s clip length through the same clamp branches
+  // the rail drag uses.
+  const commitStartInput = useCallback((sec: number) => {
+    const sel = selectionRef.current;
+    commitSelection(clampClipSelection(
+      sec, sel.end, win.start, win.end, { move: 'in', fixedEnd: sel.end },
+    ));
+  }, [win, commitSelection]);
+
+  const commitEndInput = useCallback((sec: number) => {
+    const sel = selectionRef.current;
+    commitSelection(clampClipSelection(
+      sel.start, sec, win.start, win.end, { move: 'out', fixedStart: sel.start },
+    ));
+  }, [win, commitSelection]);
+
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
   // (clip_assist.mjs content script) instead of the Helix API — works with the
   // plain browser-login session cookie, no clip scopes needed. When the
@@ -724,6 +742,35 @@ export default function TwitchClipPopup({
 
       {/* Trim rail: 5..60s selection on the ±60s window timeline */}
       <div className="px-2 py-1.5 flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600">
+            {t('Range')}
+          </span>
+          <span className="flex items-center gap-1" title={t('Clip start (VOD time)')}>
+            <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('Start')}</span>
+            <EditableHmsTime
+              valueSec={selection.start}
+              minSec={win.start}
+              maxSec={win.end}
+              onChange={commitStartInput}
+              className="text-[10px] font-bold"
+            />
+          </span>
+          <span className="text-[9px] font-mono text-zinc-600">–</span>
+          <span className="flex items-center gap-1" title={t('Clip end (VOD time — the clip ends here)')}>
+            <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('End')}</span>
+            <EditableHmsTime
+              valueSec={selection.end}
+              minSec={win.start}
+              maxSec={win.end}
+              onChange={commitEndInput}
+              className="text-[10px] font-bold text-[#9146FF]"
+            />
+          </span>
+          <span className="ml-auto text-[8px] font-mono uppercase tracking-wider text-zinc-600">
+            {t('H:M:S')}
+          </span>
+        </div>
         <div className="flex items-stretch gap-2">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600 self-center">
             {t('Clip')}

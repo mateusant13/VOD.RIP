@@ -4,6 +4,7 @@ import {
   TWITCH_CLIP_MIN_SEC,
   clampClipSelection,
   clipEditorOffsetAndDuration,
+  initialClipSelection,
   openTwitchClipEditorInBrowser,
   twitchClipDurationError,
   twitchClipWindow,
@@ -50,6 +51,55 @@ describe('twitchClipWindow', () => {
 
   it('keeps the upper edge unclamped when the duration is unknown', () => {
     expect(twitchClipWindow(100, 0)).toEqual({ start: 40, end: 160 });
+  });
+
+  it('centres on the anchor midpoint when a valid anchor is given', () => {
+    // anchor 300..360 → midpoint 330 → ±60 window 270..390
+    expect(twitchClipWindow(0, 7200, { start: 300, end: 360 })).toEqual({ start: 270, end: 390 });
+  });
+
+  it('ignores an invalid anchor and centres on the playhead', () => {
+    expect(twitchClipWindow(3600, 7200, { start: 5000, end: 4000 })).toEqual({ start: 3540, end: 3660 });
+    expect(twitchClipWindow(3600, 7200, { start: 0, end: 0 })).toEqual({ start: 3540, end: 3660 });
+  });
+
+  it('clamps an anchored window at the VOD start edge', () => {
+    expect(twitchClipWindow(3600, 7200, { start: 10, end: 50 })).toEqual({ start: 0, end: 90 });
+  });
+});
+
+describe('initialClipSelection', () => {
+  it('defaults to the last 60s of the window without an anchor', () => {
+    expect(initialClipSelection({ start: 0, end: 120 })).toEqual({ start: 60, end: 120 });
+  });
+
+  it('defaults to the whole window when shorter than 60s', () => {
+    expect(initialClipSelection({ start: 0, end: 30 })).toEqual({ start: 0, end: 30 });
+  });
+
+  it('returns the anchor as-is when it fits the window', () => {
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 360 }))
+      .toEqual({ start: 300, end: 360 });
+  });
+
+  it('keeps the END anchored when the anchor is longer than 60s', () => {
+    expect(initialClipSelection({ start: 0, end: 7200 }, { start: 1000, end: 1100 }))
+      .toEqual({ start: 1040, end: 1100 });
+  });
+
+  it('grows an under-5s anchor to the minimum from its start', () => {
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 302 }))
+      .toEqual({ start: 300, end: 305 });
+    // at the window end the start is pulled back instead
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 388, end: 389 }))
+      .toEqual({ start: 385, end: 390 });
+  });
+
+  it('clamps an anchor that extends past the window edge', () => {
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 500 }))
+      .toEqual({ start: 330, end: 390 });
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 100, end: 300 }))
+      .toEqual({ start: 270, end: 300 });
   });
 });
 

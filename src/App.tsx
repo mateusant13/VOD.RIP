@@ -464,13 +464,15 @@ export default function App() {
   /** Twitch clip editor open — transient notice shown in the transport row. */
   const [clipOpenNotice, setClipOpenNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [clipOpening, setClipOpening] = useState(false);
-  /** Twitch clip mini-preview (VOD path) — opened at the current playhead. */
+  /** Twitch clip mini-preview (VOD path) — opened at the current playhead,
+   * centred on the user's typed trim range when one is set. */
   const [twitchClipPopup, setTwitchClipPopup] = useState<{
     url: string;
     broadcasterLogin: string;
     vodId: string;
     playheadSec: number;
     vodDurationSec: number;
+    anchorRange?: { start: number; end: number };
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
@@ -5842,11 +5844,14 @@ export default function App() {
       vodId,
       playheadSec: previewTimeUi,
       vodDurationSec,
+      anchorRange: previewTrimEnd > previewTrimStart
+        ? { start: previewTrimStart, end: previewTrimEnd }
+        : undefined,
       reuseSession: previewSessionIdRef.current
         ? { sessionId: previewSessionIdRef.current, trimTimeline: previewTrimTimelineRef.current }
         : null,
     });
-  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, showClipOpenNotice]);
+  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, previewTrimStart, previewTrimEnd, showClipOpenNotice]);
 
   const previewClipPct = vodDurationSec > 0
     ? {
@@ -7156,6 +7161,7 @@ export default function App() {
           vodId={twitchClipPopup.vodId}
           playheadSec={twitchClipPopup.playheadSec}
           vodDurationSec={twitchClipPopup.vodDurationSec}
+          anchorRange={twitchClipPopup.anchorRange}
           vodTitle={videoInfo?.title ?? undefined}
           zIndex={EXPLORE_POPUP_Z + 200}
           initialVolume={previewVolumeRef.current}
