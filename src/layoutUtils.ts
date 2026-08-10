@@ -984,6 +984,12 @@ export const MAX_EXPLORE_POPUPS = 5;
  *  the upgrade path is a rank-aware glance z derived from the active player's
  *  rank, not a constant. */
 export const LIVE_POPUP_ACTIVE_Z = EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS + 1;
+/** Z for app-level modal overlays (download confirm, cookie-wait). Sits above
+ *  the whole shared ladder (EXPLORE_POPUP_Z + popupZOrder rank) and the needle
+ *  glance, so a modal spawned while popups are open always covers them.
+ *  ponytail: same unbounded-counter ceiling as LIVE_POPUP_ACTIVE_Z — the
+ *  upgrade path is a rank-aware modal z derived from the active max rank. */
+export const MODAL_Z = EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS + 2;
 export const LAYOUT_ROW_GAP_TRIPLE = 12;
 export const LAYOUT_ROW_GAP_SPLIT = 24;
 export const RESIZE_EDGE_CURSORS: Record<ResizeEdge, string> = {

@@ -125,6 +125,11 @@ const MAX_LIVE_POPUPS = 5;
  *  other. */
 const ARCHIVE_SEARCH_POPUP_ID = 'archive-search';
 const PREVIEW_SEARCH_POPUP_ID = 'preview-search';
+/** Ladder ID for the floating Twitch clip mini-preview (VOD path) — it used
+ *  to sit at a fixed EXPLORE_POPUP_Z + 200, which the unbounded rank counter
+ *  eventually overtakes; a real ladder rank keeps it above every window at
+ *  spawn and on every raise. */
+const TWITCH_CLIP_POPUP_ID = 'twitch-clip-popup';
 
 interface LivePopupItem {
   id: number;
@@ -3079,15 +3084,21 @@ export default function App() {
     setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
   }, []);
 
-  const assignPopupZ = useCallback((id: string) => {
+  /**
+   * THE single shared raise-to-front mechanism for every floating window
+   * (explore, live, local-file, clip, both search popups). Each popup gets a
+   * monotonic ladder rank from one counter: zIndex = EXPLORE_POPUP_Z + rank.
+   * A rank is assigned at SPAWN (open handlers below) and re-assigned on
+   * pointer-down (drag to front), so the last-opened / last-clicked window
+   * always paints above every other — including across the portal boundary,
+   * because no container in the chain owns a z-index (see #explore-portal).
+   * Close handlers drop the rank (dropPopupZ) so the map never grows.
+   */
+  const bringPopupToFront = useCallback((id: string) => {
     popupZCounterRef.current += 1;
     const rank = popupZCounterRef.current;
     setPopupZOrder((prev) => ({ ...prev, [id]: rank }));
   }, []);
-
-  const bringPopupToFront = useCallback((id: string) => {
-    assignPopupZ(id);
-  }, [assignPopupZ]);
 
   /** Drop a closed popup's rank so the ladder map never grows unboundedly. */
   const dropPopupZ = useCallback((id: string) => {
@@ -3144,7 +3155,7 @@ export default function App() {
         return prev;
       }
       const id = crypto.randomUUID();
-      assignPopupZ(id);
+      bringPopupToFront(id);
       const next = [...prev, { id, vod, layoutIndex: prev.length }];
       if (next.length > MAX_EXPLORE_POPUPS) {
         const dropped = next.slice(0, next.length - MAX_EXPLORE_POPUPS);
@@ -3161,7 +3172,7 @@ export default function App() {
       }
       return next;
     });
-  }, [pauseAllExplorePopups, assignPopupZ, bringPopupToFront, channelContentFilter]);
+  }, [pauseAllExplorePopups, bringPopupToFront, channelContentFilter]);
 
   /**
    * Archive search → open the hit in the explore-player flow at its offset.
@@ -3201,7 +3212,7 @@ export default function App() {
     setExplorePopups((prev) => {
       const next = prev.filter((p) => p.vod.url !== vodUrl);
       const id = crypto.randomUUID();
-      assignPopupZ(id);
+      bringPopupToFront(id);
       const after = [...next, { id, vod, layoutIndex: next.length }];
       if (after.length > MAX_EXPLORE_POPUPS) {
         const dropped = after.slice(0, after.length - MAX_EXPLORE_POPUPS);
@@ -3218,7 +3229,7 @@ export default function App() {
       }
       return after;
     });
-  }, [pauseAllExplorePopups, assignPopupZ, searchOpenCounts]);
+  }, [pauseAllExplorePopups, bringPopupToFront, searchOpenCounts]);
 
   const layoutBoundsInput = useCallback((): LayoutPanelBoundsInput => {
     const aside = previewOpen || channelVodPanelOpen;
@@ -3824,7 +3835,7 @@ export default function App() {
   const openLocalFilePreview = useCallback((dl: DownloadState) => {
     if (!dl.output_file || !/\.(mp4|mkv|webm|mov|m4v)$/i.test(dl.output_file)) return;
     const id = `local_${Date.now().toString(36)}`;
-    assignPopupZ(id);
+    bringPopupToFront(id);
     setLocalFilePopups((prev) => [
       ...prev,
       {
@@ -3834,7 +3845,7 @@ export default function App() {
         platform: dl.platform,
       },
     ]);
-  }, [assignPopupZ]);
+  }, [bringPopupToFront]);
 
   const closeLocalFilePopup = useCallback((id: string) => {
     dropPopupZ(id);
@@ -5072,9 +5083,9 @@ export default function App() {
       return;
     }
     livePopupsRef.current = res.items;
-    assignPopupZ(String(item.id));
+    bringPopupToFront(String(item.id));
     setLivePopups(res.items);
-  }, [assignPopupZ]);
+  }, [bringPopupToFront]);
 
   const closeLivePopup = useCallback((id: number) => {
     dropPopupZ(String(id));
@@ -5868,7 +5879,11 @@ export default function App() {
         ? { sessionId: previewSessionIdRef.current, trimTimeline: previewTrimTimelineRef.current }
         : null,
     });
-  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, previewTrimStart, previewTrimEnd, showClipOpenNotice]);
+    // Spawn on top of whatever is open (search panel included) via the
+    // shared ladder — a fixed offset would eventually lose to the
+    // monotonic rank counter.
+    bringPopupToFront(TWITCH_CLIP_POPUP_ID);
+  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, previewTrimStart, previewTrimEnd, showClipOpenNotice, bringPopupToFront]);
 
   const previewClipPct = vodDurationSec > 0
     ? {
@@ -7179,9 +7194,9 @@ export default function App() {
           vodDurationSec={twitchClipPopup.vodDurationSec}
           anchorRange={twitchClipPopup.anchorRange}
           vodTitle={videoInfo?.title ?? undefined}
-          zIndex={EXPLORE_POPUP_Z + 200}
+          zIndex={EXPLORE_POPUP_Z + (popupZOrder[TWITCH_CLIP_POPUP_ID] ?? 0)}
           initialVolume={previewVolumeRef.current}
-          onClose={() => setTwitchClipPopup(null)}
+          onClose={() => { setTwitchClipPopup(null); dropPopupZ(TWITCH_CLIP_POPUP_ID); }}
         />
       )}
       {archiveSearchOpen && (

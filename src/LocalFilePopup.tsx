@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -83,6 +84,11 @@ export default function LocalFilePopup({
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   const [pos, setPos] = useState<PanelPos | null>(null);
+  // Spawned windows take focus (shared raise-to-front contract) — the popup
+  // is the active surface the moment it opens.
+  useEffect(() => {
+    containerRef.current?.focus({ preventScroll: true });
+  }, []);
   /** Docked archive-search panel (global search — local files have no archive identity). */
   const [searchOpen, setSearchOpen] = useState(false);
   const platform = platformKey(item.platform);
@@ -146,6 +152,7 @@ export default function LocalFilePopup({
   return (
     <div
       ref={containerRef}
+      tabIndex={-1}
       className={`fixed flex flex-col gap-2 bg-zinc-950 border-2 border-white p-3 select-none ${platformCardShadow(platform)}`}
       style={{ zIndex, width: size.w, height: size.h, ...(pos ? { left: pos.x, top: pos.y } : {}) }}
       onPointerDownCapture={onBringToFront}

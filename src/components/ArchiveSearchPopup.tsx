@@ -779,7 +779,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       style={embedded ? undefined : { zIndex }}
     >
       <div
-        className={`flex items-center justify-between gap-2 shrink-0 ${embedded ? '' : 'cursor-grab active:cursor-grabbing'}`}
+        className={`flex items-center justify-between gap-2 shrink-0 relative z-[60] ${embedded ? '' : 'cursor-grab active:cursor-grabbing'}`}
         onPointerDown={embedded ? undefined : onDragStart}
       >
         <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500">

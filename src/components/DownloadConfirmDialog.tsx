@@ -9,6 +9,7 @@
 import { type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useI18n } from '../i18n';
+import { MODAL_Z } from '../layoutUtils';
 
 
 interface DownloadConfirmDialogProps {
@@ -38,7 +39,8 @@ export default function DownloadConfirmDialog({
   if (!open) return null;
   return createPortal(
     <div
-      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 flex items-center justify-center bg-black/75 p-4"
+      style={{ zIndex: MODAL_Z }}
       onClick={onCancel}
     >
       <div
