@@ -6,9 +6,9 @@ and joins ``#<login>``. PRIVMSG lines carry tmi-sent-ts (epoch ms),
 display-name, user-id, badges and emotes in the tag block.
 
 offset_sec = (tmi-sent-ts − stream_start_ts) / 1000, with stream_start_ts
-(epoch ms) taken from the live-status payload (Helix ``started_at`` when the
-app has Helix creds). When the stream start is unknown, offsets anchor on the
-first seen message (handled by ChatSink.handle_row).
+(epoch ms) taken from the live-status payload. When the stream start is
+unknown, offsets anchor on the first seen message (handled by
+ChatSink.handle_row).
 
 Reconnects with exponential backoff (2s → 30s cap) on socket errors.
 """

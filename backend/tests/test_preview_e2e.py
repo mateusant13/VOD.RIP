@@ -192,7 +192,7 @@ class TestYouTubePreviewResolve:
             "http_headers": {},
         }
 
-        def _fake_extract(_url, oauth=None, cachedir=None, cookies_file=None):
+        def _fake_extract(_url, cachedir=None, cookies_file=None):
             return muxed_info
 
         with patch(

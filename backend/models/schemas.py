@@ -25,7 +25,6 @@ class DownloadRequest(BaseModel):
     url: str
     output_file: Optional[str] = None
     quality: Optional[str] = None
-    oauth: Optional[str] = None
     crop_start: Optional[float] = None
     crop_end: Optional[float] = None
     audio_only: bool = False
@@ -83,7 +82,6 @@ class AppSettings(BaseModel):
     # wins. VODRIP_DATA_DIR env overrides both. Takes effect after restart —
     # the DB is moved by the relocation plumbing.
     data_dir: str = ""
-    oauth: str = ""
     youtube_cookies_file: str = ""
     youtube_cookies_browser: str = ""
     youtube_visitor_data: str = ""
@@ -139,18 +137,6 @@ class AppSettings(BaseModel):
     # also picks asr_language from the same family, once, never overriding
     # an explicit user choice).
     ui_language: str = ""
-    # Official API hybrid (issue #4): Twitch helix OAuth bearer token —
-    # auto-lifted from the cookie bridge's `auth-token`, or pasted by
-    # non-extension users. Empty = GQL only (current behavior).
-    twitch_helix_token: str = ""
-    # Epoch seconds of the last token write (paste OR auto-lift). The
-    # auto-lift only replaces the stored token when the cookie export is
-    # NEWER than this — a stale browser cookie never clobbers a manual paste.
-    twitch_helix_token_updated_at: float = 0.0
-    # OAuth app Client ID used to build the "Get Twitch token" authorize URL
-    # (implicit grant, redirect to http://localhost:7897/twitch-oauth-callback).
-    # Optional: without it the token button opens the app-registration page.
-    twitch_helix_client_id: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -164,7 +150,6 @@ class SettingsUpdate(BaseModel):
     temp_folder: Optional[str] = None
     cache_dir: Optional[str] = None
     data_dir: Optional[str] = None
-    oauth: Optional[str] = None
     youtube_cookies_file: Optional[str] = None
     youtube_cookies_browser: Optional[str] = None
     youtube_visitor_data: Optional[str] = None
@@ -196,8 +181,6 @@ class SettingsUpdate(BaseModel):
     asr_language: Optional[str] = None
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None
-    twitch_helix_token: Optional[str] = None
-    twitch_helix_client_id: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):

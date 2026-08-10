@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import random
 import re
 import subprocess as sp
@@ -231,63 +230,6 @@ def probe_twitch_live_master(
     return result
 
 
-def _twitch_helix_live_info(login: str) -> Optional[dict]:
-    """Fast live-status check via Helix (client creds from env).
-
-    Returns the live metadata dict, or None when the channel is offline.
-    Raises on any API failure so the caller can fall back to a page scrape.
-    """
-    client_id = os.environ.get("TWITCH_CLIENT_ID")
-    client_secret = os.environ.get("TWITCH_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise RuntimeError("TWITCH_CLIENT_ID/SECRET not configured")
-
-    token_resp = requests.post(
-        "https://id.twitch.tv/oauth2/token",
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "client_credentials",
-        },
-        timeout=10,
-    )
-    token_resp.raise_for_status()
-    access_token = (token_resp.json() or {}).get("access_token")
-    if not access_token:
-        raise RuntimeError("Helix token missing")
-
-    resp = requests.get(
-        "https://api.twitch.tv/helix/streams",
-        params={"user_login": login.lower()},
-        headers={"Client-Id": client_id, "Authorization": f"Bearer {access_token}"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = (resp.json() or {}).get("data") or []
-    if not data:
-        return None  # offline — fast path, no page scrape
-
-    stream = data[0]
-    # Rotate player types and keep the first ad-free master (probe cached 60s).
-    probed = probe_twitch_live_master(login)
-    if not probed:
-        raise RuntimeError("no live playback token from GQL")
-
-
-    return {
-        "url": probed["url"],
-        "headers": probed["headers"],
-        "title": stream.get("title") or login,
-        "viewers": stream.get("viewer_count") or 0,
-        "platform": "Twitch",
-        "player_type": probed["player_type"],
-        "ad_free": probed["ad_free"],
-        # ISO-8601 stream start — the archive chat sink anchors message
-        # offsets to it (tmi-sent-ts − started_at).
-        "started_at": stream.get("started_at"),
-    }
-
-
 def twitch_archive_info(login: str) -> Optional[dict]:
     """Resolve the channel's current (likely in-progress) VOD master URL.
 
@@ -340,24 +282,13 @@ def kick_archive_info(slug: str) -> Optional[dict]:
 
 
 def twitch_live_info(login: str) -> Optional[dict]:
-    """Return live-stream metadata dict or None if offline.
-
-    Uses the Helix API when TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET are set
-    (fast offline detection, no yt-dlp), and falls back to a yt-dlp page
-    scrape otherwise or on any Helix failure. Whichever path produced the
-    info, the playback URL is upgraded to a fresh usher master from
+    """Return live-stream metadata dict or None if offline (yt-dlp page
+    scrape). The playback URL is upgraded to a fresh usher master from
     ``probe_twitch_live_master`` so the live popup can rotate player types
     (the rotate endpoint rejects non-usher masters, and yt-dlp's CDN URL is
     not rotation-capable). The probe is cached 60s per channel.
     """
     info: Optional[dict] = None
-    if os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"):
-        try:
-            info = _twitch_helix_live_info(login)
-        except Exception as exc:
-            logger.debug(
-                "twitch_live_info(%r): Helix failed — falling back to page scrape: %s", login, exc
-            )
 
     if info is None:
         import yt_dlp

@@ -9,7 +9,7 @@
  * editor's window and clicks Save, then posts the published clip URL to
  * /api/twitch/clips/record so it shows in the app's clip history with a
  * download button. The browser path works with the plain session cookie —
- * no Helix clip scopes or editor role needed.
+ * no API token scopes or editor role needed.
  *
  * The mini preview reuses the main preview's session machinery: one session
  * per popup with crop_start/crop_end = the window, exactly like App.tsx's
@@ -465,8 +465,8 @@ export default function TwitchClipPopup({
   }, [win, commitSelection]);
 
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
-  // (clip_assist.mjs content script) instead of the Helix API — works with the
-  // plain browser-login session cookie, no clip scopes needed. When the
+  // (clip_assist.mjs content script) — works with the plain browser-login
+  // session cookie, no API clip scopes needed. When the
   // extension is not paired yet, run the app's auto-installer FIRST (it
   // stages the extension, restarts the browser, and the extension self-pairs
   // via /api/session/cookies), then open the editor once pairing settles.

@@ -34,7 +34,6 @@ from services.download_utils import (
     _download_timeout_seconds,
     _hook_progress_percent,
 )
-from services.oauth_crypto import decrypt_token
 from services.ytdlp_download import kill_pp_state_procs, sanitize_download_error
 from services.ytdlp_ffmpeg import (
     kill_download_ffmpeg_pids,
@@ -127,7 +126,6 @@ class DownloadManager:
         url: str,
         output_file: str,
         quality: Optional[str] = None,
-        oauth: Optional[str] = None,
         crop_start: Optional[float] = None,
         crop_end: Optional[float] = None,
         download_type: str = "video",
@@ -172,7 +170,6 @@ class DownloadManager:
             "url": url,
             "output_file": output_file,
             "quality": quality,
-            "oauth": oauth,
             "crop_start": crop_start,
             "crop_end": crop_end,
             "download_type": download_type,
@@ -520,7 +517,6 @@ class DownloadManager:
                         "url": params["url"],
                         "output_path": output_file,
                         "quality": params.get("quality"),
-                        "oauth": params.get("oauth"),
                         "crop_start": params.get("crop_start"),
                         "crop_end": params.get("crop_end"),
                         "progress_hook": _progress_hook,
@@ -538,7 +534,6 @@ class DownloadManager:
                         url=params["url"],
                         output_path=output_file,
                         quality=params.get("quality"),
-                        oauth=params.get("oauth"),
                         crop_start=params.get("crop_start"),
                         crop_end=params.get("crop_end"),
                         progress_hook=_progress_hook,
@@ -741,7 +736,6 @@ class DownloadManager:
     def resume(
         self,
         download_id: str,
-        oauth: Optional[str] = None,
         download_func: Optional[Callable[..., str]] = None,
         settings_mgr: Optional["SettingsManager"] = None,
     ) -> Optional[str]:
@@ -762,7 +756,6 @@ class DownloadManager:
             return download_id
         return self._restart_resumable(
             download_id,
-            oauth=oauth,
             download_func=download_func,
             settings_mgr=settings_mgr,
         )
@@ -770,7 +763,6 @@ class DownloadManager:
     def _restart_resumable(
         self,
         download_id: str,
-        oauth: Optional[str] = None,
         download_func: Optional[Callable[..., str]] = None,
         settings_mgr: Optional["SettingsManager"] = None,
     ) -> Optional[str]:
@@ -785,7 +777,6 @@ class DownloadManager:
             url=params["url"],
             output_file=params["output_file"],
             quality=params.get("quality"),
-            oauth=oauth if oauth is not None else params.get("oauth"),
             crop_start=params.get("crop_start"),
             crop_end=params.get("crop_end"),
             download_type=params.get("download_type", params.get("type", "video")),
@@ -929,13 +920,6 @@ class DownloadManager:
             "history": completed_history,
         }
 
-    @staticmethod
-    def _decrypt_oauth_params(entry: dict) -> None:
-        """Decrypt oauth in-place from _params so callers get plaintext."""
-        params = entry.get("_params")
-        if params and params.get("oauth"):
-            params["oauth"] = decrypt_token(params["oauth"])
-
     def get_resumable_entry(self, download_id: str) -> Optional[dict]:
         """Return a resumable entry from memory, queue.json, or history."""
         with self._lock:
@@ -945,20 +929,15 @@ class DownloadManager:
                 params = self._worker_params.get(download_id)
                 if params:
                     payload["_params"] = self._db._serializable_worker_params(params)
-                    self._decrypt_oauth_params(payload)
                 return payload
         for entry in self._db.queue:
             if entry.get("download_id") == download_id:
-                entry = dict(entry)
-                self._decrypt_oauth_params(entry)
-                return entry
+                return dict(entry)
         for entry in self._db.history:
             if entry.get("download_id") != download_id:
                 continue
             if entry.get("status") in _RESUMABLE_STATUSES | _UNFINISHED_STATUSES:
-                entry = dict(entry)
-                self._decrypt_oauth_params(entry)
-                return entry
+                return dict(entry)
             return None
         return None
 
@@ -974,13 +953,11 @@ class DownloadManager:
     def retry_download(
         self,
         download_id: str,
-        oauth: Optional[str] = None,
         download_func: Optional[Callable[..., str]] = None,
         settings_mgr: Optional["SettingsManager"] = None,
     ) -> str:
         new_id = self._restart_resumable(
             download_id,
-            oauth=oauth,
             download_func=download_func,
             settings_mgr=settings_mgr,
         )

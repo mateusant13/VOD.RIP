@@ -4,14 +4,9 @@ Settings routes — GET/POST /api/settings, /api/pick-folder, /api/open-folder.
 
 import asyncio
 import logging
-import secrets
-import subprocess
-import time
-from pathlib import Path
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+
 from models.schemas import AppSettings, OpenFolderRequest, SettingsUpdate
 
 from deps import settings_mgr, download_mgr, OS_EXECUTOR
@@ -105,8 +100,6 @@ async def update_settings(update: SettingsUpdate):
     if update.data_dir is not None:
         # '' = auto (fastest usable drive); any explicit path wins.
         current.data_dir = update.data_dir.strip()
-    if update.oauth is not None:
-        current.oauth = update.oauth
     if update.youtube_cookies_file is not None:
         current.youtube_cookies_file = update.youtube_cookies_file.strip()
     if update.youtube_cookies_browser is not None:
@@ -205,145 +198,9 @@ async def update_settings(update: SettingsUpdate):
         # so the frontend re-seeds from the system language).
         val = (update.ui_language or "").strip()
         current.ui_language = val if val in ("en", "pt-BR", "es") else ""
-    if update.twitch_helix_token is not None:
-        # Official-API hybrid: a save that touches the token stamps the
-        # write time so the cookie auto-lift never clobbers a fresh paste.
-        val = (update.twitch_helix_token or "").strip()
-        if val != (current.twitch_helix_token or ""):
-            current.twitch_helix_token = val
-            current.twitch_helix_token_updated_at = time.time()
-    if update.twitch_helix_client_id is not None:
-        current.twitch_helix_client_id = (update.twitch_helix_client_id or "").strip()
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
-    # Auto-lift: refresh the helix token from the cookie bridge (zero manual
-    # steps for extension users). Never clobbers a token the save just wrote
-    # (updated_at is fresh) — fills the field only when empty or the cookie
-    # export is newer. Local I/O only, never a network call.
-    try:
-        from services.twitch_helix_service import auto_lift_token
-
-        if auto_lift_token():
-            current = settings_mgr.get()
-    except Exception:
-        logger.debug("helix token auto-lift skipped", exc_info=True)
     return current
-
-
-@router.get("/api/settings/official-apis-status")
-async def official_apis_status():
-    """Official-API credential state for the Settings UI (Twitch Helix only
-    since the YouTube Data API key was removed)."""
-    s = settings_mgr.get()
-    return {
-        "twitch_helix_token_set": bool((getattr(s, "twitch_helix_token", "") or "").strip()),
-    }
-
-
-@router.post("/api/twitch/oauth-flow")
-async def start_twitch_oauth_flow(payload: dict):
-    """Launch the off-screen OAuth consent flow for the "Get Twitch token" button.
-
-    Zero flash / zero focus steal: scripts/vodrip-oauth-flow.ps1 opens a hidden
-    Chrome window on the user's real profile (alpha-0 on-screen so the renderer
-    stays live), drives the consent page via UIA (no SendKeys, no
-    BringToForeground — PostMessage Enter), and POSTs the token to /api/settings
-    itself when the callback lands. Fire-and-forget: the script's own poll waits
-    for the settings write.
-    """
-    client_id = (payload.get("client_id") or "").strip()
-    if not client_id:
-        raise HTTPException(400, "client_id is required")
-    state = secrets.token_hex(8)
-    url = "https://id.twitch.tv/oauth2/authorize?" + urlencode({
-        "client_id": client_id,
-        "redirect_uri": "http://localhost:7897/twitch-oauth-callback",
-        "response_type": "token",
-        # Keep in sync with src/twitchClip.ts TWITCH_CLIP_SCOPES.
-        "scope": "clips:edit editor:manage:clips channel:manage:clips",
-        "state": state,
-    })
-    script = Path(__file__).resolve().parent.parent.parent / "scripts" / "vodrip-oauth-flow.ps1"
-    if not script.exists():
-        raise HTTPException(500, f"oauth flow script missing: {script}")
-    current = settings_mgr.get()
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-File", str(script), "-Url", url,
-         "-OrigToken", getattr(current, "twitch_helix_token", "") or ""],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    return {"ok": True, "state": state}
-
-
-@router.get("/twitch-oauth-callback", response_class=HTMLResponse)
-async def twitch_oauth_callback():
-    """OAuth callback target for the "Get Twitch token" flow (implicit grant).
-
-    Twitch redirects to http://localhost:7897/twitch-oauth-callback#access_token=...
-    The token lives in the URL fragment, which never reaches the server — this
-    page's JS reads it and POSTs it to /api/settings (the same paste path).
-    """
-    return """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>VOD.RIP — Twitch token</title>
-<style>
-  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
-         justify-content: center; background: #0e0e10; color: #efeff1;
-         font-family: system-ui, sans-serif; }
-  .card { max-width: 480px; text-align: center; padding: 32px; }
-  h1 { font-size: 18px; margin: 0 0 12px; }
-  p { font-size: 14px; line-height: 1.5; color: #adadb8; margin: 0; }
-  .ok { color: #38a169; font-weight: 700; }
-  .err { color: #e53e3e; font-weight: 700; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>VOD.RIP — Twitch token</h1>
-    <p id="status">Saving token…</p>
-  </div>
-<script>
-(function () {
-  var status = document.getElementById('status');
-  var params = new URLSearchParams(location.hash.replace(/^#/, ''));
-  var error = new URLSearchParams(location.search).get('error');
-  if (error) {
-    status.className = 'err';
-    status.textContent = 'Authorization failed: ' + error +
-      (new URLSearchParams(location.search).get('error_description') || '');
-    return;
-  }
-  var token = params.get('access_token');
-  if (!token) {
-    status.className = 'err';
-    status.textContent = 'No access_token in the URL. Close this tab and try again.';
-    return;
-  }
-  fetch('/api/settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ twitch_helix_token: token }),
-  }).then(function (r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    var scopes = (params.get('scope') || '').split(' ');
-    var hasClipScope = scopes.indexOf('editor:manage:clips') !== -1 ||
-                       scopes.indexOf('channel:manage:clips') !== -1;
-    status.className = 'ok';
-    status.textContent = hasClipScope
-      ? 'Token saved — you can close this tab and create clips in VOD.RIP.'
-      : 'Token saved, but it lacks the clip scopes — re-run the flow and approve the clip permission.';
-  }).catch(function (err) {
-    status.className = 'err';
-    status.textContent = 'Failed to save the token (' + err.message +
-      '). Make sure VOD.RIP is running on port 7897.';
-  });
-})();
-</script>
-</body>
-</html>"""
 
 
 @router.get("/api/settings/recommended")

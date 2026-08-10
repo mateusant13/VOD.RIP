@@ -10,7 +10,6 @@ const BASE_SETTINGS: AppSettings = {
   throttle_kib: 0,
   ffmpeg_path: "",
   temp_folder: "",
-  oauth: "",
   quality: "720p",
 };
 

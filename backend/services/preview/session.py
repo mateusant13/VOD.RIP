@@ -180,7 +180,6 @@ def _prog_head_enforce_budget() -> None:
         pass
 def kickoff_youtube_prog_head_warm(
     url: str,
-    oauth: Optional[str] = None,
     prefer_height: int = 360,
 ) -> None:
     """Background: download the head (ftyp+moov+opening media) of the muxed
@@ -203,7 +202,7 @@ def kickoff_youtube_prog_head_warm(
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
         try:
-            _youtube_prog_head_warm(url, vid, oauth=oauth, prefer_height=prefer_height)
+            _youtube_prog_head_warm(url, vid, prefer_height=prefer_height)
         finally:
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)
@@ -214,11 +213,11 @@ def kickoff_youtube_prog_head_warm(
 
     GESTURE_WARM_EXECUTOR.submit(_run)
 def _youtube_prog_head_warm(
-    url: str, vid: str, oauth: Optional[str], prefer_height: int
+    url: str, vid: str, prefer_height: int
 ) -> bool:
     try:
         _raw, headers, _platform, variant_formats, kind, yt_info = resolve_stream_info(
-            url, oauth=oauth, prefer_height=prefer_height
+            url, prefer_height=prefer_height
         )
     except Exception as exc:
         from services.ytdlp_hls import _youtube_soft_neg_error
@@ -613,7 +612,6 @@ class PreviewManager:
         url: str,
         crop_start: float = 0.0,
         crop_end: float = 0.0,
-        oauth: Optional[str] = None,
         prefer_height: int = 360,
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
@@ -627,7 +625,7 @@ class PreviewManager:
             # menu); the served tier ladder itself is NOT capped — cookieless
             # DASH formats resolve from this IP, so anonymous sessions expose
             # every adaptive height up to 1080p (muxed via window-HLS).
-            youtube_anonymous = _youtube_preview_is_anonymous(oauth)
+            youtube_anonymous = _youtube_preview_is_anonymous()
             # Wait briefly for a genuinely in-flight hover/paste warm so
             # create_session reuses the resolved-stream cache (avoids a second
             # ~3s extract). ponytail: capped low — during a startup/channel warm
@@ -671,7 +669,7 @@ class PreviewManager:
             # NOTE: helper returns (vid, height, snapshot_dict) — the reuse path
             # wants the bare dict (passing the tuple 500'd every cold first click).
             resolved = _resolve_and_cache_youtube_snapshot(
-                url, oauth=oauth, prefer_height=prefer_height,
+                url, prefer_height=prefer_height,
             )
             if resolved:
                 snap = resolved[2]
@@ -694,7 +692,6 @@ class PreviewManager:
                 raw_entry, headers, platform, variant_formats, kind, yt_info = (
                     resolve_stream_info(
                         url,
-                        oauth=oauth,
                         prefer_height=prefer_height,
                     )
                 )
@@ -874,7 +871,7 @@ class PreviewManager:
             # Quality policy: YouTube live previews follow the same anonymous
             # 360p-only rule as VODs (surfaced to the frontend via the
             # response so the live popup can clamp its quality menu).
-            anonymous=(platform or "").lower() == "youtube" and _youtube_preview_is_anonymous(None),
+            anonymous=(platform or "").lower() == "youtube" and _youtube_preview_is_anonymous(),
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -1385,18 +1382,11 @@ def _refresh_youtube_preview_urls(
     """Re-resolve googlevideo URLs — they expire; stale URLs cause preview 403/500."""
     if session.platform != "YouTube":
         return
-    try:
-        from deps import settings_mgr
-
-        oauth = settings_mgr.get().oauth or None
-    except Exception:
-        oauth = None
     was_window = getattr(session, "dash_window_hls", False)
     was_progressive = session.kind == "progressive"
     _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
     raw_entry, headers, _platform, variant_formats, kind, yt_info = resolve_stream_info(
         session.vod_url,
-        oauth=oauth,
         prefer_height=prefer_height,
         force_fresh=True,
     )
@@ -1407,7 +1397,6 @@ def _refresh_youtube_preview_urls(
     if was_progressive and kind == "hls":
         muxed = _youtube_muxed_progressive_for_long_explore(
             session.vod_url,
-            oauth,
             prefer_height,
             yt_info=yt_info,
         )
@@ -1456,7 +1445,7 @@ def _refresh_youtube_preview_urls(
             session.allowed_hosts.update(_hosts_for_url(audio_fmt["url"]))
     elif _platform == "YouTube":
         try:
-            extra = _extract_youtube_preview_info(session.vod_url, oauth)
+            extra = _extract_youtube_preview_info(session.vod_url)
             audio_fmt = extra.get("_preview_audio_format")
             if audio_fmt and audio_fmt.get("url"):
                 session.preview_audio_url = audio_fmt["url"]
@@ -1534,16 +1523,9 @@ def _refresh_youtube_window_hls_urls(
     """Refresh googlevideo URLs for the window HLS mux — swap URL set, keep window cache."""
     if session.platform != "YouTube":
         return
-    try:
-        from deps import settings_mgr
-
-        oauth = settings_mgr.get().oauth or None
-    except Exception:
-        oauth = None
     _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
     _raw, headers, _platform, variant_formats, _kind, yt_info = resolve_stream_info(
         session.vod_url,
-        oauth=oauth,
         prefer_height=prefer_height,
         force_fresh=True,
     )
@@ -2347,18 +2329,16 @@ def _merge_youtube_session_cookies(headers: dict, vod_url: str) -> dict:
     except Exception:
         pass
     return out
-def _youtube_preview_is_anonymous(oauth: Optional[str]) -> bool:
+def _youtube_preview_is_anonymous() -> bool:
     """True when this preview's YouTube resolve runs with NO user auth.
 
     Mirrors youtube_session_from_values / apply_ytdlp_cookie_opts: user auth
-    = oauth token, manual cookies file, browser cookies (settings or cached
-    auto-auth export), POT/tokens file, or bridge cookies. Anonymous = the
+    = manual cookies file, browser cookies (settings or cached auto-auth
+    export), POT/tokens file, or bridge cookies. Anonymous = the
     bootstrap-only jar. ponytail: conservative direction — if in doubt we
     call it anonymous, so an authenticated session can only be *under*
     -allowed (360p), never over-allowed past policy.
     """
-    if oauth:
-        return False
     from services.ytdlp_hls import _youtube_manual_auth_configured
 
     if _youtube_manual_auth_configured():
@@ -2387,7 +2367,7 @@ def _youtube_info_is_dash_only_progressive(info: dict) -> bool:
     if _deduped_progressive_variants({"formats": merged}):
         return False
     return True
-def _reextract_youtube_for_preview(full_url: str, oauth: Optional[str]) -> dict:
+def _reextract_youtube_for_preview(full_url: str) -> dict:
     """Bust cache and re-extract — merged InnerTube (HLS-first) then full yt-dlp."""
     from services.ytdlp_hls import (
         cached_extract_info,
@@ -2403,7 +2383,7 @@ def _reextract_youtube_for_preview(full_url: str, oauth: Optional[str]) -> dict:
         cookies = settings_mgr.get().youtube_cookies_file or None
     except Exception:
         cookies = None
-    opts = youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies)
+    opts = youtube_preview_ytdl_opts(full_url, cookies_file=cookies)
     session = opts.get("_youtube_session")
     from services.youtube_innertube import (
         _collect_merged_innertube_info,
@@ -2430,19 +2410,13 @@ def _recover_youtube_progressive_session(session: PreviewSession) -> bool:
     """Re-resolve after DASH mux failure — may switch to HLS or muxed tiers."""
     if session.platform != "YouTube":
         return False
-    try:
-        from deps import settings_mgr
-
-        oauth = settings_mgr.get().oauth or None
-    except Exception:
-        oauth = None
     old_kind = session.kind
     old_needs_mux = _youtube_entry_needs_mux(session)
     try:
         from services.ytdlp_hls import invalidate_youtube_extract_cache
 
         invalidate_youtube_extract_cache(session.vod_url)
-        _reextract_youtube_for_preview(session.vod_url, oauth)
+        _reextract_youtube_for_preview(session.vod_url)
     except Exception as exc:
         logger.debug("youtube progressive recover re-extract failed: %s", exc)
     _refresh_youtube_preview_urls(session)
@@ -2456,7 +2430,7 @@ def _recover_youtube_progressive_session(session: PreviewSession) -> bool:
         or (old_needs_mux and not _youtube_entry_needs_mux(session))
     )
 def _extract_youtube_preview_info(
-    full_url: str, oauth: Optional[str], *, warm_light: bool = False
+    full_url: str, *, warm_light: bool = False
 ) -> dict:
     """Cached YouTube resolve — InnerTube multi-client, then yt-dlp fallback.
 
@@ -2480,7 +2454,7 @@ def _extract_youtube_preview_info(
     except Exception:
         vid = None
     anon_fut = None
-    if vid and not warm_light and not oauth:
+    if vid and not warm_light:
         # Staggered hedge: the anonymous probe gets a short solo window (its
         # healthy path lands in <1s — common case starts no chain and burns no
         # cookie quota). If it hasn't won by then, the full chain starts
@@ -2509,7 +2483,7 @@ def _extract_youtube_preview_info(
     from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
 
     cookies = settings_mgr.get().youtube_cookies_file or None
-    opts = youtube_preview_ytdl_opts(full_url, oauth=oauth, cookies_file=cookies)
+    opts = youtube_preview_ytdl_opts(full_url, cookies_file=cookies)
     if warm_light:
         opts["_warm_light"] = True
     try:
@@ -2645,7 +2619,6 @@ def _deduped_progressive_variants(info: dict) -> List[dict]:
     return out
 def _youtube_muxed_progressive_for_long_explore(
     vod_url: str,
-    oauth: Optional[str],
     prefer_height: int,
     *,
     yt_info: Optional[dict] = None,
@@ -2679,7 +2652,7 @@ def _youtube_muxed_progressive_for_long_explore(
         if picked:
             return picked
     try:
-        info = _reextract_youtube_for_preview(vod_url, oauth)
+        info = _reextract_youtube_for_preview(vod_url)
     except Exception as exc:
         logger.debug("long explore muxed re-extract: %s", exc)
         return None
@@ -3127,16 +3100,9 @@ def _try_fallback_from_window_hls(
     """On window-HLS mux failure, switch to muxed HLS when InnerTube offers it."""
     if not getattr(session, "dash_window_hls", False) or session.platform != "YouTube":
         return False
-    try:
-        from deps import settings_mgr
-
-        oauth = settings_mgr.get().oauth or None
-    except Exception:
-        oauth = None
     if _session_crop_span_sec(session) > WINDOW_HLS_SHORT_VOD_MAX_SEC:
         muxed = _youtube_muxed_progressive_for_long_explore(
             session.vod_url,
-            oauth,
             prefer_height,
             yt_info=getattr(session, "explore_yt_info", None),
         )
@@ -3159,7 +3125,6 @@ def _try_fallback_from_window_hls(
         raw_entry, headers, _platform, variant_formats, kind, yt_info = (
             resolve_stream_info(
                 session.vod_url,
-                oauth=oauth,
                 prefer_height=prefer_height,
                 force_fresh=True,
             )
@@ -3686,7 +3651,6 @@ from concurrent.futures import ThreadPoolExecutor as _TPE
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 def resolve_stream_info(
     url: str,
-    oauth: Optional[str] = None,
     prefer_height: int = 720,
     *,
     force_fresh: bool = False,
@@ -3751,7 +3715,7 @@ def resolve_stream_info(
         # yt-dlp fallback — slower, may provide working URLs if GQL/auth fails.
         if not variants:
             try:
-                opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+                opts = _build_ydl_opts(full_url, os.devnull)
                 clip_info = _extract_hls_info(full_url, opts)
                 variants = _deduped_progressive_variants(clip_info)
                 first_with_headers = next(
@@ -3793,14 +3757,14 @@ def resolve_stream_info(
                     return cached
 
         info = (
-            _reextract_youtube_for_preview(full_url, oauth)
+            _reextract_youtube_for_preview(full_url)
             if force_fresh
-            else _extract_youtube_preview_info(full_url, oauth, warm_light=warm_light)
+            else _extract_youtube_preview_info(full_url, warm_light=warm_light)
         )
         _resolve_youtube_preview_audio(info)
         if _youtube_info_is_dash_only_progressive(info):
             try:
-                alt = _reextract_youtube_for_preview(full_url, oauth)
+                alt = _reextract_youtube_for_preview(full_url)
                 if alt and not _youtube_info_is_dash_only_progressive(alt):
                     info = alt
             except Exception as exc:
@@ -3956,7 +3920,7 @@ def resolve_stream_info(
                     _resolve_youtube_preview_audio(info)
                     if not info.get("_preview_audio_format"):
                         try:
-                            alt = _reextract_youtube_for_preview(full_url, oauth)
+                            alt = _reextract_youtube_for_preview(full_url)
                             if alt:
                                 info = alt
                                 merged = _dedupe_youtube_formats(
@@ -4052,7 +4016,7 @@ def resolve_stream_info(
                 "Twitch VOD GQL resolve failed, falling back to yt-dlp: %s", exc
             )
 
-    opts = _build_ydl_opts(full_url, os.devnull, oauth=oauth)
+    opts = _build_ydl_opts(full_url, os.devnull)
     hls_info = _extract_hls_info(full_url, opts)
     variants = _deduped_hls_variants(hls_info)
     with_height = [fmt for fmt in variants if int(fmt.get("height") or 0) > 0]

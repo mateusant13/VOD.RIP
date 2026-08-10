@@ -1,13 +1,12 @@
 import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, KeyRound, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
+  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
 import InfoHint from './InfoHint';
 import CookieBridgeSection, { type BridgeStatus } from './CookieBridgeSection';
 import DiskSection from './DiskSection';
-import OfficialApisSection from './OfficialApisSection';
 import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
 import Toggle from './Toggle';
@@ -40,7 +39,6 @@ const SETTING_KEYS = [
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
-  'twitch_helix_token',
   'auto_install_extension',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
@@ -329,16 +327,6 @@ export default function SettingsTab({
           onChange={(c) => setSettings({ ...settings, start_with_windows: c })}
           ariaLabel="start with windows"
         />
-      </SettingsCard>
-
-      {/* ── Official API credentials ─────────────────────────── */}
-      <SettingsCard
-        icon={KeyRound}
-        title={t('Official API credentials')}
-        open={!!openCards.official}
-        onToggle={() => toggleCard('official')}
-      >
-        <OfficialApisSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
       {/* ── Transcription ───────────────────────────────────────── */}

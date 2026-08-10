@@ -93,7 +93,6 @@ export interface AppSettings {
    * fastest usable drive; an explicit path wins). Takes effect after
    * restart (DB relocation). */
   data_dir?: string;
-  oauth: string;
   youtube_cookies_file?: string;
   youtube_cookies_browser?: string;
   youtube_visitor_data?: string;
@@ -134,11 +133,6 @@ export interface AppSettings {
   /** App UI language: 'en' | 'pt-BR' | 'es'. Absent/'' = not set yet —
    * the FE seeds it from the system language on first run. */
   ui_language?: string;
-  /** Official API hybrid (issue #4): Twitch helix OAuth bearer — auto-lifted
-   * from the cookie bridge, or pasted. Empty = GQL only. */
-  twitch_helix_token?: string;
-  /** OAuth app Client ID for the "Get Twitch token" button (implicit grant). */
-  twitch_helix_client_id?: string;
 }
 
 export interface DiskUsage {

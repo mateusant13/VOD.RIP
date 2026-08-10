@@ -616,25 +616,12 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
 
 
 def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Return recent VODs/highlights/uploads for a Twitch channel login.
-
-    Helix is PRIMARY when settings.twitch_helix_token is set (silent GQL
-    fallback on any Helix failure — issue #4); GQL only when no token.
-    """
+    """Return recent VODs/highlights/uploads for a Twitch channel login."""
     login = (login or "").strip().lower()
     if not login:
         return []
 
     limit = max(1, min(int(limit), 100))
-
-    # Official-API hybrid: helix first, silent GQL fallback. No token
-    # validation here — the first call exercises it (latency contract).
-    try:
-        from services.twitch_helix_service import list_channel_videos_sync as _helix_list
-
-        return _helix_list(login, limit=limit)
-    except Exception as exc:
-        logger.debug("helix list failed for %r, falling back to GQL: %s", login, exc)
 
     out: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
@@ -666,7 +653,7 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
                 "url": f"https://www.twitch.tv/videos/{vid}",
                 "content_kind": "vod",
                 # VOD language = the broadcaster language at stream time
-                # (the closest anonymous GQL analogue of Helix
+                # (the closest anonymous GQL analogue of the official API's
                 # broadcaster_language — 'pt', 'en', ... or None).
                 "language": node.get("language") or None,
             })
@@ -908,26 +895,10 @@ def _attach_playback_estimate(payload: Dict[str, Any], vid: str) -> None:
 
 
 def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
-    """Return metadata for a single Twitch VOD.
-
-    Helix is PRIMARY when settings.twitch_helix_token is set (silent GQL
-    fallback on any error / rate limit / missing VOD — issue #4); GQL only
-    when no token.
-    """
+    """Return metadata for a single Twitch VOD."""
     vid = _extract_video_id(url_or_id)
     if not vid:
         raise ValueError(f"Not a Twitch VOD URL or id: {url_or_id}")
-
-    # Official-API hybrid: helix first. The metadata fetch swaps, the
-    # playback estimate is shared with the GQL path below.
-    try:
-        from services.twitch_helix_service import video_metadata_sync
-
-        payload = video_metadata_sync(vid)
-        _attach_playback_estimate(payload, vid)
-        return payload
-    except Exception as exc:
-        logger.debug("helix info failed for %s, falling back to GQL: %s", vid, exc)
 
     data = _gql_request(VIDEO_INFO_QUERY, {"id": vid})
     node = data.get("video")

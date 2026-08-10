@@ -10,8 +10,7 @@
 //     Publish.
 // Everything runs inside Twitch's own page, so the editor's GQL mutation uses
 // the session cookie + integrity the site itself generates — no API token
-// scopes needed (the backend Helix path needs editor:manage:clips, which the
-// browser-login token never carries).
+// scopes needed (a browser-login token never carries clip scopes anyway).
 //
 // ponytail: the editor's DOM is Twitch's private React tree and changes without
 // notice; every selector below is a candidate list with graceful fallbacks
@@ -111,8 +110,8 @@
   };
   // The published clip is recorded into the app's clip history (so the app
   // shows a download button for it). Fire-and-forget, same posture as note();
-  // the Helix path records history server-side, this is the browser path's
-  // equivalent — Twitch's site published it, the backend never saw it.
+  // Twitch's site published it, the backend never saw it — the browser
+  // path's equivalent of a server-side history write.
   const recordPublishedClip = (clipUrl) => {
     try {
       const path = (() => {

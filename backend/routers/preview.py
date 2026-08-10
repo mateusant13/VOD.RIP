@@ -275,14 +275,12 @@ async def preview_warm(req: PreviewWarmRequest):
     # height (typically 720) for its own mux/cache path.
     kickoff_youtube_warm(
         url,
-        oauth=opts.oauth or None,
         cookies_file=opts.youtube_cookies_file or None,
         prefer_height=360,
     )
     if req.full_mux:
         kickoff_youtube_full_mux_warm(
             url,
-            oauth=opts.oauth or None,
             cookies_file=opts.youtube_cookies_file or None,
             prefer_height=req.prefer_height or 720,
         )
@@ -462,7 +460,6 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 preview_url,
                 req.crop_start,
                 req.crop_end,
-                oauth=opts.oauth or None,
                 prefer_height=req.prefer_height,
             ),
         )

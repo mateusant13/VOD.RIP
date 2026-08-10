@@ -83,7 +83,7 @@ def youtube_http_status(exc: BaseException) -> int:
         x in low
         for x in (
             "cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in",
-            "oauth", "preview unavailable",  # soft-gate chain collapse — transient, not 404
+            "preview unavailable",  # soft-gate chain collapse — transient, not 404
         )
     ):
         return 503
@@ -95,7 +95,7 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
     low = str(exc).lower()
     if any(
         x in low
-        for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in", "oauth")
+        for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in")
     ):
         return (
             "YouTube preview is temporarily restricted. Try again in a few minutes."
