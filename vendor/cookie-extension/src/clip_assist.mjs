@@ -106,6 +106,38 @@
         .catch(() => {});
     } catch { /* ignore */ }
   };
+  // The published clip is recorded into the app's clip history (so the app
+  // shows a download button for it). Fire-and-forget, same posture as note();
+  // the Helix path records history server-side, this is the browser path's
+  // equivalent — Twitch's site published it, the backend never saw it.
+  const recordPublishedClip = (clipUrl) => {
+    try {
+      const path = (() => {
+        try { return new URL(clipUrl).pathname; } catch { return ''; }
+      })();
+      const ch = params.get('broadcasterLogin') || path.split('/')[1] || undefined;
+      const vodMatch = (location.pathname || '').match(/^\/videos\/(\d+)/);
+      const start = Number(params.get('vodrip_start')) || 0;
+      const end = Number(params.get('vodrip_end')) || 0;
+      import('./modules/cookie_bridge.mjs')
+        .then(({ getApiBase }) => getApiBase())
+        .then((base) =>
+          fetch(base + '/api/twitch/clips/record', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              url: clipUrl,
+              title,
+              channel: ch,
+              vod_id: params.get('vodID') || (vodMatch ? vodMatch[1] : undefined),
+              offset_sec: end > 0 ? Math.floor(end) : undefined,
+              duration_sec: end > start ? Math.round(end - start) : undefined,
+            }),
+          }).catch(() => {}),
+        )
+        .catch(() => {});
+    } catch { /* ignore */ }
+  };
   // User window rule: after the flow ends (success OR failure) the editor
   // tab closes itself. The BACKGROUND holds the delay: content-script
   // timers freeze in hidden/throttled tabs (Chrome Memory Saver), so the
@@ -486,6 +518,7 @@
           if (shareInput) clipUrl = (shareInput.value || '').trim() || clipUrl;
         } catch { /* ignore */ }
         note('ext_published', { url: clipUrl || null, via: published === 'copy' ? 'copy-link' : 'navigation' });
+        recordPublishedClip(clipUrl || '');
         setStatus(
           clipUrl
             ? `Clip publicado ✓\n${title}\n${clipUrl}`
@@ -689,6 +722,7 @@
       } catch { /* ignore */ }
       if (!clipUrl) clipUrl = location.href;
       note('ext_published', { url: clipUrl, via: published === 'copy' ? 'copy-link' : 'navigation' });
+      recordPublishedClip(clipUrl);
       setStatus(
         clipUrl
           ? `Clip publicado ✓\n${title}\n${clipUrl}`

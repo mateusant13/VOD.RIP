@@ -2,10 +2,14 @@
  * Twitch clip mini-preview — the "Twitch clip" button on the main preview and
  * the explore popup opens this floating player on a ±60s window around the
  * click moment instead of jumping straight to Twitch. The user trims a 5..60s
- * selection on the window timeline, then 'Create Twitch clip' calls the
- * backend, which creates the clip through the official Helix API
- * (POST /helix/videos/clips, vod_offset = selection END — see twitchClip.ts)
- * and returns an edit_url the frontend opens in the OS default browser.
+ * selection on the window timeline, then 'Create clip' opens Twitch's own
+ * clip editor in the OS default browser with the selection as vodrip_* params
+ * (vod_offset = selection END — see twitchClip.ts); the VOD.RIP cookie
+ * extension (clip_assist.mjs content script) fills the title, drives the
+ * editor's window and clicks Save, then posts the published clip URL to
+ * /api/twitch/clips/record so it shows in the app's clip history with a
+ * download button. The browser path works with the plain session cookie —
+ * no Helix clip scopes or editor role needed.
  *
  * The mini preview reuses the main preview's session machinery: one session
  * per popup with crop_start/crop_end = the window, exactly like App.tsx's
@@ -20,7 +24,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
-import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X, ExternalLink } from 'lucide-react';
+import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X } from 'lucide-react';
 import { apiDelete, apiGet, apiPost } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
 import {
@@ -28,9 +32,7 @@ import {
   TWITCH_CLIP_MIN_SEC,
   TWITCH_CLIP_TITLE_MAX,
   clampClipSelection,
-  clipEditorOffsetAndDuration,
   initialClipSelection,
-  openTwitchClipEditor,
   openTwitchClipEditorInBrowser,
   reportClipEvent,
   twitchClipDurationError,
@@ -54,12 +56,6 @@ import EditableHmsTime from './EditableHmsTime';
 import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
-/** Scope string for the copy chip — VOD clips need one of these (matches
- * backend/tests test_vod_clip_missing_scope_is_rejected_before_post). */
-const VOD_CLIP_SCOPES_HINT = 'editor:manage:clips, channel:manage:clips';
-/** Token-configuration errors stay visible until dismissed — the fix lives
- * in Settings → Official APIs, not in a 4s toast. */
-const TOKEN_ERROR_CODES = ['missing_scope', 'no_token'];
 
 interface TwitchClipPopupProps {
   /** VOD URL the mini preview plays (same session machinery as the main preview). */
@@ -80,8 +76,6 @@ interface TwitchClipPopupProps {
   vodTitle?: string;
   zIndex: number;
   onClose: () => void;
-  /** Called after the editor opened — parents reuse their clip notice. */
-  onClipCreated: (editorUrl: string) => void;
   /** Volume the popup should start at — inherited from the opening preview
    * so opening the clip window never resets the user's volume level. */
   initialVolume?: number;
@@ -102,7 +96,6 @@ export default function TwitchClipPopup({
   vodTitle,
   zIndex,
   onClose,
-  onClipCreated,
   initialVolume = PREVIEW_DEFAULT_VOLUME,
   reuseSession = null,
 }: TwitchClipPopupProps) {
@@ -164,17 +157,13 @@ export default function TwitchClipPopup({
   const [muted, setMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(currentTimeRef.current);
   const [retryTick, setRetryTick] = useState(0);
-  const [clipOpening, setClipOpening] = useState(false);
-  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string; code?: string } | null>(null);
-  const [scopeCopied, setScopeCopied] = useState(false);
+  const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
 
-  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string, code?: string) => {
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
     if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
-    setClipNotice({ kind, text, code });
-    if (!code || !TOKEN_ERROR_CODES.includes(code)) {
-      clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
-    }
+    setClipNotice({ kind, text });
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
   }, []);
 
   // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
@@ -558,65 +547,12 @@ export default function TwitchClipPopup({
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
   }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
 
-  // ── Final action: create the clip via Helix on the selected range (END ref) ──
-  const createClip = useCallback(async () => {
-    const sel = selectionRef.current;
-    const err = twitchClipDurationError(sel.end - sel.start);
-    if (err) {
-      showClipNotice('error', err);
-      return;
-    }
-    reportClipEvent('create_clicked', {
-      method: 'api',
-      startSec: sel.start,
-      endSec: sel.end,
-      durationSec: sel.end - sel.start,
-      title: clipTitle.trim() || null,
-    });
-    const { offsetSec, durationSec } = clipEditorOffsetAndDuration(sel.start, sel.end);
-    setClipOpening(true);
-    try {
-      const res = await openTwitchClipEditor({
-        broadcasterLogin,
-        vodId,
-        offsetSec,
-        durationSec,
-        title: clipTitle.trim(),
-      });
-      if (res.ok) {
-        onClipCreated(res.edit_url);
-        onClose();
-      } else if (
-        res.error.code === 'missing_scope'
-        || res.error.code === 'no_token'
-        || res.error.code === 'unauthorized'
-      ) {
-        // The Helix token can't clip via Helix (missing, scope-less, or
-        // invalid/expired). The "Create Twitch clip" button is BACKEND-ONLY
-        // by design — never open a browser window behind the user's back;
-        // the explicit browser path is the "Open in browser" button. Surface
-        // the token problem (the scope-copy hint renders for these codes).
-        showClipNotice(
-          'error',
-          t('This token can\'t clip via Helix — use "Open in browser" or paste a token with clip scopes'),
-          res.error.code,
-        );
-      } else {
-        showClipNotice('error', res.error.message, res.error.code);
-      }
-    } catch {
-      showClipNotice('error', t('Failed to open the Twitch clip editor'));
-    } finally {
-      setClipOpening(false);
-    }
-  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice]);
-
   const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
   const playFrac = secToFrac(currentTime, railView) * 100;
   const selStartFrac = secToFrac(selection.start, railView) * 100;
   const selEndFrac = secToFrac(selection.end, railView) * 100;
 
-  const createDisabled = clipOpening || windowTooShort
+  const createDisabled = windowTooShort
     || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
   const createDisabledTitle = windowTooShort
     ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
@@ -874,64 +810,22 @@ export default function TwitchClipPopup({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={createInBrowser}
-              disabled={createDisabled}
-              className="flex items-center gap-1.5 border-2 border-zinc-700 bg-zinc-900/60 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-zinc-300 hover:border-zinc-400 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
-              title={t('Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes')}
-            >
-              <ExternalLink size={12} />
-              {t('Open in browser')}
-            </button>
-            <button
-              type="button"
-              onClick={() => void createClip()}
+              onClick={() => void createInBrowser()}
               disabled={createDisabled}
               className="flex items-center gap-1.5 border-2 border-[#9146FF] bg-[#9146FF]/20 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-[#9146FF]/35 disabled:opacity-40 disabled:pointer-events-none"
               title={createDisabledTitle}
             >
-              {clipOpening ? <Loader2 size={12} className="animate-spin" /> : <TwitchLogoIcon size={12} />}
-              {t('Create Twitch clip')}
+              <TwitchLogoIcon size={12} />
+              {t('Create clip')}
             </button>
           </div>
         </div>
-        {clipNotice && clipNotice.code && TOKEN_ERROR_CODES.includes(clipNotice.code) ? (
-          <div className="flex flex-col gap-1.5 border-2 border-red-500/60 bg-red-950/40 px-2 py-1.5">
-            <p className="text-[9px] font-mono text-red-300 leading-relaxed">{clipNotice.text}</p>
-            <div className="flex items-center gap-1.5">
-              <code className="flex-1 min-w-0 truncate border border-zinc-700 bg-zinc-950 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200">
-                {VOD_CLIP_SCOPES_HINT}
-              </code>
-              <button
-                type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText(VOD_CLIP_SCOPES_HINT).then(() => {
-                    setScopeCopied(true);
-                    window.setTimeout(() => setScopeCopied(false), 1500);
-                  });
-                }}
-                className="text-[8px] font-mono uppercase tracking-wider text-zinc-300 hover:text-white border border-zinc-700 px-1.5 py-0.5 shrink-0"
-                title={t('Copy the scope string')}
-              >
-                {scopeCopied ? t('Copied') : t('Copy')}
-              </button>
-              <button
-                type="button"
-                onClick={() => setClipNotice(null)}
-                className="text-[8px] font-mono uppercase tracking-wider text-zinc-400 hover:text-white border border-zinc-700 px-1.5 py-0.5 shrink-0"
-                title={t('Dismiss')}
-              >
-                {t('Dismiss')}
-              </button>
-            </div>
+        {clipNotice && (
+          <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
+            clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
+          }`}>
+            <span className="truncate">{clipNotice.text}</span>
           </div>
-        ) : (
-          clipNotice && (
-            <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider ${
-              clipNotice.kind === 'error' ? 'text-red-400' : 'text-[#53fc18]'
-            }`}>
-              <span className="truncate">{clipNotice.text}</span>
-            </div>
-          )
         )}
       </div>
     </div>,

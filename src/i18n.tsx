@@ -444,6 +444,7 @@ const ptBR: Record<string, string> = {
   'Clip end': 'Fim do clipe',
   'window {start} – {end}': 'janela {start} – {end}',
   'Create Twitch clip': 'Criar clipe do Twitch',
+  'Create clip': 'Criar clipe',
   'This token can\'t clip via Helix — using the browser editor instead':
     'Este token não pode criar clipe via Helix — usando o editor do navegador',
   'Opened in your browser — the VOD.RIP extension fills the editor and publishes':
@@ -969,6 +970,7 @@ const es: Record<string, string> = {
   'Clip end': 'Fin del clip',
   'window {start} – {end}': 'ventana {start} – {end}',
   'Create Twitch clip': 'Crear clip de Twitch',
+  'Create clip': 'Crear clip',
   'This token can\'t clip via Helix — using the browser editor instead':
     'Este token no puede crear clip vía Helix — usando el editor del navegador',
   'Opened in your browser — the VOD.RIP extension fills the editor and publishes':

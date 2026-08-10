@@ -10,7 +10,7 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
-import { clipPublicUrl, openTwitchClipEditor } from './twitchClip';
+import { openTwitchClipEditor, type TwitchClipRecord } from './twitchClip';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
@@ -4200,6 +4200,38 @@ export default function App() {
     void refreshDownloads();
   }, [selectedChannelVodUrls, ensureDownloadFolder, refreshDownloads, visibleChannelVideos]);
 
+  /** Download a Twitch clip from the clip-history row (QueueTab). */
+  const handleDownloadClip = useCallback(async (clip: TwitchClipRecord) => {
+    const pendingId = `pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    setQueueDownloads((prev) => [...prev, {
+      download_id: pendingId,
+      url: clip.url,
+      type: 'clip',
+      platform: 'Twitch',
+      status: 'Starting...',
+      progress: 0,
+      output_file: '',
+      error: null,
+      started_at: new Date().toISOString(),
+      title: clip.title,
+      channel: clip.channel,
+      thumbnail: null,
+    }]);
+    try {
+      await apiPost<{ download_id: string }>('/api/download/clip', {
+        url: clip.url,
+        quality: 'source',
+        title: clip.title ?? undefined,
+        channel: clip.channel,
+        duration: clip.duration_sec ?? undefined,
+      });
+    } catch (err: unknown) {
+      setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
+      setError(err instanceof Error ? err.message : t('Failed to start download'));
+    }
+    void refreshDownloads();
+  }, [refreshDownloads]);
+
   const toggleChannelVodSelection = useCallback((vodUrl: string) => {
     setSelectedChannelVodUrls((prev) => {
       const next = new Set(prev);
@@ -7048,6 +7080,7 @@ export default function App() {
             onBulkDeleteRecent={handleBulkDeleteRecent}
             onWatchLocal={openLocalFilePreview}
             onOpenVod={handleOpenVodFromHistory}
+            onDownloadClip={handleDownloadClip}
           />
         )}
 
@@ -7166,8 +7199,6 @@ export default function App() {
           zIndex={EXPLORE_POPUP_Z + 200}
           initialVolume={previewVolumeRef.current}
           onClose={() => setTwitchClipPopup(null)}
-          onClipCreated={(editorUrl) =>
-            showClipOpenNotice('ok', `Twitch clip created — ${clipPublicUrl(editorUrl)}`)}
         />
       )}
       {archiveSearchOpen && (

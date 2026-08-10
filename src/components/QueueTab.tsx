@@ -1,6 +1,6 @@
 
 import { useEffect, useState } from 'react';
-import { Clapperboard, ExternalLink, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
+import { Clapperboard, Download, ExternalLink, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
 import { vodCheckboxStyle, platformAccentColor } from '../platformColors';
 import { ActiveDownloadsList } from './ActiveDownloadsList';
 import DownloadThumb from './DownloadThumb';
@@ -68,6 +68,8 @@ type Props = {
   onWatchLocal?: (dl: DownloadState) => void;
   /** Click a history row's title to open that VOD in the main preview (URL tab). */
   onOpenVod?: (url: string) => void;
+  /** Download a Twitch clip from the clip-history row (enqueues via /api/download/clip). */
+  onDownloadClip?: (clip: TwitchClipRecord) => void;
 };
 
 /** PlatformVodIcon expects capitalized platform names; archive jobs are lowercase. */
@@ -100,6 +102,7 @@ export default function QueueTab({
   onBulkDeleteRecent,
   onWatchLocal,
   onOpenVod,
+  onDownloadClip,
 }: Props) {
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
@@ -611,6 +614,16 @@ export default function QueueTab({
                   <span className="text-zinc-700 text-[10px] font-mono uppercase tracking-wider shrink-0">
                     {t('—')}
                   </span>
+                )}
+                {onDownloadClip && (
+                  <button
+                    type="button"
+                    onClick={() => onDownloadClip(c)}
+                    className="text-[#53fc18] hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
+                    title={t('Download clip')}
+                  >
+                    <Download size={12} /> {t('Download')}
+                  </button>
                 )}
               </div>
             ))}

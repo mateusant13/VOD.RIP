@@ -507,9 +507,7 @@ async def test_bad_login_rejected(_isolated_data_dir):
         assert rows == []
 
 
-# --- debugging event sink (clip flow replay) ------------------------------
-
-@pytest.mark.anyio
+# --- debugging event sink (clip flow replay) ------------------------------@pytest.mark.anyio
 async def test_clip_events_sink_roundtrip(_isolated_data_dir):
     """POST /api/debug/clip-events appends a timestamped JSON line to
     <data_dir>/clip-events.log; GET reads it back in order."""
@@ -548,3 +546,47 @@ async def test_clip_events_sink_validates(_isolated_data_dir):
         )
         assert big.status_code == 422
         assert (await client.get("/api/debug/clip-events")).json() == []
+
+# --- browser-path clip record (extension posts the published URL) ---------
+
+@pytest.mark.anyio
+async def test_clip_record_roundtrip_and_idempotent(_isolated_data_dir):
+    """POST /api/twitch/clips/record adds a browser-path clip to history;
+    re-posting the same clip slug (either URL shape) does not duplicate."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        body = {
+            "url": "https://clips.twitch.tv/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL",
+            "title": "yetz",
+            "channel": "scriptingkata",
+            "vod_id": "949802656",
+            "offset_sec": 956,
+            "duration_sec": 60,
+        }
+        r = await client.post("/api/twitch/clips/record", json=body)
+        assert r.status_code == 200 and r.json()["ok"] is True
+        r2 = await client.post(
+            "/api/twitch/clips/record",
+            json={**body, "url": "https://www.twitch.tv/scriptingkata/clip/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"},
+        )
+        assert r2.status_code == 200
+        rows = await _history(client)
+        assert len(rows) == 1, "re-post must not duplicate the row"
+        assert rows[0]["id"] == "ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"
+        assert rows[0]["channel"] == "scriptingkata"
+        assert rows[0]["vod_id"] == "949802656"
+        assert rows[0]["duration_sec"] == 60
+        assert rows[0]["url"] == "https://clips.twitch.tv/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"
+
+
+@pytest.mark.anyio
+async def test_clip_record_validates(_isolated_data_dir):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for bad in ("https://twitch.tv/videos/123", "not-a-url", "https://clips.twitch.tv/"):
+            r = await client.post("/api/twitch/clips/record", json={"url": bad})
+            assert r.status_code == 422
+        bad_ch = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeSlug123", "channel": "not a login!"},
+        )
+        assert bad_ch.status_code == 422
+        assert (await _history(client)) == []

@@ -47,6 +47,12 @@ TWITCH_LOGIN_RE = re.compile(r"^[A-Za-z0-9_]{1,25}$")
 HISTORY_CAP = 200
 HISTORY_FILE = "twitch_clips.json"
 
+# clips.twitch.tv/<slug> or twitch.tv/<channel>/clip/<slug> (both public
+# clip URL shapes; Twitch's own share links use the former).
+_CLIP_URL_RE = re.compile(
+    r"^https?://(?:clips\.twitch\.tv/|(?:www\.)?twitch\.tv/[A-Za-z0-9_]+/clip/)([A-Za-z0-9_-]+)/?$"
+)
+
 LIVE_CLIP_SCOPE = "clips:edit"
 VOD_CLIP_SCOPES = ("editor:manage:clips", "channel:manage:clips")
 
@@ -64,6 +70,21 @@ class TwitchClipRequest(BaseModel):
 
 class TwitchClipHistoryDeleteRequest(BaseModel):
     ids: List[str]
+
+
+class TwitchClipRecordRequest(BaseModel):
+    """A clip created by the BROWSER path (cookie-extension content script
+    posts the published URL after the Twitch editor flow) so the clip lands
+    in the app history with a download button. The Helix path records itself
+    via _record_clip; this endpoint exists because the browser flow publishes
+    on Twitch's site, outside the backend's sight."""
+
+    url: str
+    title: Optional[str] = None
+    channel: Optional[str] = None
+    vod_id: Optional[str] = None
+    offset_sec: Optional[int] = None
+    duration_sec: Optional[int] = None
 
 
 class ClipEventBody(BaseModel):
@@ -429,6 +450,44 @@ def get_clip_events(limit: int = 200) -> List[Dict[str, Any]]:
         except Exception:
             continue  # a corrupt line must not hide the rest
     return out
+
+
+@router.post("/api/twitch/clips/record")
+def record_twitch_clip(req: TwitchClipRecordRequest) -> Dict[str, Any]:
+    """Record a browser-path clip into history (idempotent by clip slug)."""
+    m = _CLIP_URL_RE.match((req.url or "").strip())
+    if not m:
+        raise HTTPException(status_code=422, detail="invalid twitch clip url")
+    slug = m.group(1)
+    login = (req.channel or "").strip()
+    if login and not TWITCH_LOGIN_RE.fullmatch(login):
+        raise HTTPException(status_code=422, detail="invalid channel")
+    if req.offset_sec is not None and (not isinstance(req.offset_sec, int) or req.offset_sec < 0):
+        raise HTTPException(status_code=422, detail="offset_sec must be a non-negative int")
+    if req.duration_sec is not None and (
+        not isinstance(req.duration_sec, int) or not (1 <= req.duration_sec <= 86400)
+    ):
+        raise HTTPException(status_code=422, detail="duration_sec out of range")
+
+    entry = {
+        "id": slug,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "channel": login or "unknown",
+        "vod_id": req.vod_id,
+        "offset_sec": req.offset_sec,
+        "duration_sec": req.duration_sec,
+        "title": (req.title or "").strip() or None,
+        "url": f"https://clips.twitch.tv/{slug}",
+        "status": "created",
+    }
+    history = _load_history()
+    # Idempotent: the extension may re-post on retry or when both flows
+    # publish — never duplicate the row for the same clip.
+    history = [e for e in history if e.get("id") != slug]
+    history.insert(0, entry)
+    _save_history(history[:HISTORY_CAP])
+    _append_clip_event("api", "api_clip_recorded", {**entry})
+    return {"ok": True, "id": slug, "url": entry["url"]}
 
 
 @router.post("/api/twitch/clip")
