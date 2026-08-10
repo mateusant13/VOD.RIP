@@ -319,7 +319,112 @@
       `Clique de ${Math.round(len)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) confirmado no editor (${res.valuetext}).`,
       'ok',
     );
+    mountDurationBadge();
     return '';
+  };
+
+  // -------------------------------------------------------------------
+  // Duration badge — the user reads the editor's "12:31 to 12:48"
+  // (VOD-absolute m:ss from the slider's aria-valuetext) as a ~12-minute
+  // clip; the actual window is 17s. This fixed chip shows the DURATION
+  // first (seconds) and the window second, in pt-BR: "Duração: 17s
+  // (12:31 → 12:48)". It is mounted OUTSIDE React's tree (child of
+  // <html>) so re-renders never remove it. Updates are driven by a
+  // MutationObserver on the slider's aria-valuetext — both the
+  // extension's own onLeftDrag/onRightDrag drags and the user's handle
+  // drags land there — and a 1s liveness tick re-finds a React-replaced
+  // slider (the attribute observer dies with the old node) and removes
+  // the chip once the slider is gone (save → SPA navigation, editor
+  // closed, leave). pointer-events:none so it never blocks Twitch's
+  // own controls.
+  // -------------------------------------------------------------------
+  let durationBadge = null;
+  let durationBadgeObs = null;
+  let durationBadgeTick = null;
+
+  const fmtClock = (sec) => {
+    const s = Math.max(0, Math.floor(sec));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+  };
+  const parseValuetext = (vt) => {
+    const parts = String(vt || '').trim().split(/\s*to\s*/i);
+    if (parts.length !== 2) return null;
+    const a = parseClock(parts[0]);
+    const b = parseClock(parts[1]);
+    if (a == null || b == null) return null;
+    return { start: a, end: b, dur: b - a };
+  };
+  const renderDurationBadge = () => {
+    const slider = document.querySelector('[role="slider"]');
+    if (!slider) return false;
+    const w = parseValuetext(slider.getAttribute('aria-valuetext'));
+    if (!w) return true; // valuetext unreadable — keep the last known text
+    durationBadge.textContent = `Duração: ${w.dur}s (${fmtClock(w.start)} → ${fmtClock(w.end)})`;
+    // Right side, just above the timeline — pinned to the slider's box so
+    // it never drifts from the control it describes (recomputed on resize).
+    try {
+      const r = slider.getBoundingClientRect();
+      const bw = durationBadge.offsetWidth;
+      const bh = durationBadge.offsetHeight;
+      const left = Math.max(8, Math.min(r.right - bw, window.innerWidth - bw - 8));
+      const top = Math.max(8, Math.min(r.top - bh - 10, window.innerHeight - bh - 8));
+      durationBadge.style.left = `${left}px`;
+      durationBadge.style.top = `${top}px`;
+    } catch { /* slider gone — tick removes us */ }
+    return true;
+  };
+  const mountDurationBadge = () => {
+    if (durationBadge) { renderDurationBadge(); return durationBadge; }
+    durationBadge = document.createElement('div');
+    durationBadge.setAttribute('data-vodrip-duration-badge', '');
+    Object.assign(durationBadge.style, {
+      position: 'fixed',
+      zIndex: '2147483646', // one below the assist panel — never over it
+      background: 'rgba(10,10,14,0.95)',
+      color: '#f4f4f5',
+      font: '700 13px/1.4 Consolas, monospace',
+      padding: '6px 10px',
+      borderRadius: '6px',
+      border: '1px solid #a970ff',
+      boxShadow: '0 4px 24px rgba(0,0,0,0.55)',
+      pointerEvents: 'none',
+      whiteSpace: 'nowrap',
+    });
+    document.documentElement.appendChild(durationBadge);
+    const observeSlider = () => {
+      const slider = document.querySelector('[role="slider"]');
+      if (!durationBadgeObs || !slider) return;
+      durationBadgeObs.disconnect();
+      durationBadgeObs.observe(slider, { attributes: true, attributeFilter: ['aria-valuetext'] });
+    };
+    durationBadgeObs = new MutationObserver(renderDurationBadge);
+    observeSlider();
+    renderDurationBadge();
+    window.addEventListener('resize', renderDurationBadge);
+    // Liveness tick: React may replace the slider node entirely (the
+    // attribute observer dies with the old node) — re-find + re-observe;
+    // slider gone (save → SPA navigated, editor closed) → remove the chip.
+    durationBadgeTick = setInterval(() => {
+      if (!document.querySelector('[role="slider"]')) {
+        unmountDurationBadge();
+        return;
+      }
+      observeSlider();
+      renderDurationBadge();
+    }, 1000);
+    const onUnload = () => unmountDurationBadge();
+    window.addEventListener('beforeunload', onUnload);
+    window.addEventListener('pagehide', onUnload);
+    return durationBadge;
+  };
+  const unmountDurationBadge = () => {
+    if (durationBadgeTick) { clearInterval(durationBadgeTick); durationBadgeTick = null; }
+    if (durationBadgeObs) { durationBadgeObs.disconnect(); durationBadgeObs = null; }
+    if (durationBadge) { durationBadge.remove(); durationBadge = null; }
   };
 
   // vodrip_diag=1 — census the editor DOM for selector maintenance, then
@@ -445,8 +550,14 @@
         windowTest = res.ok
           ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)})`
           : `NOT CONFIRMED (${res.reason || '?'})`;
+        // The diag page doubles as the badge's DOM probe: a successful
+        // window test mounts the same duration-first chip the real flow
+        // mounts, so the census below can assert its presence + text.
+        if (res.ok) mountDurationBadge();
       }
       census.push('window-test: ' + windowTest);
+      const badge = document.querySelector('[data-vodrip-duration-badge]');
+      census.push('duration-badge: ' + (badge ? badge.textContent : 'missing'));
       const inputs = [...document.querySelectorAll('input')];
       const withLabels = inputs
         .map((i) => (i.getAttribute('aria-label') || '').trim())
