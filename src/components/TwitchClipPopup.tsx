@@ -456,21 +456,22 @@ export default function TwitchClipPopup({
     commitSelection(res);
   }, [win, commitSelection]);
 
-  // Editable H:M:S inputs for the selection: committing either end pins the
-  // other and enforces the 5..60s clip length through the same clamp branches
-  // the rail drag uses.
-  const commitStartInput = useCallback((sec: number) => {
+  // Editable H:M:S input for the clip length — CLIP-RELATIVE, like Twitch's
+  // own editor: Start is always 00:00:00 (the clip begins at its own 0) and
+  // End is the clip duration (e.g. 0:30). The absolute VOD position comes
+  // from where the selection sits on the rail (see the VOD readout below).
+  // Committing End pins the absolute start and enforces the 5..60s length,
+  // capped by the window.
+  const commitDurationInput = useCallback((relSec: number) => {
     const sel = selectionRef.current;
-    commitSelection(clampClipSelection(
-      sec, sel.end, win.start, win.end, { move: 'in', fixedEnd: sel.end },
-    ));
-  }, [win, commitSelection]);
-
-  const commitEndInput = useCallback((sec: number) => {
-    const sel = selectionRef.current;
-    commitSelection(clampClipSelection(
-      sel.start, sec, win.start, win.end, { move: 'out', fixedStart: sel.start },
-    ));
+    const winLen = win.end - win.start;
+    const minDur = Math.min(TWITCH_CLIP_MIN_SEC, winLen);
+    const maxDur = Math.min(TWITCH_CLIP_MAX_SEC, winLen);
+    const dur = Math.max(minDur, Math.min(relSec, maxDur));
+    commitSelection({
+      start: sel.start,
+      end: Math.min(win.end, sel.start + dur),
+    });
   }, [win, commitSelection]);
 
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
@@ -746,29 +747,29 @@ export default function TwitchClipPopup({
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600">
             {t('Range')}
           </span>
-          <span className="flex items-center gap-1" title={t('Clip start (VOD time)')}>
+          <span className="flex items-center gap-1" title={t('Clip start — always 00:00:00 (clip time, like the Twitch editor)')}>
             <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('Start')}</span>
-            <EditableHmsTime
-              valueSec={selection.start}
-              minSec={win.start}
-              maxSec={win.end}
-              onChange={commitStartInput}
-              className="text-[10px] font-bold"
-            />
+            <span className="text-[10px] font-bold text-zinc-500">00:00:00</span>
           </span>
           <span className="text-[9px] font-mono text-zinc-600">–</span>
-          <span className="flex items-center gap-1" title={t('Clip end (VOD time — the clip ends here)')}>
+          <span className="flex items-center gap-1" title={t('Clip length (clip time — the clip ends here)')}>
             <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('End')}</span>
             <EditableHmsTime
-              valueSec={selection.end}
-              minSec={win.start}
-              maxSec={win.end}
-              onChange={commitEndInput}
+              valueSec={selection.end - selection.start}
+              minSec={Math.min(TWITCH_CLIP_MIN_SEC, winLen)}
+              maxSec={Math.min(TWITCH_CLIP_MAX_SEC, winLen)}
+              onChange={commitDurationInput}
               className="text-[10px] font-bold text-[#9146FF]"
             />
           </span>
           <span className="ml-auto text-[8px] font-mono uppercase tracking-wider text-zinc-600">
             {t('H:M:S')}
+          </span>
+        </div>
+        <div className="flex items-center gap-1 pl-9" title={t('Absolute VOD time of the selection (debug)')}>
+          <span className="text-[7px] font-mono uppercase tracking-wider text-zinc-700">{t('VOD')}</span>
+          <span className="text-[8px] font-mono text-zinc-600">
+            {formatHmsFull(selection.start)} – {formatHmsFull(selection.end)}
           </span>
         </div>
         <div className="flex items-stretch gap-2">
