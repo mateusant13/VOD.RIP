@@ -232,8 +232,119 @@ async def test_clip_events_validation(_isolated_data_dir):
 async def test_record_appends_clip_event(_isolated_data_dir):
     """Recording a clip writes an 'api' event line so the flow is replayable."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        await _record(client, {"url": "https://clips.twitch.tv/CuteSlothOMG1"})
-        events = (await client.get("/api/debug/clip-events")).json()
-    assert [e["event"] for e in events] == ["api_clip_recorded"]
-    assert events[0]["src"] == "api"
-    assert events[0]["id"] == "CuteSlothOMG1"
+        bad_src = await client.post("/api/debug/clip-events", json={"src": "nope", "event": "x"})
+        assert bad_src.status_code == 422
+        bad_event = await client.post("/api/debug/clip-events", json={"src": "ext", "event": ""})
+        assert bad_event.status_code == 422
+        big = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "x", "data": {"blob": "y" * 9000}},
+        )
+        assert big.status_code == 422
+        assert (await client.get("/api/debug/clip-events")).json() == []
+
+
+@pytest.mark.anyio
+async def test_clip_endpoints_answer_cors_preflight(_isolated_data_dir):
+    """The clip-assist content script POSTs JSON from https://clips.twitch.tv to
+    the localhost app — cross-origin, so the browser blocks the POST unless
+    OPTIONS answers with the allow headers (this was the root cause of zero
+    ext_* events reaching the sink). Both direct-POST endpoints must also
+    carry ACAO on the response so the caller's fetch resolves."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        paths = ("/api/debug/clip-events", "/api/twitch/clips/record")
+        for path in paths:
+            r = await client.options(
+                path,
+                headers={
+                    "Origin": "https://clips.twitch.tv",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            assert r.status_code == 200, path
+            assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+            assert "content-type" in (r.headers.get("access-control-allow-headers") or "").lower()
+            assert "post" in (r.headers.get("access-control-allow-methods") or "").lower()
+        # POST responses must carry ACAO too, or the request lands but the
+        # content-script fetch rejects on the CORS response check.
+        r = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "ext_start", "data": {"cors": True}},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+        r = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeCorsSlug123"},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "https://clips.twitch.tv"
+
+# --- browser-path clip record (extension posts the published URL) ---------
+
+@pytest.mark.anyio
+async def test_clip_record_roundtrip_and_idempotent(_isolated_data_dir):
+    """POST /api/twitch/clips/record adds a browser-path clip to history;
+    re-posting the same clip slug (either URL shape) does not duplicate."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        body = {
+            "url": "https://clips.twitch.tv/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL",
+            "title": "yetz",
+            "channel": "scriptingkata",
+            "vod_id": "949802656",
+            "offset_sec": 956,
+            "duration_sec": 60,
+        }
+        r = await client.post("/api/twitch/clips/record", json=body)
+        assert r.status_code == 200 and r.json()["ok"] is True
+        r2 = await client.post(
+            "/api/twitch/clips/record",
+            json={**body, "url": "https://www.twitch.tv/scriptingkata/clip/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"},
+        )
+        assert r2.status_code == 200
+        rows = await _history(client)
+        assert len(rows) == 1, "re-post must not duplicate the row"
+        assert rows[0]["id"] == "ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"
+        assert rows[0]["channel"] == "scriptingkata"
+        assert rows[0]["vod_id"] == "949802656"
+        assert rows[0]["duration_sec"] == 60
+        assert rows[0]["url"] == "https://clips.twitch.tv/ColorfulBlindingEmuPicoMause-2ZWixeGOPIGpLrTL"
+
+
+@pytest.mark.anyio
+async def test_clip_record_validates(_isolated_data_dir):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for bad in ("https://twitch.tv/videos/123", "not-a-url", "https://clips.twitch.tv/"):
+            r = await client.post("/api/twitch/clips/record", json={"url": bad})
+            assert r.status_code == 422
+        bad_ch = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeSlug123", "channel": "not a login!"},
+        )
+        assert bad_ch.status_code == 422
+        bad_dur = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeSlug123", "duration_sec": 120},
+        )
+        assert bad_dur.status_code == 422
+        assert (await _history(client)) == []
+
+
+@pytest.mark.anyio
+async def test_clip_record_accepts_query_strings_and_mobile_host(_isolated_data_dir):
+    """Share links carry ?t=... and m.twitch.tv — both must record cleanly."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SlugOne?t=10s&tab=clips"},
+        )
+        assert r.status_code == 200 and r.json()["id"] == "SlugOne"
+        r2 = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://m.twitch.tv/srdogg/clip/SlugTwo#clip"},
+        )
+        assert r2.status_code == 200 and r2.json()["id"] == "SlugTwo"
+        rows = await _history(client)
+        assert {row["id"] for row in rows} == {"SlugOne", "SlugTwo"}
+        assert rows[0]["url"] == "https://clips.twitch.tv/SlugTwo"

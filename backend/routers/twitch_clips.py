@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 from services.disk_hygiene import data_dir
@@ -175,11 +175,49 @@ def delete_twitch_clips_history(
     return {"ok": True, "removed": removed}
 
 
+# The extension's content script POSTs JSON from https://clips.twitch.tv to
+# this localhost app — cross-origin, so the browser requires a CORS preflight
+# before the POST is sent. The app binds localhost only: these are headers,
+# not an auth change. (The service-worker relay makes the preflight moot in
+# the shipped flow; these routes keep the direct content-script path working.)
+_CLIP_ORIGIN = "https://clips.twitch.tv"
+
+
+def _clip_cors_preflight() -> Response:
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": _CLIP_ORIGIN,
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+        },
+    )
+
+
+def _set_clip_cors(response: Response) -> None:
+    """Allow the clips.twitch.tv content script to READ the POST response
+    (without ACAO the request lands but the caller's fetch rejects)."""
+    response.headers["Access-Control-Allow-Origin"] = _CLIP_ORIGIN
+
+
+@router.options("/api/debug/clip-events")
+def clip_events_options() -> Response:
+    """CORS preflight for the clip-assist content script (clips.twitch.tv)."""
+    return _clip_cors_preflight()
+
+
+@router.options("/api/twitch/clips/record")
+def clip_record_options() -> Response:
+    """CORS preflight for the clip-assist content script (clips.twitch.tv)."""
+    return _clip_cors_preflight()
+
+
 @router.post("/api/debug/clip-events")
-def post_clip_event(body: ClipEventBody) -> Dict[str, Any]:
+def post_clip_event(body: ClipEventBody, response: Response) -> Dict[str, Any]:
     """Event-sequence sink for the clip flow (app UI + browser extension POST
     their steps here; timestamps are added server-side). Localhost-only app,
     append-only log — validation is a sanity guard, not an auth boundary."""
+    _set_clip_cors(response)
     if body.src not in ("app", "ext", "api"):
         raise HTTPException(status_code=422, detail="invalid src")
     if not body.event or len(body.event) > 120:
@@ -207,8 +245,9 @@ def get_clip_events(limit: int = 200) -> List[Dict[str, Any]]:
 
 
 @router.post("/api/twitch/clips/record")
-def record_twitch_clip(req: TwitchClipRecordRequest) -> Dict[str, Any]:
+def record_twitch_clip(req: TwitchClipRecordRequest, response: Response) -> Dict[str, Any]:
     """Record a browser-path clip into history (idempotent by clip slug)."""
+    _set_clip_cors(response)
     raw = (req.url or "").strip()
     # Strip ?query/#fragment — the extension may post the tab's full URL.
     for sep in ("?", "#"):
