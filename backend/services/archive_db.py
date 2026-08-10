@@ -135,6 +135,15 @@ CREATE TRIGGER IF NOT EXISTS transcript_embeddings_ad AFTER DELETE ON transcript
   DELETE FROM transcript_embeddings WHERE transcript_id = old.id;
 END;
 
+-- Model-version stamp for stored semantic vectors: a fingerprint of the
+-- embed-model files that produced them. A mismatch with the current model
+-- triggers a full re-embed — vectors from two different embedders are not
+-- comparable, so a model upgrade must never silently mix vector spaces.
+CREATE TABLE IF NOT EXISTS semantic_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 -- Acoustic-event rows from the PANNs stage (kind='events' jobs, or the
 -- VODRIP_EVENTS_ENABLED auto-run after transcription): laughs, claps,
 -- screams, music, ... with real boundaries and a confidence score.
@@ -2734,8 +2743,8 @@ def search(
         h.pop("_rowid", None)
         out.append(h)
     if semantic and "transcript" in wanted:
-        # Concept pass: embedding-based hits lead, lexical follows (deduped
-        # by video). Any embedding failure degrades to pure lexical.
+        # Concept pass: tiered hybrid merge (exact lexical > semantic >
+        # partial lexical). Any embedding failure degrades to pure lexical.
         try:
             sem = _semantic_search(
                 q, fetch, platforms=platforms, video_id=video_id,
@@ -2745,8 +2754,7 @@ def search(
         except Exception:
             sem = None
         if sem:
-            sem_keys = {(h["platform"], h["video_id"]) for h in sem}
-            out = (sem + [h for h in out if (h["platform"], h["video_id"]) not in sem_keys])[:limit]
+            out = _merge_semantic_hits(out, sem, limit=int(limit))
             return _attach_platforms(out)
     return _attach_platforms(out[:limit])
 
@@ -3366,6 +3374,26 @@ def _phrase_span_rows(
     return hits[: max(fetch * 3, 3)]
 
 
+def _stamp_embed_fingerprint() -> None:
+    """Record the current embed-model fingerprint next to the vectors just
+    written, so a later model swap is detected and re-embeds the corpus."""
+    try:
+        from services import archive_embed  # lazy: no import cycle
+
+        fp = archive_embed.embed_fingerprint()
+        if fp is None:
+            return
+        with _lock:
+            with get_conn():
+                get_conn().execute(
+                    "INSERT INTO semantic_meta (key, value) VALUES ('embed_fingerprint', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (fp,),
+                )
+    except Exception:
+        pass  # stamping is best-effort; a missing stamp just re-embeds once
+
+
 def set_transcript_embedding(transcript_id: int, vec: bytes) -> None:
     """Upsert one segment's embedding blob (float32, 384 dims)."""
     with _lock:
@@ -3375,6 +3403,7 @@ def set_transcript_embedding(transcript_id: int, vec: bytes) -> None:
                 "ON CONFLICT(transcript_id) DO UPDATE SET vec = excluded.vec",
                 (transcript_id, vec),
             )
+    _stamp_embed_fingerprint()
 
 
 def set_transcript_embeddings(pairs: list[tuple[int, bytes]]) -> None:
@@ -3388,6 +3417,7 @@ def set_transcript_embeddings(pairs: list[tuple[int, bytes]]) -> None:
                 "ON CONFLICT(transcript_id) DO UPDATE SET vec = excluded.vec",
                 pairs,
             )
+    _stamp_embed_fingerprint()
 
 
 def missing_embedding_segments(limit: int = 0) -> list[sqlite3.Row]:
@@ -3412,7 +3442,7 @@ _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
 # (~21s) — MAX alone is the stamp; a deleted highest-id row leaves a stale
 # matrix row that no scope query can select (its transcript is gone), so it
 # is harmless until the next insert bumps the stamp.
-_embed_matrix_cache: Optional[tuple[tuple[str, int], object, object, object]] = None
+_embed_matrix_cache: Optional[tuple[tuple[str, int, Optional[str]], object, object, object]] = None
 _embed_matrix_lock = threading.Lock()
 # One-time logged reason when the GPU scan is unavailable (diagnostic).
 _gpu_scan_fallback_logged = False
@@ -3492,7 +3522,12 @@ def _embed_matrix() -> tuple[object, object, object]:
     mx = int(query(
         "SELECT COALESCE(MAX(transcript_id), 0) AS mx FROM transcript_embeddings"
     )[0]["mx"])
-    key = (str(_db_path()), mx)
+    # The embed-model fingerprint is part of the key: after a model swap the
+    # corpus vectors are re-embedded (same ids, new values), so a matrix
+    # cached under the old model must never be served.
+    from services import archive_embed  # lazy: keeps onnxruntime out of boot
+
+    key = (str(_db_path()), mx, archive_embed.embed_fingerprint())
     hit = _embed_matrix_cache
     if hit is not None and hit[0] == key:
         return hit[1], hit[2], hit[3]
@@ -3564,6 +3599,100 @@ def _matmul_scores(mat: object, qv: object, gpu: object, idx: object = None) -> 
     return np.asarray(sub) @ np.asarray(qv)
 
 
+def _semantic_noise(text: Optional[str]) -> bool:
+    """True when a transcript row carries no meaningful words.
+
+    ASR censorship/profanity masking leaves placeholder rows like
+    '[&nbsp;__&nbsp;]', event tags ('Ã,', '[ ]') or punctuation runs. They
+    embed to a dense, generic region (XLM-R special-token space) and rank
+    near MANY queries, so they would pollute the semantic candidate pool —
+    the FTS lexical passes never match them (no real tokens), but the
+    cosine scan does. Rows with at least one 2+ char word token are real
+    content and kept ('[risadas]' is a meaningful laugh marker)."""
+    t = re.sub(r"&[a-z]+;", " ", str(text or ""))  # strip HTML entities (nbsp)
+    return not [w for w in re.findall(r"[^\W_]+", t) if len(w) >= 2]
+
+
+def _semantic_query_text(q: str) -> str:
+    """Corpus-spelling-corrected query for embedding.
+
+    e5 embeds the raw spelling; a typo'd or ASR-mangled token ("preato",
+    "recita") yields a weaker vector than the corpus form ("preto",
+    "receita"). Every query token ABSENT from the transcript vocab is
+    replaced by its closest conservative expansion — a dist-0 variant
+    (fold/digraph-equal) or a dist-1 true typo sharing the 3-char prefix
+    or consonant skeleton. Intent-preserving by construction: 'molho' is
+    never rewritten to the corpus word 'olho' (dist 1 but no prefix/
+    skeleton bridge), and tokens present in the corpus are left untouched
+    (they are already the intended word). An unavailable vocab degrades to
+    the raw query. Deterministic per vocab snapshot, so the semantic
+    response cache (keyed on the raw query) stays effective on repeats."""
+    tokens = q.split()
+    if not tokens:
+        return q
+    vocab = _load_vocab("transcripts")
+    if not vocab:
+        return q
+    merged: dict[str, int] = {}
+    for bucket in vocab.values():
+        for term, n in bucket:
+            merged[term] = merged.get(term, 0) + n
+    bigrams = _load_bigrams(["transcripts"])
+    out: list[str] = []
+    for tok in tokens:
+        w = re.sub(r"[^\w]+", "", tok).casefold()
+        if len(w) < 4 or not w.isalnum() or merged.get(w, 0) > 0:
+            out.append(tok)
+            continue
+        best: Optional[str] = None
+        for term, dist in _token_expansions(w, [vocab], bigrams, merged):
+            if term == w:
+                continue
+            if dist == 0 or (
+                dist == 1
+                and (
+                    w[:3] == term[:3]
+                    or _consonant_skeleton(w) == _consonant_skeleton(term)
+                )
+            ):
+                best = term
+                break
+        out.append(best if best is not None else tok)
+    return " ".join(out)
+
+
+def _merge_semantic_hits(
+    lex: list[dict], sem: list[dict], limit: int
+) -> list[dict]:
+    """Tiered hybrid merge of lexical and semantic passes.
+
+    Exact lexical hits (phrase/all-words, partial=False) lead — they are
+    literally what the user typed — then semantic concept hits, then
+    partial lexical matches. Dedupes by (platform, video_id, offset_sec)
+    with the higher tier winning (a semantic hit never shadows the exact
+    lexical hit of the same segment), and the per-video cap applies across
+    the merged stream so one video cannot flood the concept page with
+    near-identical rows."""
+    exact = [h for h in lex if not h.get("partial")]
+    partial = [h for h in lex if h.get("partial")]
+    per_video: dict[tuple[str, str], int] = {}
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for h in exact + sem + partial:
+        key = (h["platform"], h["video_id"])
+        skey = (h["platform"], h["video_id"], h.get("offset_sec"))
+        if skey in seen:
+            continue
+        seen.add(skey)
+        if per_video.get(key, 0) >= _HITS_PER_VIDEO_CAP:
+            continue
+        per_video[key] = per_video.get(key, 0) + 1
+        out.append(h)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _semantic_search(
     q: str,
     fetch: int,
@@ -3592,11 +3721,18 @@ def _semantic_search(
 
     # Whole-pass response cache: identical params within the TTL return the
     # previous hit list (deep-copied — callers mutate hits, e.g. the
-    # _attach_platforms pass). Key carries the model callables so a session
-    # that swaps models never reuses stale vectors.
+    # _attach_platforms pass). Key carries the model callables AND their
+    # file fingerprints, so a session that swaps models (or re-exports a
+    # model file) never reuses stale vectors or stale ranking.
+    efp = archive_embed.embed_fingerprint()
+    rfp = archive_embed.rerank_fingerprint()
+    # Query spelling is corrected against the corpus vocab before embedding
+    # (deterministic given q, so the cache stays effective on repeat
+    # submits; both the raw and corrected forms ride in the key).
+    q_embed = _semantic_query_text(q)
     resp_key = (
-        q, tuple(platforms), video_id, channel, tuple(kinds),
-        date_from, date_to, lang, fetch,
+        q, q_embed, tuple(platforms), video_id, channel, tuple(kinds),
+        date_from, date_to, lang, fetch, efp, rfp,
         archive_embed.embed_query, archive_embed.rerank,
     )
     cached = _semantic_resp_cache.get(resp_key)
@@ -3605,10 +3741,10 @@ def _semantic_search(
             return [dict(h) for h in cached[1]]
         _semantic_resp_cache.pop(resp_key, None)
 
-    qkey = (q, archive_embed.embed_query)
+    qkey = (q_embed, efp, archive_embed.embed_query)
     qv = _embed_query_cache.get(qkey)
     if qv is None:
-        raw = archive_embed.embed_query(q)
+        raw = archive_embed.embed_query(q_embed)
         if raw is None:
             return None
         qv = np.asarray(raw).reshape(-1).copy()  # (1, dim) -> (dim,)
@@ -3623,14 +3759,37 @@ def _semantic_search(
         "SELECT COALESCE(MAX(transcript_id), 0) AS mx FROM transcript_embeddings"
     )[0]["mx"])
     mx_tr = int(query("SELECT COALESCE(MAX(id), 0) AS mx FROM transcripts")[0]["mx"])
-    if mx_tr > mx_emb:
+    # Model-version check: stored vectors carry the fingerprint of the
+    # embedder that produced them. A missing/mismatched stamp means the
+    # corpus was embedded by another model (or before fingerprinting) —
+    # those vectors live in a different space, so the whole corpus is
+    # re-embedded in bounded batches and the disk/RAM matrix caches are
+    # invalidated first.
+    stored_fp: Optional[str] = None
+    fp_row = query("SELECT value FROM semantic_meta WHERE key = 'embed_fingerprint'")
+    if fp_row:
+        stored_fp = fp_row[0]["value"]
+    model_stale = stored_fp != efp
+    if model_stale and efp is not None:
+        for p in _embed_matrix_paths(mx_emb):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        missing = query(
+            "SELECT id AS transcript_id, text AS text FROM transcripts LIMIT ?",
+            (_EMBED_BACKFILL_CAP,),
+        )
+    elif mx_tr > mx_emb:
         missing = missing_embedding_segments(_EMBED_BACKFILL_CAP)
-        if missing:
-            vecs = archive_embed.embed_texts([r["text"] for r in missing], "passage: ")
-            if vecs is None:
-                return None
-            for r, v in zip(missing, vecs):
-                set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
+    else:
+        missing = []
+    if missing:
+        vecs = archive_embed.embed_texts([r["text"] for r in missing], "passage: ")
+        if vecs is None:
+            return None
+        for r, v in zip(missing, vecs):
+            set_transcript_embedding(r["transcript_id"], v.astype("<f4").tobytes())
 
     ids, mat, gpu = _embed_matrix()
     if len(ids) == 0:
@@ -3690,16 +3849,25 @@ def _semantic_search(
         cand_ids,
     )
     by_id = {r["transcript_id"]: dict(r) for r in rows}
-    cand = [by_id[i] for i in cand_ids if i in by_id]
-    cand_scores = [s for i, s in zip(cand_ids, cand_scores) if i in by_id]
+    # Placeholder/empty rows ('[&nbsp;__&nbsp;]', 'Ã,') are semantically
+    # empty — they embed to a dense region and rank near many queries, so
+    # they never enter the rerank pool (see _semantic_noise).
+    cand = []
+    keep = []
+    for i, s in zip(cand_ids, cand_scores):
+        r = by_id.get(i)
+        if r is not None and not _semantic_noise(r["text"]):
+            cand.append(r)
+            keep.append(s)
+    cand_scores = keep
     # mmarco rerank of the top candidates is the semantic path's dominant
     # cost (~1.4s at 150 pairs); identical (query, candidates) pairs are
     # cached — the model is deterministic and transcript text is immutable
     # per rowid (deletes cascade, updates rewrite rows).
-    rkey = (q, tuple(r["text"] for r in cand), archive_embed.rerank)
+    rkey = (q_embed, rfp, tuple(r["text"] for r in cand), archive_embed.rerank)
     reranked = _rerank_cache.get(rkey)
     if reranked is None:
-        reranked = archive_embed.rerank(q, [r["text"] for r in cand])
+        reranked = archive_embed.rerank(q_embed, [r["text"] for r in cand])
         if reranked is not None:
             reranked = tuple(reranked)
             if len(_rerank_cache) >= _RERANK_CACHE_MAX:

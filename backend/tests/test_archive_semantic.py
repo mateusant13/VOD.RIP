@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -243,3 +244,100 @@ async def test_semantic_router_param_passes_through(_patch_embedder):
     # object (truthy) instead of FastAPI's substituted value.
     resp = await archive_search(q="felino", semantic=False, limit=20)
     assert resp["hits"] == []
+
+
+def test_semantic_query_spelling_corrected_before_embedding(_patch_embedder, monkeypatch):
+    import services.archive_embed
+
+    _add_video("sem-typo", "gaveta")
+    _add_seg("sem-typo", 0, "o gato preto corre")
+    # Force the transcript vocab warm; the cold path returns None and the
+    # spelling correction would no-op on the raw query.
+    archive_db._load_vocab_uncached("transcripts", time.monotonic())
+
+    seen = []
+    orig = services.archive_embed.embed_query
+    monkeypatch.setattr(
+        services.archive_embed, "embed_query", lambda q: (seen.append(q), orig(q))[1]
+    )
+    hits = archive_db.search("preato gato", semantic=True, limit=10)
+    assert any(h["semantic"] and h["video_id"] == "sem-typo" for h in hits)
+    # the embedded query used the corpus spelling, not the typo
+    assert seen and seen[0] == "preto gato", seen
+
+
+def test_semantic_typo_and_exact_queries_agree(_patch_embedder, monkeypatch):
+    import services.archive_embed
+
+    _add_video("sem-receita", "gaveta")
+    _add_seg("sem-receita", 0, "vamos fazer uma receita de molho")
+    archive_db._load_vocab_uncached("transcripts", time.monotonic())
+
+    exact = archive_db.search("receita de molho", semantic=True, limit=10)
+    seen = []
+    orig = services.archive_embed.embed_query
+    monkeypatch.setattr(
+        services.archive_embed, "embed_query", lambda q: (seen.append(q), orig(q))[1]
+    )
+    typo = archive_db.search("recita de molho", semantic=True, limit=10)
+    assert seen and seen[0] == "receita de molho", seen
+    # same embedded text -> same rerank cache key -> identical top hit
+    assert typo and typo[0]["semantic"] is True
+    assert typo[0]["offset_sec"] == exact[0]["offset_sec"]
+
+
+def test_semantic_hybrid_exact_lexical_leads(_patch_embedder):
+    _add_video("sem-hy-a", "gaveta")
+    _add_seg("sem-hy-a", 0, "o gato felino corre")
+    _add_video("sem-hy-b", "gaveta")
+    _add_seg("sem-hy-b", 0, "uma criatura peluda anda")
+    hits = archive_db.search("felino gato", semantic=True, limit=10)
+    assert len(hits) >= 2
+    # literal (all-words) lexical match leads; the concept-only hit follows
+    assert hits[0]["video_id"] == "sem-hy-a"
+    assert hits[0]["partial"] is False
+    assert any(h["video_id"] == "sem-hy-b" and h["semantic"] for h in hits[1:])
+
+
+def test_semantic_fingerprint_invalidation_reembeds(_patch_embedder, monkeypatch):
+    import services.archive_embed
+
+    calls = _patch_embedder
+    _add_video("sem-fp", "gaveta")
+    _add_seg("sem-fp", 0, "o gato felino corre")
+    _add_seg("sem-fp", 1, "a lua brilha")
+    archive_db.search("criatura peluda", semantic=True)
+    n1 = len(calls)
+    assert n1 > 0
+    # model files changed -> stored vectors belong to another vector space
+    monkeypatch.setattr(
+        services.archive_embed, "embed_fingerprint", lambda: "other-model-v2"
+    )
+    archive_db.search("criatura peluda", semantic=True)
+    assert len(calls) > n1  # full re-embed happened
+    n2 = len(calls)
+    # a different query with the same fingerprint: no re-embed
+    archive_db.search("outro conceito", semantic=True)
+    assert len(calls) == n2
+
+
+def test_semantic_noise_rows_never_rank(_patch_embedder):
+    _add_video("sem-noise", "gaveta")
+    _add_seg("sem-noise", 0, "o gato felino corre")
+    _add_seg("sem-noise", 1, "[&nbsp;__&nbsp;]")
+    hits = archive_db.search("criatura peluda", semantic=True, limit=10)
+    assert hits
+    assert all("[&nbsp;__&nbsp;]" not in (h.get("text") or "") for h in hits)
+    # unit-level contract of the noise predicate
+    assert archive_db._semantic_noise("[&nbsp;__&nbsp;]") is True
+    assert archive_db._semantic_noise("Ã,") is True
+    assert archive_db._semantic_noise("[risadas]") is False
+    assert archive_db._semantic_noise("o gato corre") is False
+
+
+def test_semantic_rerank_degenerate_scores_detected(_patch_embedder):
+    import services.archive_embed
+
+    assert services.archive_embed._scores_degenerate([]) is False
+    assert services.archive_embed._scores_degenerate([0.5, 0.5, 0.501]) is True
+    assert services.archive_embed._scores_degenerate([0.1, 0.9]) is False
