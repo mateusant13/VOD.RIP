@@ -60,18 +60,6 @@ async def get_settings():
     return settings_mgr.get()
 
 
-@router.get("/api/system/gpu-encoder")
-async def system_gpu_encoder():
-    from services.gpu_detect import get_encoder_detection
-    from deps import INFO_EXECUTOR
-    from services.ytdlp_service import _resolve_ffmpeg_exe
-    ffmpeg_bin = _resolve_ffmpeg_exe(settings_mgr.get().ffmpeg_path or None)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        INFO_EXECUTOR, lambda: get_encoder_detection(ffmpeg_bin, fresh=True)
-    )
-
-
 @router.get("/api/settings/youtube-auth")
 async def youtube_auth_status():
     """Which browser / PO providers auto-auth will use (diagnostics for Settings)."""
