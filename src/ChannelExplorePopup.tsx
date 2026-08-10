@@ -955,6 +955,12 @@ export default function ChannelExplorePopup({
     containerRef.current?.focus();
   }, []);
 
+  // Spawned windows take focus (shared raise-to-front contract) — the popup
+  // is the active surface the moment it opens.
+  useEffect(() => {
+    containerRef.current?.focus({ preventScroll: true });
+  }, []);
+
   const onPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     startExplorePanelWidthResize(e, edge, panelWidthRef, setPanelWidth, {
       panelEl: containerRef.current,
@@ -1960,6 +1966,10 @@ export default function ChannelExplorePopup({
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
           reuseSession={clipPopup.reuseSession}
+          // Ladder-derived: parent's shared-ladder rank + 50 headroom — at
+          // spawn this is above every other window (search panel included).
+          // ponytail: 50+ new ranks while this popup is open could overtake
+          // it; upgrade path is a ladder rank of its own via App.
           zIndex={zIndex + 50}
           initialVolume={volumeRef.current}
           onClose={() => setClipPopup(null)}

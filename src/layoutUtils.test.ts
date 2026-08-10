@@ -17,6 +17,11 @@ import {
   PANEL_MIN,
   URL_ASIDE_PANEL_DEFAULT,
   MAIN_PANEL_DEFAULT,
+  EXPLORE_POPUP_Z,
+  SEARCH_POPUP_Z,
+  LIVE_POPUP_ACTIVE_Z,
+  MODAL_Z,
+  MAX_EXPLORE_POPUPS,
 } from './layoutUtils';
 import type { LayoutPanelBoundsInput } from './types';
 
@@ -492,5 +497,24 @@ describe('panelPosAfterResize (live popup west/north edges)', () => {
   it('clamps x when the viewport is too small to fit the size at the start pos', () => {
     const p = panelPosAfterResize('e', { x: 1900, y: 50 }, { w: 480, h: 320 }, { w: 480, h: 320 }, viewport);
     expect(p.x).toBe(1920 - 480 - 8);
+  });
+});
+
+describe('floating-window z-ladder contract', () => {
+  it('every floating window shares ONE ladder base (players + search popups)', () => {
+    // EXPLORE_POPUP_Z and SEARCH_POPUP_Z are the same base on purpose: a
+    // popup spawned or clicked later always gets a higher rank than the
+    // search panel, so it paints above it (root-cause guard for the
+    // "spawned window behind the file-search panel" bug).
+    expect(SEARCH_POPUP_Z).toBe(EXPLORE_POPUP_Z);
+  });
+
+  it('unranked constants sit above the ladder and modals above everything', () => {
+    // Ladder ranks = EXPLORE_POPUP_Z + rank (rank >= 0).
+    expect(LIVE_POPUP_ACTIVE_Z).toBe(EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS + 1);
+    expect(LIVE_POPUP_ACTIVE_Z).toBeGreaterThan(SEARCH_POPUP_Z);
+    // Modals spawn above the ladder and the needle glance.
+    expect(MODAL_Z).toBeGreaterThan(LIVE_POPUP_ACTIVE_Z);
+    expect(MODAL_Z).toBeGreaterThan(SEARCH_POPUP_Z);
   });
 });

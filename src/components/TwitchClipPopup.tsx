@@ -201,6 +201,11 @@ export default function TwitchClipPopup({
   const popupRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
+  // Spawned windows take focus (shared raise-to-front contract) — the popup
+  // is the active surface the moment it opens.
+  useEffect(() => {
+    popupRef.current?.focus({ preventScroll: true });
+  }, []);
   /** In-flight window-body drag (move the whole selection along the VOD). */
   const windowDragRef = useRef<{
     pointerId: number;
@@ -821,6 +826,7 @@ export default function TwitchClipPopup({
   return createPortal(
     <div
       ref={popupRef}
+      tabIndex={-1}
       className="border-2 border-zinc-700 bg-zinc-950 flex flex-col"
       data-twitch-clip-popup
       style={{

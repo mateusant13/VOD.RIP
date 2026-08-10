@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { CheckCircle2, Loader2 } from 'lucide-react';
 import { apiGet } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
+import { MODAL_Z } from '../layoutUtils';
 import type { BridgeStatus } from './CookieBridgeSection';
 
 /** Poll cadence for the cookie status endpoint while the overlay is open. */
@@ -76,7 +77,8 @@ export default function ExtensionWaitOverlay({
       role="dialog"
       aria-modal="true"
       aria-label={t('Waiting for cookies')}
-      className="fixed inset-0 z-[400] flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 flex items-center justify-center bg-black/75 p-4"
+      style={{ zIndex: MODAL_Z }}
     >
       <div
         className="bg-zinc-950 border-2 border-white p-5 font-mono text-sm flex flex-col gap-3 min-w-[22rem] max-w-[30rem]"

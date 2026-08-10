@@ -101,6 +101,35 @@ describe('ArchiveSearchPopup', () => {
     expect(embeddedDialog.querySelector('div')!.className).not.toContain('cursor-grab');
   });
 
+  it('close button stacks above the resize handles (corner handle must not eat the click)', () => {
+    // jsdom has no layout/hit-testing, so assert the CSS contract: the
+    // floating panel's shadow-2xl band grows the corner resize blocks up to
+    // ~52px INSIDE the panel (clipsOverflow hug), and the ne block sits
+    // exactly on top of the close button — it eats every click there unless
+    // the header row (which hosts the button) paints above the z-50 handles.
+    mockFetch();
+    const { container } = render(
+      <ArchiveSearchPopup zIndex={7} onClose={() => {}} onOpenHit={() => {}} />,
+    );
+    const dialog = container.querySelector('[role="dialog"]')!;
+    const header = dialog.firstElementChild as HTMLElement;
+    const closeBtn = [...header.querySelectorAll('button')].find(
+      (b) => (b.title || '').toLowerCase().includes('close'),
+    )!;
+    expect(closeBtn).toBeTruthy();
+    expect(closeBtn.closest('div')).toBe(header); // the button rides in the raised row
+    const zClass = (cls: string): number => {
+      const m = cls.match(/z-\[(\d+)\]/) ?? cls.match(/z-(\d+)/);
+      return m ? Number(m[1]) : 0;
+    };
+    const headerZ = zClass(header.className);
+    const handles = [...dialog.querySelectorAll('[data-panel-resize]')];
+    expect(handles.length).toBeGreaterThan(0);
+    for (const h of handles) {
+      expect(headerZ).toBeGreaterThan(zClass(h.className));
+    }
+  });
+
   it('kind filter chips are VOD/clip/short only — no LIVE chip', () => {
     mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);

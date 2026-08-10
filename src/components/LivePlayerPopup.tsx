@@ -89,6 +89,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
+  // Spawned windows take focus (shared raise-to-front contract) — the popup
+  // is the active surface the moment it opens.
+  useEffect(() => {
+    popupRef.current?.focus({ preventScroll: true });
+  }, []);
   const hlsRef = useRef<Hls | null>(null);
   const hlsCtorRef = useRef<typeof Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -929,6 +934,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   return createPortal(
     <div
       ref={popupRef}
+      tabIndex={-1}
       className="group border-2 border-zinc-700 bg-zinc-950"
       data-live-popup
       onPointerDownCapture={onBringToFront}
@@ -1220,10 +1226,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         )}
       </div>
     </div>,
-    // Share the #explore-portal stacking context (fixed layer at
-    // EXPLORE_POPUP_Z - 1) with explore/local-file players — otherwise a
-    // body-level z-index can never win over the portal, and cross-type
-    // bring-to-front (live vs explore) would be impossible.
+    // Mount inside #explore-portal with the explore/local-file players so all
+    // popups share one DOM subtree (it is a static mount point with no stacking
+    // context — see index.css), letting the shared ladder z compete at root
+    // level for cross-type bring-to-front (live vs explore vs search panel).
     document.getElementById('explore-portal') ?? document.body,
   );
 }

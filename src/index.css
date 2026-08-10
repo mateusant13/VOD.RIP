@@ -41,13 +41,16 @@ body {
   overflow: hidden;
 }
 
-/* Channel explore player portal — fixed layer above the app, no layout coupling */
+/* Channel explore player portal — pure React mount point, no layout coupling.
+   It must NOT create a stacking context: Chrome's css-position-3 treats
+   position:fixed (even with z-index:auto) as a stacking context, which would cap
+   every portal child (9999+rank) below root-level siblings like the floating
+   search panel — the reported "spawned window behind the search panel" bug.
+   A static, zero-size mount lets the fixed-positioned children carry the shared
+   ladder z (EXPLORE_POPUP_Z + rank) and compete directly at root level —
+   newest rank always wins, portal or not. */
 #explore-portal {
-  position: fixed;
-  inset: 0;
-  z-index: 9998;
   pointer-events: none;
-  overflow: visible;
 }
 
 #explore-portal > * {
