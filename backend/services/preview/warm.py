@@ -192,7 +192,6 @@ def _try_adopt_preflight_mux(session: PreviewSession) -> bool:
     return _window_hls_seg0_ready(session)
 def kickoff_youtube_preflight_mux(
     url: str,
-    oauth: Optional[str] = None,
     prefer_height: int = 360,
 ) -> None:
     """Background mux of the initial window chunk — adopted on create_session."""
@@ -215,7 +214,7 @@ def kickoff_youtube_preflight_mux(
     def _run() -> None:
         from services.preview.session import MuxJob
         try:
-            _youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
+            _youtube_preflight_mux(url, prefer_height=prefer_height)
         finally:
             with _PREFLIGHT_MUX_LOCK:
                 _PREFLIGHT_MUX_INFLIGHT.pop(key, None)
@@ -226,7 +225,6 @@ def kickoff_youtube_preflight_mux(
     GESTURE_WARM_EXECUTOR.submit(_run)
 def kickoff_youtube_batch_warm(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
     channel_key: str = "",
@@ -266,7 +264,7 @@ def kickoff_youtube_batch_warm(
             # ponytail: warm_youtube_resolve_only itself builds + stashes the
             # session snapshot. Calling it twice would re-extract + re-build.
             warm_youtube_resolve_only(
-                url, oauth=oauth, prefer_height=prefer_height,
+                url, prefer_height=prefer_height,
                 channel_key=channel_key,
             )
             with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
@@ -287,7 +285,6 @@ def kickoff_youtube_batch_warm(
     WARM_EXECUTOR.submit(_run)
 def _youtube_preflight_mux(
     url: str,
-    oauth: Optional[str] = None,
     prefer_height: int = 360,
 ) -> bool:
     """Mux [0, INITIAL_CHUNK) to preflight cache — no session required."""
@@ -306,7 +303,6 @@ def _youtube_preflight_mux(
     try:
         _raw, headers, platform, variant_formats, _kind, yt_info = resolve_stream_info(
             url,
-            oauth=oauth,
             prefer_height=prefer_height,
         )
     except Exception as exc:
@@ -360,7 +356,6 @@ def _build_youtube_session_snapshot(
     crop_start: float,
     crop_end: float,
     prefer_height: int,
-    oauth: Optional[str],
     resolve_result: Tuple,
 ) -> Optional[Tuple[str, int, dict]]:
     """ponytail: prebuild a session snapshot during the warm.
@@ -550,7 +545,6 @@ def invalidate_resolved_stream_cache(
         _RESOLVED_STREAM_CACHE.pop(key, None)
 def _build_and_cache_youtube_snapshot(
     url: str,
-    oauth: Optional[str],
     prefer_height: int,
     resolve_result,
 ) -> Optional[Tuple[str, int, dict]]:
@@ -566,14 +560,13 @@ def _build_and_cache_youtube_snapshot(
     """
     from services.preview.session import create_session
     snap = _build_youtube_session_snapshot(
-        url, 0.0, 0.0, prefer_height, oauth, resolve_result,
+        url, 0.0, 0.0, prefer_height, resolve_result,
     )
     if snap:
         _put_session_snapshot(snap[0], snap[1], snap[2])
     return snap
 def _resolve_and_cache_youtube_snapshot(
     url: str,
-    oauth: Optional[str] = None,
     prefer_height: int = 360,
     **resolve_kwargs,
 ) -> Optional[Tuple[str, int, dict]]:
@@ -589,7 +582,7 @@ def _resolve_and_cache_youtube_snapshot(
     t0 = time.monotonic()
     try:
         resolve_result = resolve_stream_info(
-            url, oauth=oauth, prefer_height=prefer_height, **resolve_kwargs,
+            url, prefer_height=prefer_height, **resolve_kwargs,
         )
     except Exception as exc:
         # ponytail: this failure used to vanish — a cold click then burned ~27s
@@ -600,7 +593,7 @@ def _resolve_and_cache_youtube_snapshot(
             url[:80], time.monotonic() - t0, exc,
         )
         return None
-    return _build_and_cache_youtube_snapshot(url, oauth, prefer_height, resolve_result)
+    return _build_and_cache_youtube_snapshot(url, prefer_height, resolve_result)
 def _invalidate_youtube_resolve_caches(
     url: str,
     prefer_height: int = 360,
@@ -635,7 +628,6 @@ def _youtube_warm_inflight_key(url: str) -> str:
     return extract_video_id(raw) or raw
 def kickoff_youtube_warm(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
     *,
@@ -689,7 +681,7 @@ def kickoff_youtube_warm(
             from services.ytdlp_hls import warm_youtube_extract
 
             warm_youtube_extract(
-                url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height
+                url, cookies_file=cookies_file, prefer_height=prefer_height
             )
         finally:
             # ponytail: failed warm on slow VOD must not nuke session before create_session runs
@@ -703,7 +695,6 @@ def kickoff_youtube_warm(
     GESTURE_WARM_EXECUTOR.submit(_run)
 def kickoff_youtube_full_mux_warm(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 720,
 ) -> None:
@@ -746,11 +737,11 @@ def kickoff_youtube_full_mux_warm(
         try:
             from services.ytdlp_hls import warm_youtube_extract
 
-            if not warm_youtube_extract(url, oauth=oauth, cookies_file=cookies_file):
+            if not warm_youtube_extract(url, cookies_file=cookies_file):
                 return
             try:
                 _entry, headers, _platform, variant_formats, _kind, yt_info = (
-                    resolve_stream_info(url, oauth=oauth, prefer_height=prefer_height)
+                    resolve_stream_info(url, prefer_height=prefer_height)
                 )
             except Exception as exc:
                 from services.ytdlp_hls import _youtube_soft_neg_error
@@ -868,7 +859,7 @@ def _warm_note_success() -> None:
 
 
 def _enqueue_full_warm(
-    url: str, oauth: Optional[str], cookies_file: Optional[str], prefer_height: int
+    url: str, cookies_file: Optional[str], prefer_height: int
 ) -> None:
     global _full_warm_backoff_until
     if time.monotonic() < _full_warm_backoff_until:
@@ -884,7 +875,7 @@ def _enqueue_full_warm(
             return
         try:
             warm_youtube_preview_resolve(
-                url, oauth=oauth, cookies_file=cookies_file, prefer_height=prefer_height,
+                url, cookies_file=cookies_file, prefer_height=prefer_height,
                 reraise=True,
             )
         except Exception as exc:
@@ -902,7 +893,6 @@ def _enqueue_full_warm(
     _FULL_WARM_EXECUTOR.submit(_run)
 def warm_youtube_preview_resolve(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
     *,
@@ -922,10 +912,10 @@ def warm_youtube_preview_resolve(
     from services.preview.session import resolve_stream_info
     try:
         resolve_result = resolve_stream_info(
-            url, oauth=oauth, prefer_height=prefer_height
+            url, prefer_height=prefer_height
         )
-        kickoff_youtube_preflight_mux(url, oauth=oauth, prefer_height=prefer_height)
-        kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
+        kickoff_youtube_preflight_mux(url, prefer_height=prefer_height)
+        kickoff_youtube_prog_head_warm(url, prefer_height=prefer_height)
     except Exception as exc:
         from services.ytdlp_hls import _youtube_soft_neg_error
 
@@ -943,7 +933,7 @@ def warm_youtube_preview_resolve(
         return False
     try:
         snap = _build_youtube_session_snapshot(
-            url, 0.0, 0.0, prefer_height, oauth, resolve_result
+            url, 0.0, 0.0, prefer_height, resolve_result
         )
         if snap:
             _put_session_snapshot(snap[0], snap[1], snap[2])
@@ -959,7 +949,6 @@ def warm_youtube_preview_resolve(
     return True
 def warm_youtube_resolve_only(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
     channel_key: str = "",
@@ -984,7 +973,7 @@ def warm_youtube_resolve_only(
     from services.preview.session import kickoff_youtube_prog_head_warm
     try:
         resolve_result = resolve_stream_info(
-            url, oauth=oauth, prefer_height=prefer_height, warm_light=True
+            url, prefer_height=prefer_height, warm_light=True
         )
     except Exception as exc:
         # ponytail: light pass failed — usually anon-bot-gated videos the full
@@ -1006,20 +995,20 @@ def warm_youtube_resolve_only(
         from services.ytdlp_hls import _youtube_fatal_extract_error
 
         if not _youtube_fatal_extract_error(exc):
-            _enqueue_full_warm(url, oauth, cookies_file, prefer_height)
+            _enqueue_full_warm(url, cookies_file, prefer_height)
         logger.debug("YouTube batch warm resolve skipped for %s: %s", url[:80], exc)
         return False
     # ponytail: preflight the head + mux so the first 5s of playable bytes are
     # on disk before the user clicks. 360p muxed progressive is unauthenticated
     # and survives without cookies/POT/visitor_data.
     try:
-        kickoff_youtube_prog_head_warm(url, oauth=oauth, prefer_height=prefer_height)
+        kickoff_youtube_prog_head_warm(url, prefer_height=prefer_height)
     except Exception as exc:
         logger.debug("YouTube batch warm head skipped for %s: %s", url[:80], exc)
     # ponytail: build the session shell through the shared _build_and_cache
     # helper so warm and create_session produce identical keys + payloads.
     snap = _build_and_cache_youtube_snapshot(
-        url, oauth, prefer_height, resolve_result,
+        url, prefer_height, resolve_result,
     )
     if snap:
         logger.info(

@@ -3,7 +3,7 @@
 The local extension (Get-cookies.txt-LOCALLY fork) pushes cookie diffs for
 kick.com / youtube.com / twitch.tv; this service keeps only the names each
 downloader actually needs (see KEEP_LISTS) and stores values AES-encrypted
-via oauth_crypto (machine-derived key, no user password).
+via token_crypto (machine-derived key, no user password).
 
 Storage: same SQLite file as archive_db (%APPDATA%/VOD.RIP/archive.db, or env
 VODRIP_ARCHIVE_DB) but in its own table/connection — the file is shared with
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from services.oauth_crypto import decrypt_token, encrypt_token
+from services.token_crypto import decrypt_token, encrypt_token
 from services.settings import _get_appdata_dir
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ PLATFORMS = ("youtube", "twitch", "kick")
 # kick.com: auth_token (+ g_session keeps the Kick session alive).
 # youtube.com: the SID family the innertube client needs (plus the
 # visitor-id cookie yt-dlp falls back to when the account is logged out).
-# twitch.tv: auth-token (OAuth) + sp (device id, needed for GQL requests).
+# twitch.tv: auth-token (session token) + sp (device id, needed for GQL requests).
 KEEP_LISTS: dict[str, frozenset[str]] = {
     "kick": frozenset({"auth_token", "g_session"}),
     "youtube": frozenset({

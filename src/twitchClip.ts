@@ -1,13 +1,13 @@
 /**
  * Twitch clip creation — shared helpers for the preview "CLIP" buttons.
  *
- * POST /api/twitch/clip creates the clip through Twitch's official Helix API
- * (Chatterino-style) using the stored twitch_helix_token: live clips via
- * POST /helix/clips (clips:edit), VOD clips via POST /helix/videos/clips
- * (editor:manage:clips | channel:manage:clips, vod_offset = clip END).
- * On success the returned edit_url (valid 24h) is opened in the OS default
- * browser; failures come back as {ok: false, error: {code, message}} and are
- * surfaced by the callers.
+ * Clips are created in Twitch's own clip editor (clips.twitch.tv/create),
+ * opened by the frontend in the OS default browser with vodrip_* params; the
+ * VOD.RIP cookie extension's content script (clip_assist.mjs) fills the title
+ * and clicks Save using Twitch's own session cookie — no API token, scopes or
+ * editor role needed. The extension posts the published clip URL to
+ * /api/twitch/clips/record so the clip lands in the app history with a
+ * download button.
  */
 
 import { apiDelete, apiGet, apiPost } from './hooks/useApiClient';
@@ -15,12 +15,12 @@ import { apiDelete, apiGet, apiPost } from './hooks/useApiClient';
 export const TWITCH_CLIP_MAX_SEC = 60;
 /** Twitch's own editor rejects selections shorter than this. */
 export const TWITCH_CLIP_MIN_SEC = 5;
-/** Helix clip title length limit. */
+/** Twitch editor clip title length limit. */
 export const TWITCH_CLIP_TITLE_MAX = 140;
 
 /**
  * Debugging event sequence for the clip flow: every step of a clip attempt
- * (app UI, Helix API, browser cookie extension) appends a timestamped JSON
+ * (app UI, browser cookie extension, backend) appends a timestamped JSON
  * line to the backend's clip-events log so the attempt can be replayed end
  * to end — see GET /api/debug/clip-events. Fire-and-forget: logging must
  * never affect the flow.
@@ -60,9 +60,9 @@ export function twitchClipWindow(
  * user's typed trim range) the selection IS the anchor, clamped into the
  * window, with its length forced into [TWITCH_CLIP_MIN_SEC, TWITCH_CLIP_MAX_SEC]
  * — an over-long anchor keeps its END pinned (start = end − 60, matching the
- * END-reference semantics of Helix vod_offset), an under-long one grows from
- * its start. Without an anchor, replicate the default: the last 60s of the
- * window, or the whole window when it's shorter.
+ * END-reference semantics of the Twitch editor's offsetSeconds), an under-long
+ * one grows from its start. Without an anchor, replicate the default: the
+ * last 60s of the window, or the whole window when it's shorter.
  */
 export function initialClipSelection(
   win: { start: number; end: number },
@@ -72,7 +72,7 @@ export function initialClipSelection(
     let start = Math.max(win.start, Math.min(anchor.start, win.end));
     let end = Math.max(win.start, Math.min(anchor.end, win.end));
     if (end - start > TWITCH_CLIP_MAX_SEC) {
-      // Keep the END anchored (clip END = Helix vod_offset).
+      // Keep the END anchored (clip END = editor offsetSeconds).
       start = end - TWITCH_CLIP_MAX_SEC;
     } else if (end - start < TWITCH_CLIP_MIN_SEC) {
       // Grow from the start first; at the window edge, pull the start back.
@@ -163,42 +163,13 @@ export interface TwitchClipError {
   message: string;
 }
 
-export type TwitchClipOpenResult =
-  | { ok: true; id: string | null; edit_url: string }
-  | { ok: false; error: TwitchClipError };
-
-export interface OpenTwitchClipArgs {
-  broadcasterLogin: string;
-  vodId?: string;
-  offsetSec?: number;
-  durationSec?: number;
-  /** User-chosen clip title (empty -> backend sends the broadcaster login for VOD clips, since Helix requires a title; live clips omit it -> Twitch auto-titles). Becomes the local filename on download. */
-  title?: string;
-}
-
-/** Open a URL in the OS default browser (external window, not the WebView2). */
-function openExternal(url: string): void {
-  window.open(url, '_blank', 'noopener,noreferrer');
-}
-
-/**
- * Official VOD.RIP OAuth app Client ID, embedded at build time so end users
- * never register their own app (same model as Chatterino's client_login).
- * The registered redirect URI (localhost:7897) is identical on every machine,
- * so one app serves all users. Overridable per-user via Settings → Official
- * APIs for power users. Empty until the official app is created; the token
- * button then falls back to the registration page.
- */
-export const DEFAULT_TWITCH_CLIENT_ID = 'lvhunanwtrdeo3luw5hq2p94ygzgjp';
-
 /**
  * Open Twitch's clip editor at a VOD timestamp in the OS default browser.
  * Uses the legacy editor URL (clips.twitch.tv/create?vodID=...&offsetSeconds=...)
  * which mounts the clip editor DIRECTLY when logged in — offsetSeconds is the
- * clip END (Twitch's editor anchor), the same reference the Helix path uses.
- * The VOD.RIP cookie extension's content script (clip_assist.mjs, matches
- * clips.twitch.tv/create) then fills the title and clicks Save Clip using
- * Twitch's own session cookie — no Helix clip scopes needed.
+ * clip END (Twitch's editor anchor). The VOD.RIP cookie extension's content
+ * script (clip_assist.mjs, matches clips.twitch.tv/create) then fills the
+ * title and clicks Save Clip using Twitch's own session cookie.
  */
 export function openTwitchClipEditorInBrowser(
   vodId: string,
@@ -227,37 +198,7 @@ export function openTwitchClipEditorInBrowser(
   const url =
     `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
   reportClipEvent('browser_open', { url, startSec, endSec, title: title ?? null });
-  openExternal(url);
-}
-
-/**
- * Ask the backend to create a Twitch clip via the official Helix API. The
- * clip is created server-side — no browser window is opened; the caller
- * surfaces the clip URL (see clipPublicUrl) in the app.
- */
-export async function openTwitchClipEditor(
-  args: OpenTwitchClipArgs,
-): Promise<TwitchClipOpenResult> {
-  const body = {
-    broadcaster_login: args.broadcasterLogin,
-    vod_id: args.vodId ?? null,
-    offset_sec: args.offsetSec ?? null,
-    duration_sec: args.durationSec ?? null,
-    title: args.title ?? null,
-  };
-  reportClipEvent('api_request', body);
-  const res = await apiPost<TwitchClipOpenResult>('/api/twitch/clip', body);
-  if (res.ok) {
-    reportClipEvent('api_success', { id: res.id, edit_url: res.edit_url });
-  } else {
-    reportClipEvent('api_error', { code: res.error.code, message: res.error.message });
-  }
-  return res;
-}
-
-/** Public clip URL for a Helix edit_url (drops a trailing /edit, if any). */
-export function clipPublicUrl(editUrl: string): string {
-  return editUrl ? editUrl.replace(/\/edit$/, '') : editUrl;
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 export async function fetchTwitchClipHistory(): Promise<TwitchClipRecord[]> {

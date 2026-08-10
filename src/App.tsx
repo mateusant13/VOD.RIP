@@ -10,7 +10,7 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
-import { openTwitchClipEditor, type TwitchClipRecord } from './twitchClip';
+import { type TwitchClipRecord } from './twitchClip';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
@@ -377,14 +377,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   ffmpeg_path: '',
   temp_folder: '',
   cache_dir: '',
-  oauth: '',
   quality: '1080p',
   channel_kick_enabled: true,
   channel_twitch_enabled: true,
   channel_youtube_enabled: true,
   channel_content_filter: 'vods',
   start_with_windows: false,
-  twitch_helix_token: '',
 };
 
 export default function App() {
@@ -463,7 +461,6 @@ export default function App() {
   const [previewTrimEnd, setPreviewTrimEnd] = useState(3600);
   /** Twitch clip editor open — transient notice shown in the transport row. */
   const [clipOpenNotice, setClipOpenNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
-  const [clipOpening, setClipOpening] = useState(false);
   /** Twitch clip mini-preview (VOD path) — opened at the current playhead,
    * centred on the user's typed trim range when one is set. */
   const [twitchClipPopup, setTwitchClipPopup] = useState<{
@@ -5849,22 +5846,6 @@ export default function App() {
       showClipOpenNotice('error', t('A clip can\u2019t be clipped'));
       return;
     }
-    if (isLive) {
-      setClipOpening(true);
-      try {
-        const res = await openTwitchClipEditor({ broadcasterLogin: login });
-        if (res.ok) {
-          showClipOpenNotice('ok', `Twitch clip created — ${res.edit_url}`);
-        } else {
-          showClipOpenNotice('error', res.error.message);
-        }
-      } catch {
-        showClipOpenNotice('error', t('Failed to open the Twitch clip editor'));
-      } finally {
-        setClipOpening(false);
-      }
-      return;
-    }
     const vodId = archiveVideoIdFromUrl(url) ?? undefined;
     if (!vodId) {
       showClipOpenNotice('error', t('Not a Twitch VOD URL'));
@@ -6055,21 +6036,19 @@ export default function App() {
         })}
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
-        {urlPlatform === 'twitch' && (
+        {urlPlatform === 'twitch' && !isLive && (
           <button
             type="button"
             onClick={() => void openPreviewTwitchClip()}
-            disabled={clipOpening || !videoInfo?.channel?.trim()}
+            disabled={!videoInfo?.channel?.trim()}
             className={`${previewCtrlBtn(previewFullscreen, true)} flex items-center gap-1.5`}
             title={
               !videoInfo?.channel?.trim()
                 ? t('Extract VOD info first to enable Twitch clip')
-                : isLive
-                  ? t('Open Twitch clip editor for this live stream')
-                  : t('Open the Twitch clip mini-preview at the playhead')
+                : t('Open the Twitch clip mini-preview at the playhead')
             }
           >
-            {clipOpening ? <Loader2 size={16} className="animate-spin" /> : <TwitchLogoIcon size={15} className="shrink-0" />}
+            <TwitchLogoIcon size={15} className="shrink-0" />
             {/* Logo already says Twitch — label stays bare "clip" (user request). */}
             <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
           </button>

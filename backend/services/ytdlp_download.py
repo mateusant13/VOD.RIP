@@ -146,11 +146,9 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
 
     cache_dir = _get_cache_dir()
     max_cache_mb = 200
-    oauth = None
     cookies_file = None
     if settings_mgr is not None:
         max_cache_mb = settings_mgr.get().max_cache_mb
-        oauth = settings_mgr.get().oauth or None
         cookies_file = settings_mgr.get().youtube_cookies_file or None
     max_bytes = max_cache_mb * 1024 * 1024
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -161,7 +159,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             from services.ytdlp_hls import cached_extract_info, youtube_preview_ytdl_opts
 
             opts = youtube_preview_ytdl_opts(
-                full_url, oauth=oauth, cachedir=cache_dir,
+                full_url, cachedir=cache_dir,
                 cookies_file=cookies_file,
             )
             return cached_extract_info(full_url, opts)
@@ -807,7 +805,6 @@ def _build_ydl_opts(
     url: str,
     output_path: str,
     quality: Optional[str] = None,
-    oauth: Optional[str] = None,
     progress_hook: Optional[Callable] = None,
     cachedir: Optional[str] = None,
     throttle_kib: Optional[int] = None,
@@ -874,10 +871,6 @@ def _build_ydl_opts(
             opts["format"] = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
         elif quality not in ("best", "worst"):
             opts["format"] = quality
-
-    if oauth:
-        opts["username"] = "oauth_token"
-        opts["password"] = oauth
 
     # Auto-inject YouTube cookies (auto-extracted from browser at startup)
     if not opts.get("cookies") and "youtube" in url.lower():
@@ -1178,7 +1171,6 @@ def download_video_sync(
     url: str,
     output_path: str,
     quality: Optional[str] = None,
-    oauth: Optional[str] = None,
     crop_start: Optional[float] = None,
     crop_end: Optional[float] = None,
     progress_hook: Optional[Callable] = None,
@@ -1206,8 +1198,6 @@ def download_video_sync(
     if settings_mgr is not None:
         max_cache_mb = settings_mgr.get().max_cache_mb
         cookies_file = settings_mgr.get().youtube_cookies_file or None
-        if not oauth:
-            oauth = settings_mgr.get().oauth or None
     max_bytes = max_cache_mb * 1024 * 1024
     cache_dir.mkdir(parents=True, exist_ok=True)
     _prune_cache_dir(cache_dir, max_bytes)
@@ -1237,7 +1227,7 @@ def download_video_sync(
             info = cached_extract_info(
                 full_url,
                 youtube_preview_ytdl_opts(
-                    full_url, oauth=oauth, cachedir=cache_dir,
+                    full_url, cachedir=cache_dir,
                     cookies_file=cookies_file,
                 ),
             )
@@ -1285,7 +1275,7 @@ def download_video_sync(
             return output_path
 
     opts = _build_ydl_opts(
-        full_url, output_path, quality, oauth, progress_hook, cachedir=str(cache_dir),
+        full_url, output_path, quality, progress_hook, cachedir=str(cache_dir),
         temp_folder=settings_mgr.get().temp_folder if settings_mgr is not None else None,
         ffmpeg_path=settings_mgr.get().ffmpeg_path if settings_mgr is not None else None,
         video_encoder=encoder_setting,

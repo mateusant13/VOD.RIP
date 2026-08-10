@@ -35,9 +35,6 @@ def _get_appdata_dir():
     return _settings_mod._get_appdata_dir()
 
 
-from services.oauth_crypto import encrypt_token
-
-
 class DownloadPersistence:
     """JSON-backed persistence for download history and resumable queue.
 
@@ -220,10 +217,7 @@ class DownloadPersistence:
                 continue
             if callable(value):
                 continue
-            if key == "oauth" and value is not None:
-                out[key] = encrypt_token(value)
-            else:
-                out[key] = value
+            out[key] = value
         return out
 
     def upsert_queue_entry(

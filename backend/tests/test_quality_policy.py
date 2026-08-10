@@ -90,13 +90,7 @@ def test_anonymous_default_when_no_user_auth():
         "services.youtube_auth.find_fresh_cookie_cache", return_value=None
     ):
         mgr.get.return_value = _anon_settings()
-        assert _youtube_preview_is_anonymous(None) is True
-
-
-def test_oauth_token_means_user_auth():
-    with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = _anon_settings()
-        assert _youtube_preview_is_anonymous("oauth-token") is False
+        assert _youtube_preview_is_anonymous() is True
 
 
 def test_manual_cookie_file_means_user_auth(tmp_path):
@@ -111,7 +105,7 @@ def test_manual_cookie_file_means_user_auth(tmp_path):
             youtube_po_token="",
             youtube_tokens_file="",
         )
-        assert _youtube_preview_is_anonymous(None) is False
+        assert _youtube_preview_is_anonymous() is False
 
 
 def test_browser_cookies_setting_means_user_auth():
@@ -124,7 +118,7 @@ def test_browser_cookies_setting_means_user_auth():
             youtube_po_token="",
             youtube_tokens_file="",
         )
-        assert _youtube_preview_is_anonymous(None) is False
+        assert _youtube_preview_is_anonymous() is False
 
 
 def test_cached_browser_export_means_user_auth():
@@ -133,7 +127,7 @@ def test_cached_browser_export_means_user_auth():
         return_value="/appdata/VOD.RIP/youtube_cookies_chrome.txt",
     ):
         mgr.get.return_value = _anon_settings()
-        assert _youtube_preview_is_anonymous(None) is False
+        assert _youtube_preview_is_anonymous() is False
 
 
 def test_anon_jar_stays_anonymous():
@@ -142,7 +136,7 @@ def test_anon_jar_stays_anonymous():
         return_value="/tmp/yt_anon_abc123",
     ):
         mgr.get.return_value = _anon_settings()
-        assert _youtube_preview_is_anonymous(None) is True
+        assert _youtube_preview_is_anonymous() is True
 
 
 # ── create_session height handling ──

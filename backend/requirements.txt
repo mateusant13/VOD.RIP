@@ -8,7 +8,7 @@ bgutil-ytdlp-pot-provider>=1.2.0
 pydantic>=2.0
 requests>=2.31.0
 curl_cffi>=0.7.0
-# services/oauth_crypto.py imports it directly (OAuth state signing)
+# services/token_crypto.py imports it directly (session-cookie encryption)
 cryptography>=42.0.0
 
 # ── Desktop shell ──────────────────────────────────────────────────────────

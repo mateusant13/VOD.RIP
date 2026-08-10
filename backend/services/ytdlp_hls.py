@@ -200,7 +200,6 @@ _YT_FATAL_MARKERS = (
     "this video is unavailable",
     "video is unavailable",  # InnerTube playability: deleted/private/geo/members-converted
     "video unavailable",  # WEB client's terse variant of the above
-    "login with oauth is no longer supported",  # yt-dlp dead auth path — never recovers on retry
 )
 # Negative cache for fatal extracts — a members-only row in a channel list gets
 # warmed, clicked, and re-clicked; don't re-run the whole chain every time.
@@ -322,7 +321,6 @@ def _extract_cache_key(url: str, opts: dict) -> str:
 
     cache_url = canonical_youtube_watch_url(url) or url
     clients = (opts.get("extractor_args") or {}).get("youtube", {}).get("player_client")
-    oauth = opts.get("password") or opts.get("username") or ""
     cookie = opts.get("cookiefile") or ""
     if Path(cookie).name.startswith("yt_anon_"):
         # Anonymous bootstrap jars are volatile — every re-bootstrap mints a new
@@ -334,7 +332,7 @@ def _extract_cache_key(url: str, opts: dict) -> str:
     sess_key = ""
     if session is not None:
         sess_key = f"{bool(session.visitor_data)}|{bool(session.po_token)}|{bool(session.cookie_header)}"
-    return f"{cache_url}|{clients}|{bool(oauth)}|{cookie}|{browser}|{sess_key}"
+    return f"{cache_url}|{clients}|{cookie}|{browser}|{sess_key}"
 
 
 def _youtube_url_from_opts(url: str, opts: dict) -> bool:
@@ -381,7 +379,6 @@ YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android_vr", "android", "web_safari"]
 
 def youtube_preview_ytdl_opts(
     full_url: str,
-    oauth: Optional[str] = None,
     cachedir: Optional[Path] = None,
     cookies_file: Optional[str] = None,
     session=None,
@@ -452,9 +449,6 @@ def youtube_preview_ytdl_opts(
     }
     if fast_only:
         opts["_preview_fast_only"] = True
-    if oauth and not fast_only:
-        opts["username"] = "oauth_token"
-        opts["password"] = oauth
     from services.youtube_session import apply_ytdlp_cookie_opts
 
     apply_ytdlp_cookie_opts(
@@ -1255,7 +1249,6 @@ assert _youtube_info_playable(
 
 def warm_youtube_extract(
     url: str,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
     prefer_height: int = 360,
 ) -> bool:
@@ -1273,7 +1266,7 @@ def warm_youtube_extract(
     try:
         from services.preview_service import warm_youtube_preview_resolve
 
-        return warm_youtube_preview_resolve(url, oauth=oauth, prefer_height=prefer_height)
+        return warm_youtube_preview_resolve(url, prefer_height=prefer_height)
     except Exception as exc:
         from services.youtube_diag import log_extract_fail
 
@@ -3774,7 +3767,6 @@ def _download_hls_clip(
         if not extract_opts.get("_youtube_session"):
             extract_opts = youtube_preview_ytdl_opts(
                 url,
-                oauth=opts.get("password"),
                 cachedir=opts.get("cachedir"),
                 cookies_file=opts.get("cookiefile"),
             )
@@ -3951,7 +3943,6 @@ def ytdlp_section_mux_to_ts(
     output_path: str,
     start_sec: float,
     end_sec: float,
-    oauth: Optional[str] = None,
     cookies_file: Optional[str] = None,
 ) -> None:
     """ponytail: yt-dlp section download when googlevideo Range seek fails (deep scrub)."""
@@ -3961,7 +3952,7 @@ def ytdlp_section_mux_to_ts(
     tmpdir = tempfile.mkdtemp(prefix="ytdlp_seg_")
     try:
         base = os.path.join(tmpdir, "clip")
-        opts = youtube_preview_ytdl_opts(url, oauth=oauth, cookies_file=cookies_file)
+        opts = youtube_preview_ytdl_opts(url, cookies_file=cookies_file)
         opts["logger"] = ytdlp_console_logger()
         opts["js_runtimes"] = ytdlp_js_runtimes()
         opts.update(

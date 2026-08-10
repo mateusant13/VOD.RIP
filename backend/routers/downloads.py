@@ -195,7 +195,6 @@ async def download_video(req: DownloadRequest):
         url=req.url,
         output_file=output,
         quality=req.quality or opts.quality,
-        oauth=req.oauth or opts.oauth,
         crop_start=req.crop_start,
         crop_end=req.crop_end,
         download_func=download_func,
@@ -244,7 +243,6 @@ async def download_clip(req: DownloadRequest):
         url=req.url,
         output_file=output,
         quality=req.quality or opts.quality,
-        oauth=req.oauth or opts.oauth,
         crop_start=crop_start,
         crop_end=crop_end,
         download_func=download_func,
@@ -359,7 +357,6 @@ async def resume_download(download_id: str):
         raise HTTPException(status_code=404, detail="Download not found or not resumable")
     new_id = download_mgr.resume(
         download_id,
-        oauth=opts.oauth,
         download_func=download_func_for_entry(entry),
         settings_mgr=settings_mgr,
     )

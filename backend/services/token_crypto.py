@@ -1,4 +1,4 @@
-"""AES-CBC encryption for OAuth tokens at rest.
+"""AES-CBC encryption for stored session tokens at rest.
 
 Uses a machine-derived key (hostname + fixed salt) so tokens are encrypted
 on disk but don't need a user-supplied password.
@@ -14,7 +14,7 @@ def _derive_key() -> bytes:
     global _KEY_CACHE
     if _KEY_CACHE is not None:
         return _KEY_CACHE
-    raw = socket.gethostname() + "::vodrip::oauth::v1"
+    raw = socket.gethostname() + "::vodrip::token::v1"
     _KEY_CACHE = hashlib.sha256(raw.encode()).digest()
     return _KEY_CACHE
 

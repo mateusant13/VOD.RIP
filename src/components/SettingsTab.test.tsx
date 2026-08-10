@@ -11,7 +11,6 @@ const BASE: AppSettings = {
   throttle_kib: 0,
   ffmpeg_path: "",
   temp_folder: "",
-  oauth: "",
   quality: "720p",
   skip_youtube_startup_warm: false,
   archive_vod_keep_count: 5,
