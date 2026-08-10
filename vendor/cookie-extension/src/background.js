@@ -156,13 +156,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (window.__vodripRangeReady) return;
           window.__vodripRangeReady = true;
           const pc = (s) => {
+            // "3:20" (m:ss) or "1:02:05" (h:mm:ss) -> seconds.
+            const h = /^(\d+):(\d{1,2}):(\d{2})$/.exec(s);
+            if (h) return +h[1] * 3600 + +h[2] * 60 + +h[3];
             const m = /^(\d+):(\d{2})$/.exec(s);
             return m ? +m[1] * 60 + +m[2] : null;
           };
           window.addEventListener('message', (ev) => {
             const d = ev.data;
             if (!d || d.source !== 'vodrip-range-req') return;
-            const { nonce, start, end } = d;
+            const { nonce, start, end, dur } = d;
             const send = (p) => {
               try { window.postMessage(Object.assign({ source: 'vodrip-range-res', nonce }, p), '*'); } catch { /* ignore */ }
             };
@@ -181,32 +184,70 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               n = n.return;
             }
             if (!drag) { send({ ok: false, reason: 'controle de trecho não acessível' }); return; }
-            try {
-              drag.onLeftDrag({ startOffset: start, endOffset: end });
-              drag.onRightDrag({ startOffset: start, endOffset: end });
-            } catch (err) {
-              send({ ok: false, reason: 'drag falhou: ' + (err && err.message || err) });
-              return;
-            }
-            const deadline = Date.now() + 8000;
-            const tick = () => {
+            // The editor accepts the window as {startOffset, endOffset}
+            // ABSOLUTE VOD seconds (proven live: a 500-520s window landed
+            // exactly), but it clamps to the VOD's own frame edges — a window
+            // ending at the VOD's last second settles a frame or two early,
+            // and the old ±1s confirmation then failed and aborted the save
+            // (seen live: 17:00-17:22 on a ~17:22 VOD never published).
+            // Tolerance: per-handle 3s, length delta 2s, and the site's hard
+            // 5..60s window rule — the LENGTH is what the editor enforces.
+            const TOL = 3;
+            const LEN_TOL = 2;
+            const readWindow = () => {
               const vt = (slider.getAttribute('aria-valuetext') || '').trim();
               const parts = vt.split(/\s*to\s*/i);
-              if (parts.length === 2) {
-                const a = pc(parts[0]);
-                const b = pc(parts[1]);
-                if (a != null && b != null && Math.abs(a - start) <= 1 && Math.abs(b - end) <= 1) {
-                  send({ ok: true, valuetext: vt });
+              if (parts.length !== 2) return null;
+              const a = pc(parts[0]);
+              const b = pc(parts[1]);
+              return a != null && b != null ? { a, b, vt } : null;
+            };
+            const attempt = (s, e) =>
+              new Promise((resolve) => {
+                try {
+                  drag.onLeftDrag({ startOffset: s, endOffset: e });
+                  drag.onRightDrag({ startOffset: s, endOffset: e });
+                } catch (err) {
+                  resolve({ ok: false, reason: 'drag falhou: ' + (err && err.message || err) });
                   return;
                 }
+                const deadline = Date.now() + 8000;
+                const tick = () => {
+                  const w = readWindow();
+                  if (
+                    w &&
+                    Math.abs(w.a - s) <= TOL && Math.abs(w.b - e) <= TOL &&
+                    Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
+                    w.b - w.a >= 5 && w.b - w.a <= 60
+                  ) {
+                    resolve({ ok: true, valuetext: w.vt });
+                    return;
+                  }
+                  if (Date.now() > deadline) {
+                    resolve({ ok: false, reason: 'editor ajustou para "' + (w ? w.vt : '(sem leitura)') + '"' });
+                    return;
+                  }
+                  setTimeout(tick, 250);
+                };
+                setTimeout(tick, 0);
+              });
+            (async () => {
+              let res = await attempt(start, end);
+              // VOD-edge retry: when the editor clamped the window to the VOD's
+              // last frames (or near it), pull the END off the edge and keep
+              // the requested length — the user gets the clip instead of a
+              // refusal.
+              if (!res.ok && Number.isFinite(dur) && dur > 0) {
+                const e2 = Math.min(end, Math.max(start + 5, dur - 3));
+                const s2 = Math.max(0, e2 - (end - start));
+                if (e2 !== end || s2 !== start) {
+                  const res2 = await attempt(s2, e2);
+                  if (res2.ok) res = res2;
+                  else if (res2.reason) res.reason = res2.reason;
+                }
               }
-              if (Date.now() > deadline) {
-                send({ ok: false, reason: 'editor ajustou para "' + vt + '"' });
-                return;
-              }
-              setTimeout(tick, 250);
-            };
-            setTimeout(tick, 0);
+              send(res);
+            })();
           });
         },
       })

@@ -206,6 +206,7 @@ export function openTwitchClipEditorInBrowser(
   startSec: number,
   endSec: number,
   title?: string,
+  vodDurationSec?: number,
 ): void {
   const p = new URLSearchParams({
     vodrip_clip: '1',
@@ -217,6 +218,12 @@ export function openTwitchClipEditorInBrowser(
     vodrip_close: '0',
   });
   if (title) p.set('vodrip_title', title);
+  // VOD total length — the editor clamps the clip window at the VOD's last
+  // frame, so the extension needs it to nudge the window off the edge
+  // instead of failing the confirmation (see background.js edge retry).
+  if (vodDurationSec && Number.isFinite(vodDurationSec) && vodDurationSec > 0) {
+    p.set('vodrip_dur', String(Math.round(vodDurationSec)));
+  }
   const url =
     `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
   reportClipEvent('browser_open', { url, startSec, endSec, title: title ?? null });

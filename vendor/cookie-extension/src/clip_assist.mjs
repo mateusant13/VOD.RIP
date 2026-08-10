@@ -39,6 +39,9 @@
 
   const startSec = Math.max(0, Math.floor(Number(params.get('vodrip_start')) || 0));
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
+  // VOD total length (the app sends vodrip_dur) — lets the editor-range
+  // helper nudge the window off the VOD's last frame instead of failing.
+  const durSec = Number(params.get('vodrip_dur')) || 0;
 
   // document_start on clips.twitch.tv may run before <html> exists.
   if (!document.documentElement) {
@@ -192,7 +195,7 @@
       return 'storage-unreadable';
     }
   };
-  const rangeViaMainWorld = (startSec, endSec) =>
+  const rangeViaMainWorld = (startSec, endSec, durSec) =>
     new Promise((resolve) => {
       const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
       const onMsg = (ev) => {
@@ -209,7 +212,7 @@
       }, 12000);
       window.addEventListener('message', onMsg);
       try {
-        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec }, '*');
+        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec, dur: durSec }, '*');
       } catch (err) {
         clearTimeout(timer);
         window.removeEventListener('message', onMsg);
@@ -265,7 +268,19 @@
    * aria-valuemax was still 95.3). Returns '' on confirmed success, else a
    * human-readable reason (the caller refuses to save on failure).
    */
-  const setEditorRange = async (scope, startSec, endSec) => {
+  const setEditorRange = async (scope, startSec, endSec, durSec) => {
+    const len = endSec - startSec;
+    // Twitch's own hard rule (the user's ground truth): the editor only
+    // accepts 5..60s windows, and its slider spans at most ~1:30 around the
+    // anchor. Refuse early instead of fighting the editor for a doomed range.
+    if (len < 5 || len > 60) {
+      note('ext_range_refused', { startSec, endSec, len });
+      setStatus(
+        `Trecho de ${Math.round(len)}s fora do limite da Twitch (5..60s) — ajuste o clipe no app e tente de novo.`,
+        'err',
+      );
+      return 'fora-do-limite';
+    }
     // The slider renders late (after the title input/dialog) — 45s budget.
     const slider = await waitFor(
       () => (scope || document).querySelector('[role="slider"]'),
@@ -276,24 +291,25 @@
     // The fiber drag must run in the page's MAIN world (the isolated world
     // cannot see the __reactFiber$ expando); the helper polls the
     // valuetext and reports what the editor ACTUALLY accepted.
-    const res = await rangeViaMainWorld(startSec, endSec);
+    const res = await rangeViaMainWorld(startSec, endSec, durSec);
     note('ext_range', {
       ok: !!res.ok,
       targetStart: startSec,
       targetEnd: endSec,
+      durSec,
       valuetext: res.ok ? (res.valuetext || null) : null,
       reason: res.ok ? null : (res.reason || null),
     });
     if (!res.ok) {
       const reason = res.reason || 'falha';
       setStatus(
-        `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${reason}) — nada será salvo. Ajuste manualmente e salve você mesmo.`,
+        `Clique de ${Math.round(len)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${reason}) — nada foi salvo. Ajuste o trecho no editor e salve você mesmo.`,
         'err',
       );
       return reason;
     }
     setStatus(
-      `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} confirmado no editor (${res.valuetext}).`,
+      `Clique de ${Math.round(len)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) confirmado no editor (${res.valuetext}).`,
       'ok',
     );
     return '';
@@ -418,7 +434,7 @@
           catch (err) { resolve('postMessage-threw:' + err); }
         });
         census.push('helper-echo: ' + echo);
-        const res = await rangeViaMainWorld(tStart, tEnd);
+        const res = await rangeViaMainWorld(tStart, tEnd, durSec);
         windowTest = res.ok
           ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)})`
           : `NOT CONFIRMED (${res.reason || '?'})`;
@@ -440,7 +456,7 @@
     });
     return;
   }
-  setStatus(`Preparando clip em ${fmtHms(startSec)}…`);
+  setStatus(`Preparando clique de ${Math.round(endSec - startSec)}s…`);
 
   // clips.twitch.tv/create — the legacy URL opens Twitch's clip editor
   // DIRECTLY (it reads vodID + offsetSeconds, which is the clip END) when
@@ -475,16 +491,16 @@
       setReactValue(editorInput, title);
       note('ext_title', { title, flow: 'create' });
       setStatus(`Título preenchido: ${title}`);
-      const rangeErr = await setEditorRange(document, startSec, endSec);
+      const rangeErr = await setEditorRange(document, startSec, endSec, durSec);
       if (rangeErr) {
         setStatus(
-          `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${rangeErr}) — nada foi salvo. Ajuste manualmente e salve você mesmo.`,
+          `Clique de ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${rangeErr}) — nada foi salvo. Ajuste o trecho no editor e salve você mesmo.`,
           'err',
         );
         closeAfterFlow(2000);
         return;
       }
-      setStatus(`Salvando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
+      setStatus(`Salvando clique de ${Math.round(endSec - startSec)}s…`);
       // Wait for the Save button to become enabled (the editor loads the
       // VOD frame preview first; clicking too early is a silent no-op).
       const save = await waitFor(
@@ -647,17 +663,17 @@
       setStatus(
         'Não consegui abrir o editor (faça login na Twitch nesta aba e tente de novo).\nTítulo: ' +
           (title || '(vazio)') +
-          `\nTrecho: ${fmtHms(startSec)} → ${fmtHms(endSec)}`,
+          `\nClique: ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)})`,
         'err',
       );
       closeAfterFlow(2000);
       return;
     }
     await sleep(1500); // let the editor settle
-    const rangeErr = await setEditorRange(editor, startSec, endSec);
+    const rangeErr = await setEditorRange(editor, startSec, endSec, durSec);
     if (rangeErr) {
       setStatus(
-        `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${rangeErr}) — nada foi publicado. Ajuste manualmente e publique você mesmo.`,
+        `Clique de ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${rangeErr}) — nada foi publicado. Ajuste o trecho no editor e publique você mesmo.`,
         'err',
       );
       closeAfterFlow(2000);

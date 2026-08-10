@@ -161,7 +161,7 @@ describe('openTwitchClipEditorInBrowser', () => {
       return null;
     });
     try {
-      openTwitchClipEditorInBrowser('2832716983', 'titiltei', 458, 520, 'Teste VOD.RIP');
+      openTwitchClipEditorInBrowser('2832716983', 'titiltei', 458, 520, 'Teste VOD.RIP', 3600);
       expect(opened).toHaveLength(1);
       const u = new URL(opened[0]);
       expect(u.host).toBe('clips.twitch.tv');
@@ -172,6 +172,7 @@ describe('openTwitchClipEditorInBrowser', () => {
       expect(u.searchParams.get('vodrip_clip')).toBe('1');
       expect(u.searchParams.get('vodrip_start')).toBe('458');
       expect(u.searchParams.get('vodrip_end')).toBe('520');
+      expect(u.searchParams.get('vodrip_dur')).toBe('3600'); // VOD length for the editor-edge nudge
       expect(u.searchParams.get('vodrip_title')).toBe('Teste VOD.RIP');
       // Browser path is the user's explicit choice — the Twitch tab stays
       // open after the flow (the extension's closeAfterFlow honors this).
@@ -191,6 +192,7 @@ describe('openTwitchClipEditorInBrowser', () => {
       openTwitchClipEditorInBrowser('2832716983', 'titiltei', 458, 520);
       const u = new URL(opened[0]);
       expect(u.searchParams.has('vodrip_title')).toBe(false);
+      expect(u.searchParams.has('vodrip_dur')).toBe(false);
       expect(u.searchParams.get('offsetSeconds')).toBe('520');
     } finally {
       vi.restoreAllMocks();

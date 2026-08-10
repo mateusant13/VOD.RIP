@@ -543,7 +543,7 @@ export default function TwitchClipPopup({
       durationSec: sel.end - sel.start,
       title: clipTitle.trim() || null,
     });
-    openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined);
+    openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined, vodDurationSec);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
   }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
 
