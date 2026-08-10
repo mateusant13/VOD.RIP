@@ -3,7 +3,6 @@ import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
   clampClipSelection,
-  clipEditorOffsetAndDuration,
   initialClipSelection,
   openTwitchClipEditorInBrowser,
   twitchClipDurationError,
@@ -151,20 +150,6 @@ describe('clampClipSelection', () => {
     // 30s window: max 30, not 60
     expect(clampClipSelection(0, 30, 0, 30)).toEqual({ start: 0, end: 30 });
     expect(clampClipSelection(-10, 50, 0, 30)).toEqual({ start: 0, end: 30 });
-  });
-});
-
-describe('clipEditorOffsetAndDuration', () => {
-  it('maps selection end → offset (END reference) and length → duration', () => {
-    expect(clipEditorOffsetAndDuration(100, 160)).toEqual({ offsetSec: 160, durationSec: 60 });
-  });
-
-  it('floors the offset and rounds the duration', () => {
-    expect(clipEditorOffsetAndDuration(99.4, 160.7)).toEqual({ offsetSec: 160, durationSec: 61 });
-  });
-
-  it('never produces a negative offset', () => {
-    expect(clipEditorOffsetAndDuration(0, 0)).toEqual({ offsetSec: 0, durationSec: 0 });
   });
 });
 

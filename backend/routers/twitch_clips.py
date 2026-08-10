@@ -48,9 +48,10 @@ HISTORY_CAP = 200
 HISTORY_FILE = "twitch_clips.json"
 
 # clips.twitch.tv/<slug> or twitch.tv/<channel>/clip/<slug> (both public
-# clip URL shapes; Twitch's own share links use the former).
+# clip URL shapes; Twitch's own share links use the former). Query strings
+# and fragments (e.g. ?t=... from share buttons) are stripped before matching.
 _CLIP_URL_RE = re.compile(
-    r"^https?://(?:clips\.twitch\.tv/|(?:www\.)?twitch\.tv/[A-Za-z0-9_]+/clip/)([A-Za-z0-9_-]+)/?$"
+    r"^https?://(?:clips\.twitch\.tv/|(?:www\.|m\.)?twitch\.tv/[A-Za-z0-9_]+/clip/)([A-Za-z0-9_-]+)/?$"
 )
 
 LIVE_CLIP_SCOPE = "clips:edit"
@@ -455,7 +456,11 @@ def get_clip_events(limit: int = 200) -> List[Dict[str, Any]]:
 @router.post("/api/twitch/clips/record")
 def record_twitch_clip(req: TwitchClipRecordRequest) -> Dict[str, Any]:
     """Record a browser-path clip into history (idempotent by clip slug)."""
-    m = _CLIP_URL_RE.match((req.url or "").strip())
+    raw = (req.url or "").strip()
+    # Strip ?query/#fragment — the extension may post the tab's full URL.
+    for sep in ("?", "#"):
+        raw = raw.split(sep, 1)[0]
+    m = _CLIP_URL_RE.match(raw)
     if not m:
         raise HTTPException(status_code=422, detail="invalid twitch clip url")
     slug = m.group(1)
@@ -465,9 +470,9 @@ def record_twitch_clip(req: TwitchClipRecordRequest) -> Dict[str, Any]:
     if req.offset_sec is not None and (not isinstance(req.offset_sec, int) or req.offset_sec < 0):
         raise HTTPException(status_code=422, detail="offset_sec must be a non-negative int")
     if req.duration_sec is not None and (
-        not isinstance(req.duration_sec, int) or not (1 <= req.duration_sec <= 86400)
+        not isinstance(req.duration_sec, int) or not (5 <= req.duration_sec <= 60)
     ):
-        raise HTTPException(status_code=422, detail="duration_sec out of range")
+        raise HTTPException(status_code=422, detail="duration_sec out of range (5..60)")
 
     entry = {
         "id": slug,

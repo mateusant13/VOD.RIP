@@ -209,6 +209,8 @@ const ptBR: Record<string, string> = {
   'Delete': 'Excluir',
   'Twitch Clips': 'Clipes Twitch',
   'Refresh Twitch clip history': 'Atualizar histórico de clipes Twitch',
+  'Download clip': 'Baixar clipe',
+  'Download': 'Baixar',
   'NO TWITCH CLIPS YET — use the CLIP button in a Twitch preview.':
     'AINDA NÃO HÁ CLIPES TWITCH — use o botão CLIP em uma pré-visualização do Twitch.',
   'Open Twitch clip editor': 'Abrir editor de clipe Twitch',
@@ -443,14 +445,9 @@ const ptBR: Record<string, string> = {
   'Clip start': 'Início do clipe',
   'Clip end': 'Fim do clipe',
   'window {start} – {end}': 'janela {start} – {end}',
-  'Create Twitch clip': 'Criar clipe do Twitch',
   'Create clip': 'Criar clipe',
-  'This token can\'t clip via Helix — using the browser editor instead':
-    'Este token não pode criar clipe via Helix — usando o editor do navegador',
   'Opened in your browser — the VOD.RIP extension fills the editor and publishes':
     'Aberto no navegador — a extensão VOD.RIP preenche o editor e publica',
-  'Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes':
-    'Abrir o editor de clipes do Twitch no seu navegador — a extensão VOD.RIP preenche o título e publica',
   'The {seconds}s window is too short to clip (min {min}s)': 'A janela de {seconds}s é curta demais para clipe (mínimo {min}s)',
   'Trim the selection to {max}s or less': 'Reduza a seleção para {max}s ou menos',
   'Select at least {min}s': 'Selecione ao menos {min}s',
@@ -752,6 +749,8 @@ const es: Record<string, string> = {
   'Delete': 'Eliminar',
   'Twitch Clips': 'Clips de Twitch',
   'Refresh Twitch clip history': 'Refrescar historial de clips de Twitch',
+  'Download clip': 'Descargar clip',
+  'Download': 'Descargar',
   'NO TWITCH CLIPS YET — use the CLIP button in a Twitch preview.': 'AÚN NO HAY CLIPS DE TWITCH — usa el botón CLIP en una vista previa de Twitch.',
   'Open Twitch clip editor': 'Abrir editor de clips de Twitch',
   'Editor': 'Editor',
@@ -969,14 +968,9 @@ const es: Record<string, string> = {
   'Clip start': 'Inicio del clip',
   'Clip end': 'Fin del clip',
   'window {start} – {end}': 'ventana {start} – {end}',
-  'Create Twitch clip': 'Crear clip de Twitch',
   'Create clip': 'Crear clip',
-  'This token can\'t clip via Helix — using the browser editor instead':
-    'Este token no puede crear clip vía Helix — usando el editor del navegador',
   'Opened in your browser — the VOD.RIP extension fills the editor and publishes':
     'Abierto en el navegador — la extensión VOD.RIP rellena el editor y publica',
-  'Open Twitch\'s clip editor in your browser — the VOD.RIP extension fills the title and publishes':
-    'Abrir el editor de clips de Twitch en tu navegador — la extensión VOD.RIP rellena el título y publica',
   'The {seconds}s window is too short to clip (min {min}s)': 'La ventana de {seconds}s es demasiado corta para recortar (mín. {min}s)',
   'Trim the selection to {max}s or less': 'Recorta la selección a {max}s o menos',
   'Select at least {min}s': 'Selecciona al menos {min}s',

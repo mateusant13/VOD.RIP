@@ -115,7 +115,13 @@
       const path = (() => {
         try { return new URL(clipUrl).pathname; } catch { return ''; }
       })();
-      const ch = params.get('broadcasterLogin') || path.split('/')[1] || undefined;
+      // Only a /<login>/clip/<slug> URL carries the channel; a /videos/N URL
+      // has none (split[1] would be 'videos'), so fall back to the param.
+      const ch = params.get('broadcasterLogin') || (() => {
+        const segs = path.split('/').filter(Boolean);
+        const clipIdx = segs.indexOf('clip');
+        return clipIdx > 0 ? segs[clipIdx - 1] : undefined;
+      })();
       const vodMatch = (location.pathname || '').match(/^\/videos\/(\d+)/);
       const start = Number(params.get('vodrip_start')) || 0;
       const end = Number(params.get('vodrip_end')) || 0;

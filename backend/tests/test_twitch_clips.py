@@ -589,4 +589,28 @@ async def test_clip_record_validates(_isolated_data_dir):
             json={"url": "https://clips.twitch.tv/SomeSlug123", "channel": "not a login!"},
         )
         assert bad_ch.status_code == 422
+        bad_dur = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SomeSlug123", "duration_sec": 120},
+        )
+        assert bad_dur.status_code == 422
         assert (await _history(client)) == []
+
+
+@pytest.mark.anyio
+async def test_clip_record_accepts_query_strings_and_mobile_host(_isolated_data_dir):
+    """Share links carry ?t=... and m.twitch.tv — both must record cleanly."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://clips.twitch.tv/SlugOne?t=10s&tab=clips"},
+        )
+        assert r.status_code == 200 and r.json()["id"] == "SlugOne"
+        r2 = await client.post(
+            "/api/twitch/clips/record",
+            json={"url": "https://m.twitch.tv/srdogg/clip/SlugTwo#clip"},
+        )
+        assert r2.status_code == 200 and r2.json()["id"] == "SlugTwo"
+        rows = await _history(client)
+        assert {row["id"] for row in rows} == {"SlugOne", "SlugTwo"}
+        assert rows[0]["url"] == "https://clips.twitch.tv/SlugTwo"

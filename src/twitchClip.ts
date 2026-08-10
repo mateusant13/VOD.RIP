@@ -132,21 +132,6 @@ export function clampClipSelection(
   return { start, end };
 }
 
-/**
- * Map a VOD-coordinate selection to the clip request: vod_offset is a clip-END
- * reference (the backend passes it straight to Helix as vod_offset), duration
- * is the selected clip length.
- */
-export function clipEditorOffsetAndDuration(
-  selectionStartSec: number,
-  selectionEndSec: number,
-): { offsetSec: number; durationSec: number } {
-  return {
-    offsetSec: Math.max(0, Math.floor(selectionEndSec)),
-    durationSec: Math.round(Math.max(0, selectionEndSec - selectionStartSec)),
-  };
-}
-
 /** Error message when the selected range can't become a Twitch clip, else null. */
 export function twitchClipDurationError(durationSec: number): string | null {
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
