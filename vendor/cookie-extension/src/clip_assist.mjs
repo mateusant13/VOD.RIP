@@ -25,7 +25,7 @@
   // clips.twitch.tv/create SPA-redirects (e.g. to /clips/500) and drops the
   // query — stash the params at document_start so the flow below can still
   // read them after the redirect.
-  if (location.hostname === 'clips.twitch.tv' && location.search.includes('vodrip_clip=1')) {
+  if (location.hostname === 'clips.twitch.tv' && /vodrip_(clip|diag)=1/.test(location.search)) {
     try {
       sessionStorage.setItem('vodrip_clip_params', location.search);
     } catch { /* storage blocked */ }
@@ -35,7 +35,7 @@
     ? (sessionStorage.getItem('vodrip_clip_params') || location.search)
     : location.search;
   const params = new URLSearchParams(rawSearch.replace(/^\?/, ''));
-  if (params.get('vodrip_clip') !== '1') return;
+  if (params.get('vodrip_diag') !== '1' && params.get('vodrip_clip') !== '1') return;
 
   const startSec = Math.max(0, Math.floor(Number(params.get('vodrip_start')) || 0));
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
@@ -74,17 +74,79 @@
 
   const fmtHms = (sec) => {
     const s = Math.max(0, Math.floor(sec));
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
+    const m = Math.floor(s / 60);
     const r = s % 60;
     const pad = (n) => String(n).padStart(2, '0');
-    return h ? `${h}h${pad(m)}m${pad(r)}s` : m ? `${m}m${pad(r)}s` : `${r}s`;
+    return `${m}:${pad(r)}`;
   };
-  // No user title -> a deterministic default so the clip still auto-publishes
-  // with zero interaction (the app's "Open in browser" button never requires
-  // a title).
-  const title = (params.get('vodrip_title') || '').trim() || `VOD.RIP ${fmtHms(startSec)}`;
+  // No user title -> the VOD/live title (twitch.tv/videos pages set
+  // document.title to "<stream title> - Twitch" server-side). NEVER a
+  // "VOD.RIP …" default — the user requires the live's title verbatim.
+  const title =
+    (params.get('vodrip_title') || '').trim() ||
+    (document.title || '').replace(/\s*-\s*Twitch\s*$/i, '').trim() ||
+    'Clip';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // User window rule: after the flow ends (success OR failure) the editor
+  // tab closes itself. The BACKGROUND holds the delay: content-script
+  // timers freeze in hidden/throttled tabs (Chrome Memory Saver), so the
+  // close message is sent immediately and the service worker waits.
+  // vodrip_close=0 keeps the tab open. Default: close.
+  const closeAfterFlow = (delayMs = 1200) => {
+    if ((params.get('vodrip_close') || '1') === '0') {
+      // Stay-open mode: still stop the preview video so the tab is idle
+      // (the looping editor preview was the GPU hog).
+      try { document.querySelector('video')?.pause(); } catch { /* ignore */ }
+      return;
+    }
+    try {
+      const p = chrome.runtime.sendMessage({ type: 'vodrip-close-tab', delayMs });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch {
+      try { window.close(); } catch { /* ignore */ }
+    }
+  };
+  // React-fiber access lives in the page's MAIN world: content scripts
+  // (isolated world) CANNOT see the __reactFiber$ expando React puts on DOM
+  // nodes, and inline script tags get blocked by the page CSP/Trusted Types
+  // (proven live 2026-08-09). The background injects the helper via
+  // chrome.scripting with world:'MAIN' — it drives the fiber drag + poll
+  // and posts the result back (vodrip-range-res).
+  const injectMainHelper = async () => {
+    if (window.__vodripMainInjected) return 'already';
+    window.__vodripMainInjected = true;
+    try { await chrome.runtime.sendMessage({ type: 'vodrip-inject-main' }).catch(() => {}); } catch { /* ignore */ }
+    try {
+      const m = await chrome.storage.local.get('vodrip_sw_inject_msg');
+      return m.vodrip_sw_inject_msg ? 'delivered' : 'not-delivered';
+    } catch {
+      return 'storage-unreadable';
+    }
+  };
+  const rangeViaMainWorld = (startSec, endSec) =>
+    new Promise((resolve) => {
+      const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      const onMsg = (ev) => {
+        const d = ev.data;
+        if (d && d.source === 'vodrip-range-res' && d.nonce === nonce) {
+          clearTimeout(timer);
+          window.removeEventListener('message', onMsg);
+          resolve(d);
+        }
+      };
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', onMsg);
+        resolve({ ok: false, reason: 'helper não respondeu (injeção MAIN falhou?)' });
+      }, 12000);
+      window.addEventListener('message', onMsg);
+      try {
+        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec }, '*');
+      } catch (err) {
+        clearTimeout(timer);
+        window.removeEventListener('message', onMsg);
+        resolve({ ok: false, reason: String(err) });
+      }
+    });
   async function waitFor(fn, timeoutMs, intervalMs = 500) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -113,6 +175,195 @@
     }
     return null;
   };
+
+  /** Parse an editor clock "3:20" (m:ss) or "1:02:05" (h:mm:ss) → seconds. */
+  const parseClock = (s) => {
+    const m = String(s || '').trim().match(/^(\d+):(\d{1,2})(?::(\d{1,2}))?$/);
+    if (!m) return null;
+    return +m[1] * 60 + +m[2] + (+m[3] || 0);
+  };
+
+  /**
+   * Drive the clip editor's REAL window control. The editor has NO start/end
+   * time inputs (proven on the live page 2026-08-09): the clip window is a
+   * draggable slider (`[role=slider]`, aria-valuetext "3:00 to 3:20") whose
+   * React internals expose onLeftDrag/onRightDrag callbacks that take
+   * {startOffset, endOffset} — the same contract a real handle drag fires.
+   * We invoke the callbacks, then poll the slider's valuetext to report what
+   * the editor ACTUALLY accepted (it clamps to the VOD + the site's
+   * 5..60s window length limits). No seek: the callbacks set the window
+   * offsets directly (the editor accepted a 500–520s window while its
+   * aria-valuemax was still 95.3). Returns '' on confirmed success, else a
+   * human-readable reason (the caller refuses to save on failure).
+   */
+  const setEditorRange = async (scope, startSec, endSec) => {
+    // The slider renders late (after the title input/dialog) — 45s budget.
+    const slider = await waitFor(
+      () => (scope || document).querySelector('[role="slider"]'),
+      45000,
+      700,
+    );
+    if (!slider) return 'controle do editor (slider) não encontrado';
+    // The fiber drag must run in the page's MAIN world (the isolated world
+    // cannot see the __reactFiber$ expando); the helper polls the
+    // valuetext and reports what the editor ACTUALLY accepted.
+    const res = await rangeViaMainWorld(startSec, endSec);
+    if (!res.ok) {
+      const reason = res.reason || 'falha';
+      setStatus(
+        `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${reason}) — nada será salvo. Ajuste manualmente e salve você mesmo.`,
+        'err',
+      );
+      return reason;
+    }
+    setStatus(
+      `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} confirmado no editor (${res.valuetext}).`,
+      'ok',
+    );
+    return '';
+  };
+
+  // vodrip_diag=1 — census the editor DOM for selector maintenance, then
+  // stop (never auto-publishes). Panel text is read back via UIA.
+  if (params.get('vodrip_diag') === '1') {
+    (async () => {
+      const injectResult = await injectMainHelper();
+      // Wait for the REAL window control: the editor renders [role=slider]
+      // well after the title input/dialog appear; probing early reports
+      // everything missing (seen live 2026-08-09).
+      await waitFor(
+        () => document.querySelector('[role="slider"]'),
+        45000,
+        1000,
+      );
+      const census = [];
+      census.push('inject-result: ' + injectResult);
+      const probe = (label, sel) => {
+        const el = document.querySelector(sel);
+        census.push(`${label}: ${el ? 'FOUND value=' + (el.value != null ? JSON.stringify(el.value) : '(no value)') : 'missing'}`);
+      };
+      probe('title-input', 'input[data-a-target="clip-editor-title-input"], input[data-a-target="tw-input"]');
+      const inputDump = [...document.querySelectorAll('input, textarea')]
+        .slice(0, 12)
+        .map((i) => {
+          const attrs = [];
+          ['id', 'name', 'aria-label', 'aria-labelledby', 'placeholder', 'data-a-target', 'class'].forEach((a) => {
+            const v = i.getAttribute(a);
+            if (v) attrs.push(a + '=' + JSON.stringify(v.slice(0, 40)));
+          });
+          return '<' + i.tagName.toLowerCase() + (i.type ? ' type=' + i.type : '') + (attrs.length ? ' ' + attrs.join(' ') : '') + '>';
+        });
+      census.push('inputs: ' + (inputDump.join(' | ') || '(none)'));
+      const targets = [...document.querySelectorAll('[data-a-target]')]
+        .map((el) => el.getAttribute('data-a-target'))
+        .filter((t) => t && /clip|editor|range|handle|start|end|time|title|slider/i.test(t))
+        .slice(0, 30);
+      census.push('targets: ' + (targets.join(' | ') || '(none)'));
+      const handles = [...document.querySelectorAll('[class*="handle" i], [class*="range" i], [class*="timeline" i], [class*="scrubber" i]')]
+        .slice(0, 12)
+        .map((el) => String(el.className).slice(0, 90));
+      census.push('handles: ' + (handles.join(' | ') || '(none)'));
+      const roles = [...document.querySelectorAll('[role]')]
+        .map((el) => el.getAttribute('role'))
+        .filter((r) => r && r !== 'dialog')
+        .slice(0, 12);
+      census.push('roles: ' + (roles.join(' | ') || '(none)'));
+      const rangeEl = document.querySelector('[class*="ScRange" i]');
+      census.push('range-el: ' + (rangeEl ? rangeEl.outerHTML.slice(0, 400) : '(none)'));
+      const rangeInput = document.querySelector('[class*="tw-range" i], input[type="range"]');
+      census.push('range-input: ' + (rangeInput ? rangeInput.outerHTML.slice(0, 300) : '(none)'));
+      const timeEl = [...document.querySelectorAll('*')].find(
+        (el) => /^\s*\d+:\d{2}\s*\/\s*\d+:\d{2}\s*$/.test((el.textContent || '')) && el.children.length <= 4,
+      );
+      census.push('time-el: ' + (timeEl ? timeEl.outerHTML.slice(0, 300) : '(none)'));
+      const timeParent = timeEl && timeEl.parentElement;
+      census.push('time-parent: ' + (timeParent ? timeParent.outerHTML.slice(0, 300) : '(none)'));
+      const timeGp = timeParent && timeParent.parentElement;
+      census.push('time-grandparent: ' + (timeGp ? timeGp.outerHTML.slice(0, 300) : '(none)'));
+      const styled = [...document.querySelectorAll('[style]')]
+        .filter((el) => /left|transform|width|margin/i.test(el.getAttribute('style') || ''))
+        .slice(0, 10)
+        .map((el) => String(el.className).slice(0, 70) + ' => ' + String(el.getAttribute('style')).slice(0, 70));
+      census.push('styled: ' + (styled.join(' | ') || '(none)'));
+      const btns = [...document.querySelectorAll('button')]
+        .slice(0, 25)
+        .map((b) => (b.getAttribute('aria-label') || b.innerText || '').trim().slice(0, 40))
+        .filter(Boolean);
+      census.push('buttons: ' + (btns.join(' | ') || '(none)'));
+      const slider = document.querySelector('[role="slider"]');
+      census.push(
+        'slider: ' +
+          (slider
+            ? 'FOUND valuetext=' + (slider.getAttribute('aria-valuetext') || '?') + ' now=' + (slider.getAttribute('aria-valuenow') || '?')
+            : 'missing'),
+      );
+      let hasDrag = false;
+      if (slider) {
+        const fiberKey2 = Object.keys(slider).find((k) => k.startsWith('__reactFiber'));
+        census.push('fiber-keys: ' + (fiberKey2 || '(none)'));
+        if (fiberKey2) {
+          let n = slider[fiberKey2];
+          const propKeys = new Set();
+          for (let i = 0; n && i < 40; i++) {
+            const p = n.memoizedProps || {};
+            Object.keys(p).forEach((k) => propKeys.add(k));
+            if (typeof p.onLeftDrag === 'function' && typeof p.onRightDrag === 'function') {
+              hasDrag = true;
+              break;
+            }
+            n = n.return;
+          }
+          census.push('fiber-props: ' + ([...propKeys].slice(0, 30).join(' | ') || '(none)'));
+        }
+      }
+      census.push('drag-handles: ' + (hasDrag ? 'OK (onLeftDrag/onRightDrag)' : 'missing'));
+      // Window test: prove the fiber drag + poll from the isolated world
+      // WITHOUT publishing (diag never saves). vodrip_start/vodrip_end are
+      // the target window in seconds.
+      const tStart = Number(params.get('vodrip_start') || '0');
+      const tEnd = Number(params.get('vodrip_end') || '0');
+      let windowTest = 'no range requested';
+      if (tEnd > tStart) {
+        // Probe the helper first (echo) — isolates injection failure from
+        // drag failure.
+        const echo = await new Promise((resolve) => {
+          const nonce = 'echo' + Math.random().toString(36).slice(2);
+          const timer = setTimeout(() => resolve('no-echo'), 3000);
+          const onMsg = (ev) => {
+            const d = ev.data;
+            if (d && d.source === 'vodrip-range-res' && d.nonce === nonce) {
+              clearTimeout(timer);
+              window.removeEventListener('message', onMsg);
+              resolve('alive:' + (d.ok ? 'ok' : d.reason));
+            }
+          };
+          window.addEventListener('message', onMsg);
+          try { window.postMessage({ source: 'vodrip-range-req', nonce, start: 0, end: 0 }, '*'); }
+          catch (err) { resolve('postMessage-threw:' + err); }
+        });
+        census.push('helper-echo: ' + echo);
+        const res = await rangeViaMainWorld(tStart, tEnd);
+        windowTest = res.ok
+          ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)})`
+          : `NOT CONFIRMED (${res.reason || '?'})`;
+      }
+      census.push('window-test: ' + windowTest);
+      const inputs = [...document.querySelectorAll('input')];
+      const withLabels = inputs
+        .map((i) => (i.getAttribute('aria-label') || '').trim())
+        .filter((l) => l);
+      census.push('aria-labels: ' + (withLabels.join(' | ') || '(none)'));
+      const values = inputs.map((i) => i.value || '').filter(Boolean);
+      census.push('input-values: ' + (values.join(' | ') || '(none)'));
+      census.push('doc-title: ' + document.title);
+      setStatus('DIAG CENSUS\n' + census.join('\n'), 'info');
+      // GPU: the looping editor preview is the hog — stop it right away.
+      try { document.querySelector('video')?.pause(); } catch { /* ignore */ }
+    })().catch((err) => {
+      setStatus('DIAG FAIL: ' + (err && err.message ? err.message : String(err)), 'err');
+    });
+    return;
+  }
   setStatus(`Preparando clip em ${fmtHms(startSec)}…`);
 
   // clips.twitch.tv/create — the legacy URL opens Twitch's clip editor
@@ -121,6 +372,7 @@
   // flow below is the player route (Clip button → editor overlay).
   if (location.hostname === 'clips.twitch.tv') {
     (async () => {
+      injectMainHelper();
       const editorInput = await waitFor(
         () =>
           find([
@@ -145,6 +397,15 @@
       }
       setReactValue(editorInput, title);
       setStatus(`Título preenchido: ${title}`);
+      const rangeErr = await setEditorRange(document, startSec, endSec);
+      if (rangeErr) {
+        setStatus(
+          `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${rangeErr}) — nada foi salvo. Ajuste manualmente e salve você mesmo.`,
+          'err',
+        );
+        closeAfterFlow(2000);
+        return;
+      }
       setStatus(`Salvando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
       // Wait for the Save button to become enabled (the editor loads the
       // VOD frame preview first; clicking too early is a silent no-op).
@@ -160,6 +421,7 @@
       );
       if (!save) {
         setStatus('Botão Save Clip não encontrado — clique você mesmo.', 'err');
+        closeAfterFlow();
         return;
       }
       await sleep(1200);
@@ -187,6 +449,7 @@
             : `Clip publicado ✓\n${title}`,
           'ok',
         );
+        closeAfterFlow(1500);
         return;
       }
       setStatus(
@@ -194,6 +457,7 @@
           (title ? `\n${title}` : '') + '\n(se não aparecer em instantes, confira se o clipe foi criado)',
         'err',
       );
+      closeAfterFlow(2000);
     })().catch((err) => {
       setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');
     });
@@ -201,6 +465,7 @@
   }
 
   (async () => {
+    injectMainHelper();
     // 1. Player — needs real duration before we can seek.
     const video = await waitFor(() => {
       const v = document.querySelector('video');
@@ -236,6 +501,7 @@
     );
     if (!clipBtn) {
       setStatus('Botão Clip não habilitou (anúncio em reprodução?) — tente de novo mais tarde.', 'err');
+      closeAfterFlow(2000);
       return;
     }
     try {
@@ -299,9 +565,19 @@
           `\nTrecho: ${fmtHms(startSec)} → ${fmtHms(endSec)}`,
         'err',
       );
+      closeAfterFlow(2000);
       return;
     }
     await sleep(1500); // let the editor settle
+    const rangeErr = await setEditorRange(editor, startSec, endSec);
+    if (rangeErr) {
+      setStatus(
+        `Trecho ${fmtHms(startSec)} → ${fmtHms(endSec)} NÃO confirmado no editor (${rangeErr}) — nada foi publicado. Ajuste manualmente e publique você mesmo.`,
+        'err',
+      );
+      closeAfterFlow(2000);
+      return;
+    }
 
     // 4. Title (always non-empty — the URL default covers missing vodrip_title).
     const input =
@@ -338,6 +614,7 @@
     );
     if (!publish) {
       setStatus('Botão Publish não encontrado — clique você mesmo.', 'err');
+      closeAfterFlow();
       return;
     }
     setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
@@ -367,11 +644,13 @@
           : `Clip publicado ✓\n${title}`,
         'ok',
       );
+      closeAfterFlow(1500);
     } else {
       setStatus(
         'Publish clicado — aguardando processamento…\n' + (title || ''),
         'err',
       );
+      closeAfterFlow(2000);
     }
   })().catch((err) => {
     setStatus('Falha inesperada: ' + (err && err.message ? err.message : String(err)), 'err');

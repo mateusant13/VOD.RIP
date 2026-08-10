@@ -7156,6 +7156,7 @@ export default function App() {
           vodId={twitchClipPopup.vodId}
           playheadSec={twitchClipPopup.playheadSec}
           vodDurationSec={twitchClipPopup.vodDurationSec}
+          vodTitle={videoInfo?.title ?? undefined}
           zIndex={EXPLORE_POPUP_Z + 200}
           initialVolume={previewVolumeRef.current}
           onClose={() => setTwitchClipPopup(null)}

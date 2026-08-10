@@ -67,6 +67,9 @@ interface TwitchClipPopupProps {
   playheadSec: number;
   /** VOD length; <=0/unknown → the upper window edge is unclamped. */
   vodDurationSec: number;
+  /** VOD/live title — the clip title defaults to it (the user requires the
+   * live's title verbatim, never a "VOD.RIP …" default). */
+  vodTitle?: string;
   zIndex: number;
   onClose: () => void;
   /** Called after the editor opened — parents reuse their clip notice. */
@@ -87,6 +90,7 @@ export default function TwitchClipPopup({
   vodId,
   playheadSec,
   vodDurationSec,
+  vodTitle,
   zIndex,
   onClose,
   onClipCreated,
@@ -123,8 +127,10 @@ export default function TwitchClipPopup({
   }, []);
   const selLen = Math.max(0, selection.end - selection.start);
   // User-chosen clip title — becomes the clip's Twitch title and the local
-  // filename when the clip is downloaded; empty -> Twitch auto-titles.
-  const [clipTitle, setClipTitle] = useState('');
+  // Defaults to the VOD/live title (user-mandated: the clip title is the
+  // live's title, never a "VOD.RIP …" placeholder). Empty only when the
+  // caller has no title either — then Twitch auto-titles.
+  const [clipTitle, setClipTitle] = useState(vodTitle ?? '');
 
   // Floating panel position (draggable via the header, like the other popups).
   const [position, setPosition] = useState(() => ({
@@ -449,52 +455,6 @@ export default function TwitchClipPopup({
     commitSelection(res);
   }, [win, commitSelection]);
 
-  // ── Final action: create the clip via Helix on the selected range (END ref) ──
-  const createClip = useCallback(async () => {
-    const sel = selectionRef.current;
-    const err = twitchClipDurationError(sel.end - sel.start);
-    if (err) {
-      showClipNotice('error', err);
-      return;
-    }
-    const { offsetSec, durationSec } = clipEditorOffsetAndDuration(sel.start, sel.end);
-    setClipOpening(true);
-    try {
-      const res = await openTwitchClipEditor({
-        broadcasterLogin,
-        vodId,
-        offsetSec,
-        durationSec,
-        title: clipTitle.trim(),
-      });
-      if (res.ok) {
-        onClipCreated(res.edit_url);
-        onClose();
-      } else {
-        showClipNotice('error', res.error.message, res.error.code);
-      }
-    } catch {
-      showClipNotice('error', t('Failed to open the Twitch clip editor'));
-    } finally {
-      setClipOpening(false);
-    }
-  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice]);
-
-  const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
-  const playFrac = secToFrac(currentTime, railView) * 100;
-  const selStartFrac = secToFrac(selection.start, railView) * 100;
-  const selEndFrac = secToFrac(selection.end, railView) * 100;
-
-  const createDisabled = clipOpening || windowTooShort
-    || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
-  const createDisabledTitle = windowTooShort
-    ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
-    : selLen > TWITCH_CLIP_MAX_SEC
-      ? t('Trim the selection to {max}s or less', { max: TWITCH_CLIP_MAX_SEC })
-      : selLen < TWITCH_CLIP_MIN_SEC
-        ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
-        : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
-
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
   // (clip_assist.mjs content script) instead of the Helix API — works with the
   // plain browser-login session cookie, no clip scopes needed. When the
@@ -550,6 +510,59 @@ export default function TwitchClipPopup({
     openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
   }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
+
+  // ── Final action: create the clip via Helix on the selected range (END ref) ──
+  const createClip = useCallback(async () => {
+    const sel = selectionRef.current;
+    const err = twitchClipDurationError(sel.end - sel.start);
+    if (err) {
+      showClipNotice('error', err);
+      return;
+    }
+    const { offsetSec, durationSec } = clipEditorOffsetAndDuration(sel.start, sel.end);
+    setClipOpening(true);
+    try {
+      const res = await openTwitchClipEditor({
+        broadcasterLogin,
+        vodId,
+        offsetSec,
+        durationSec,
+        title: clipTitle.trim(),
+      });
+      if (res.ok) {
+        onClipCreated(res.edit_url);
+        onClose();
+      } else if (res.error.code === 'missing_scope' || res.error.code === 'no_token') {
+        // The Helix token can't carry clip scopes (the auto-lifted browser
+        // login never does) — fall back to the browser editor + VOD.RIP
+        // extension, which publish with the session cookie and the exact
+        // selection + title. The clip still gets created, zero interaction.
+        showClipNotice('ok', t('This token can\'t clip via Helix — using the browser editor instead'));
+        void createInBrowser();
+      } else {
+        showClipNotice('error', res.error.message, res.error.code);
+      }
+    } catch {
+      showClipNotice('error', t('Failed to open the Twitch clip editor'));
+    } finally {
+      setClipOpening(false);
+    }
+  }, [broadcasterLogin, vodId, clipTitle, onClipCreated, onClose, showClipNotice, createInBrowser]);
+
+  const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
+  const playFrac = secToFrac(currentTime, railView) * 100;
+  const selStartFrac = secToFrac(selection.start, railView) * 100;
+  const selEndFrac = secToFrac(selection.end, railView) * 100;
+
+  const createDisabled = clipOpening || windowTooShort
+    || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
+  const createDisabledTitle = windowTooShort
+    ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
+    : selLen > TWITCH_CLIP_MAX_SEC
+      ? t('Trim the selection to {max}s or less', { max: TWITCH_CLIP_MAX_SEC })
+      : selLen < TWITCH_CLIP_MIN_SEC
+        ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
+        : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
 
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
