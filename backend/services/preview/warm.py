@@ -542,12 +542,17 @@ def invalidate_resolved_stream_cache(
     """Drop cached resolve for *url* — refresh must not recycle expired googlevideo URLs."""
     from services.youtube_innertube import extract_video_id
 
-    vid = extract_video_id((url or "").strip())
+    raw = (url or "").strip()
+    vid = extract_video_id(raw)
+    if not vid:
+        # Mirrors twitch_gql_service._extract_video_id (both VOD URL forms).
+        m = re.search(r"twitch\.tv/(?:[^/]+/)?videos/(\d+)", raw, re.I)
+        vid = m.group(1) if m else None
     if not vid:
         return
-    key = f"{vid}:{prefer_height}:v2"
     with _RESOLVED_STREAM_LOCK:
-        _RESOLVED_STREAM_CACHE.pop(key, None)
+        _RESOLVED_STREAM_CACHE.pop(f"{vid}:{prefer_height}:v2", None)
+        _RESOLVED_STREAM_CACHE.pop(f"twvod:{vid}:{prefer_height}", None)
 def _build_and_cache_youtube_snapshot(
     url: str,
     oauth: Optional[str],

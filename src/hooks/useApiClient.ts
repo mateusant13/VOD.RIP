@@ -9,7 +9,9 @@
 const API_BASE = '';
 const API_TIMEOUT_MS = 60_000;
 const API_RETRY_ATTEMPTS = 2;
-const API_RETRY_BACKOFF_MS = 900;
+// Short backoff: two retries sleep 0.4s + 0.8s (was 0.9s + 1.8s) — transient
+// failures no longer add ~2.4s of dead wait to a preview open.
+const API_RETRY_BACKOFF_MS = 400;
 
 const IS_DEV_UI = import.meta.env.DEV;
 const TIMEOUT_HINT = IS_DEV_UI

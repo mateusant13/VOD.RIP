@@ -1277,10 +1277,11 @@ export default function ChannelExplorePopup({
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 12,
-        // Play-first: start playback once ~6 s are buffered instead of waiting
-        // for 20 s. Window-HLS keeps a larger buffer because the chunk is muxed.
-        maxBufferLength: dashSegTimeline ? 60 : 6,
-        maxMaxBufferLength: dashSegTimeline ? 180 : 12,
+        // Play-first: start playback once ~3 s are buffered instead of waiting
+        // for 20 s (6 s delayed first frame on slow Twitch CDN fetches).
+        // Window-HLS keeps a larger buffer because the chunk is muxed.
+        maxBufferLength: dashSegTimeline ? 60 : 3,
+        maxMaxBufferLength: dashSegTimeline ? 180 : 6,
         startFragPrefetch: true,
         capLevelToPlayerSize: platform !== 'youtube',
         fragLoadingTimeOut: dashSegTimeline ? 90000 : 20000,

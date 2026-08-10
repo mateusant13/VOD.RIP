@@ -4033,13 +4033,25 @@ def resolve_stream_info(
 
     # Twitch VODs — fast GQL + Usher path; fall back to yt-dlp if auth/geo fails.
     if platform == "Twitch" and not is_clip_url(url):
-        try:
-            from services.twitch_gql_service import get_vod_playback_sync
+        from services.twitch_gql_service import (
+            TwitchVodUnavailable,
+            _extract_video_id,
+            get_vod_playback_sync,
+        )
 
+        # Cache the resolve like clips/YouTube do — every play used to re-run
+        # the serial GQL token -> Usher master chain (~1-11s) before any probe.
+        vid = _extract_video_id(url)
+        cache_key = f"twvod:{vid}:{prefer_height}" if vid else None
+        if cache_key and not force_fresh:
+            cached = _get_resolved_stream_cached(cache_key)
+            if cached is not None:
+                return cached
+        try:
             master_url, vod_headers, vod_variants = get_vod_playback_sync(url)
             with_height = [v for v in vod_variants if int(v.get("height") or 0) > 0]
             if master_url:
-                return (
+                result = (
                     master_url,
                     vod_headers,
                     platform,
@@ -4047,6 +4059,13 @@ def resolve_stream_info(
                     "hls",
                     None,
                 )
+                if cache_key and not force_fresh:
+                    _put_resolved_stream_cache(cache_key, result)
+                return result
+        except TwitchVodUnavailable:
+            # Sub-only/geo/removed — the old path fell into a 30-60s yt-dlp
+            # extract that reproduced the same failure. Surface it immediately.
+            raise
         except Exception as exc:
             logger.debug(
                 "Twitch VOD GQL resolve failed, falling back to yt-dlp: %s", exc
@@ -4133,6 +4152,13 @@ def _resolve_preview_entry(
         raise RuntimeError("Upstream returned an empty or invalid HLS playlist")
 
     text = data.decode("utf-8", errors="replace")
+    # Seed the rewritten master — the browser's first master.m3u8 request is
+    # served from this probe instead of re-fetching upstream through the proxy.
+    try:
+        rewritten = _rewrite_playlist(text, session, entry_url)
+        _playlist_cache(session)[entry_url] = (rewritten.encode("utf-8"), time.time())
+    except Exception:
+        pass
     if "#EXT-X-STREAM-INF" not in text:
         return entry_url
 
@@ -4285,6 +4311,22 @@ def _apply_growing_vod_duration(session: PreviewSession) -> None:
     text = data.decode("utf-8", errors="replace")
     total = _playlist_total_duration(text)
     session.growing_vod = "#EXT-X-ENDLIST" not in text
+    # Seed the proxy's rewritten-playlist cache from this probe — the browser's
+    # first media-playlist request then hits the cache instead of re-fetching
+    # the same upstream playlist through the proxy (the create-time probe was
+    # previously thrown away). Completed VODs get a 30s TTL so the seed survives
+    # until hls.js asks; growing VODs keep the short TTL so live knobs pick up
+    # newly published segments.
+    session.playlist_ttl_sec = 2.0 if session.growing_vod else 30.0
+    if text.lstrip().startswith("#EXTM3U"):
+        try:
+            rewritten = _rewrite_playlist(text, session, session.entry_url)
+            _playlist_cache(session)[session.entry_url] = (
+                rewritten.encode("utf-8"),
+                time.time(),
+            )
+        except Exception:
+            pass
     if total <= 0:
         return
     session.vod_duration = total
