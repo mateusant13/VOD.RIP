@@ -532,9 +532,13 @@ export default function TwitchClipPopup({
       if (res.ok) {
         onClipCreated(res.edit_url);
         onClose();
-      } else if (res.error.code === 'missing_scope' || res.error.code === 'no_token') {
-        // The Helix token can't carry clip scopes (the auto-lifted browser
-        // login never does) — fall back to the browser editor + VOD.RIP
+      } else if (
+        res.error.code === 'missing_scope'
+        || res.error.code === 'no_token'
+        || res.error.code === 'unauthorized'
+      ) {
+        // The Helix token can't clip via Helix (missing, scope-less, or
+        // invalid/expired) — fall back to the browser editor + VOD.RIP
         // extension, which publish with the session cookie and the exact
         // selection + title. The clip still gets created, zero interaction.
         showClipNotice('ok', t('This token can\'t clip via Helix — using the browser editor instead'));
