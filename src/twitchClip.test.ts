@@ -31,39 +31,39 @@ describe('twitchClipDurationError', () => {
 });
 
 describe('twitchClipWindow', () => {
-  it('centres a ±60s window on the playhead', () => {
-    expect(twitchClipWindow(3600, 7200)).toEqual({ start: 3540, end: 3660 });
+  it('centres a 95s (1:35) window on the playhead', () => {
+    expect(twitchClipWindow(3600, 7200)).toEqual({ start: 3553, end: 3648 });
   });
 
   it('clamps the start at the VOD start edge', () => {
-    expect(twitchClipWindow(10, 7200)).toEqual({ start: 0, end: 70 });
+    expect(twitchClipWindow(10, 7200)).toEqual({ start: 0, end: 95 });
   });
 
   it('clamps the end at the VOD end edge', () => {
-    expect(twitchClipWindow(7190, 7200)).toEqual({ start: 7130, end: 7200 });
+    expect(twitchClipWindow(7190, 7200)).toEqual({ start: 7143, end: 7200 });
   });
 
-  it('shortens the window for VODs under 120s', () => {
-    expect(twitchClipWindow(30, 100)).toEqual({ start: 0, end: 90 });
-    expect(twitchClipWindow(50, 60)).toEqual({ start: 0, end: 60 });
+  it('shortens the window for VODs under 95s', () => {
+    expect(twitchClipWindow(30, 100)).toEqual({ start: 0, end: 95 });
+    expect(twitchClipWindow(50, 60)).toEqual({ start: 3, end: 60 });
   });
 
   it('keeps the upper edge unclamped when the duration is unknown', () => {
-    expect(twitchClipWindow(100, 0)).toEqual({ start: 40, end: 160 });
+    expect(twitchClipWindow(100, 0)).toEqual({ start: 53, end: 148 });
   });
 
   it('centres on the anchor midpoint when a valid anchor is given', () => {
-    // anchor 300..360 → midpoint 330 → ±60 window 270..390
-    expect(twitchClipWindow(0, 7200, { start: 300, end: 360 })).toEqual({ start: 270, end: 390 });
+    // anchor 300..360 → midpoint 330 → 95s window 283..378
+    expect(twitchClipWindow(0, 7200, { start: 300, end: 360 })).toEqual({ start: 283, end: 378 });
   });
 
   it('ignores an invalid anchor and centres on the playhead', () => {
-    expect(twitchClipWindow(3600, 7200, { start: 5000, end: 4000 })).toEqual({ start: 3540, end: 3660 });
-    expect(twitchClipWindow(3600, 7200, { start: 0, end: 0 })).toEqual({ start: 3540, end: 3660 });
+    expect(twitchClipWindow(3600, 7200, { start: 5000, end: 4000 })).toEqual({ start: 3553, end: 3648 });
+    expect(twitchClipWindow(3600, 7200, { start: 0, end: 0 })).toEqual({ start: 3553, end: 3648 });
   });
 
   it('clamps an anchored window at the VOD start edge', () => {
-    expect(twitchClipWindow(3600, 7200, { start: 10, end: 50 })).toEqual({ start: 0, end: 90 });
+    expect(twitchClipWindow(3600, 7200, { start: 10, end: 50 })).toEqual({ start: 0, end: 95 });
   });
 });
 
