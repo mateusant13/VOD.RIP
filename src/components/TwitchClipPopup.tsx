@@ -23,7 +23,7 @@
  */
 
 import {
-  useCallback, useEffect, useMemo, useRef, useState,
+  useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
@@ -52,7 +52,9 @@ import {
   resolvePreviewPlayback,
 } from '../previewPlayerUtils';
 import { fracToSec, secToFrac, trimButtonDeltaForEndpoint } from '../trimUtils';
-import { PREVIEW_DEFAULT_VOLUME } from '../layoutUtils';
+import { PREVIEW_DEFAULT_VOLUME, panelPosAfterResize, startPanelResizeDrag } from '../layoutUtils';
+import { PanelResizeHandles, type ResizeEdge } from '../explorePopupUtils';
+import type { PanelSize } from '../types';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { formatHmsFull } from '../utils';
 import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
@@ -60,6 +62,25 @@ import EditableHmsTime from './EditableHmsTime';
 import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
+
+/**
+ * Min panel size — the CSS contract that guarantees every button row is 100%
+ * visible. Width: the widest row is the Clip trim row — w-9 label (36) +
+ * gap (8) + 4 compact duration buttons (~100) + gap (8) + w-11 length
+ * readout (44) + a usable rail (~100) + px-2 padding (16) = 312 → 320.
+ * Height: header (~40) + video at min width (320 * 9/16 = 180) + trim
+ * section (~129) = 349 → 360. Enforced BOTH as CSS min-width/min-height on
+ * the panel AND as the resize-time clamp (clampSize), so the panel can never
+ * render smaller than its buttons need — during a drag, after a drag, or on
+ * mount. Min wins even on a degenerate viewport smaller than the panel
+ * (mirrors clampExplorePanelBox: the panel may overflow a tiny viewport
+ * rather than become unusable).
+ */
+const CLIP_PANEL_MIN_W = 320;
+const CLIP_PANEL_MIN_H = 360;
+export { CLIP_PANEL_MIN_W, CLIP_PANEL_MIN_H };
+/** Keep at least this much of the panel on screen while resizing. */
+const RESIZE_MARGIN = 32;
 
 /**
  * Reusable clip-preview sessions keyed by VOD URL. Closing the popup used to
@@ -164,6 +185,13 @@ export default function TwitchClipPopup({
     y: 80,
   }));
   const posRef = useRef(position);
+  // Panel size — explicit width/height so the panel is resizable in ALL
+  // directions (same [data-panel-resize] machinery as the live player popup).
+  // h starts 0 = auto height; the mount effect adopts the natural height so a
+  // resize drag never starts from an unmeasured box.
+  const [size, setSize] = useState<PanelSize>(() => ({ w: POPUP_W, h: 0 }));
+  const sizeRef = useRef(size);
+  useEffect(() => { sizeRef.current = size; }, [size]);
   const [drag, setDrag] = useState<{
     startX: number; startY: number; offsetX: number; offsetY: number;
   } | null>(null);
@@ -684,6 +712,50 @@ export default function TwitchClipPopup({
     posRef.current = position;
   }, [position]);
 
+  // Adopt the natural content height once — the panel opens auto-height at
+  // its natural size (the exact pre-resize look), then becomes explicitly
+  // sized so drag/resize can reason in pixels. Also clamps the initial
+  // position so the bottom buttons are never below the fold on a short
+  // window (the reported cut-off bug).
+  useLayoutEffect(() => {
+    const el = popupRef.current;
+    if (!el || sizeRef.current.h > 0) return;
+    const h = el.offsetHeight;
+    if (h <= 0) return;
+    sizeRef.current = { w: POPUP_W, h };
+    setSize(sizeRef.current);
+    const margin = 8;
+    const start = posRef.current;
+    const p = {
+      x: Math.max(margin, Math.min(start.x, window.innerWidth - POPUP_W - margin)),
+      y: Math.max(margin, Math.min(start.y, window.innerHeight - h - margin)),
+    };
+    posRef.current = p;
+    setPosition(p);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only
+  }, []);
+
+  // Window resize while the popup is open: keep the whole panel inside the
+  // viewport so a shrink never strands the bottom buttons below the fold.
+  useEffect(() => {
+    const fit = () => {
+      const el = popupRef.current;
+      if (!el) return;
+      const s = sizeRef.current;
+      const w = s.w || el.offsetWidth || POPUP_W;
+      const h = s.h || el.offsetHeight || CLIP_PANEL_MIN_H;
+      const margin = 8;
+      const p = {
+        x: Math.max(margin, Math.min(posRef.current.x, window.innerWidth - w - margin)),
+        y: Math.max(margin, Math.min(posRef.current.y, window.innerHeight - h - margin)),
+      };
+      posRef.current = p;
+      setPosition(p);
+    };
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, []);
+
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
     if (t.closest('.twitch-clip-popup-close')) return;
@@ -693,9 +765,14 @@ export default function TwitchClipPopup({
   useEffect(() => {
     if (!drag) return;
     const onMove = (e: MouseEvent) => {
+      // Clamp against the panel's LIVE size (not a fixed constant) so the
+      // panel can never be dragged with its bottom buttons below the fold.
+      const s = sizeRef.current;
+      const w = s.w || POPUP_W;
+      const h = s.h || window.innerHeight;
       setPosition({
-        x: Math.max(0, Math.min(window.innerWidth - POPUP_W, drag.offsetX + e.clientX - drag.startX)),
-        y: Math.max(0, Math.min(window.innerHeight - 320, drag.offsetY + e.clientY - drag.startY)),
+        x: Math.max(0, Math.min(window.innerWidth - w, drag.offsetX + e.clientX - drag.startX)),
+        y: Math.max(0, Math.min(window.innerHeight - h, drag.offsetY + e.clientY - drag.startY)),
       });
     };
     const onUp = () => setDrag(null);
@@ -707,6 +784,40 @@ export default function TwitchClipPopup({
     };
   }, [drag]);
 
+  // ── Resize (same [data-panel-resize] pattern as the live player popup) ──
+  // 8-directional: west/north edges move the panel so the opposite edge stays
+  // put (panelPosAfterResize keeps the panel inside the viewport). The min
+  // contract is clamped at RESIZE time (clampSize) — min wins even on a
+  // degenerate viewport smaller than the panel.
+  const handleResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    const el = popupRef.current;
+    if (!el) return;
+    if (sizeRef.current.h <= 0) {
+      // The mount measure hasn't run (or measured 0): seed from the DOM so a
+      // drag never starts from an unmeasured box.
+      sizeRef.current = { w: POPUP_W, h: el.offsetHeight || CLIP_PANEL_MIN_H };
+    }
+    const startSize = { ...sizeRef.current };
+    const startPos = posRef.current;
+    const viewport = { w: window.innerWidth, h: window.innerHeight };
+    const applyPos = (next: PanelSize) => {
+      const p = panelPosAfterResize(edge, startPos, startSize, next, viewport);
+      posRef.current = p;
+      setPosition(p);
+    };
+    startPanelResizeDrag(e, edge, sizeRef, setSize, {
+      panelEl: el,
+      maxW: viewport.w - RESIZE_MARGIN,
+      maxH: viewport.h - RESIZE_MARGIN,
+      clampSize: (s) => ({
+        w: Math.max(CLIP_PANEL_MIN_W, Math.min(s.w, viewport.w - RESIZE_MARGIN)),
+        h: Math.max(CLIP_PANEL_MIN_H, Math.min(s.h, viewport.h - RESIZE_MARGIN)),
+      }),
+      onResizeMove: (next) => applyPos(next),
+      onResizeEnd: () => applyPos(sizeRef.current),
+    });
+  }, []);
+
   return createPortal(
     <div
       ref={popupRef}
@@ -716,11 +827,18 @@ export default function TwitchClipPopup({
         position: 'fixed',
         left: position.x,
         top: position.y,
-        width: POPUP_W,
+        width: size.w,
+        height: size.h > 0 ? size.h : 'auto',
+        // Min-size contract: the panel can never render smaller than its
+        // button rows need — also enforced at resize time by clampSize.
+        minWidth: CLIP_PANEL_MIN_W,
+        minHeight: CLIP_PANEL_MIN_H,
         zIndex,
         boxShadow: '6px 6px 0px 0px rgba(9,9,11,0.9)',
       }}
     >
+      <PanelResizeHandles onPointerDown={handleResize} />
+
       {/* Header — drag handle + close */}
       <div
         onMouseDown={handleHeaderMouseDown}
@@ -748,8 +866,12 @@ export default function TwitchClipPopup({
         </button>
       </div>
 
-      {/* Video — click toggles play/pause */}
-      <div className="relative bg-black shrink-0" style={{ aspectRatio: '16/9' }}>
+      {/* Video — click toggles play/pause. flex-1 + min-h-0: the video area
+          absorbs ALL vertical slack (grows when the panel is resized taller,
+          letterboxed via objectFit:contain; shrinks when shorter) so the trim
+          section below — every button row — never gets squished or clipped at
+          any panel size at or above the min contract. */}
+      <div className="relative bg-black flex-1 min-h-0" style={{ aspectRatio: '16/9' }}>
         <div
           className="absolute inset-0 z-0 cursor-pointer"
           onClick={() => { if (!loading && !error) togglePlay(); }}
@@ -819,7 +941,7 @@ export default function TwitchClipPopup({
       </div>
 
       {/* Trim rail: 5..60s selection on the 95s (1:35) window timeline */}
-      <div className="px-2 py-1.5 flex flex-col gap-1">
+      <div className="px-2 py-1.5 flex flex-col gap-1 shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600">
             {t('Range')}
