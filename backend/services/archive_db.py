@@ -2402,6 +2402,24 @@ _PHRASE_BOOST = 1.5      # exact-phrase matches get +50% before the cross-table 
 # multi-word AND semantics: a row that contains every word the user typed is
 # a real match; a row with only one word is partial.
 _AND_BOOST = 1.25
+# Cross-segment phrase span pass: capped at 8 query tokens. The split loop
+# is O(tokens^2) per adjacent segment pair and the LIKE prefilter carries
+# one clause per long-token variant, so a long sentence would hang the
+# search for nothing — a >8-token "phrase" is not something a user searches
+# for, and FTS5 phrases within one segment already cover those cases.
+_SPAN_MAX_TOKENS = 8
+# Expansion work bound: _expand_query flattens every query token's fuzzy
+# candidates. Beyond ~64 tokens the tier pattern would be capped out anyway
+# (_MAX_EXPANDED_TERMS), so stop scanning the vocab for the rest — the
+# exact-token fallback still covers them, and the work is bounded.
+_QUERY_TOKENS_EXPAND_CAP = 64
+# Title pass token cap: _titles_search iterates every query token against
+# every video's title tokens, so an unbounded query is O(q_tokens × videos ×
+# title_tokens) — a 2000-token query took ~4 minutes on the real archive.
+# Realistic title queries are 1-4 words; the score denominator stays the
+# FULL token count, so a title matching only the first few of a huge query
+# keeps ranking as noise.
+_TITLES_MAX_TOKENS = 16
 
 
 def search(
@@ -2478,9 +2496,25 @@ def search(
     word can no longer flood the literal-results page; partials carrying
     the rare token ('estranheza') survive as closest matches. Single-token
     queries skip the floor — their phrase pass marks every exact row
-    non-partial, preserving the "every mention" literal mode."""
+    non-partial, preserving the "every mention" literal mode.
+
+    Robustness: the query is sanitized (control chars -> spaces) so NUL can
+    never corrupt a MATCH string; every quoted pattern escapes embedded
+    quotes and every MATCH pass degrades to the remaining passes instead of
+    raising (a query like 'a"b' used to 500). Partial words of >= 4 chars
+    ABSENT from the corpus get native FTS5 prefix reach ("estranh" finds
+    estranheza rows in chat/transcript content, not just titles); present
+    tokens never prefix-flood tier 0 (the 'vale' -> valendo/valeu regression
+    guard). The cross-segment span pass is capped at _SPAN_MAX_TOKENS and
+    expands variants with ONE vocab/bigram load, so long queries return
+    promptly instead of hanging the request path."""
     if not q.strip() and not (username or "").strip():
         return []
+    # Control characters (NUL and friends) can never appear in indexed
+    # tokens but corrupt FTS5 MATCH strings — sqlite truncates the query at
+    # the NUL, leaving an unterminated quote that raises OperationalError
+    # (a 500). Replace them with spaces; tabs/newlines stay separators.
+    q = "".join(c if ord(c) >= 32 or c in "\t\n\r" else " " for c in q)
     raw_q = q.strip()
     kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
     platforms = (
@@ -2521,13 +2555,6 @@ def search(
         loops.append(("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"))
     if "chat" in wanted:
         loops.append(("message", "messages_fts", "messages", "t.offset_sec", "NULL"))
-    pattern = _fuzzy_pattern(q, [t[2] for t in loops])
-    if pattern is None:
-        pattern = {0: " OR ".join(f'"{w}"' for w in q.split() if w) or q}
-    phrase_pattern = None
-    if raw_q:
-        # "raw query" quoted as one FTS5 phrase; embedded quotes are escaped.
-        phrase_pattern = '"' + raw_q.replace('"', '""') + '"'
     # All-tokens AND pattern: FTS5's implicit multi-word semantics. Quoted
     # tokens joined with AND match rows containing EVERY query word (any
     # order/position). 1-2 char tokens ("da") are OR-noise and phrase-only
@@ -2553,22 +2580,45 @@ def search(
         {t for t, n in q_present.items() if n == min(q_present.values())}
         if q_present and len(q_tokens) >= 2 else set()
     )
-    and_pattern = " AND ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in q_tokens) if len(q_tokens) >= 2 else None
+    # Tiered OR pattern (exact/fuzzy expansions + native prefix reach for
+    # partial words) — see _fuzzy_pattern. The fallback quotes every raw
+    # token (embedded quotes escaped) so a query like 'a"b' can never build
+    # a malformed MATCH string.
+    pattern = _fuzzy_pattern(q, [t[2] for t in loops], q_freq=q_freq)
+    if pattern is None:
+        pattern = {0: " OR ".join(_fts_phrase(w) for w in q.split() if w) or _fts_phrase(q)}
+    phrase_pattern = _fts_phrase(raw_q) if raw_q else None
+    and_pattern = " AND ".join(_fts_phrase(t) for t in q_tokens) if len(q_tokens) >= 2 else None
     # Cross-segment phrase matching: multi-word queries whose tokens are
     # split across two ADJACENT transcript segments ("…vale" | "da
     # estranheza…"). FTS5 phrases cannot span rows, so the span pass scans
-    # the transcript table directly (see _phrase_span_rows).
+    # the transcript table directly (see _phrase_span_rows). Capped at
+    # _SPAN_MAX_TOKENS — the split loop is O(tokens^2) per adjacent pair,
+    # so an unbounded sentence would hang the search (and a >8-token
+    # "phrase" never meaningfully spans two segments).
     span_tokens = q_tokens_all
-    # The span pass's LIKE prefilter (see _phrase_span_rows) gates on the
-    # literal long tokens, so a segment holding a dist-1 ASR variant
-    # ("da estranhesa") would be filtered out before the _tok_eq span
-    # match could see it. Expand each long token once (cached) and pass
-    # the variant map down so the prefilter admits ASR variants too.
-    span_variants = {
-        t: [term for term, _ in _expand_query(t, [t2[2] for t2 in loops])]
-        for t in span_tokens
-        if len(t) >= 4
-    }
+    span_variants: dict[str, list[str]] = {}
+    if len(span_tokens) >= 2 and len(span_tokens) <= _SPAN_MAX_TOKENS:
+        # The span pass's LIKE prefilter (see _phrase_span_rows) gates on
+        # the literal long tokens, so a segment holding a dist-1 ASR
+        # variant ("da estranhesa") would be filtered out before the
+        # _tok_eq span match could see it. Expand each long token once and
+        # pass the variant map down so the prefilter admits ASR variants
+        # too. ONE vocab/bigram load for the whole query: the previous
+        # per-token _expand_query calls re-paid the bigram row-count
+        # re-checks (2 COUNT(*) on million-row tables) for every token —
+        # an N-token query cost N × ~1s on the real archive.
+        span_tables = [t2[2] for t2 in loops]
+        span_vocabs = [v for v in (_load_vocab(t) for t in span_tables) if v is not None]
+        span_bigrams = _load_bigrams(span_tables)
+        span_variants = {
+            t: [t] + [
+                term for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq)
+                if term != t
+            ]
+            for t in span_tokens
+            if len(t) >= 4
+        }
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -2583,7 +2633,14 @@ def search(
         # prefer the intended matches over rare expansion noise.
         by_row: dict[int, dict] = {}
         for dist, tier_pat in pattern.items():
-            for r in _table_search(tier_pat, fetch, **base):
+            try:
+                tier_rows = _table_search(tier_pat, fetch, **base)
+            except sqlite3.Error:
+                # Pattern not parseable even quoted (defense in depth — the
+                # builders escape quotes, but a pathological token can slip
+                # through); skip the tier instead of failing the search.
+                tier_rows = []
+            for r in tier_rows:
                 r["_tier"] = dist
                 by_row.setdefault(r["_rowid"], r)
         rows = list(by_row.values())
@@ -2805,7 +2862,7 @@ def _titles_search(
     # 1-2 char tokens are substring noise in titles ("da" ⊂ "day", "mudam").
     # The content passes keep them for phrase adjacency; here they only
     # match half the catalog. An all-short query simply skips the pass.
-    q_tokens = [t for t in q_tokens if len(t) >= 3]
+    q_tokens = [t for t in q_tokens if len(t) >= 3][:_TITLES_MAX_TOKENS]
     if not q_tokens:
         return []
     freq = q_freq or {}
@@ -3288,7 +3345,11 @@ def _phrase_span_rows(
     normalize like within-row phrase hits. ponytail: O(archive rows that
     contain a long query token) per phrase search — the prefilter keeps it
     fast for typical phrases; a trigram index would make it O(log n)."""
-    if len(q_tokens) < 2:
+    if len(q_tokens) < 2 or len(q_tokens) > _SPAN_MAX_TOKENS:
+        # Over the cap the split loop below is O(tokens^2) per adjacent
+        # pair and the LIKE prefilter carries one clause per variant — a
+        # long sentence would hang the request. search() caps the span
+        # query before calling; this guard defends direct callers.
         return []
     long_toks = [t for t in q_tokens if len(t) >= 4]
     if span_variants:
@@ -4636,14 +4697,14 @@ def _expand_query(q: str, tables: list[str]) -> list[tuple[str, int]]:
         for bucket in vocab.values():
             for term, freq in bucket:
                 merged_freq[term] = merged_freq.get(term, 0) + freq
-    for w in q.split():
+    for w in q.split()[:_QUERY_TOKENS_EXPAND_CAP]:
         if not w:
             continue
         for t, d in _token_expansions(w, vocabs, bigrams, merged_freq):
             if d < terms.get(t, 99):
                 terms[t] = d
     if bigrams:
-        q_toks = [w for w in q.split() if w]
+        q_toks = [w for w in q.split() if w][:_QUERY_TOKENS_EXPAND_CAP]
         for a, b in zip(q_toks, q_toks[1:]):
             fk = _phonetic_fold(a) + _phonetic_fold(b)
             for pair, _freq in bigrams.get(fk, ()):
@@ -4652,7 +4713,17 @@ def _expand_query(q: str, tables: list[str]) -> list[tuple[str, int]]:
     return sorted(terms.items(), key=lambda kv: (kv[1], kv[0]))
 
 
-def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[dict[int, str]]:
+def _fts_phrase(token: str) -> str:
+    """Quote a term as an FTS5 phrase, escaping embedded quotes ('a"b' ->
+    '"a""b"'). Every MATCH pattern in the pipeline goes through this — a raw
+    quote in a pattern is a syntax error that used to raise OperationalError
+    out of search() (a 500)."""
+    return '"' + str(token).replace('"', '""') + '"'
+
+
+def _fuzzy_pattern(
+    q: str, tables: list[str], q_freq: Optional[dict[str, int]] = None
+) -> Optional[dict[int, str]]:
     """Distance-tiered quoted-phrase MATCH patterns, {dist: OR-pattern}.
 
     Tier 0 holds the user's own tokens plus fold-equal matches
@@ -4660,6 +4731,17 @@ def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[dict[int, str]]:
     Callers run one MATCH pass per tier and merge — BM25's IDF inflates
     low-frequency terms, so a single OR pattern ranks rare noise above the
     intended matches; tiering keeps distance-0 rows ahead of everything.
+
+    Partial-word prefix reach: a user token ABSENT from the merged corpus
+    (freq 0) is a partial word or mishearing, so it additionally emits a
+    native FTS5 prefix term ('"estranh"*') at tier 0 — the vocab-based
+    Damerau bridge stops at 1-2 edits, leaving >= 7-char partial words
+    unreachable in chat/transcript content (titles had their own substring
+    pass). A PRESENT rare token (freq <= _PREFIX_GATE_FREQ) is a complete
+    word: its prefix forms sit at tier 1 so they never tie with the exact
+    token ('vale' must not pull valendo/valeu into tier 0). Tokens above
+    the gate (chat-spam common) emit nothing.
+
     Returns None to fall back to the exact token pattern: no expandable
     token, vocab unavailable, or the expansion exceeding the term cap."""
     if not any(len(w) >= 3 for w in q.split()):
@@ -4678,8 +4760,26 @@ def _fuzzy_pattern(q: str, tables: list[str]) -> Optional[dict[int, str]]:
             terms = long_terms
         tiers: dict[int, list[str]] = {}
         for t, d in terms:
-            tiers.setdefault(d, []).append(t)
-        return {d: " OR ".join(f'"{t}"' for t in ts) for d, ts in sorted(tiers.items())}
+            tiers.setdefault(d, []).append(_fts_phrase(t))
+        if q_freq is None:
+            q_freq = {}
+            for vocab in (_load_vocab(t) for t in tables):
+                if not vocab:
+                    continue
+                for bucket in vocab.values():
+                    for term, n in bucket:
+                        q_freq[term] = q_freq.get(term, 0) + n
+        for w in q.split():
+            toks = re.findall(r"[^\W_]+", w.casefold())
+            if len(toks) == 1 and 4 <= len(toks[0]) <= 40:
+                freq = q_freq.get(toks[0], 0)
+                if freq > _PREFIX_GATE_FREQ:
+                    continue
+                pref = _fts_phrase(w) + "*"
+                tier = 0 if freq == 0 else 1
+                if pref not in tiers.setdefault(tier, []):
+                    tiers[tier].append(pref)
+        return {d: " OR ".join(ts) for d, ts in sorted(tiers.items())}
     except sqlite3.Error:
         logger.warning("fuzzy expansion failed — falling back to exact pattern")
         return None

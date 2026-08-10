@@ -651,6 +651,12 @@ async def archive_search(
         username = ""
     if not q.strip() and not username:
         raise HTTPException(status_code=400, detail="q or username required")
+    if len(q) > 500:
+        # Bound the fuzzy-expansion work: the FE never sends queries this
+        # long, and an unbounded q (pasted novels, fuzzers) multiplies the
+        # per-token vocab scans, the FTS5 phrase/AND MATCH sizes, and the
+        # title pass (O(q_tokens × videos × title_tokens)).
+        raise HTTPException(status_code=400, detail="q too long (max 500 characters)")
     # channel_hint: search() understands a leading channel-slug token (see
     # archive_db.search) and reports the matched slug through the out-param.
     # hint=False (UI dismissed the chip) disables the whole implicit-scope
