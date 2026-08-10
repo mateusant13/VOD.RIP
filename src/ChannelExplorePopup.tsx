@@ -1966,6 +1966,10 @@ export default function ChannelExplorePopup({
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
           reuseSession={clipPopup.reuseSession}
+          // The clip title defaults to the VOD's title (user-mandated:
+          // the clip keeps the ORIGINAL title) — sent as vodrip_title so
+          // the extension fills the editor's required field.
+          vodTitle={vod.title}
           // Ladder-derived: parent's shared-ladder rank + 50 headroom — at
           // spawn this is above every other window (search panel included).
           // ponytail: 50+ new ranks while this popup is open could overtake

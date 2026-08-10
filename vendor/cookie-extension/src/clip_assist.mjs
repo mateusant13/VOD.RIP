@@ -41,6 +41,16 @@
   // VOD total length (the app sends vodrip_dur) — lets the editor-range
   // helper nudge the window off the VOD's last frame instead of failing.
   const durSec = Number(params.get('vodrip_dur')) || 0;
+  // The title the editor gets: the ORIGINAL one — vodrip_title (the app
+  // sends the VOD's GraphQL title) else document.title minus the " - Twitch"
+  // suffix. NEVER a "VOD.RIP …" default, and never a page-title artifact
+  // ("Criar clipe - Twitch") — an unusable fallback stays '' so the write
+  // is skipped rather than typing a fake title.
+  const title =
+    (params.get('vodrip_title') || '').trim() ||
+    (document.title || '').replace(/\s*-\s*Twitch\s*$/i, '').trim() ||
+    '';
+  const clipTitle = /^(criar clipe|create clip|clips?|twitch)$/i.test(title) ? '' : title;
 
   // document_start on clips.twitch.tv may run before <html> exists.
   if (!document.documentElement) {
@@ -86,22 +96,122 @@
   // the slider valuetext (window-relative 0..90s), this shows the
   // VOD-absolute position the editor is actually at — a "17:00 / 1:30"
   // here means the window sits at 17:00 of the VOD, NOT a 17-minute
-  // duration. Always read + log it when attempting a clip.
+  // duration. Always read + log it when attempting a clip. PRIMARY locator
+  // is the user's exact structural path (the <strong> inside the editor's
+  // time display); the loose 'main strong' regex is the fallback.
   const playbackTimeText = () => {
     try {
+      const viaPath = document.evaluate(
+        '//*[@id="root"]/div[1]/div[1]/div/div/main/div/div[1]/div[2]/div/div/div[1]/div[3]/strong',
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null,
+      ).singleNodeValue;
+      // secondsifyClocks() rewrites the visible text to "Ns" — the ORIGINAL
+      // VOD-absolute time is preserved in data-vodrip-clock-orig for the
+      // ground-truth read + logging.
+      const orig = viaPath && viaPath.dataset.vodripClockOrig;
+      const t = orig || (viaPath && viaPath.textContent ? viaPath.textContent.trim() : '');
+      if (t) return t;
       const el = [...document.querySelectorAll('main strong')].find((x) =>
         /^\s*\d+:\d{2}\s*\/\s*\d+:\d{2}\s*$/.test((x.textContent || '').trim()),
       );
-      return el ? el.textContent.trim() : null;
+      return el ? (el.dataset.vodripClockOrig || el.textContent.trim()) : null;
     } catch { return null; }
   };
-  // No user title -> the VOD/live title (twitch.tv/videos pages set
-  // document.title to "<stream title> - Twitch" server-side). NEVER a
-  // "VOD.RIP …" default — the user requires the live's title verbatim.
-  const title =
-    (params.get('vodrip_title') || '').trim() ||
-    (document.title || '').replace(/\s*-\s*Twitch\s*$/i, '').trim() ||
-    'Clip';
+  // USER-MANDATED (2026-08-10): the clock on screen IS the "input" in the
+  // user's model — "16:48 / 1:30" (VOD-absolute position) reads as 16
+  // minutes being input, so it must NEVER display minutes. The clock must
+  // show the clip DURATION in seconds (5..60 — Twitch's hard window rule).
+  // REWRITE every clock candidate's textContent to "Ns" (e.g. "12s"), keep
+  // the ORIGINAL text in data-vodrip-clock-orig for ground-truth logging,
+  // and HIDE the editor's position-setter buttons ("Ajustar momento de
+  // início/encerramento para 16:48" — labels that read as minute inputs).
+  // Re-asserted by MutationObserver + 1s interval so a React re-render
+  // can't resurrect minutes on screen.
+  const CLOCK_RE = /^\s*\d{1,2}:\d{2}\s*\/\s*\d{1,2}:\d{2}\s*$/;
+  const SETTER_RE = /ajustar momento de (in[ií]cio|encerramento)|set (?:clip )?(?:start|end) (?:moment|time)/i;
+  const clockCandidates = () => {
+    const out = [];
+    try {
+      const viaPath = document.evaluate(
+        '//*[@id="root"]/div[1]/div[1]/div/div/main/div/div[1]/div[2]/div/div/div[1]/div[3]/strong',
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null,
+      ).singleNodeValue;
+      if (viaPath) out.push(viaPath);
+    } catch { /* ignore */ }
+    // Loose fallback (covers the /videos editor overlay DOM and any
+    // re-render variant): any strong shaped "MM:SS / M:SS" — the user's
+    // exact "16:48 / 1:30" pattern.
+    for (const s of document.querySelectorAll('strong')) {
+      if (CLOCK_RE.test((s.textContent || '').trim()) && !out.includes(s)) out.push(s);
+    }
+    return out;
+  };
+  // Duration in seconds for the clock rewrite: the slider's accepted
+  // window (aria-valuetext) when parseable, else the requested window.
+  const clockDurationSec = () => {
+    try {
+      const slider = document.querySelector('[role="slider"]');
+      const vt = slider && slider.getAttribute('aria-valuetext');
+      const w = vt && parseValuetext(vt);
+      if (w && w.dur >= 5 && w.dur <= 60) return Math.round(w.dur);
+    } catch { /* ignore */ }
+    return Math.max(0, Math.round(endSec - startSec));
+  };
+  const isClockSecondsified = () => {
+    const els = clockCandidates();
+    if (!els.length) return true; // not rendered yet — nothing visible
+    const want = `${clockDurationSec()}s`;
+    return els.every((el) => {
+      const t = (el.textContent || '').trim();
+      return t === want || t === `${want} ` || t.endsWith(want);
+    });
+  };
+  let clockObserver = null;
+  let clockSecondsTimer = null;
+  const secondsifyClocks = () => {
+    try {
+      if (!document.getElementById('vodrip-clock-hide')) {
+        const st = document.createElement('style');
+        st.id = 'vodrip-clock-hide';
+        st.textContent =
+          '[data-vodrip-setter-hidden="1"]{display:none !important;visibility:hidden !important}';
+        (document.head || document.documentElement).appendChild(st);
+      }
+      const dur = clockDurationSec();
+      for (const el of clockCandidates()) {
+        if (!el.dataset.vodripClockOrig) el.dataset.vodripClockOrig = el.textContent || '';
+        if ((el.textContent || '').trim() !== `${dur}s`) el.textContent = `${dur}s`;
+        el.style.color = '#53fc18';
+        el.style.fontWeight = '700';
+      }
+      // The position-setter buttons ("Ajustar momento de início para
+      // 16:48") read as minute inputs — never show them.
+      for (const b of document.querySelectorAll('button')) {
+        if (SETTER_RE.test((b.innerText || '').trim())) {
+          b.setAttribute('data-vodrip-setter-hidden', '1');
+        }
+      }
+      if (!clockObserver) {
+        clockObserver = new MutationObserver(() => {
+          secondsifyClocks();
+        });
+        clockObserver.observe(document.body || document.documentElement, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      }
+      if (!clockSecondsTimer) {
+        clockSecondsTimer = setInterval(secondsifyClocks, 1000);
+      }
+    } catch { /* ignore */ }
+  };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // Debugging event sequence: every flow step is POSTed to the app's
   // clip-events sink (same API base as the cookie bridge) so a clip attempt
@@ -234,6 +344,10 @@
       await sleep(intervalMs);
     }
   }
+  const click = (el) => {
+    el.click();
+    return el;
+  };
   /** Set a React-controlled input's value the way the site's own handlers see it. */
   const setReactValue = (el, value) => {
     const proto =
@@ -242,16 +356,106 @@
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
   };
-  const click = (el) => {
-    el.click();
-    return el;
-  };
   const find = (selectors) => {
     for (const selector of selectors) {
       const el = document.querySelector(selector);
       if (el) return el;
     }
     return null;
+  };
+
+  /**
+   * Dismiss the editor's portrait-layout modal — "Notamos que você não
+   * editou o layout em retrato" / "You haven't edited the portrait layout".
+   * Twitch shows it on EVERY save when the portrait layout was never
+   * edited; it sat in front of the post-publish state, so the publish
+   * watcher timed out and NO clip was ever created. The modal opens right
+   * after Save and first shows the editor processing the clip ("Salvando
+   * clipe... N%" + layout-version tabs); its "skip" button ("Salvar sem
+   * editar" / "Save without editing" / "Continuar sem editar" / "Skip (the)
+   * (portrait) layout") only becomes clickable once processing finishes —
+   * observed live at >5min for a 34-min VOD (2026-08-10). Two phases:
+   * detect the dialog fast (15s), then poll for the button with a long
+   * budget. Fallback: the modal's OWN confirm button (/salvar clip|save
+   * clip/i) scoped to the dialog element so the page's Save button is
+   * never clicked twice; a page-wide skip-button search covers a modal
+   * rendered without role=dialog (the skip text is unique to the modal).
+   * Always logs ext_modal. Called AFTER click(save)/click(publish), BEFORE
+   * the publish watcher.
+   */
+  const dismissPortraitModal = async () => {
+    // Real modal text (seen live 2026-08-10): the pt-BR intro + the dialog's
+    // layout-version tabs ("Versão em retrato"/"Versão em paisagem").
+    const modalTextRe = /layout em retrato|portrait layout|não editou o layout|haven'?t edited the layout|em retrato|em paisagem|portrait|landscape|sem editar|without editing/i;
+    const skipBtnRe = /salvar sem editar|save without editing|continuar sem editar|skip(?:ping)? (?:the )?(?:portrait )?layout/i;
+    const confirmBtnRe = /^(salvar clipe|save clip|criar clipe|create clip)$/i;
+    const findDialog = () =>
+      [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].find((el) =>
+        modalTextRe.test((el.innerText || '').slice(0, 600)),
+      ) || null;
+    const findSkipPageWide = () =>
+      [...document.querySelectorAll('button, [role="button"]')].find((b) =>
+        skipBtnRe.test((b.innerText || '').trim()),
+      ) || null;
+    const bodyHasModalText = () =>
+      /em retrato|em paisagem|salvar sem editar|save without editing|layout em retrato|portrait layout/i.test(
+        (document.body ? document.body.innerText : '').slice(0, 8000),
+      );
+    let dialog = null;
+    let modalText = null;
+    let skipBtn = null;
+    let confirmBtn = null;
+    // Phase 1 — detect the modal quickly (it opens right after save).
+    const detectDeadline = Date.now() + 15000;
+    while (!dialog && !skipBtn && Date.now() <= detectDeadline) {
+      dialog = findDialog();
+      skipBtn = findSkipPageWide();
+      if (!skipBtn) await sleep(400);
+    }
+    if (dialog) modalText = (dialog.innerText || '').trim().slice(0, 120);
+    if (!dialog && !skipBtn && !bodyHasModalText()) {
+      // No modal at all (e.g. the editor remembered the layout) — the
+      // publish watcher proceeds immediately.
+      note('ext_modal', { action: 'none', modalText: null });
+      return;
+    }
+    // Phase 2 — the modal is present; wait for its button (long budget:
+    // the editor's "Salvando clipe..." processing must finish first).
+    const deadline = Date.now() + 480000;
+    while (Date.now() <= deadline) {
+      if (dialog) {
+        const btns = [...dialog.querySelectorAll('button, [role="button"]')];
+        skipBtn = skipBtn || btns.find((b) => skipBtnRe.test((b.innerText || '').trim()));
+        confirmBtn = confirmBtn || btns.find((b) => confirmBtnRe.test((b.innerText || '').trim()));
+        if (skipBtn || confirmBtn) break;
+      }
+      skipBtn = skipBtn || findSkipPageWide();
+      if (skipBtn) break;
+      await sleep(500);
+    }
+    if (skipBtn) {
+      click(skipBtn);
+      note('ext_modal', { action: 'dismissed', modalText, via: dialog ? 'dialog' : 'page' });
+      return;
+    }
+    if (confirmBtn) {
+      click(confirmBtn);
+      note('ext_modal', { action: 'save-in-modal', modalText });
+      return;
+    }
+    // Diagnostic census when nothing was found — the next fix needs to know
+    // what the live DOM actually looked like (roles? button texts?).
+    const census = {
+      dialogs: [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')]
+        .slice(0, 5)
+        .map((d) => (d.innerText || '').trim().slice(0, 160)),
+      buttons: [...document.querySelectorAll('button, [role="button"]')]
+        .slice(0, 40)
+        .map((b) => (b.innerText || '').trim().slice(0, 40))
+        .filter(Boolean),
+      bodyHasModalText: bodyHasModalText(),
+    };
+    note('ext_modal', { action: 'none', modalText, census });
   };
 
   /** Parse an editor clock "3:20" (m:ss) or "1:02:05" (h:mm:ss) → seconds. */
@@ -304,6 +508,7 @@
       targetEnd: endSec,
       durSec,
       playback: playbackTimeText(),
+      clockHidden: isClockSecondsified(),
       valuetext: res.ok ? (res.valuetext || null) : null,
       reason: res.ok ? null : (res.reason || null),
     });
@@ -326,17 +531,18 @@
   // -------------------------------------------------------------------
   // Duration badge — the user reads the editor's "12:31 to 12:48"
   // (VOD-absolute m:ss from the slider's aria-valuetext) as a ~12-minute
-  // clip; the actual window is 17s. This fixed chip shows the DURATION
-  // first (seconds) and the window second, in pt-BR: "Duração: 17s
-  // (12:31 → 12:48)". It is mounted OUTSIDE React's tree (child of
-  // <html>) so re-renders never remove it. Updates are driven by a
-  // MutationObserver on the slider's aria-valuetext — both the
-  // extension's own onLeftDrag/onRightDrag drags and the user's handle
-  // drags land there — and a 1s liveness tick re-finds a React-replaced
-  // slider (the attribute observer dies with the old node) and removes
-  // the chip once the slider is gone (save → SPA navigation, editor
-  // closed, leave). pointer-events:none so it never blocks Twitch's
-  // own controls.
+  // clip; the actual window is 17s. This big banner makes the SECONDS the
+  // unmissable thing: large green "Duração: Ns" with the window in small
+  // text beneath, pinned center-top of the viewport (user-mandated
+  // 2026-08-10). It is mounted OUTSIDE React's tree (child of <html>) so
+  // re-renders never remove it, and renders immediately on range-set
+  // success (no tick). Updates are driven by a MutationObserver on the
+  // slider's aria-valuetext — both the extension's own onLeftDrag/
+  // onRightDrag drags and the user's handle drags land there — and a 1s
+  // liveness tick re-finds a React-replaced slider (the attribute observer
+  // dies with the old node) and removes the chip once the slider is gone
+  // (save → SPA navigation, editor closed, leave). pointer-events:none so
+  // it never blocks Twitch's own controls.
   // -------------------------------------------------------------------
   let durationBadge = null;
   let durationBadgeObs = null;
@@ -363,18 +569,11 @@
     if (!slider) return false;
     const w = parseValuetext(slider.getAttribute('aria-valuetext'));
     if (!w) return true; // valuetext unreadable — keep the last known text
-    durationBadge.textContent = `Duração: ${w.dur}s (${fmtClock(w.start)} → ${fmtClock(w.end)})`;
-    // Right side, just above the timeline — pinned to the slider's box so
-    // it never drifts from the control it describes (recomputed on resize).
-    try {
-      const r = slider.getBoundingClientRect();
-      const bw = durationBadge.offsetWidth;
-      const bh = durationBadge.offsetHeight;
-      const left = Math.max(8, Math.min(r.right - bw, window.innerWidth - bw - 8));
-      const top = Math.max(8, Math.min(r.top - bh - 10, window.innerHeight - bh - 8));
-      durationBadge.style.left = `${left}px`;
-      durationBadge.style.top = `${top}px`;
-    } catch { /* slider gone — tick removes us */ }
+    // USER-MANDATED (2026-08-10): minutes-shaped values must NEVER appear
+    // on the editor screen — the "16:48 to 17:00" window line read as a
+    // minutes input. The badge shows the DURATION IN SECONDS ONLY (the
+    // input is 5..60s by Twitch's rule); the window line is gone.
+    durationBadge.querySelector('[data-vodrip-badge-sec]').textContent = `Duração: ${w.dur}s`;
     return true;
   };
   const mountDurationBadge = () => {
@@ -383,17 +582,26 @@
     durationBadge.setAttribute('data-vodrip-duration-badge', '');
     Object.assign(durationBadge.style, {
       position: 'fixed',
+      top: '14px',
+      left: '50%',
+      transform: 'translateX(-50%)',
       zIndex: '2147483646', // one below the assist panel — never over it
-      background: 'rgba(10,10,14,0.95)',
+      background: 'rgba(10,10,14,0.97)',
       color: '#f4f4f5',
-      font: '700 13px/1.4 Consolas, monospace',
-      padding: '6px 10px',
-      borderRadius: '6px',
-      border: '1px solid #a970ff',
-      boxShadow: '0 4px 24px rgba(0,0,0,0.55)',
+      fontFamily: 'Consolas, monospace',
+      padding: '10px 20px',
+      borderRadius: '12px',
+      border: '3px solid #53fc18',
+      boxShadow: '0 0 28px rgba(83,252,24,0.5), 0 4px 24px rgba(0,0,0,0.65)',
       pointerEvents: 'none',
+      textAlign: 'center',
       whiteSpace: 'nowrap',
+      lineHeight: '1.15',
     });
+    // Static inner structure (no user data) — seconds only, large.
+    durationBadge.innerHTML =
+      '<div data-vodrip-badge-sec style="font-size:30px;font-weight:800;color:#53fc18;letter-spacing:1px;">Duração: —</div>' +
+      '<div style="font-size:13px;color:#f4f4f5;opacity:0.9;">clipe de 5 a 60 segundos</div>';
     document.documentElement.appendChild(durationBadge);
     const observeSlider = () => {
       const slider = document.querySelector('[role="slider"]');
@@ -593,6 +801,7 @@
   if (location.hostname === 'clips.twitch.tv') {
     (async () => {
       injectMainHelper();
+      secondsifyClocks();
       const editorInput = await waitFor(
         () =>
           find([
@@ -616,9 +825,16 @@
         );
         return;
       }
-      setReactValue(editorInput, title);
-      note('ext_title', { title, flow: 'create' });
-      setStatus(`Título preenchido: ${title}`);
+      // Fill the title with the ORIGINAL one (vodrip_title from the app =
+      // the VOD's GraphQL title, else document.title). The editor REQUIRES
+      // a title ("Adicione um título (obrigatório)") — leaving it empty
+      // blocks the save. Never typed when the fallback is a page-title
+      // artifact (clipTitle ''). The wait above doubles as the
+      // editor-ready + error-page check.
+      if (clipTitle) {
+        setReactValue(editorInput, clipTitle);
+        note('ext_title', { title: clipTitle, flow: 'create' });
+      }
       const rangeErr = await setEditorRange(document, startSec, endSec, durSec);
       let manualFallback = false;
       if (rangeErr) {
@@ -639,12 +855,16 @@
         // VOD frame preview first; clicking too early is a silent no-op).
         const save = await waitFor(
           () => {
+            // Exact label match: "Salvar clipe" (create, pt-BR census),
+            // "Save Clip", "Criar clipe" (/videos publish label), "Create
+            // Clip". NEVER substring — "Sempre criar clipes em novas abas"
+            // (the toggle) contains "criar clipe" and would swallow the click.
             const b = [...document.querySelectorAll('button')].find((x) =>
-              /save clip|salvar clip/i.test((x.innerText || '').trim()),
+              /^(save clip|salvar clipe|criar clipe|create clip)$/i.test((x.innerText || '').trim()),
             );
             return b && !b.disabled ? b : null;
           },
-          30000,
+          90000,
           800,
         );
         if (!save) {
@@ -656,6 +876,10 @@
         note('ext_save_clicked', { startSec, endSec, title });
         await sleep(1200);
         click(save);
+        // The portrait-layout modal blocks EVERY save — dismiss it before
+        // the publish watcher below starts (else the watcher times out and
+        // no clip is ever created). Same guard on the /videos publish path.
+        await dismissPortraitModal();
       }
       // Success = the SPA navigates to /<slug>, or the editor reaches its
       // post-publish state ("Copiar Link"). /create and /clips/* are the
@@ -712,6 +936,7 @@
 
   (async () => {
     injectMainHelper();
+    secondsifyClocks();
     // 1. Player — needs real duration before we can seek.
     const video = await waitFor(() => {
       const v = document.querySelector('video');
@@ -827,29 +1052,34 @@
       return;
     }
 
-    // 4. Title (always non-empty — the URL default covers missing vodrip_title).
-    const input =
-      (editor.querySelector('input[data-a-target="tw-input"], [data-a-target="clip-editor-title-input"], input[placeholder*="title" i], textarea[placeholder*="title" i], input[aria-label*="title" i]')) ||
-      find([
-        '[data-a-target="clip-editor-title-input"]',
-        'input[placeholder*="title" i]',
-        'textarea[placeholder*="title" i]',
-        'input[aria-label*="title" i]',
-      ]);
-    if (input) {
-      setReactValue(input, title);
-      note('ext_title', { title, flow: 'videos' });
-      setStatus(`Título preenchido: ${title}`);
-    } else {
-      note('ext_error', { step: 'title-input', reason: 'missing' });
-      setStatus('Campo de título não encontrado — preencha manualmente.', 'err');
+    // 4. Title — the editor REQUIRES one ("Adicione um título
+    // (obrigatório)"); fill it with the ORIGINAL title (vodrip_title from
+    // the app, else document.title minus " - Twitch"). Never typed when
+    // the fallback is a page-title artifact (clipTitle '').
+    if (clipTitle) {
+      const titleInput =
+        (editor && editor.querySelector(
+          'input[data-a-target="tw-input"], [data-a-target="clip-editor-title-input"], ' +
+            'input[placeholder*="title" i], textarea[placeholder*="title" i], input[aria-label*="title" i]',
+        )) ||
+        find([
+          'input[data-a-target="tw-input"]',
+          '[data-a-target="clip-editor-title-input"]',
+          'input[placeholder*="title" i]',
+          'textarea[placeholder*="title" i]',
+          'input[aria-label*="title" i]',
+        ]);
+      if (titleInput) {
+        setReactValue(titleInput, clipTitle);
+        note('ext_title', { title: clipTitle, flow: 'videos' });
+      }
     }
 
     // 5. Publish.
     const publish = await waitFor(
       () => {
         const inEditor = [...editor.querySelectorAll('button')].find((b) =>
-          /save clip|publish|salvar clip|publicar/i.test((b.innerText || '').trim()),
+          /save clip|publish|salvar clip|publicar|criar clip|create clip/i.test((b.innerText || '').trim()),
         );
         if (inEditor) return inEditor;
         return find([
@@ -872,6 +1102,8 @@
     setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
     await sleep(1200);
     click(publish);
+    // Same portrait-layout modal guard as the /create save flow (above).
+    await dismissPortraitModal();
     // Success = the editor reaches its post-publish state ("Copiar Link" /
     // "Copy Link"), or the site navigates to /<channel>/clip/<slug>.
     const published = await waitFor(() => {
