@@ -1528,7 +1528,7 @@ export default function ChannelExplorePopup({
   }, []);
 
   /**
-   * Open the Twitch clip mini-preview at the current playhead (±60s window,
+   * Open the Twitch clip mini-preview at the current playhead (95s window,
    * user trims there and creates the clip). Fixes the old direct-open call,
    * which sent offsetSec without durationSec — the backend 422'd every VOD.
    */
@@ -1959,6 +1959,7 @@ export default function ChannelExplorePopup({
           vodId={clipPopup.vodId}
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
+          reuseSession={clipPopup.reuseSession}
           zIndex={zIndex + 50}
           initialVolume={volumeRef.current}
           onClose={() => setClipPopup(null)}

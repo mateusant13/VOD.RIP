@@ -5836,7 +5836,7 @@ export default function App() {
   }, []);
 
   /**
-   * VOD: open the Twitch clip mini-preview at the playhead (±60s window, user
+   * VOD: open the Twitch clip mini-preview at the playhead (95s window, user
    * trims there and creates the clip). Live: open the editor directly — no
    * VOD timeline to select from.
    */

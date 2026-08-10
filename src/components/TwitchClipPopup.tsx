@@ -1,7 +1,8 @@
 /**
  * Twitch clip mini-preview — the "Twitch clip" button on the main preview and
- * the explore popup opens this floating player on a ±60s window around the
- * click moment instead of jumping straight to Twitch. The user trims a 5..60s
+ * the explore popup opens this floating player on a 95s (1:35) window around
+ * the click moment instead of jumping straight to Twitch. The user trims a
+ * 5..60s
  * selection on the window timeline, then 'Create clip' opens Twitch's own
  * clip editor in the OS default browser with the selection as vodrip_* params
  * (vod_offset = selection END — see twitchClip.ts); the VOD.RIP cookie
@@ -13,9 +14,12 @@
  *
  * The mini preview reuses the main preview's session machinery: one session
  * per popup with crop_start/crop_end = the window, exactly like App.tsx's
- * openPreview passes the trim range. ponytail: no quality menu here — the
- * session starts at the fast-start tier (360p) and plays the default level;
- * the main/explore previews remain the full quality experience.
+ * openPreview passes the trim range. Sessions created here are cached by VOD
+ * URL (_clipSessionCache) and reused on re-open — the popup probes the cached
+ * session's master and adopts it instead of POSTing a fresh session (no
+ * re-resolve). ponytail: no quality menu here — the session starts at the
+ * fast-start tier (360p) and plays the default level; the main/explore
+ * previews remain the full quality experience.
  */
 
 import {
@@ -57,12 +61,39 @@ import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
 
+/**
+ * Reusable clip-preview sessions keyed by VOD URL. Closing the popup used to
+ * DELETE its session, so every reopen re-created one and the backend
+ * re-resolved the VOD from scratch (slow). Sessions are kept here instead —
+ * a reopen for the same VOD probes the cached session's master and adopts it
+ * (zero POST, zero resolve); a stale one (backend TTL 30 min / LRU cap) falls
+ * through to a fresh create. Replacing an entry drops the superseded session;
+ * the map is capped so long browsing never accumulates ids.
+ */
+const _clipSessionCache = new Map<string, string>();
+const _CLIP_SESSION_CACHE_MAX = 8;
+
+function _cacheClipSession(url: string, sessionId: string): void {
+  const prev = _clipSessionCache.get(url);
+  if (prev && prev !== sessionId) {
+    // Same VOD, superseded session (stale probe → fresh create).
+    void apiDelete(`/api/preview/session/${prev}`).catch(() => {});
+  }
+  _clipSessionCache.set(url, sessionId);
+  if (_clipSessionCache.size > _CLIP_SESSION_CACHE_MAX) {
+    const oldestUrl = _clipSessionCache.keys().next().value as string;
+    const evicted = _clipSessionCache.get(oldestUrl);
+    _clipSessionCache.delete(oldestUrl);
+    if (evicted) void apiDelete(`/api/preview/session/${evicted}`).catch(() => {});
+  }
+}
+
 interface TwitchClipPopupProps {
   /** VOD URL the mini preview plays (same session machinery as the main preview). */
   url: string;
   broadcasterLogin: string;
   vodId: string;
-  /** VOD time of the click — the ±60s window is centred here (unless
+  /** VOD time of the click — the 95s (1:35) window is centred here (unless
    * anchorRange is set, which takes precedence). */
   playheadSec: number;
   /** VOD length; <=0/unknown → the upper window edge is unclamped. */
@@ -136,10 +167,23 @@ export default function TwitchClipPopup({
   const [drag, setDrag] = useState<{
     startX: number; startY: number; offsetX: number; offsetY: number;
   } | null>(null);
+  /** Window-body drag in progress — drives the grab/grabbing cursor. */
+  const [windowDragging, setWindowDragging] = useState(false);
 
   const popupRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
+  /** In-flight window-body drag (move the whole selection along the VOD). */
+  const windowDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    grabOffsetSec: number;
+    selLen: number;
+    moved: boolean;
+    prevUserSelect: string;
+  } | null>(null);
+  /** A window drag ends with a synthetic click on the bar — suppress its seek. */
+  const suppressBarClickRef = useRef(false);
   const hlsRef = useRef<Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const timelineOffsetRef = useRef(0);
@@ -169,30 +213,35 @@ export default function TwitchClipPopup({
   // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
   useEffect(() => {
     let cancelled = false;
-    // Only delete the session we created — a reused parent session is owned
-    // by the opening preview and must survive the popup.
-    let ownsSession = !reuseSession?.sessionId || reuseSession.trimTimeline === true;
-    (async () => {
-      if (reuseSession?.sessionId && !reuseSession.trimTimeline) {
-        // Same-VOD full-HLS session from the opening preview: adopt it so the
-        // proxy serves segments from that session's disk cache instead of
-        // re-downloading from the CDN (and skip the GQL re-resolve). Probe the
-        // master first — a stale session falls through to a fresh one.
-        const sid = reuseSession.sessionId;
-        try {
-          const probe = await fetch(`/api/preview/hls/${sid}/master.m3u8`);
-          if (!probe.ok) throw new Error(`stale session ${sid.slice(0, 8)}`);
-          if (cancelled) return;
-          sessionIdRef.current = sid;
-          // Full-VOD HLS proxy (no window mux): video time is absolute VOD time.
-          timelineOffsetRef.current = 0;
-          setPlayback({ url: `/api/preview/hls/${sid}/master.m3u8`, kind: 'hls' });
-          setLoading(false);
-          return;
-        } catch {
-          ownsSession = true; // stale/missing — fall through to a fresh session
-        }
+    // Full-VOD HLS proxy (no window mux): video time is absolute VOD time.
+    // Adopt an existing same-VOD session so the proxy serves segments from
+    // that session's disk cache instead of re-downloading from the CDN (and
+    // no POST / re-resolve at all). Probes the master first — a stale session
+    // falls through to a fresh one.
+    const adoptSession = async (sid: string): Promise<boolean> => {
+      try {
+        const probe = await fetch(`/api/preview/hls/${sid}/master.m3u8`);
+        if (!probe.ok) throw new Error(`stale session ${sid.slice(0, 8)}`);
+        if (cancelled) return true;
+        sessionIdRef.current = sid;
+        timelineOffsetRef.current = 0;
+        setPlayback({ url: `/api/preview/hls/${sid}/master.m3u8`, kind: 'hls' });
+        setLoading(false);
+        return true;
+      } catch {
+        return false;
       }
+    };
+    (async () => {
+      // Priority 1: the opening preview's own session (same VOD).
+      if (reuseSession?.sessionId && !reuseSession.trimTimeline) {
+        if (await adoptSession(reuseSession.sessionId)) return;
+      }
+      // Priority 2: a clip session cached from an earlier open of this VOD —
+      // closing the popup no longer deletes it (see _clipSessionCache), so a
+      // re-open skips the POST and the backend resolve entirely.
+      const cachedSid = _clipSessionCache.get(url);
+      if (cachedSid && await adoptSession(cachedSid)) return;
       try {
         const res = await createPreviewSessionWithRetry({
           url,
@@ -213,6 +262,7 @@ export default function TwitchClipPopup({
           return;
         }
         sessionIdRef.current = res.session_id;
+        _cacheClipSession(url, res.session_id);
         // Window-muxed MP4 (trim_timeline) is 0-based; Twitch VOD HLS is
         // absolute VOD time. offset maps video time → VOD time.
         timelineOffsetRef.current = res.trim_timeline === true ? win.start : 0;
@@ -234,11 +284,11 @@ export default function TwitchClipPopup({
       }
       const video = videoRef.current;
       if (video) detachProgressivePreview(video);
-      const sid = sessionIdRef.current;
+      // Created sessions are intentionally NOT deleted here — they live in
+      // _clipSessionCache so re-opening the popup for the same VOD reuses the
+      // session instead of re-resolving from scratch. The backend TTL (30 min)
+      // and LRU cap reclaim idle sessions.
       sessionIdRef.current = null;
-      if (sid && ownsSession) {
-        void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
-      }
     };
   }, [url, win.start, win.end, retryTick, reuseSession]);
 
@@ -430,6 +480,71 @@ export default function TwitchClipPopup({
     handle.addEventListener('lostpointercapture', endDrag);
   }, [win, commitSelection, markEndpoint]);
 
+  // Grab the selection WINDOW (between the edge handles) and move it along
+  // the VOD; the edge handles keep resizing. The grab offset is recorded in
+  // seconds on pointerdown (grab point → selection start), so the window
+  // tracks the pointer 1:1 instead of jumping by the grab-point delta.
+  const beginWindowDrag = useCallback((e: ReactPointerEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
+    const rail = railRef.current;
+    if (!rail) return;
+    const rect = rail.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const pointerId = e.pointerId;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget;
+    target.setPointerCapture(pointerId);
+    setWindowDragging(true);
+    const winLen = win.end - win.start;
+    const sel = selectionRef.current;
+    const selLen = sel.end - sel.start;
+    const grabFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const grabSec = win.start + grabFrac * winLen;
+    const state = {
+      pointerId,
+      startClientX: e.clientX,
+      grabOffsetSec: grabSec - sel.start,
+      selLen,
+      moved: false,
+      prevUserSelect: document.body.style.userSelect,
+    };
+    windowDragRef.current = state;
+    suppressBarClickRef.current = false;
+    document.body.style.userSelect = 'none';
+
+    const endDrag = () => {
+      if (windowDragRef.current !== state) return;
+      windowDragRef.current = null;
+      setWindowDragging(false);
+      document.body.style.userSelect = state.prevUserSelect;
+      // pointerup fires a click on the bar — a real drag must not then seek.
+      if (state.moved) suppressBarClickRef.current = true;
+      target.removeEventListener('pointermove', onMove);
+      target.removeEventListener('pointerup', endDrag);
+      target.removeEventListener('pointercancel', endDrag);
+      target.removeEventListener('lostpointercapture', endDrag);
+      try { target.releasePointerCapture(pointerId); } catch { /* ignore */ }
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== state.pointerId) return;
+      if (!state.moved) {
+        if (Math.abs(ev.clientX - state.startClientX) < 3) return;
+        state.moved = true;
+      }
+      const r = rail.getBoundingClientRect();
+      if (r.width <= 0) return;
+      const frac = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+      const sec = win.start + frac * winLen;
+      const newStart = Math.max(win.start, Math.min(win.end - state.selLen, sec - state.grabOffsetSec));
+      commitSelection({ start: newStart, end: newStart + state.selLen });
+    };
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', endDrag);
+    target.addEventListener('pointercancel', endDrag);
+    target.addEventListener('lostpointercapture', endDrag);
+  }, [win, commitSelection]);
+
   const adjustSelection = useCallback((buttonDelta: number) => {
     const sel = selectionRef.current;
     const which = lastEndpointRef.current;
@@ -561,6 +676,13 @@ export default function TwitchClipPopup({
       : selLen < TWITCH_CLIP_MIN_SEC
         ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
         : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
+
+  // Keep the drag-offset ref in sync with the applied position — posRef was
+  // never written, so every grab after the first offset from the INITIAL
+  // position and teleported the popup back to the right edge on pointerdown.
+  useEffect(() => {
+    posRef.current = position;
+  }, [position]);
 
   const handleHeaderMouseDown = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
@@ -696,7 +818,7 @@ export default function TwitchClipPopup({
         )}
       </div>
 
-      {/* Trim rail: 5..60s selection on the ±60s window timeline */}
+      {/* Trim rail: 5..60s selection on the 95s (1:35) window timeline */}
       <div className="px-2 py-1.5 flex flex-col gap-1">
         <div className="flex items-center gap-2">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600">
@@ -746,12 +868,30 @@ export default function TwitchClipPopup({
             }}
           >
             <div
-              className="absolute top-1/2 -translate-y-1/2 h-1.5 bg-[#9146FF]/60 pointer-events-none"
+              className="absolute top-0 bottom-0 touch-none select-none"
               style={{
                 left: `${selStartFrac}%`,
                 width: `${Math.max(0, selEndFrac - selStartFrac)}%`,
+                cursor: windowDragging ? 'grabbing' : 'grab',
               }}
-            />
+              title={t('Drag the window to move the clip along the VOD')}
+              onPointerDown={beginWindowDrag}
+              onClick={(e) => {
+                // A drag releases with a synthetic click — don't seek after moving.
+                if (suppressBarClickRef.current) {
+                  suppressBarClickRef.current = false;
+                  return;
+                }
+                const rail = railRef.current;
+                if (!rail) return;
+                const rect = rail.getBoundingClientRect();
+                if (rect.width <= 0) return;
+                const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                seekTo(fracToSec(frac, railView));
+              }}
+            >
+              <div className="absolute top-1/2 -translate-y-1/2 h-1.5 w-full bg-[#9146FF]/60 pointer-events-none" />
+            </div>
             <div
               className="absolute top-0 bottom-0 w-px bg-white/70 -translate-x-1/2 pointer-events-none z-[1]"
               style={{ left: `${playFrac}%` }}
