@@ -1,15 +1,18 @@
-# One-click cookie-extension auto-install (productized CookieInstallWorker flow).
+# One-click cookie-extension auto-install (productized CookieInstallWorker flow)
+# + zero-window version reload.
 #
-# Mechanism (proven on Chrome 151, this machine): drive the user's REAL
-# profile entirely by UIA on a hidden window — spawn chrome --new-window
-# chrome://extensions (reuses the RUNNING instance, never kills anything),
-# alpha-0 the window (renderer stays live so UIA sees the page), click
+# INSTALL path (first-time only): drive the user's REAL profile entirely by
+# UIA on a hidden window — spawn chrome --new-window chrome://extensions
+# (reuses the RUNNING instance, never kills anything), move the window
+# off-screen, alpha-0 it (renderer stays live so UIA sees the page), click
 # "Load unpacked" by automation id, drive the folder dialog by keyboard
 # (Ctrl+L, type the path, Enter, Enter — Chrome 151's picker on Win11 24H2+
 # exposes "Pasta:"/"Selecionar pasta" as pattern-less Panes, so UIA
 # SetValue/Invoke are no-ops; keyboard falls back to the classic UIA
 # SetValue+click for older layouts), verify the extension card, capture
-# its ID, close the hidden window.
+# its ID, close the hidden window. The window is never focused: it is moved
+# off-screen BEFORE the alpha-0 (focus-steal audit 2026-08-10) and the
+# reload path NEVER routes through this window at all.
 #
 # Why not CDP: Chrome 151 refuses --remote-debugging-port on the real
 # profile (the account gets revoked); the old debug-instance mechanism
@@ -22,28 +25,34 @@
 # Usage:
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `
 #     cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" `
-#     [-Browser chrome|msedge|brave] [-DebugPort 9222] [-DryRun]
+#     [-Browser chrome|msedge|brave] [-DebugPort 7897] [-DryRun]
 #   cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" -ReloadOnly `
-#     [-ExpectedVersion 0.8.3] [-Browser chrome|msedge|brave] [-DryRun]
+#     [-ExpectedVersion 0.8.6] [-DryRun]
 #
-# -ReloadOnly: the extension is already installed UNPACKED but may be running
-# stale code (Chrome does NOT hot-reload a loaded folder on file change, and
-# the plain auto-install short-circuits with "already present, nothing to
-# do"). This mode clicks the card's Reload button on the hidden
-# chrome://extensions window instead, so the service worker re-registers
-# from the folder on disk in place — the browser keeps its extension id,
-# permissions and every user tab. -ExpectedVersion, when given, reports
-# whether the card text contains that version string after the reload.
+# -ReloadOnly: ZERO-WINDOW reload of a live unpacked extension. Chrome does
+# NOT hot-reload a loaded folder on file change, so after the caller stages
+# a new copy the service worker must re-register from disk. This mode NEVER
+# spawns chrome and NEVER opens a tab or window (the user mandate: no focus
+# steal, ever — "para de abrir uma nova guia inutil que rouba o foco"). It
+# reads the staged folder's manifest version, POSTs /api/extension/reload
+# {to:<version>} to the local backend, then polls GET /api/extension/status
+# until the directive clears (max 90s). The extension's own service worker
+# does the actual reload: it polls the same endpoint on a 30s alarm,
+# chrome.runtime.reload()s itself in place, and the fresh SW POSTs
+# reload-done — which clears the directive. The directive clearing IS the
+# version proof: the SW only confirms after its manifest version matches the
+# version the backend ships. -ExpectedVersion is accepted for CLI compat
+# (the reload target is always the on-disk version).
 #
 # stdout: exactly ONE JSON line (the result), human progress goes to stderr:
 #   {"ok":true,"installed":true,"extension_id":"...","error":null}
-#   {"ok":true,"reloaded":true,"extension_id":"...","version_found":true,"error":null}
-# DryRun prints the resolved plan without touching the browser.
+#   {"ok":true,"reloaded":true,"extension_id":null,"version_found":true,"error":null}
+# DryRun prints the resolved plan without touching the browser or backend.
 
 param(
     [string]$ExtensionDir,
     [string]$Browser = 'chrome',
-    [int]$DebugPort = 9222,  # kept for CLI compat; the UIA path needs no CDP
+    [int]$DebugPort = 7897,  # CLI-compat alias for the LOCAL API port (the zero-window reload POSTs/polls 127.0.0.1:$DebugPort); the UIA install path needs no port at all
     [switch]$DryRun,
     [switch]$ReloadOnly,
     [string]$ExpectedVersion = ''
@@ -52,6 +61,94 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $EXT_NAME = 'VOD RIP Get Cookies'
+
+function Write-ProgressLog([string]$msg) { [Console]::Error.WriteLine($msg) }
+
+# --- zero-window reload (directive-based, NO chrome spawn) --------------------
+# The extension is already installed UNPACKED but may be running stale code
+# (Chrome does NOT hot-reload a loaded folder on file change). The reload is
+# directive-based and NEVER touches the browser: read the staged folder's
+# version, POST /api/extension/reload {to:<version>} to the local backend,
+# then poll GET /api/extension/status until the directive clears (max 90s).
+# The extension's own service worker does the actual work — it polls the same
+# endpoint on a 30s alarm (and on content-script messages), reloads ITSELF in
+# place via chrome.runtime.reload() (extension id, permissions and every user
+# tab kept; no window, no tab, no focus steal), and the fresh SW POSTs
+# reload-done, which clears the directive. The directive clearing IS the
+# version proof: the SW only confirms after its manifest version matches the
+# version the backend ships.
+if ($ReloadOnly) {
+    $relManifest = Join-Path $ExtensionDir 'manifest.json'
+    if (-not (Test-Path -LiteralPath $relManifest)) {
+        Write-Output (@{ ok = $false; reloaded = $false; extension_id = $null; version_found = $false; error = "extension folder missing manifest.json: $ExtensionDir" } | ConvertTo-Json -Compress)
+        exit 1
+    }
+    $targetVersion = ''
+    try {
+        $targetVersion = "$((Get-Content -LiteralPath $relManifest -Raw | ConvertFrom-Json).version)"
+    } catch { $targetVersion = '' }
+    if (-not $targetVersion) {
+        Write-Output (@{ ok = $false; reloaded = $false; extension_id = $null; version_found = $false; error = "cannot read version from $relManifest" } | ConvertTo-Json -Compress)
+        exit 1
+    }
+    # Mirror the SW's getApiBase (modules/cookie_bridge.mjs): default
+    # http://127.0.0.1:7897 with a per-install override. The SW's override
+    # lives in chrome.storage.local, which a PS1 cannot read; VODRIP_API_BASE
+    # env covers the same "different port" use case, and -DebugPort stays as
+    # the CLI-compat alias for the API port.
+    $apiBase = if ($env:VODRIP_API_BASE) { $env:VODRIP_API_BASE.TrimEnd('/') } else { "http://127.0.0.1:$DebugPort" }
+
+    if ($DryRun) {
+        Write-Output (@{
+            ok = $true; dryRun = $true
+            mechanism = 'zero-window-directive'
+            chrome_spawn = $false
+            reloadOnly = $true
+            extension_dir = $ExtensionDir
+            target_version = $targetVersion
+            api_base = $apiBase
+            expected_version = $ExpectedVersion
+            actions = @(
+                "read live extension version from $relManifest (target: $targetVersion)",
+                "POST $apiBase/api/extension/reload {to:'$targetVersion'} - persists the reload directive",
+                "poll GET $apiBase/api/extension/status until reloadTo clears (fresh SW confirms via reload-done; max 90s)",
+                "NO chrome.exe spawn, NO new window, NO new tab - the SW self-reloads in place"
+            )
+        } | ConvertTo-Json -Compress -Depth 4)
+        exit 0
+    }
+
+    $result = @{ ok = $false; reloaded = $false; extension_id = $null; version_found = $false; error = $null }
+    try {
+        $status = Invoke-RestMethod -Uri "$apiBase/api/extension/status" -Method Get -TimeoutSec 10
+        Write-ProgressLog "reload: backend up (bundled version '$($status.version)')"
+        $body = @{ to = $targetVersion } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri "$apiBase/api/extension/reload" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+        Write-ProgressLog "reload: directive set to '$targetVersion' - waiting for the SW to self-reload (no windows involved)"
+        $deadline = (Get-Date).AddSeconds(90)
+        $cleared = $false
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            try {
+                $st = Invoke-RestMethod -Uri "$apiBase/api/extension/status" -Method Get -TimeoutSec 10
+                if (-not $st.reloadTo) { $cleared = $true; break }
+            } catch {
+                Write-ProgressLog "reload: status poll failed (backend restarting?) - $($_.Exception.Message)"
+            }
+        }
+        if (-not $cleared) {
+            throw "reload directive not cleared within 90s - is Chrome running with the extension loaded?"
+        }
+        $result.ok = $true
+        $result.reloaded = $true
+        $result.version_found = $true
+    } catch {
+        $result.error = $_.Exception.Message
+        Write-ProgressLog "reload error: $($result.error)"
+    }
+    Write-Output ($result | ConvertTo-Json -Compress)
+    exit 0
+}
 
 # --- browser resolution ------------------------------------------------------
 $browserMap = @{
@@ -87,15 +184,13 @@ if (-not (Test-Path -LiteralPath $manifest)) {
 if ($DryRun) {
     Write-Output (@{
         ok = $true; dryRun = $true; browser = $Browser; browser_exe = $exe
-        mechanism = if ($ReloadOnly) { 'uia-hidden-window-reload' } else { 'uia-hidden-window' }
-        reloadOnly = [bool]$ReloadOnly
+        mechanism = 'uia-hidden-window'
+        reloadOnly = $false
         extension_dir = $ExtensionDir
         expected_version = $ExpectedVersion
     } | ConvertTo-Json -Compress)
     exit 0
 }
-
-function Write-ProgressLog([string]$msg) { [Console]::Error.WriteLine($msg) }
 
 # --- Win32 + UIA plumbing (compiled once) --------------------------------------
 Add-Type -AssemblyName System.Windows.Forms
@@ -344,7 +439,13 @@ try {
     }
     if ($newWin -eq [IntPtr]::Zero) { throw 'new browser window not found' }
     Write-ProgressLog ("auto-install: window '" + [ExtWin]::Title($newWin) + "'")
-    [ExtWin]::Move($newWin, 80, 80)
+    # Focus-steal audit (2026-08-10): the window is moved OFF-SCREEN first
+    # and only then alpha-0'd — it never flashes at its spawn position and
+    # never takes focus. Residual: the window exists at its default position
+    # for up to ~3s until this discovery pass finds it (unavoidable without
+    # UIA watching for the process's first window); that is acceptable for a
+    # ONE-TIME user-confirmed install — version reloads never route here.
+    [ExtWin]::Move($newWin, -32000, -32000)
     [ExtWin]::Invisible($newWin)
 
     # If the page did not open on the extension URL (fresh instance), navigate.
@@ -363,39 +464,10 @@ try {
     Start-Sleep -Seconds 2
 
     # Already installed? The card text contains the extension name.
+    # NOTE: reloads NEVER route through this window — -ReloadOnly is handled
+    # by the zero-window directive branch at the top of the script.
     $page = [ExtWin]::DumpText($newWin)
-    if ($ReloadOnly) {
-        # In-place reload of the running unpacked extension: click the card's
-        # Reload button (dev mode). The service worker re-registers from the
-        # folder on disk WITHOUT removing/re-adding, so the browser keeps its
-        # extension id, permissions and the user's tabs untouched.
-        if ($page -notmatch [regex]::Escape($EXT_NAME)) {
-            throw "extension not installed ('$EXT_NAME' not found) - run the normal auto-install first"
-        }
-        $r = [ExtWin]::ClickButton($newWin, 'Recarregar', 'dev-reload-button', 15000, $false)
-        Write-ProgressLog "auto-install: reload button -> $r"
-        if ($r -eq 'NOT_FOUND') {
-            $r2 = [ExtWin]::ClickButton($newWin, 'Reload', 'reload', 8000, $false)
-            Write-ProgressLog "auto-install: reload fallback -> $r2"
-            if ($r2 -eq 'NOT_FOUND') { throw 'reload button never appeared (developer mode off?)' }
-        }
-        # Wait for the card to come back after the reload (SW re-registers).
-        $found = $false
-        for ($i = 0; $i -lt 40; $i++) {
-            if ([ExtWin]::DumpText($newWin) -match [regex]::Escape($EXT_NAME)) { $found = $true; break }
-            Start-Sleep -Milliseconds 500
-        }
-        if (-not $found) { throw 'extension card did not reappear after reload' }
-        $result.ok = $true
-        $result.reloaded = $true
-        $result.installed = $true
-        $idm = [regex]::Match([ExtWin]::DumpText($newWin), 'ID:\s*([a-z0-9]{32})')
-        if ($idm.Success) { $result.extension_id = $idm.Groups[1].Value }
-        if ($ExpectedVersion) {
-            $result.version_found = ([ExtWin]::DumpText($newWin) -match [regex]::Escape($ExpectedVersion))
-            Write-ProgressLog "auto-install: expected version '$ExpectedVersion' found: $($result.version_found)"
-        }
-    } elseif ($page -match [regex]::Escape($EXT_NAME)) {
+    if ($page -match [regex]::Escape($EXT_NAME)) {
         Write-ProgressLog 'auto-install: extension already present, nothing to do'
         $result.ok = $true
         $result.installed = $true

@@ -13,6 +13,16 @@ GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
 POST /api/session/cookies/enable|disable — kill switch (consent toggle).
 GET  /api/session/cookies/extension/extension.crx — the packed extension.
 GET  /api/session/cookies/extension/id — extension id from the packed key.
+
+Zero-window version reload (no browser window or tab ever):
+GET  /api/extension/status — {ok, version (the app's staged copy), reloadTo
+    (persisted directive or null), extensionId (always null — the cookie
+    push payload carries no id)}. The extension's SW polls this on a 30s
+    alarm and after content-script messages.
+POST /api/extension/reload {to:<version>} — persist the reload directive
+    (scripts/cookie_auto_install.ps1 -ReloadOnly calls this after staging).
+POST /api/extension/reload-done {version:<version>} — fresh-SW confirmation;
+    clears the directive when the version matches the staged copy.
 """
 
 import base64
@@ -29,7 +39,7 @@ import sys
 import threading
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +48,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 
 from deps import settings_mgr
 from services import cookie_store
+from services.disk_hygiene import data_dir
 from services.settings import _get_appdata_dir
 from services.yt_gate import gate_remaining_sec
 
@@ -177,6 +188,81 @@ def _ext_version() -> str:
             version = ""
         _ext_version_cache[key] = version
     return _ext_version_cache[key]
+
+
+def _ext_bundled_version() -> str:
+    """Version of the extension copy the APP ships — the target a live
+    unpacked install should be reloaded to. Mirrors where the codebase
+    stages the folder: dist/VOD-RIP/cookie-extension/src in dev
+    (scripts/stage-cookie-extension.mjs), <install>/cookie-extension/src in
+    a frozen onedir (the path __main_launcher__._materialize_cookie_extension
+    writes), falling back to the vendored source the release builds from.
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "cookie-extension" / "src")
+    candidates.append(Path(__file__).resolve().parents[2] / "dist" / "VOD-RIP" / "cookie-extension" / "src")
+    candidates.append(Path(__file__).resolve().parents[2] / "vendor" / "cookie-extension" / "src")
+    for src in candidates:
+        try:
+            manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        version = (manifest.get("version") or "").strip()
+        if version:
+            return version
+    return ""
+
+
+# --- zero-window version reload directive ----------------------------------
+# Chrome does NOT hot-reload a loaded unpacked extension when its folder on
+# disk changes; the SW must re-register first. The reload is directive-based
+# and window-free: the caller (scripts/cookie_auto_install.ps1 -ReloadOnly,
+# after staging the new copy) POSTs /api/extension/reload {to:<version>};
+# the extension's service worker polls this status endpoint on its 30s alarm
+# (and on content-script messages) and chrome.runtime.reload()s ITSELF in
+# place when the directive differs from its manifest version — no new tabs,
+# no windows, no focus steal, extension id and permissions kept. The fresh
+# SW then POSTs reload-done, which clears the directive; the caller polls
+# until it clears as the proof that the new version is live.
+_RELOAD_DIRECTIVE_FILE = "cookie-extension-reload.json"
+_RELOAD_DIRECTIVE_LOCK = threading.Lock()
+
+
+def _reload_directive_path() -> Path:
+    """Persisted reload directive — sits with the other app state files in
+    the data dir (same resolver the clip-events log uses)."""
+    return data_dir() / _RELOAD_DIRECTIVE_FILE
+
+
+def _read_reload_directive() -> Optional[str]:
+    """Target version of a pending extension reload, or None."""
+    try:
+        with _RELOAD_DIRECTIVE_LOCK:
+            raw = _reload_directive_path().read_text(encoding="utf-8")
+        doc = json.loads(raw)
+        to = (doc.get("to") or "").strip()
+        return to or None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_reload_directive(to: str) -> None:
+    path = _reload_directive_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"to": to, "set_at": datetime.now(timezone.utc).isoformat()}
+    with _RELOAD_DIRECTIVE_LOCK:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+
+def _clear_reload_directive() -> None:
+    try:
+        with _RELOAD_DIRECTIVE_LOCK:
+            _reload_directive_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # Signpost the user drops alongside the extension folder in the parent dir —
@@ -474,6 +560,50 @@ def _open_extension_manager() -> dict:
     return {"launched": False, "browser": None, "url": None}
 
 
+@router.get("/api/extension/status")
+async def extension_status():
+    """Version + pending reload directive for the cookie extension's SW.
+
+    ``version`` is the APP's own staged copy (the reload target);
+    ``reloadTo`` is the persisted directive (null when none); ``extensionId``
+    is always null — the SW's cookie push payload carries no id (postCookies
+    posts {token, cookies} only), and a live unpacked install's id is not
+    derivable server-side.
+    """
+    return {
+        "ok": True,
+        "version": _ext_bundled_version(),
+        "reloadTo": _read_reload_directive(),
+        "extensionId": None,
+    }
+
+
+@router.post("/api/extension/reload")
+async def extension_reload(body: dict):
+    """Arm a zero-window extension reload: persist a directive for version
+    ``to`` that the extension's SW picks up on its next status poll and
+    self-reloads into. Never opens a browser window or tab."""
+    to = (body.get("to") or "").strip()
+    if not to or len(to) > 64:
+        raise HTTPException(status_code=422, detail="to (version string) required")
+    _write_reload_directive(to)
+    logger.info("cookie extension reload directive set -> %s", to)
+    return {"ok": True}
+
+
+@router.post("/api/extension/reload-done")
+async def extension_reload_done(body: dict):
+    """Fresh-SW confirmation: clears the directive when the reported version
+    matches the app's staged copy. The SW only confirms after matching, so a
+    clear IS the proof the new version is live."""
+    version = (body.get("version") or "").strip()
+    cleared = bool(version) and version == _ext_bundled_version()
+    if cleared:
+        _clear_reload_directive()
+        logger.info("cookie extension reload confirmed at %s — directive cleared", version)
+    return {"ok": True, "cleared": cleared}
+
+
 # --- one-click auto-install (productized CookieInstallWorker flow) ----------
 # The proven mechanism: drive the user's REAL Chrome profile entirely by UIA
 # on a hidden window — spawn chrome --new-window chrome://extensions (reuses
@@ -512,12 +642,13 @@ def _auto_install_script() -> Path:
     return Path(__file__).resolve().parent.parent / "scripts" / "cookie_auto_install.ps1"
 
 
-def _run_auto_install_script(browser: str, extension_dir: Path, port: int = 9222) -> dict:
+def _run_auto_install_script(browser: str, extension_dir: Path, port: int = 7897) -> dict:
     """Run scripts/cookie_auto_install.ps1; parse the trailing JSON result line.
 
     The script prints human progress to stderr and exactly one JSON object as
     its final stdout line. Best-effort: any failure yields an error dict, never
-    an exception (the caller reports a clean error string).
+    an exception (the caller reports a clean error string). ``port`` is the
+    local API port (ps1 -DebugPort, the CLI-compat alias for the API base).
     """
     script = _auto_install_script()
     if not script.is_file():
