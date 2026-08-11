@@ -92,13 +92,100 @@ const armHeartbeat = () => {
   });
 };
 
+// ---------------------------------------------------------------------------
+// Zero-window version reload — the backend persists a reload directive when a
+// NEW staged copy of the extension is on disk (scripts/cookie_auto_install.ps1
+// -ReloadOnly POSTs it after staging; Chrome does NOT hot-reload a loaded
+// unpacked folder on file change). This SW reloads ITSELF in place via
+// chrome.runtime.reload() — no new tabs, no windows, no focus steal; the
+// extension id, permissions and every user tab are kept. Checked on a 30s
+// alarm AND whenever a content-script message arrives (an editor note right
+// after the user opens the clip editor triggers it promptly). The fresh SW
+// then confirms with reload-done (which clears the directive) and reloads
+// open editor tabs so the NEW content script runs on them. Every fetch is
+// fire-and-forget: a failed status call must never break the cookie bridge.
+// ---------------------------------------------------------------------------
+const RELOAD_CHECK_ALARM = 'vodrip-reload-check';
+const RELOAD_CHECK_PERIOD_MIN = 0.5;
+const RELOAD_EDITOR_URLS = [
+  'https://clips.twitch.tv/create*',
+  'https://www.twitch.tv/videos/*',
+];
+
+const armReloadCheck = () => {
+  chrome.alarms.create(RELOAD_CHECK_ALARM, {
+    periodInMinutes: RELOAD_CHECK_PERIOD_MIN,
+  });
+};
+
+/** Reload open clip-editor tabs so the freshly-registered content script
+ * runs on them. The manifest host_permissions (https://*.twitch.tv/*)
+ * already cover both editor origins, so querying their URLs needs no
+ * extra permission. */
+const reloadEditorTabs = async () => {
+  try {
+    const tabs = await chrome.tabs.query({ url: RELOAD_EDITOR_URLS });
+    for (const tab of tabs) {
+      try {
+        await chrome.tabs.reload(tab.id);
+      } catch {
+        // tab closed between query and reload — ignore
+      }
+    }
+  } catch {
+    // tabs API unavailable — the next check retries
+  }
+};
+
+/** Fresh-SW confirmation: POST reload-done so the backend clears the
+ * directive. The backend only clears when the version matches its staged
+ * copy, so a clear is the proof this SW IS the new version. */
+const confirmReloadDone = (version) => {
+  (async () => {
+    try {
+      await fetch(`${await getApiBase()}/api/extension/reload-done`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version }),
+      });
+    } catch {
+      // backend offline — the directive stays; the next check retries
+    }
+  })();
+};
+
+/** One directive check: fetch status; when reloadTo is set and differs from
+ * our manifest version, reload in place (the fresh SW then confirms and
+ * refreshes editor tabs). When it already matches, clear it and refresh the
+ * editor tabs. Never opens a tab or window. */
+const checkReloadDirective = async () => {
+  let body;
+  try {
+    const res = await fetch(`${await getApiBase()}/api/extension/status`);
+    if (!res.ok) return;
+    body = await res.json();
+  } catch {
+    return; // backend offline — the alarm retries
+  }
+  if (!body || !body.reloadTo) return;
+  const manifestVersion = chrome.runtime.getManifest().version;
+  if (body.reloadTo === manifestVersion) {
+    confirmReloadDone(manifestVersion);
+    reloadEditorTabs();
+    return;
+  }
+  chrome.runtime.reload();
+};
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) pushBridgeCookies();
+  if (alarm.name === RELOAD_CHECK_ALARM) checkReloadDirective();
 });
 
 // Update notification
 chrome.runtime.onInstalled.addListener(({ previousVersion, reason }) => {
   armHeartbeat();
+  armReloadCheck();
   pushBridgeCookies(); // initial push — don't wait for the first cookie change
   if (reason === 'update') {
     const currentVersion = chrome.runtime.getManifest().version;
@@ -113,8 +200,14 @@ chrome.runtime.onInstalled.addListener(({ previousVersion, reason }) => {
 
 chrome.runtime.onStartup.addListener(() => {
   armHeartbeat();
+  armReloadCheck();
   pushBridgeCookies();
 });
+
+// Boot-time directive check: a fresh SW (after chrome.runtime.reload())
+// must confirm and clear the directive WITHOUT waiting for the first alarm;
+// a normal boot with no directive is a single no-op fetch.
+checkReloadDirective();
 
 // TODO: use offscreen API to integrate implementation in chrome and firefox
 // Save file message listener for firefox
@@ -270,6 +363,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // unreliable anyway).
 chrome.runtime.onMessage.addListener((message) => {
   if (!message || !message.type) return;
+  // A content-script note means the user just opened the clip editor —
+  // check for a pending reload directive NOW instead of waiting for the
+  // 30s alarm (the new content script only runs after a self-reload).
+  checkReloadDirective();
   if (message.type === 'vodrip_note') {
     const { event, data } = message;
     if (!event) return;

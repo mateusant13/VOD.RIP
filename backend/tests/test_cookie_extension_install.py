@@ -250,3 +250,71 @@ def test_ps1_exit_contract_distinguishes_no_process_from_undriveable():
     assert "Test-AnyBrowserRunning" in src
     assert "exit 1" in src
     assert "exit 2" in src
+
+
+# --- zero-window reload directive -------------------------------------------
+# The SW self-reloads via chrome.runtime.reload() when the persisted
+# directive differs from its manifest version; the fresh SW confirms with
+# reload-done. These tests pin the backend half of that contract.
+
+def _directive_test_client():
+    from httpx import AsyncClient, ASGITransport
+
+    from app import app
+
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.mark.anyio
+async def test_extension_reload_directive_roundtrip(monkeypatch, tmp_path):
+    """status -> reload -> status(reloadTo set) -> reload-done mismatch keeps,
+    matching version clears; directive persists under the data dir."""
+    from routers import cookie_bridge as cb
+    from services.disk_hygiene import data_dir
+
+    monkeypatch.setenv("VODRIP_DATA_DIR", str(tmp_path))
+
+    async with _directive_test_client() as client:
+        st = await client.get("/api/extension/status")
+        assert st.status_code == 200
+        body = st.json()
+        assert body["ok"] is True
+        assert body["reloadTo"] is None
+        assert body["extensionId"] is None
+        assert body["version"], "status must resolve the bundled extension version"
+        version = body["version"]
+
+        r = await client.post("/api/extension/reload", json={"to": version})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        assert (data_dir() / cb._RELOAD_DIRECTIVE_FILE).is_file(), (
+            "directive must persist under the data dir"
+        )
+
+        st = await client.get("/api/extension/status")
+        assert st.json()["reloadTo"] == version
+
+        # A mismatched version must NOT clear the directive (the SW only
+        # confirms after its manifest version matches the staged copy).
+        r = await client.post("/api/extension/reload-done", json={"version": "0.0.0"})
+        assert r.status_code == 200
+        assert r.json()["cleared"] is False
+        st = await client.get("/api/extension/status")
+        assert st.json()["reloadTo"] == version
+
+        r = await client.post("/api/extension/reload-done", json={"version": version})
+        assert r.status_code == 200
+        assert r.json()["cleared"] is True
+        st = await client.get("/api/extension/status")
+        assert st.json()["reloadTo"] is None
+
+
+@pytest.mark.anyio
+async def test_extension_reload_requires_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("VODRIP_DATA_DIR", str(tmp_path))
+    async with _directive_test_client() as client:
+        for bad in ({}, {"to": ""}, {"to": "x" * 65}):
+            r = await client.post("/api/extension/reload", json=bad)
+            assert r.status_code == 422, f"expected 422 for {bad}"
+        st = await client.get("/api/extension/status")
+        assert st.json()["reloadTo"] is None
