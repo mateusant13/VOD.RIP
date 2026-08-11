@@ -93,24 +93,12 @@ const armHeartbeat = () => {
 };
 
 // ---------------------------------------------------------------------------
-// Zero-window version reload — the backend persists a reload directive when a
-// NEW staged copy of the extension is on disk (scripts/cookie_auto_install.ps1
-// -ReloadOnly POSTs it after staging; Chrome does NOT hot-reload a loaded
-// unpacked folder on file change). This SW reloads ITSELF in place via
-// chrome.runtime.reload() — no new tabs, no windows, no focus steal; the
-// extension id, permissions and every user tab are kept. Checked on a 30s
-// alarm AND whenever a content-script message arrives (an editor note right
-// after the user opens the clip editor triggers it promptly). The fresh SW
-// then confirms with reload-done (which clears the directive) and reloads
-// open editor tabs so the NEW content script runs on them. Every fetch is
-// fire-and-forget: a failed status call must never break the cookie bridge.
+// Zero-window version reload. The service worker reloads itself in place via
+// chrome.runtime.reload() when the backend has a newer staged copy. It never
+// opens, reloads, or otherwise touches user tabs.
 // ---------------------------------------------------------------------------
 const RELOAD_CHECK_ALARM = 'vodrip-reload-check';
 const RELOAD_CHECK_PERIOD_MIN = 0.5;
-const RELOAD_EDITOR_URLS = [
-  'https://clips.twitch.tv/create*',
-  'https://www.twitch.tv/videos/*',
-];
 
 const armReloadCheck = () => {
   chrome.alarms.create(RELOAD_CHECK_ALARM, {
@@ -118,28 +106,7 @@ const armReloadCheck = () => {
   });
 };
 
-/** Reload open clip-editor tabs so the freshly-registered content script
- * runs on them. The manifest host_permissions (https://*.twitch.tv/*)
- * already cover both editor origins, so querying their URLs needs no
- * extra permission. */
-const reloadEditorTabs = async () => {
-  try {
-    const tabs = await chrome.tabs.query({ url: RELOAD_EDITOR_URLS });
-    for (const tab of tabs) {
-      try {
-        await chrome.tabs.reload(tab.id);
-      } catch {
-        // tab closed between query and reload — ignore
-      }
-    }
-  } catch {
-    // tabs API unavailable — the next check retries
-  }
-};
-
-/** Fresh-SW confirmation: POST reload-done so the backend clears the
- * directive. The backend only clears when the version matches its staged
- * copy, so a clear is the proof this SW IS the new version. */
+/** Fresh-SW confirmation: clear the directive only for the matching version. */
 const confirmReloadDone = (version) => {
   (async () => {
     try {
@@ -154,10 +121,7 @@ const confirmReloadDone = (version) => {
   })();
 };
 
-/** One directive check: fetch status; when reloadTo is set and differs from
- * our manifest version, reload in place (the fresh SW then confirms and
- * refreshes editor tabs). When it already matches, clear it and refresh the
- * editor tabs. Never opens a tab or window. */
+/** Check the directive without opening or reloading any browser page. */
 const checkReloadDirective = async () => {
   let body;
   try {
@@ -171,7 +135,6 @@ const checkReloadDirective = async () => {
   const manifestVersion = chrome.runtime.getManifest().version;
   if (body.reloadTo === manifestVersion) {
     confirmReloadDone(manifestVersion);
-    reloadEditorTabs();
     return;
   }
   chrome.runtime.reload();
@@ -284,8 +247,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // ending at the VOD's last second settles a frame or two early,
             // and the old ±1s confirmation then failed and aborted the save
             // (seen live: 17:00-17:22 on a ~17:22 VOD never published).
-            // Tolerance: per-handle 3s, length delta 2s, and the site's hard
-            // 5..60s window rule — the LENGTH is what the editor enforces.
+            // Tolerance: per-handle 3s, length delta 2s, and Twitch's native
+            // 5..90s window rule (1:30 maximum) — LENGTH is enforced.
             const TOL = 3;
             const LEN_TOL = 2;
             const readWindow = () => {
@@ -312,7 +275,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     w &&
                     Math.abs(w.a - s) <= TOL && Math.abs(w.b - e) <= TOL &&
                     Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
-                    w.b - w.a >= 5 && w.b - w.a <= 60
+                    w.b - w.a >= 5 && w.b - w.a <= 90
                   ) {
                     resolve({ ok: true, valuetext: w.vt });
                     return;

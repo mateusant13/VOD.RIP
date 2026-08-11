@@ -40,7 +40,7 @@
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
   // VOD total length (the app sends vodrip_dur) — lets the editor-range
   // helper nudge the window off the VOD's last frame instead of failing.
-  const durSec = Number(params.get('vodrip_dur')) || 0;
+  const vodDurationSec = Number(params.get('vodrip_dur')) || 0;
   // The title the editor gets: the ORIGINAL one — vodrip_title (the app
   // sends the VOD's GraphQL title) else document.title minus the " - Twitch"
   // suffix. NEVER a "VOD.RIP …" default, and never a page-title artifact
@@ -108,30 +108,20 @@
         XPathResult.FIRST_ORDERED_NODE_TYPE,
         null,
       ).singleNodeValue;
-      // secondsifyClocks() rewrites the visible text to "Ns" — the ORIGINAL
-      // VOD-absolute time is preserved in data-vodrip-clock-orig for the
-      // ground-truth read + logging.
-      const orig = viaPath && viaPath.dataset.vodripClockOrig;
-      const t = orig || (viaPath && viaPath.textContent ? viaPath.textContent.trim() : '');
+      const t = viaPath && viaPath.textContent ? viaPath.textContent.trim() : '';
       if (t) return t;
       const el = [...document.querySelectorAll('main strong')].find((x) =>
         /^\s*\d+:\d{2}\s*\/\s*\d+:\d{2}\s*$/.test((x.textContent || '').trim()),
       );
-      return el ? (el.dataset.vodripClockOrig || el.textContent.trim()) : null;
+      return el ? el.textContent.trim() : null;
     } catch { return null; }
   };
-  // USER-MANDATED (2026-08-10): the clock on screen IS the "input" in the
-  // user's model — "16:48 / 1:30" (VOD-absolute position) reads as 16
-  // minutes being input, so it must NEVER display minutes. The clock must
-  // show the clip DURATION in seconds (5..60 — Twitch's hard window rule).
-  // REWRITE every clock candidate's textContent to "Ns" (e.g. "12s"), keep
-  // the ORIGINAL text in data-vodrip-clock-orig for ground-truth logging,
-  // and HIDE the editor's position-setter buttons ("Ajustar momento de
-  // início/encerramento para 16:48" — labels that read as minute inputs).
-  // Re-asserted by MutationObserver + 1s interval so a React re-render
-  // can't resurrect minutes on screen.
+  // Ground-truth display: leave Twitch's native "x / 1:30" element intact.
+  // x is the current time shown by the clip editor and 1:30 is Twitch's
+  // maximum sliding-window length; changing the selected window does not
+  // change this display. It is the user's visual correctness check, so never
+  // hide, rewrite, recolor, or continuously mutate it.
   const CLOCK_RE = /^\s*\d{1,2}:\d{2}\s*\/\s*\d{1,2}:\d{2}\s*$/;
-  const SETTER_RE = /ajustar momento de (in[ií]cio|encerramento)|set (?:clip )?(?:start|end) (?:moment|time)/i;
   const clockCandidates = () => {
     const out = [];
     try {
@@ -144,74 +134,12 @@
       ).singleNodeValue;
       if (viaPath) out.push(viaPath);
     } catch { /* ignore */ }
-    // Loose fallback (covers the /videos editor overlay DOM and any
-    // re-render variant): any strong shaped "MM:SS / M:SS" — the user's
-    // exact "16:48 / 1:30" pattern.
     for (const s of document.querySelectorAll('strong')) {
       if (CLOCK_RE.test((s.textContent || '').trim()) && !out.includes(s)) out.push(s);
     }
     return out;
   };
-  // Duration in seconds for the clock rewrite: the slider's accepted
-  // window (aria-valuetext) when parseable, else the requested window.
-  const clockDurationSec = () => {
-    try {
-      const slider = document.querySelector('[role="slider"]');
-      const vt = slider && slider.getAttribute('aria-valuetext');
-      const w = vt && parseValuetext(vt);
-      if (w && w.dur >= 5 && w.dur <= 60) return Math.round(w.dur);
-    } catch { /* ignore */ }
-    return Math.max(0, Math.round(endSec - startSec));
-  };
-  const isClockSecondsified = () => {
-    const els = clockCandidates();
-    if (!els.length) return true; // not rendered yet — nothing visible
-    const want = `${clockDurationSec()}s`;
-    return els.every((el) => {
-      const t = (el.textContent || '').trim();
-      return t === want || t === `${want} ` || t.endsWith(want);
-    });
-  };
-  let clockObserver = null;
-  let clockSecondsTimer = null;
-  const secondsifyClocks = () => {
-    try {
-      if (!document.getElementById('vodrip-clock-hide')) {
-        const st = document.createElement('style');
-        st.id = 'vodrip-clock-hide';
-        st.textContent =
-          '[data-vodrip-setter-hidden="1"]{display:none !important;visibility:hidden !important}';
-        (document.head || document.documentElement).appendChild(st);
-      }
-      const dur = clockDurationSec();
-      for (const el of clockCandidates()) {
-        if (!el.dataset.vodripClockOrig) el.dataset.vodripClockOrig = el.textContent || '';
-        if ((el.textContent || '').trim() !== `${dur}s`) el.textContent = `${dur}s`;
-        el.style.color = '#53fc18';
-        el.style.fontWeight = '700';
-      }
-      // The position-setter buttons ("Ajustar momento de início para
-      // 16:48") read as minute inputs — never show them.
-      for (const b of document.querySelectorAll('button')) {
-        if (SETTER_RE.test((b.innerText || '').trim())) {
-          b.setAttribute('data-vodrip-setter-hidden', '1');
-        }
-      }
-      if (!clockObserver) {
-        clockObserver = new MutationObserver(() => {
-          secondsifyClocks();
-        });
-        clockObserver.observe(document.body || document.documentElement, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-        });
-      }
-      if (!clockSecondsTimer) {
-        clockSecondsTimer = setInterval(secondsifyClocks, 1000);
-      }
-    } catch { /* ignore */ }
-  };
+  const clockVisible = () => clockCandidates().length > 0;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // Debugging event sequence: every flow step is POSTed to the app's
   // clip-events sink (same API base as the cookie bridge) so a clip attempt
@@ -311,7 +239,7 @@
       return 'storage-unreadable';
     }
   };
-  const rangeViaMainWorld = (startSec, endSec, durSec) =>
+  const rangeViaMainWorld = (startSec, endSec, vodDurationSec) =>
     new Promise((resolve) => {
       const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
       const onMsg = (ev) => {
@@ -328,7 +256,7 @@
       }, 12000);
       window.addEventListener('message', onMsg);
       try {
-        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec, dur: durSec }, '*');
+        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec, dur: vodDurationSec }, '*');
       } catch (err) {
         clearTimeout(timer);
         window.removeEventListener('message', onMsg);
@@ -473,20 +401,19 @@
    * {startOffset, endOffset} — the same contract a real handle drag fires.
    * We invoke the callbacks, then poll the slider's valuetext to report what
    * the editor ACTUALLY accepted (it clamps to the VOD + the site's
-   * 5..60s window length limits). No seek: the callbacks set the window
-   * offsets directly (the editor accepted a 500–520s window while its
-   * aria-valuemax was still 95.3). Returns '' on confirmed success, else a
+   * 5..90s native window length limits). No seek: the callbacks set the
+   * window offsets directly. Returns '' on confirmed success, else a
    * human-readable reason (the caller refuses to save on failure).
    */
-  const setEditorRange = async (scope, startSec, endSec, durSec) => {
+  const setEditorRange = async (scope, startSec, endSec, vodDurationSec) => {
     const len = endSec - startSec;
-    // Twitch's own hard rule (the user's ground truth): the editor only
-    // accepts 5..60s windows, and its slider spans at most ~1:30 around the
-    // anchor. Refuse early instead of fighting the editor for a doomed range.
-    if (len < 5 || len > 60) {
+    // Twitch's native hard rule: the editor accepts 5..90s windows
+    // (1:30 maximum). The app may choose a smaller product limit, but the
+    // extension must match what the Twitch slider actually accepts.
+    if (len < 5 || len > 90) {
       note('ext_range_refused', { startSec, endSec, len });
       setStatus(
-        `Trecho de ${Math.round(len)}s fora do limite da Twitch (5..60s) — ajuste o clipe no app e tente de novo.`,
+        `Trecho de ${Math.round(len)}s fora do limite da Twitch (5..90s) — ajuste o clipe no app e tente de novo.`,
         'err',
       );
       return 'fora-do-limite';
@@ -501,14 +428,14 @@
     // The fiber drag must run in the page's MAIN world (the isolated world
     // cannot see the __reactFiber$ expando); the helper polls the
     // valuetext and reports what the editor ACTUALLY accepted.
-    const res = await rangeViaMainWorld(startSec, endSec, durSec);
+    const res = await rangeViaMainWorld(startSec, endSec, vodDurationSec);
     note('ext_range', {
       ok: !!res.ok,
       targetStart: startSec,
       targetEnd: endSec,
-      durSec,
+      vodDurationSec,
       playback: playbackTimeText(),
-      clockHidden: isClockSecondsified(),
+      clockVisible: clockVisible(),
       valuetext: res.ok ? (res.valuetext || null) : null,
       reason: res.ok ? null : (res.reason || null),
     });
@@ -564,6 +491,22 @@
     if (a == null || b == null) return null;
     return { start: a, end: b, dur: b - a };
   };
+  const selectedWindow = (scope = document) => {
+    const slider = (scope || document).querySelector('[role="slider"]') ||
+      document.querySelector('[role="slider"]');
+    return slider ? parseValuetext(slider.getAttribute('aria-valuetext')) : null;
+  };
+  const confirmSelectedWindow = (scope, start, end) => waitFor(() => {
+    const w = selectedWindow(scope);
+    const len = end - start;
+    return w &&
+      Math.abs(w.start - start) <= 3 &&
+      Math.abs(w.end - end) <= 3 &&
+      Math.abs(w.dur - len) <= 1 &&
+      w.dur >= 5 && w.dur <= 90
+      ? w
+      : null;
+  }, 5000, 250);
   const renderDurationBadge = () => {
     const slider = document.querySelector('[role="slider"]');
     if (!slider) return false;
@@ -572,7 +515,7 @@
     // USER-MANDATED (2026-08-10): minutes-shaped values must NEVER appear
     // on the editor screen — the "16:48 to 17:00" window line read as a
     // minutes input. The badge shows the DURATION IN SECONDS ONLY (the
-    // input is 5..60s by Twitch's rule); the window line is gone.
+    // input is the actual selected slider duration; the native maximum is 90s.
     durationBadge.querySelector('[data-vodrip-badge-sec]').textContent = `Duração: ${w.dur}s`;
     return true;
   };
@@ -601,7 +544,7 @@
     // Static inner structure (no user data) — seconds only, large.
     durationBadge.innerHTML =
       '<div data-vodrip-badge-sec style="font-size:30px;font-weight:800;color:#53fc18;letter-spacing:1px;">Duração: —</div>' +
-      '<div style="font-size:13px;color:#f4f4f5;opacity:0.9;">clipe de 5 a 60 segundos</div>';
+      '<div style="font-size:13px;color:#f4f4f5;opacity:0.9;">janela Twitch: 5 a 90 segundos</div>';
     document.documentElement.appendChild(durationBadge);
     const observeSlider = () => {
       const slider = document.querySelector('[role="slider"]');
@@ -754,7 +697,7 @@
           catch (err) { resolve('postMessage-threw:' + err); }
         });
         census.push('helper-echo: ' + echo);
-        const res = await rangeViaMainWorld(tStart, tEnd, durSec);
+        const res = await rangeViaMainWorld(tStart, tEnd, vodDurationSec);
         windowTest = res.ok
           ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)})`
           : `NOT CONFIRMED (${res.reason || '?'})`;
@@ -801,7 +744,6 @@
   if (location.hostname === 'clips.twitch.tv') {
     (async () => {
       injectMainHelper();
-      secondsifyClocks();
       const editorInput = await waitFor(
         () =>
           find([
@@ -835,7 +777,7 @@
         setReactValue(editorInput, clipTitle);
         note('ext_title', { title: clipTitle, flow: 'create' });
       }
-      const rangeErr = await setEditorRange(document, startSec, endSec, durSec);
+      const rangeErr = await setEditorRange(document, startSec, endSec, vodDurationSec);
       let manualFallback = false;
       if (rangeErr) {
         // NEVER a silent failure: the panel tells the user exactly what to
@@ -850,6 +792,29 @@
           'err',
         );
       } else {
+        const confirmedWindow = await confirmSelectedWindow(document, startSec, endSec);
+        if (!confirmedWindow) {
+          note('ext_error', {
+            step: 'range-before-save',
+            reason: 'slider-changed-before-save',
+            targetStart: startSec,
+            targetEnd: endSec,
+            valuetext: selectedWindow()?.start != null
+              ? `${selectedWindow().start} to ${selectedWindow().end}`
+              : null,
+          });
+          setStatus(
+            `O trecho mudou antes do save — nada foi salvo. Ajuste para ${Math.round(endSec - startSec)}s e tente novamente.`,
+            'err',
+          );
+          return;
+        }
+        note('ext_range_confirmed', {
+          startSec,
+          endSec,
+          durationSec: confirmedWindow.dur,
+          valuetext: confirmedWindow.start + ' to ' + confirmedWindow.end,
+        });
         setStatus(`Salvando clique de ${Math.round(endSec - startSec)}s…`);
         // Wait for the Save button to become enabled (the editor loads the
         // VOD frame preview first; clicking too early is a silent no-op).
@@ -936,7 +901,6 @@
 
   (async () => {
     injectMainHelper();
-    secondsifyClocks();
     // 1. Player — needs real duration before we can seek.
     const video = await waitFor(() => {
       const v = document.querySelector('video');
@@ -1042,7 +1006,7 @@
       return;
     }
     await sleep(1500); // let the editor settle
-    const rangeErr = await setEditorRange(editor, startSec, endSec, durSec);
+    const rangeErr = await setEditorRange(editor, startSec, endSec, vodDurationSec);
     if (rangeErr) {
       setStatus(
         `Clique de ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${rangeErr}) — nada foi publicado. Ajuste o trecho no editor e publique você mesmo.`,
@@ -1051,6 +1015,27 @@
       closeAfterFlow(2000);
       return;
     }
+    const confirmedWindow = await confirmSelectedWindow(editor, startSec, endSec);
+    if (!confirmedWindow) {
+      note('ext_error', {
+        step: 'range-before-publish',
+        reason: 'slider-changed-before-publish',
+        targetStart: startSec,
+        targetEnd: endSec,
+      });
+      setStatus(
+        `O trecho mudou antes do publish — nada foi publicado. Ajuste para ${Math.round(endSec - startSec)}s e tente novamente.`,
+        'err',
+      );
+      closeAfterFlow(2000);
+      return;
+    }
+    note('ext_range_confirmed', {
+      startSec,
+      endSec,
+      durationSec: confirmedWindow.dur,
+      valuetext: confirmedWindow.start + ' to ' + confirmedWindow.end,
+    });
 
     // 4. Title — the editor REQUIRES one ("Adicione um título
     // (obrigatório)"); fill it with the ORIGINAL title (vodrip_title from
