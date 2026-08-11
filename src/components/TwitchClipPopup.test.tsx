@@ -36,6 +36,7 @@ function renderPopup() {
       broadcasterLogin="somebody"
       vodId="123456789"
       playheadSec={120}
+      vodTitle="jantando o guiven parte 1"
       vodDurationSec={600}
       zIndex={10}
       onClose={vi.fn()}

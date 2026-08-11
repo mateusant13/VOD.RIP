@@ -41,16 +41,9 @@
   // VOD total length (the app sends vodrip_dur) — lets the editor-range
   // helper nudge the window off the VOD's last frame instead of failing.
   const vodDurationSec = Number(params.get('vodrip_dur')) || 0;
-  // The title the editor gets: the ORIGINAL one — vodrip_title (the app
-  // sends the VOD's GraphQL title) else document.title minus the " - Twitch"
-  // suffix. NEVER a "VOD.RIP …" default, and never a page-title artifact
-  // ("Criar clipe - Twitch") — an unusable fallback stays '' so the write
-  // is skipped rather than typing a fake title.
-  const title =
-    (params.get('vodrip_title') || '').trim() ||
-    (document.title || '').replace(/\s*-\s*Twitch\s*$/i, '').trim() ||
-    '';
-  const clipTitle = /^(criar clipe|create clip|clips?|twitch)$/i.test(title) ? '' : title;
+  // Only the app-supplied original VOD title is allowed. Never derive a title
+  // from Twitch's page chrome and never invent a VOD.RIP/custom fallback.
+  const clipTitle = (params.get('vodrip_title') || '').trim();
 
   // document_start on clips.twitch.tv may run before <html> exists.
   if (!document.documentElement) {
@@ -204,7 +197,7 @@
         type: 'vodrip_record',
         payload: {
           url: clipUrl,
-          title,
+          title: clipTitle,
           channel: ch,
           vod_id: params.get('vodID') || (vodMatch ? vodMatch[1] : undefined),
           offset_sec: end > 0 ? Math.floor(end) : undefined,
@@ -237,11 +230,17 @@
       try { window.close(); } catch { /* ignore */ }
     }
   };
+  // Twitch's create flow first lands on /create/<slug> before the public
+  // canonical URL is available. Treat that route as success as well.
+  const publishedSlugFromPath = () => {
+    const match = (location.pathname || '').match(/^\/(?:create\/)?([A-Za-z][A-Za-z0-9_-]+)$/);
+    return match && match[1].toLowerCase() !== 'create' ? match[1] : null;
+  };
   note('ext_start', {
     hostname: location.hostname,
     startSec,
     endSec,
-    title,
+    title: clipTitle,
     playback: playbackTimeText(),
     diag: params.get('vodrip_diag') === '1',
     closeMode: (params.get('vodrip_close') || '1') === '0' ? 'stay-open' : 'close',
@@ -367,9 +366,17 @@
       [...document.querySelectorAll('[role="progressbar"], [role="status"]')]
         .some((el) => /salvando|saving|processando|processing/i.test(el.innerText || ''));
     while (!dialog && !skipBtn && Date.now() <= detectDeadline) {
+      if (publishedSlugFromPath()) {
+        note('ext_modal', { action: 'none', modalText: null, reason: 'published-route' });
+        return;
+      }
       dialog = findDialog();
       skipBtn = findSkipPageWide();
       if (!skipBtn) await sleep(400);
+    }
+    if (publishedSlugFromPath()) {
+      note('ext_modal', { action: 'none', modalText: null, reason: 'published-route' });
+      return;
     }
     if (dialog) modalText = (dialog.innerText || '').trim().slice(0, 120);
     if (!dialog && !skipBtn && !bodyHasModalText() && !bodyHasProcessingText()) {
@@ -793,12 +800,9 @@
         );
         return;
       }
-      // Fill the title with the ORIGINAL one (vodrip_title from the app =
-      // the VOD's GraphQL title, else document.title). The editor REQUIRES
-      // a title ("Adicione um título (obrigatório)") — leaving it empty
-      // blocks the save. Never typed when the fallback is a page-title
-      // artifact (clipTitle ''). The wait above doubles as the
-      // editor-ready + error-page check.
+      // Fill only the original title supplied by the app. The editor REQUIRES
+      // one ("Adicione um título (obrigatório)"); an absent title stays empty
+      // so the flow cannot publish a custom or page-title artifact.
       if (clipTitle) {
         setReactValue(editorInput, clipTitle);
         note('ext_title', { title: clipTitle, value: editorInput.value || '', flow: 'create' });
@@ -864,20 +868,19 @@
           closeAfterFlow();
           return;
         }
-        note('ext_save_clicked', { startSec, endSec, title });
+        note('ext_save_clicked', { startSec, endSec, title: clipTitle });
         await sleep(1200);
         click(save);
         // The portrait-layout modal blocks EVERY save — dismiss it before
         // the publish watcher below starts (else the watcher times out and
         // no clip is ever created). Same guard on the /videos publish path.
         await dismissPortraitModal();
-      // Success = the SPA navigates to /<slug>, or the editor reaches its
-      // post-publish state ("Copiar Link"). /create and /clips/* are the
-      // editor itself and never a success navigation. Save is reached only
-      // after the selected window was confirmed above.
-      const slugRe = /^\/(?!create$)(?!clips(?:\/|$))[A-Za-z][A-Za-z0-9_-]+$/;
+      // Success = the SPA navigates to /create/<slug> before it exposes the
+      // canonical /<slug> URL, or the editor reaches "Copiar Link". Save is
+      // reached only after the selected window was confirmed above.
       const published = await waitFor(() => {
-        if (location.pathname.match(slugRe)) return `https://clips.twitch.tv${location.pathname}`;
+        const slug = publishedSlugFromPath();
+        if (slug) return `https://clips.twitch.tv/${slug}`;
         const copyBtn = [...document.querySelectorAll('button')].find((b) =>
           /copiar link|copy link/i.test((b.innerText || '').trim()),
         );
@@ -893,8 +896,8 @@
         recordPublishedClip(clipUrl || '');
         setStatus(
           clipUrl
-            ? `Clip publicado ✓\n${title}\n${clipUrl}`
-            : `Clip publicado ✓\n${title}`,
+            ? `Clip publicado ✓\n${clipTitle}\n${clipUrl}`
+            : `Clip publicado ✓\n${clipTitle}`,
           'ok',
         );
         closeAfterFlow(1500);
@@ -902,7 +905,7 @@
       }
       setStatus(
         'Save clicado, aguardando processamento… ' +
-          (title ? `\n${title}` : '') + '\n(se não aparecer em instantes, confira se o clipe foi criado)',
+          (clipTitle ? `\n${clipTitle}` : '') + '\n(se não aparecer em instantes, confira se o clipe foi criado)',
         'err',
       );
       closeAfterFlow(2000);
@@ -1012,7 +1015,7 @@
       note('ext_error', { step: 'editor-dialog', reason: 'missing' });
       setStatus(
         'Não consegui abrir o editor (faça login na Twitch nesta aba e tente de novo).\nTítulo: ' +
-          (title || '(vazio)') +
+          (clipTitle || '(vazio)') +
           `\nClique: ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)})`,
         'err',
       );
@@ -1051,10 +1054,9 @@
       valuetext: confirmedWindow.start + ' to ' + confirmedWindow.end,
     });
 
-    // 4. Title — the editor REQUIRES one ("Adicione um título
-    // (obrigatório)"); fill it with the ORIGINAL title (vodrip_title from
-    // the app, else document.title minus " - Twitch"). Never typed when
-    // the fallback is a page-title artifact (clipTitle '').
+    // 4. Title — fill only the original title supplied by the app. The editor
+    // REQUIRES one ("Adicione um título (obrigatório)"); without it, leave the
+    // field empty rather than inventing a custom or page-title artifact.
     if (clipTitle) {
       const titleInput =
         (editor && editor.querySelector(
@@ -1097,7 +1099,7 @@
       closeAfterFlow();
       return;
     }
-    note('ext_publish_clicked', { startSec, endSec, title });
+    note('ext_publish_clicked', { startSec, endSec, title: clipTitle });
     setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
     await sleep(1200);
     click(publish);
@@ -1125,14 +1127,14 @@
       recordPublishedClip(clipUrl);
       setStatus(
         clipUrl
-          ? `Clip publicado ✓\n${title}\n${clipUrl}`
-          : `Clip publicado ✓\n${title}`,
+          ? `Clip publicado ✓\n${clipTitle}\n${clipUrl}`
+          : `Clip publicado ✓\n${clipTitle}`,
         'ok',
       );
       closeAfterFlow(1500);
     } else {
       setStatus(
-        'Publish clicado — aguardando processamento…\n' + (title || ''),
+        'Publicando clip…\n' + (clipTitle || ''),
         'err',
       );
       closeAfterFlow(2000);

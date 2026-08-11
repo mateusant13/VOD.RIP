@@ -179,9 +179,11 @@ export function openTwitchClipEditorInBrowser(
   broadcasterLogin: string,
   startSec: number,
   endSec: number,
-  title?: string,
+  title: string,
   vodDurationSec?: number,
 ): void {
+  const clipTitle = title.trim();
+  if (!clipTitle) throw new Error('Original VOD title is required to create a Twitch clip');
   const p = new URLSearchParams({
     vodrip_clip: '1',
     vodrip_start: String(Math.max(0, Math.floor(startSec))),
@@ -190,8 +192,8 @@ export function openTwitchClipEditorInBrowser(
     // keep the Twitch tab open after the flow so the editor + published clip
     // stay visible. Default (absent) is close, per the window rule.
     vodrip_close: '0',
+    vodrip_title: clipTitle,
   });
-  if (title) p.set('vodrip_title', title);
   // VOD total length — the editor clamps the clip window at the VOD's last
   // frame, so the extension needs it to nudge the window off the edge
   // instead of failing the confirmation (see background.js edge retry).
@@ -200,7 +202,7 @@ export function openTwitchClipEditorInBrowser(
   }
   const url =
     `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
-  reportClipEvent('browser_open', { url, startSec, endSec, title: title ?? null });
+  reportClipEvent('browser_open', { url, startSec, endSec, title: clipTitle });
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
