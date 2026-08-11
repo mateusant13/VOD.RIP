@@ -34,7 +34,6 @@ import { useI18n } from '../i18n';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
-  TWITCH_CLIP_TITLE_MAX,
   clampClipSelection,
   initialClipSelection,
   openTwitchClipEditorInBrowser,
@@ -123,9 +122,8 @@ interface TwitchClipPopupProps {
    * (end > start), the popup window centres on it and the initial clip
    * selection IS the trim — the clip comes from where the user pointed. */
   anchorRange?: { start: number; end: number };
-  /** VOD/live title — the clip title defaults to it (the user requires the
-   * live's title verbatim, never a "VOD.RIP …" default). */
-  vodTitle?: string;
+  /** Original VOD title; every browser clip uses this title verbatim. */
+  vodTitle: string;
   zIndex: number;
   onClose: () => void;
   /** Volume the popup should start at — inherited from the opening preview
@@ -173,11 +171,9 @@ export default function TwitchClipPopup({
     setLastEndpoint(which);
   }, []);
   const selLen = Math.max(0, selection.end - selection.start);
-  // User-chosen clip title — becomes the clip's Twitch title and the local
-  // Defaults to the VOD/live title (user-mandated: the clip title is the
-  // live's title, never a "VOD.RIP …" placeholder). Empty only when the
-  // caller has no title either — then Twitch auto-titles.
-  const [clipTitle, setClipTitle] = useState(vodTitle ?? '');
+  // The browser flow never accepts a user-supplied/custom title. The title
+  // comes from the VOD metadata and is passed to Twitch unchanged.
+  const clipTitle = vodTitle.trim();
 
   // Floating panel position (draggable via the header, like the other popups).
   const [position, setPosition] = useState(() => ({
@@ -625,6 +621,10 @@ export default function TwitchClipPopup({
       showClipNotice('error', err);
       return;
     }
+    if (!clipTitle) {
+      showClipNotice('error', t('Original VOD title unavailable'));
+      return;
+    }
     try {
       const status = await apiGet<{
         paired: boolean;
@@ -689,9 +689,9 @@ export default function TwitchClipPopup({
       startSec: sel.start,
       endSec: sel.end,
       durationSec: sel.end - sel.start,
-      title: clipTitle.trim() || null,
+      title: clipTitle,
     });
-    openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle.trim() || undefined, vodDurationSec);
+    openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle, vodDurationSec);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
   }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
 
@@ -701,14 +701,17 @@ export default function TwitchClipPopup({
   const selEndFrac = secToFrac(selection.end, railView) * 100;
 
   const createDisabled = windowTooShort
+    || !clipTitle
     || selLen < TWITCH_CLIP_MIN_SEC || selLen > TWITCH_CLIP_MAX_SEC;
-  const createDisabledTitle = windowTooShort
-    ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
-    : selLen > TWITCH_CLIP_MAX_SEC
-      ? t('Trim the selection to {max}s or less', { max: TWITCH_CLIP_MAX_SEC })
-      : selLen < TWITCH_CLIP_MIN_SEC
-        ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
-        : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
+  const createDisabledTitle = !clipTitle
+    ? t('Original VOD title unavailable')
+    : windowTooShort
+      ? t('The {seconds}s window is too short to clip (min {min}s)', { seconds: Math.round(winLen), min: TWITCH_CLIP_MIN_SEC })
+      : selLen > TWITCH_CLIP_MAX_SEC
+        ? t('Trim the selection to {max}s or less', { max: TWITCH_CLIP_MAX_SEC })
+        : selLen < TWITCH_CLIP_MIN_SEC
+          ? t('Select at least {min}s', { min: TWITCH_CLIP_MIN_SEC })
+          : t("Open Twitch's clip editor — {len}s ending at {time}", { len: Math.round(selLen), time: formatHmsFull(selection.end) });
 
   // Keep the drag-offset ref in sync with the applied position — posRef was
   // never written, so every grab after the first offset from the INITIAL
@@ -1054,21 +1057,20 @@ export default function TwitchClipPopup({
           <span
             className="text-[9px] font-mono w-11 shrink-0 text-right text-zinc-300 tabular-nums self-center"
             title={t('Selected clip length')}
+            data-clip-duration-seconds={Math.round(selLen)}
           >
-            {formatHmsFull(selLen)}
+            {Math.round(selLen)}s
           </span>
         </div>
         <div className="flex items-center gap-2">
           <input
             type="text"
             value={clipTitle}
-            onChange={(e) => setClipTitle(e.target.value)}
-            maxLength={TWITCH_CLIP_TITLE_MAX}
-            placeholder={t('Clip title (optional — used as the file name)')}
-            aria-label={t('Clip title')}
+            readOnly
+            aria-label={t('Original VOD title')}
             autoComplete="off"
             spellCheck={false}
-            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-[#9146FF]"
+            className="flex-1 min-w-0 bg-zinc-950 border-2 border-zinc-800 text-white px-2 py-1 text-[10px] font-mono opacity-80 cursor-not-allowed"
           />
         </div>
         <div className="flex items-center justify-between gap-2">

@@ -7193,7 +7193,7 @@ export default function App() {
           playheadSec={twitchClipPopup.playheadSec}
           vodDurationSec={twitchClipPopup.vodDurationSec}
           anchorRange={twitchClipPopup.anchorRange}
-          vodTitle={videoInfo?.title ?? undefined}
+          vodTitle={videoInfo?.title ?? ''}
           zIndex={EXPLORE_POPUP_Z + (popupZOrder[TWITCH_CLIP_POPUP_ID] ?? 0)}
           initialVolume={previewVolumeRef.current}
           onClose={() => { setTwitchClipPopup(null); dropPopupZ(TWITCH_CLIP_POPUP_ID); }}

@@ -2,7 +2,7 @@
   "name": "VOD RIP Get Cookies",
   "short_name": "VOD RIP Cookies",
   "description": "VOD.RIP companion — export login cookies for YouTube, Twitch and Kick only, and keep the app paired locally.",
-  "version": "0.8.21",
+  "version": "0.8.23",
   "manifest_version": 3,
   "permissions": ["activeTab", "alarms", "cookies", "downloads", "notifications", "clipboardWrite", "storage", "scripting"],
   "host_permissions": [
