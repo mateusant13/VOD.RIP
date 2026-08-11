@@ -13,11 +13,11 @@
 // scopes needed (a browser-login token never carries clip scopes anyway).
 //
 // ponytail: the editor's DOM is Twitch's private React tree and changes without
-// notice; every selector below is a candidate list with graceful fallbacks
-// (status panel tells the user what to finish by hand). Upgrade path: drive
-// the range handles precisely once the live editor DOM is confirmed; until
-// then the site's default clip window around offsetSeconds is used, and the
-// panel shows the requested start → end.
+// notice; candidate selectors have graceful fallbacks and the status panel
+// reports actionable failures. The MAIN-world fiber callbacks are the source
+// of truth for the selected absolute VOD range; the visible clock is rewritten
+// to the confirmed 5–60 second duration so users never read VOD positions as
+// clip lengths.
 (async () => {
   if (window.top !== window) return; // the player lives in the top frame
 
@@ -109,6 +109,8 @@
         null,
       ).singleNodeValue;
       const t = viaPath && viaPath.textContent ? viaPath.textContent.trim() : '';
+      const original = viaPath && viaPath.dataset.vodripOriginalClock;
+      if (original) return original;
       if (t) return t;
       const el = [...document.querySelectorAll('main strong')].find((x) =>
         /^\s*\d+:\d{2}\s*\/\s*\d+:\d{2}\s*$/.test((x.textContent || '').trim()),
@@ -116,13 +118,12 @@
       return el ? el.textContent.trim() : null;
     } catch { return null; }
   };
-  // Ground-truth display: leave Twitch's native "x / 1:30" element intact.
-  // x is the current time shown by the clip editor and 1:30 is Twitch's
-  // maximum sliding-window length; changing the selected window does not
-  // change this display. It is the user's visual correctness check, so never
-  // hide, rewrite, recolor, or continuously mutate it.
+  // Twitch renders the selected clip as VOD-absolute m:ss values (for
+  // example "12:31 / 1:30"). Users read those as clip input values, so keep
+  // the real slider contract in seconds on-screen and hide duplicate setter
+  // labels that repeat the absolute clock.
   const CLOCK_RE = /^\s*\d{1,2}:\d{2}\s*\/\s*\d{1,2}:\d{2}\s*$/;
-  const clockCandidates = () => {
+  const clockNodes = () => {
     const out = [];
     try {
       const viaPath = document.evaluate(
@@ -139,7 +140,30 @@
     }
     return out;
   };
-  const clockVisible = () => clockCandidates().length > 0;
+  const clockVisible = () => clockNodes().length > 0;
+  const hideAbsoluteTimeControls = () => {
+    for (const button of document.querySelectorAll('button, [role="button"]')) {
+      if (!/ajustar momento de (início|encerramento)|set (clip )?(start|end)|set (the )?(start|end) time/i.test(
+        (button.innerText || '').trim(),
+      )) continue;
+      button.style.display = 'none';
+      button.setAttribute('aria-hidden', 'true');
+    }
+  };
+  const secondsifyClock = () => {
+    const w = selectedWindow();
+    if (!w || !Number.isFinite(w.dur) || w.dur < 5) return;
+    const duration = Math.max(5, Math.min(60, Math.round(w.dur)));
+    for (const clock of clockNodes()) {
+      if (!clock.dataset.vodripOriginalClock) {
+        clock.dataset.vodripOriginalClock = (clock.textContent || '').trim();
+      }
+      clock.textContent = `${duration}s`;
+      clock.setAttribute('aria-label', `Duração do clipe: ${duration} segundos`);
+      clock.dataset.vodripSecondsClock = '1';
+    }
+    hideAbsoluteTimeControls();
+  };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // Debugging event sequence: every flow step is POSTed to the app's
   // clip-events sink (same API base as the cookie bridge) so a clip attempt
@@ -302,9 +326,10 @@
    * clipe... N%" + layout-version tabs); its "skip" button ("Salvar sem
    * editar" / "Save without editing" / "Continuar sem editar" / "Skip (the)
    * (portrait) layout") only becomes clickable once processing finishes —
-   * observed live at >5min for a 34-min VOD (2026-08-10). Two phases:
-   * detect the dialog fast (15s), then poll for the button with a long
-   * budget. Fallback: the modal's OWN confirm button (/salvar clip|save
+   * observed live at >5min for a 34-min VOD (2026-08-10). Phase 1 waits
+   * through the editor's processing state; phase 2 polls the modal button
+   * with a long budget.
+   * Fallback: the modal's OWN confirm button (/salvar clip|save
    * clip/i) scoped to the dialog element so the page's Save button is
    * never clicked twice; a page-wide skip-button search covers a modal
    * rendered without role=dialog (the skip text is unique to the modal).
@@ -333,15 +358,21 @@
     let modalText = null;
     let skipBtn = null;
     let confirmBtn = null;
-    // Phase 1 — detect the modal quickly (it opens right after save).
-    const detectDeadline = Date.now() + 15000;
+    // Phase 1 — detect the modal while Twitch may still be processing.
+    const detectDeadline = Date.now() + 120000;
+    const bodyHasProcessingText = () =>
+      /salvando clipe|saving clip|processando|processing/i.test(
+        (document.body ? document.body.innerText : '').slice(0, 8000),
+      ) ||
+      [...document.querySelectorAll('[role="progressbar"], [role="status"]')]
+        .some((el) => /salvando|saving|processando|processing/i.test(el.innerText || ''));
     while (!dialog && !skipBtn && Date.now() <= detectDeadline) {
       dialog = findDialog();
       skipBtn = findSkipPageWide();
       if (!skipBtn) await sleep(400);
     }
     if (dialog) modalText = (dialog.innerText || '').trim().slice(0, 120);
-    if (!dialog && !skipBtn && !bodyHasModalText()) {
+    if (!dialog && !skipBtn && !bodyHasModalText() && !bodyHasProcessingText()) {
       // No modal at all (e.g. the editor remembered the layout) — the
       // publish watcher proceeds immediately.
       note('ext_modal', { action: 'none', modalText: null });
@@ -394,45 +425,41 @@
   };
 
   /**
-   * Drive the clip editor's REAL window control. The editor has NO start/end
-   * time inputs (proven on the live page 2026-08-09): the clip window is a
-   * draggable slider (`[role=slider]`, aria-valuetext "3:00 to 3:20") whose
-   * React internals expose onLeftDrag/onRightDrag callbacks that take
-   * {startOffset, endOffset} — the same contract a real handle drag fires.
-   * We invoke the callbacks, then poll the slider's valuetext to report what
-   * the editor ACTUALLY accepted (it clamps to the VOD + the site's
-   * 5..90s native window length limits). No seek: the callbacks set the
-   * window offsets directly. Returns '' on confirmed success, else a
-   * human-readable reason (the caller refuses to save on failure).
+   * Twitch's clip editor displays the selected window in absolute VOD
+   * seconds. The fiber drag callbacks use those same absolute values;
+   * the 90-second preview chunk is only a viewport around the selection.
+   */
+  const EDITOR_WINDOW_SEC = 90;
+  const editorChunkStart = (endSec) => Math.max(0, endSec - EDITOR_WINDOW_SEC);
+
+  /**
+   * Drive the editor's real window control. React exposes
+   * onLeftDrag/onRightDrag callbacks on the slider; their offsets are
+   * absolute VOD seconds, as confirmed by the live 12:31 -> 12:48 run.
    */
   const setEditorRange = async (scope, startSec, endSec, vodDurationSec) => {
     const len = endSec - startSec;
-    // Twitch's native hard rule: the editor accepts 5..90s windows
-    // (1:30 maximum). The app may choose a smaller product limit, but the
-    // extension must match what the Twitch slider actually accepts.
-    if (len < 5 || len > 90) {
+    // Twitch's native viewport is 90s, but VOD.RIP's clip contract is 5..60s.
+    if (len < 5 || len > 60) {
       note('ext_range_refused', { startSec, endSec, len });
       setStatus(
-        `Trecho de ${Math.round(len)}s fora do limite da Twitch (5..90s) — ajuste o clipe no app e tente de novo.`,
+        `Trecho de ${Math.round(len)}s fora do limite (5..60s) — ajuste o clipe no app e tente de novo.`,
         'err',
       );
       return 'fora-do-limite';
     }
-    // The slider renders late (after the title input/dialog) — 45s budget.
-    const slider = await waitFor(
-      () => (scope || document).querySelector('[role="slider"]'),
-      45000,
-      700,
-    );
+    // The title can render before Twitch mounts the real range control.
+    // Wait for that control instead of falling back with the native window untouched.
+    const slider = await waitFor(() => document.querySelector('[role="slider"]'), 45000, 500);
     if (!slider) return 'controle do editor (slider) não encontrado';
-    // The fiber drag must run in the page's MAIN world (the isolated world
-    // cannot see the __reactFiber$ expando); the helper polls the
-    // valuetext and reports what the editor ACTUALLY accepted.
     const res = await rangeViaMainWorld(startSec, endSec, vodDurationSec);
     note('ext_range', {
       ok: !!res.ok,
       targetStart: startSec,
       targetEnd: endSec,
+      editorChunkStart: editorChunkStart(endSec),
+      editorStart: startSec,
+      editorEnd: endSec,
       vodDurationSec,
       playback: playbackTimeText(),
       clockVisible: clockVisible(),
@@ -448,7 +475,7 @@
       return reason;
     }
     setStatus(
-      `Clique de ${Math.round(len)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) confirmado no editor (${res.valuetext}).`,
+      `Clique de ${Math.round(len)}s confirmado no editor.`,
       'ok',
     );
     mountDurationBadge();
@@ -503,7 +530,7 @@
       Math.abs(w.start - start) <= 3 &&
       Math.abs(w.end - end) <= 3 &&
       Math.abs(w.dur - len) <= 1 &&
-      w.dur >= 5 && w.dur <= 90
+      w.dur >= 5 && w.dur <= 60
       ? w
       : null;
   }, 5000, 250);
@@ -513,10 +540,9 @@
     const w = parseValuetext(slider.getAttribute('aria-valuetext'));
     if (!w) return true; // valuetext unreadable — keep the last known text
     // USER-MANDATED (2026-08-10): minutes-shaped values must NEVER appear
-    // on the editor screen — the "16:48 to 17:00" window line read as a
-    // minutes input. The badge shows the DURATION IN SECONDS ONLY (the
-    // input is the actual selected slider duration; the native maximum is 90s.
-    durationBadge.querySelector('[data-vodrip-badge-sec]').textContent = `Duração: ${w.dur}s`;
+    // on the editor screen — the badge and native clock show seconds only.
+    secondsifyClock();
+    durationBadge.querySelector('[data-vodrip-badge-sec]').textContent = `Duração: ${Math.max(5, Math.min(60, Math.round(w.dur)))}s`;
     return true;
   };
   const mountDurationBadge = () => {
@@ -543,8 +569,7 @@
     });
     // Static inner structure (no user data) — seconds only, large.
     durationBadge.innerHTML =
-      '<div data-vodrip-badge-sec style="font-size:30px;font-weight:800;color:#53fc18;letter-spacing:1px;">Duração: —</div>' +
-      '<div style="font-size:13px;color:#f4f4f5;opacity:0.9;">janela Twitch: 5 a 90 segundos</div>';
+      '<div data-vodrip-badge-sec style="font-size:30px;font-weight:800;color:#53fc18;letter-spacing:1px;">Duração: —</div>';
     document.documentElement.appendChild(durationBadge);
     const observeSlider = () => {
       const slider = document.querySelector('[role="slider"]');
@@ -699,7 +724,7 @@
         census.push('helper-echo: ' + echo);
         const res = await rangeViaMainWorld(tStart, tEnd, vodDurationSec);
         windowTest = res.ok
-          ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)})`
+          ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)}) debug=${JSON.stringify(res.debug || {})}`
           : `NOT CONFIRMED (${res.reason || '?'})`;
         // The diag page doubles as the badge's DOM probe: a successful
         // window test mounts the same duration-first chip the real flow
@@ -720,6 +745,7 @@
       // The playback-time strong the user identified ("17:00 / 1:30") — the
       // VOD-absolute position; always surfaced in the diag census.
       census.push('playback-strong: ' + (playbackTimeText() || '(none)'));
+      census.push('visible-clock: ' + (clockNodes().map((el) => (el.textContent || '').trim()).join(' | ') || '(none)'));
       // Sink the census so Main can read the REAL editor DOM from the app
       // log (GET /api/debug/clip-events) after the user opens the diag URL.
       // Truncate each line: the backend rejects data > 8KB, and the panel
@@ -775,23 +801,23 @@
       // editor-ready + error-page check.
       if (clipTitle) {
         setReactValue(editorInput, clipTitle);
-        note('ext_title', { title: clipTitle, flow: 'create' });
+        note('ext_title', { title: clipTitle, value: editorInput.value || '', flow: 'create' });
       }
       const rangeErr = await setEditorRange(document, startSec, endSec, vodDurationSec);
-      let manualFallback = false;
       if (rangeErr) {
-        // NEVER a silent failure: the panel tells the user exactly what to
-        // drag/save, the tab STAYS OPEN (no closeAfterFlow), and the publish
-        // watcher below still records the clip when the user clicks Save.
-        manualFallback = true;
+        // Never click Save without a confirmed range. Leave the editor open
+        // for an explicit user correction instead of publishing an unknown
+        // duration.
         note('ext_range_fallback', { reason: rangeErr, startSec, endSec, len: endSec - startSec });
         setStatus(
-          'Não consegui ajustar o trecho automaticamente.\n' +
-            `Arraste o clipe no editor para ${fmtHms(startSec)}–${fmtHms(endSec)} ` +
-            `(Clique de ${Math.round(endSec - startSec)}s) e clique em Save — o VOD.RIP detecta e registra.`,
+          'Não consegui confirmar o trecho automaticamente.\n' +
+            `Não vou clicar em Save sem confirmar ${Math.round(endSec - startSec)}s. ` +
+            `Ajuste o clipe no editor para ${fmtHms(startSec)}–${fmtHms(endSec)} e tente novamente.`,
           'err',
         );
-      } else {
+        closeAfterFlow(8000);
+        return;
+      }
         const confirmedWindow = await confirmSelectedWindow(document, startSec, endSec);
         if (!confirmedWindow) {
           note('ext_error', {
@@ -845,12 +871,10 @@
         // the publish watcher below starts (else the watcher times out and
         // no clip is ever created). Same guard on the /videos publish path.
         await dismissPortraitModal();
-      }
       // Success = the SPA navigates to /<slug>, or the editor reaches its
       // post-publish state ("Copiar Link"). /create and /clips/* are the
-      // editor itself and never a success navigation. Runs for the
-      // auto-clicked Save AND the manual fallback's user-clicked Save —
-      // either way the published clip must be recorded.
+      // editor itself and never a success navigation. Save is reached only
+      // after the selected window was confirmed above.
       const slugRe = /^\/(?!create$)(?!clips(?:\/|$))[A-Za-z][A-Za-z0-9_-]+$/;
       const published = await waitFor(() => {
         if (location.pathname.match(slugRe)) return `https://clips.twitch.tv${location.pathname}`;
@@ -858,7 +882,7 @@
           /copiar link|copy link/i.test((b.innerText || '').trim()),
         );
         return copyBtn ? 'copy' : null;
-      }, manualFallback ? 90000 : 60000, 800);
+      }, 60000, 800);
       if (published) {
         let clipUrl = published === 'copy' ? '' : published;
         try {
@@ -874,16 +898,6 @@
           'ok',
         );
         closeAfterFlow(1500);
-        return;
-      }
-      if (manualFallback) {
-        setStatus(
-          'Ainda não detectei o clipe publicado.\n' +
-            `Arraste o clipe no editor para ${fmtHms(startSec)}–${fmtHms(endSec)} ` +
-            `(Clique de ${Math.round(endSec - startSec)}s) e clique em Save — o VOD.RIP detecta e registra.`,
-          'err',
-        );
-        closeAfterFlow(8000);
         return;
       }
       setStatus(
@@ -1056,7 +1070,7 @@
         ]);
       if (titleInput) {
         setReactValue(titleInput, clipTitle);
-        note('ext_title', { title: clipTitle, flow: 'videos' });
+        note('ext_title', { title: clipTitle, value: titleInput.value || '', flow: 'videos' });
       }
     }
 

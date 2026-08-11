@@ -17,8 +17,8 @@ export const TWITCH_CLIP_MAX_SEC = 60;
 export const TWITCH_CLIP_MIN_SEC = 5;
 /** Twitch editor clip title length limit. */
 export const TWITCH_CLIP_TITLE_MAX = 140;
-/** Mini-preview selectable window length: 1:35 (95s) around the click moment. */
-export const TWITCH_CLIP_WINDOW_SEC = 95;
+/** Twitch's native editor window length: 1:30 (90s). */
+export const TWITCH_CLIP_WINDOW_SEC = 90;
 
 /**
  * Debugging event sequence for the clip flow: every step of a clip attempt
@@ -32,11 +32,9 @@ export function reportClipEvent(event: string, data: Record<string, unknown> = {
 }
 
 /**
- * Mini-preview window for the "Twitch clip" button: 95s (1:35) around the
- * click moment — ±47.5s, rounded to whole seconds — clamped to the VOD
- * edges (shorter at the edges is fine). Unknown duration (<=0) leaves the
- * upper edge unclamped — the backend clamps the session crop to the real
- * extracted length anyway.
+ * Mini-preview window for the "Twitch clip" button: 90s (1:30) around the
+ * click moment — the user trims there and creates a 5–60s clip. Live: open
+ * the editor directly — no VOD timeline to select from.
  *
  * When `anchor` is a valid range (end > start) — the user's typed trim from
  * the opening preview — the window centres on the anchor's midpoint instead
@@ -52,7 +50,7 @@ export function twitchClipWindow(
     : Number.POSITIVE_INFINITY;
   const anchorValid = !!anchor && anchor.end > anchor.start;
   const center = anchorValid ? (anchor.start + anchor.end) / 2 : playheadSec;
-  // Round the start, then add the full window so the span is exactly 95s.
+  // Round the start, then add the full native 90s window.
   const start = Math.max(0, Math.round(center - TWITCH_CLIP_WINDOW_SEC / 2));
   return {
     start,

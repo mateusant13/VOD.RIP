@@ -17,7 +17,7 @@ const confirm = (w, s, e) =>
   w &&
   Math.abs(w.a - s) <= TOL && Math.abs(w.b - e) <= TOL &&
   Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
-  w.b - w.a >= 5 && w.b - w.a <= 60;
+  w.b - w.a >= 5 && w.b - w.a <= 90;
 
 // 1. h:mm:ss parsing (long VODs — the old parser returned null).
 assert.equal(pc('17:00'), 1020);
@@ -31,19 +31,10 @@ assert.ok(confirm({ a: 1020, b: 1040 }, 1020, 1042), 'edge clamp within toleranc
 // 3. But a real mismatch (handle at 17:00 while target 8:20) still fails.
 assert.ok(!confirm({ a: 500, b: 520 }, 1020, 1042), 'wrong position rejected');
 
-// 4. Length rule: 90s window never confirms (slider max 1:30, Twitch 5..60).
-assert.ok(!confirm({ a: 952, b: 1042 }, 1020, 1042), 'over-long window rejected');
-assert.ok(!confirm({ a: 1020, b: 1024 }, 1020, 1042), 'under-long window rejected');
+// 4. The local editor accepts the full native 90s chunk, but not longer.
+assert.ok(confirm({ a: 75, b: 90 }, 75, 90), '15s local range confirms');
+assert.ok(confirm({ a: 0, b: 90 }, 0, 90), 'native 90s window confirms');
+assert.ok(!confirm({ a: 0, b: 91 }, 0, 91), 'over-long local window rejected');
+assert.ok(!confirm({ a: 0, b: 4 }, 0, 4), 'under-long local window rejected');
 
-// 5. Edge retry math: end pulled 3s off the VOD edge, length preserved.
-const start = 1020, end = 1042, dur = 1042;
-const e2 = Math.min(end, Math.max(start + 5, dur - 3));
-const s2 = Math.max(0, e2 - (end - start));
-assert.equal(e2, 1039);
-assert.equal(s2, 1017);
-assert.equal(e2 - s2, 22, 'retry keeps the requested length');
-
-// 6. Retry confirms when the editor accepts the nudged window.
-assert.ok(confirm({ a: 1017, b: 1039 }, s2, e2), 'nudged window confirms');
-
-console.log('clip-range logic OK (6 assertions)');
+console.log('clip-range logic OK (8 assertions)');

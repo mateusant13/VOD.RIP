@@ -241,14 +241,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               n = n.return;
             }
             if (!drag) { send({ ok: false, reason: 'controle de trecho não acessível' }); return; }
-            // The editor accepts the window as {startOffset, endOffset}
-            // ABSOLUTE VOD seconds (proven live: a 500-520s window landed
-            // exactly), but it clamps to the VOD's own frame edges — a window
-            // ending at the VOD's last second settles a frame or two early,
-            // and the old ±1s confirmation then failed and aborted the save
-            // (seen live: 17:00-17:22 on a ~17:22 VOD never published).
-            // Tolerance: per-handle 3s, length delta 2s, and Twitch's native
-            // 5..90s window rule (1:30 maximum) — LENGTH is enforced.
+            // The editor's fiber callbacks use absolute VOD seconds. The
+            // visible 90-second preview is a viewport; its aria-valuetext
+            // reports the same absolute coordinates.
+            // Confirmation therefore compares the absolute valuetext and
+            // enforces Twitch's native 5..90s window rule.
             const TOL = 3;
             const LEN_TOL = 2;
             const readWindow = () => {
@@ -277,7 +274,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
                     w.b - w.a >= 5 && w.b - w.a <= 90
                   ) {
-                    resolve({ ok: true, valuetext: w.vt });
+                    resolve({
+                      ok: true,
+                      valuetext: w.vt,
+                      debug: {
+                        left: String(drag.onLeftDrag).slice(0, 500),
+                        right: String(drag.onRightDrag).slice(0, 500),
+                      },
+                    });
                     return;
                   }
                   if (Date.now() > deadline) {
@@ -290,19 +294,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               });
             (async () => {
               let res = await attempt(start, end);
-              // VOD-edge retry: when the editor clamped the window to the VOD's
-              // last frames (or near it), pull the END off the edge and keep
-              // the requested length — the user gets the clip instead of a
-              // refusal.
-              if (!res.ok && Number.isFinite(dur) && dur > 0) {
-                const e2 = Math.min(end, Math.max(start + 5, dur - 3));
-                const s2 = Math.max(0, e2 - (end - start));
-                if (e2 !== end || s2 !== start) {
-                  const res2 = await attempt(s2, e2);
-                  if (res2.ok) res = res2;
-                  else if (res2.reason) res.reason = res2.reason;
-                }
-              }
               send(res);
             })();
           });
