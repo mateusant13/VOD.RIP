@@ -2155,6 +2155,14 @@ def update_job(job_id: str, *, status: Optional[str] = None,
                progress: Optional[float] = None, error: Optional[str] = None) -> None:
     sets = ["updated_at = ?", "heartbeat = ?"]
     params: list[Any] = [_now_iso(), _now_iso()]
+    if status == "failed":
+        err = (error or "")
+        terminal = ("FileNotFound" in err) or ("archive-file-missing" in err)
+        rate = ("429" in err) or ("rate limit" in err.lower()) or ("ratelimit" in err.lower())
+        if not terminal and not rate:
+            status = "queued"
+            if progress is None:
+                progress = 0
     if status is not None:
         sets.append("status = ?")
         params.append(status)
@@ -2166,6 +2174,12 @@ def update_job(job_id: str, *, status: Optional[str] = None,
         params.append(error)
     params.append(job_id)
     execute(f"UPDATE archive_jobs SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def clear_finished_jobs() -> int:
+    """Drop done/failed notification rows. Queued/running (immortal retries) stay."""
+    cur = execute("DELETE FROM archive_jobs WHERE status IN ('done','failed')")
+    return int(cur.rowcount or 0)
 
 
 def list_jobs(limit: int = 50) -> list[dict]:
@@ -2970,6 +2984,15 @@ def search(
     # artifacts) collapse BEFORE the cap, so one video's caption dups never
     # eat the page or the per-video slots.
     merged = _collapse_transcript_dupes(merged)
+    if mode == "exact":
+        phrase = " ".join(raw_q.casefold().split())
+        if phrase:
+            def _contiguous_phrase(h):
+                blob = " ".join(f"{h.get('text') or ''} {h.get('title') or ''}".casefold().split())
+                return phrase in blob
+            merged = [h for h in merged if _contiguous_phrase(h)]
+            for h in merged:
+                h["partial"] = False
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
     # FE's "infinite literal results" mode sends ~2000) wants every match
@@ -2980,7 +3003,7 @@ def search(
     cap = (
         _HITS_PER_VIDEO_CAP
         if int(limit) <= _HITS_PER_VIDEO_CAP * 10
-        else _LITERAL_PER_VIDEO_CAP
+        else (10**9 if int(limit) >= 10_000 else _LITERAL_PER_VIDEO_CAP)
     )
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []

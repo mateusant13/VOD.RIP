@@ -124,6 +124,94 @@ def write_chat_sidecar(
         return None
 
 
+_THUMB_SIZE_CAP = 8 * 1024 * 1024
+_THUMB_FETCH_TIMEOUT = 10.0
+
+
+def _resolve_thumb_placeholders(url: str) -> str:
+    """Substitute Twitch/Kick %{width}x%{height} thumbnail templates (mirror
+    of the frontend resolveVideoThumbnail, 48x36 keeps the file small)."""
+    return (
+        url.replace("%{width}", "48")
+        .replace("%{height}", "36")
+        .replace("{width}", "48")
+        .replace("{height}", "36")
+    )
+
+
+def write_thumbnail_sidecar(thumbnail: Optional[str], output_file: str) -> Optional[str]:
+    """Persist a local thumbnail next to the finished download.
+
+    Prefers a yt-dlp-written sidecar (<stem>.jpg/.webp from writethumbnail);
+    else downloads the remote thumbnail URL to <stem>.thumb.jpg. Returns the
+    local path or None. ponytail: best-effort — a thumb failure must never
+    fail the download; the queue UI falls back to the Play placeholder."""
+    try:
+        if not output_file:
+            return None
+        stem = Path(output_file)
+        for ext in (".jpg", ".jpeg", ".webp", ".png"):
+            candidate = stem.with_suffix(ext)
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return str(candidate)
+        if not thumbnail or not str(thumbnail).lower().startswith(
+            ("http://", "https://", "file://")
+        ):
+            return None
+        import urllib.request
+
+        url = _resolve_thumb_placeholders(str(thumbnail))
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (VOD.RIP thumbnail)"}
+        )
+        with urllib.request.urlopen(req, timeout=_THUMB_FETCH_TIMEOUT) as resp:
+            body = resp.read(_THUMB_SIZE_CAP + 1)
+        if len(body) > _THUMB_SIZE_CAP or len(body) < 100:
+            return None
+        dest = Path(f"{stem}.thumb.jpg")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(body)
+        return str(dest)
+    except Exception:
+        logger.debug("thumbnail sidecar skipped", exc_info=True)
+        return None
+
+
+def resolve_remote_thumbnail(url: str, platform: Optional[str]) -> Optional[str]:
+    """Best-effort thumbnail URL for a download that has none yet.
+
+    YouTube is derived locally (i.ytimg.com pattern, same as the frontend);
+    Twitch/Kick ask their APIs (GQL/Kick) once per download, short timeout.
+    ponytail: failure returns None — the sidecar is best-effort by design."""
+    plat = (platform or "").lower()
+    try:
+        if plat == "youtube":
+            m = re.search(
+                r"(?:[?&]v=|youtu\.be/|/shorts/|/live/)([a-zA-Z0-9_-]{11})",
+                url or "",
+            )
+            if m:
+                return f"https://i.ytimg.com/vi/{m.group(1)}/mqdefault.jpg"
+        elif plat == "twitch":
+            from services.ytdlp_service import is_clip_url
+            if is_clip_url(url):
+                from services.twitch_gql_service import get_clip_info_sync
+                return (get_clip_info_sync(url) or {}).get("thumbnail")
+            from services.twitch_gql_service import get_video_info_sync
+            return (get_video_info_sync(url) or {}).get("thumbnail")
+        elif plat == "kick":
+            from services.kick_api_service import (
+                get_clip_info_sync as kick_clip,
+                get_video_info_sync as kick_video,
+            )
+            from services.ytdlp_service import is_clip_url
+            fn = kick_clip if is_clip_url(url) else kick_video
+            return (fn(url) or {}).get("thumbnail")
+    except Exception:
+        logger.debug("remote thumbnail resolution skipped", exc_info=True)
+    return None
+
+
 def write_download_sidecars(
     output_file: str,
     url: str,

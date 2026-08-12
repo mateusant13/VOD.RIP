@@ -765,6 +765,8 @@ def validate_open_folder_path(path: str, settings_mgr) -> str:
 
 _PLAYABLE_MEDIA_EXTS = frozenset({
     ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".m4a", ".mp3",
+    # TASK1: thumbnail sidecars ride the same local-media route.
+    ".jpg", ".jpeg", ".png", ".webp",
 })
 _MEDIA_MIME = {
     ".mp4": "video/mp4",
@@ -774,6 +776,10 @@ _MEDIA_MIME = {
     ".mov": "video/quicktime",
     ".mp3": "audio/mpeg",
     ".m4a": "audio/mp4",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
 }
 
 

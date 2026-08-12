@@ -70,7 +70,7 @@ export const ARCHIVE_FILTER_KINDS = ['vod', 'clip', 'short', 'video'] as const;
  * default (the backend's default 'both' = everything). Selected set is
  * sent comma-joined; all-three collapses to omitted (backend default).
  */
-export const ARCHIVE_SOURCES = ['video', 'transcript', 'chat'] as const;
+export const ARCHIVE_SOURCES = ['transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
@@ -95,7 +95,6 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
  *  when a proper subset is selected; all-three is omitted = backend 'both');
  *  only the display words changed (STREAMER → speech). */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
-  video: 'video',
   transcript: 'speech',
   chat: 'chat',
 };

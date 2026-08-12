@@ -649,7 +649,8 @@ export default function App() {
   const [lastPreviewTrimEndpoint, setLastPreviewTrimEndpoint] = useState<'in' | 'out'>('out');
 
   // Channel explore players (up to 5 floating popups)
-  const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
+  const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number; hidden?: boolean }[]>([]);
+  const [parkedExploreId, setParkedExploreId] = useState<string | null>(null);
   const [localFilePopups, setLocalFilePopups] = useState<LocalFilePopupItem[]>([]);
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   /** Session counters: archive search hits opened per platform (0-init).
@@ -972,6 +973,17 @@ export default function App() {
     () => allChannelVideos.filter((v) => v.platform === 'YouTube'),
     [allChannelVideos],
   );
+
+  useEffect(() => {
+    if (channelContentFilter !== 'clips') return;
+    if (channelsLoading) return;
+    const steps = [1, 7, 14, 30, 180, 365, 0];
+    const idx = steps.indexOf(clipRangeDays);
+    if (idx < 0 || idx >= steps.length - 1) return;
+    if (visibleChannelVideos.length > 0) return;
+    const next = steps[idx + 1];
+    if (next !== clipRangeDays) setClipRangeDays(next);
+  }, [channelContentFilter, clipRangeDays, visibleChannelVideos.length, channelsLoading]);
 
   const channelsLoading = selectedChannel?.loading ?? false;
 
@@ -4255,7 +4267,7 @@ export default function App() {
       started_at: new Date().toISOString(),
       title: clip.title,
       channel: clip.channel,
-      thumbnail: null,
+      thumbnail: clip.thumbnail_url ?? null,
     }]);
     try {
       await apiPost<{ download_id: string }>(
@@ -5335,7 +5347,11 @@ export default function App() {
     selectVod(vodUrl, undefined, hint);
   }, [selectVod]);
 
-  const carryExploreToUrl = useCallback((vod: ExplorePopupVod) => {
+  const carryExploreToUrl = useCallback((vod: ExplorePopupVod, timeSec = 0, popupId?: string) => {
+    if (popupId) {
+      setExplorePopups((prev) => prev.map((p) => p.id === popupId ? { ...p, hidden: true } : p));
+      setParkedExploreId(popupId);
+    }
     selectVod(vod.url, {
       platform: vod.platform,
       platformListIndex: vod.platformListIndex,
@@ -5350,7 +5366,11 @@ export default function App() {
       channel: vod.channel,
       skipNetwork: true,
     });
-  }, [selectVod]);
+    const seekTo = Number.isFinite(timeSec) ? Math.max(0, timeSec) : 0;
+    if (seekTo > 0) {
+      window.setTimeout(() => seekPreviewVideo(seekTo, true), 500);
+    }
+  }, [selectVod, seekPreviewVideo]);
 
   const currentIsClip = isClipUrl(url);
 
@@ -6096,6 +6116,20 @@ export default function App() {
         })}
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
+        {parkedExploreId && (
+          <button
+            type="button"
+            onClick={() => {
+              const id = parkedExploreId;
+              setExplorePopups((prev) => prev.map((p) => p.id === id ? { ...p, hidden: false } : p));
+              setParkedExploreId(null);
+            }}
+            className={`${previewCtrlBtn(previewFullscreen, true)} flex items-center gap-1.5`}
+            title={t('Back to mini preview')}
+          >
+            {t('Mini')}
+          </button>
+        )}
         {urlPlatform === 'twitch' && !isLive && (
           <button
             type="button"
@@ -7160,21 +7194,22 @@ export default function App() {
       {explorePopups.length > 0 && createPortal(
         <>
           {explorePopups.map((entry) => (
+            <div key={entry.id} style={entry.hidden ? { display: 'none' } : undefined}>
             <ChannelExplorePopup
-              key={entry.id}
               id={entry.id}
               vod={entry.vod}
               zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
-              onCarryToUrl={carryExploreToUrl}
+              onHandoffToMain={(vod, timeSec) => carryExploreToUrl(vod, timeSec, entry.id)}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
               onBringToFront={() => bringPopupToFront(entry.id)}
               onOpenHit={openArchiveHit}
             />
+            </div>
           ))}
         </>,
         document.getElementById('explore-portal') ?? document.body,

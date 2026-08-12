@@ -4,7 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, ArrowRightToLine, Loader2, RefreshCw, Search, AlertCircle } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, Download, Loader2, RefreshCw, Search, AlertCircle } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
@@ -120,7 +120,7 @@ interface ChannelExplorePopupProps {
   stackIndex: number;
   volumeMenuCloseTick: number;
   onClose: () => void;
-  onCarryToUrl: (vod: ExplorePopupVod) => void;
+  onHandoffToMain: (vod: ExplorePopupVod, timeSec: number) => void;
   onRegisterPause: (id: string, pause: () => void) => void;
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
@@ -150,7 +150,7 @@ export default function ChannelExplorePopup({
   stackIndex,
   volumeMenuCloseTick,
   onClose,
-  onCarryToUrl,
+  onHandoffToMain,
   onRegisterPause,
   onUnregisterPause,
   onVolumeMenuOpen,
@@ -179,6 +179,8 @@ export default function ChannelExplorePopup({
   /** Twitch clip editor open — transient notice in the transport row. */
   const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   /** Twitch clip mini-preview — opened at the current playhead. */
+  const [exploreTrimStart, setExploreTrimStart] = useState(0);
+  const [exploreTrimEnd, setExploreTrimEnd] = useState(0);
   const [clipPopup, setClipPopup] = useState<{
     url: string;
     broadcasterLogin: string;
@@ -1470,10 +1472,10 @@ export default function ChannelExplorePopup({
       </span>
       <input
         type="range"
-        min={0}
-        max={effectiveDurationSec}
+        min={exploreTrimStart}
+        max={exploreTrimEnd > exploreTrimStart ? exploreTrimEnd : effectiveDurationSec}
         step={0.25}
-        value={Math.min(currentTime, effectiveDurationSec)}
+        value={Math.min(Math.max(currentTime, exploreTrimStart), exploreTrimEnd > exploreTrimStart ? exploreTrimEnd : effectiveDurationSec)}
         disabled={!ready}
         onChange={(e) => seekVideoDebounced(parseFloat(e.target.value))}
         className="flex-1 accent-white disabled:opacity-40 h-1"
@@ -1481,6 +1483,18 @@ export default function ChannelExplorePopup({
       <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${fullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
         {formatHmsFull(effectiveDurationSec)}
       </span>
+    </div>
+    <div className="flex items-center gap-1.5 w-full shrink-0">
+      <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('In')}</span>
+      <input type="range" min={0} max={effectiveDurationSec} step={0.25}
+        value={Math.min(exploreTrimStart, effectiveDurationSec)}
+        onChange={(e) => setExploreTrimStart(Math.min(parseFloat(e.target.value), (exploreTrimEnd || effectiveDurationSec) - 1))}
+        className="flex-1 accent-zinc-400 h-1" />
+      <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('Out')}</span>
+      <input type="range" min={0} max={effectiveDurationSec} step={0.25}
+        value={exploreTrimEnd > 0 ? exploreTrimEnd : effectiveDurationSec}
+        onChange={(e) => setExploreTrimEnd(Math.max(parseFloat(e.target.value), exploreTrimStart + 1))}
+        className="flex-1 accent-zinc-400 h-1" />
     </div>
   );
 
@@ -1875,12 +1889,12 @@ export default function ChannelExplorePopup({
                 {showClipButton && exploreClipBtn(false)}
                 <button
                   type="button"
-                  onClick={() => onCarryToUrl(vod)}
+                  onClick={() => onHandoffToMain(vod, currentTime)}
                   className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                  title={t('Send to URL panel for rip')}
+                  title={t('Open in main preview to download')}
                 >
-                  <ArrowRightToLine size={14} />
-                  URL
+                  <Download size={14} />
+                  {t('Download')}
                 </button>
               </div>
               <div className="flex items-center gap-1.5 ml-auto">
@@ -1940,12 +1954,12 @@ export default function ChannelExplorePopup({
                   {showClipButton && exploreClipBtn(true)}
                   <button
                     type="button"
-                    onClick={() => onCarryToUrl(vod)}
+                    onClick={() => onHandoffToMain(vod, currentTime)}
                     className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
-                    title={t('Send to URL panel for rip')}
+                    title={t('Open in main preview to download')}
                   >
-                    <ArrowRightToLine size={14} />
-                    URL
+                    <Download size={14} />
+                    {t('Download')}
                   </button>
                 </div>
                 <div className="flex items-center gap-1.5 ml-auto">

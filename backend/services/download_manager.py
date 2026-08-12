@@ -588,6 +588,25 @@ class DownloadManager:
                         )
                     except Exception:
                         logger.debug("download sidecars skipped", exc_info=True)
+                    try:
+                        # TASK1: persist a local thumbnail next to the file —
+                        # yt-dlp's writethumbnail sidecar when present, else a
+                        # download of the remote thumb URL (<stem>.thumb.jpg).
+                        from services.download_sidecars import (
+                            resolve_remote_thumbnail,
+                            write_thumbnail_sidecar,
+                        )
+                        thumb_url = state.thumbnail
+                        if not thumb_url:
+                            thumb_url = resolve_remote_thumbnail(
+                                params.get("url") or "", state.platform
+                            )
+                        local_thumb = write_thumbnail_sidecar(thumb_url, output_file_result)
+                        if local_thumb:
+                            with self._lock:
+                                state.thumbnail = local_thumb
+                    except Exception:
+                        logger.debug("thumbnail sidecar skipped", exc_info=True)
                     with self._lock:
                         state.status = "Completed"
                         state.progress = 100

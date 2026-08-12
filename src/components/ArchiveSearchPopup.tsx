@@ -109,7 +109,7 @@ const SEARCH_DEBOUNCE_MS = 250;
  *  bounded server-side) is a full scroll of variety — the old 2000 flooded
  *  the page with one video's repeated chat and took 20s+ under load. The
  *  list renders incrementally, so even this stays smooth. */
-const SEARCH_LIMIT_LITERAL = 300;
+const SEARCH_LIMIT_LITERAL = 100000;
 /** Semantic (embedding) search stays tight — it is expensive per candidate. */
 const SEARCH_LIMIT_SEMANTIC = 30;
 /** How many hits render per scroll batch. */

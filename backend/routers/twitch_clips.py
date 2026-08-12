@@ -61,6 +61,7 @@ class TwitchClipRecordRequest(BaseModel):
     vod_id: Optional[str] = None
     offset_sec: Optional[int] = None
     duration_sec: Optional[int] = None
+    thumbnail_url: Optional[str] = None
 
 
 class ClipEventBody(BaseModel):
@@ -265,6 +266,11 @@ def _apply_twitch_published_range(entry: Dict[str, Any], clip_url: str) -> Dict[
     mapped = published_clip_range_from_gql(info.get("offset_sec"), info.get("duration"))
     if mapped:
         entry["offset_sec"], entry["duration_sec"] = mapped
+    # TASK1: the GQL node carries the clip thumbnail — persist it so clip
+    # history rows render a real image instead of the icon placeholder.
+    gql_thumb = info.get("thumbnail")
+    if gql_thumb:
+        entry["thumbnail_url"] = gql_thumb
     return entry
 
 
@@ -364,6 +370,7 @@ def record_twitch_clip(req: TwitchClipRecordRequest, response: Response) -> Dict
         "title": (req.title or "").strip() or None,
         "url": f"https://clips.twitch.tv/{slug}",
         "status": "created",
+        "thumbnail_url": (req.thumbnail_url or "").strip() or None,
     }
     entry = _apply_twitch_published_range(entry, entry["url"])
     history = _load_history()

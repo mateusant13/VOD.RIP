@@ -80,6 +80,7 @@ export default function NotificationsPanel() {
 
   const activeCount = jobs.filter((j) => j.status === 'queued' || j.status === 'running').length;
   const doneCount = jobs.filter((j) => j.status === 'done').length;
+  const finishedCount = jobs.filter((j) => j.status === 'done' || j.status === 'failed').length;
 
   const chip = (id: string, label: string, active: boolean, onClick: () => void) => (
     <button
@@ -107,6 +108,20 @@ export default function NotificationsPanel() {
           <span className="text-[#53fc18]">{activeCount} {t('in progress')}</span>
           <span>·</span>
           <span>{doneCount} {t('completed')}</span>
+          <button
+            type="button"
+            disabled={finishedCount === 0}
+            onClick={() => {
+              void fetch('/api/archive/jobs/clear', { method: 'POST' })
+                .then(() => fetchJobs())
+                .then(setJobs)
+                .catch(() => {});
+            }}
+            className="ml-2 px-2 py-0.5 border-2 border-zinc-700 text-zinc-400 hover:text-white hover:border-white uppercase tracking-widest font-bold disabled:opacity-40 disabled:hover:text-zinc-400 disabled:hover:border-zinc-700 disabled:cursor-default"
+            title={t('Clear notifications')}
+          >
+            {t('Clear notifications')}
+          </button>
         </div>
       </div>
 

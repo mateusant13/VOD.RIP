@@ -264,6 +264,7 @@ export interface TwitchClipRecord {
   title: string | null;
   url: string;
   status: string;
+  thumbnail_url?: string | null;
 }
 /**
  * Build the download payload for a history clip.
@@ -277,11 +278,13 @@ export function twitchClipDownloadRequest(clip: TwitchClipRecord): {
   quality: 'source';
   title?: string;
   channel: string;
+  thumbnail?: string;
   duration?: number;
   crop_start?: number;
   crop_end?: number;
 } {
   const title = clip.title?.trim() || undefined;
+  const thumbnail = clip.thumbnail_url?.trim() || undefined;
   const offset = clip.offset_sec;
   const duration = clip.duration_sec;
   if (
@@ -298,6 +301,7 @@ export function twitchClipDownloadRequest(clip: TwitchClipRecord): {
       quality: 'source',
       title,
       channel: clip.channel,
+      thumbnail,
       duration: length,
       crop_start: Math.max(0, end - length),
       crop_end: end,
@@ -308,6 +312,7 @@ export function twitchClipDownloadRequest(clip: TwitchClipRecord): {
     quality: 'source',
     title,
     channel: clip.channel,
+    thumbnail,
     duration: clip.duration_sec ?? undefined,
   };
 }

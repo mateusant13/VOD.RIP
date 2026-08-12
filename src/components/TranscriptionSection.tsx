@@ -24,7 +24,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
   const [msg, setMsg] = useState<string | null>(null);
   const { t } = useI18n();
 
-  const activeModel = (settings.whisper_model ?? '').trim() || 'large-v3-turbo';
+  const activeModel = (settings.whisper_model ?? '').trim() || 'parakeet';
 
   const onSave = useCallback(async () => {
     setSaving(true);
@@ -51,12 +51,12 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
       <div className="flex flex-col gap-1.5">
         <FieldCaption
           noWrap
-          info={t('The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.')}
+          info={t('Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).')}
         >
-          {t('Whisper Model')}
+          {t('ASR (Parakeet default)')}
         </FieldCaption>
         <p className="text-[10px] font-mono text-zinc-500 leading-relaxed">
-          {t('Parakeet (NVIDIA / sherpa-onnx) is used automatically for 25 European languages including pt/en/es. Whisper large-v3-turbo stays the fallback for Japanese, Korean, Chinese, Arabic, unknown language, and when Parakeet is unavailable. Parakeet-only would drop those languages.')}
+          {t('Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.')}
         </p>
         <span
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"

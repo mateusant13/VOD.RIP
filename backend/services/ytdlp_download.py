@@ -171,6 +171,8 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
+        "writethumbnail": True,
+        "convert_thumbnails": "jpg",
             "cachedir": str(cache_dir),
             **_ytdlp_engine_opts(),
         }

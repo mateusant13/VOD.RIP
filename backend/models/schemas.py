@@ -126,7 +126,8 @@ class AppSettings(BaseModel):
     # Local transcription model: faster-whisper id + HF cache dir (mirrors
     # the VODRIP_WHISPER_MODEL / VODRIP_WHISPER_CACHE env knobs). A cache
     # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
-    whisper_model: str = "large-v3-turbo"
+    whisper_model: str = "parakeet"
+    asr_engine: str = "parakeet"
     whisper_model_cache: Optional[str] = None
     # Captions-first: when a YouTube video already has auto-caption rows at
     # ingest, whisper transcription skips it (default on; toggle in Disk UI).

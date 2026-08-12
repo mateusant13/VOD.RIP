@@ -16,6 +16,16 @@ function youtubeThumbFromUrl(url: string): string | null {
   return m ? `https://i.ytimg.com/vi/${m[1]}/mqdefault.jpg` : null;
 }
 
+function twitchThumbFromUrl(url: string): string | null {
+  const clip = url.match(/clips\.twitch\.tv\/([A-Za-z0-9_-]+)/);
+  if (clip) return `https://clips-media-assets2.twitch.tv/${clip[1]}-preview-480x272.jpg`;
+  const live = url.match(/twitch\.tv\/([A-Za-z0-9_]{1,25})(?:\/|$)/);
+  if (live && !/\/(videos|clip)\//.test(url)) {
+    return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${live[1].toLowerCase()}-320x180.jpg`;
+  }
+  return null;
+}
+
 export default function DownloadThumb({
   thumbnail,
   url,
@@ -28,6 +38,14 @@ export default function DownloadThumb({
   let src = resolveVideoThumbnail(thumbnail, 48, 36);
   if (!src && platform.toLowerCase() === 'youtube') {
     src = youtubeThumbFromUrl(url);
+  }
+  // TASK1: a persisted local thumbnail (backend sidecar path) is served by
+  // the Range-aware local-media route — remote URLs pass through untouched.
+  if (src && !/^https?:\/\//i.test(src)) {
+    src = `/api/local/media?path=${encodeURIComponent(src)}`;
+  }
+  if (!src && platform.toLowerCase() === 'twitch') {
+    src = twitchThumbFromUrl(url);
   }
 
   const thumbBody = !src || failed ? (

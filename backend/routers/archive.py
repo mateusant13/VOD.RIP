@@ -601,7 +601,7 @@ async def archive_search(
     video_id: str | None = None,
     lang: str | None = None,
     username: str | None = None,
-    limit: int = Query(20, ge=1, le=5000),
+    limit: int = Query(20, ge=1, le=100000),
     hint: bool = Query(True),
     semantic: bool = Query(False),
     mode: str = Query("exact"),
@@ -913,6 +913,12 @@ async def archive_aliases(platform: str, video_id: str, canonical_key: str, note
         raise HTTPException(status_code=400, detail="canonical_key required")
     archive_db.set_alias(platform, video_id, canonical_key.strip(), note)
     return {"ok": True}
+
+
+@router.post("/api/archive/jobs/clear")
+async def archive_jobs_clear():
+    n = archive_db.clear_finished_jobs()
+    return {"ok": True, "cleared": n}
 
 
 @router.get("/api/archive/jobs")

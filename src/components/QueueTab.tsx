@@ -452,7 +452,16 @@ export default function QueueTab({
                   className="shrink-0"
                   style={vodCheckboxStyle('#9146FF')}
                 />
-                <Clapperboard size={14} className="shrink-0 text-[#9146FF]" />
+                {c.thumbnail_url ? (
+                  <img
+                    src={c.thumbnail_url}
+                    alt=""
+                    className="shrink-0 w-16 h-9 object-cover border border-zinc-800 bg-zinc-900"
+                    onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                  />
+                ) : (
+                  <Clapperboard size={14} className="shrink-0 text-[#9146FF]" />
+                )}
                 <div className="flex flex-col gap-0.5 min-w-0 flex-1">
                   <span className="text-xs font-mono text-zinc-300 truncate">
                     {c.channel}
