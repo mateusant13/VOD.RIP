@@ -161,7 +161,8 @@ def test_channel_hint_fires_for_first_token_channel_only():
     _upsert("youtube", "hint-vid", channel="TiTiltei", title="beta")
     archive_db.insert_messages(
         "youtube", "hint-vid",
-        [{"offset_sec": 1.0, "username": "u", "text": "zebra stripe"}],
+        [{"offset_sec": 1.0, "username": "u", "text": "zebra stripe"},
+         {"offset_sec": 2.0, "username": "u", "text": "titiltei mention"}],
     )
     try:
         box: list[str] = []
@@ -173,10 +174,17 @@ def test_channel_hint_fires_for_first_token_channel_only():
         box2: list[str] = []
         archive_db.search("notachannel zebra", _channel_hint_out=box2)
         assert box2 == [], "a non-channel first token must NOT fire the hint"
-        # single-token queries never fire (nothing would be left to search)
+        # Single-token channel queries DO fire the hint, scope-only: the slug
+        # token stays in the query (" ".join([1:]) or q), so a bare 'titiltei'
+        # matches the name inside the channel's content instead of archive-wide
+        # (search-v2 contract since a7f9b67 — 'gaveta' no longer means
+        # 'drawer'). What never fires is a NON-channel first token (above).
         box3: list[str] = []
-        archive_db.search("titiltei", _channel_hint_out=box3)
-        assert box3 == []
+        hits3 = archive_db.search("titiltei", _channel_hint_out=box3)
+        assert box3 == ["TiTiltei"], "a single-token channel query must still fire the hint"
+        assert any(
+            h["video_id"] == "hint-vid" and h.get("offset_sec") == 2.0 for h in hits3
+        ), "the single-token hint must keep the token — the name still matches in-channel"
     finally:
         archive_db.execute("DELETE FROM messages WHERE video_id='hint-vid'")
         archive_db.execute("DELETE FROM videos WHERE video_id='hint-vid'")
