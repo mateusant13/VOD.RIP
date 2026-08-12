@@ -79,7 +79,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
-import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -697,9 +697,13 @@ export default function App() {
   // ponytail: lock the preview container height across refetch/aspect changes.
   // The CSS `aspect-ratio` would re-derive the height from the new video aspect
   // on every metadata load, collapsing a 16:9 panel to a square when the next
-  // video is 1:1. Storing the last rendered height in a ref and using it as
-  // explicit `height` keeps the panel size the user picked. Upgrade: persist
-  // this to loadPanelLayout so the height survives reloads.
+  // video is 1:1. Storing the picked height in a ref and using it as explicit
+  // `height` keeps the panel size the user chose — previewContainerHeight caps
+  // it so a landscape panel never becomes taller than wide, applied at
+  // render/DOM-apply time (the ref itself is only written by preview drags),
+  // so a sibling squeeze shrinks the panel transiently and the picked height
+  // returns when the width grows back. Upgrade: persist this to
+  // loadPanelLayout so the height survives reloads.
   const previewPanelHeightRef = useRef(0);
   const urlAsidePanelSizeRef = useRef(initialPanelLayout.urlAside);
   const mainPanelSizeRef = useRef(initialPanelLayout.main);
@@ -3300,6 +3304,23 @@ export default function App() {
   );
   const effectivePreviewPanelWidth = effectiveLayout.preview.w;
 
+  /** Apply the preview panel width and keep the player container height
+   *  inside the aspect constraint (a landscape panel must never become
+   *  taller than wide). The frozen ref is NOT overwritten here — it holds
+   *  the user's picked height so the render-time clamp restores it when the
+   *  width grows back. */
+  const applyPreviewWidthWithHeight = useCallback((w: number) => {
+    previewPanelWidthRef.current = w;
+    if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
+    const h = previewContainerHeight(
+      previewPanelHeightRef.current,
+      w,
+      previewVideoAspectRef.current,
+      previewChromeHRef.current,
+    );
+    const c = previewContainerRef.current;
+    if (c) c.style.height = `${h}px`;
+  }, []);
 
   const handlePreviewLoadedMetadata = useCallback(() => {
     const video = previewVideoRef.current;
@@ -3324,10 +3345,9 @@ export default function App() {
         },
       );
       const w = effective.preview.w;
-      previewPanelWidthRef.current = w;
-      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
+      applyPreviewWidthWithHeight(w);
     }
-  }, [layoutBoundsInput, previewOpen, channelVodPanelOpen]);
+  }, [layoutBoundsInput, previewOpen, channelVodPanelOpen, applyPreviewWidthWithHeight]);
 
   /**
    * Sync DOM panel sizes from the runtime-clamped effective layout.
@@ -3345,8 +3365,7 @@ export default function App() {
         previewVideoAspectRef.current,
         { ...layout, preview: clamped.preview, urlAside: clamped.urlAside, main: clamped.main },
       );
-      previewPanelWidthRef.current = w;
-      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
+      applyPreviewWidthWithHeight(w);
     }
     if (layout.urlPanelAside) {
       urlAsidePanelSizeRef.current = clamped.urlAside;
@@ -3354,7 +3373,7 @@ export default function App() {
     }
     mainPanelSizeRef.current = clamped.main;
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, clamped.main);
-  }, [layoutBoundsInput]);
+  }, [layoutBoundsInput, applyPreviewWidthWithHeight]);
 
   useEffect(() => {
     // Preview close: side panels fall back to their owned heights instead of
@@ -3442,7 +3461,7 @@ export default function App() {
     mainPanelSizeRef.current = fitted.main;
     if (layout.previewOpen) {
       if (commitState) setPreviewPanelWidth(fitted.preview.w);
-      if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, fitted.preview.w);
+      applyPreviewWidthWithHeight(fitted.preview.w);
     }
     if (layout.urlPanelAside) {
       if (commitState) setUrlAsidePanelSize(fitted.urlAside);
@@ -3451,7 +3470,7 @@ export default function App() {
     if (commitState) setMainPanelSize(fitted.main);
     if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, fitted.main);
     syncRowHeightsToPreview(commitState);
-  }, [layoutBoundsInput, syncRowHeightsToPreview]);
+  }, [layoutBoundsInput, syncRowHeightsToPreview, applyPreviewWidthWithHeight]);
 
   const onPreviewPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const chromeH = previewChromeHRef.current;
@@ -3465,9 +3484,15 @@ export default function App() {
 
     // The container height is frozen (previewPanelHeightRef) so a refetch's
     // aspect change can't collapse the panel; a user resize must re-derive it
-    // from the new width or the panel stays locked on the vertical axis.
+    // from the new width or the panel stays locked on the vertical axis. The
+    // constraint keeps a landscape panel from ever flipping to portrait.
     const setPreviewHeightFromWidth = (w: number) => {
-      const h = Math.round(w / Math.max(0.01, aspect));
+      const h = previewContainerHeight(
+        Math.round(w / Math.max(0.01, aspect)),
+        w,
+        aspect,
+        chromeH,
+      );
       previewPanelHeightRef.current = h;
       const c = previewContainerRef.current;
       if (c) c.style.height = `${h}px`;
@@ -3596,11 +3621,6 @@ export default function App() {
       previewChromeHRef.current = chromeH;
     }
   }, [previewOpen, previewFullscreen, previewVideoAspect, previewVideoReady]);
-  useEffect(() => {
-    if (!previewOpen || previewFullscreen || !previewContainerRef.current) return;
-    const h = previewContainerRef.current.offsetHeight;
-    if (h > 0) previewPanelHeightRef.current = h;
-  });
 
   // ── Fetch video info ──
 
@@ -6329,7 +6349,7 @@ export default function App() {
                   ? 'relative flex-1 min-w-0 border-0'
                   : 'relative flex-1 min-w-0 shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { height: previewPanelHeightRef.current || Math.round(effectivePreviewPanelWidth / Math.max(0.01, previewVideoAspect)), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
+              style={!previewFullscreen ? { height: previewContainerHeight(previewPanelHeightRef.current, effectivePreviewPanelWidth, previewVideoAspect, previewChromeHRef.current), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
 
             >
               <div
