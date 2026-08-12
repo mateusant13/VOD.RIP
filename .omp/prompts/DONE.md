@@ -1,11 +1,14 @@
-# Tasks
-1 Thumbnails: clip history img from thumbnail_url; DownloadThumb twitch fallback; yt-dlp writethumbnail; record API thumbnail_url. DONE
-2 Clear notifications: POST /api/archive/jobs/clear + button. DONE
-3 Mini preview: URL removed, Download handoff to main at currentTime, mini hidden in memory, Voltar Mini on main; trim In/Out sliders. DONE
-4 Clip filters auto-advance next range with clips (skips while loading). DONE
-5 Source chips: only speech+chat (video chip removed). DONE
-6 Exact = contiguous phrase filter; mode already in search deps so reruns. DONE
-7 Search limit 100000 API+UI; per-video cap lifts at 10k. DONE
-8 mention_irc 24/7 justinfan join saved channels, word-boundary names into messages. DONE
-9 Parakeet default schemas+settings copy; Whisper only on Parakeet fail/ja-ko-zh-ar. DONE
-10 Immortal: failed jobs requeue unless file-missing or rate-limit; clear keeps queued. DONE
+# Tasks — status 2026-08-12 (TASK8+9+10 batch, merged `e611d8d`)
+
+Merged into `main` at `e611d8d`. Backend: 115 passed on TASK8/9/10 subset, 917/921 full suite. Frontend: 34 vitest on touched components.
+
+1. Thumbnails: clip history img from thumbnail_url; DownloadThumb twitch fallback; yt-dlp writethumbnail; record API thumbnail_url. DONE (parallel session; `test_download_sidecars` green on merged main)
+2. Clear notifications: POST /api/archive/jobs/clear + button. DONE (parallel session; merged + conflict-resolved; vitest green)
+3. Mini preview: URL removed, Download handoff at currentTime, Voltar Mini, trim sliders. DONE (parallel session) — but `test_youtube_preview_playback_proof` (HLS segment body empty, `98 > 256`) and `test_youtube_explore_progressive::test_long_explore_muxed_pick_accepts_single_low_tier` (TypeError: `_youtube_muxed_progressive_for_long_explore() takes 2 positional arguments but 3`) still FAIL — owned by that parallel session; present on pre-TASK8/9/10 baseline too.
+4. Clip filters auto-advance next range with clips (skips while loading). DONE (parallel session)
+5. Source chips: only speech+chat (video chip removed). DONE (parallel session)
+6. Exact = contiguous phrase filter. DONE (parallel session)
+7. Search limit 100000 API+UI; per-video cap lifts at 10k. DONE (parallel session) — `test_archive_enrich_v2::test_channel_hint_fires_for_first_token_channel_only` (`['TiTiltei'] != []`, DB pollution) still FAILs, fails in isolation too; owned by that session.
+8. mention_irc 24/7 justinfan join saved channels, word-boundary names into messages. DONE — `backend/services/mention_irc.py` (persist fix: epoch `offset_sec` stamp, `_monitor_enabled()` runtime toggle, autostart in `app.py` lifespan), `twitch_monitor_enabled` setting (schemas + settings router + types.ts + SettingsTab toggle + i18n PT/ES/EN), searchable fallback via archive messages FTS. Tests: `test_mention_irc.py` 3 pass.
+9. Parakeet default ASR; Whisper large-v3-turbo ONLY when Parakeet fails or ja/ko/zh/ar. DONE — `asr_engine` setting wired (schemas/router/types/SettingsTab selector/TranscriptionSection); `_job_engine` parakeet default incl. unknown/None; whisper only for `WHISPER_ONLY_LANGS={"ja","ko","zh","ar"}`, forced engine, or lane-unavailable; thread-local parakeet→whisper runtime fallback (one retry; FileNotFound/DownloadError not retried); autodetect gate `language_probability < 0.5 → None`. Tests: `test_parakeet_lane.py` 23 pass, TranscriptionSection 3 pass. Engine-agnostic `whisper_model="large-v3-turbo"`.
+10. Immortal retry queue: failed jobs requeue with exponential backoff unless terminal (FileNotFound/archive-file-missing/DownloadError/no HLS source); rate-limit failures retry AFTER gates (floor 120s), cap 3600s, jitter ≤30s; attempts/max_attempts/next_retry_at columns + migration; claim only due/stale-running. Fewer failed notifications: UI amber "retrying" treatment + `progress.status.retrying` i18n. Tests: `test_archive_jobs_retry.py` 5 pass, jobs API clear test green, QueueTab 14 pass.
