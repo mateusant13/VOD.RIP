@@ -140,12 +140,14 @@ def test_kick_lane_skips_queued_and_running_jobs(scratch_db, monkeypatch):
 
 
 def test_kick_lane_requeues_failed_row_in_place(scratch_db, monkeypatch):
-    """A fresh failed row under the stable id is requeued IN PLACE by the
+    """A terminal-failed row under the stable id stays 'failed' (TASK10 only
+    requeues transient errors) and a re-kick requeues it IN PLACE via the
     IntegrityError backstop — the retry reuses the row (no orphaned failed
     id, no crash), and only one job row ever exists for the video."""
     _seed_video("1002")
     archive_db.enqueue_job("tw-backfill-1002", "chat", "twitch", "1002")
-    archive_db.update_job("tw-backfill-1002", status="failed", error="service error")
+    archive_db.update_job(
+        "tw-backfill-1002", status="failed", error="FileNotFound: missing archive")
 
     def fake_page(vid, offset, size):
         return [_node(5.0)]
