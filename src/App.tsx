@@ -5137,7 +5137,14 @@ export default function App() {
       channelName: name,
       channel: channel ?? null,
     };
-    const res = appendLivePopup(livePopupsRef.current, item, MAX_LIVE_POPUPS);
+    // Dedupe by live URL: clicking a live that already has an open popup
+    // FOCUSES the existing one instead of spawning a duplicate popup + a
+    // second backend session (mirrors the explore-popup dedup, f189b99d).
+    const res = appendLivePopup(livePopupsRef.current, item, MAX_LIVE_POPUPS, (p) => p.entry.url);
+    if (res.existing) {
+      bringPopupToFront(String(res.existing.id));
+      return;
+    }
     if (res.blocked) {
       setLivePopupNotice(t('Max {n} live players at once — close one first.', { n: MAX_LIVE_POPUPS }));
       return;

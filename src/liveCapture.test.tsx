@@ -72,3 +72,30 @@ describe("appendLivePopup (5-player cap)", () => {
     expect(sixth.items).not.toContain(99);
   });
 });
+
+describe("appendLivePopup URL dedup", () => {
+  it("returns the existing item instead of appending a duplicate", () => {
+    const items = [
+      { id: 1, url: "https://twitch.tv/stream-a" },
+      { id: 2, url: "https://twitch.tv/stream-b" },
+    ];
+    const res = appendLivePopup(items, { id: 3, url: "https://twitch.tv/stream-b" }, 5, (p) => p.url);
+    expect(res.blocked).toBe(false);
+    expect(res.existing).toEqual({ id: 2, url: "https://twitch.tv/stream-b" });
+    expect(res.items).toBe(items); // unchanged reference when deduped
+  });
+
+  it("dedupes even when the cap is already reached", () => {
+    const items = [
+      { id: 1, url: "https://twitch.tv/a" },
+      { id: 2, url: "https://twitch.tv/b" },
+      { id: 3, url: "https://twitch.tv/c" },
+      { id: 4, url: "https://twitch.tv/d" },
+      { id: 5, url: "https://twitch.tv/e" },
+    ];
+    const res = appendLivePopup(items, { id: 6, url: "https://twitch.tv/c" }, 5, (p) => p.url);
+    expect(res.blocked).toBe(false);
+    expect(res.existing?.id).toBe(3);
+    expect(res.items).toHaveLength(5);
+  });
+});

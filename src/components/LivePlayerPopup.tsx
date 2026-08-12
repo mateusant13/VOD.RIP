@@ -130,6 +130,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
   const previewRetryRef = useRef<PreviewRetryState | null>(null);
   const previewRetryingRef = useRef(false);
+  /** ONE invisible session recreate per popup (fatal NETWORK_ERROR): the first
+   *  fatal error re-creates the backend session (fresh usher/master tokens)
+   *  before the startLoad retries — a stale session's startLoad cannot recover. */
+  const silentRecreateDoneRef = useRef(false);
+  /** True while the mount effect is re-running as that invisible recreate —
+   *  the effect then skips the loading swap (keeps the last frame visible). */
+  const invisibleRecreateRef = useRef(false);
   const [retryTick, setRetryTick] = useState(0);
   const clearRetry = useCallback(() => {
     previewRetryingRef.current = false;
@@ -289,6 +296,22 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     setBuffering(false);
   }, []);
 
+  /** ONE invisible session recreate per popup — the first fatal NETWORK_ERROR
+   *  deletes the stale session and re-runs the mount effect (re-POST + re-
+   *  attach) with NO error UI: the frame stays up and the buffering overlay
+   *  covers the swap. Subsequent fatals fall back to the startLoad retries. */
+  const recreateSessionInvisible = useCallback(() => {
+    invisibleRecreateRef.current = true;
+    setError(null);
+    const sid = sessionIdRef.current;
+    if (sid) {
+      void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
+      sessionIdRef.current = null;
+    }
+    sessionRef.current = null;
+    setRetryTick((t) => t + 1);
+  }, []);
+
   /** Create an hls.js instance for *src*; live mode defaults 360p after parse. */
   const createHlsPlayer = useCallback(async (src: string, startPos: number): Promise<any | null> => {
     const video = videoRef.current;
@@ -428,6 +451,15 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // (resume near the current position), media error recovery, then error.
       switch (data.type) {
         case Hls.ErrorTypes.NETWORK_ERROR:
+          // Invisible session recreate FIRST (fix D): a fatal NETWORK_ERROR on
+          // a live stream is usually a stale session (expired usher/master
+          // token) that startLoad cannot fix — one delete+re-POST recovers.
+          // Only after that do the bounded startLoad retries run.
+          if (modeRef.current === 'live' && !silentRecreateDoneRef.current) {
+            silentRecreateDoneRef.current = true;
+            recreateSessionInvisible();
+            break;
+          }
           if (networkRetries < 4) {
             networkRetries += 1;
             window.setTimeout(() => {
@@ -453,7 +485,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible]);
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
@@ -512,7 +544,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
     (async () => {
       try {
-        setLoading(true);
+        if (invisibleRecreateRef.current) {
+          // Invisible retry: keep the current frame under the buffering
+          // overlay — no loading swap for the one automatic recreate.
+          invisibleRecreateRef.current = false;
+        } else {
+          setLoading(true);
+        }
         setError(null);
         const body: {
           url: string;
