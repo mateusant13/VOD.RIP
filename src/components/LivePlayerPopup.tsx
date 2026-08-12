@@ -24,6 +24,7 @@ import { platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
+import { noteUserUnpause } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
 import { fmtDuration } from '../formatters';
 import { createFullscreenGate, nativeFullscreenAdapter, type FullscreenGate } from '../utils/fullscreenGate';
@@ -691,6 +692,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (!video) return;
     if (video.paused) {
       userPausedRef.current = false;
+      noteUserUnpause();
       video.play().catch(() => {});
     } else {
       userPausedRef.current = true;

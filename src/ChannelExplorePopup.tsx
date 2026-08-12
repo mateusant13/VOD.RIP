@@ -53,10 +53,11 @@ import {
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable } from './previewTiming';
 import { PREVIEW_DEFAULT_VOLUME } from './layoutUtils';
-import { pauseOtherPreviews, registerPreviewPlayback } from './previewPlaybackBus';
+import { pauseOtherPreviews, autoPauseOtherPreviews, noteUserUnpause, registerPreviewPlayback } from './previewPlaybackBus';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import {
   EXPLORE_PANEL_DEFAULT_W,
+  EXPLORE_PANEL_MIN_W,
   EXPLORE_PANEL_CHROME_H_EST,
   EXPLORE_VIDEO_ASPECT_DEFAULT,
   VIEWPORT_EDGE_LOCK,
@@ -297,6 +298,10 @@ export default function ChannelExplorePopup({
   const cachedProgressiveRef = useRef(false);
   const previewTimingRef = useRef<PreviewTiming | null>(null);
   const suppressPlayRef = useRef(false);
+  /** Load start of the current preview — any user unpause at/after this
+   *  timestamp suppresses the load-complete auto-pause (mini preview open
+   *  and loading rule). */
+  const loadingSinceRef = useRef(0);
   const platform = explorePlatformKey(vod.platform);
   useEffect(() => {
     playbackKindRef.current = playback?.kind ?? 'progressive';
@@ -437,6 +442,9 @@ export default function ChannelExplorePopup({
     setBuffering(false);
     setReady(false);
     setError(null);
+    // Auto-pause guard: any user unpause at/after this instant suppresses
+    // the load-complete pause when the mini preview finishes loading.
+    loadingSinceRef.current = Date.now();
     // Synthetic watchdog ids (chat capture without an extracted videoId) have
     // no video — show the honest state instead of booting a 404 preview
     // session (watch?v=<synthetic> does not exist on YouTube).
@@ -659,6 +667,7 @@ export default function ChannelExplorePopup({
         postYoutubeCommand(muted ? 'mute' : 'unMute');
         postYoutubeCommand('playVideo');
         setPlaying(true);
+        noteUserUnpause();
       }
       return;
     }
@@ -666,6 +675,7 @@ export default function ChannelExplorePopup({
     if (!video || !ready) return;
     if (video.paused) {
       unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
+      noteUserUnpause();
       void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
         setPlaying(!video.paused);
       });
@@ -983,8 +993,11 @@ export default function ChannelExplorePopup({
       posRef,
       setPos,
       // The drag resizes the video; the container is video + chat footprint.
+      // Floor at the panel minimum (60 was below EXPLORE_PANEL_MIN_W and let
+      // the player column collapse to a few px — buttons wrapped into the
+      // chat panel).
       clampWidth: (w) =>
-        Math.max(60, clampExplorePanelWidth(w + chatTotal, chromeHRef.current, videoAspectRef.current) - chatTotal),
+        Math.max(EXPLORE_PANEL_MIN_W, clampExplorePanelWidth(w + chatTotal, chromeHRef.current, videoAspectRef.current) - chatTotal),
     });
   }, [chatTotal]);
 
@@ -1116,7 +1129,7 @@ export default function ChannelExplorePopup({
         chromeHRef.current,
         videoAspectRef.current,
       );
-      const clampedW = Math.max(60, totalW - chatTotalRef.current);
+      const clampedW = Math.max(EXPLORE_PANEL_MIN_W, totalW - chatTotalRef.current);
       panelWidthRef.current = clampedW;
       setPanelWidth(clampedW);
       const el = containerRef.current;
@@ -1171,7 +1184,7 @@ export default function ChannelExplorePopup({
       setVolume(PREVIEW_DEFAULT_VOLUME);
       if (!initialPlayDoneRef.current && video.paused) {
         initialPlayDoneRef.current = true;
-        pauseOtherPreviews();
+        autoPauseOtherPreviews(loadingSinceRef.current);
         void playPreviewWithAudio(video, setMuted, PREVIEW_DEFAULT_VOLUME).then(() => {
           setPlaying(!video.paused);
           if (video.readyState >= 3 && !video.paused && video.currentTime > 0.02) {
@@ -1467,7 +1480,7 @@ export default function ChannelExplorePopup({
 
   const timelineUi = (
     <>
-    <div className="flex items-center gap-1.5 w-full shrink-0">
+    <div className="flex items-center gap-1.5 w-full shrink-0 flex-wrap">
       <span className={`text-[9px] font-mono w-10 shrink-0 ${fullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
         {formatHmsFull(currentTime)}
       </span>
@@ -1479,23 +1492,23 @@ export default function ChannelExplorePopup({
         value={Math.min(Math.max(currentTime, exploreTrimStart), exploreTrimEnd > exploreTrimStart ? exploreTrimEnd : effectiveDurationSec)}
         disabled={!ready}
         onChange={(e) => seekVideoDebounced(parseFloat(e.target.value))}
-        className="flex-1 accent-white disabled:opacity-40 h-1"
+        className="flex-1 accent-white disabled:opacity-40 h-1 min-w-0"
       />
       <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${fullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
         {formatHmsFull(effectiveDurationSec)}
       </span>
     </div>
-    <div className="flex items-center gap-1.5 w-full shrink-0">
+    <div className="flex items-center gap-1.5 w-full shrink-0 flex-wrap">
       <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('In')}</span>
       <input type="range" min={0} max={effectiveDurationSec} step={0.25}
         value={Math.min(exploreTrimStart, effectiveDurationSec)}
         onChange={(e) => setExploreTrimStart(Math.min(parseFloat(e.target.value), (exploreTrimEnd || effectiveDurationSec) - 1))}
-        className="flex-1 accent-zinc-400 h-1" />
+        className="flex-1 accent-zinc-400 h-1 min-w-0" />
       <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('Out')}</span>
       <input type="range" min={0} max={effectiveDurationSec} step={0.25}
         value={exploreTrimEnd > 0 ? exploreTrimEnd : effectiveDurationSec}
         onChange={(e) => setExploreTrimEnd(Math.max(parseFloat(e.target.value), exploreTrimStart + 1))}
-        className="flex-1 accent-zinc-400 h-1" />
+        className="flex-1 accent-zinc-400 h-1 min-w-0" />
     </div>
     </>
   );
@@ -1791,7 +1804,7 @@ export default function ChannelExplorePopup({
                 chromeHRef.current,
                 aspect,
               );
-              const clampedW = Math.max(60, totalW - chatTotalRef.current);
+              const clampedW = Math.max(EXPLORE_PANEL_MIN_W, totalW - chatTotalRef.current);
               panelWidthRef.current = clampedW;
               setPanelWidth(clampedW);
             }}
@@ -1882,7 +1895,7 @@ export default function ChannelExplorePopup({
             <p className="text-[8px] font-mono text-zinc-600 uppercase tracking-wider text-center shrink-0">
               Fullscreen to explore
             </p>
-            <div className="flex items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center justify-between gap-2 shrink-0 flex-wrap">
               <div className="flex items-center gap-1.5">
                 <button type="button" onClick={togglePlay} disabled={!ready} className={ctrlBtn(false)}>
                   {playing ? <Pause size={18} /> : <Play size={18} />}

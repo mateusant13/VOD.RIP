@@ -8,6 +8,7 @@ import {
   clampAllLayoutPanels,
   effectiveLayoutFromPreferred,
   previewContainerHeight,
+  previewPlayerColumnWidth,
   panelPosAfterResize,
   healSqueezedPanelLayout,
   aspectHeightForWidth,
@@ -552,5 +553,40 @@ describe('previewContainerHeight aspect constraint', () => {
     expect(previewContainerHeight(0, 280, 9 / 16, 120)).toBe(498);
     // Never collapse below the video-fit height.
     expect(previewContainerHeight(300, 280, 9 / 16, 120)).toBe(498);
+  });
+});
+
+describe('previewPlayerColumnWidth — chat attached to the player row', () => {
+  // Card = p-4 (16/side) + border-2 (2/side) + row gap-2 (8) = 44 fixed.
+  it('reserves the card chrome and the attached chat footprint', () => {
+    // No chat (collapsed strip 28): 640 - 44 - 28.
+    expect(previewPlayerColumnWidth(640, 28)).toBe(568);
+    // Chat open at its rendered width: 640 - 44 - 316.
+    expect(previewPlayerColumnWidth(640, 316)).toBe(280);
+  });
+
+  it('never goes negative when the chat overfills the card', () => {
+    expect(previewPlayerColumnWidth(280, 320)).toBe(0);
+  });
+
+  it('keeps a landscape player landscape while the chat is attached', () => {
+    // 640px card with the chat open at its max cap (640 - 280 - 8 - 36 = 316):
+    // the container height derived from the REMAINING column width (280) must
+    // stay <= the column width — never the portrait box the card-width math
+    // produced (previewContainerHeight(frozen, 640, ...) = 360 > 280).
+    const colW = previewPlayerColumnWidth(640, 316);
+    const h = previewContainerHeight(0, colW, 16 / 9, 120);
+    expect(h).toBe(158);
+    expect(h).toBeLessThanOrEqual(colW);
+    expect(h + 120).toBeLessThanOrEqual(640); // whole card stays landscape
+  });
+
+  it('grows the player back when the chat collapses', () => {
+    const colOpen = previewPlayerColumnWidth(640, 316);
+    const colClosed = previewPlayerColumnWidth(640, 28);
+    expect(previewContainerHeight(0, colOpen, 16 / 9, 120)).toBeLessThan(
+      previewContainerHeight(0, colClosed, 16 / 9, 120),
+    );
+    expect(previewContainerHeight(0, colClosed, 16 / 9, 120)).toBe(320);
   });
 });

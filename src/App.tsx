@@ -67,7 +67,7 @@ import {
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable, notePreviewGesture } from './previewTiming';
-import { pauseOtherPreviews, registerPreviewPlayback } from './previewPlaybackBus';
+import { pauseOtherPreviews, autoPauseOtherPreviews, noteUserUnpause, registerPreviewPlayback } from './previewPlaybackBus';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
@@ -79,7 +79,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
-import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, previewPlayerColumnWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -91,7 +91,7 @@ import SettingsTab from './components/SettingsTab';
 import BotGateBanner from './components/BotGateBanner';
 import CookieInstallOffer from './components/CookieInstallOffer';
 import { isFirstTime as isFirstTimeFlag } from './lib/firstTime';
-import PreviewChatPanel from './components/PreviewChatPanel';
+import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
@@ -484,6 +484,19 @@ export default function App() {
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
+  /** Attached chat panel's rendered footprint in the preview row (open width,
+   *  collapsed strip, or 0 when space-forced shut). The player container
+   *  height derives from the column width LEFT after the chat, so the
+   *  container can never flip to portrait while the chat is attached. */
+  const [previewChatLayout, setPreviewChatLayout] = useState<{ open: boolean; width: number }>(() => ({
+    open: true,
+    width: readPreviewChatPanelWidth(),
+  }));
+  const previewChatLayoutRef = useRef(previewChatLayout);
+  previewChatLayoutRef.current = previewChatLayout;
+  /** Load start of the current preview session — any user unpause at/after
+   *  this timestamp suppresses the load-complete auto-pause. */
+  const previewLoadSinceRef = useRef(0);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const previewPlayheadRef = useRef<HTMLDivElement>(null);
   const previewCurrentTimeRef = useRef(0);
@@ -1617,6 +1630,9 @@ export default function App() {
     setPreviewPlayback(null);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
+    // Auto-pause guard: any user unpause at/after this instant suppresses the
+    // load-complete pause (see autoPauseOtherPreviews).
+    previewLoadSinceRef.current = Date.now();
     syncPreviewTimeUi(start, true);
     setError(null);
     // YouTube deliberately uses the app's proxied <video>/HLS pipeline too.
@@ -1986,7 +2002,7 @@ export default function App() {
       performInitialSeek();
       if (!previewInitialPlayDoneRef.current && video.paused) {
         previewInitialPlayDoneRef.current = true;
-        pauseOtherPreviews();
+        autoPauseOtherPreviews(previewLoadSinceRef.current);
         void video.play().catch(() => {
           video.muted = true;
           setPreviewMuted(true);
@@ -2516,6 +2532,7 @@ export default function App() {
         postYoutubePreviewCommand(previewMuted ? 'mute' : 'unMute');
         postYoutubePreviewCommand('playVideo');
         setPreviewPlaying(true);
+        noteUserUnpause();
       } else {
         postYoutubePreviewCommand('pauseVideo');
         setPreviewPlaying(false);
@@ -2540,6 +2557,7 @@ export default function App() {
       }
       void video.play();
       setPreviewPlaying(true);
+      noteUserUnpause();
     } else {
       video.pause();
       setPreviewPlaying(false);
@@ -3307,13 +3325,17 @@ export default function App() {
    *  inside the aspect constraint (a landscape panel must never become
    *  taller than wide). The frozen ref is NOT overwritten here — it holds
    *  the user's picked height so the render-time clamp restores it when the
-   *  width grows back. */
+   *  width grows back. The height derives from the PLAYER COLUMN width
+   *  (card minus the attached chat panel), never the card width — a height
+   *  from the card width makes the container portrait while the chat is
+   *  open. */
   const applyPreviewWidthWithHeight = useCallback((w: number) => {
     previewPanelWidthRef.current = w;
     if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
+    const colW = previewPlayerColumnWidth(w, previewChatLayoutRef.current.width);
     const h = previewContainerHeight(
       previewPanelHeightRef.current,
-      w,
+      colW,
       previewVideoAspectRef.current,
       previewChromeHRef.current,
     );
@@ -3484,11 +3506,15 @@ export default function App() {
     // The container height is frozen (previewPanelHeightRef) so a refetch's
     // aspect change can't collapse the panel; a user resize must re-derive it
     // from the new width or the panel stays locked on the vertical axis. The
-    // constraint keeps a landscape panel from ever flipping to portrait.
+    // constraint keeps a landscape panel from ever flipping to portrait. The
+    // height derives from the PLAYER COLUMN width (card minus the attached
+    // chat panel), never the card width — otherwise the panel goes portrait
+    // the moment the chat opens.
     const setPreviewHeightFromWidth = (w: number) => {
+      const colW = previewPlayerColumnWidth(w, previewChatLayoutRef.current.width);
       const h = previewContainerHeight(
-        Math.round(w / Math.max(0.01, aspect)),
-        w,
+        Math.round(colW / Math.max(0.01, aspect)),
+        colW,
         aspect,
         chromeH,
       );
@@ -6343,7 +6369,7 @@ export default function App() {
                   ? 'relative flex-1 min-w-0 border-0'
                   : 'relative flex-1 min-w-0 shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { height: previewContainerHeight(previewPanelHeightRef.current, effectivePreviewPanelWidth, previewVideoAspect, previewChromeHRef.current), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
+              style={!previewFullscreen ? { height: previewContainerHeight(previewPanelHeightRef.current, previewPlayerColumnWidth(effectivePreviewPanelWidth, previewChatLayoutRef.current.width), previewVideoAspect, previewChromeHRef.current), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
 
             >
               <div
@@ -6466,6 +6492,10 @@ export default function App() {
               // and it collapses to zero width. Keep the 36 in sync with the
               // card's p-4/border-2 classes.
               maxWidth={Math.max(0, effectivePreviewPanelWidth - PREVIEW_PANEL_MIN_W - 8 - 36)}
+              // The container height derives from the width the chat actually
+              // occupies (see previewPlayerColumnWidth): report it so the
+              // player column never flips to portrait when the panel opens.
+              onLayoutChange={setPreviewChatLayout}
             />
           </div>
           {!previewFullscreen && (

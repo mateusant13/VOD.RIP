@@ -498,6 +498,24 @@ export function previewContainerHeight(
   const cap = Math.max(naturalH, panelW - chromeH);
   return frozenH > 0 ? Math.min(frozenH, cap) : naturalH;
 }
+
+/** Fixed horizontal chrome of the preview card around the player row:
+ *  card p-4 (16px per side) + border-2 (2px per side) + the row's gap-2 (8).
+ *  Keep in sync with the card's p-4/border-2 classes and the row's gap-2. */
+export const PREVIEW_PLAYER_ROW_FIXED_W = 36 + 8;
+/**
+ * Actual width available to the preview PLAYER container inside the card.
+ * The container height must be derived from THIS width, not the card width:
+ * the attached chat panel eats into the row, and a height computed from the
+ * card width makes the container portrait (taller than wide) the moment the
+ * chat opens — the reported "divs entering one another" bug. `chatW` is the
+ * chat panel's rendered footprint (open width, collapsed strip, or 0 when
+ * space-forced); pass the value reported via PreviewChatPanel's
+ * onLayoutChange, or PANEL_STRIP_W's equivalent when it is not wired.
+ */
+export function previewPlayerColumnWidth(cardW: number, chatW: number): number {
+  return Math.max(0, cardW - PREVIEW_PLAYER_ROW_FIXED_W - chatW);
+}
 export function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
   el.style.position = 'fixed';
   el.style.top = `${pos.y}px`;

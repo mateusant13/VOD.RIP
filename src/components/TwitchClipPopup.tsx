@@ -56,7 +56,7 @@ import { PREVIEW_DEFAULT_VOLUME, panelPosAfterResize, startPanelResizeDrag } fro
 import { PanelResizeHandles, type ResizeEdge } from '../explorePopupUtils';
 import type { PanelSize } from '../types';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
-import { pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
+import { pauseOtherPreviews, autoPauseOtherPreviews, noteUserUnpause, registerPreviewPlayback } from '../previewPlaybackBus';
 import { formatHmsFull } from '../utils';
 import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
 import TwitchLogoIcon from './TwitchLogoIcon';
@@ -239,6 +239,9 @@ export default function TwitchClipPopup({
   const holdPlayheadRef = useRef(false);
   const hlsRef = useRef<Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  /** Load start of this clip preview — any user unpause at/after this
+   *  timestamp suppresses the load-complete auto-pause. */
+  const loadingSinceRef = useRef(0);
   const timelineOffsetRef = useRef(0);
   const currentTimeRef = useRef(Math.max(win.start, Math.min(win.end, playheadSec)));
 
@@ -267,6 +270,9 @@ export default function TwitchClipPopup({
   // ── Preview session (mirrors App.tsx openPreview: crop window = trim range) ──
   useEffect(() => {
     let cancelled = false;
+    // Auto-pause guard: any user unpause at/after this instant suppresses
+    // the load-complete pause when this clip preview finishes loading.
+    loadingSinceRef.current = Date.now();
     // Full-VOD HLS proxy (no window mux): video time is absolute VOD time.
     // Adopt an existing same-VOD session so the proxy serves segments from
     // that session's disk cache instead of re-downloading from the CDN (and
@@ -383,7 +389,7 @@ export default function TwitchClipPopup({
       setBuffering(false);
       setLoading(false);
       if (video.paused) {
-        pauseOtherPreviews();
+        autoPauseOtherPreviews(loadingSinceRef.current);
         void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
           setPlaying(!video.paused);
         });
@@ -496,6 +502,7 @@ export default function TwitchClipPopup({
     const video = videoRef.current;
     if (!video || !ready) return;
     if (video.paused) {
+      noteUserUnpause();
       void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
         setPlaying(!video.paused);
       });
