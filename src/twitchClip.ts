@@ -378,3 +378,28 @@ export async function deleteTwitchClipHistory(
 ): Promise<{ ok: boolean; removed: number }> {
   return apiDelete<{ ok: boolean; removed: number }>('/api/twitch/clips/history', { ids });
 }
+
+/** One archived chat row inside a clip's window (preview-panel projection). */
+export interface TwitchClipChatMessage {
+  platform: string;
+  video_id: string;
+  offset_sec: number;
+  username: string;
+  text: string;
+  spam_count: number;
+  color: string | null;
+}
+
+/** GET /api/twitch/clips/{slug}/chat — the source VOD's chat windowed to the
+ *  clip media ([offset_sec - duration_sec, offset_sec]); an empty window
+ *  arrives as `messages: []` with total 0. */
+export interface TwitchClipChat {
+  messages: TwitchClipChatMessage[];
+  truncated: boolean;
+  total: number;
+}
+
+/** Fetch the archived chat of a recorded clip's source VOD (windowed). */
+export async function fetchTwitchClipChat(slug: string): Promise<TwitchClipChat> {
+  return apiGet<TwitchClipChat>(`/api/twitch/clips/${encodeURIComponent(slug)}/chat`);
+}

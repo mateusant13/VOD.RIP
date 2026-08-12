@@ -1,14 +1,16 @@
 
-import { useEffect, useState } from 'react';
-import { Clapperboard, Download, ExternalLink, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { Clapperboard, Download, ExternalLink, FolderOpen, MessageSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { vodCheckboxStyle, platformAccentColor } from '../platformColors';
 import { ActiveDownloadsList } from './ActiveDownloadsList';
 import DownloadThumb from './DownloadThumb';
 import PlatformVodIcon from './PlatformVodIcon';
 import type { DownloadState } from '../types';
 import { useI18n } from '../i18n';
-import { deleteTwitchClipHistory, fetchTwitchClipHistory, type TwitchClipRecord } from '../twitchClip';
+import { deleteTwitchClipHistory, fetchTwitchClipChat, fetchTwitchClipHistory, type TwitchClipRecord, type TwitchClipChat } from '../twitchClip';
 import { formatHmsFull } from '../utils';
+import { formatArchiveOffset } from '../archiveSearchUtils';
+import { resolveChatColor } from '../chatColors';
 import NotificationsPanel from './NotificationsPanel';
 
 function isPlayableLocalFile(path: string): boolean {
@@ -137,6 +139,27 @@ export default function QueueTab({
       setClipDeleteError(t('Failed to delete Twitch clips'));
     }
   };
+  /** Open/close the windowed source-VOD chat viewer for one clip history row.
+   *  Fetched on demand; closing the panel drops the loaded payload. */
+  const [clipChatOpen, setClipChatOpen] = useState<string | null>(null);
+  const [clipChat, setClipChat] = useState<TwitchClipChat | null>(null);
+  const [clipChatLoading, setClipChatLoading] = useState(false);
+  const [clipChatError, setClipChatError] = useState<string | null>(null);
+  const toggleClipChat = useCallback((clip: TwitchClipRecord) => {
+    if (clipChatOpen === clip.id) {
+      setClipChatOpen(null);
+      setClipChat(null);
+      return;
+    }
+    setClipChatOpen(clip.id);
+    setClipChat(null);
+    setClipChatError(null);
+    setClipChatLoading(true);
+    fetchTwitchClipChat(clip.id)
+      .then(setClipChat)
+      .catch(() => setClipChatError(t('Could not load chat history.')))
+      .finally(() => setClipChatLoading(false));
+  }, [clipChatOpen, t]);
   useEffect(() => {
     loadTwitchClips();
   }, []);
@@ -452,7 +475,8 @@ export default function QueueTab({
         ) : (
           <div className="flex flex-col gap-2">
             {twitchClips.map((c) => (
-              <div key={c.id} className="border-2 border-zinc-800 bg-zinc-950 p-2 flex items-center gap-3">
+              <div key={c.id} className="flex flex-col gap-1.5">
+              <div className="border-2 border-zinc-800 bg-zinc-950 p-2 flex items-center gap-3">
                 <input
                   type="checkbox"
                   checked={selectedClipIds.has(c.id)}
@@ -507,6 +531,57 @@ export default function QueueTab({
                     <Download size={12} /> {t('Download')}
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={() => toggleClipChat(c)}
+                  className="text-[#1f8fff] hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
+                  title={t('Clip chat history')}
+                >
+                  <MessageSquare size={12} /> {t('Chat')}
+                </button>
+              </div>
+              {clipChatOpen === c.id && (
+                <div className="border-2 border-zinc-800 bg-zinc-900/60 p-2 flex flex-col gap-1 max-h-56 overflow-y-auto custom-scrollbar">
+                  {clipChatLoading && (
+                    <p className="text-[10px] font-mono text-zinc-500">{t('Loading chat history...')}</p>
+                  )}
+                  {clipChatError && (
+                    <p className="text-[10px] font-mono text-red-400">{clipChatError}</p>
+                  )}
+                  {!clipChatLoading && !clipChatError && clipChat && clipChat.messages.length === 0 && (
+                    <p className="text-[10px] font-mono text-zinc-500">{t('No archived chat for this clip.')}</p>
+                  )}
+                  {!clipChatLoading && !clipChatError && clipChat && clipChat.messages.length > 0 && (
+                    <>
+                      {clipChat.messages.map((m) => (
+                        <p
+                          key={`c:${m.video_id}:${m.offset_sec}:${m.username}:${m.text}`}
+                          className="text-[10px] leading-snug text-zinc-200 break-words"
+                        >
+                          <span className="text-zinc-400 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
+                          <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
+                          {typeof m.spam_count === 'number' && m.spam_count > 1 && (
+                            <span
+                              className="text-[9px] font-mono text-zinc-500 ml-1"
+                              title={t('{count} identical messages collapsed', { count: m.spam_count })}
+                            >
+                              ×{m.spam_count}
+                            </span>
+                          )}
+                        </p>
+                      ))}
+                      {clipChat.truncated && (
+                        <p className="text-[9px] font-mono text-zinc-600">
+                          {t('History cut at the archive cap — showing the first {shown} of {total} messages.', {
+                            shown: clipChat.messages.length,
+                            total: clipChat.total,
+                          })}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
               </div>
             ))}
           </div>

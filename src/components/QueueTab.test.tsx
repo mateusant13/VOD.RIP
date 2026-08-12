@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import QueueTab, { type ArchiveJobRow } from './QueueTab';
 import type { DownloadState } from '../types';
 
@@ -380,5 +380,106 @@ describe('QueueTab', () => {
     expect(img).not.toBeNull();
     expect(img.src).toContain('/api/local/media?path=');
     expect(img.src).toContain(encodeURIComponent('C:\\VODs\\clip.thumb.jpg'));
+  });
+
+  it('clip Chat button loads and renders the windowed source-VOD chat', async () => {
+    const clip = {
+      id: 'ClipChat1',
+      created_at: '2026-08-01T00:00:00Z',
+      channel: 'chan',
+      vod_id: '1001',
+      offset_sec: 434,
+      duration_sec: 30,
+      title: 'T',
+      url: 'https://clips.twitch.tv/ClipChat1',
+      status: 'created',
+    };
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/twitch/clips/history')) {
+        return new Response(JSON.stringify([clip]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/twitch/clips/ClipChat1/chat')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { platform: 'twitch', video_id: '1001', offset_sec: 410, username: 'lubu', text: 'oi gente', spam_count: 1, color: null },
+              { platform: 'twitch', video_id: '1001', offset_sec: 420, username: 'ze', text: 'gg!', spam_count: 3, color: '#FF0000' },
+            ],
+            truncated: false,
+            total: 2,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fn);
+    try {
+      renderTab({ queue: [], history: [] });
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Chat' })).toBeTruthy());
+      fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+      await waitFor(() => expect(screen.getByText('oi gente')).toBeTruthy());
+      expect(screen.getByText('gg!')).toBeTruthy();
+      // Offsets render zero-padded mm:ss next to each message; collapsed duplicates show ×N.
+      expect(screen.getByText('06:50')).toBeTruthy();
+      expect(screen.getByText('07:00')).toBeTruthy();
+      expect(screen.getByText(/lubu\s*:/)).toBeTruthy();
+      expect(screen.getByText(/ze\s*:/)).toBeTruthy();
+      expect(screen.getByText('×3')).toBeTruthy();
+      // The chat URL was fetched once per open.
+      const chatCalls = fn.mock.calls.filter((c) => String(c[0]).includes('/ClipChat1/chat'));
+      expect(chatCalls).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('clip Chat shows the no-archived-chat empty state for an empty window', async () => {
+    const clip = {
+      id: 'EmptyChatClip',
+      created_at: '2026-08-01T00:00:00Z',
+      channel: 'chan',
+      vod_id: '1001',
+      offset_sec: 434,
+      duration_sec: 30,
+      title: 'T',
+      url: 'https://clips.twitch.tv/EmptyChatClip',
+      status: 'created',
+    };
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/twitch/clips/history')) {
+        return new Response(JSON.stringify([clip]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/twitch/clips/EmptyChatClip/chat')) {
+        return new Response(
+          JSON.stringify({ messages: [], truncated: false, total: 0 }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fn);
+    try {
+      renderTab({ queue: [], history: [] });
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Chat' })).toBeTruthy());
+      fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+      await waitFor(() => expect(screen.getByText('No archived chat for this clip.')).toBeTruthy());
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

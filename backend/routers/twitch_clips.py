@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
+from services import archive_db
 from services.disk_hygiene import data_dir
 
 logger = logging.getLogger(__name__)
@@ -381,3 +382,51 @@ def record_twitch_clip(req: TwitchClipRecordRequest, response: Response) -> Dict
     _save_history(history[:HISTORY_CAP])
     _append_clip_event("api", "api_clip_recorded", {**entry})
     return {"ok": True, "id": slug, "url": entry["url"]}
+
+
+# Rows the clip chat viewer renders: the same projection the preview chat
+# panel uses (offset_sec, text, username, spam_count, color) plus the row's
+# platform/video_id so the client can attribute merged rows.
+_CLIP_CHAT_KEYS = ("platform", "video_id", "offset_sec", "username", "text", "spam_count", "color")
+
+
+@router.get("/api/twitch/clips/{slug}/chat")
+async def twitch_clip_chat(slug: str) -> Dict[str, Any]:
+    """Archived chat of a recorded clip's source VOD, windowed to the clip.
+
+    History stores offset_sec as the VOD END of the published clip media
+    (downloads crop [end-duration, end]), so the window is
+    [offset_sec - duration_sec, offset_sec]. Rows are the same messages
+    table rows the preview chat panel renders, ordered by offset and capped
+    at the archive's window cap (archive_db.CHAT_WINDOW_HALF_LIMIT);
+    `truncated`/`total` let the UI show the 'History cut at the archive
+    cap' notice. Clips without vod/offset metadata, or whose source VOD has
+    no archived chat, return an empty list gracefully (the UI shows the
+    'No archived chat for this clip.' empty state)."""
+    clip = next((e for e in _load_history() if e.get("id") == slug), None)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="clip not found in history")
+    vod_id = clip.get("vod_id")
+    offset = clip.get("offset_sec")
+    duration = clip.get("duration_sec")
+    if not vod_id or not isinstance(offset, (int, float)) or not isinstance(duration, (int, float)):
+        return {"messages": [], "truncated": False, "total": 0}
+    offset = float(offset)
+    duration = float(duration)
+    if offset < 0 or duration <= 0:
+        return {"messages": [], "truncated": False, "total": 0}
+    vod_id = str(vod_id)
+    # Reuse the existing time-windowed chat helper: half the clip's length
+    # around its midpoint yields exactly BETWEEN [end-duration, end].
+    rows, _ = archive_db.chat_window(
+        "twitch", vod_id, offset - duration / 2.0, half=duration / 2.0,
+    )
+    total = int(
+        archive_db.query(
+            "SELECT COUNT(*) n FROM messages WHERE platform = 'twitch' AND video_id = ?"
+            " AND offset_sec BETWEEN ? AND ?",
+            (vod_id, offset - duration, offset),
+        )[0]["n"]
+    )
+    messages = [{k: row[k] for k in _CLIP_CHAT_KEYS} for row in rows]
+    return {"messages": messages, "truncated": total > len(messages), "total": total}
