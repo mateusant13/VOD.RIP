@@ -98,6 +98,13 @@ const ptBR: Record<string, string> = {
   'YouTube subtitles first': 'Legendas do YouTube primeiro',
   'Fallback to Whisper when subtitles are unavailable':
     'Recorre ao Whisper quando as legendas não estiverem disponíveis',
+  'ASR engine': 'Motor de ASR',
+  'Parakeet (default)': 'Parakeet (padrão)',
+  'Whisper large-v3-turbo': 'Whisper large-v3-turbo',
+  'Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).':
+    'Parakeet é o ASR padrão. Whisper large-v3-turbo é baixado e usado apenas quando o próprio Parakeet falha (idioma sem suporte como ja/ko/zh/ar, ou erro do motor Parakeet).',
+  'Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.':
+    'Parakeet é o padrão. Whisper large-v3-turbo roda apenas se o Parakeet falhar naquele trabalho (erro do Parakeet ou idioma que o Parakeet não suporta: ja/ko/zh/ar). Outros erros não acionam o Whisper.',
   'Captions Language': 'Idioma das legendas',
   'Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.':
     'Idioma ASR padrão para trabalhos do Whisper. Idiomas por canal são aprendidos automaticamente pelas transcrições (backend services/channel_language.py) — sobrescreva apenas se um canal for detectado errado com frequência.',
@@ -671,6 +678,11 @@ const es: Record<string, string> = {
   'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.': 'Los modelos Whisper se descargan aquí. Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio. Una ruta personalizada (HF hub compartido) también funciona.',
   'YouTube subtitles first': 'Subtítulos de YouTube primero',
   'Fallback to Whisper when subtitles are unavailable': 'Usar Whisper cuando no haya subtítulos',
+  'ASR engine': 'Motor de ASR',
+  'Parakeet (default)': 'Parakeet (predeterminado)',
+  'Whisper large-v3-turbo': 'Whisper large-v3-turbo',
+  'Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).': 'Parakeet es el ASR predeterminado. Whisper large-v3-turbo se descarga y usa solo cuando el propio Parakeet falla (idioma sin soporte como ja/ko/zh/ar, o error del motor Parakeet).',
+  'Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.': 'Parakeet es el predeterminado. Whisper large-v3-turbo solo corre si Parakeet falla en ese trabajo (error de Parakeet o idioma que Parakeet no soporta: ja/ko/zh/ar). Otros errores no activan Whisper.',
   'Captions Language': 'Idioma de subtítulos',
   'Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.': 'Idioma ASR predeterminado para trabajos de Whisper. Los idiomas por canal se aprenden automáticamente de la evidencia de transcripciones (backend services/channel_language.py) — anula solo si un canal se detecta mal de forma constante.',
   'Auto-detect': 'Detección automática',
