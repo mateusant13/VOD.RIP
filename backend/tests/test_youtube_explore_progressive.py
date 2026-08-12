@@ -104,7 +104,6 @@ def test_long_explore_muxed_pick_accepts_single_low_tier():
     }
     picked = _youtube_muxed_progressive_for_long_explore(
         "https://www.youtube.com/watch?v=unit",
-        None,
         720,
         yt_info=info,
     )
