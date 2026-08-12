@@ -364,13 +364,21 @@ def _try_prog_head_proxy(
                 yield chunk
                 remaining -= len(chunk)
         if end >= head_len:
+            from services.preview.hls import (
+                _UPSTREAM_SEGMENT_DEADLINE_SEC,
+                _iter_upstream_bounded,
+            )
+
             resp = _open_upstream_stream(
                 session,
                 session.entry_url,
                 f"bytes={head_len}-{'' if end == total - 1 else end}",
             )
             try:
-                for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                # Wall-clock watchdog — same stall bound as segment fetches.
+                for chunk in _iter_upstream_bounded(
+                    resp, _UPSTREAM_SEGMENT_DEADLINE_SEC, session.entry_url[:80]
+                ):
                     if chunk:
                         yield chunk
             finally:
@@ -850,6 +858,27 @@ class PreviewManager:
         url = (url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("Live preview requires an http(s) HLS URL")
+        # Dedupe: an ACTIVE live session for the same platform+master URL is
+        # reused — duplicate popups / rapid re-clicks must not spawn parallel
+        # backend sessions (each pins a LIVE_EXECUTOR worker and a 30min-TTL
+        # session). Closed or TTL-expired sessions still create fresh.
+        # ponytail: the scan isn't atomic against a concurrent create for the
+        # same URL; the frontend popup dedup (App.openLivePreview) makes that
+        # a non-issue — a session-id-keyed pending map would close it if it
+        # ever shows up in metrics.
+        now = time.time()
+        platform_key = (platform or "").strip().lower()
+        with self._lock:
+            for _sid, existing in self._sessions.items():
+                if (
+                    existing.is_live
+                    and not existing.closed
+                    and (existing.platform or "").strip().lower() == platform_key
+                    and existing.master_url == url
+                    and now - existing.last_access <= SESSION_TTL_SEC
+                ):
+                    existing.touch()
+                    return existing
         session_id = secrets.token_hex(8)
         cache_dir = preview_root() / session_id
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2263,8 +2292,16 @@ def open_progressive_proxy(
             pass
 
     def _generate():
+        from services.preview.hls import (
+            _UPSTREAM_SEGMENT_DEADLINE_SEC,
+            _iter_upstream_bounded,
+        )
+
         try:
-            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+            # Wall-clock watchdog — same stall bound as segment fetches.
+            for chunk in _iter_upstream_bounded(
+                resp, _UPSTREAM_SEGMENT_DEADLINE_SEC, upstream[:80]
+            ):
                 if chunk:
                     yield chunk
         finally:
@@ -2299,9 +2336,19 @@ def open_segment_proxy(
             pass
 
     def _generate() -> object:
+        from services.preview.hls import (
+            _UPSTREAM_SEGMENT_DEADLINE_SEC,
+            _iter_upstream_bounded,
+        )
+
         buf = bytearray()
         try:
-            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+            # Wall-clock watchdog: 0 B/s upstream (stalled usher/CDN) aborts
+            # after 15s instead of pinning a PREVIEW_EXECUTOR worker for the
+            # whole 3600s libcurl low-speed window (see hls._iter_upstream_bounded).
+            for chunk in _iter_upstream_bounded(
+                resp, _UPSTREAM_SEGMENT_DEADLINE_SEC, upstream_url[:80]
+            ):
                 if not chunk:
                     continue
                 if range_header is None and len(buf) + len(chunk) <= MAX_SEGMENT_BYTES:
@@ -3554,7 +3601,19 @@ def open_replay_hls_proxy(
         raise ValueError("No archive for this preview session")
     from services.preview.hls import _http_get_bytes
 
-    data, _, _, _ = _http_get_bytes(session, session.archive_entry_url)
+    try:
+        data, _, _, _ = _http_get_bytes(session, session.archive_entry_url)
+    except StalePreviewUrls:
+        # Long-parked REPLAY: the archive media playlist's usher token expired
+        # (409 upstream). Re-resolve the DVR archive ONCE and retry the
+        # snapshot fetch transparently — the frontend gets a normal 200 and
+        # playback continues instead of an endless 409 retry loop.
+        session.archive_url = None
+        session.archive_entry_url = None
+        session.resource_map.pop(REPLAY_PLAYLIST_RESOURCE, None)
+        if not _manager._ensure_live_archive(session):
+            raise
+        data, _, _, _ = _http_get_bytes(session, session.archive_entry_url)
     text = data.decode("utf-8", errors="replace")
     total = _playlist_total_duration(text)
     if total > 0:
@@ -4341,13 +4400,23 @@ def _fetch_and_rewrite_playlist_streaming(
     upstream_url: str,
 ) -> Tuple[bytes, int]:
     """Stream upstream m3u8 and rewrite line-by-line (long VOD playlists exceed 512KB)."""
+    from services.preview.hls import (
+        _UPSTREAM_PLAYLIST_DEADLINE_SEC,
+        _iter_upstream_bounded,
+    )
+
     base = upstream_url.rsplit("/", 1)[0] + "/"
     resp = _open_upstream_stream(session, upstream_url)
     out = bytearray()
     status = resp.status_code
     pending = ""
     try:
-        for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+        # Wall-clock watchdog: a stalled upstream (no bytes for 20s) aborts
+        # the read instead of pinning a PREVIEW_EXECUTOR worker for libcurl's
+        # whole 3600s low-speed window (see hls._iter_upstream_bounded).
+        for chunk in _iter_upstream_bounded(
+            resp, _UPSTREAM_PLAYLIST_DEADLINE_SEC, upstream_url[:80]
+        ):
             if not chunk:
                 continue
             pending += chunk.decode("utf-8", errors="replace")

@@ -155,9 +155,22 @@ export function replaySeekTarget(
 
 /**
  * Concurrent live-player cap: append *next* unless *items* already holds
- * *max* entries. Returns the new list (or the unchanged one when blocked).
+ * *max* entries. With a *keyOf* extractor the same key is deduped FIRST —
+ * the existing item is returned so the caller can focus it instead of
+ * spawning a duplicate popup + backend session. Returns the new list (or the
+ * unchanged one when blocked/deduped).
  */
-export function appendLivePopup<T>(items: T[], next: T, max: number): { items: T[]; blocked: boolean } {
+export function appendLivePopup<T>(
+  items: T[],
+  next: T,
+  max: number,
+  keyOf?: (item: T) => string,
+): { items: T[]; blocked: boolean; existing?: T } {
+  if (keyOf) {
+    const key = keyOf(next);
+    const existing = items.find((it) => keyOf(it) === key);
+    if (existing) return { items, blocked: false, existing };
+  }
   if (items.length >= max) return { items, blocked: true };
   return { items: [...items, next], blocked: false };
 }

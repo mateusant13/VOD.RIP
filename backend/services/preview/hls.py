@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import re
 import socket
@@ -13,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from services.ytdlp_service import (
     MIN_VALID_OUTPUT_BYTES,
@@ -133,6 +134,79 @@ def _abort_upstream_read(resp: object, worker: threading.Thread) -> None:
     except Exception:
         pass
     worker.join(timeout=_UPSTREAM_READ_TIMEOUT_SEC * 2)
+
+
+def _iter_upstream_bounded(
+    resp: object,
+    deadline_sec: float,
+    url_label: str,
+) -> Iterator[bytes]:
+    """Yield ``resp.iter_content`` chunks under a wall-clock IDLE watchdog.
+
+    Streaming sibling of _read_upstream_body: each chunk resets the budget,
+    so a slow-but-flowing transfer completes while a 0 B/s stall (blocked
+    iter_content queue.get) aborts after deadline_sec. On expiry the response
+    is closed from a daemon thread (same reasoning as _read_upstream_body) and
+    RuntimeError propagates to the caller, so the proxy responds fast instead
+    of pinning a PREVIEW_EXECUTOR worker up to libcurl's 3600s low-speed
+    window.
+    ponytail: one short-lived drain thread per fetch; move to a shared
+    executor if profiling ever shows the spawn cost.
+    """
+    q: "queue.Queue[object]" = queue.Queue(maxsize=64)
+    drained: List[Exception] = []
+    sentinel = object()
+
+    def _drain() -> None:
+        try:
+            for chunk in resp.iter_content(chunk_size=_UPSTREAM_CHUNK_BYTES):
+                q.put(chunk)
+            q.put(sentinel)
+        except Exception as exc:
+            drained.append(exc)
+            q.put(sentinel)
+
+    worker = threading.Thread(target=_drain, name="upstream-drain", daemon=True)
+    worker.start()
+    aborted = False
+
+    def _abort() -> None:
+        nonlocal aborted
+        if aborted:
+            return
+        aborted = True
+        threading.Thread(
+            target=_abort_upstream_read,
+            args=(resp, worker),
+            name="upstream-abort",
+            daemon=True,
+        ).start()
+
+    try:
+        deadline = time.monotonic() + deadline_sec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _abort()
+                raise RuntimeError(
+                    f"Upstream read stalled/timed out after {deadline_sec:.0f}s for {url_label}"
+                )
+            try:
+                chunk = q.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if chunk is sentinel:
+                if drained:
+                    raise drained[0]
+                return
+            if chunk:
+                deadline = time.monotonic() + deadline_sec
+            yield chunk
+    finally:
+        # Consumer abandoned the stream early (byte cap, caller error) — reap
+        # the drain thread without waiting on a possibly-stalled recv.
+        if worker.is_alive() and not drained:
+            _abort()
 
 
 def _http_get_bytes(
