@@ -20,15 +20,6 @@ def _hms(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
 
 
-def _chat_clock(sec: float) -> str:
-    sec = max(0, int(round(float(sec))))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
 def ids_from_url(url: str) -> tuple[str, str]:
     plat = (detect_platform(url) or "").lower()
     vid = vod_id_from_url(url)
@@ -64,14 +55,16 @@ def format_transcript_txt(rows: list[dict]) -> str:
 
 
 def format_chat_txt(rows: list[dict]) -> str:
+    """One `user: message` per line — deliberately NO timestamps (the user
+    asked for plain text video-editor import; the marker range already
+    bounds the file, so a per-line clock adds nothing but noise)."""
     lines: list[str] = []
     for row in rows:
-        off = float(row.get("offset_sec") or 0)
         user = (row.get("username") or "user").strip()
         text = (row.get("text") or "").strip()
         if not text:
             continue
-        lines.append(f"[{_chat_clock(off)}] {user}: {text}")
+        lines.append(f"{user}: {text}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -95,6 +88,22 @@ def write_transcript_sidecar(output_file: str, platform: str, video_id: str) -> 
         return None
 
 
+def _clip_source_vod_id(slug: str) -> Optional[str]:
+    """Twitch clip slug -> recorded source VOD id (clip chat is archived
+    under the source VOD, not the clip slug). Best-effort read of the clip
+    history file; failures return None."""
+    try:
+        from services.disk_hygiene import data_dir
+        import json as _json
+        raw = (Path(data_dir()) / "twitch_clips.json").read_text("utf-8")
+        for entry in _json.loads(raw):
+            if entry.get("id") == slug and entry.get("vod_id"):
+                return str(entry["vod_id"])
+    except Exception:
+        logger.debug("clip source VOD lookup skipped", exc_info=True)
+    return None
+
+
 def write_chat_sidecar(
     dest: str,
     platform: str,
@@ -108,6 +117,13 @@ def write_chat_sidecar(
     try:
         from services import archive_db
         rows = archive_db.chat_for(platform, video_id)
+        if not rows and platform.lower() == "twitch":
+            # A clip download carries the clip slug as its video id, but the
+            # chat archive lives under the source VOD id — resolve it so clip
+            # downloads get their chat txt too.
+            vod_id = _clip_source_vod_id(video_id)
+            if vod_id:
+                rows = archive_db.chat_for(platform, vod_id)
         if start_sec is not None or end_sec is not None:
             lo = float(start_sec) if start_sec is not None else float("-inf")
             hi = float(end_sec) if end_sec is not None else float("inf")
@@ -220,8 +236,8 @@ def write_download_sidecars(
     include_chat: bool,
     crop_start: Optional[float],
     crop_end: Optional[float],
-    chat_before_sec: float,
-    chat_after_sec: float,
+    chat_start_sec: Optional[float],
+    chat_end_sec: Optional[float],
     platform: Optional[str] = None,
 ) -> dict[str, Any]:
     plat, vid = ids_from_url(url)
@@ -231,10 +247,12 @@ def write_download_sidecars(
     if include_transcript:
         out["transcript"] = write_transcript_sidecar(output_file, plat, vid)
     if include_chat:
-        start = None if crop_start is None else max(0.0, float(crop_start) - max(0.0, chat_before_sec))
-        end = None if crop_end is None else float(crop_end) + max(0.0, chat_after_sec)
+        # The chat txt range comes straight from the START/END markers the
+        # user set in the chat history (absolute offsets; crop is irrelevant
+        # to the exported window).
         chat_path = str(Path(output_file).with_suffix(".chat.txt"))
         out["chat"] = write_chat_sidecar(
-            chat_path, plat, vid, start_sec=start, end_sec=end,
+            chat_path, plat, vid,
+            start_sec=chat_start_sec, end_sec=chat_end_sec,
         )
     return out

@@ -142,8 +142,8 @@ class DownloadManager:
         platform: Optional[str] = None,
         include_transcript: bool = False,
         include_chat: bool = False,
-        chat_before_sec: float = 120.0,
-        chat_after_sec: float = 30.0,
+        chat_start_sec: Optional[float] = None,
+        chat_end_sec: Optional[float] = None,
     ) -> str:
         download_id = download_id or f"dl_{uuid.uuid4().hex[:12]}"
         resolved_platform = platform or ytdlp_service.detect_platform(url)
@@ -189,8 +189,8 @@ class DownloadManager:
             "platform": resolved_platform,
             "include_transcript": include_transcript,
             "include_chat": include_chat,
-            "chat_before_sec": chat_before_sec,
-            "chat_after_sec": chat_after_sec,
+            "chat_start_sec": chat_start_sec,
+            "chat_end_sec": chat_end_sec,
         }
 
         with self._lock:
@@ -582,8 +582,8 @@ class DownloadManager:
                             include_chat=bool(params.get("include_chat")),
                             crop_start=params.get("crop_start"),
                             crop_end=params.get("crop_end"),
-                            chat_before_sec=float(params.get("chat_before_sec") or 120),
-                            chat_after_sec=float(params.get("chat_after_sec") or 30),
+                            chat_start_sec=params.get("chat_start_sec"),
+                            chat_end_sec=params.get("chat_end_sec"),
                             platform=state.platform,
                         )
                     except Exception:

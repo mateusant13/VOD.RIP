@@ -40,6 +40,14 @@ import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
+import {
+  applyChatMarker,
+  ChatMarkerChips,
+  ChatRowMarkers,
+  EMPTY_CHAT_MARKERS,
+  type ChatMarkerKind,
+  type ChatMarkers,
+} from './ChatRangeMarkers';
 
 export interface PreviewPanelTranscriptRow {
   offset_sec: number;
@@ -164,6 +172,11 @@ interface PreviewChatPanelProps {
    *  (open), strip width (collapsed), or 0 (space-forced). The explore popup
    *  sizes its container from this. */
   onLayoutChange?: (info: { open: boolean; width: number }) => void;
+  /** Fired whenever the start/end chat markers change (null = unset). The
+   *  host lifts the pair so the NEXT download of this video also writes a
+   *  <media>.chat.txt covering [start, end]. Keep the callback stable
+   *  (useCallback) — it is invoked on every marker change and video switch. */
+  onMarkersChange?: (markers: ChatMarkers) => void;
 }
 
 const TABS: ReadonlyArray<{
@@ -181,12 +194,16 @@ const ChatRow = memo(function ChatRow({
   active,
   platform,
   onSeek,
+  markers,
+  onSetMarker,
   ref,
 }: {
   row: PreviewPanelChatRow;
   active: boolean;
   platform: string | null;
   onSeek?: (offsetSec: number) => void;
+  markers: ChatMarkers;
+  onSetMarker: (kind: ChatMarkerKind, offsetSec: number) => void;
   ref?: React.Ref<HTMLDivElement>;
 }) {
   const { t } = useI18n();
@@ -198,7 +215,7 @@ const ChatRow = memo(function ChatRow({
       style={{ height: CHAT_ROW_H }}
       onClick={onSeek ? () => seekToTimestamp(row.offset_sec, onSeek) : undefined}
       title={onSeek ? t('Seek to {offset}', { offset: formatArchiveOffset(row.offset_sec) }) : undefined}
-      className={`flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
+      className={`relative group/marker flex items-baseline gap-1 px-2 overflow-hidden border-l-2 whitespace-nowrap ${
         active
           ? 'bg-yellow-300/10 border-yellow-300 text-zinc-100'
           : 'border-transparent text-zinc-200 hover:bg-zinc-900/70'
@@ -224,6 +241,7 @@ const ChatRow = memo(function ChatRow({
           ×{row.spam_count}
         </span>
       )}
+      <ChatRowMarkers offsetSec={row.offset_sec} markers={markers} onSetMarker={onSetMarker} />
     </div>
   );
 });
@@ -355,11 +373,39 @@ export function PreviewChatPanel({
   defaultOpen = true,
   maxWidth: maxWidthProp,
   onLayoutChange,
+  onMarkersChange,
 }: PreviewChatPanelProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(defaultOpen);
   const [tab, setTab] = useState<PreviewPanelTab>('chat');
   const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
+  /** Start/end chat markers (green/red). One pair per surface — the host
+   *  lifts it via onMarkersChange so the next download writes the chat txt
+   *  range. Reset whenever the panel's video changes (markers belong to one
+   *  video's chat). */
+  const [markers, setMarkers] = useState<ChatMarkers>(EMPTY_CHAT_MARKERS);
+  const markersRef = useRef(markers);
+  markersRef.current = markers;
+  const onMarkersChangeRef = useRef(onMarkersChange);
+  onMarkersChangeRef.current = onMarkersChange;
+  const setChatMarkers = useCallback((next: ChatMarkers) => {
+    markersRef.current = next;
+    setMarkers(next);
+    onMarkersChangeRef.current?.(next);
+  }, []);
+  const handleSetMarker = useCallback(
+    (kind: ChatMarkerKind, offsetSec: number) => {
+      setChatMarkers(applyChatMarker(kind, offsetSec, markersRef.current));
+    },
+    [setChatMarkers],
+  );
+  const handleClearMarker = useCallback(
+    (kind: ChatMarkerKind) => {
+      const cur = markersRef.current;
+      setChatMarkers({ ...cur, [kind]: null });
+    },
+    [setChatMarkers],
+  );
   const [payload, setPayload] = useState<PreviewPanelPayload | null>(null);
   const [fetchState, setFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [retryTick, setRetryTick] = useState(0);
@@ -479,6 +525,12 @@ export function PreviewChatPanel({
     setFollow(true);
     setScrollAnchorIdx(0);
   }, [payloadKey]);
+  // Markers belong to one video's chat: switching the panel's video clears
+  // the pair (and lifts the clear so the host's copy can't leak onto the
+  // next video's download). setChatMarkers is stable (useCallback []).
+  useEffect(() => {
+    setChatMarkers(EMPTY_CHAT_MARKERS);
+  }, [payloadKey, setChatMarkers]);
   useEffect(() => {
     const prev = lastBackfillRef.current;
     lastBackfillRef.current = payload?.backfill ?? null;
@@ -958,6 +1010,17 @@ export function PreviewChatPanel({
               )}
             </div>
           )}
+          {fetchState === 'done' && payload && tab === 'chat' && payload.has_chat && (
+            <ChatMarkerChips
+              markers={markers}
+              onClear={handleClearMarker}
+              hint={
+                markers.start == null && markers.end == null
+                  ? t('Hover a message to set markers')
+                  : undefined
+              }
+            />
+          )}
           {!started && subsFetchState === 'idle' && subtitlesOnly && (
             <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-600 px-4">
               <span className="text-[10px] font-mono text-center">
@@ -1095,6 +1158,8 @@ export function PreviewChatPanel({
                           active={active}
                           platform={platform}
                           onSeek={onSeek}
+                          markers={markers}
+                          onSetMarker={handleSetMarker}
                           ref={active ? activeRowRef : undefined}
                         />
                       );

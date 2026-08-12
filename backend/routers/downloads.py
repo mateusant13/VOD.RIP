@@ -75,17 +75,11 @@ def _sidecar_kwargs(req: DownloadRequest, opts) -> dict:
     include_t = req.include_transcript
     if include_t is None:
         include_t = bool(getattr(opts, "download_transcript_sidecar", True))
-    before = req.chat_before_sec
-    if before is None:
-        before = float(getattr(opts, "download_chat_before_sec", 120) or 120)
-    after = req.chat_after_sec
-    if after is None:
-        after = float(getattr(opts, "download_chat_after_sec", 30) or 30)
     return {
         "include_transcript": bool(include_t),
         "include_chat": bool(req.include_chat),
-        "chat_before_sec": max(0.0, min(600.0, float(before))),
-        "chat_after_sec": max(0.0, min(600.0, float(after))),
+        "chat_start_sec": req.chat_start_sec,
+        "chat_end_sec": req.chat_end_sec,
     }
 
 

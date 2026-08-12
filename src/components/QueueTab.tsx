@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Clapperboard, Download, ExternalLink, FolderOpen, MessageSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { vodCheckboxStyle, platformAccentColor } from '../platformColors';
 import { ActiveDownloadsList } from './ActiveDownloadsList';
@@ -12,6 +12,14 @@ import { formatHmsFull } from '../utils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
 import NotificationsPanel from './NotificationsPanel';
+import {
+  applyChatMarker,
+  ChatMarkerChips,
+  ChatRowMarkers,
+  EMPTY_CHAT_MARKERS,
+  type ChatMarkerKind,
+  type ChatMarkers,
+} from './ChatRangeMarkers';
 
 function isPlayableLocalFile(path: string): boolean {
   return /\.(mp4|mkv|webm|mov|m4v)$/i.test(path);
@@ -71,6 +79,10 @@ type Props = {
   onOpenVod?: (url: string, hint?: { title?: string; durationSec?: number; skipNetwork?: boolean }) => void;
   /** Download a Twitch clip from the clip-history row (enqueues via /api/download/clip). */
   onDownloadClip?: (clip: TwitchClipRecord) => void;
+  /** Start/end chat markers set in a clip's chat viewer — lifted to the host
+   *  so the NEXT download of that clip also writes the source-VOD chat .txt
+   *  covering [start, end]. */
+  onClipChatMarkersChange?: (slug: string, markers: ChatMarkers) => void;
 };
 
 export default function QueueTab({
@@ -97,6 +109,7 @@ export default function QueueTab({
   onWatchLocal,
   onOpenVod,
   onDownloadClip,
+  onClipChatMarkersChange,
 }: Props) {
   const queueAllSelected = queueDownloads.length > 0 && selectedQueueIds?.size === queueDownloads.length;
   const recentAllSelected = recentDownloads.length > 0 && selectedRecentIds?.size === recentDownloads.length;
@@ -160,6 +173,26 @@ export default function QueueTab({
       .catch(() => setClipChatError(t('Could not load chat history.')))
       .finally(() => setClipChatLoading(false));
   }, [clipChatOpen, t]);
+  /** Start/end chat markers per clip slug (set in the clip chat viewer). */
+  const [clipMarkers, setClipMarkers] = useState<Record<string, ChatMarkers>>({});
+  const clipMarkersRef = useRef(clipMarkers);
+  clipMarkersRef.current = clipMarkers;
+  const onClipChatMarkersChangeRef = useRef(onClipChatMarkersChange);
+  onClipChatMarkersChangeRef.current = onClipChatMarkersChange;
+  const setClipMarker = useCallback((slug: string, kind: ChatMarkerKind, offsetSec: number) => {
+    const cur = clipMarkersRef.current[slug] ?? EMPTY_CHAT_MARKERS;
+    const next = applyChatMarker(kind, offsetSec, cur);
+    clipMarkersRef.current = { ...clipMarkersRef.current, [slug]: next };
+    setClipMarkers(clipMarkersRef.current);
+    onClipChatMarkersChangeRef.current?.(slug, next);
+  }, []);
+  const clearClipMarker = useCallback((slug: string, kind: ChatMarkerKind) => {
+    const cur = clipMarkersRef.current[slug] ?? EMPTY_CHAT_MARKERS;
+    const next = { ...cur, [kind]: null };
+    clipMarkersRef.current = { ...clipMarkersRef.current, [slug]: next };
+    setClipMarkers(clipMarkersRef.current);
+    onClipChatMarkersChangeRef.current?.(slug, next);
+  }, []);
   useEffect(() => {
     loadTwitchClips();
   }, []);
@@ -541,7 +574,17 @@ export default function QueueTab({
                 </button>
               </div>
               {clipChatOpen === c.id && (
-                <div className="border-2 border-zinc-800 bg-zinc-900/60 p-2 flex flex-col gap-1 max-h-56 overflow-y-auto custom-scrollbar">
+                <div className="border-2 border-zinc-800 bg-zinc-900/60 flex flex-col">
+                  <ChatMarkerChips
+                    markers={clipMarkers[c.id] ?? EMPTY_CHAT_MARKERS}
+                    onClear={(kind) => clearClipMarker(c.id, kind)}
+                    hint={
+                      (clipMarkers[c.id]?.start == null && clipMarkers[c.id]?.end == null)
+                        ? t('Hover a message to set markers')
+                        : undefined
+                    }
+                  />
+                  <div className="p-2 flex flex-col gap-1 max-h-56 overflow-y-auto custom-scrollbar">
                   {clipChatLoading && (
                     <p className="text-[10px] font-mono text-zinc-500">{t('Loading chat history...')}</p>
                   )}
@@ -556,7 +599,7 @@ export default function QueueTab({
                       {clipChat.messages.map((m) => (
                         <p
                           key={`c:${m.video_id}:${m.offset_sec}:${m.username}:${m.text}`}
-                          className="text-[10px] leading-snug text-zinc-200 break-words"
+                          className="relative group/marker text-[10px] leading-snug text-zinc-200 break-words"
                         >
                           <span className="text-zinc-400 font-mono mr-1">{formatArchiveOffset(m.offset_sec)}</span>
                           <span className="font-bold" style={{ color: resolveChatColor(m.color, m.username, m.platform) }}>{m.username}:</span> {m.text}
@@ -568,6 +611,11 @@ export default function QueueTab({
                               ×{m.spam_count}
                             </span>
                           )}
+                          <ChatRowMarkers
+                            offsetSec={m.offset_sec}
+                            markers={clipMarkers[c.id] ?? EMPTY_CHAT_MARKERS}
+                            onSetMarker={(kind, offsetSec) => setClipMarker(c.id, kind, offsetSec)}
+                          />
                         </p>
                       ))}
                       {clipChat.truncated && (
@@ -580,6 +628,7 @@ export default function QueueTab({
                       )}
                     </>
                   )}
+                  </div>
                 </div>
               )}
               </div>
