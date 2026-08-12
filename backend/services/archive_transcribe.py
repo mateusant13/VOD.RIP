@@ -1172,23 +1172,53 @@ def _slot_engine(device: str) -> str:
     return "parakeet" if _parakeet_available() else "whisper"
 
 
+# Languages whisper MUST handle: parakeet's TDT model carries only the 26
+# European families in PARAKEET_LANG_CANDIDATES — the CJK + Arabic families
+# route to whisper even though parakeet is the default engine.
+_WHISPER_ONLY_LANGS = frozenset({"ja", "ko", "zh", "ar"})
+
+# TASK9 runtime fallback: when a parakeet run fails mid-job, _process_job
+# retries the SAME job once with whisper (thread-local so multi-copy pool
+# threads never leak each other's override). _job_engine consults it first.
+_engine_override_tls = threading.local()
+
+
+def _engine_override() -> Optional[str]:
+    """Forced engine for the current thread (parakeet-failure fallback)."""
+    return getattr(_engine_override_tls, "engine", None)
+
+
 def _job_engine(language: Optional[str]) -> str:
-    """Engine for THIS job on the calling lane: 'parakeet' when the lane can
-    run it AND the job's language is in parakeet's supported set; known
-    other languages (ja, ...) and UNKNOWN language stay whisper. GPU slots
-    use parakeet only with CUDA sherpa present AND enough measured free
-    VRAM; CPU slots need the plain import. Without a CUDA wheel the GPU slot
-    is whisper exactly as before."""
+    """Engine for THIS job on the calling lane.
+
+    TASK9: parakeet is the DEFAULT engine — every language the lane can run
+    through sherpa, including UNKNOWN (None) — and whisper large-v3-turbo is
+    the fallback, used ONLY when (a) the current thread's job override says
+    whisper (user forced asr_engine='whisper', or a parakeet run failed and
+    _process_job is retrying it), (b) the language is one parakeet cannot do
+    (ja/ko/zh/ar — outside its token set), or (c) the lane has no usable
+    parakeet (no sherpa import / CUDA-wheel / VRAM). GPU slots need CUDA
+    sherpa AND enough measured free VRAM; CPU slots need the plain import.
+    Without a CUDA wheel the GPU slot is whisper exactly as before.
+    Pure: no settings read here (the module self-check runs at import;
+    reading settings then could touch real appdata). _process_job maps the
+    asr_engine setting onto the thread-local override instead."""
+    forced = _engine_override()
+    if forced == "whisper":
+        return "whisper"
+    if language in _WHISPER_ONLY_LANGS:
+        return "whisper"
+    # Known language outside the model's token set (ja/ko/zh/ar via the
+    # explicit set, plus anything else a swapped model lacks): whisper.
+    # Unknown (None / '') is NOT narrowed — parakeet is the default for it.
+    if language and language not in _parakeet_langs():
+        return "whisper"
     device, _ = _thread_pin() or _effective_device()
     if device == "cuda":
-        if (
-            _parakeet_cuda_available()
-            and _parakeet_gpu_allowed()
-            and language in _parakeet_langs()
-        ):
+        if _parakeet_cuda_available() and _parakeet_gpu_allowed():
             return "parakeet"
         return "whisper"
-    if _parakeet_available() and language in _parakeet_langs():
+    if _parakeet_available():
         return "parakeet"
     return "whisper"
 
@@ -2172,6 +2202,14 @@ def _transcribe_batch(
                 raw, info = run(BatchedInferencePipeline(_get_model()))
 
     detected_lang = getattr(info, "language", None) or None
+    # TASK9 autodetect improvement: only trust whisper's own detection when
+    # it is confident. A low-probability guess (short/ambiguous audio) is
+    # discarded so the job's rows carry lang=None and the done-time
+    # channel-language re-aggregation (which weighs platform clues + every
+    # channel video's transcript evidence) stamps the family instead of a
+    # coin-flip. 0.5 is the faster-whisper docs' low-confidence boundary.
+    if detected_lang is not None and (getattr(info, "language_probability", 0.0) or 0.0) < 0.5:
+        detected_lang = None
     # Attribute each segment to its clip by start time (clips are disjoint
     # and sorted; the pipeline offsets segments by their clip start).
     per: list[list[Any]] = [[] for _ in chunks]
@@ -2586,18 +2624,20 @@ def _claim_next_job() -> Optional[dict]:
     transcribe_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
     twitch_chat_cutoff = (now - _CHAT_HEARTBEAT_STALE).isoformat(timespec="seconds")
     yt_chat_cutoff = (now - _CHAT_STALE_TIMEDELTA).isoformat(timespec="seconds")
+    now_iso = now.isoformat(timespec="seconds")
     # String comparison is valid: both sides come from _now_iso (UTC, same width).
     rows = archive_db.query(
         """SELECT * FROM archive_jobs
            WHERE kind IN ('transcribe','events','chat')
-             AND (status = 'queued' OR (status = 'running' AND
+             AND ((status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                  OR (status = 'running' AND
                   COALESCE(heartbeat, updated_at) <
                   CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ?
                        WHEN kind = 'chat' THEN ?
                        ELSE ? END))
            ORDER BY priority DESC, created_at ASC
            LIMIT 8""",
-        (twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
+        (now_iso, twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
     )
     for row in rows:
         # Bot-gate freeze: never claim YouTube jobs while the gate is up.
@@ -2614,8 +2654,9 @@ def _claim_next_job() -> Optional[dict]:
         if row["status"] == "queued":
             cur = archive_db.execute(
                 "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
-                "WHERE id = ? AND status = 'queued'",
-                (_now_iso(), _now_iso(), row["id"]),
+                "WHERE id = ? AND status = 'queued' "
+                "AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+                (_now_iso(), _now_iso(), row["id"], now_iso),
             )
         else:
             # Stale-reclaim CAS: the UPDATE re-checks the same stale-window
@@ -2876,11 +2917,49 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 )
 
         resolved_lang = _resolve_job_language(platform, video_id)
-        stats = transcribe_video(
-            platform, video_id,
-            language=resolved_lang,
-            progress_cb=_progress, events_cb=events_cb,
-        )
+        # Map the asr_engine setting onto the thread-local override: the
+        # engine is re-evaluated inside transcribe_video per run, and the
+        # override must cover the WHOLE job (not just this one call) so the
+        # parakeet-failure fallback below can stack on top of it.
+        try:
+            from deps import settings_mgr
+            pref = getattr(settings_mgr.get(), "asr_engine", "parakeet") or "parakeet"
+        except Exception:
+            pref = "parakeet"
+        _engine_override_tls.engine = "whisper" if pref == "whisper" else None
+        try:
+            engine = _job_engine(resolved_lang)
+            try:
+                stats = transcribe_video(
+                    platform, video_id,
+                    language=resolved_lang,
+                    progress_cb=_progress, events_cb=events_cb,
+                )
+            except Exception as exc:
+                # TASK9: whisper large-v3-turbo is the fallback when parakeet
+                # itself fails (decode error, recognizer crash) — retry the SAME
+                # job once with whisper before giving up. Terminal failures
+                # (missing archive file, yt-dlp download error) are NOT retried:
+                # they cannot succeed on the other engine.
+                from yt_dlp.utils import DownloadError as _DLError
+
+                if engine != "parakeet" or isinstance(exc, (FileNotFoundError, _DLError)):
+                    raise
+                logger.warning(
+                    "parakeet failed for %s/%s (%s: %s) — retrying job with whisper",
+                    platform, video_id, type(exc).__name__, exc,
+                )
+                _engine_override_tls.engine = "whisper"
+                try:
+                    stats = transcribe_video(
+                        platform, video_id,
+                        language=resolved_lang,
+                        progress_cb=_progress, events_cb=events_cb,
+                    )
+                finally:
+                    _engine_override_tls.engine = "whisper" if pref == "whisper" else None
+        finally:
+            _engine_override_tls.engine = None
         archive_db.update_job(job_id, status="done", progress=1.0)
         # New transcript evidence -> re-aggregate the channel language
         # (throttled; best-effort — a failure must never fail the job).
@@ -3474,7 +3553,10 @@ try:
     assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
     assert _job_engine("es") == "parakeet", "es routes to parakeet on a CPU lane"
     assert _job_engine("ja") == "whisper", "known-other languages stay on whisper"
-    assert _job_engine(None) == "whisper", "unknown language stays on whisper"
+    assert _job_engine("ko") == "whisper", "ko stays on whisper (CJK)"
+    assert _job_engine("zh") == "whisper", "zh stays on whisper (CJK)"
+    assert _job_engine("ar") == "whisper", "ar stays on whisper (Arabic)"
+    assert _job_engine(None) == "parakeet", "parakeet is the DEFAULT for unknown language"
     _device_override = ("cuda", "float16")
     assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots may run parakeet"
     assert _job_engine("pt") == "parakeet", (

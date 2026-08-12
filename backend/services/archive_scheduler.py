@@ -363,7 +363,7 @@ def _enqueue_chat_job(
         # already covered by the guard above.
         cur = archive_db.execute(
             "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
-            "updated_at=?, heartbeat=? "
+            "attempts=0, next_retry_at=NULL, updated_at=?, heartbeat=? "
             "WHERE id=? AND status='failed'",
             (datetime.now(timezone.utc).isoformat(timespec="seconds"),
              datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id),
