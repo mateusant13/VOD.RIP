@@ -168,12 +168,20 @@ async def update_settings(update: SettingsUpdate):
         current.auto_install_extension = bool(update.auto_install_extension)
     if update.entity_watch_enabled is not None:
         current.entity_watch_enabled = bool(update.entity_watch_enabled)
+    if update.twitch_monitor_enabled is not None:
+        current.twitch_monitor_enabled = bool(update.twitch_monitor_enabled)
     if update.archive_vod_keep_count is not None:
         current.archive_vod_keep_count = max(1, min(50, update.archive_vod_keep_count))
     if update.whisper_model is not None:
         # Non-empty model id; empty/whitespace falls back to the default.
         val = update.whisper_model.strip()
         current.whisper_model = val or "large-v3-turbo"
+    if update.asr_engine is not None:
+        # 'parakeet' (default) or 'whisper' — anything else falls back to
+        # the default; the job router still auto-falls back to whisper for
+        # ja/ko/zh/ar and parakeet-engine failures.
+        val = (update.asr_engine or "").strip().lower()
+        current.asr_engine = val if val in ("parakeet", "whisper") else "parakeet"
     if update.whisper_model_cache is not None:
         # Any non-empty path, or None to clear back to the default cache.
         val = update.whisper_model_cache.strip()

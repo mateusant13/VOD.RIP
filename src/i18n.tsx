@@ -98,6 +98,13 @@ const ptBR: Record<string, string> = {
   'YouTube subtitles first': 'Legendas do YouTube primeiro',
   'Fallback to Whisper when subtitles are unavailable':
     'Recorre ao Whisper quando as legendas não estiverem disponíveis',
+  'ASR engine': 'Motor de ASR',
+  'Parakeet (default)': 'Parakeet (padrão)',
+  'Whisper large-v3-turbo': 'Whisper large-v3-turbo',
+  'Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).':
+    'Parakeet é o ASR padrão. Whisper large-v3-turbo é baixado e usado apenas quando o próprio Parakeet falha (idioma sem suporte como ja/ko/zh/ar, ou erro do motor Parakeet).',
+  'Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.':
+    'Parakeet é o padrão. Whisper large-v3-turbo roda apenas se o Parakeet falhar naquele trabalho (erro do Parakeet ou idioma que o Parakeet não suporta: ja/ko/zh/ar). Outros erros não acionam o Whisper.',
   'Captions Language': 'Idioma das legendas',
   'Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.':
     'Idioma ASR padrão para trabalhos do Whisper. Idiomas por canal são aprendidos automaticamente pelas transcrições (backend services/channel_language.py) — sobrescreva apenas se um canal for detectado errado com frequência.',
@@ -534,6 +541,7 @@ const ptBR: Record<string, string> = {
   'progress.kind.chat': 'Retrocesso de chat',
   'progress.kind.events': 'Eventos',
   'progress.kind.ingest': 'Ingestão',
+  'progress.status.retrying': 'Tentando novamente…',
   'progress.status.queued': 'Na fila',
   'progress.status.running': 'Em andamento',
   'progress.status.done': 'Concluído',
@@ -562,6 +570,9 @@ const ptBR: Record<string, string> = {
   'cookieAuto.close': 'Fechar',
   'cookieAuto.toggle': 'Instalação automática da extensão',
   'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
+  // ── Twitch mention monitor (twitchMonitor.*) ─────────────
+  'twitchMonitor.toggle': 'Monitor de menções na Twitch',
+  'twitchMonitor.toggleInfo': 'Fica conectado 24/7 aos canais salvos e registra mensagens que mencionam eles — mesmo sem VOD gravado.',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
@@ -575,6 +586,7 @@ const en: Record<string, string> = {
   'progress.kind.chat': 'Chat backfill',
   'progress.kind.events': 'Events',
   'progress.kind.ingest': 'Ingest',
+  'progress.status.retrying': 'Retrying…',
   'progress.status.queued': 'Queued',
   'progress.status.running': 'Running',
   'progress.status.done': 'Done',
@@ -601,6 +613,8 @@ const en: Record<string, string> = {
   'cookieAuto.close': 'Close',
   'cookieAuto.toggle': 'Auto-install cookie extension',
   'cookieAuto.toggleInfo': 'Offer the one-click install when cookies are not paired yet. Turn off to install manually only.',
+  'twitchMonitor.toggle': 'Twitch mention monitor',
+  'twitchMonitor.toggleInfo': 'Stays connected 24/7 to saved channels and logs chat lines that mention them — even with no VOD recorded.',
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Tutorial messages re-enabled',
 }
@@ -666,6 +680,11 @@ const es: Record<string, string> = {
   'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.': 'Los modelos Whisper se descargan aquí. Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio. Una ruta personalizada (HF hub compartido) también funciona.',
   'YouTube subtitles first': 'Subtítulos de YouTube primero',
   'Fallback to Whisper when subtitles are unavailable': 'Usar Whisper cuando no haya subtítulos',
+  'ASR engine': 'Motor de ASR',
+  'Parakeet (default)': 'Parakeet (predeterminado)',
+  'Whisper large-v3-turbo': 'Whisper large-v3-turbo',
+  'Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).': 'Parakeet es el ASR predeterminado. Whisper large-v3-turbo se descarga y usa solo cuando el propio Parakeet falla (idioma sin soporte como ja/ko/zh/ar, o error del motor Parakeet).',
+  'Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.': 'Parakeet es el predeterminado. Whisper large-v3-turbo solo corre si Parakeet falla en ese trabajo (error de Parakeet o idioma que Parakeet no soporta: ja/ko/zh/ar). Otros errores no activan Whisper.',
   'Captions Language': 'Idioma de subtítulos',
   'Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.': 'Idioma ASR predeterminado para trabajos de Whisper. Los idiomas por canal se aprenden automáticamente de la evidencia de transcripciones (backend services/channel_language.py) — anula solo si un canal se detecta mal de forma constante.',
   'Auto-detect': 'Detección automática',
@@ -1062,6 +1081,7 @@ const es: Record<string, string> = {
   'progress.kind.chat': 'Retroceso de chat',
   'progress.kind.events': 'Eventos',
   'progress.kind.ingest': 'Ingestión',
+  'progress.status.retrying': 'Reintentando…',
   'progress.status.queued': 'En cola',
   'progress.status.running': 'En curso',
   'progress.status.done': 'Hecho',
@@ -1090,6 +1110,8 @@ const es: Record<string, string> = {
   'cookieAuto.close': 'Cerrar',
   'cookieAuto.toggle': 'Instalación automática de la extensión',
   'cookieAuto.toggleInfo': 'Muestra la oferta de instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
+  'twitchMonitor.toggle': 'Monitor de menciones de Twitch',
+  'twitchMonitor.toggleInfo': 'Se mantiene conectado 24/7 a los canales guardados y registra mensajes que los mencionan, incluso sin VOD grabado.',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',

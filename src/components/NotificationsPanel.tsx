@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Bell, CheckCircle2, CircleAlert, Loader2 } from 'lucide-react';
 import PlatformVodIcon from './PlatformVodIcon';
-import type { ArchiveJobRow } from './QueueTab';
+import { isRetryJob, type ArchiveJobRow } from './QueueTab';
 import { useI18n } from '../i18n';
 
 const JOBS_POLL_MS = 3000;
@@ -13,7 +13,7 @@ const PLATFORM_ICON_NAME: Record<string, string> = {
   kick: 'Kick',
 };
 
-type StatusFilter = 'all' | 'active' | 'done' | 'failed';
+type StatusFilter = 'all' | 'active' | 'done' | 'failed' | 'retrying';
 type KindFilter = 'all' | 'transcribe' | 'chat' | 'events' | 'ingest';
 
 async function fetchJobs(): Promise<ArchiveJobRow[]> {
@@ -58,13 +58,15 @@ export default function NotificationsPanel() {
       default: return kind;
     }
   };
-  const statusLabel = (status: string) => {
-    switch (status) {
+  const statusLabel = (j: ArchiveJobRow) => {
+    // Retry (queued with attempts > 0) takes precedence over the queued case.
+    if (isRetryJob(j)) return t('progress.status.retrying');
+    switch (j.status) {
       case 'queued': return t('progress.status.queued');
       case 'running': return t('progress.status.running');
       case 'done': return t('progress.status.done');
       case 'failed': return t('progress.status.failed');
-      default: return status;
+      default: return j.status;
     }
   };
 
@@ -73,7 +75,9 @@ export default function NotificationsPanel() {
       if (kindFilter !== 'all' && j.kind !== kindFilter) return false;
       if (statusFilter === 'active') return j.status === 'queued' || j.status === 'running';
       if (statusFilter === 'done') return j.status === 'done';
+      // 'failed' is FINAL failure only — retries (queued, attempts>0) are not.
       if (statusFilter === 'failed') return j.status === 'failed';
+      if (statusFilter === 'retrying') return isRetryJob(j);
       return true;
     }).slice(0, JOBS_MAX_ROWS);
   }, [jobs, kindFilter, statusFilter]);
@@ -130,6 +134,7 @@ export default function NotificationsPanel() {
         {chip('s-active', t('In progress'), statusFilter === 'active', () => setStatusFilter('active'))}
         {chip('s-done', t('Completed'), statusFilter === 'done', () => setStatusFilter('done'))}
         {chip('s-fail', t('Failed'), statusFilter === 'failed', () => setStatusFilter('failed'))}
+        {chip('s-retry', t('progress.status.retrying'), statusFilter === 'retrying', () => setStatusFilter('retrying'))}
       </div>
       <div className="flex flex-wrap gap-1.5">
         {chip('k-all', t('Any work'), kindFilter === 'all', () => setKindFilter('all'))}
@@ -148,6 +153,7 @@ export default function NotificationsPanel() {
           {filtered.map((j) => {
             const pct = Math.min(100, Math.max(0, Math.round((j.progress || 0) * 100)));
             const running = j.status === 'running';
+            const retrying = isRetryJob(j);
             return (
               <div key={j.id} className="border-2 border-zinc-800 bg-zinc-950/80 p-2.5 flex flex-col gap-1.5">
                 <div className="flex justify-between items-center gap-2">
@@ -163,12 +169,13 @@ export default function NotificationsPanel() {
                   <span className={`text-[10px] font-mono shrink-0 flex items-center gap-1 ${
                     j.status === 'running' ? 'text-[#53fc18]' :
                     j.status === 'failed' ? 'text-red-400' :
+                    retrying ? 'text-amber-400' :
                     j.status === 'done' ? 'text-zinc-400' : 'text-zinc-500'
                   }`}>
                     {j.status === 'running' ? <Loader2 size={11} className="animate-spin" /> : null}
                     {j.status === 'done' ? <CheckCircle2 size={11} /> : null}
                     {j.status === 'failed' ? <CircleAlert size={11} /> : null}
-                    {statusLabel(j.status)}
+                    {statusLabel(j)}
                   </span>
                 </div>
                 {running && (
@@ -181,6 +188,9 @@ export default function NotificationsPanel() {
                 )}
                 {j.status === 'failed' && j.error && (
                   <span className="text-[10px] text-red-400 font-mono truncate" title={j.error}>{j.error}</span>
+                )}
+                {retrying && j.error && (
+                  <span className="text-[10px] text-amber-300/70 font-mono truncate" title={j.error}>{j.error}</span>
                 )}
               </div>
             );

@@ -32,6 +32,7 @@ def scratch_db(monkeypatch, tmp_path):
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(tmp_path / "archive.db"))
     archive_db._conn = None
     archive_db._schema_ready = False
+    archive_db._schema_ready = False
     yield
     archive_db._conn = None
     archive_db._schema_ready = False
@@ -85,14 +86,16 @@ def test_failed_job_fresh_skipped_stale_retried(scratch_db):
     _seed_stream("ccccccccccc", chat=False)
     fresh_id = "chat-youtube-aaaaaaaaaaa"
     archive_db.enqueue_job(fresh_id, "chat", "youtube", "aaaaaaaaaaa", priority=0)
-    archive_db.update_job(fresh_id, status="failed", error="extract error")
+    archive_db.update_job(fresh_id, status="failed",
+                          error="FileNotFound: archive evicted")
     archive_db.execute(
         """UPDATE archive_jobs SET updated_at = ? WHERE id = ?""",
         ("2020-01-01T00:00:00Z", fresh_id),  # stale -> retried
     )
     stale_id = "chat-youtube-bbbbbbbbbbb"
     archive_db.enqueue_job(stale_id, "chat", "youtube", "bbbbbbbbbbb", priority=0)
-    archive_db.update_job(stale_id, status="failed", error="extract error")
+    archive_db.update_job(stale_id, status="failed",
+                          error="FileNotFound: archive evicted")
     archive_scheduler._backfill_youtube_chat()
     # aaaaaaaaaaa: stale failed job -> re-queued; bbbbbbbbbbb: fresh failed ->
     # skipped (still recent); ccccccccccc: no job -> queued.
@@ -121,7 +124,8 @@ def test_enqueue_chat_job_dedupes_across_kinds(scratch_db):
                            "aaaaaaaaaaa", priority=0)
     archive_db.update_job("legacy-backfill-id", status="running")
     assert archive_scheduler._enqueue_chat_job("youtube", "aaaaaaaaaaa") is False
-    archive_db.update_job("legacy-backfill-id", status="failed", error="x")
+    archive_db.update_job("legacy-backfill-id", status="failed",
+                          error="FileNotFound: archive evicted")
     archive_db.execute(
         """UPDATE archive_jobs SET updated_at = ? WHERE id = ?""",
         ("2020-01-01T00:00:00Z", "legacy-backfill-id"),

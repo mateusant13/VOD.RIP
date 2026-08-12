@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import re
 import shutil
 import sqlite3
@@ -367,6 +368,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_jobs_priority(_conn)
             _ensure_jobs_kind_chat(_conn)
             _ensure_jobs_heartbeat_column(_conn)
+            _ensure_jobs_retry_columns(_conn)
             rebuilt = _migrate_fts_contentless(_conn)
             # One-time data migrations on transcripts (entity + lang backfill).
             # Runs after the FTS rebuild so the current trigger set re-indexes.
@@ -840,6 +842,24 @@ def _ensure_jobs_heartbeat_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
     if "heartbeat" not in cols:
         conn.execute("ALTER TABLE archive_jobs ADD COLUMN heartbeat TEXT")
+
+
+def _ensure_jobs_retry_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add archive_jobs retry-queue columns.
+
+    TASK10 immortal retry queue: a failed job is requeued (status='queued')
+    with a next_retry_at deadline instead of staying terminal, unless it
+    exhausted max_attempts or failed for a terminal reason (file missing).
+    attempts counts prior failures; next_retry_at (UTC ISO, NULL = due now)
+    is the backoff/gate-aware deadline _claim_next_job honors. Additive
+    only; PRAGMA table_info guard makes repeated calls no-ops."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
+    if "attempts" not in cols:
+        conn.execute("ALTER TABLE archive_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    if "max_attempts" not in cols:
+        conn.execute("ALTER TABLE archive_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3")
+    if "next_retry_at" not in cols:
+        conn.execute("ALTER TABLE archive_jobs ADD COLUMN next_retry_at TEXT")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -2156,11 +2176,32 @@ def update_job(job_id: str, *, status: Optional[str] = None,
     sets = ["updated_at = ?", "heartbeat = ?"]
     params: list[Any] = [_now_iso(), _now_iso()]
     if status == "failed":
+        # TASK10 immortal retry queue: a failed job is requeued with a
+        # next_retry_at deadline unless the failure is terminal (file
+        # missing / yt-dlp download error) or attempts are exhausted —
+        # only THEN it lands on 'failed' (the UI's failure notification).
         err = (error or "")
-        terminal = ("FileNotFound" in err) or ("archive-file-missing" in err)
+        terminal = (
+            ("FileNotFound" in err)
+            or ("archive-file-missing" in err)
+            or ("DownloadError" in err)
+            or ("no HLS source" in err)
+        )
         rate = ("429" in err) or ("rate limit" in err.lower()) or ("ratelimit" in err.lower())
-        if not terminal and not rate:
+        row = query(
+            "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
+        )
+        attempts = int(row[0]["attempts"] or 0) + 1 if row else 1
+        max_attempts = int(row[0]["max_attempts"] or 0) or 3 if row else 3
+        sets.append("attempts = ?")
+        params.append(attempts)
+        if terminal or attempts >= max_attempts:
+            status = "failed"  # final — no more retries
+        else:
             status = "queued"
+            delay = _retry_delay_sec(attempts, rate)
+            sets.append("next_retry_at = ?")
+            params.append(_now_iso_plus(delay))
             if progress is None:
                 progress = 0
     if status is not None:
@@ -2174,6 +2215,31 @@ def update_job(job_id: str, *, status: Optional[str] = None,
         params.append(error)
     params.append(job_id)
     execute(f"UPDATE archive_jobs SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def _retry_delay_sec(attempts: int, rate: bool) -> float:
+    """Backoff before the next attempt: exponential with a cap, gate-aware.
+
+    Rate-limit failures (429 / 'rate limit') wait out the active YouTube
+    / Kick gates (honoring them instead of hot-retrying), floored at 2 min.
+    Everything else: 60 * 2^(attempts-1) seconds, capped at 1 h, plus up to
+    30 s of jitter so a batch of failed jobs doesn't retry in lockstep."""
+    if rate:
+        try:
+            from services.yt_gate import gate_remaining_sec as _yt_rem
+            from services.kick_gate import gate_remaining_sec as _kick_rem
+            return max(120.0, _yt_rem(), _kick_rem()) + 15.0
+        except Exception:
+            return 135.0  # gates unavailable — fixed 2m15s floor
+    delay = min(3600.0, 60.0 * (2 ** max(0, attempts - 1)))
+    return delay + (random.random() * 30.0)
+
+
+def _now_iso_plus(seconds: float) -> str:
+    """UTC ISO timestamp `seconds` from now (ISO strings compare lexically)."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def clear_finished_jobs() -> int:

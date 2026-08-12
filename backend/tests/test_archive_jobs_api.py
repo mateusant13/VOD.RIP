@@ -8,10 +8,37 @@ updated_at/heartbeat) — this test pins the fields the frontend consumes.
 """
 from __future__ import annotations
 
-import pytest
-from httpx import ASGITransport, AsyncClient
+import os
+import tempfile
+from pathlib import Path
 
-from app import app
+os.environ["VODRIP_ARCHIVE_DB"] = str(
+    Path(tempfile.mkdtemp(prefix="archive-jobs-api-")) / "archive.db")
+
+import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from app import app  # noqa: E402
+from services import archive_db  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _api_scratch_db():
+    """Rebind the shared archive conn to THIS module's scratch DB so the
+    /clear endpoint's counts are not polluted by other modules' leftover
+    terminal rows in the shared conftest DB."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(
+        Path(tempfile.mkdtemp(prefix="archive-jobs-api-")) / "archive.db")
+    archive_db._conn = None
+    archive_db._schema_ready = False
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    archive_db._conn = None
+    archive_db._schema_ready = False
 from services import archive_db
 
 
@@ -93,10 +120,10 @@ async def test_archive_jobs_clear_removes_only_terminal_rows():
     archive_db.enqueue_job("prog-ui-clr-done", "transcribe", "twitch", "prog-1001")
     archive_db.update_job("prog-ui-clr-done", status="done", progress=1)
     archive_db.enqueue_job("prog-ui-clr-fail", "chat", "twitch", "prog-1001")
-    # Terminal failure (immortal-retry guard keeps transient errors queued).
+    # TASK10 requeues transient failures; only a terminal error (FileNotFound)
+    # stays 'failed', so the seed must be terminal for clear to drop the row.
     archive_db.update_job(
-        "prog-ui-clr-fail", status="failed", error="archive-file-missing"
-    )
+        "prog-ui-clr-fail", status="failed", error="FileNotFound: missing archive")
     archive_db.enqueue_job("prog-ui-clr-run", "transcribe", "twitch", "prog-1001")
     archive_db.update_job("prog-ui-clr-run", status="running", progress=0.5)
     archive_db.enqueue_job("prog-ui-clr-que", "events", "twitch", "prog-1001")

@@ -30,7 +30,16 @@ export interface ArchiveJobRow {
   updated_at: string;
   heartbeat: string | null;
   title?: string;
+  /** TASK10 retry bookkeeping — absent on older backends; all optional. */
+  attempts?: number;
+  max_attempts?: number;
+  next_retry_at?: string | null;
 }
+
+/** TASK10: a queued job with attempts > 0 was auto-requeued after a failure —
+ *  an informational retry, NOT a final failure (only status 'failed' is final). */
+export const isRetryJob = (j: Pick<ArchiveJobRow, 'status' | 'attempts'>): boolean =>
+  j.status === 'queued' && (j.attempts ?? 0) > 0;
 
 type Props = {
   queueDownloads: DownloadState[];

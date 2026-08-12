@@ -78,14 +78,32 @@ def _persist(login: str, row: dict, names: list[str]) -> None:
         })
     except Exception:
         pass
+    # parse_privmsg leaves offset_sec None without a stream timeline; this
+    # log is wall-clock, so stamp the row with epoch seconds (insert_messages
+    # requires a numeric offset and sorts/dedupes on it).
+    if row.get("offset_sec") is None:
+        row = {**row, "offset_sec": time.time()}
     try:
         archive_db.insert_messages("twitch", vid, [row])
     except Exception:
         logger.debug("mention persist failed", exc_info=True)
 
 
+def _monitor_enabled() -> bool:
+    """Live toggle read: the running loop stops within one reconnect window
+    when the user turns the monitor off in Settings."""
+    try:
+        from deps import settings_mgr
+        return bool(getattr(settings_mgr.get(), "twitch_monitor_enabled", True))
+    except Exception:
+        return True
+
+
 def _run() -> None:
     while not _stop.is_set():
+        if not _monitor_enabled():
+            _stop.wait(10)
+            continue
         names = _saved_twitch_logins()
         if not names:
             _stop.wait(15)
@@ -150,6 +168,9 @@ def _session(names: list[str]) -> None:
 def start_mention_irc() -> None:
     global _thread
     if _thread and _thread.is_alive():
+        return
+    if not _monitor_enabled():
+        logger.info("mention IRC logger disabled via settings")
         return
     _stop.clear()
     _thread = threading.Thread(target=_run, name="mention-irc", daemon=True)

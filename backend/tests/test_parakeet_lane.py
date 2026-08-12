@@ -50,11 +50,15 @@ def test_cpu_lane_routes_supported_languages_to_parakeet():
         assert _routed(lang) == "parakeet", lang
 
 
-def test_known_other_and_unknown_stay_whisper():
+def test_known_other_languages_stay_whisper_but_unknown_defaults_parakeet():
+    """TASK9: parakeet is the DEFAULT engine; whisper only for languages
+    parakeet cannot do (ja/ko/zh/ar + anything outside the token set) or
+    when parakeet itself is unavailable."""
     for lang in ("ja", "ko", "zh", "ar", "hi"):
         assert _routed(lang) == "whisper", lang
-    assert _routed(None) == "whisper"
-    assert _routed("") == "whisper"
+    # Unknown language -> parakeet (the default), NOT whisper.
+    assert _routed(None) == "parakeet"
+    assert _routed("") == "parakeet"
 
 
 GIB = 1024 ** 3
@@ -82,10 +86,10 @@ def test_gpu_lane_vram_tight_falls_back():
 
 
 def test_gpu_lane_keeps_whisper_for_other_languages():
-    """Known-other (ja) and unknown languages stay whisper on GPU slots."""
+    """Known-other (ja) stays whisper on GPU slots; unknown defaults parakeet."""
     assert _routed("ja", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
-    assert _routed(None, device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
-    assert _routed("", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
+    assert _routed(None, device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
+    assert _routed("", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
 
 
 def test_cpu_lane_parakeet_unaffected_by_cuda_probe():

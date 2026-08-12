@@ -121,11 +121,15 @@ export interface AppSettings {
   /** One-click extension auto-install: ON offers the install on first run;
    * OFF = manual drag-and-drop only. Absent on older backends -> ON. */
   auto_install_extension?: boolean;
+  twitch_monitor_enabled?: boolean;
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
   /** Local transcription model: faster-whisper id + HF cache dir (absent on
    * older backends -> default large-v3-turbo + %APPDATA%/VOD.RIP/whisper-models). */
   whisper_model?: string;
+  /** ASR engine: 'parakeet' (default) | 'whisper'. Whisper stays the
+   * automatic fallback for ja/ko/zh/ar and parakeet-engine failures. */
+  asr_engine?: string;
   whisper_model_cache?: string | null;
   /** Captions-first: skip whisper for YouTube videos that already have
    * auto-caption rows at ingest (absent on older backends -> default true). */

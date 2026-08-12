@@ -1466,6 +1466,7 @@ export default function ChannelExplorePopup({
   const fsCtrlBtn = platformPreviewCtrlBtn(platform, true);
 
   const timelineUi = (
+    <>
     <div className="flex items-center gap-1.5 w-full shrink-0">
       <span className={`text-[9px] font-mono w-10 shrink-0 ${fullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
         {formatHmsFull(currentTime)}
@@ -1496,6 +1497,7 @@ export default function ChannelExplorePopup({
         onChange={(e) => setExploreTrimEnd(Math.max(parseFloat(e.target.value), exploreTrimStart + 1))}
         className="flex-1 accent-zinc-400 h-1" />
     </div>
+    </>
   );
 
   const volumeUi = (fs: boolean) => (

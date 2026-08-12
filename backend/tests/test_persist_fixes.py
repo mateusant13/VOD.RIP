@@ -348,7 +348,11 @@ def test_stale_failed_transcribe_job_requeued(scratch_db, tmp_path):
     assert job["id"] == job_id, "requeue must happen IN PLACE (stable job id)"
 
 
-def test_fresh_failed_transcribe_job_stays_failed(scratch_db, tmp_path):
+def test_fresh_failed_transcribe_job_stays_queued_as_retry(scratch_db, tmp_path):
+    """TASK10: a transient transcribe failure is auto-requeued by
+    update_job (status='queued', attempts=1, next_retry_at deadline) — the
+    scheduler must NOT enqueue a duplicate for it, and the retry owns the
+    row until the deadline passes."""
     media = tmp_path / "v.mp4"
     media.write_bytes(b"not really media")
     _seed_ready_youtube(_VID, media)
@@ -360,6 +364,15 @@ def test_fresh_failed_transcribe_job_stays_failed(scratch_db, tmp_path):
     archive_scheduler._enqueue_transcriptions()
 
     job = archive_db.latest_job("youtube", _VID, kind="transcribe")
-    assert job["status"] == "failed", (
-        "failure fresher than FAILED_JOB_FRESH_S must not be requeued"
+    assert job["status"] == "queued", (
+        "transient failure must be requeued, not left terminal"
+    )
+    assert job["attempts"] == 1, "one prior failure recorded"
+    assert job["next_retry_at"] is not None, "retry scheduled with a deadline"
+    rows = archive_db.query(
+        "SELECT id FROM archive_jobs WHERE kind='transcribe' "
+        "AND platform='youtube' AND video_id=?", (_VID,)
+    )
+    assert len(rows) == 1 and rows[0]["id"] == job_id, (
+        "the scheduler must not enqueue a duplicate while a retry owns the row"
     )
