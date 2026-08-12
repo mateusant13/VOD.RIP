@@ -470,6 +470,34 @@ export function clampPreviewPanelWidth(
   const maxW = maxPreviewPanelWidth(chromeH, aspect, layout);
   return Math.min(maxW, Math.max(minW, width));
 }
+/**
+ * Preview player container height for the current panel width and media
+ * aspect. The frozen (user-picked) height survives refetches and sibling
+ * squeezes, but a LANDSCAPE panel must never become taller than wide — the
+ * container is capped at width minus chrome so the whole card stays
+ * landscape (a 1920x1080 video in a portrait panel is the reported bug).
+ * Portrait media (shorts 9:16) keeps its tall panel: height > width is
+ * correct there. `chromeH` is the non-video card chrome (header + padding +
+ * gap); App.tsx passes the measured value, the estimate is the fallback.
+ */
+export function previewContainerHeight(
+  frozenH: number,
+  panelW: number,
+  aspect: number,
+  chromeH = PREVIEW_PANEL_CHROME_H_EST,
+): number {
+  const naturalH = Math.round(panelW / Math.max(0.01, aspect));
+  if (aspect < 1) {
+    // Portrait media (shorts): preserve the tall panel the user picked;
+    // never collapse below the video-fit height.
+    return Math.max(frozenH, naturalH);
+  }
+  // Landscape: the user's picked height wins only while it fits the panel
+  // width minus chrome; it can shrink but never grow past that cap, so the
+  // panel cannot flip to portrait. Nothing picked yet → video-fit height.
+  const cap = Math.max(naturalH, panelW - chromeH);
+  return frozenH > 0 ? Math.min(frozenH, cap) : naturalH;
+}
 export function applyExplorePopupWindowPosition(el: HTMLElement, pos: PanelPos) {
   el.style.position = 'fixed';
   el.style.top = `${pos.y}px`;

@@ -7,6 +7,7 @@ import {
   clampPanelSizeForLayout,
   clampAllLayoutPanels,
   effectiveLayoutFromPreferred,
+  previewContainerHeight,
   panelPosAfterResize,
   healSqueezedPanelLayout,
   aspectHeightForWidth,
@@ -517,5 +518,39 @@ describe('floating-window z-ladder contract', () => {
     // Modals spawn above the ladder and the needle glance.
     expect(MODAL_Z).toBeGreaterThan(LIVE_POPUP_ACTIVE_Z);
     expect(MODAL_Z).toBeGreaterThan(SEARCH_POPUP_Z);
+  });
+});
+
+describe('previewContainerHeight aspect constraint', () => {
+  it('caps a stale tall frozen height so a 16:9 panel stays landscape', () => {
+    // Frozen height left over from a shorts/wide session can exceed what the
+    // current width can hold → capped at width minus chrome.
+    expect(previewContainerHeight(604, 500, 16 / 9, 120)).toBe(380);
+    expect(previewContainerHeight(604, 640, 16 / 9, 120)).toBe(520);
+    // A picked height that already fits the width is preserved unchanged.
+    expect(previewContainerHeight(360, 640, 16 / 9, 120)).toBe(360);
+  });
+
+  it('uses the video-fit height when nothing is frozen yet', () => {
+    expect(previewContainerHeight(0, 640, 16 / 9, 120)).toBe(360);
+    expect(previewContainerHeight(0, 280, 16 / 9, 120)).toBe(158);
+  });
+
+  it('never lets a landscape card exceed its width (16:9 or wider)', () => {
+    for (const w of [280, 320, 480, 640, 960]) {
+      for (const aspect of [16 / 9, 21 / 9]) {
+        const h = previewContainerHeight(w * 2, w, aspect, 120);
+        expect(h).toBeLessThanOrEqual(w); // container
+        expect(h + 120).toBeLessThanOrEqual(w); // whole card incl. chrome
+      }
+    }
+  });
+
+  it('preserves the tall panel for portrait shorts media', () => {
+    // 9:16 shorts: height > width is correct and the picked height wins.
+    expect(previewContainerHeight(500, 280, 9 / 16, 120)).toBe(500);
+    expect(previewContainerHeight(0, 280, 9 / 16, 120)).toBe(498);
+    // Never collapse below the video-fit height.
+    expect(previewContainerHeight(300, 280, 9 / 16, 120)).toBe(498);
   });
 });
