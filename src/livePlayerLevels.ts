@@ -7,7 +7,9 @@
  */
 
 import { buildVodUrl, isPublicVideo } from './channelUtils';
-import type { SavedChannel } from './types';
+import { edgeAffectsNorth, edgeAffectsWest, widthDeltaFromEdge } from './layoutUtils';
+import type { PanelSize, SavedChannel } from './types';
+import type { ResizeEdge } from './explorePopupUtils';
 
 export interface LiveLevelLike {
   index: number;
@@ -160,4 +162,105 @@ export function replaySeekTarget(
 export function appendLivePopup<T>(items: T[], next: T, max: number): { items: T[]; blocked: boolean } {
   if (items.length >= max) return { items, blocked: true };
   return { items: [...items, next], blocked: false };
+}
+
+// ---------------------------------------------------------------------------
+// Aspect-locked popup resize
+// ---------------------------------------------------------------------------
+
+export interface LivePanelAspectClamp {
+  minW: number;
+  minH: number;
+  maxW: number;
+  maxH: number;
+}
+
+/**
+ * Aspect-locked size for the live player popup during a resize drag.
+ *
+ * The popup is a flex column (fixed header + video area), and the live chat
+ * panel may dock right of the video, shrinking its width. For the video to
+ * fill its area with NO letterboxing the VIDEO AREA must keep the stream's
+ * aspect: (h − headerH) = (w − chatW) / aspect. `startPanelResizeDrag`
+ * hands us the raw (already edge-calc'd, generically clamped) size — we
+ * reconstruct the pointer deltas from it, re-derive the width via
+ * `widthDeltaFromEdge` (the same math the main preview uses), then derive
+ * the height from the width. When the height hits a clamp the width is
+ * re-derived from it (two-way lock), so growing the panel grows it exactly
+ * like the video and shrinking behaves consistently.
+ */
+export function livePanelSizeFromAspect(
+  edge: ResizeEdge,
+  startSize: PanelSize,
+  current: PanelSize,
+  aspect: number,
+  headerH: number,
+  chatW: number,
+  clamp: LivePanelAspectClamp,
+): PanelSize {
+  // `current` came from calcPanelSizeFromEdge, which INVERTS the pointer
+  // delta on west/north edges (w = startW − dx, h = startH − dy). Recover
+  // the raw pointer deltas so widthDeltaFromEdge sees the same sign
+  // convention the main preview's resize path uses.
+  const rawDx = edgeAffectsWest(edge) ? startSize.w - current.w : current.w - startSize.w;
+  const rawDy = edgeAffectsNorth(edge) ? startSize.h - current.h : current.h - startSize.h;
+  const deltaW = widthDeltaFromEdge(edge, rawDx, rawDy, Math.max(0.01, aspect));
+  let w = startSize.w + deltaW;
+  w = Math.min(clamp.maxW, Math.max(clamp.minW, w));
+
+  let h = headerH + Math.max(0, w - chatW) / Math.max(0.01, aspect);
+  h = Math.round(h);
+  if (h > clamp.maxH) {
+    h = clamp.maxH;
+    w = Math.round(chatW + (clamp.maxH - headerH) * Math.max(0.01, aspect));
+    w = Math.min(clamp.maxW, Math.max(clamp.minW, w));
+  } else if (h < clamp.minH) {
+    h = clamp.minH;
+    w = Math.round(chatW + (clamp.minH - headerH) * Math.max(0.01, aspect));
+    w = Math.min(clamp.maxW, Math.max(clamp.minW, w));
+  }
+  return { w, h };
+}
+
+// ---------------------------------------------------------------------------
+// Fast clip (livestream popup CLIP button)
+// ---------------------------------------------------------------------------
+
+/** Fast-clip cooldown: one clip per window; a second click is ignored. */
+export const FAST_CLIP_COOLDOWN_MS = 5000;
+/** Fast-clip duration bounds — the seconds input clamps to this range. */
+export const FAST_CLIP_MIN_SEC = 1;
+export const FAST_CLIP_MAX_SEC = 60;
+export const FAST_CLIP_DEFAULT_SEC = 30;
+
+/** Seconds remaining in the clip cooldown at `nowMs`, or 0 when free. */
+export function clipCooldownRemaining(lastClipAtMs: number, nowMs: number, cooldownMs = FAST_CLIP_COOLDOWN_MS): number {
+  if (lastClipAtMs <= 0) return 0;
+  return Math.max(0, lastClipAtMs + cooldownMs - nowMs);
+}
+
+/** Clamp the seconds input to the 1..60 fast-clip range. */
+export function clampClipSeconds(value: number): number {
+  if (!Number.isFinite(value)) return FAST_CLIP_DEFAULT_SEC;
+  return Math.min(FAST_CLIP_MAX_SEC, Math.max(FAST_CLIP_MIN_SEC, Math.round(value)));
+}
+
+/**
+ * Live chat room slug from the entry URL (twitch.tv/<login>,
+ * kick.com/<slug>, youtube.com/@handle) — falls back to the platform slug
+ * the archive context resolved. Used to open the per-viewer chat stream.
+ */
+export function liveChatSlugFromUrl(url: string, platform: string | undefined): string | undefined {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.split('/').filter(Boolean);
+    const plat = (platform || '').toLowerCase();
+    if (plat === 'twitch' || host.includes('twitch.tv')) return path[0] || undefined;
+    if (plat === 'kick' || host.includes('kick.com')) return path[0] || undefined;
+    if (plat === 'youtube' || host.includes('youtube.com') || host === 'youtu.be') return path[0] || undefined;
+    return path[0] || undefined;
+  } catch {
+    return undefined;
+  }
 }

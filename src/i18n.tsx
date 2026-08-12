@@ -578,6 +578,26 @@ const ptBR: Record<string, string> = {
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
+  // ── Live chat / fast clip (livestream) ────────────────────
+  'Live chat': 'Chat ao vivo',
+  'Live chat connected': 'Chat ao vivo conectado',
+  'Connecting…': 'Conectando…',
+  'Reconnecting…': 'Reconectando…',
+  'Live chat unavailable': 'Chat ao vivo indisponível',
+  'Live chat offline': 'Chat ao vivo offline',
+  'Waiting for chat…': 'Aguardando chat…',
+  'Close live chat': 'Fechar chat ao vivo',
+  'Badges': 'Emblemas',
+  'Clip duration (seconds)': 'Duração do clipe (segundos)',
+  'Clip cooldown {n}s': 'Clipe em {n}s',
+  'Create a clip of the live stream': 'Criar um clipe do stream ao vivo',
+  'Clip created': 'Clipe criado!',
+  'Clip unavailable': 'Clipe indisponível',
+  'CLIP': 'CLIPE',
+  'Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).':
+    'Clipes ao vivo do Twitch precisam de um token OAuth Helix com escopo clips:edit (POST /helix/clips).',
+  'Kick has no public clip-creation API.': 'O Kick não tem API pública de criação de clipes.',
+  'YouTube has no public live-clip API.': 'O YouTube não tem API pública de clipes ao vivo.',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
@@ -1119,6 +1139,26 @@ const es: Record<string, string> = {
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',
+  // ── Live chat / fast clip (livestream) ────────────────────
+  'Live chat': 'Chat en vivo',
+  'Live chat connected': 'Chat en vivo conectado',
+  'Connecting…': 'Conectando…',
+  'Reconnecting…': 'Reconectando…',
+  'Live chat unavailable': 'Chat en vivo no disponible',
+  'Live chat offline': 'Chat en vivo sin conexión',
+  'Waiting for chat…': 'Esperando chat…',
+  'Close live chat': 'Cerrar chat en vivo',
+  'Badges': 'Insignias',
+  'Clip duration (seconds)': 'Duración del clip (segundos)',
+  'Clip cooldown {n}s': 'Clip en {n}s',
+  'Create a clip of the live stream': 'Crear un clip del stream en vivo',
+  'Clip created': '¡Clip creado!',
+  'Clip unavailable': 'Clip no disponible',
+  'CLIP': 'CLIP',
+  'Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).':
+    'Los clips en vivo de Twitch necesitan un token OAuth de Helix con ámbito clips:edit (POST /helix/clips).',
+  'Kick has no public clip-creation API.': 'Kick no tiene una API pública de creación de clips.',
+  'YouTube has no public live-clip API.': 'YouTube no tiene una API pública de clips en vivo.',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so

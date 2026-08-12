@@ -1,13 +1,17 @@
 """Live-stream info and DVR endpoints."""
 
+import asyncio
+import json
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from deps import settings_mgr
 from services.live_capture import (
@@ -451,3 +455,137 @@ def _build_live_output_path(title: str, platform: str, channel: str) -> str:
         candidate = out_dir / f"{safe_ch}_{safe_title}_{platform}_{counter}.mp4"
         counter += 1
     return str(candidate)
+
+
+# ---------------------------------------------------------------------------
+# Live chat stream (per-viewer SSE) + fast-clip capability
+# ---------------------------------------------------------------------------
+#
+# The livestream popup docks a LIVE chat panel right of the video. There is no
+# archived chat for a viewer session, so each SSE connection builds a fresh
+# per-viewer sink (reusing the SAME capture classes as the archive watchdog —
+# Twitch anon IRC / Kick Pusher / yt-dlp live_chat) with a flush callback that
+# pushes rows into the connection's asyncio queue instead of writing to the
+# archive. `video_id` is viewer-scoped (never a saved video id), so a viewer
+# stream can never collide with or pollute archive rows. Disconnect stops the
+# sink (interrupting the IRC socket / pusher ws / yt-dlp process).
+
+_CHAT_PLATFORM_KWARG = {"twitch": "login", "kick": "slug", "youtube": "handle"}
+_CHAT_FLUSH_INTERVAL_SEC = 1.0  # live panel needs near-real-time, not the 5s archive cadence
+_CHAT_FLUSH_MAX_ROWS = 20
+
+
+def _build_viewer_chat_sink(platform: str, slug: str, push) -> "object":
+    """Create a per-viewer chat sink whose flushes forward rows to ``push``.
+
+    Mirrors the archive watchdog's sink factory (login/slug/handle per
+    platform) but with a viewer-scoped video_id and a flush callback instead
+    of the archive writer. Lazy-imported so this router never pulls chat-sink
+    deps (websockets/yt-dlp) into the app boot path unless a stream is open.
+    """
+    from services.chat_sinks import SINKS
+
+    cls = SINKS[platform]
+    kwargs = {
+        "video_id": f"viewer-{platform}-{slug}-{uuid.uuid4().hex[:8]}",
+        "channel": slug,
+        "title": "",
+        "stream_start_ts": None,
+        "flush_interval": _CHAT_FLUSH_INTERVAL_SEC,
+        "flush_max": _CHAT_FLUSH_MAX_ROWS,
+        "flush_cb": push,
+    }
+    kwargs[_CHAT_PLATFORM_KWARG[platform]] = slug
+    return cls(**kwargs)
+
+
+@router.get("/live/chat/stream")
+async def live_chat_stream(
+    request: Request,
+    platform: str = Query(..., description="twitch | kick | youtube"),
+    slug: str = Query(..., description="chat room slug (login / slug / @handle)"),
+):
+    """SSE stream of LIVE chat rows for one channel (per-viewer capture).
+
+    Each connection owns a ChatSink; rows flush every ~1s and are forwarded
+    as ``data: {…}`` frames. Same keepalive/disconnect contract as the
+    download stream endpoint. The sink dies with the connection.
+    """
+    plat = (platform or "").lower()
+    if plat not in _CHAT_PLATFORM_KWARG or not slug:
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube and slug is required")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    sink = _build_viewer_chat_sink(plat, slug, lambda rows: loop.call_soon_threadsafe(queue.put_nowait, rows))
+
+    return StreamingResponse(
+        _chat_sse_gen(request, queue, sink),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+async def _chat_sse_gen(request: Request, queue: asyncio.Queue, sink) -> "AsyncGenerator[str, None]":
+    """SSE body generator: start the sink, forward flushed row batches, and
+    keep the connection alive with comment frames. Extracted so tests can
+    drive it directly (ASGITransport buffers the whole infinite body)."""
+    try:
+        sink.start()
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                rows = await asyncio.wait_for(queue.get(), timeout=15)
+                for row in rows:
+                    yield f"data: {json.dumps(row, ensure_ascii=False)}\n\n"
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+    finally:
+        sink.stop()
+
+
+class FastClipRequest(BaseModel):
+    platform: str = Field(..., description="twitch | kick | youtube")
+    slug: str = Field(..., description="channel slug / login / @handle")
+    duration_sec: int = Field(30, ge=1, le=60, description="clip duration in seconds (1..60)")
+
+
+@router.post("/live/clip")
+def fast_live_clip(req: FastClipRequest) -> dict:
+    """Fast-clip capability report — HONEST, never fakes a clip.
+
+    There is NO server-side live clip path in this build (audited):
+    - Twitch: Helix ``POST /helix/clips`` needs an OAuth user token with the
+      ``clips:edit`` scope + a Client-Id header; the old implementation was
+      removed in c609e93 and no OAuth client creds remain. The session-cookie
+      auth this app uses is not accepted by Helix.
+    - Kick: has no public clip-creation API.
+    - YouTube: has no public live-clip API.
+    So the payload always reports ``available: false`` with the exact
+    requirement the UI surfaces (never a fabricated clip id).
+    """
+    plat = (req.platform or "").lower()
+    if plat == "twitch":
+        return {
+            "available": False,
+            "reason": "Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).",
+            "needed": [
+                "OAuth user token with clips:edit scope",
+                "Client-Id header",
+                "POST https://api.twitch.tv/helix/clips",
+            ],
+        }
+    if plat == "kick":
+        return {
+            "available": False,
+            "reason": "Kick has no public clip-creation API.",
+            "needed": ["No public Kick endpoint — a first-party account flow would be required"],
+        }
+    if plat == "youtube":
+        return {
+            "available": False,
+            "reason": "YouTube has no public live-clip API.",
+            "needed": ["No public YouTube endpoint for live clip creation"],
+        }
+    raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube")

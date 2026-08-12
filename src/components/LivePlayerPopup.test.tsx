@@ -29,6 +29,14 @@ function mockFetch() {
     if (url.includes('/api/archive/videos')) {
       return new Response(JSON.stringify({ videos: [] }), { status: 200 });
     }
+    if (url.includes('/api/live/clip')) {
+      // Honest capability report — never a fake clip.
+      return new Response(JSON.stringify({
+        available: false,
+        reason: 'Kick has no public clip-creation API.',
+        needed: [],
+      }), { status: 200 });
+    }
     return new Response(JSON.stringify({}), { status: 404 });
   });
   vi.stubGlobal('fetch', fn);
@@ -143,6 +151,59 @@ describe('LivePlayerPopup fullscreen', () => {
     fsElement = null;
     document.dispatchEvent(new Event('fullscreenchange'));
     await screen.findByRole('dialog', { name: 'Archive search' });
+  });
+});
+
+describe('LivePlayerPopup fast clip', () => {
+  it('fires ONE clip request on a double-click (5s cooldown ignores the second)', async () => {
+    const fetchMock = mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const btn = screen.getByTitle('Create a clip of the live stream');
+    fireEvent.click(btn);
+    fireEvent.click(btn); // within the 5s window — must be ignored
+
+    const clipCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/live/clip'));
+    expect(clipCalls).toHaveLength(1);
+
+    // The button flips into countdown mode (disabled, showing seconds).
+    await waitFor(() => expect(btn).toBeDisabled());
+
+    // Honest notification: reports the capability gap, never "clip saved".
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Clip unavailable');
+  });
+
+  it('clamps the seconds input to 1..60', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const input = screen.getByLabelText('Clip duration (seconds)');
+    fireEvent.change(input, { target: { value: '99' } });
+    expect((input as HTMLInputElement).value).toBe('60');
+    fireEvent.change(input, { target: { value: '0' } });
+    expect((input as HTMLInputElement).value).toBe('1');
+  });
+});
+
+describe('LivePlayerPopup live chat', () => {
+  it('docks the chat panel by default and guards a missing EventSource (jsdom)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // The panel is docked right of the video (default open).
+    const panel = document.querySelector('[data-live-chat-panel]');
+    expect(panel).toBeTruthy();
+    // jsdom has no EventSource — the panel must degrade, not crash.
+    expect(screen.getByText('Live chat unavailable')).toBeTruthy();
+
+    // The header toggle closes the panel (first match — the panel's own X
+    // shares the title).
+    fireEvent.click(screen.getAllByTitle('Close live chat')[0]);
+    await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeNull());
   });
 });
 
