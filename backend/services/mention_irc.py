@@ -78,6 +78,11 @@ def _persist(login: str, row: dict, names: list[str]) -> None:
         })
     except Exception:
         pass
+    # parse_privmsg leaves offset_sec None without a stream timeline; this
+    # log is wall-clock, so stamp the row with epoch seconds (insert_messages
+    # requires a numeric offset and sorts/dedupes on it).
+    if row.get("offset_sec") is None:
+        row = {**row, "offset_sec": time.time()}
     try:
         archive_db.insert_messages("twitch", vid, [row])
     except Exception:
@@ -151,6 +156,13 @@ def start_mention_irc() -> None:
     global _thread
     if _thread and _thread.is_alive():
         return
+    try:
+        from deps import settings_mgr
+        if not bool(getattr(settings_mgr.get(), "twitch_monitor_enabled", True)):
+            logger.info("mention IRC logger disabled via settings")
+            return
+    except Exception:
+        pass
     _stop.clear()
     _thread = threading.Thread(target=_run, name="mention-irc", daemon=True)
     _thread.start()

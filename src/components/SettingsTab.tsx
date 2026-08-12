@@ -40,7 +40,7 @@ const SETTING_KEYS = [
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
-  'auto_install_extension',
+  'auto_install_extension', 'twitch_monitor_enabled',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
   JSON.stringify(SETTING_KEYS.map((k) => s[k] ?? null));
@@ -183,6 +183,13 @@ export default function SettingsTab({
         checked={settings.auto_install_extension !== false}
         onChange={(c) => setSettings({ ...settings, auto_install_extension: c })}
         ariaLabel="auto install cookie extension"
+      />
+      <Toggle
+        label={t('twitchMonitor.toggle')}
+        info={t('twitchMonitor.toggleInfo')}
+        checked={settings.twitch_monitor_enabled !== false}
+        onChange={(c) => setSettings({ ...settings, twitch_monitor_enabled: c })}
+        ariaLabel="twitch mention monitor"
       />
       <CookieBridgeSection onStatusChange={setCookieStatus} />
       <div className="flex items-center gap-2">

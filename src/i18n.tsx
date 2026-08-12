@@ -562,6 +562,9 @@ const ptBR: Record<string, string> = {
   'cookieAuto.close': 'Fechar',
   'cookieAuto.toggle': 'Instalação automática da extensão',
   'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
+  // ── Twitch mention monitor (twitchMonitor.*) ─────────────
+  'twitchMonitor.toggle': 'Monitor de menções na Twitch',
+  'twitchMonitor.toggleInfo': 'Fica conectado 24/7 aos canais salvos e registra mensagens que mencionam eles — mesmo sem VOD gravado.',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
@@ -601,6 +604,8 @@ const en: Record<string, string> = {
   'cookieAuto.close': 'Close',
   'cookieAuto.toggle': 'Auto-install cookie extension',
   'cookieAuto.toggleInfo': 'Offer the one-click install when cookies are not paired yet. Turn off to install manually only.',
+  'twitchMonitor.toggle': 'Twitch mention monitor',
+  'twitchMonitor.toggleInfo': 'Stays connected 24/7 to saved channels and logs chat lines that mention them — even with no VOD recorded.',
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Tutorial messages re-enabled',
 }
@@ -1090,6 +1095,8 @@ const es: Record<string, string> = {
   'cookieAuto.close': 'Cerrar',
   'cookieAuto.toggle': 'Instalación automática de la extensión',
   'cookieAuto.toggleInfo': 'Muestra la oferta de instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
+  'twitchMonitor.toggle': 'Monitor de menciones de Twitch',
+  'twitchMonitor.toggleInfo': 'Se mantiene conectado 24/7 a los canales guardados y registra mensajes que los mencionan, incluso sin VOD grabado.',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',

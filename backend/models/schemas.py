@@ -120,13 +120,23 @@ class AppSettings(BaseModel):
     # manual drag-and-drop only. Absent on older backends -> ON (getattr).
     auto_install_extension: bool = True
     entity_watch_enabled: bool = True
+    # 24/7 Twitch IRC mention logger: stays joined to saved channels and
+    # persists chat lines that mention them (searchable even without a VOD).
+    twitch_monitor_enabled: bool = True
     # Archived VOD retention: keep only the newest N video FILES per platform;
     # older files are deleted but DB rows/transcripts/chat stay forever.
     archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
     # Local transcription model: faster-whisper id + HF cache dir (mirrors
     # the VODRIP_WHISPER_MODEL / VODRIP_WHISPER_CACHE env knobs). A cache
     # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
-    whisper_model: str = "parakeet"
+    # NOTE: whisper_model is the faster-whisper model id (NOT an engine) —
+    # 'parakeet' here would break WhisperModel() loads. Engine selection is
+    # asr_engine ('parakeet' default; whisper large-v3-turbo only when
+    # parakeet itself fails or the language is ja/ko/zh/ar).
+    whisper_model: str = "large-v3-turbo"
+    # ASR engine: 'parakeet' (default) or 'whisper'. The job router keeps
+    # whisper as the fallback for ja/ko/zh/ar and parakeet-engine failures
+    # regardless; this setting forces the engine for every job.
     asr_engine: str = "parakeet"
     whisper_model_cache: Optional[str] = None
     # Captions-first: when a YouTube video already has auto-caption rows at
@@ -190,8 +200,10 @@ class SettingsUpdate(BaseModel):
     cookie_bridge_enabled: Optional[bool] = None
     auto_install_extension: Optional[bool] = None
     entity_watch_enabled: Optional[bool] = None
+    twitch_monitor_enabled: Optional[bool] = None
     archive_vod_keep_count: Optional[int] = None
     whisper_model: Optional[str] = None
+    asr_engine: Optional[str] = None
     whisper_model_cache: Optional[str] = None
     yt_subtitles_first: Optional[bool] = None
     archive_smart_enrich: Optional[bool] = None
