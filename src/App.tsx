@@ -1003,19 +1003,6 @@ export default function App() {
     [allChannelVideos],
   );
 
-  useEffect(() => {
-    if (channelContentFilter !== 'clips') return;
-    if (channelsLoading) return;
-    const steps = [1, 7, 14, 30, 180, 365, 0];
-    const idx = steps.indexOf(clipRangeDays);
-    if (idx < 0 || idx >= steps.length - 1) return;
-    if (visibleChannelVideos.length > 0) return;
-    const next = steps[idx + 1];
-    if (next !== clipRangeDays) setClipRangeDays(next);
-  }, [channelContentFilter, clipRangeDays, visibleChannelVideos.length, channelsLoading]);
-
-  const channelsLoading = selectedChannel?.loading ?? false;
-
   const channelHasKick = Boolean(selectedChannel?.kickSlug?.trim());
   const channelHasTwitch = Boolean(selectedChannel?.twitchSlug?.trim());
   const channelHasYoutube = Boolean(selectedChannel?.youtubeSlug?.trim());
@@ -1103,6 +1090,31 @@ export default function App() {
     channelHasYoutube,
     channelBeyondRecent,
   ]);
+
+  // Clip era auto-advance (TASK4): when the selected window has no clips,
+  // step to the next wider window. The pending flag blocks advancing BEFORE
+  // the current range's fetch settles — otherwise an empty cache would skip
+  // Hoje/1–7d on first paint even when the server has clips there.
+  const channelsLoading = selectedChannel?.loading ?? false;
+  const clipRangeFetchPendingRef = useRef(false);
+  useEffect(() => {
+    if (channelContentFilter !== 'clips') return;
+    const steps = [1, 7, 14, 30, 180, 365, 0];
+    const idx = steps.indexOf(clipRangeDays);
+    const next = idx >= 0 && idx < steps.length - 1 ? steps[idx + 1] : null;
+    if (next == null) return;
+    if (visibleChannelVideos.length > 0) {
+      clipRangeFetchPendingRef.current = false;
+      return;
+    }
+    if (channelsLoading) {
+      clipRangeFetchPendingRef.current = true;
+      return;
+    }
+    if (!clipRangeFetchPendingRef.current) return;
+    clipRangeFetchPendingRef.current = false;
+    if (next !== clipRangeDays) setClipRangeDays(next);
+  }, [channelContentFilter, clipRangeDays, visibleChannelVideos.length, channelsLoading]);
 
   const bulkDownloadPlatforms = useMemo(() => {
     const platforms = new Set<PlatformStyleKey>();
@@ -5421,7 +5433,11 @@ export default function App() {
     selectVod(vodUrl, undefined, hint);
   }, [selectVod]);
 
-  const carryExploreToUrl = useCallback((vod: ExplorePopupVod, timeSec = 0) => {
+  const carryExploreToUrl = useCallback((
+    vod: ExplorePopupVod,
+    timeSec = 0,
+    trim?: { start: number; end: number } | null,
+  ) => {
     selectVod(vod.url, {
       platform: vod.platform,
       platformListIndex: vod.platformListIndex,
@@ -5436,6 +5452,21 @@ export default function App() {
       channel: vod.channel,
       skipNetwork: true,
     });
+    // Same trim as main preview: selectVod's skipNetwork path resets the
+    // preview trim to the full VOD (applyVideoInfoTrim), so apply the carried
+    // In/Out afterwards — the main preview rail/timeline now matches the mini.
+    if (trim && Number.isFinite(trim.start) && Number.isFinite(trim.end) && trim.end > trim.start) {
+      const start = Math.max(0, trim.start);
+      const end = Math.max(start + 1, trim.end);
+      trimStartSecRef.current = start;
+      trimEndSecRef.current = end;
+      previewTrimStartRef.current = start;
+      previewTrimEndRef.current = end;
+      setTrimStartSec(start);
+      setTrimEndSec(end);
+      setPreviewTrimStart(start);
+      setPreviewTrimEnd(end);
+    }
     const seekTo = Number.isFinite(timeSec) ? Math.max(0, timeSec) : 0;
     if (seekTo > 0) {
       window.setTimeout(() => seekPreviewVideo(seekTo, true), 500);
@@ -7282,7 +7313,7 @@ export default function App() {
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
-              onHandoffToMain={(vod, timeSec) => carryExploreToUrl(vod, timeSec)}
+              onHandoffToMain={(vod, timeSec, trim) => carryExploreToUrl(vod, timeSec, trim)}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}

@@ -121,7 +121,10 @@ interface ChannelExplorePopupProps {
   stackIndex: number;
   volumeMenuCloseTick: number;
   onClose: () => void;
-  onHandoffToMain: (vod: ExplorePopupVod, timeSec: number) => void;
+  /** Hand the mini preview to the app MAIN preview: plays `timeSec` (VOD
+   *  absolute) and carries the explore trim (In/Out) so the main preview
+   *  opens with the same window. */
+  onHandoffToMain: (vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null) => void;
   onRegisterPause: (id: string, pause: () => void) => void;
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
@@ -188,6 +191,9 @@ export default function ChannelExplorePopup({
     vodId: string;
     playheadSec: number;
     vodDurationSec: number;
+    /** Explore trim (In/Out) — the mini preview starts its selection there,
+     *  mirroring how the main preview anchors on its own trim. */
+    anchorRange?: { start: number; end: number } | null;
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
@@ -1600,6 +1606,12 @@ export default function ChannelExplorePopup({
       vodId,
       playheadSec: currentTime,
       vodDurationSec: vod.durationSec,
+      // Same trim as main preview: a 5–60s In/Out selection seeds the mini
+      // preview's initial clip selection, exactly like the main preview
+      // passes its trim as anchorRange.
+      anchorRange: exploreTrimEnd > exploreTrimStart
+        ? { start: exploreTrimStart, end: exploreTrimEnd }
+        : null,
       reuseSession: sessionIdRef.current
         ? { sessionId: sessionIdRef.current, trimTimeline: trimTimelineRef.current }
         : null,
@@ -1904,7 +1916,11 @@ export default function ChannelExplorePopup({
                 {showClipButton && exploreClipBtn(false)}
                 <button
                   type="button"
-                  onClick={() => onHandoffToMain(vod, currentTime)}
+                  onClick={() => onHandoffToMain(
+                    vod,
+                    currentTime,
+                    exploreTrimEnd > exploreTrimStart ? { start: exploreTrimStart, end: exploreTrimEnd } : null,
+                  )}
                   className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
                   title={t('Open in main preview to download')}
                 >
@@ -1969,7 +1985,11 @@ export default function ChannelExplorePopup({
                   {showClipButton && exploreClipBtn(true)}
                   <button
                     type="button"
-                    onClick={() => onHandoffToMain(vod, currentTime)}
+                    onClick={() => onHandoffToMain(
+                    vod,
+                    currentTime,
+                    exploreTrimEnd > exploreTrimStart ? { start: exploreTrimStart, end: exploreTrimEnd } : null,
+                  )}
                     className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
                     title={t('Open in main preview to download')}
                   >
@@ -2010,6 +2030,7 @@ export default function ChannelExplorePopup({
           vodId={clipPopup.vodId}
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
+          anchorRange={clipPopup.anchorRange ?? undefined}
           reuseSession={clipPopup.reuseSession}
           // The clip title defaults to the VOD's title (user-mandated:
           // the clip keeps the ORIGINAL title) — sent as vodrip_title so
