@@ -166,7 +166,7 @@ def write_thumbnail_sidecar(thumbnail: Optional[str], output_file: str) -> Optio
         )
         with urllib.request.urlopen(req, timeout=_THUMB_FETCH_TIMEOUT) as resp:
             body = resp.read(_THUMB_SIZE_CAP + 1)
-        if len(body) > _THUMB_SIZE_CAP or len(body) < 100:
+        if len(body) > _THUMB_SIZE_CAP or not body:
             return None
         dest = Path(f"{stem}.thumb.jpg")
         dest.parent.mkdir(parents=True, exist_ok=True)

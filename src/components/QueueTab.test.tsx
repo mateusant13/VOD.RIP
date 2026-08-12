@@ -265,4 +265,85 @@ describe('QueueTab', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('Clear notifications clears done/failed jobs and refetches', async () => {
+    vi.useFakeTimers();
+    try {
+      let cleared = false;
+      const fn = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/archive/jobs/clear')) {
+          cleared = true;
+          return new Response(JSON.stringify({ ok: true, cleared: 2 }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.includes('/api/archive/jobs')) {
+          const jobs = cleared
+            ? [JOB({ id: 'tr-run', status: 'running', progress: 0.2 })]
+            : [
+                JOB({ id: 'tr-done', status: 'done', progress: 1 }),
+                JOB({ id: 'tr-fail', status: 'failed', error: 'archive-file-missing' }),
+                JOB({ id: 'tr-run', status: 'running', progress: 0.2 }),
+              ];
+          return new Response(JSON.stringify({ jobs }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+      vi.stubGlobal('fetch', fn);
+      renderTab({ queue: [], history: [] });
+      openNotifications();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const clearBtn = screen.getByRole('button', { name: 'Clear notifications' });
+      expect(clearBtn).not.toBeDisabled();
+      fireEvent.click(clearBtn);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The clear POST fired, then a refetch re-synced the panel.
+      expect(fn.mock.calls.some((c) => String(c[0]).includes('/api/archive/jobs/clear'))).toBe(true);
+      expect(screen.queryByText('Done')).toBeNull();
+      expect(screen.getByText('Running')).toBeTruthy();
+      // Nothing finished left → the button disables.
+      expect(screen.getByRole('button', { name: 'Clear notifications' })).toBeDisabled();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('history row with a local thumbnail path renders the local-media URL', () => {
+    render(
+      <QueueTab
+        queueDownloads={[]}
+        historyDownloads={[DL({
+          download_id: 'dl-thumb',
+          title: 'VOD Thumb',
+          status: 'Completed',
+          thumbnail: 'C:\\VODs\\clip.thumb.jpg',
+        })]}
+        onPause={() => {}}
+        onResume={() => {}}
+        onCancel={() => {}}
+        onDelete={() => {}}
+        onDeleteHistory={() => {}}
+        onOpenFolder={() => {}}
+        onRefresh={() => {}}
+        basename={(p) => p}
+      />,
+    );
+    const img = document.querySelector('img') as HTMLImageElement;
+    expect(img).not.toBeNull();
+    expect(img.src).toContain('/api/local/media?path=');
+    expect(img.src).toContain(encodeURIComponent('C:\\VODs\\clip.thumb.jpg'));
+  });
 });

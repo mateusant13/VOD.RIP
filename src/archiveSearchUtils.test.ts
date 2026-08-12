@@ -200,15 +200,11 @@ describe('buildSearchUrl', () => {
     expect(buildSearchUrl({ query: 'x', source: ['chat'] })).toBe(
       '/api/archive/search?q=x&source=chat&limit=30',
     );
-    // A proper subset goes comma-joined.
-    expect(buildSearchUrl({ query: 'x', source: ['video', 'chat'] })).toBe(
-      '/api/archive/search?q=x&source=video%2Cchat&limit=30',
-    );
     expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
       '/api/archive/search?q=x&video_id=abc123&limit=30',
     );
-    // All three selected = backend default 'both' — param omitted.
-    expect(buildSearchUrl({ query: 'x', source: ['video', 'transcript', 'chat'], videoId: 'v1' })).toBe(
+    // All sources selected = backend default 'both' — param omitted.
+    expect(buildSearchUrl({ query: 'x', source: ['transcript', 'chat'], videoId: 'v1' })).toBe(
       '/api/archive/search?q=x&video_id=v1&limit=30',
     );
     // Empty selection = same default — omitted.

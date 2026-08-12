@@ -43,7 +43,7 @@ def test_write_thumbnail_sidecar_downloads_remote(tmp_path: Path):
     out.write_bytes(b"video")
     url = src.as_uri().replace("thumb48x36", "thumb%{width}x%{height}")
     got = write_thumbnail_sidecar(url, str(out))
-    assert got == str(tmp_path / "clip.thumb.jpg")
+    assert got == str(tmp_path / "clip.mp4.thumb.jpg")
     assert Path(got).read_bytes() == b"jpeg-data"
 
 

@@ -93,7 +93,10 @@ async def test_archive_jobs_clear_removes_only_terminal_rows():
     archive_db.enqueue_job("prog-ui-clr-done", "transcribe", "twitch", "prog-1001")
     archive_db.update_job("prog-ui-clr-done", status="done", progress=1)
     archive_db.enqueue_job("prog-ui-clr-fail", "chat", "twitch", "prog-1001")
-    archive_db.update_job("prog-ui-clr-fail", status="failed", error="boom")
+    # Terminal failure (immortal-retry guard keeps transient errors queued).
+    archive_db.update_job(
+        "prog-ui-clr-fail", status="failed", error="archive-file-missing"
+    )
     archive_db.enqueue_job("prog-ui-clr-run", "transcribe", "twitch", "prog-1001")
     archive_db.update_job("prog-ui-clr-run", status="running", progress=0.5)
     archive_db.enqueue_job("prog-ui-clr-que", "events", "twitch", "prog-1001")
