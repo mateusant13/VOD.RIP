@@ -19,6 +19,7 @@ from services.preview import session as session_mod
 from services.preview.hls import proxy_playlist
 from services.preview.session import (
     REPLAY_PLAYLIST_RESOURCE,
+    StalePreviewUrls,
     _apply_growing_vod_duration,
     _manager,
     _playlist_cache,
@@ -250,7 +251,7 @@ def test_live_session_archive_fields() -> None:
         assert REPLAY_PLAYLIST_RESOURCE not in sess.resource_map
 
         sess2 = preview.create_live_session(
-            "http://cdn.example.com/master.m3u8",
+            "http://cdn.example.com/master2.m3u8",
             {},
             "Twitch",
             vod_url="https://www.twitch.tv/videos/123456789",
@@ -276,6 +277,134 @@ def test_live_session_archive_fields() -> None:
         hls_mod._http_get_bytes = real_bytes
 
 
+def test_iter_upstream_bounded_stall_aborts() -> None:
+    # Fix C wall-clock watchdog: a 0 B/s upstream read aborts after the
+    # deadline instead of hanging the worker for libcurl's 3600s low-speed
+    # window; a slow-but-flowing transfer completes (idle reset semantics).
+    from services.preview.hls import _iter_upstream_bounded
+
+    class StalledResp:
+        closed = False
+
+        def iter_content(self, chunk_size=None):
+            time.sleep(10)  # simulate a blocked CDN read (never yields)
+            yield b""
+
+        def close(self):
+            self.closed = True
+
+    t0 = time.monotonic()
+    stalled = StalledResp()
+    try:
+        list(_iter_upstream_bounded(stalled, 0.5, "stalled.example"))
+        raise AssertionError("stall must raise RuntimeError, not complete")
+    except RuntimeError as exc:
+        assert "stalled" in str(exc)
+    assert time.monotonic() - t0 < 5, "deadline must be wall-clock, not the low-speed window"
+
+    class FlowingResp:
+        def iter_content(self, chunk_size=None):
+            for _i in range(3):
+                time.sleep(0.1)  # data keeps flowing — must NOT be cut off
+                yield b"x" * 1024
+
+        def close(self):
+            pass
+
+    got = b"".join(_iter_upstream_bounded(FlowingResp(), 1.0, "flowing.example"))
+    assert got == b"x" * (3 * 1024), "flowing transfer completes under the idle watchdog"
+
+
+def test_replay_snapshot_reresolves_stale_archive() -> None:
+    # Fix E: open_replay_hls_proxy self-heals a StalePreviewUrls (expired usher
+    # token -> 409) on the archive media playlist: re-resolve the DVR archive
+    # ONCE and retry the snapshot fetch transparently (frontend sees a 200).
+    import services.preview.hls as hls_mod
+
+    sess = _mk_session("r3")
+    sess.archive_url = "http://cdn.example.com/archive-master.m3u8"
+    sess.archive_entry_url = "http://cdn.example.com/archive-media.m3u8"
+    sess.resource_map[REPLAY_PLAYLIST_RESOURCE] = "replay-hls:playlist"
+    _manager._sessions["r3"] = sess
+
+    calls = {"fetch": 0}
+
+    def _fake_bytes(session, url, range_header=None, **_kw):
+        calls["fetch"] += 1
+        if calls["fetch"] == 1:
+            raise StalePreviewUrls(f"upstream HTTP 410 for {url[:80]}")
+        return ARCHIVE_GROWING, "application/vnd.apple.mpegurl", {}, 200
+
+    def _fake_ensure(session):
+        # mirrors _ensure_live_archive's success path on re-resolve
+        session.archive_url = "http://cdn.example.com/archive-master2.m3u8"
+        session.archive_entry_url = "http://cdn.example.com/archive-media2.m3u8"
+        session.resource_map[REPLAY_PLAYLIST_RESOURCE] = "replay-hls:playlist"
+        return True
+
+    real_bytes = hls_mod._http_get_bytes
+    real_ensure = _manager._ensure_live_archive
+    hls_mod._http_get_bytes = _fake_bytes
+    _manager._ensure_live_archive = _fake_ensure
+    try:
+        gen, ctype, _hdrs, status, _cleanup = open_replay_hls_proxy(
+            "r3", REPLAY_PLAYLIST_RESOURCE
+        )
+        body = b"".join(gen())
+        assert status == 200 and ctype == "application/vnd.apple.mpegurl"
+        assert b"#EXTINF:6.000" in body
+        assert body.rstrip().endswith(b"#EXT-X-ENDLIST")
+        assert calls["fetch"] == 2, "exactly one re-resolve + retry"
+        assert sess.archive_entry_url == "http://cdn.example.com/archive-media2.m3u8"
+    finally:
+        _manager._sessions.pop("r3", None)
+        hls_mod._http_get_bytes = real_bytes
+        _manager._ensure_live_archive = real_ensure
+
+
+def test_create_live_session_dedup_reuses_active_session() -> None:
+    # create_live_session dedup: an ACTIVE session for the same platform+master
+    # URL is reused; closed sessions and different platforms create fresh.
+    import services.preview.hls as hls_mod
+
+    MASTER = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nhttp://cdn.example.com/media.m3u8\n"
+
+    def _fake_fetch(session, upstream_url):
+        return MASTER, 200
+
+    def _fake_bytes(session, url, range_header=None, **_kw):
+        return MASTER, "application/vnd.apple.mpegurl", {}, 200
+
+    real_fetch = hls_mod._fetch_and_rewrite_playlist_streaming
+    real_bytes = hls_mod._http_get_bytes
+    hls_mod._fetch_and_rewrite_playlist_streaming = _fake_fetch
+    hls_mod._http_get_bytes = _fake_bytes
+    try:
+        s1 = preview.create_live_session(
+            "http://cdn.example.com/dedup-master.m3u8", {}, "Twitch"
+        )
+        s2 = preview.create_live_session(
+            "http://cdn.example.com/dedup-master.m3u8", {}, "Twitch"
+        )
+        assert s2 is s1, "active live session for the same platform+master URL is reused"
+        # Closed (DELETE called) sessions are NOT reused — fresh session created.
+        _manager.delete_session(s1.session_id)
+        s3 = preview.create_live_session(
+            "http://cdn.example.com/dedup-master.m3u8", {}, "Twitch"
+        )
+        assert s3 is not s1
+        # Different platform for the same URL is a different stream.
+        s4 = preview.create_live_session(
+            "http://cdn.example.com/dedup-master.m3u8", {}, "youtube"
+        )
+        assert s4 is not s3
+        _manager.delete_session(s3.session_id)
+        _manager.delete_session(s4.session_id)
+    finally:
+        hls_mod._fetch_and_rewrite_playlist_streaming = real_fetch
+        hls_mod._http_get_bytes = real_bytes
+
+
 if __name__ == "__main__":
     test_playlist_total_duration()
     test_strip_low_latency_param()
@@ -284,4 +413,7 @@ if __name__ == "__main__":
     test_replay_snapshot_endpoint()
     test_per_session_playlist_ttl()
     test_live_session_archive_fields()
+    test_iter_upstream_bounded_stall_aborts()
+    test_replay_snapshot_reresolves_stale_archive()
+    test_create_live_session_dedup_reuses_active_session()
     print("test_live_replay self-check OK")
