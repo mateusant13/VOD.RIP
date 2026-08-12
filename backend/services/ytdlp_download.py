@@ -53,6 +53,7 @@ from services.ytdlp_hls import (
 )
 from services.ytdlp_cache import _get_cache_dir, _prune_cache_dir
 from services.os_services import _NO_WINDOW
+from services.youtube_diag import is_age_gate_error
 
 logger = logging.getLogger(__name__)
 
@@ -882,6 +883,14 @@ def _build_ydl_opts(
         if cookie_path:
             opts["cookies"] = cookie_path
 
+    # Age-gated videos must reach the extractor regardless of age_limit: pin
+    # 100 so no config path (yt-dlp's CLI default is 0, which would silently
+    # SKIP age_limit>=18 videos after extraction) drops them. The gate itself
+    # needs logged-in cookies — wired above — yt-dlp 2026 has no anonymous
+    # client that passes it (verified against 2026.07.04, 2026-08-12).
+    if "youtube" in url.lower():
+        opts["age_limit"] = 100
+
     # Enable POT (Proof of Origin Token) as anti-bot measure for YouTube.
     # Mirror the preview ladder exactly (YOUTUBE_LEAST_GATED_PLAYER_CLIENTS):
     # android_vr is the least bot-gated client (no POT needed) and the one the
@@ -1009,6 +1018,11 @@ def sanitize_download_error(exc: BaseException) -> str:
     msg = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
     msg = re.sub(r"^ERROR:\s*", "", msg, flags=re.IGNORECASE).strip()
     low = msg.lower()
+    # Definitive age gate — retrying NEVER helps without a logged-in account
+    # (no anonymous player client passes it since 2024+; verified 2026-08-12
+    # on yt-dlp 2026.07.04). Say so instead of the transient bot-gate line.
+    if is_age_gate_error(exc):
+        return "This video is age-restricted — sign in to YouTube to download it."
     if "sign in to confirm" in low or "not a bot" in low:
         return (
             "Preview unavailable for this video — try again in a moment."
