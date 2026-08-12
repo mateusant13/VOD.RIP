@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2, Maximize2, Minimize2, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Scissors, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
+import { reportClipEvent } from '../twitchClip';
 import { useI18n } from '../i18n';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -16,13 +17,29 @@ import {
   LIVE_PANEL_MIN_H,
   LIVE_PANEL_MIN_W,
   LIVE_POPUP_ACTIVE_Z,
+  PREVIEW_VIDEO_ASPECT_DEFAULT,
   panelPosAfterResize,
   startPanelResizeDrag,
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
 import { platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
-import { filterLiveLevels, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from '../livePlayerLevels';
+import {
+  clampClipSeconds,
+  clipCooldownRemaining,
+  FAST_CLIP_COOLDOWN_MS,
+  FAST_CLIP_MAX_SEC,
+  FAST_CLIP_MIN_SEC,
+  FAST_CLIP_DEFAULT_SEC,
+  filterLiveLevels,
+  liveBroadcastPositionSec,
+  liveChatSlugFromUrl,
+  livePanelSizeFromAspect,
+  parsePlaylistTotalSec,
+  replaySeekTarget,
+  type LivePanelAspectClamp,
+} from '../livePlayerLevels';
+import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
 import { noteUserUnpause } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
@@ -80,6 +97,21 @@ interface LevelInfo {
 const POPUP_WIDTH = 480;
 const POPUP_HEIGHT = 320;
 const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while resizing
+/** Live chat docks right of the video by default (parent request) — the
+ *  popup opens wide enough that the VIDEO keeps the classic 480px slot. */
+const INITIAL_CHAT_OPEN = true;
+/** Fallback header height for the aspect-lock math when the header has not
+ *  been measured yet (drag starts before the first paint). */
+const POPUP_HEADER_EST = 52;
+
+/** Honest fast-clip capability payload — this build has NO server-side live
+ *  clip path, so `available` is always false and `reason`/`needed` document
+ *  the exact backend requirement (never a fake clip id). */
+interface LiveClipCapability {
+  available: boolean;
+  reason?: string;
+  needed?: string[];
+}
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
 /** Live session POST stall budget — after this the popup advances to the next
@@ -118,12 +150,36 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const firstFrameStartRef = useRef<number>(performance.now());
   const firstFrameLoggedRef = useRef(false);
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
-  const [position, setPosition] = useState(() => ({
-    x: window.innerWidth - POPUP_WIDTH - 24 - cascadeIndex * 28,
-    y: 80 + cascadeIndex * 28,
-  }));
+  // Header height + video aspect, captured at drag start / media load so the
+  // aspect-lock math uses real geometry (no re-layout mid-drag).
+  const headerRef = useRef<HTMLDivElement>(null);
+  const videoAspectRef = useRef<number>(PREVIEW_VIDEO_ASPECT_DEFAULT);
+  // Live chat docks right of the video — open by default so the feature is
+  // visible; the popup opens wide enough that the video keeps 480px.
+  const [chatOpen, setChatOpen] = useState(INITIAL_CHAT_OPEN);
+  const chatOpenRef = useRef(INITIAL_CHAT_OPEN);
+  useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
+  // Fast CLIP: seconds input (1..60) + 5s cooldown + transient notification.
+  const [clipSeconds, setClipSeconds] = useState(FAST_CLIP_DEFAULT_SEC);
+  const lastClipAtRef = useRef(0);
+  const [clipCooldownLeft, setClipCooldownLeft] = useState(0);
+  const clipCooldownTimerRef = useRef<number | null>(null);
+  const [clipNotice, setClipNotice] = useState<string | null>(null);
+  const clipNoticeTimerRef = useRef<number | null>(null);
+  const [position, setPosition] = useState(() => {
+    const w = Math.min(window.innerWidth - RESIZE_MARGIN, POPUP_WIDTH + (INITIAL_CHAT_OPEN ? LIVE_CHAT_PANEL_W : 0));
+    return {
+      x: Math.max(8, window.innerWidth - w - 24 - cascadeIndex * 28),
+      y: 80 + cascadeIndex * 28,
+    };
+  });
   const posRef = useRef(position);
-  const [size, setSize] = useState<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
+  const [size, setSize] = useState<PanelSize>({
+    // Chat open by default → the popup is wider; clamp so a small viewport
+    // never spawns an off-screen popup (resize re-clamps the same way).
+    w: Math.min(window.innerWidth - RESIZE_MARGIN, POPUP_WIDTH + (INITIAL_CHAT_OPEN ? LIVE_CHAT_PANEL_W : 0)),
+    h: POPUP_HEIGHT,
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Per-media retry state — the live pipeline is a single stage (session
@@ -219,6 +275,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (plat === 'kick') return `https://kick.com/${channelSlug}`;
     return `https://www.twitch.tv/${channelSlug}`;
   }, [activeEntry.platform, channelSlug]);
+
+  // Live chat room: prefer the playing entry's URL slug (fallback chain can
+  // advance to a different channel), else the archive-context slug.
+  const chatPlatform = (activeEntry.platform || '').toLowerCase();
+  const chatSlug = useMemo(
+    () => liveChatSlugFromUrl(activeEntry.url, chatPlatform) ?? channelSlug,
+    [activeEntry.url, chatPlatform, channelSlug],
+  );
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -490,6 +554,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
+    if (clipCooldownTimerRef.current != null) {
+      window.clearTimeout(clipCooldownTimerRef.current);
+      clipCooldownTimerRef.current = null;
+    }
+    if (clipNoticeTimerRef.current != null) {
+      window.clearTimeout(clipNoticeTimerRef.current);
+      clipNoticeTimerRef.current = null;
+    }
     abortRef.abort();
     destroyHls();
     const sid = sessionIdRef.current;
@@ -880,11 +952,83 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     fsGateRef.current?.toggle(el);
   }, []);
 
-  // --- Resize (same [data-panel-resize] pattern as the VOD preview panel) ---
+  // --- Live chat dock toggle ---
+  const toggleChat = useCallback(() => {
+    const next = !chatOpenRef.current;
+    chatOpenRef.current = next;
+    setChatOpen(next);
+    // Keep the VIDEO at its current width: growing/shrinking the popup by
+    // the chat panel width, never stealing pixels from the video area.
+    const s = sizeRef.current;
+    const maxW = Math.min(window.innerWidth - RESIZE_MARGIN, LIVE_PANEL_MAX_W);
+    const w = next
+      ? Math.min(maxW, s.w + LIVE_CHAT_PANEL_W)
+      : Math.max(LIVE_PANEL_MIN_W, s.w - LIVE_CHAT_PANEL_W);
+    if (w !== s.w) {
+      // Video width unchanged → aspect height unchanged (aspect-lock holds).
+      setSize({ w, h: s.h });
+    }
+  }, []);
+
+  // --- Fast CLIP (5s cooldown, seconds input, honest capability report) ---
+  const showClipNotice = useCallback((msg: string) => {
+    setClipNotice(msg);
+    if (clipNoticeTimerRef.current != null) window.clearTimeout(clipNoticeTimerRef.current);
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 3500);
+  }, []);
+
+  const handleFastClip = useCallback(async () => {
+    const now = Date.now();
+    if (clipCooldownRemaining(lastClipAtRef.current, now) > 0) return; // 2nd click within 5s ignored
+    lastClipAtRef.current = now;
+    const platform = (activeEntry.platform || '').toLowerCase();
+    const slug = liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '';
+    const durationSec = clampClipSeconds(clipSeconds);
+    reportClipEvent('live_clip_clicked', { platform, slug, durationSec });
+    // Countdown ticker on the button (250ms steps).
+    const tick = () => {
+      const left = clipCooldownRemaining(lastClipAtRef.current, Date.now(), FAST_CLIP_COOLDOWN_MS);
+      setClipCooldownLeft(left);
+      if (left > 0) {
+        clipCooldownTimerRef.current = window.setTimeout(tick, 250);
+      } else {
+        clipCooldownTimerRef.current = null;
+      }
+    };
+    if (clipCooldownTimerRef.current != null) window.clearTimeout(clipCooldownTimerRef.current);
+    tick();
+    try {
+      const res = await apiPost<LiveClipCapability>('/api/live/clip', {
+        platform,
+        slug,
+        duration_sec: durationSec,
+      });
+      // The backend never fabricates a clip: it reports what it CAN do. When
+      // a server-side path arrives, `available` flips and this shows success.
+      showClipNotice(res.available
+        ? t('Clip created')
+        : `${t('Clip unavailable')}: ${t(res.reason ?? '')}`);
+    } catch (err) {
+      showClipNotice(`${t('Clip unavailable')}: ${err instanceof Error ? err.message : ''}`);
+    }
+  }, [activeEntry.url, activeEntry.platform, channelSlug, clipSeconds, showClipNotice, t]);
+
+  // --- Resize: aspect-locked (video keeps the stream's aspect; chat docks
+  //     right of the video, so the video area = popup − chat panel width) ---
   const handleResize = useCallback((e: React.PointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
     const startSize = { ...sizeRef.current };
     const startPos = { ...posRef.current };
     const viewport = { w: window.innerWidth, h: window.innerHeight };
+    const headerH = headerRef.current?.offsetHeight ?? POPUP_HEADER_EST;
+    const chatW = chatOpenRef.current ? LIVE_CHAT_PANEL_W : 0;
+    const maxW = Math.min(viewport.w - RESIZE_MARGIN, LIVE_PANEL_MAX_W);
+    const maxH = Math.min(viewport.h - RESIZE_MARGIN, LIVE_PANEL_MAX_H);
+    const clamp: LivePanelAspectClamp = {
+      minW: LIVE_PANEL_MIN_W,
+      minH: LIVE_PANEL_MIN_H,
+      maxW,
+      maxH,
+    };
     const applyPos = (next: PanelSize) => {
       const p = panelPosAfterResize(edge, startPos, startSize, next, viewport);
       posRef.current = p;
@@ -892,12 +1036,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
     startPanelResizeDrag(e, edge, sizeRef, setSize, {
       panelEl: popupRef.current,
-      maxW: Math.min(viewport.w - RESIZE_MARGIN, LIVE_PANEL_MAX_W),
-      maxH: Math.min(viewport.h - RESIZE_MARGIN, LIVE_PANEL_MAX_H),
-      clampSize: (s) => ({
-        w: Math.min(viewport.w - RESIZE_MARGIN, Math.max(LIVE_PANEL_MIN_W, Math.min(s.w, LIVE_PANEL_MAX_W))),
-        h: Math.min(viewport.h - RESIZE_MARGIN, Math.max(LIVE_PANEL_MIN_H, Math.min(s.h, LIVE_PANEL_MAX_H))),
-      }),
+      maxW,
+      maxH,
+      clampSize: (s) =>
+        livePanelSizeFromAspect(edge, startSize, s, videoAspectRef.current, headerH, chatW, clamp),
       onResizeMove: (next) => applyPos(next),
       onResizeEnd: () => applyPos(sizeRef.current),
     });
@@ -1000,6 +1142,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           (eyebrow label + title + LIVE badge, labeled SEARCH ARCHIVE button,
           close X). */}
       <div
+        ref={headerRef}
         onMouseDown={handleMouseDown}
         className="flex items-start justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
         style={{ cursor: drag ? 'grabbing' : 'grab' }}
@@ -1056,6 +1199,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               {searchOpen ? t('CLOSE SEARCH') : t('SEARCH ARCHIVE')}
             </button>
           )}
+          {/* Live chat dock toggle — same chrome language as SEARCH ARCHIVE. */}
+          <button
+            type="button"
+            onClick={toggleChat}
+            aria-pressed={chatOpen}
+            className={`live-popup-chat flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+              chatOpen
+                ? 'bg-white text-black border-white'
+                : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+            }`}
+            title={chatOpen ? t('Close live chat') : t('Live chat')}
+          >
+            <MessageSquare size={10} className="shrink-0" />
+            {chatOpen ? t('Close live chat') : t('Live chat')}
+          </button>
           <button
             className="live-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
             onClick={handleClose}
@@ -1066,8 +1224,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         </div>
       </div>
 
-      {/* Video area — same as the mini preview player: click toggles
-          play/pause, loading + buffering show spinner overlays. */}
+      {/* Video area + docked live chat — the chat panel takes its own column
+          right of the video (same side-dock pattern as the archive preview's
+          chat panel), never over the video while fullscreen. */}
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
       <div
         style={{
           flex: 1,
@@ -1087,6 +1247,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             autoPlay
             playsInline
             muted
+            onLoadedMetadata={() => {
+              // Lock the resize math to the STREAM's aspect (not the panel's
+              // box) — the reason the old free-form resize letterboxed.
+              const v = videoRef.current;
+              if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+                videoAspectRef.current = v.videoWidth / v.videoHeight;
+              }
+            }}
             style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
         </div>
@@ -1228,6 +1396,51 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
+              {/* Fast CLIP — one click, no popups: seconds input (1..60) +
+                  5s cooldown; the backend reports its real capability
+                  (never fakes a clip). */}
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleFastClip}
+                  disabled={clipCooldownLeft > 0}
+                  title={clipCooldownLeft > 0
+                    ? t('Clip cooldown {n}s', { n: Math.ceil(clipCooldownLeft / 1000) })
+                    : t('Create a clip of the live stream')}
+                  className={`flex items-center gap-1 border-2 px-1.5 py-1 text-[9px] font-bold tracking-wider transition-colors ${
+                    clipCooldownLeft > 0
+                      ? 'border-zinc-700 bg-zinc-900/60 text-zinc-500 cursor-default'
+                      : 'border-red-800 bg-red-950/30 text-red-400 hover:border-red-500 hover:text-red-300'
+                  }`}
+                >
+                  <Scissors size={12} />
+                  {clipCooldownLeft > 0 ? `${Math.ceil(clipCooldownLeft / 1000)}s` : t('CLIP')}
+                </button>
+                <input
+                  type="number"
+                  min={FAST_CLIP_MIN_SEC}
+                  max={FAST_CLIP_MAX_SEC}
+                  step={1}
+                  value={clipSeconds}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
+                  }}
+                  className="w-11 shrink-0 bg-zinc-900 border-2 border-zinc-700 text-zinc-200 text-[9px] font-mono px-1 py-0.5 text-center"
+                  aria-label={t('Clip duration (seconds)')}
+                  title={t('Clip duration (seconds)')}
+                />
+              </div>
+
+              {clipNotice && (
+                <div
+                  role="status"
+                  className="absolute left-0 right-0 -top-9 mx-2 rounded border-2 border-zinc-700 bg-zinc-950/95 px-2 py-1 text-[9px] font-mono text-zinc-200 shadow-lg"
+                >
+                  {clipNotice}
+                </div>
+              )}
+
               <div className="ml-auto flex items-center gap-1.5">
                 <button
                   type="button"
@@ -1264,6 +1477,16 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             </div>
           </div>
         )}
+      </div>
+      {/* Docked live chat — same side-dock rule as the archive search panel:
+          hidden while this popup is fullscreen. */}
+      {chatOpen && !isFullscreen && chatSlug && (
+        <LiveChatPanel
+          platform={chatPlatform}
+          slug={chatSlug}
+          onClose={toggleChat}
+        />
+      )}
       </div>
     </div>,
     // Mount inside #explore-portal with the explore/local-file players so all

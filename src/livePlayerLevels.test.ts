@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { filterLiveLevels, liveArchiveContext, liveBroadcastPositionSec, parsePlaylistTotalSec, replaySeekTarget } from './livePlayerLevels';
+import {
+  clampClipSeconds,
+  clipCooldownRemaining,
+  FAST_CLIP_COOLDOWN_MS,
+  FAST_CLIP_DEFAULT_SEC,
+  FAST_CLIP_MAX_SEC,
+  FAST_CLIP_MIN_SEC,
+  filterLiveLevels,
+  liveArchiveContext,
+  liveBroadcastPositionSec,
+  liveChatSlugFromUrl,
+  livePanelSizeFromAspect,
+  parsePlaylistTotalSec,
+  replaySeekTarget,
+} from './livePlayerLevels';
 import type { SavedChannel } from './types';
 
 describe('filterLiveLevels', () => {
@@ -209,5 +223,96 @@ describe('liveArchiveContext', () => {
 
   it('degrades gracefully without a channel (popup still plays from entry.url)', () => {
     expect(liveArchiveContext(undefined, 'Twitch')).toEqual({ channelSlug: undefined, vodUrl: undefined });
+  });
+});
+
+describe('livePanelSizeFromAspect', () => {
+  const CLAMP = { minW: 320, minH: 200, maxW: 1280, maxH: 800 };
+  // 16:9 stream, 44px header, no chat docked.
+  const start = { w: 480, h: 44 + 480 / (16 / 9) }; // aspect-locked start
+  const aspect = 16 / 9;
+
+  it('growing the south edge grows the width too (video keeps 16:9)', () => {
+    const next = livePanelSizeFromAspect('s', start, { w: 480, h: start.h + 90 }, aspect, 44, 0, CLAMP);
+    // Δw = Δh * aspect → video area stays exactly 16:9 (h is rounded).
+    expect(next.w).toBe(480 + Math.round(90 * aspect));
+    expect(Math.abs((next.h - 44) - next.w / aspect)).toBeLessThan(1.01);
+  });
+
+  it('growing the east edge grows the height to match', () => {
+    const next = livePanelSizeFromAspect('e', start, { w: 640, h: start.h }, aspect, 44, 0, CLAMP);
+    expect(next.w).toBe(640);
+    expect(Math.abs((next.h - 44) - 640 / aspect)).toBeLessThan(1.01);
+  });
+
+  it('shrinking stays consistent (north edge)', () => {
+    // Drag north by 60: panel shrinks but the video area keeps the aspect.
+    const next = livePanelSizeFromAspect('n', start, { w: 480, h: start.h - 60 }, aspect, 44, 0, CLAMP);
+    expect(next.h).toBe(start.h - 60);
+    expect(Math.abs((next.h - 44) - (next.w / aspect))).toBeLessThan(1.01);
+  });
+
+  it('reserves the chat panel width from the video area', () => {
+    // chatW=260: video area = w - 260 must keep 16:9.
+    const next = livePanelSizeFromAspect('e', start, { w: 640, h: start.h }, aspect, 44, 260, CLAMP);
+    expect(Math.abs((next.h - 44) - (640 - 260) / aspect)).toBeLessThan(1.01);
+  });
+
+  it('clamps to maxH and re-derives the width (two-way lock)', () => {
+    // Portrait stream: at maxH the width (h−44)*aspect stays under maxW, so
+    // the HEIGHT clamp binds and the width is re-derived from it.
+    const tallAspect = 9 / 16;
+    const tallStart = { w: 320, h: 44 + 320 / tallAspect };
+    const next = livePanelSizeFromAspect('s', tallStart, { w: 320, h: 9999 }, tallAspect, 44, 0, CLAMP);
+    expect(next.h).toBe(CLAMP.maxH);
+    expect(Math.abs(next.w - (CLAMP.maxH - 44) * tallAspect)).toBeLessThan(1.01);
+  });
+
+  it('clamps to minW even when the pointer says smaller', () => {
+    const next = livePanelSizeFromAspect('e', start, { w: 100, h: start.h }, aspect, 44, 0, CLAMP);
+    expect(next.w).toBe(CLAMP.minW);
+    // Height re-derived from the min width keeps the aspect.
+    expect(Math.abs((next.h - 44) - CLAMP.minW / aspect)).toBeLessThan(1.01);
+  });
+});
+
+describe('fast clip helpers', () => {
+  it('enforces the 5s cooldown window', () => {
+    expect(clipCooldownRemaining(0, 1000)).toBe(0); // never clicked
+    expect(clipCooldownRemaining(1000, 2000)).toBe(FAST_CLIP_COOLDOWN_MS - 1000);
+    expect(clipCooldownRemaining(1000, 1000 + FAST_CLIP_COOLDOWN_MS)).toBe(0);
+    expect(clipCooldownRemaining(1000, 9999)).toBe(0); // past the window
+  });
+
+  it('clamps seconds to 1..60 with a default for garbage', () => {
+    expect(FAST_CLIP_MIN_SEC).toBe(1);
+    expect(FAST_CLIP_MAX_SEC).toBe(60);
+    expect(FAST_CLIP_DEFAULT_SEC).toBe(30);
+    expect(clampClipSeconds(0)).toBe(1);
+    expect(clampClipSeconds(-5)).toBe(1);
+    expect(clampClipSeconds(99)).toBe(60);
+    expect(clampClipSeconds(12.6)).toBe(13); // rounds
+    expect(clampClipSeconds(Number.NaN)).toBe(FAST_CLIP_DEFAULT_SEC);
+    expect(clampClipSeconds(Number.POSITIVE_INFINITY)).toBe(FAST_CLIP_DEFAULT_SEC);
+  });
+});
+
+describe('liveChatSlugFromUrl', () => {
+  it('parses the room slug per platform', () => {
+    expect(liveChatSlugFromUrl('https://www.twitch.tv/srdogg', 'twitch')).toBe('srdogg');
+    expect(liveChatSlugFromUrl('https://kick.com/srdoglol', 'kick')).toBe('srdoglol');
+    expect(liveChatSlugFromUrl('https://www.youtube.com/@srdogyt/live', 'youtube')).toBe('@srdogyt');
+    // Platform tag wins over a mismatched host — first path segment IS the slug.
+    expect(liveChatSlugFromUrl('https://example.com/whatever', 'twitch')).toBe('whatever');
+  });
+
+  it('falls back to the host when the platform tag is missing', () => {
+    expect(liveChatSlugFromUrl('https://kick.com/srdoglol', undefined)).toBe('srdoglol');
+    expect(liveChatSlugFromUrl('https://www.twitch.tv/srdogg', '')).toBe('srdogg');
+  });
+
+  it('returns undefined for garbage', () => {
+    expect(liveChatSlugFromUrl('not-a-url', 'twitch')).toBeUndefined();
+    expect(liveChatSlugFromUrl('', 'kick')).toBeUndefined();
   });
 });
