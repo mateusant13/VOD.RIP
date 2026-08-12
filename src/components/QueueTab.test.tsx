@@ -265,4 +265,39 @@ describe('QueueTab', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('renders retries (queued + attempts>0) as informational, not final failures', async () => {
+    vi.useFakeTimers();
+    try {
+      mockJobsFetch([
+        JOB({ id: 'tr-retry', status: 'queued', attempts: 2, max_attempts: 5, error: 'rate limited by Twitch' }),
+        JOB({ id: 'tr-fail', status: 'failed', error: 'hard failure' }),
+        JOB({ id: 'tr-plain', kind: 'chat', status: 'queued', progress: 0, title: '' }),
+      ]);
+      renderTab({ queue: [], history: [] });
+      openNotifications();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Retry gets its own label + amber accent; a queued job without attempts stays 'Queued'.
+      // (getAllByText: the chip and the row status share the 'Retrying…' label.)
+      const retryLabels = screen.getAllByText('Retrying…');
+      expect(retryLabels.length).toBe(2);
+      expect(retryLabels.some((el) => el.className.includes('text-amber-400'))).toBe(true);
+      expect(screen.getByText('Queued')).toBeTruthy();
+      // Error on a retry is muted amber; final failure stays red.
+      expect(screen.getByText('rate limited by Twitch').className).toContain('text-amber-300/70');
+      expect(screen.getByText('hard failure').className).toContain('text-red-400');
+      // Failed filter excludes retries; the retrying filter shows only retries.
+      fireEvent.click(screen.getByRole('button', { name: 'Failed' }));
+      expect(screen.queryByText('rate limited by Twitch')).toBeNull();
+      expect(screen.getByText('hard failure')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'Retrying…' }));
+      expect(screen.getByText('rate limited by Twitch')).toBeTruthy();
+      expect(screen.queryByText('hard failure')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
 });
