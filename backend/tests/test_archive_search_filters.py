@@ -1251,6 +1251,24 @@ def test_span_respects_filters_and_ordering():
     assert {"span-vid-4", "span-vid-5"} <= vids
 
 
+
+def test_exact_mode_finds_phrase_inside_longer_sentence():
+    _insert_video("exact-vid-1")
+    archive_db.insert_transcript(
+        "twitch", "exact-vid-1",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 2.0,
+          "text": "blabla vale da estranheza blabla"}],
+        lang="pt",
+    )
+    hits = archive_db.search("vale da estranheza", mode="exact", video_id="exact-vid-1")
+    assert any(
+        h["kind"] == "transcript" and "vale da estranheza" in h["text"].casefold()
+        for h in hits
+    ), "exact mode must match a consecutive phrase inside a longer sentence"
+    fuzzy = archive_db.search("vale da estranheza", mode="broad", video_id="exact-vid-1")
+    assert fuzzy
+
+
 def test_short_tokens_are_not_or_pattern_noise():
     # "da" must not make rows match a phrase query when the long tokens are
     # absent (previously every PT row containing "da" flooded the results).

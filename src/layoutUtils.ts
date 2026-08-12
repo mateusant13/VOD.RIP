@@ -85,9 +85,10 @@ export function clampPanelSizeForLayout(
   const maxW = layoutMaxPanelWidth(target, layout);
   const maxH = layoutMaxPanelHeight();
   const minW = target === 'live' ? LIVE_PANEL_MIN_W : PANEL_MIN.w;
+  const minH = target === 'urlAside' ? URL_ASIDE_TRIM_MIN_H : PANEL_MIN.h;
   return {
     w: Math.min(maxW, Math.max(minW, size.w)),
-    h: Math.min(maxH, Math.max(PANEL_MIN.h, size.h)),
+    h: Math.min(maxH, Math.max(minH, size.h)),
   };
 }
 export function layoutRowWidthBudget(layout: LayoutPanelBoundsInput): number {
@@ -408,7 +409,7 @@ export function clampAllLayoutPanels(layout: LayoutPanelBoundsInput): {
     if (layout.previewOpen) preview = { ...preview, w: live.w };
   }
   if (layout.urlPanelAside) {
-    urlAside = { ...urlAside, h: Math.min(maxH, Math.max(PANEL_MIN.h, urlAside.h)) };
+    urlAside = { ...urlAside, h: Math.min(maxH, Math.max(URL_ASIDE_TRIM_MIN_H, urlAside.h)) };
   }
   main = { ...main, h: Math.min(maxH, Math.max(PANEL_MIN.h, main.h)) };
 
@@ -935,7 +936,7 @@ export function sanitizeStoredPanelSize(value: unknown, fallback: PanelSize): Pa
 
 export const PREVIEW_KEY_SKIP_SEC = 5;
 export const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-export const PREVIEW_DEFAULT_VOLUME = 0.1;
+export const PREVIEW_DEFAULT_VOLUME = 0.3;
 export const PREVIEW_PANEL_DEFAULT_W = 640;
 export const PREVIEW_PANEL_MIN_W = 280;
 export const PREVIEW_PANEL_CHROME_H_EST = 120;
@@ -951,9 +952,9 @@ export const LIVE_PANEL_MIN_H = 200;
 export const LIVE_PANEL_MAX_W = 1280;
 export const LIVE_PANEL_MAX_H = 800;
 export const PREVIEW_VIDEO_ASPECT_DEFAULT = 16 / 9;
-export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 414 };
+export const URL_ASIDE_PANEL_DEFAULT: PanelSize = { w: 288, h: 480 };
 /** Min height when trim UI + action buttons must stay visible. */
-export const URL_ASIDE_TRIM_MIN_H = 414;
+export const URL_ASIDE_TRIM_MIN_H = 480;
 export const MAIN_PANEL_DEFAULT: PanelSize = { w: 448, h: 448 };
 /**
  * Minimum width for urlAside/main panels. 240 keeps every panel's text on one
@@ -1015,11 +1016,12 @@ export function aspectWidthForHeight(key: 'urlAside' | 'main', h: number): numbe
   if (key === 'main') {
     return Math.max(PANEL_MIN.w, Math.min(MAIN_PANEL_DEFAULT.w, Math.round(h)));
   }
+  const hh = Math.max(h, URL_ASIDE_TRIM_MIN_H);
   return Math.max(
     PANEL_MIN.w,
     Math.min(
       URL_ASIDE_PANEL_DEFAULT.w,
-      Math.round((h * URL_ASIDE_PANEL_DEFAULT.w) / URL_ASIDE_PANEL_DEFAULT.h),
+      Math.round((hh * URL_ASIDE_PANEL_DEFAULT.w) / URL_ASIDE_PANEL_DEFAULT.h),
     ),
   );
 }
@@ -1032,9 +1034,9 @@ export function aspectHeightForWidth(key: 'urlAside' | 'main', w: number): numbe
     return Math.max(PANEL_MIN.h, Math.min(MAIN_PANEL_DEFAULT.h, Math.round(w)));
   }
   return Math.max(
-    PANEL_MIN.h,
+    URL_ASIDE_TRIM_MIN_H,
     Math.min(
-      URL_ASIDE_PANEL_DEFAULT.h,
+      Math.max(URL_ASIDE_PANEL_DEFAULT.h, URL_ASIDE_TRIM_MIN_H),
       Math.round((w * URL_ASIDE_PANEL_DEFAULT.h) / URL_ASIDE_PANEL_DEFAULT.w),
     ),
   );
@@ -1049,7 +1051,8 @@ export function aspectHeightForWidth(key: 'urlAside' | 'main', w: number): numbe
  * pollution from the stored value alone).
  */
 export function ownedPanelHeightSeed(key: 'urlAside' | 'main', w: number, storedH: number): number {
-  return Math.max(PANEL_MIN.h, Math.min(storedH, aspectHeightForWidth(key, w)));
+  const floor = key === 'urlAside' ? URL_ASIDE_TRIM_MIN_H : PANEL_MIN.h;
+  return Math.max(floor, Math.min(Math.max(storedH, floor), aspectHeightForWidth(key, w)));
 }
 
 /** Two-way preview-row height target for a side panel: row-aligned with the

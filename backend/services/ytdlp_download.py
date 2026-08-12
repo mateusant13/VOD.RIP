@@ -947,7 +947,9 @@ def _build_ydl_opts(
         opts["ratelimit"] = throttle_kib * 1024
 
     if temp_folder:
-        opts["paths"] = {"home": temp_folder}
+        # temp only — never redirect the finished file away from output_path
+        # (old paths.home dumped clips into the local temp VOD.RIP folder).
+        opts["paths"] = {"temp": temp_folder}
 
     resolved_ffmpeg = ffmpeg_path or _find_ffmpeg()
     if resolved_ffmpeg:
@@ -1249,6 +1251,12 @@ def download_video_sync(
                 expected_duration = info.get("duration")
     except (OSError, json.JSONDecodeError, ValueError, TypeError, RuntimeError):
         expected_duration = None
+    except (IndexError, KeyError, AttributeError) as exc:
+        # yt-dlp extractors can raise these unwrapped (e.g. TwitchClipsIE's
+        # formats[-1] on a clip page with no media variants) — the probe is
+        # best-effort metadata; never let it crash the download.
+        logger.debug("Duration probe extractor error: %s", exc)
+        expected_duration = None
     except yt_dlp.utils.DownloadError as exc:
         logger.debug("YouTube duration probe failed: %s", exc)
         expected_duration = None
@@ -1262,7 +1270,34 @@ def download_video_sync(
     # downloads (full clip uses 0..duration; audio-only extracts MP3).
     if platform == "Twitch" and is_clip_url(full_url):
         clip_start = trim[0] if trim else 0.0
-        clip_end = trim[1] if trim else (expected_duration if expected_duration else 0.0)
+        if trim:
+            clip_end = trim[1]
+        elif expected_duration:
+            clip_end = expected_duration
+        else:
+            # Probe failed (broken/empty clip extractor) — resolve the clip's
+            # duration via our own GQL path so the yt-dlp-free download below
+            # still runs instead of falling into yt-dlp's clip extractor.
+            from services.twitch_gql_service import get_clip_info_sync
+
+            try:
+                clip_end = float(get_clip_info_sync(full_url).get("duration") or 0)
+            except Exception as exc:
+                # Both the yt-dlp probe AND our GQL fetch failed — never fall
+                # into yt-dlp's clip extractor (empty formats -> IndexError).
+                raise RuntimeError(
+                    "Twitch clip metadata unavailable — the clip may be removed "
+                    "or still processing"
+                ) from exc
+            if clip_end <= 0:
+                # The clip exists on GQL but was never transcoded (duration 0,
+                # empty videoQualities) — there is no media to download.
+                # Raising keeps direct clip URLs out of yt-dlp's clip
+                # extractor, which IndexErrors on the empty formats list.
+                raise RuntimeError(
+                    "Twitch clip has no media — it was never transcoded. "
+                    "Re-create the clip and try again."
+                )
         if clip_end > clip_start:
             _download_twitch_clip_sync(
                 full_url, output_path, quality, clip_start, clip_end,

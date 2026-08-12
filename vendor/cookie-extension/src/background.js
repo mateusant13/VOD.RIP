@@ -213,16 +213,83 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (window.__vodripRangeReady) return;
           window.__vodripRangeReady = true;
           const pc = (s) => {
-            // "3:20" (m:ss) or "1:02:05" (h:mm:ss) -> seconds.
-            const h = /^(\d+):(\d{1,2}):(\d{2})$/.exec(s);
+            const value = String(s || '').trim();
+            const h = /^(\d+):(\d{1,2}):(\d{2})$/.exec(value);
             if (h) return +h[1] * 3600 + +h[2] * 60 + +h[3];
-            const m = /^(\d+):(\d{2})$/.exec(s);
-            return m ? +m[1] * 60 + +m[2] : null;
+            const m = /^(\d+):(\d{2})$/.exec(value);
+            if (m) return +m[1] * 60 + +m[2];
+            if (/^\d{1,3}$/.test(value)) return +value;
+            return null;
+          };
+          const urlOffset = () => {
+            try {
+              const n = Number(new URLSearchParams(location.search).get('offsetSeconds'));
+              return Number.isFinite(n) && n > 0 ? n : null;
+            } catch {
+              return null;
+            }
+          };
+          const historyOffsets = () => {
+            try {
+              const raw = JSON.stringify(history.state || {});
+              const s = raw.match(/"startOffset"\s*:\s*(-?\d+(?:\.\d+)?)/);
+              const e = raw.match(/"endOffset"\s*:\s*(-?\d+(?:\.\d+)?)/);
+              if (!s || !e) return null;
+              return { startOffset: +s[1], endOffset: +e[1] };
+            } catch {
+              return null;
+            }
+          };
+          const writeClipOffsets = (s, e) => {
+            const patch = (obj) => {
+              if (!obj || typeof obj !== 'object') return false;
+              let hit = false;
+              if (obj.clipOffsets && typeof obj.clipOffsets === 'object') {
+                obj.clipOffsets.startOffset = s;
+                obj.clipOffsets.endOffset = e;
+                hit = true;
+              }
+              for (const val of Object.values(obj)) {
+                if (val && typeof val === 'object') hit = patch(val) || hit;
+              }
+              return hit;
+            };
+            try {
+              const st = history.state ? JSON.parse(JSON.stringify(history.state)) : {};
+              if (!patch(st)) st.clipOffsets = { startOffset: s, endOffset: e };
+              history.replaceState(st, '', location.href);
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          const toRelative = (start, end, native) => {
+            const requestedDur = end - start;
+            const uiEnd = (native && native.b > 0 && native.b <= 93) ? native.b : 90;
+            const anchor = urlOffset() || end;
+            const origin = Math.max(0, anchor - uiEnd);
+            let relEnd = end - origin;
+            let relStart = start - origin;
+            if (relEnd > uiEnd) {
+              relStart -= (relEnd - uiEnd);
+              relEnd = uiEnd;
+            }
+            if (relStart < 0) relStart = 0;
+            const minLen = Math.min(5, uiEnd);
+            if (relEnd - relStart < minLen) relStart = Math.max(0, relEnd - minLen);
+            return {
+              relStart: Math.round(relStart),
+              relEnd: Math.round(relEnd),
+              origin,
+              uiEnd,
+              requestedDur,
+              anchor,
+            };
           };
           window.addEventListener('message', (ev) => {
             const d = ev.data;
             if (!d || d.source !== 'vodrip-range-req') return;
-            const { nonce, start, end, dur } = d;
+            const { nonce, start, end } = d;
             const send = (p) => {
               try { window.postMessage(Object.assign({ source: 'vodrip-range-res', nonce }, p), '*'); } catch { /* ignore */ }
             };
@@ -241,13 +308,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               n = n.return;
             }
             if (!drag) { send({ ok: false, reason: 'controle de trecho não acessível' }); return; }
-            // The editor's fiber callbacks use absolute VOD seconds. The
-            // visible 90-second preview is a viewport; its aria-valuetext
-            // reports the same absolute coordinates.
-            // Confirmation therefore compares the absolute valuetext and
-            // enforces Twitch's native 5..90s window rule.
-            const TOL = 3;
-            const LEN_TOL = 2;
+            const TOL = 2;
+            const LEN_TOL = 1;
             const readWindow = () => {
               const vt = (slider.getAttribute('aria-valuetext') || '').trim();
               const parts = vt.split(/\s*to\s*/i);
@@ -256,44 +318,101 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               const b = pc(parts[1]);
               return a != null && b != null ? { a, b, vt } : null;
             };
-            const attempt = (s, e) =>
-              new Promise((resolve) => {
-                try {
-                  drag.onLeftDrag({ startOffset: s, endOffset: e });
-                  drag.onRightDrag({ startOffset: s, endOffset: e });
-                } catch (err) {
-                  resolve({ ok: false, reason: 'drag falhou: ' + (err && err.message || err) });
-                  return;
-                }
-                const deadline = Date.now() + 8000;
-                const tick = () => {
-                  const w = readWindow();
-                  if (
-                    w &&
-                    Math.abs(w.a - s) <= TOL && Math.abs(w.b - e) <= TOL &&
-                    Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
-                    w.b - w.a >= 5 && w.b - w.a <= 90
-                  ) {
-                    resolve({
-                      ok: true,
-                      valuetext: w.vt,
-                      debug: {
-                        left: String(drag.onLeftDrag).slice(0, 500),
-                        right: String(drag.onRightDrag).slice(0, 500),
-                      },
-                    });
-                    return;
-                  }
-                  if (Date.now() > deadline) {
-                    resolve({ ok: false, reason: 'editor ajustou para "' + (w ? w.vt : '(sem leitura)') + '"' });
-                    return;
-                  }
-                  setTimeout(tick, 250);
-                };
-                setTimeout(tick, 0);
+            if (!(end > start)) {
+              const cur = readWindow();
+              send({
+                ok: true,
+                ping: true,
+                valuetext: cur ? cur.vt : (slider.getAttribute('aria-valuetext') || ''),
+                history: historyOffsets(),
               });
+              return;
+            }
+            const native = readWindow();
+            const mapped = toRelative(start, end, native);
+            const relStart = mapped.relStart;
+            const relEnd = mapped.relEnd;
+            const matches = (w, s, e) => w &&
+              Math.abs(w.a - s) <= TOL && Math.abs(w.b - e) <= TOL &&
+              Math.abs((w.b - w.a) - (e - s)) <= LEN_TOL &&
+              w.b - w.a >= 5 && w.b - w.a <= 60;
+            const attempt = async (s, e) => {
+              try {
+                drag.onLeftDrag({ startOffset: s, endOffset: e });
+              } catch (err) {
+                return { ok: false, reason: 'arraste inicial falhou: ' + (err && err.message || err) };
+              }
+              const leftDeadline = Date.now() + 8000;
+              let left = null;
+              while (Date.now() <= leftDeadline) {
+                left = readWindow();
+                if (left && Math.abs(left.a - s) <= TOL) break;
+                await new Promise((r) => setTimeout(r, 250));
+              }
+              if (!left || Math.abs(left.a - s) > TOL) {
+                return { ok: false, reason: 'editor não confirmou início "' + (left ? left.vt : '(sem leitura)') + '"' };
+              }
+              try {
+                drag.onRightDrag({ startOffset: s, endOffset: e });
+              } catch (err) {
+                return { ok: false, reason: 'arraste final falhou: ' + (err && err.message || err) };
+              }
+              const deadline = Date.now() + 8000;
+              let w = null;
+              while (Date.now() <= deadline) {
+                w = readWindow();
+                if (matches(w, s, e)) {
+                  writeClipOffsets(s, e);
+                  const vid = document.querySelector('video');
+                  if (vid) {
+                    try { vid.currentTime = s; } catch { /* ignore */ }
+                    vid.dataset.vodripClampStart = String(s);
+                    vid.dataset.vodripClampEnd = String(e);
+                    if (vid.dataset.vodripRangeClamp !== '1') {
+                      vid.dataset.vodripRangeClamp = '1';
+                      const clamp = () => {
+                        const a = Number(vid.dataset.vodripClampStart);
+                        const b = Number(vid.dataset.vodripClampEnd);
+                        if (!Number.isFinite(a) || !Number.isFinite(b) || !(b > a)) return;
+                        if (vid.currentTime > b + 0.05) {
+                          try { vid.currentTime = b; } catch { /* ignore */ }
+                          try { if (!vid.paused) vid.pause(); } catch { /* ignore */ }
+                        } else if (vid.currentTime < a - 0.2) {
+                          try { vid.currentTime = a; } catch { /* ignore */ }
+                        }
+                      };
+                      vid.addEventListener('timeupdate', clamp);
+                      vid.addEventListener('seeking', clamp);
+                    }
+                  }
+                  const histDeadline = Date.now() + 2500;
+                  while (Date.now() <= histDeadline) {
+                    const ho = historyOffsets();
+                    if (ho && Math.abs(ho.startOffset - s) <= TOL && Math.abs(ho.endOffset - e) <= TOL) break;
+                    writeClipOffsets(s, e);
+                    await new Promise((r) => setTimeout(r, 200));
+                  }
+                  return {
+                    ok: true,
+                    valuetext: w.vt,
+                    debug: {
+                      relStart: s,
+                      relEnd: e,
+                      requestedDur: mapped.requestedDur,
+                      rawEnd: mapped.uiEnd,
+                      origin: mapped.origin,
+                      anchor: mapped.anchor,
+                      history: historyOffsets(),
+                      videoDuration: vid && Number.isFinite(vid.duration) ? vid.duration : null,
+                    },
+                  };
+                }
+                await new Promise((r) => setTimeout(r, 250));
+              }
+              return { ok: false, reason: 'editor ajustou para "' + (w ? w.vt : '(sem leitura)') + '"' };
+            };
             (async () => {
-              let res = await attempt(start, end);
+              const res = await attempt(relStart, relEnd);
               send(res);
             })();
           });

@@ -371,10 +371,10 @@ def _transcribe_candidates(
     still on disk, not covered by captions, no queued/running transcribe
     job, latest job not failed-within-1h, and a live worker — without a
     worker the jobs would sit queued forever for users who never opted in."""
-    if platform and "youtube" not in [
-        p.strip().lower() for p in platform.split(",") if p.strip()
-    ]:
-        return []
+    if platform:
+        plats = {p.strip().lower() for p in platform.split(",") if p.strip()}
+        if plats and not plats.intersection({"youtube", "twitch", "kick"}):
+            return []
     now = time.monotonic()
     with _transcribe_lock:
         if now - _last_transcribe_kick < _TRANSCRIBE_MIN_GAP_S:
@@ -383,7 +383,7 @@ def _transcribe_candidates(
         return []
     sql = (
         "SELECT v.platform, v.video_id, v.channel, v.title, v.duration_sec, v.archive_path "
-        "FROM videos v WHERE v.platform='youtube' AND v.status='ready' "
+        "FROM videos v WHERE v.platform IN ('youtube','twitch','kick') AND v.status='ready' "
         "AND v.archive_path IS NOT NULL AND v.archive_path != '' "
         "AND NOT EXISTS (SELECT 1 FROM transcripts t "
         "  WHERE t.platform=v.platform AND t.video_id=v.video_id)"
@@ -416,13 +416,13 @@ def _transcribe_candidates(
             covered = {
                 r["video_id"] for r in archive_db.query(
                     "SELECT DISTINCT video_id FROM transcripts "
-                    "WHERE platform='youtube' AND video_id IN ("
+                    "WHERE platform IN ('youtube','twitch','kick') AND video_id IN ("
                     + ",".join("?" * len(vids)) + ")",
                     vids,
                 )
             }
         for r in archive_db.query(
-            "SELECT * FROM archive_jobs WHERE platform='youtube' "
+            "SELECT * FROM archive_jobs WHERE platform IN ('youtube','twitch','kick') "
             "AND video_id IN (" + ",".join("?" * len(vids)) + ") AND kind='transcribe'",
             vids,
         ):
@@ -555,6 +555,12 @@ async def archive_videos_upsert(video: dict):
         archive_db.upsert_video(video)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=f"missing required field: {exc}") from exc
+    if (video.get("status") or "") == "ready":
+        archive_db.maybe_enqueue_transcribe(
+            str(video.get("platform") or ""),
+            str(video.get("video_id") or ""),
+            archive_path=video.get("archive_path"),
+        )
     return {"ok": True}
 
 
@@ -598,10 +604,18 @@ async def archive_search(
     limit: int = Query(20, ge=1, le=5000),
     hint: bool = Query(True),
     semantic: bool = Query(False),
+    mode: str = Query("exact"),
 ):
     # Semantic (embedding) search is expensive per candidate — its cap stays
     # tight. Literal-word queries may page through every match ("infinite
     # results"): the frontend asks for a large limit and renders incrementally.
+    if not isinstance(mode, str):
+        mode = "exact"
+    mode = (mode or "exact").strip().lower()
+    if mode not in ("exact", "broad", "semantic"):
+        mode = "exact"
+    if mode == "semantic":
+        semantic = True
     if semantic:
         limit = min(limit, 100)
     # platform/kind accept comma-separated lists ("twitch,kick").
@@ -611,9 +625,10 @@ async def archive_search(
     for label, value in (("date_from", date_from), ("date_to", date_to)):
         if value and not _is_iso_date(value):
             raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
+    _KIND_OK = set(archive_db.KINDS) | {"video"}
     bad_kinds = [
         k for k in (k.strip().lower() for k in (kind or "").split(","))
-        if k and k not in archive_db.KINDS
+        if k and k not in _KIND_OK
     ]
     if bad_kinds:
         raise HTTPException(status_code=400, detail=f"kind must be one of {archive_db.KINDS}")
@@ -674,6 +689,7 @@ async def archive_search(
         lang=lang or None,
         limit=limit,
         semantic=semantic,
+        mode=mode,
         _channel_hint_out=hint_box if hint else None,
         username=username or None,
     )
@@ -939,3 +955,35 @@ async def archive_jobs_enqueue(job: dict):
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail=f"job {job_id} already exists") from None
     return {"ok": True, "id": job_id}
+
+
+from pydantic import BaseModel
+
+
+class ChatExportRequest(BaseModel):
+    platform: str
+    video_id: str
+    start_sec: float | None = None
+    end_sec: float | None = None
+    full: bool = True
+
+
+@router.post("/api/archive/chat/export")
+async def export_chat(body: ChatExportRequest):
+    from services.download_sidecars import write_chat_sidecar
+    from utils import download_kind_dir
+    from deps import settings_mgr
+
+    _require_platform(body.platform)
+    opts = settings_mgr.get()
+    dest_dir = download_kind_dir(opts, "chat")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{body.platform}-{body.video_id}.chat.txt"
+    start = None if body.full else body.start_sec
+    end = None if body.full else body.end_sec
+    path = write_chat_sidecar(
+        str(dest), body.platform, body.video_id, start_sec=start, end_sec=end,
+    )
+    if not path:
+        raise HTTPException(status_code=404, detail="No chat history for this video")
+    return {"path": path}

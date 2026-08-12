@@ -23,6 +23,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Captions,
+  Download,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -33,7 +34,7 @@ import {
   Search,
   X,
 } from 'lucide-react';
-import { apiGet } from '../hooks/useApiClient';
+import { apiGet, apiPost } from '../hooks/useApiClient';
 import { t, useI18n } from '../i18n';
 import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
@@ -867,6 +868,23 @@ export function PreviewChatPanel({
               ),
             )}
             <div className="flex-1" />
+            {tab === 'chat' && payload?.has_chat && platform && videoId && (
+              <button
+                type="button"
+                title={t('Download chat history')}
+                onClick={() => {
+                  void apiPost('/api/archive/chat/export', { platform, video_id: videoId, full: true })
+                    .then((r) => {
+                      const saved = (r as { path?: string } | null)?.path;
+                      if (saved) window.alert(t('Saved chat to {path}', { path: saved }));
+                    })
+                    .catch(() => window.alert(t('No chat history for this video')));
+                }}
+                className="text-zinc-500 hover:text-white p-1"
+              >
+                <Download size={12} />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setOpen(false)}

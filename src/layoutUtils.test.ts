@@ -16,6 +16,7 @@ import {
   LIVE_PANEL_MIN_W,
   PANEL_MIN,
   URL_ASIDE_PANEL_DEFAULT,
+  URL_ASIDE_TRIM_MIN_H,
   MAIN_PANEL_DEFAULT,
   EXPLORE_POPUP_Z,
   SEARCH_POPUP_Z,
@@ -289,7 +290,7 @@ describe('layoutUtils resize budget', () => {
     expect(main.h).toBe(PANEL_MIN.h);
     const urlAside = clampPanelSizeForLayout('urlAside', { w: 0, h: 0 }, layout);
     expect(urlAside.w).toBe(PANEL_MIN.w);
-    expect(urlAside.h).toBe(PANEL_MIN.h);
+    expect(urlAside.h).toBe(URL_ASIDE_TRIM_MIN_H);
   });
 
   it('grows urlAside back toward its aspect target when the squeeze releases', () => {

@@ -10,7 +10,7 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
-import { type TwitchClipRecord } from './twitchClip';
+import { twitchClipDownloadRequest, type TwitchClipRecord } from './twitchClip';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
@@ -63,9 +63,11 @@ import {
   reloadWindowHlsAtPosition,
   shieldPreviewBuffering,
   createPreviewSessionWithRetry,
+  pinHlsToLowestLevel,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable, notePreviewGesture } from './previewTiming';
+import { pauseOtherPreviews, registerPreviewPlayback } from './previewPlaybackBus';
 import DownloadConfirmDialog from './components/DownloadConfirmDialog';
 import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
@@ -387,7 +389,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   channel_twitch_enabled: true,
   channel_youtube_enabled: true,
   channel_content_filter: 'vods',
-  start_with_windows: false,
+  start_with_windows: true,
+  download_layout: 'typed',
+  download_transcript_sidecar: true,
+  download_chat_before_sec: 120,
+  download_chat_after_sec: 30,
 };
 
 export default function App() {
@@ -614,6 +620,10 @@ export default function App() {
   const [needleGlance, setNeedleGlance] = useState<NeedleGlanceState | null>(null);
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
   const [downloadFilename, setDownloadFilename] = useState('');
+  const [dlIncludeTranscript, setDlIncludeTranscript] = useState(true);
+  const [dlIncludeChat, setDlIncludeChat] = useState(false);
+  const [dlChatBefore, setDlChatBefore] = useState(120);
+  const [dlChatAfter, setDlChatAfter] = useState(30);
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
@@ -1268,6 +1278,7 @@ export default function App() {
     }
     const video = previewVideoRef.current;
     if (!video || !previewVideoReady) return;
+    pinHlsToLowestLevel(previewHlsRef.current);
     previewSeekTargetRef.current = target;
     previewTimingRef.current?.markSeekStart(target);
     const pageUrl = previewLoadedUrlRef.current ?? url.trim();
@@ -1960,6 +1971,7 @@ export default function App() {
       performInitialSeek();
       if (!previewInitialPlayDoneRef.current && video.paused) {
         previewInitialPlayDoneRef.current = true;
+        pauseOtherPreviews();
         void video.play().catch(() => {
           video.muted = true;
           setPreviewMuted(true);
@@ -3911,7 +3923,7 @@ export default function App() {
   const finishDownloadRemoval = useCallback((id: string, ok: boolean) => {
     pendingRemovalIdsRef.current.delete(id);
     if (!ok) void refreshDownloads();
-  }, [refreshDownloads]);
+  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar]);
 
   const requestDownloadRemoval = useCallback((id: string) => {
     hideDownloadOptimistic(id);
@@ -4017,6 +4029,12 @@ export default function App() {
         thumbnail: videoInfo.thumbnail ?? undefined,
         duration: videoInfo.duration ?? undefined,
       };
+      const sidecarBody = {
+        include_transcript: dlIncludeTranscript,
+        include_chat: dlIncludeChat,
+        chat_before_sec: dlChatBefore,
+        chat_after_sec: dlChatAfter,
+      };
       const body = clipDownload
         ? {
             url: url.trim(),
@@ -4024,12 +4042,14 @@ export default function App() {
             output_file: clipName,
             ...trimBody,
             ...metaBody,
+            ...sidecarBody,
           }
         : {
             url: url.trim(),
             quality: quality || undefined,
             ...trimBody,
             ...metaBody,
+            ...sidecarBody,
             ...(downloadAsAudio && !clipDownload ? { audio_only: true } : {}),
           };
       await apiPost<{ download_id: string; status: string }>(endpoint, body);
@@ -4038,7 +4058,7 @@ export default function App() {
       setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
       setError(err instanceof Error ? err.message : t('Download failed'));
     }
-  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio]);
+  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio, dlIncludeTranscript, dlIncludeChat, dlChatBefore, dlChatAfter]);
 
   const downloadConfirmCopy = useMemo(() => {
     const clipDownload = isClipUrl(url.trim());
@@ -4074,7 +4094,11 @@ export default function App() {
   useEffect(() => {
     if (!downloadConfirmOpen) return;
     setDownloadFilename('');
-  }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename]);
+    setDlIncludeTranscript(settings?.download_transcript_sidecar !== false);
+    setDlIncludeChat(false);
+    setDlChatBefore(Math.min(600, Math.max(0, settings?.download_chat_before_sec ?? 120)));
+    setDlChatAfter(Math.min(600, Math.max(0, settings?.download_chat_after_sec ?? 30)));
+  }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename, settings?.download_transcript_sidecar, settings?.download_chat_before_sec, settings?.download_chat_after_sec]);
 
   // ── Cancel download ──
 
@@ -4214,6 +4238,10 @@ export default function App() {
 
   /** Download a Twitch clip from the clip-history row (QueueTab). */
   const handleDownloadClip = useCallback(async (clip: TwitchClipRecord) => {
+    if (!(await ensureDownloadFolder())) {
+      setError('Choose a download folder to continue.');
+      return;
+    }
     const pendingId = `pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     setQueueDownloads((prev) => [...prev, {
       download_id: pendingId,
@@ -4230,19 +4258,19 @@ export default function App() {
       thumbnail: null,
     }]);
     try {
-      await apiPost<{ download_id: string }>('/api/download/clip', {
-        url: clip.url,
-        quality: 'source',
-        title: clip.title ?? undefined,
-        channel: clip.channel,
-        duration: clip.duration_sec ?? undefined,
-      });
+      await apiPost<{ download_id: string }>(
+        '/api/download/clip',
+        {
+          ...twitchClipDownloadRequest(clip),
+          include_transcript: settings?.download_transcript_sidecar !== false,
+        },
+      );
     } catch (err: unknown) {
       setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
       setError(err instanceof Error ? err.message : t('Failed to start download'));
     }
     void refreshDownloads();
-  }, [refreshDownloads]);
+  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar]);
 
   const toggleChannelVodSelection = useCallback((vodUrl: string) => {
     setSelectedChannelVodUrls((prev) => {
@@ -5840,6 +5868,17 @@ export default function App() {
     return () => rail.removeEventListener('wheel', onWheel);
   }, [previewOpen, vodDurationSec, previewTrimView, bumpPreviewFsControls]);
 
+  useEffect(() => {
+    const pause = () => {
+      const video = previewVideoRef.current;
+      if (video && !video.paused) {
+        video.pause();
+        setPreviewPlaying(false);
+      }
+    };
+    return registerPreviewPlayback(pause);
+  }, []);
+
   const showClipOpenNotice = useCallback((kind: 'error' | 'ok', text: string) => {
     if (clipOpenNoticeTimerRef.current) window.clearTimeout(clipOpenNoticeTimerRef.current);
     setClipOpenNotice({ kind, text });
@@ -5847,7 +5886,7 @@ export default function App() {
   }, []);
 
   /**
-   * VOD: open the Twitch clip mini-preview at the playhead (90s window, user
+   * VOD: open the Twitch clip mini-preview at the playhead (120s window, user
    * trims there and creates the clip). Live: open the editor directly — no
    * VOD timeline to select from.
    */
@@ -5866,6 +5905,8 @@ export default function App() {
       showClipOpenNotice('error', t('Not a Twitch VOD URL'));
       return;
     }
+    try { previewVideoRef.current?.pause(); } catch { /* ignore */ }
+    pauseOtherPreviews();
     setTwitchClipPopup({
       url: url.trim(),
       broadcasterLogin: login,
@@ -7195,7 +7236,21 @@ export default function App() {
           anchorRange={twitchClipPopup.anchorRange}
           vodTitle={videoInfo?.title ?? ''}
           zIndex={EXPLORE_POPUP_Z + (popupZOrder[TWITCH_CLIP_POPUP_ID] ?? 0)}
-          initialVolume={previewVolumeRef.current}
+          initialVolume={PREVIEW_DEFAULT_VOLUME}
+          reuseSession={twitchClipPopup.reuseSession}
+          onDownloadSelection={(sel) => {
+            void handleDownloadClip({
+              id: `range-${sel.vodId}-${Math.floor(sel.end)}`,
+              created_at: new Date().toISOString(),
+              channel: sel.channel,
+              vod_id: sel.vodId,
+              offset_sec: Math.floor(sel.end),
+              duration_sec: Math.max(1, Math.round(sel.end - sel.start)),
+              title: sel.title,
+              url: sel.url,
+              status: 'created',
+            });
+          }}
           onClose={() => { setTwitchClipPopup(null); dropPopupZ(TWITCH_CLIP_POPUP_ID); }}
         />
       )}
@@ -7235,6 +7290,30 @@ export default function App() {
         }
         filename={downloadFilename}
         onFilenameChange={setDownloadFilename}
+        extras={(
+          <div className="flex flex-col gap-2 border-2 border-zinc-800 p-2">
+            <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
+              <input type="checkbox" checked={dlIncludeTranscript} onChange={(e) => setDlIncludeTranscript(e.target.checked)} />
+              {t('Download transcript (.txt)')}
+            </label>
+            <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
+              <input type="checkbox" checked={dlIncludeChat} onChange={(e) => setDlIncludeChat(e.target.checked)} />
+              {t('Download chat history')}
+            </label>
+            {dlIncludeChat && (
+              <div className="flex flex-col gap-1.5 pl-1">
+                <label className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest">
+                  {t('Chat before')} ({Math.round(dlChatBefore / 60)}m)
+                  <input type="range" min={0} max={600} step={10} value={dlChatBefore} onChange={(e) => setDlChatBefore(Number(e.target.value))} className="w-full" />
+                </label>
+                <label className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest">
+                  {t('Chat after')} ({Math.round(dlChatAfter / 60)}m)
+                  <input type="range" min={0} max={600} step={10} value={dlChatAfter} onChange={(e) => setDlChatAfter(Number(e.target.value))} className="w-full" />
+                </label>
+              </div>
+            )}
+          </div>
+        )}
         onConfirm={() => void executeStartDownload()}
         onCancel={() => setDownloadConfirmOpen(false)}
       />

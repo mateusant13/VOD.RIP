@@ -6,6 +6,10 @@ class VideoInfo(BaseModel):
     id: str
     title: Optional[str] = None
     duration: Optional[float] = None
+    include_transcript: Optional[bool] = None
+    include_chat: bool = False
+    chat_before_sec: Optional[float] = None
+    chat_after_sec: Optional[float] = None
     duration_string: Optional[str] = None
     uploader: Optional[str] = None
     thumbnail: Optional[str] = None
@@ -33,6 +37,10 @@ class DownloadRequest(BaseModel):
     channel: Optional[str] = None
     thumbnail: Optional[str] = None
     duration: Optional[float] = None
+    include_transcript: Optional[bool] = None
+    include_chat: bool = False
+    chat_before_sec: Optional[float] = None
+    chat_after_sec: Optional[float] = None
 
 
 class DownloadState(BaseModel):
@@ -104,7 +112,7 @@ class AppSettings(BaseModel):
     # Autostart launches hidden-to-tray with VODRIP_BACKGROUND=1 so the
     # background machinery (transcribe, index, chat capture) keeps working
     # at a quieter pace; the tray icon reopens the window.
-    start_with_windows: bool = False
+    start_with_windows: bool = True
     cookie_bridge_token: str = ""
     cookie_bridge_enabled: bool = True
     # One-click cookie-extension install (Settings toggle): when ON, the
@@ -137,6 +145,14 @@ class AppSettings(BaseModel):
     # also picks asr_language from the same family, once, never overriding
     # an explicit user choice).
     ui_language: str = ""
+    # Download folder layout: 'flat' (everything in download_folder) or
+    # 'typed' (VODs / Cuts / Clips / Twitch clips / Live / Audio / Chat).
+    download_layout: str = "typed"
+    # Write a .txt transcript sidecar next to finished downloads when the
+    # archive already has a transcript (on by default).
+    download_transcript_sidecar: bool = True
+    download_chat_before_sec: int = 120
+    download_chat_after_sec: int = 30
 
 
 class SettingsUpdate(BaseModel):
@@ -181,6 +197,10 @@ class SettingsUpdate(BaseModel):
     asr_language: Optional[str] = None
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None
+    download_layout: Optional[str] = None
+    download_transcript_sidecar: Optional[bool] = None
+    download_chat_before_sec: Optional[int] = None
+    download_chat_after_sec: Optional[int] = None
 
 
 class OpenFolderRequest(BaseModel):

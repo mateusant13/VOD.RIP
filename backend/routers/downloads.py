@@ -25,6 +25,8 @@ from utils import (
     build_output_path,
     download_func_for_entry,
     download_dir,
+    download_kind_dir,
+    classify_download_kind,
     fetch_queue_meta,
     remove_download_history,
     require_hls_crop,
@@ -67,6 +69,25 @@ async def _resolve_queue_meta(req: DownloadRequest, platform: str) -> dict:
         return {}
 
 MAX_DOWNLOAD_BYTES = int(os.environ.get("VODRIP_MAX_DOWNLOAD_BYTES", "1073741824"))
+
+
+def _sidecar_kwargs(req: DownloadRequest, opts) -> dict:
+    include_t = req.include_transcript
+    if include_t is None:
+        include_t = bool(getattr(opts, "download_transcript_sidecar", True))
+    before = req.chat_before_sec
+    if before is None:
+        before = float(getattr(opts, "download_chat_before_sec", 120) or 120)
+    after = req.chat_after_sec
+    if after is None:
+        after = float(getattr(opts, "download_chat_after_sec", 30) or 30)
+    return {
+        "include_transcript": bool(include_t),
+        "include_chat": bool(req.include_chat),
+        "chat_before_sec": max(0.0, min(600.0, float(before))),
+        "chat_after_sec": max(0.0, min(600.0, float(after))),
+    }
+
 
 
 # Ponytail: validate URL is a supported Kick/Twitch URL before starting download
@@ -207,6 +228,7 @@ async def download_video(req: DownloadRequest):
         duration=meta.get("duration"),
         duration_string=meta.get("duration_string"),
         estimated_bytes=est,
+        **_sidecar_kwargs(req, opts),
     )
     _log_download_api_ok(download_id, platform, req.url, kind="video")
     return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
@@ -255,6 +277,7 @@ async def download_clip(req: DownloadRequest):
         duration=meta.get("duration"),
         duration_string=meta.get("duration_string"),
         estimated_bytes=est,
+        **_sidecar_kwargs(req, opts),
     )
     _log_download_api_ok(download_id, platform, req.url, kind="clip")
     return {"download_id": download_id, "status": "started", "cap_warning": cap_warning or None}
@@ -275,7 +298,7 @@ def _build_live_output_path(channel: str, title: str, platform: str) -> str:
     for DVR recordings when the settings schema supports it.
     """
     settings = settings_mgr.get()
-    out_dir = Path(settings.download_folder or str(Path.home() / "Downloads"))
+    out_dir = download_kind_dir(settings, "live")
     safe_ch = re.sub(r"[^\w.-]", "_", (channel or "live").strip())
     safe_title = re.sub(r"[^\w.-]", "_", (title or "stream").strip())
     out_dir.mkdir(parents=True, exist_ok=True)

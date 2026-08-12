@@ -94,6 +94,54 @@ def download_dir(opts) -> Path:
     return Path.home() / "Downloads"
 
 
+DOWNLOAD_KIND_FOLDERS = {
+    "vods": "VODs",
+    "cuts": "Cuts",
+    "clips": "Clips",
+    "twitch_clips": "Twitch clips",
+    "live": "Live",
+    "audio": "Audio",
+    "chat": "Chat",
+}
+
+
+def download_kind_dir(opts, kind: str) -> Path:
+    """Root or typed subfolder for a download kind."""
+    base = download_dir(opts)
+    layout = (getattr(opts, "download_layout", None) or "typed").strip().lower()
+    if layout == "flat":
+        return base
+    folder = DOWNLOAD_KIND_FOLDERS.get(kind, "Downloads")
+    return base / folder
+
+
+def classify_download_kind(
+    url: str,
+    download_type: str,
+    crop_start: Optional[float],
+    crop_end: Optional[float],
+    duration: Optional[float],
+) -> str:
+    dtype = (download_type or "video").lower()
+    if dtype == "audio":
+        return "audio"
+    if dtype == "live":
+        return "live"
+    low = (url or "").lower()
+    twitch_clip = "clips.twitch.tv/" in low or "/clip/" in low
+    if dtype == "clip" and ("twitch" in low or twitch_clip):
+        return "twitch_clips"
+    if dtype == "clip" or twitch_clip:
+        return "clips"
+    if crop_start is not None and crop_end is not None:
+        span = float(crop_end) - float(crop_start)
+        if duration and duration > 0 and span < float(duration) * 0.95:
+            return "cuts"
+        if not duration and span > 0:
+            return "cuts"
+    return "vods"
+
+
 # ==================== URL / slug helpers ====================
 
 
@@ -155,7 +203,14 @@ def resolve_output_file_override(req, opts, default_path: str) -> str:
         return default_path
     if os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":"):
         return raw
-    base = download_dir(opts)
+    kind = classify_download_kind(
+        getattr(req, "url", ""),
+        "clip" if "clip" in (getattr(req, "url", "") or "").lower() else "video",
+        getattr(req, "crop_start", None),
+        getattr(req, "crop_end", None),
+        None,
+    )
+    base = download_kind_dir(opts, kind)
     p = Path(raw)
     stem = sanitize_filename_component(p.stem, fallback="clip")
     ext = p.suffix.lower()
@@ -168,7 +223,14 @@ def build_output_path(req, opts, meta: dict) -> str:
     raw = (req.output_file or "").strip()
     if raw and (os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":")):
         return raw
-    base = download_dir(opts)
+    kind = classify_download_kind(
+        getattr(req, "url", ""),
+        "audio" if getattr(req, "audio_only", False) else "video",
+        getattr(req, "crop_start", None),
+        getattr(req, "crop_end", None),
+        meta.get("duration"),
+    )
+    base = download_kind_dir(opts, kind)
     title = meta.get("title") or detect_platform(req.url).lower()
     platform = detect_platform(req.url).lower()
     v_id = vod_id_from_url(req.url)
@@ -192,7 +254,14 @@ def build_output_path(req, opts, meta: dict) -> str:
 
 
 def build_clip_output_path(req, opts, meta: dict) -> str:
-    base = download_dir(opts)
+    kind = classify_download_kind(
+        getattr(req, "url", ""),
+        "clip",
+        getattr(req, "crop_start", None),
+        getattr(req, "crop_end", None),
+        meta.get("duration"),
+    )
+    base = download_kind_dir(opts, kind)
     clipper = (
         meta.get("channel")
         or meta.get("uploader")

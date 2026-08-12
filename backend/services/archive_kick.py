@@ -269,6 +269,9 @@ def _ingest_one(
         archive_db.upsert_video({**base, "status": "ready",
                                  "archive_path": reg["archive_path"],
                                  "content_sha256": reg["content_sha256"]})
+        archive_db.maybe_enqueue_transcribe(
+            PLATFORM, v.id, archive_path=reg["archive_path"],
+        )
         archive_db.update_job(job_id, status="done")
         logger.info("archive_kick: %s DOWNLOADED (%ds): %s", v.id, int(spent), v.title)
         _enforce_retention()

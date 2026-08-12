@@ -2,11 +2,15 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
+  TWITCH_CLIP_WINDOW_SEC,
   clampClipSelection,
+  clipRailDragTarget,
   initialClipSelection,
   openTwitchClipEditorInBrowser,
   twitchClipDurationError,
+  twitchClipDownloadRequest,
   twitchClipWindow,
+  vodRangeFromEditorWindow,
 } from './twitchClip';
 
 describe('twitchClipDurationError', () => {
@@ -31,74 +35,83 @@ describe('twitchClipDurationError', () => {
 });
 
 describe('twitchClipWindow', () => {
-  it('centres a 90s (1:30) window on the playhead', () => {
-    expect(twitchClipWindow(3600, 7200)).toEqual({ start: 3555, end: 3645 });
+  it('is 120s (60s each side of the click)', () => {
+    expect(TWITCH_CLIP_WINDOW_SEC).toBe(120);
+    expect(twitchClipWindow(3600, 7200)).toEqual({ start: 3540, end: 3660 });
   });
 
-  it('clamps the start at the VOD start edge', () => {
-    expect(twitchClipWindow(10, 7200)).toEqual({ start: 0, end: 90 });
+  it('fills from the right when the click is near VOD start', () => {
+    expect(twitchClipWindow(10, 7200)).toEqual({ start: 0, end: 120 });
   });
 
-  it('clamps the end at the VOD end edge', () => {
-    expect(twitchClipWindow(7190, 7200)).toEqual({ start: 7145, end: 7200 });
+  it('fills from the left when the click is near VOD end', () => {
+    expect(twitchClipWindow(7190, 7200)).toEqual({ start: 7080, end: 7200 });
   });
 
-  it('shortens the window for VODs under 90s', () => {
-    expect(twitchClipWindow(30, 100)).toEqual({ start: 0, end: 90 });
-    expect(twitchClipWindow(50, 60)).toEqual({ start: 5, end: 60 });
+  it('shortens the window for VODs under 120s', () => {
+    expect(twitchClipWindow(30, 100)).toEqual({ start: 0, end: 100 });
+    expect(twitchClipWindow(50, 60)).toEqual({ start: 0, end: 60 });
   });
 
   it('keeps the upper edge unclamped when the duration is unknown', () => {
-    expect(twitchClipWindow(100, 0)).toEqual({ start: 55, end: 145 });
+    expect(twitchClipWindow(100, 0)).toEqual({ start: 40, end: 160 });
   });
 
-  it('centres on the anchor midpoint when a valid anchor is given', () => {
-    // anchor 300..360 → midpoint 330 → 90s window 285..375
-    expect(twitchClipWindow(0, 7200, { start: 300, end: 360 })).toEqual({ start: 285, end: 375 });
-  });
-
-  it('ignores an invalid anchor and centres on the playhead', () => {
-    expect(twitchClipWindow(3600, 7200, { start: 5000, end: 4000 })).toEqual({ start: 3555, end: 3645 });
-    expect(twitchClipWindow(3600, 7200, { start: 0, end: 0 })).toEqual({ start: 3555, end: 3645 });
-  });
-
-  it('clamps an anchored window at the VOD start edge', () => {
-    expect(twitchClipWindow(3600, 7200, { start: 10, end: 50 })).toEqual({ start: 0, end: 90 });
+  it('ignores an anchor and stays on the click', () => {
+    expect(twitchClipWindow(3600, 7200, { start: 300, end: 360 })).toEqual({ start: 3540, end: 3660 });
+    expect(twitchClipWindow(3600, 7200, { start: 10, end: 50 })).toEqual({ start: 3540, end: 3660 });
   });
 });
 
 describe('initialClipSelection', () => {
-  it('defaults to the last 60s of the window without an anchor', () => {
-    expect(initialClipSelection({ start: 0, end: 120 })).toEqual({ start: 60, end: 120 });
+  it('defaults to the first 60s of the window without an anchor', () => {
+    expect(initialClipSelection({ start: 0, end: 120 })).toEqual({ start: 0, end: 60 });
   });
 
   it('defaults to the whole window when shorter than 60s', () => {
     expect(initialClipSelection({ start: 0, end: 30 })).toEqual({ start: 0, end: 30 });
   });
 
-  it('returns the anchor as-is when it fits the window', () => {
+  it('starts at the click and extends forward up to 60s', () => {
+    expect(initialClipSelection({ start: 3540, end: 3660 }, undefined, 3600))
+      .toEqual({ start: 3600, end: 3660 });
+  });
+
+  it('grows backward when there is not enough room after the click', () => {
+    expect(initialClipSelection({ start: 3540, end: 3660 }, undefined, 3658))
+      .toEqual({ start: 3655, end: 3660 });
+  });
+
+  it('returns a short in-window anchor as-is', () => {
     expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 360 }))
       .toEqual({ start: 300, end: 360 });
   });
 
-  it('keeps the END anchored when the anchor is longer than 60s', () => {
-    expect(initialClipSelection({ start: 0, end: 7200 }, { start: 1000, end: 1100 }))
-      .toEqual({ start: 1040, end: 1100 });
+  it('ignores a full-VOD / over-long anchor and uses the playhead', () => {
+    expect(initialClipSelection({ start: 3540, end: 3660 }, { start: 0, end: 3600 }, 3600))
+      .toEqual({ start: 3600, end: 3660 });
+    expect(initialClipSelection({ start: 0, end: 7200 }, { start: 1000, end: 1100 }, 3600))
+      .toEqual({ start: 3600, end: 3660 });
   });
 
-  it('grows an under-5s anchor to the minimum from its start', () => {
-    expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 302 }))
-      .toEqual({ start: 300, end: 305 });
-    // at the window end the start is pulled back instead
-    expect(initialClipSelection({ start: 270, end: 390 }, { start: 388, end: 389 }))
-      .toEqual({ start: 385, end: 390 });
+  it('clamps a short anchor that sits before the window', () => {
+    expect(initialClipSelection({ start: 270, end: 390 }, { start: 100, end: 160 }))
+      .toEqual({ start: 270, end: 275 });
+  });
+});
+
+describe('clipRailDragTarget', () => {
+  it('picks the playhead when the pointer is near it', () => {
+    expect(clipRailDragTarget(50, 100, 50, 40, 80)).toBe('playhead');
+    expect(clipRailDragTarget(50 + 12, 100, 50, 40, 80)).toBe('playhead');
   });
 
-  it('clamps an anchor that extends past the window edge', () => {
-    expect(initialClipSelection({ start: 270, end: 390 }, { start: 300, end: 500 }))
-      .toEqual({ start: 330, end: 390 });
-    expect(initialClipSelection({ start: 270, end: 390 }, { start: 100, end: 300 }))
-      .toEqual({ start: 270, end: 300 });
+  it('picks the range inside the slider away from the playhead', () => {
+    expect(clipRailDragTarget(70, 100, 50, 40, 80)).toBe('range');
+  });
+
+  it('seeks on empty rail', () => {
+    expect(clipRailDragTarget(10, 100, 50, 40, 80)).toBe('seek');
   });
 });
 
@@ -153,6 +166,58 @@ describe('clampClipSelection', () => {
   });
 });
 
+
+describe('vodRangeFromEditorWindow', () => {
+  it('maps a relative 0-90 editor window back through the VOD end anchor', () => {
+    expect(vodRangeFromEditorWindow({ start: 871, end: 890 }, { start: 71, end: 90 }))
+      .toEqual({ start: 871, end: 890 });
+    expect(vodRangeFromEditorWindow({ start: 1054, end: 1066 }, { start: 78, end: 90 }))
+      .toEqual({ start: 1054, end: 1066 });
+  });
+  it('keeps an already-absolute editor window', () => {
+    expect(vodRangeFromEditorWindow({ start: 871, end: 890 }, { start: 871, end: 890 }))
+      .toEqual({ start: 871, end: 890 });
+  });
+  it('does not treat a short early-VOD range as relative', () => {
+    expect(vodRangeFromEditorWindow({ start: 10, end: 29 }, { start: 10, end: 29 }))
+      .toEqual({ start: 10, end: 29 });
+  });
+});
+
+describe('twitchClipDownloadRequest', () => {
+  const base = {
+    id: '1',
+    created_at: '2026-08-12T00:00:00Z',
+    channel: 'relentless',
+    title: 'clip',
+    url: 'https://clips.twitch.tv/example',
+    status: 'ready',
+    vod_id: '2844207886',
+    offset_sec: 890,
+    duration_sec: 19,
+  };
+  it('crops the original VOD using offset_sec as the clip END', () => {
+    expect(twitchClipDownloadRequest(base)).toEqual({
+      url: 'https://www.twitch.tv/videos/2844207886',
+      quality: 'source',
+      title: 'clip',
+      channel: 'relentless',
+      duration: 19,
+      crop_start: 871,
+      crop_end: 890,
+    });
+  });
+  it('falls back to the clip URL when the VOD range is missing', () => {
+    expect(twitchClipDownloadRequest({ ...base, vod_id: null, offset_sec: null })).toEqual({
+      url: 'https://clips.twitch.tv/example',
+      quality: 'source',
+      title: 'clip',
+      channel: 'relentless',
+      duration: 19,
+    });
+  });
+});
+
 describe('openTwitchClipEditorInBrowser', () => {
   it('opens the legacy editor URL with vodrip_* params (offset = clip END)', () => {
     const opened: string[] = [];
@@ -170,7 +235,7 @@ describe('openTwitchClipEditorInBrowser', () => {
       expect(u.searchParams.get('broadcasterLogin')).toBe('titiltei');
       expect(u.searchParams.get('offsetSeconds')).toBe('520'); // clip END, not start
       expect(u.searchParams.get('vodrip_clip')).toBe('1');
-      expect(u.searchParams.get('vodrip_start')).toBe('458');
+      expect(u.searchParams.get('vodrip_start')).toBe('460'); // 62s range clamped to 60s, END kept
       expect(u.searchParams.get('vodrip_end')).toBe('520');
       expect(u.searchParams.get('vodrip_dur')).toBe('3600'); // VOD length for the editor-edge nudge
       expect(u.searchParams.get('vodrip_title')).toBe('jantando o guiven parte 1');

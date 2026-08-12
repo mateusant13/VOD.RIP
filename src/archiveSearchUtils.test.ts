@@ -257,15 +257,16 @@ describe('isValidDateParam', () => {
 
 describe('kindLabel', () => {
   it('maps the four archive kinds to uppercase labels', () => {
-    expect(ARCHIVE_KINDS).toEqual(['vod', 'clip', 'short', 'live']);
+    expect(ARCHIVE_KINDS).toEqual(['vod', 'clip', 'short', 'live', 'video']);
     expect(kindLabel('vod')).toBe('VOD');
     expect(kindLabel('clip')).toBe('CLIP');
     expect(kindLabel('short')).toBe('SHORT');
     expect(kindLabel('live')).toBe('LIVE');
+    expect(kindLabel('video')).toBe('VIDEO');
   });
 
   it('offers only VOD/clip/short as filter chips — LIVE is not filterable', () => {
-    expect(ARCHIVE_FILTER_KINDS).toEqual(['vod', 'clip', 'short']);
+    expect(ARCHIVE_FILTER_KINDS).toEqual(['vod', 'clip', 'short', 'video']);
     expect(ARCHIVE_FILTER_KINDS).not.toContain('live');
   });
 

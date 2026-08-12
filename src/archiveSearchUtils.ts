@@ -55,14 +55,14 @@ export interface ArchiveVideoRow {
 }
 
 export const ARCHIVE_PLATFORMS = ['youtube', 'twitch', 'kick'] as const;
-export const ARCHIVE_KINDS = ['vod', 'clip', 'short', 'live'] as const;
+export const ARCHIVE_KINDS = ['vod', 'clip', 'short', 'live', 'video'] as const;
 export type ArchiveKind = (typeof ARCHIVE_KINDS)[number];
 
 /**
  * Kind values offered as search filter chips — LIVE is hidden so search is
  * VOD-only (kindLabel('live') still renders badges on stored hits).
  */
-export const ARCHIVE_FILTER_KINDS = ARCHIVE_KINDS.filter((k) => k !== 'live');
+export const ARCHIVE_FILTER_KINDS = ['vod', 'clip', 'short', 'video'] as const;
 
 /**
  * Content sources offered as multi-select filter chips. 'both' is NOT an
@@ -87,6 +87,7 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
   clip: 'CLIP',
   short: 'SHORT',
   live: 'LIVE',
+  video: 'VIDEO',
 };
 
 /** i18n keys for the source-filter labels. The query PARAM values stay
@@ -200,6 +201,8 @@ export interface ArchiveSearchFilterParams {
   hint?: boolean;
   /** Concept search: embedding pass over transcript segments (semantic=1). */
   semantic?: boolean;
+  /** exact (default consecutive phrase) | broad (fuzzy) | semantic. */
+  mode?: 'exact' | 'broad' | 'semantic';
 }
 
 /** Query-string for GET /api/archive/search — omits unset filters. */
@@ -227,6 +230,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (username) params.set('username', username);
   if (p.hint === false) params.set('hint', '0');
   if (p.semantic) params.set('semantic', '1');
+  if (p.mode && p.mode !== 'exact') params.set('mode', p.mode);
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }

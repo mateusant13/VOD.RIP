@@ -110,3 +110,12 @@ if __name__ == "__main__":
             fn()
             print(f"PASS {name}")
     print("all download-opts self-checks passed")
+
+
+def test_temp_folder_is_not_output_home():
+    opts = _build_ydl_opts(
+        "https://www.twitch.tv/videos/123", "D:/Videos/clip.mp4", temp_folder="C:/Temp/VOD.RIP",
+    )
+    paths = opts.get("paths") or {}
+    assert paths.get("temp") == "C:/Temp/VOD.RIP"
+    assert paths.get("home") != "C:/Temp/VOD.RIP"

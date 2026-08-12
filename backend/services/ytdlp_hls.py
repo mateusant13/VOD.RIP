@@ -1557,7 +1557,11 @@ def _parse_m3u8(
     for line in lines:
         line = line.strip()
         if line.startswith("#EXTINF:"):
-            current_duration = float(line.split(":")[1].split(",")[0])
+            try:
+                current_duration = float(line.split(":")[1].split(",")[0])
+            except (IndexError, ValueError):
+                # Malformed EXTINF — skip this segment instead of crashing.
+                current_duration = None
         elif line and not line.startswith("#") and current_duration is not None:
             segments.append(
                 {
@@ -2056,6 +2060,8 @@ def _concat_and_trim(
     video_encoder: Optional[str] = None,
 ) -> None:
     """Concatenate HLS segments and trim (stream copy or H.264 re-encode)."""
+    if not files:
+        raise RuntimeError("No HLS segments to concatenate")
     tmp_dir = os.path.dirname(files[0])
     concat_txt = os.path.join(tmp_dir, "concat.txt")
     tmp_out = os.path.join(tmp_dir, f"clip_{uuid.uuid4().hex}.mp4")

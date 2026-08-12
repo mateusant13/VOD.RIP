@@ -49,8 +49,11 @@ import {
   type PreviewLevelOption,
   isValidPreviewUrl,
   createPreviewSessionWithRetry,
+  pinHlsToLowestLevel,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable } from './previewTiming';
+import { PREVIEW_DEFAULT_VOLUME } from './layoutUtils';
+import { pauseOtherPreviews, registerPreviewPlayback } from './previewPlaybackBus';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import {
   EXPLORE_PANEL_DEFAULT_W,
@@ -86,7 +89,6 @@ function explorePlatformKey(raw: string): PlatformStyleKey {
 
 const PREVIEW_KEY_SKIP_SEC = 5;
 const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
-const PREVIEW_DEFAULT_VOLUME = 0.1;
 
 export interface ExplorePopupVod {
   url: string;
@@ -274,6 +276,16 @@ export default function ChannelExplorePopup({
   /** Pinned row height (px); 0 = pre-measure (row auto-sized for one frame). */
   const playerColHRef = useRef(0);
   const volumeRef = useRef(PREVIEW_DEFAULT_VOLUME);
+  useEffect(() => {
+    const pause = () => {
+      const video = videoRef.current;
+      if (video && !video.paused) {
+        video.pause();
+        setPlaying(false);
+      }
+    };
+    return registerPreviewPlayback(pause);
+  }, []);
   const seekDebounceRef = useRef<number | null>(null);
   const playbackKindRef = useRef<'hls' | 'progressive'>('progressive');
   const pendingSeekSecRef = useRef<number | null>(null);
@@ -754,6 +766,7 @@ export default function ChannelExplorePopup({
     }
     const video = videoRef.current;
     if (!video || !ready) return;
+    pinHlsToLowestLevel(hlsRef.current);
     const windowHlsSeek = trimTimelineRef.current
       || isYoutubeWindowHlsPreview(
         platform === 'youtube',
@@ -1156,6 +1169,7 @@ export default function ChannelExplorePopup({
       setVolume(PREVIEW_DEFAULT_VOLUME);
       if (!initialPlayDoneRef.current && video.paused) {
         initialPlayDoneRef.current = true;
+        pauseOtherPreviews();
         void playPreviewWithAudio(video, setMuted, PREVIEW_DEFAULT_VOLUME).then(() => {
           setPlaying(!video.paused);
           if (video.readyState >= 3 && !video.paused && video.currentTime > 0.02) {
@@ -1534,7 +1548,7 @@ export default function ChannelExplorePopup({
   }, []);
 
   /**
-   * Open the Twitch clip mini-preview at the current playhead (90s window,
+   * Open the Twitch clip mini-preview at the current playhead (120s window,
    * user trims there and creates the clip). Fixes the old direct-open call,
    * which sent offsetSec without durationSec — the backend 422'd every VOD.
    */
@@ -1549,6 +1563,8 @@ export default function ChannelExplorePopup({
       showClipNotice('error', t('Not a Twitch VOD URL'));
       return;
     }
+    try { videoRef.current?.pause(); } catch { /* ignore */ }
+    pauseOtherPreviews();
     setClipPopup({
       url: vod.url,
       broadcasterLogin: login,
@@ -1975,7 +1991,7 @@ export default function ChannelExplorePopup({
           // ponytail: 50+ new ranks while this popup is open could overtake
           // it; upgrade path is a ladder rank of its own via App.
           zIndex={zIndex + 50}
-          initialVolume={volumeRef.current}
+          initialVolume={PREVIEW_DEFAULT_VOLUME}
           onClose={() => setClipPopup(null)}
         />
       )}

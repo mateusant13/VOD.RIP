@@ -34,10 +34,10 @@ def channel_playlist_url(channel_ref: str, kind: PlaylistKind = "videos") -> str
 
 def _content_kind_for_playlist(kind: PlaylistKind) -> str:
     if kind == "shorts":
-        return "clip"
+        return "short"
     if kind == "streams":
         return "stream"
-    return "vod"
+    return "video"
 
 
 def _created_at_from_entry(e: dict) -> Optional[str]:
@@ -176,7 +176,7 @@ def _classify_youtube_video(
     """
     # 1. URL pattern (strongest signal for shorts)
     if "/shorts/" in url:
-        return "clip"
+        return "short"
     
     # 2. Live status (strongest signal for streams)
     if live_status in ("live", "is_live", "is_upcoming", "was_live", "post_live"):
@@ -185,16 +185,16 @@ def _classify_youtube_video(
     # 3. Duration-based classification
     if duration is not None:
         if duration < 60:
-            return "clip"  # Under 60s = short
+            return "short"  # Under 60s = short
         # NOTE: > 1 hour is NOT a stream signal — long VODs (2-8h recorded streams)
         # stay "vod". live_status is the correct stream indicator.
     
     # 4. Playlist source as final fallback
     if playlist_source == "shorts":
-        return "clip"
+        return "short"
     if playlist_source == "streams":
         return "stream"
-    return "vod"
+    return "video"
 
 
 def _enrich_with_rss_dates(rows: list[dict[str, Any]], channel_id: Optional[str]) -> None:
@@ -333,9 +333,9 @@ def list_channel_videos_sync(
     # Filter by requested playlist type. Drop member-only entries at source.
     _memb_only = lambda v: v.get("availability") == "subscriber_only"  # noqa: E731
     if playlist == "videos":
-        filtered = [v for v in all_videos.values() if v["content_kind"] == "vod" and not _memb_only(v)]
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "video" and not _memb_only(v)]
     elif playlist == "shorts":
-        filtered = [v for v in all_videos.values() if v["content_kind"] == "clip" and not _memb_only(v)]
+        filtered = [v for v in all_videos.values() if v["content_kind"] == "short" and not _memb_only(v)]
     elif playlist == "streams":
         filtered = [v for v in all_videos.values() if v["content_kind"] == "stream" and not _memb_only(v)]
     else:

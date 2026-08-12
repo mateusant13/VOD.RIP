@@ -80,12 +80,55 @@ class ClipEventBody(BaseModel):
 CLIP_EVENTS_FILE = "clip-events.log"
 CLIP_EVENTS_KEEP = 2000  # lines retained after the size cap kicks in
 CLIP_EVENTS_MAX_BYTES = 1_000_000
+# DOM/network spam from the page-trace extension stays on disk only.
+_CLIP_ECHO_QUIET = frozenset(
+    {
+        "trace_dom",
+        "trace_network_start",
+        "trace_network_end",
+        "trace_focus",
+        "trace_gql_op",
+        "gql_op",
+    }
+)
+
+
+def _format_clip_event(src: str, event: str, data: Dict[str, Any]) -> str:
+    """One-line terminal summary for a clip-flow event."""
+    bits: list[str] = []
+    for key, value in (data or {}).items():
+        if key in ("census", "traceId", "tabId"):
+            continue
+        if value is None or value == "":
+            continue
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(value)
+        if len(text) > 220:
+            text = text[:220] + "…"
+        bits.append(f"{key}={text}")
+    extra = " ".join(bits[:16])
+    return f"CLIP {src} {event}" + (f" {extra}" if extra else "")
+
+
+def _echo_clip_event(src: str, event: str, data: Dict[str, Any]) -> None:
+    """Print clip-flow events on the API terminal so both extensions are visible."""
+    if event in _CLIP_ECHO_QUIET:
+        return
+    line = _format_clip_event(src, event, data)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    logger.info("%s", line)
 
 
 def _append_clip_event(src: str, event: str, data: Dict[str, Any]) -> None:
     """Append one JSON line to the clip event log. Best-effort: a full disk or
     log failure must never break the clip flow itself."""
     try:
+        _echo_clip_event(src, event, data)
         path = data_dir() / CLIP_EVENTS_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(
@@ -183,6 +226,48 @@ def delete_twitch_clips_history(
 _CLIP_ORIGIN = "https://clips.twitch.tv"
 
 
+def published_clip_range_from_gql(
+    gql_offset: Optional[float],
+    gql_duration: Optional[float],
+) -> Optional[tuple]:
+    """Map Twitch GQL clip fields to (end_sec, duration_sec).
+
+    Frame compares of live clips showed videoOffsetSeconds is the VOD END
+    of the published media (15s: 886/15 -> start 871; 19s: 896/18 -> start
+    878). History stores END because downloads crop [end-duration, end].
+    An offset that cannot be an end (offset <= duration) is treated as start.
+    """
+    if gql_offset is None or gql_duration is None:
+        return None
+    try:
+        offset = int(round(float(gql_offset)))
+        duration = int(round(float(gql_duration)))
+    except (TypeError, ValueError):
+        return None
+    if duration < 5 or duration > 60 or offset < 0:
+        return None
+    if offset > duration + 2:
+        return offset, duration
+    return offset + duration, duration
+
+
+def _apply_twitch_published_range(entry: Dict[str, Any], clip_url: str) -> Dict[str, Any]:
+    """Overwrite vod/offset/duration with Twitch's published range when GQL answers."""
+    try:
+        from services.twitch_gql_service import get_clip_info_sync
+        info = get_clip_info_sync(clip_url)
+    except Exception as exc:
+        logger.debug("clip record GQL enrich skipped: %s", exc)
+        return entry
+    vod_id = info.get("vod_id")
+    if vod_id:
+        entry["vod_id"] = str(vod_id)
+    mapped = published_clip_range_from_gql(info.get("offset_sec"), info.get("duration"))
+    if mapped:
+        entry["offset_sec"], entry["duration_sec"] = mapped
+    return entry
+
+
 def _clip_cors_preflight() -> Response:
     return Response(
         status_code=200,
@@ -219,10 +304,13 @@ def post_clip_event(body: ClipEventBody, response: Response) -> Dict[str, Any]:
     append-only log — validation is a sanity guard, not an auth boundary."""
     _set_clip_cors(response)
     if body.src not in ("app", "ext", "api"):
+        print(f"CLIP drop {body.src} {body.event}: invalid src", flush=True)
         raise HTTPException(status_code=422, detail="invalid src")
     if not body.event or len(body.event) > 120:
+        print(f"CLIP drop {body.src} {body.event!r}: invalid event", flush=True)
         raise HTTPException(status_code=422, detail="invalid event")
     if not isinstance(body.data, dict) or len(json.dumps(body.data)) > 8000:
+        print(f"CLIP drop {body.src} {body.event}: data too large", flush=True)
         raise HTTPException(status_code=422, detail="data too large")
     _append_clip_event(body.src, body.event, body.data)
     return {"ok": True}
@@ -277,6 +365,7 @@ def record_twitch_clip(req: TwitchClipRecordRequest, response: Response) -> Dict
         "url": f"https://clips.twitch.tv/{slug}",
         "status": "created",
     }
+    entry = _apply_twitch_published_range(entry, entry["url"])
     history = _load_history()
     # Idempotent: the extension may re-post on retry or when both flows
     # publish — never duplicate the row for the same clip.

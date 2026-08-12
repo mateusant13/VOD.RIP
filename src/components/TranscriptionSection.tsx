@@ -55,6 +55,9 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         >
           {t('Whisper Model')}
         </FieldCaption>
+        <p className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+          {t('Parakeet (NVIDIA / sherpa-onnx) is used automatically for 25 European languages including pt/en/es. Whisper large-v3-turbo stays the fallback for Japanese, Korean, Chinese, Arabic, unknown language, and when Parakeet is unavailable. Parakeet-only would drop those languages.')}
+        </p>
         <span
           className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"
           aria-label="whisper model id (read-only)"

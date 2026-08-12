@@ -1,10 +1,19 @@
 {
   "name": "VOD RIP Get Cookies",
   "short_name": "VOD RIP Cookies",
-  "description": "VOD.RIP companion — export login cookies for YouTube, Twitch and Kick only, and keep the app paired locally.",
-  "version": "0.8.23",
+  "description": "VOD.RIP companion \u2014 export login cookies for YouTube, Twitch and Kick only, and keep the app paired locally.",
+  "version": "0.8.32",
   "manifest_version": 3,
-  "permissions": ["activeTab", "alarms", "cookies", "downloads", "notifications", "clipboardWrite", "storage", "scripting"],
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "cookies",
+    "downloads",
+    "notifications",
+    "clipboardWrite",
+    "storage",
+    "scripting"
+  ],
   "host_permissions": [
     "https://*.youtube.com/*",
     "https://*.twitch.tv/*",
@@ -13,13 +22,21 @@
   ],
   "content_scripts": [
     {
-      "matches": ["https://www.twitch.tv/videos/*"],
-      "js": ["clip_assist.mjs"],
+      "matches": [
+        "https://www.twitch.tv/videos/*"
+      ],
+      "js": [
+        "clip_assist.mjs"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://clips.twitch.tv/create*"],
-      "js": ["clip_assist.mjs"],
+      "matches": [
+        "https://clips.twitch.tv/create*"
+      ],
+      "js": [
+        "clip_assist.mjs"
+      ],
       "run_at": "document_start"
     }
   ],

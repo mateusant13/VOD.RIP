@@ -41,7 +41,7 @@ PLATFORMS = ("youtube", "twitch", "kick")
 # "stream" = YouTube was_live content from the /streams tab (recorded live
 # broadcasts). Without it, _normalize_kind mapped every stream row to "vod",
 # so stream VODs were indistinguishable from regular uploads in the index.
-KINDS = ("vod", "clip", "short", "live", "stream")
+KINDS = ("vod", "clip", "short", "live", "stream", "video")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS videos (
   status        TEXT NOT NULL DEFAULT 'known'
                 CHECK (status IN ('known','downloading','ready','failed')),
   kind          TEXT NOT NULL DEFAULT 'vod'
-                CHECK (kind IN ('vod','clip','short','live','stream')),
+                CHECK (kind IN ('vod','clip','short','live','stream','video')),
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (platform, video_id)
@@ -395,7 +395,7 @@ def _ensure_kind_column(conn: sqlite3.Connection) -> None:
     if "kind" not in cols:
         conn.execute(
             "ALTER TABLE videos ADD COLUMN kind TEXT NOT NULL DEFAULT 'vod'"
-            " CHECK (kind IN ('vod','clip','short','live','stream'))"
+            " CHECK (kind IN ('vod','clip','short','live','stream','video'))"
         )
 
 
@@ -438,12 +438,11 @@ def _ensure_kind_check_includes_stream(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'"
     ).fetchone()
-    if not row or "stream" in (row[0] or ""):
+    ddl = (row[0] or "") if row else ""
+    if not ddl or "'video'" in ddl:
         return
-    ddl = (row[0] or "").replace(
-        "CHECK (kind IN ('vod','clip','short','live'))",
-        "CHECK (kind IN ('vod','clip','short','live','stream'))",
-    )
+    _KIND_CHECK = "CHECK (kind IN ('vod','clip','short','live','stream','video'))"
+    ddl = re.sub(r"CHECK \(kind IN \([^)]+\)\)", _KIND_CHECK, ddl, count=1)
     if "kind" not in ddl:
         # kind was added via ALTER TABLE (pre-kind DBs) — ALTER never touches
         # sqlite_master.sql, so the stored DDL lacks the column. Rebuild with
@@ -452,12 +451,12 @@ def _ensure_kind_check_includes_stream(conn: sqlite3.Connection) -> None:
         if pk_idx == -1:
             ddl = ddl.rstrip().rstrip(")").rstrip() + (
                 ", kind TEXT NOT NULL DEFAULT 'vod'"
-                " CHECK (kind IN ('vod','clip','short','live','stream')))"
+                " CHECK (kind IN ('vod','clip','short','live','stream','video')))"
             )
         else:
             ddl = ddl[:pk_idx] + (
                 "  kind TEXT NOT NULL DEFAULT 'vod'"
-                " CHECK (kind IN ('vod','clip','short','live','stream')),\n"
+                " CHECK (kind IN ('vod','clip','short','live','stream','video')),\n"
             ) + ddl[pk_idx:]
     conn.execute("ALTER TABLE videos RENAME TO videos_old")
     conn.execute(ddl)
@@ -2114,6 +2113,34 @@ def delete_video(platform: str, video_id: str) -> Optional[str]:
 
 # --- jobs -----------------------------------------------------------------
 
+
+def maybe_enqueue_transcribe(platform: str, video_id: str, *, archive_path: Optional[str] = None, priority: int = 0) -> bool:
+    """Queue whisper when a real archive file exists and no transcript yet."""
+    plat = (platform or "").strip().lower()
+    vid = (video_id or "").strip()
+    if plat not in PLATFORMS or not vid:
+        return False
+    path = archive_path
+    if not path:
+        rows = query(
+            "SELECT archive_path FROM videos WHERE platform = ? AND video_id = ?",
+            (plat, vid),
+        )
+        path = rows[0]["archive_path"] if rows else None
+    if not path or not Path(path).is_file():
+        return False
+    if plat == "youtube" and captions_cover(plat, vid):
+        return False
+    if transcript_for(plat, vid):
+        return False
+    job_id = f"transcribe-{plat}-{vid}"
+    try:
+        enqueue_job(job_id, "transcribe", plat, vid, priority=priority)
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
 def enqueue_job(job_id: str, kind: str, platform: str, video_id: str, *, priority: int = 0) -> None:
     now = _now_iso()
     execute(
@@ -2143,7 +2170,14 @@ def update_job(job_id: str, *, status: Optional[str] = None,
 
 def list_jobs(limit: int = 50) -> list[dict]:
     rows = query(
-        "SELECT * FROM archive_jobs ORDER BY priority DESC, created_at ASC LIMIT ?",
+        """SELECT * FROM archive_jobs
+           ORDER BY CASE status
+             WHEN 'running' THEN 0
+             WHEN 'queued' THEN 1
+             WHEN 'failed' THEN 2
+             ELSE 3 END,
+             updated_at DESC
+           LIMIT ?""",
         (limit,),
     )
     return [dict(r) for r in rows]
@@ -2530,6 +2564,7 @@ def search(
     lang: Optional[str] = None,
     limit: int = 20,
     semantic: bool = False,
+    mode: str = "broad",
     _channel_hint_out: Optional[list] = None,
     username: Optional[str] = None,
 ) -> list[dict]:
@@ -2606,6 +2641,12 @@ def search(
     guard). The cross-segment span pass is capped at _SPAN_MAX_TOKENS and
     expands variants with ONE vocab/bigram load, so long queries return
     promptly instead of hanging the request path."""
+    mode = (mode or "broad").strip().lower()
+    if mode not in ("exact", "broad", "semantic"):
+        mode = "broad"
+    if mode == "semantic" or semantic:
+        semantic = True
+        mode = "broad"
     if not q.strip() and not (username or "").strip():
         return []
     # Control characters (NUL and friends) can never appear in indexed
@@ -2614,7 +2655,9 @@ def search(
     # (a 500). Replace them with spaces; tabs/newlines stay separators.
     q = "".join(c if ord(c) >= 32 or c in "\t\n\r" else " " for c in q)
     raw_q = q.strip()
-    kinds = [k for k in (k.strip().lower() for k in (kind or "").split(",")) if k in KINDS]
+    kinds_raw = [k.strip().lower() for k in (kind or "").split(",") if k.strip()]
+    want_yt_video = "video" in kinds_raw
+    kinds = [k for k in kinds_raw if k in KINDS]
     platforms = (
         [p for p in (p.strip().lower() for p in platform.split(",")) if p in PLATFORMS]
         if platform
@@ -2628,7 +2671,7 @@ def search(
             fetch=max(int(limit) * 3, 3),
             platforms=platforms, video_id=video_id, channel=channel,
             kinds=kinds, date_from=date_from, date_to=date_to,
-            username=username,
+            username=username, want_yt_video=want_yt_video,
         )[:int(limit)])
     if channel is None and _channel_hint_out is not None:
         hint = _channel_hint_for(raw_q)
@@ -2745,6 +2788,10 @@ def search(
             for t in missing:
                 for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq):
                     q_keep_tokens.add(term)
+    if mode == "exact":
+        pattern = {}
+        and_pattern = None
+        span_variants = {}
     fetch = max(int(limit) * 3, 3)  # ~3x batch; no per-table cap below 3x
     merged: list[dict] = []
     for tbl_idx, (hit_kind, fts, src, offcol, langcol) in enumerate(loops):
@@ -2752,7 +2799,7 @@ def search(
             hit_kind=hit_kind, fts=fts, src=src, offcol=offcol, langcol=langcol,
             platforms=platforms, video_id=video_id, channel=channel, kinds=kinds,
             date_from=date_from, date_to=date_to, lang=lang,
-            username=username,
+            username=username, want_yt_video=want_yt_video,
         )
         # Distance tiers: one MATCH pass per tier, unioned by rowid (lowest
         # tier wins). Scores are discounted by 0.5^tier so cross-table merges
@@ -2829,6 +2876,7 @@ def search(
                     platforms=platforms,
                     video_id=video_id, channel=channel, kinds=kinds,
                     date_from=date_from, date_to=date_to, lang=lang,
+                    want_yt_video=want_yt_video, exact=(mode == "exact"),
                 )
             except sqlite3.Error:
                 span_rows = []  # scan failed — degrade to phrase/fuzzy-only
@@ -2895,6 +2943,8 @@ def search(
             kinds=kinds,
             date_from=date_from,
             date_to=date_to,
+            want_yt_video=want_yt_video,
+            exact=(mode == "exact"),
         )
         if title_rows:
             # No ÷tmax normalization: a title matching only a common token
@@ -2952,7 +3002,7 @@ def search(
             sem = _semantic_search(
                 q, fetch, platforms=platforms, video_id=video_id,
                 channel=channel, kinds=kinds, date_from=date_from,
-                date_to=date_to, lang=lang,
+                date_to=date_to, lang=lang, want_yt_video=want_yt_video,
             )
         except Exception:
             sem = None
@@ -2983,6 +3033,8 @@ def _titles_search(
     kinds: list[str],
     date_from: Optional[str],
     date_to: Optional[str],
+    want_yt_video: bool = False,
+    exact: bool = False,
 ) -> list[dict]:
     """Video-title match over the videos table (folded-token coverage).
 
@@ -3027,9 +3079,10 @@ def _titles_search(
         if slugs:
             where.append(f"lower(channel) IN ({','.join('?' * len(slugs))})")
             params.extend(s.lower() for s in slugs)
-    if kinds:
-        where.append(f"kind IN ({','.join('?' * len(kinds))})")
-        params.extend(kinds)
+    kind_sql, kind_params = _kind_match_sql(kinds, want_yt_video, "")
+    if kind_sql:
+        where.append(kind_sql)
+        params.extend(kind_params)
     if date_from:
         where.append("date(started_at) >= date(?)")
         params.append(date_from)
@@ -3048,20 +3101,27 @@ def _titles_search(
         toks = _fold_tokens(f"{title} {original}")
         if not toks:
             continue
-        matched = sum(
-            1
-            for qt in q_tokens
-            if any(
-                tt == qt
-                or (
-                    len(qt) >= 4
-                    and freq.get(qt, 0) <= _PREFIX_GATE_FREQ
-                    and qt in tt
+        if exact:
+            hay = f"{title} {original}".casefold()
+            needle = " ".join(q_tokens)
+            if needle not in " ".join(toks) and q.strip().casefold() not in hay:
+                continue
+            matched = len(q_tokens)
+        else:
+            matched = sum(
+                1
+                for qt in q_tokens
+                if any(
+                    tt == qt
+                    or (
+                        len(qt) >= 4
+                        and freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                        and qt in tt
+                    )
+                    or _tok_eq(tt, qt)
+                    for tt in toks
                 )
-                or _tok_eq(tt, qt)
-                for tt in toks
             )
-        )
         if not matched:
             continue
         score = matched / len(q_tokens)
@@ -3104,6 +3164,7 @@ def _table_search(
     date_to: Optional[str],
     lang: Optional[str],
     username: Optional[str] = None,
+    want_yt_video: bool = False,
 ) -> list[dict]:
     """One MATCH pass over one FTS table with the shared filter set.
 
@@ -3141,9 +3202,10 @@ def _table_search(
         if slugs:
             sql += f" AND lower(v.channel) IN ({','.join('?' * len(slugs))})"
             params.extend(s.lower() for s in slugs)
-    if kinds:
-        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
-        params.extend(kinds)
+    kind_sql, kind_params = _kind_match_sql(kinds, want_yt_video, "v")
+    if kind_sql:
+        sql += f" AND {kind_sql}"
+        params.extend(kind_params)
     if date_from:
         sql += " AND date(v.started_at) >= date(?)"
         params.append(date_from)
@@ -3231,6 +3293,7 @@ def _username_only_search(
     date_from: Optional[str],
     date_to: Optional[str],
     username: Optional[str],
+    want_yt_video: bool = False,
 ) -> list[dict]:
     """All chat rows from the chosen author(s) — no text matching.
 
@@ -3266,9 +3329,10 @@ def _username_only_search(
         if slugs:
             sql += f" AND lower(COALESCE(v.channel, '')) IN ({','.join('?' * len(slugs))})"
             params.extend(slugs)
-    if kinds:
-        sql += f" AND v.kind IN ({','.join('?' * len(kinds))})"
-        params.extend(kinds)
+    kind_sql, kind_params = _kind_match_sql(kinds, want_yt_video, "v")
+    if kind_sql:
+        sql += f" AND {kind_sql}"
+        params.extend(kind_params)
     if date_from:
         sql += " AND date(v.started_at) >= date(?)"
         params.append(date_from)
@@ -3327,6 +3391,25 @@ def _tok_eq(a: str, b: str) -> bool:
     return any(a[:i] + a[i + 1:] == b for i in range(len(a)))
 
 
+
+def _kind_match_sql(kinds: list[str], want_yt_video: bool, video: str) -> tuple[Optional[str], list[str]]:
+    """SQL for videos.kind, plus virtual kind=video (YouTube long-form, not shorts)."""
+    col = f"{video}.kind" if video else "kind"
+    plat = f"{video}.platform" if video else "platform"
+    clauses: list[str] = []
+    params: list[str] = []
+    if kinds:
+        clauses.append(f"{col} IN ({','.join('?' * len(kinds))})")
+        params.extend(kinds)
+    if want_yt_video:
+        clauses.append(f"({plat} = 'youtube' AND {col} NOT IN ('short', 'clip'))")
+    if not clauses:
+        return None, []
+    if len(clauses) == 1:
+        return clauses[0], params
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def _append_content_filters(
     parts: list[str],
     params: list[Any],
@@ -3341,6 +3424,7 @@ def _append_content_filters(
     table: str = "t",
     video: str = "v",
     apply_lang: bool = True,
+    want_yt_video: bool = False,
 ) -> None:
     """Shared WHERE fragment for content-table scans (transcripts/messages).
 
@@ -3357,9 +3441,10 @@ def _append_content_filters(
         if slugs:
             parts.append(f"lower({video}.channel) IN ({','.join('?' * len(slugs))})")
             params.extend(s.lower() for s in slugs)
-    if kinds:
-        parts.append(f"{video}.kind IN ({','.join('?' * len(kinds))})")
-        params.extend(kinds)
+    kind_sql, kind_params = _kind_match_sql(kinds, want_yt_video, video)
+    if kind_sql:
+        parts.append(kind_sql)
+        params.extend(kind_params)
     if date_from:
         parts.append(f"date({video}.started_at) >= date(?)")
         params.append(date_from)
@@ -3479,6 +3564,8 @@ def _phrase_span_rows(
     date_from: Optional[str],
     date_to: Optional[str],
     lang: Optional[str],
+    want_yt_video: bool = False,
+    exact: bool = False,
 ) -> list[dict]:
     """Exact-phrase hits whose tokens sit in two ADJACENT transcript
     segments: seg N ends with a phrase prefix and seg N+1 starts with the
@@ -3525,6 +3612,7 @@ def _phrase_span_rows(
     _append_content_filters(
         parts, params, platforms=platforms, video_id=video_id, channel=channel,
         kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
+        want_yt_video=want_yt_video,
     )
     # Span hits are transcripts: same channel-language family exclusion as
     # _table_search (both segments of the pair must pass the row filter).
@@ -3547,16 +3635,17 @@ def _phrase_span_rows(
                 continue
             a_toks = re.findall(r"[^\W_]+", a["text"].casefold())
             b_toks = re.findall(r"[^\W_]+", b["text"].casefold())
+            tok_match = (lambda x, y: x == y) if exact else _tok_eq
             for split in range(1, len(q_tokens)):
                 prefix, suffix = q_tokens[:split], q_tokens[split:]
                 if len(a_toks) < len(prefix) or len(b_toks) < len(suffix):
                     continue
                 if not all(
-                    _tok_eq(x, y) for x, y in zip(a_toks[-len(prefix):], prefix)
+                    tok_match(x, y) for x, y in zip(a_toks[-len(prefix):], prefix)
                 ):
                     continue
                 if not all(
-                    _tok_eq(x, y) for x, y in zip(b_toks[:len(suffix)], suffix)
+                    tok_match(x, y) for x, y in zip(b_toks[:len(suffix)], suffix)
                 ):
                     continue
                 hit = {
@@ -3890,6 +3979,7 @@ def _semantic_search(
     date_from: Optional[str],
     date_to: Optional[str],
     lang: Optional[str],
+    want_yt_video: bool = False,
 ) -> Optional[list[dict]]:
     """Concept pass over transcript embeddings: cosine scan of the filtered
     scope, segments embedded lazily (bounded per query), then an optional
@@ -4015,6 +4105,7 @@ def _semantic_search(
         _append_content_filters(
             parts, params, platforms=platforms, video_id=video_id, channel=channel,
             kinds=kinds, date_from=date_from, date_to=date_to, lang=lang,
+            want_yt_video=want_yt_video,
         )
         if parts:
             sql += " AND " + " AND ".join(parts)

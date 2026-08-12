@@ -130,12 +130,13 @@ describe('ArchiveSearchPopup', () => {
     }
   });
 
-  it('kind filter chips are VOD/clip/short only — no LIVE chip', () => {
+  it('kind filter chips are VOD/clip/short/video only — no LIVE chip', () => {
     mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     expect(screen.getByRole('button', { name: 'VOD' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: 'CLIP' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'SHORT' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'VIDEO' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'LIVE' })).toBeNull();
   });
 

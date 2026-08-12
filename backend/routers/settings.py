@@ -198,6 +198,16 @@ async def update_settings(update: SettingsUpdate):
         # so the frontend re-seeds from the system language).
         val = (update.ui_language or "").strip()
         current.ui_language = val if val in ("en", "pt-BR", "es") else ""
+
+    if update.download_layout is not None:
+        layout = (update.download_layout or 'typed').strip().lower()
+        current.download_layout = layout if layout in ('flat', 'typed') else 'typed'
+    if update.download_transcript_sidecar is not None:
+        current.download_transcript_sidecar = bool(update.download_transcript_sidecar)
+    if update.download_chat_before_sec is not None:
+        current.download_chat_before_sec = max(0, min(600, int(update.download_chat_before_sec)))
+    if update.download_chat_after_sec is not None:
+        current.download_chat_after_sec = max(0, min(600, int(update.download_chat_after_sec)))
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current

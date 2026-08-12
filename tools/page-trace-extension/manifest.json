@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "VOD.RIP Page Trace",
+  "short_name": "VOD.RIP Trace",
+  "version": "1.1.1",
+  "description": "Captures redacted VOD.RIP/Twitch clip interactions, GQL clip payloads, and network timing for debugging.",
+  "permissions": ["storage", "webRequest"],
+  "host_permissions": [
+    "http://127.0.0.1:5173/*",
+    "http://127.0.0.1:7897/*",
+    "https://*.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1:5173/*",
+        "https://www.twitch.tv/videos/*",
+        "https://clips.twitch.tv/*",
+        "https://www.twitch.tv/*/clip/*"
+      ],
+      "js": ["gql_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:5173/*",
+        "https://www.twitch.tv/videos/*",
+        "https://clips.twitch.tv/*",
+        "https://www.twitch.tv/*/clip/*"
+      ],
+      "js": ["trace.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "VOD.RIP Page Trace"
+  }
+}

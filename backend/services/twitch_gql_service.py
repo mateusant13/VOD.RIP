@@ -73,6 +73,7 @@ query ClipMetadata($slug: ID!) {
     slug
     title
     durationSeconds
+    videoOffsetSeconds
     viewCount
     createdAt
     thumbnailURL
@@ -80,6 +81,9 @@ query ClipMetadata($slug: ID!) {
       quality
       sourceURL
       frameRate
+    }
+    video {
+      id
     }
     broadcaster {
       login
@@ -238,6 +242,8 @@ def get_clip_info_sync(url_or_slug: str) -> Dict[str, Any]:
         "platform": "Twitch",
         "created_at": node.get("createdAt"),
         "content_kind": "clip",
+        "vod_id": ((node.get("video") or {}).get("id") if isinstance(node.get("video"), dict) else None),
+        "offset_sec": node.get("videoOffsetSeconds"),
     }
     # Probe signed CloudFront URLs for accurate size estimates. Unsigned sourceURL
     # values redirect/403 from CloudFront, so the HEAD probe must use sig/token.

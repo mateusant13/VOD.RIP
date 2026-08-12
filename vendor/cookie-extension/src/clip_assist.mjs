@@ -38,9 +38,39 @@
 
   const startSec = Math.max(0, Math.floor(Number(params.get('vodrip_start')) || 0));
   const endSec = Math.max(startSec, Math.floor(Number(params.get('vodrip_end')) || 0));
-  // VOD total length (the app sends vodrip_dur) — lets the editor-range
-  // helper nudge the window off the VOD's last frame instead of failing.
-  const vodDurationSec = Number(params.get('vodrip_dur')) || 0;
+  // Twitch's editor defaults clipOffsets to the last 30s ending at
+  // offsetSeconds (f.HI=30). That 30s window is what the processing
+  // preview plays until ShareClip duration lands. Seed relative offsets
+  // (0-90 editor chunk) in history.state before React reads router state
+  // so the render job matches the range the user picked.
+  const seedEditorClipOffsets = () => {
+    const uiEnd = 90;
+    const origin = Math.max(0, endSec - uiEnd);
+    let relEnd = endSec - origin;
+    let relStart = startSec - origin;
+    if (relEnd > uiEnd) {
+      relStart -= (relEnd - uiEnd);
+      relEnd = uiEnd;
+    }
+    if (relStart < 0) relStart = 0;
+    const dur = Math.max(5, Math.min(60, endSec - startSec));
+    if (relEnd - relStart !== dur) {
+      if (relEnd >= dur) relStart = relEnd - dur;
+      else {
+        relStart = 0;
+        relEnd = Math.min(uiEnd, dur);
+      }
+    }
+    relStart = Math.round(relStart);
+    relEnd = Math.round(relEnd);
+    try {
+      const st = Object.assign({}, history.state && typeof history.state === 'object' ? history.state : {});
+      st.clipOffsets = { startOffset: relStart, endOffset: relEnd };
+      history.replaceState(st, '', location.href);
+    } catch { /* ignore */ }
+    return { relStart, relEnd };
+  };
+  if (location.hostname === 'clips.twitch.tv') seedEditorClipOffsets();
   // Only the app-supplied original VOD title is allowed. Never derive a title
   // from Twitch's page chrome and never invent a VOD.RIP/custom fallback.
   const clipTitle = (params.get('vodrip_title') || '').trim();
@@ -128,35 +158,35 @@
       ).singleNodeValue;
       if (viaPath) out.push(viaPath);
     } catch { /* ignore */ }
+    for (const p of document.querySelectorAll(
+      'p[aria-label*="Tempo restante em segundos" i], p[aria-label*="seconds remaining" i]',
+    )) {
+      if (!out.includes(p)) out.push(p);
+    }
+    const clockText = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+    for (const el of document.querySelectorAll(
+      '[data-layout-id="draggable-slider-handle"], [role="tooltip"]',
+    )) {
+      const text = clockText(el);
+      if (
+        (/^(?:ajustar momento de (?:início|encerramento) para|adjust (?:clip )?(?:start|end) time at|set (?:clip )?(?:start|end) time at)\s+\d{1,2}:\d{2}$/i.test(text)
+          || /^\d{1,2}:\d{2}\s*(?:-|to)\s*\d{1,2}:\d{2}$/i.test(text))
+        && !out.includes(el)
+      ) out.push(el);
+    }
     for (const s of document.querySelectorAll('strong')) {
-      if (CLOCK_RE.test((s.textContent || '').trim()) && !out.includes(s)) out.push(s);
+      const text = (s.textContent || '').trim();
+      if ((CLOCK_RE.test(text) || /^\d{1,2}:\d{2}$/.test(text)) && !out.includes(s)) out.push(s);
     }
     return out;
   };
-  const clockVisible = () => clockNodes().length > 0;
-  const hideAbsoluteTimeControls = () => {
-    for (const button of document.querySelectorAll('button, [role="button"]')) {
-      if (!/ajustar momento de (início|encerramento)|set (clip )?(start|end)|set (the )?(start|end) time/i.test(
-        (button.innerText || '').trim(),
-      )) continue;
-      button.style.display = 'none';
-      button.setAttribute('aria-hidden', 'true');
-    }
-  };
-  const secondsifyClock = () => {
-    const w = selectedWindow();
-    if (!w || !Number.isFinite(w.dur) || w.dur < 5) return;
-    const duration = Math.max(5, Math.min(60, Math.round(w.dur)));
-    for (const clock of clockNodes()) {
-      if (!clock.dataset.vodripOriginalClock) {
-        clock.dataset.vodripOriginalClock = (clock.textContent || '').trim();
-      }
-      clock.textContent = `${duration}s`;
-      clock.setAttribute('aria-label', `Duração do clipe: ${duration} segundos`);
-      clock.dataset.vodripSecondsClock = '1';
-    }
-    hideAbsoluteTimeControls();
-  };
+  const clockVisible = () => clockNodes().some((el) => el.style.visibility !== 'hidden');
+  // Assigned after parseClock/selectedWindow exist. Until then, no-ops.
+  let hideAbsoluteTimeControls = () => {};
+  let secondsifyClock = () => {};
+  let maskAbsoluteTimeControls = () => {};
+  let preRangeClockObs = null;
+  let startClockMask = () => {};
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // Debugging event sequence: every flow step is POSTed to the app's
   // clip-events sink (same API base as the cookie bridge) so a clip attempt
@@ -178,7 +208,7 @@
   // shows a download button for it). Fire-and-forget, same posture as note();
   // Twitch's site published it, the backend never saw it — the browser
   // path's equivalent of a server-side history write.
-  const recordPublishedClip = (clipUrl) => {
+  const recordPublishedClip = (clipUrl, confirmedWindow = null) => {
     try {
       const path = (() => {
         try { return new URL(clipUrl).pathname; } catch { return ''; }
@@ -191,8 +221,17 @@
         return clipIdx > 0 ? segs[clipIdx - 1] : undefined;
       })();
       const vodMatch = (location.pathname || '').match(/^\/videos\/(\d+)/);
-      const start = Number(params.get('vodrip_start')) || 0;
-      const end = Number(params.get('vodrip_end')) || 0;
+      const requestedStart = Number(params.get('vodrip_start')) || 0;
+      const requestedEnd = Number(params.get('vodrip_end')) || 0;
+      // The editor confirms a window on the ~90s raw-media timeline
+      // (e.g. 71-90). History/download need VOD-absolute seconds. Map back
+      // through the URL anchor: offsetSeconds / vodrip_end is the raw media end.
+      const mapped = vodRangeFromEditorWindow(
+        { start: requestedStart, end: requestedEnd },
+        confirmedWindow,
+      );
+      const start = mapped.start;
+      const end = mapped.end;
       const p = chrome.runtime.sendMessage({
         type: 'vodrip_record',
         payload: {
@@ -236,6 +275,19 @@
     const match = (location.pathname || '').match(/^\/(?:create\/)?([A-Za-z][A-Za-z0-9_-]+)$/);
     return match && match[1].toLowerCase() !== 'create' ? match[1] : null;
   };
+  const publishProcessingVisible = () => {
+    const body = document.body ? document.body.innerText || '' : '';
+    return /salvando clipe|saving clip|processando clipe|processing clip/i.test(body);
+  };
+  const waitForPublishReady = async () => {
+    const started = Date.now();
+    const gone = await waitFor(() => publishProcessingVisible() ? null : true, 480000, 500);
+    if (!gone) return false;
+    await sleep(1500);
+    if (publishProcessingVisible()) return false;
+    note('ext_ready', { processingGone: true, waitMs: Date.now() - started });
+    return true;
+  };
   note('ext_start', {
     hostname: location.hostname,
     startSec,
@@ -262,7 +314,7 @@
       return 'storage-unreadable';
     }
   };
-  const rangeViaMainWorld = (startSec, endSec, vodDurationSec) =>
+  const rangeViaMainWorld = (startSec, endSec) =>
     new Promise((resolve) => {
       const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
       const onMsg = (ev) => {
@@ -279,7 +331,7 @@
       }, 12000);
       window.addEventListener('message', onMsg);
       try {
-        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec, dur: vodDurationSec }, '*');
+        window.postMessage({ source: 'vodrip-range-req', nonce, start: startSec, end: endSec }, '*');
       } catch (err) {
         clearTimeout(timer);
         window.removeEventListener('message', onMsg);
@@ -426,16 +478,48 @@
 
   /** Parse an editor clock "3:20" (m:ss) or "1:02:05" (h:mm:ss) → seconds. */
   const parseClock = (s) => {
-    const m = String(s || '').trim().match(/^(\d+):(\d{1,2})(?::(\d{1,2}))?$/);
-    if (!m) return null;
-    return +m[1] * 60 + +m[2] + (+m[3] || 0);
+    const value = String(s || '').trim();
+    const parts = value.split(':').map(Number);
+    if (parts.some((part) => !Number.isInteger(part) || part < 0)) return null;
+    if (parts.length === 1 && parts[0] <= 99) return parts[0];
+    if (parts.length === 2 && parts[1] < 60) return parts[0] * 60 + parts[1];
+    if (parts.length === 3 && parts[1] < 60 && parts[2] < 60) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    return null;
   };
-
   /**
-   * Twitch's clip editor displays the selected window in absolute VOD
-   * seconds. The fiber drag callbacks use those same absolute values;
-   * the 90-second preview chunk is only a viewport around the selection.
+   * Slider valuetext / clipOffsets are relative to the ~90s raw-media chunk.
+   * offsetSeconds / vodrip_end is the VOD time at that chunk's end, so
+   * origin = vodEnd - editorEnd. A window already in VOD seconds is kept.
    */
+  const vodRangeFromEditorWindow = (requested, editor) => {
+    const reqStart = Number(requested && requested.start) || 0;
+    const reqEnd = Number(requested && requested.end) || 0;
+    if (!editor || !Number.isFinite(editor.start) || !Number.isFinite(editor.end)) {
+      return { start: reqStart, end: reqEnd };
+    }
+    if (editor.end <= 93 && reqEnd > editor.end + 2) {
+      const origin = Math.max(0, reqEnd - editor.end);
+      return { start: origin + editor.start, end: origin + editor.end };
+    }
+    return { start: editor.start, end: editor.end };
+  };
+  const waitHistoryOffsets = async (s, e) => {
+    const deadline = Date.now() + 4000;
+    while (Date.now() <= deadline) {
+      try {
+        const raw = JSON.stringify(history.state || {});
+        const sm = raw.match(/"startOffset"\s*:\s*(-?\d+(?:\.\d+)?)/);
+        const em = raw.match(/"endOffset"\s*:\s*(-?\d+(?:\.\d+)?)/);
+        if (sm && em && Math.abs(+sm[1] - s) <= 2 && Math.abs(+em[1] - e) <= 2) {
+          return { ok: true, startOffset: +sm[1], endOffset: +em[1] };
+        }
+      } catch { /* ignore */ }
+      await sleep(200);
+    }
+    return { ok: false, startOffset: null, endOffset: null };
+  };
   const EDITOR_WINDOW_SEC = 90;
   const editorChunkStart = (endSec) => Math.max(0, endSec - EDITOR_WINDOW_SEC);
 
@@ -444,9 +528,11 @@
    * onLeftDrag/onRightDrag callbacks on the slider; their offsets are
    * absolute VOD seconds, as confirmed by the live 12:31 -> 12:48 run.
    */
-  const setEditorRange = async (scope, startSec, endSec, vodDurationSec) => {
+  const setEditorRange = async (scope, startSec, endSec) => {
     const len = endSec - startSec;
-    // Twitch's native viewport is 90s, but VOD.RIP's clip contract is 5..60s.
+    // The native control displays absolute VOD positions; hide it before
+    // Twitch's first render can flash a minutes-looking value.
+    maskAbsoluteTimeControls();
     if (len < 5 || len > 60) {
       note('ext_range_refused', { startSec, endSec, len });
       setStatus(
@@ -459,7 +545,10 @@
     // Wait for that control instead of falling back with the native window untouched.
     const slider = await waitFor(() => document.querySelector('[role="slider"]'), 45000, 500);
     if (!slider) return 'controle do editor (slider) não encontrado';
-    const res = await rangeViaMainWorld(startSec, endSec, vodDurationSec);
+    // Hide Twitch's VOD-absolute clock before the first range mutation can
+    // leave a minutes-looking value visible to the user.
+    mountDurationBadge();
+    const res = await rangeViaMainWorld(startSec, endSec);
     note('ext_range', {
       ok: !!res.ok,
       targetStart: startSec,
@@ -467,11 +556,18 @@
       editorChunkStart: editorChunkStart(endSec),
       editorStart: startSec,
       editorEnd: endSec,
-      vodDurationSec,
       playback: playbackTimeText(),
       clockVisible: clockVisible(),
       valuetext: res.ok ? (res.valuetext || null) : null,
       reason: res.ok ? null : (res.reason || null),
+      relStart: res.debug && res.debug.relStart,
+      relEnd: res.debug && res.debug.relEnd,
+      requestedDur: res.debug && res.debug.requestedDur,
+      rawEnd: res.debug && res.debug.rawEnd,
+      origin: res.debug && res.debug.origin,
+      anchor: res.debug && res.debug.anchor,
+      history: res.debug && res.debug.history,
+      videoDuration: res.debug && res.debug.videoDuration,
     });
     if (!res.ok) {
       const reason = res.reason || 'falha';
@@ -490,33 +586,17 @@
   };
 
   // -------------------------------------------------------------------
-  // Duration badge — the user reads the editor's "12:31 to 12:48"
-  // (VOD-absolute m:ss from the slider's aria-valuetext) as a ~12-minute
-  // clip; the actual window is 17s. This big banner makes the SECONDS the
-  // unmissable thing: large green "Duração: Ns" with the window in small
-  // text beneath, pinned center-top of the viewport (user-mandated
-  // 2026-08-10). It is mounted OUTSIDE React's tree (child of <html>) so
-  // re-renders never remove it, and renders immediately on range-set
-  // success (no tick). Updates are driven by a MutationObserver on the
-  // slider's aria-valuetext — both the extension's own onLeftDrag/
-  // onRightDrag drags and the user's handle drags land there — and a 1s
-  // liveness tick re-finds a React-replaced slider (the attribute observer
-  // dies with the old node) and removes the chip once the slider is gone
-  // (save → SPA navigation, editor closed, leave). pointer-events:none so
-  // it never blocks Twitch's own controls.
+  // Duration badge — Twitch's aria-valuetext uses VOD-absolute m:ss
+  // positions (for example "12:31 to 12:48"), which users can mistake for
+  // clip duration. The badge and all visible editor clocks expose only the
+  // selected duration in seconds. A slider observer, a DOM observer, and a
+  // 1s liveness tick re-apply that display across React replacements.
   // -------------------------------------------------------------------
   let durationBadge = null;
   let durationBadgeObs = null;
   let durationBadgeTick = null;
-
-  const fmtClock = (sec) => {
-    const s = Math.max(0, Math.floor(sec));
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const r = s % 60;
-    const pad = (n) => String(n).padStart(2, '0');
-    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
-  };
+  let durationClockObs = null;
+  let durationClockMaskLogged = false;
   const parseValuetext = (vt) => {
     const parts = String(vt || '').trim().split(/\s*to\s*/i);
     if (parts.length !== 2) return null;
@@ -530,16 +610,116 @@
       document.querySelector('[role="slider"]');
     return slider ? parseValuetext(slider.getAttribute('aria-valuetext')) : null;
   };
+  // C5 — anchor guard. The playback clock shows the VOD-absolute position
+  // the editor's media is actually at. After the drag the playhead (and the
+  // window start) must sit at startSec; a persistent offset means the VOD
+  // source never resolved (dead VOD, embed/auth error) and saving would
+  // publish a clip with no media. Re-read over ~3s so the editor's post-drag
+  // seek settles before refusing. Unreadable clock -> proceed (the slider
+  // valuetext confirm already guards the window; the clock is best-effort).
+  const anchorGuardOk = async (startSec, endSec = startSec) => {
+    const len = Math.max(0, endSec - startSec);
+    const read = () => {
+      const t = playbackTimeText();
+      if (!t) return null;
+      const m = t.match(/^\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*\/\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*$/);
+      if (!m) return null;
+      const pos = parseClock(m[1]);
+      const den = parseClock(m[2]);
+      if (pos == null) return null;
+      return { clock: t, pos, den };
+    };
+    for (let i = 0; i < 6; i++) {
+      const r = read();
+      if (r) {
+        if (r.den != null && r.den <= 90) {
+          const relStart = Math.max(0, r.den - len);
+          const relEnd = r.den;
+          // Native Twitch often parks the playhead at the clip end (1:30/1:30).
+          if (Math.abs(r.pos - relStart) <= 15 || Math.abs(r.pos - relEnd) <= 15) {
+            return { ok: true, pos: r.pos, clock: r.clock };
+          }
+        } else if (Math.abs(r.pos - startSec) <= 15 || Math.abs(r.pos - endSec) <= 15) {
+          return { ok: true, pos: r.pos, clock: r.clock };
+        }
+      }
+      if (i < 5) await sleep(600);
+    }
+    const last = read();
+    return { ok: false, pos: last ? last.pos : null, clock: last ? last.clock : null };
+  };
+  const clipDurFromSlider = () => {
+    const w = selectedWindow();
+    if (w && w.dur >= 5 && w.dur <= 60) return w.dur;
+    return Math.max(5, Math.min(60, endSec - startSec));
+  };
+  const clipRangeFromSlider = () => {
+    const w = selectedWindow();
+    if (w && w.dur >= 5 && w.dur <= 60) return { start: w.start, end: w.end };
+    return null;
+  };
+  const clampEditorVideo = () => {
+    const range = clipRangeFromSlider();
+    if (!range) return;
+    const vid = document.querySelector('video');
+    if (!vid || !Number.isFinite(vid.currentTime)) return;
+    if (vid.currentTime > range.end + 0.05) {
+      try { vid.currentTime = range.end; } catch { /* ignore */ }
+      try { if (!vid.paused) vid.pause(); } catch { /* ignore */ }
+    } else if (vid.currentTime < range.start - 0.2) {
+      try { vid.currentTime = range.start; } catch { /* ignore */ }
+    }
+  };
+  secondsifyClock = () => {
+    const dur = clipDurFromSlider();
+    for (const el of clockNodes()) {
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!CLOCK_RE.test(text)) continue;
+      const den = parseClock(text.split(/\s*\/\s*/)[1]);
+      if (den != null && Math.abs(den - dur) > 0.51) {
+        el.dataset.vodripOriginalClock = text;
+      } else if (!el.dataset.vodripOriginalClock) {
+        el.dataset.vodripOriginalClock = text;
+      }
+      const orig = el.dataset.vodripOriginalClock || text;
+      const origPos = parseClock(orig.split(/\s*\/\s*/)[0]);
+      const shownPos = origPos == null ? 0 : Math.max(0, Math.min(dur, origPos));
+      const next = `${fmtHms(shownPos)} / ${fmtHms(dur)}`;
+      if (text !== next) el.textContent = next;
+    }
+  };
+  hideAbsoluteTimeControls = () => { secondsifyClock(); };
+  maskAbsoluteTimeControls = () => { secondsifyClock(); clampEditorVideo(); };
+  startClockMask = () => {
+    secondsifyClock();
+    clampEditorVideo();
+    const vid = document.querySelector('video');
+    if (vid && vid.dataset.vodripClamp !== '1') {
+      vid.dataset.vodripClamp = '1';
+      vid.addEventListener('timeupdate', clampEditorVideo);
+      vid.addEventListener('seeking', clampEditorVideo);
+    }
+    if (preRangeClockObs || !document.body) return;
+    preRangeClockObs = new MutationObserver(() => {
+      secondsifyClock();
+      clampEditorVideo();
+    });
+    preRangeClockObs.observe(document.body, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+  };
   const confirmSelectedWindow = (scope, start, end) => waitFor(() => {
     const w = selectedWindow(scope);
     const len = end - start;
-    return w &&
-      Math.abs(w.start - start) <= 3 &&
-      Math.abs(w.end - end) <= 3 &&
-      Math.abs(w.dur - len) <= 1 &&
-      w.dur >= 5 && w.dur <= 60
-      ? w
-      : null;
+    if (!w || Math.abs(w.dur - len) > 1 || w.dur < 5 || w.dur > 60) return null;
+    // Success is the duration on the 90s raw-media timeline (e.g. "1:18 to
+    // 1:30" for a 12s clip). Absolute VOD clocks ("17:34 to 17:46") mean we
+    // fed the editor the wrong coordinate system.
+    const relative = w.start >= 0 && w.end <= 90 + 3;
+    const absolute = Math.abs(w.start - start) <= 3 && Math.abs(w.end - end) <= 3;
+    return relative || absolute ? w : null;
   }, 5000, 250);
   const renderDurationBadge = () => {
     const slider = document.querySelector('[role="slider"]');
@@ -578,6 +758,7 @@
     durationBadge.innerHTML =
       '<div data-vodrip-badge-sec style="font-size:30px;font-weight:800;color:#53fc18;letter-spacing:1px;">Duração: —</div>';
     document.documentElement.appendChild(durationBadge);
+    startClockMask();
     const observeSlider = () => {
       const slider = document.querySelector('[role="slider"]');
       if (!durationBadgeObs || !slider) return;
@@ -587,6 +768,18 @@
     durationBadgeObs = new MutationObserver(renderDurationBadge);
     observeSlider();
     renderDurationBadge();
+    durationClockObs = new MutationObserver(() => {
+      // Twitch re-renders the native clock independently of the slider; keep
+      // its visible value seconds-only instead of allowing a VOD m:ss back.
+      if (durationBadge) secondsifyClock();
+    });
+    if (document.body) {
+      durationClockObs.observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+      });
+    }
     window.addEventListener('resize', renderDurationBadge);
     // Liveness tick: React may replace the slider node entirely (the
     // attribute observer dies with the old node) — re-find + re-observe;
@@ -606,7 +799,8 @@
   };
   const unmountDurationBadge = () => {
     if (durationBadgeTick) { clearInterval(durationBadgeTick); durationBadgeTick = null; }
-    if (durationBadgeObs) { durationBadgeObs.disconnect(); durationBadgeObs = null; }
+    if (durationClockObs) { durationClockObs.disconnect(); durationClockObs = null; }
+    durationClockMaskLogged = false;
     if (durationBadge) { durationBadge.remove(); durationBadge = null; }
   };
 
@@ -729,7 +923,7 @@
           catch (err) { resolve('postMessage-threw:' + err); }
         });
         census.push('helper-echo: ' + echo);
-        const res = await rangeViaMainWorld(tStart, tEnd, vodDurationSec);
+        const res = await rangeViaMainWorld(tStart, tEnd);
         windowTest = res.ok
           ? `MOVED to ${res.valuetext} (target ${fmtHms(tStart)}→${fmtHms(tEnd)}) debug=${JSON.stringify(res.debug || {})}`
           : `NOT CONFIRMED (${res.reason || '?'})`;
@@ -737,6 +931,12 @@
         // window test mounts the same duration-first chip the real flow
         // mounts, so the census below can assert its presence + text.
         if (res.ok) mountDurationBadge();
+        // C5 anchor guard: does the editor's clock track the dragged window?
+        // Proves on a LIVE VOD (no publish) that a save would pass the guard.
+        const anchor = await anchorGuardOk(tStart, tEnd);
+        census.push('anchor-guard: ' + (anchor.ok
+          ? `OK@${anchor.pos}`
+          : `MISMATCH pos=${anchor.pos} clock=${anchor.clock || '(unreadable)'}`));
       }
       census.push('window-test: ' + windowTest);
       const badge = document.querySelector('[data-vodrip-duration-badge]');
@@ -753,7 +953,6 @@
       // VOD-absolute position; always surfaced in the diag census.
       census.push('playback-strong: ' + (playbackTimeText() || '(none)'));
       census.push('visible-clock: ' + (clockNodes().map((el) => (el.textContent || '').trim()).join(' | ') || '(none)'));
-      // Sink the census so Main can read the REAL editor DOM from the app
       // log (GET /api/debug/clip-events) after the user opens the diag URL.
       // Truncate each line: the backend rejects data > 8KB, and the panel
       // keeps the full text for UIA reads.
@@ -768,7 +967,45 @@
     });
     return;
   }
+  // Observe-only: never drag, rewrite clocks, or click Save. Used to capture
+  // Twitch's real GQL payload (clipOffsets / duration) without our hacks.
+  if (params.get('vodrip_observe') === '1') {
+    (async () => {
+      setStatus(
+        'MODO OBSERVAÇÃO\nNão vou mexer no editor.\nAjuste o trecho e clique Save você mesmo.\nA extensão de trace captura o GQL.',
+        'info',
+      );
+      const snapshot = (why) => {
+        const slider = document.querySelector('[role="slider"]');
+        let hist = null;
+        try {
+          const raw = JSON.stringify(history.state || {});
+          const match = raw.match(/"clipOffsets"\s*:\s*\{[^}]{0,240}\}/);
+          hist = match ? match[0] : (raw.includes('clipOffsets') ? 'present' : 'absent');
+        } catch {
+          hist = 'unreadable';
+        }
+        note('ext_observe', {
+          why,
+          startSec,
+          endSec,
+          title: clipTitle,
+          playback: playbackTimeText(),
+          valuetext: slider ? slider.getAttribute('aria-valuetext') : null,
+          historyClipOffsets: hist,
+        });
+      };
+      snapshot('start');
+      await waitFor(() => document.querySelector('[role="slider"]'), 45000, 500);
+      snapshot('slider');
+      setInterval(() => snapshot('tick'), 4000);
+    })().catch((err) => {
+      setStatus('OBSERVE FAIL: ' + (err && err.message ? err.message : String(err)), 'err');
+    });
+    return;
+  }
   setStatus(`Preparando clique de ${Math.round(endSec - startSec)}s…`);
+  startClockMask();
 
   // clips.twitch.tv/create — the legacy URL opens Twitch's clip editor
   // DIRECTLY (it reads vodID + offsetSeconds, which is the clip END) when
@@ -807,7 +1044,7 @@
         setReactValue(editorInput, clipTitle);
         note('ext_title', { title: clipTitle, value: editorInput.value || '', flow: 'create' });
       }
-      const rangeErr = await setEditorRange(document, startSec, endSec, vodDurationSec);
+      const rangeErr = await setEditorRange(document, startSec, endSec);
       if (rangeErr) {
         // Never click Save without a confirmed range. Leave the editor open
         // for an explicit user correction instead of publishing an unknown
@@ -839,12 +1076,37 @@
           );
           return;
         }
-        note('ext_range_confirmed', {
+        const vodWindow = vodRangeFromEditorWindow(
+          { start: startSec, end: endSec },
+          confirmedWindow,
+        );
+        seedEditorClipOffsets();
+    note('ext_range_confirmed', {
           startSec,
           endSec,
           durationSec: confirmedWindow.dur,
           valuetext: confirmedWindow.start + ' to ' + confirmedWindow.end,
+          vodStart: vodWindow.start,
+          vodEnd: vodWindow.end,
         });
+        const anchor = await anchorGuardOk(startSec, endSec);
+        if (!anchor.ok) {
+          note('ext_anchor_mismatch', {
+            startSec,
+            endSec,
+            durationSec: endSec - startSec,
+            clock: anchor.clock,
+            pos: anchor.pos,
+          });
+          setStatus(
+            'O vídeo não carregou no editor (posição ' +
+              (anchor.clock || 'indeterminada') +
+              `) — nada foi publicado. Verifique se o VOD ainda existe na Twitch (trecho ${fmtHms(startSec)}–${fmtHms(endSec)}, ${Math.round(endSec - startSec)}s).`,
+            'err',
+          );
+          closeAfterFlow(8000);
+          return;
+        }
         setStatus(`Salvando clique de ${Math.round(endSec - startSec)}s…`);
         // Wait for the Save button to become enabled (the editor loads the
         // VOD frame preview first; clicking too early is a silent no-op).
@@ -868,8 +1130,16 @@
           closeAfterFlow();
           return;
         }
-        note('ext_save_clicked', { startSec, endSec, title: clipTitle });
-        await sleep(1200);
+        const offsetsReady = await waitHistoryOffsets(confirmedWindow.start, confirmedWindow.end);
+        note('ext_save_clicked', {
+          startSec,
+          endSec,
+          title: clipTitle,
+          vodStart: vodWindow.start,
+          vodEnd: vodWindow.end,
+          historyOffsets: offsetsReady,
+        });
+        await sleep(offsetsReady.ok ? 400 : 1500);
         click(save);
         // The portrait-layout modal blocks EVERY save — dismiss it before
         // the publish watcher below starts (else the watcher times out and
@@ -892,8 +1162,14 @@
           const shareInput = find(['[data-a-target="clip-share-url"]', 'input[readonly]', 'textarea[readonly]']);
           if (shareInput) clipUrl = (shareInput.value || '').trim() || clipUrl;
         } catch { /* ignore */ }
+        const ready = await waitForPublishReady();
+        if (!ready) {
+          note('ext_error', { step: 'publish-ready', reason: 'processing-timeout' });
+          setStatus('A Twitch ainda está processando o clipe — deixei a aba aberta; não registrei um clipe incompleto.', 'err');
+          return;
+        }
         note('ext_published', { url: clipUrl || null, via: published === 'copy' ? 'copy-link' : 'navigation' });
-        recordPublishedClip(clipUrl || '');
+        recordPublishedClip(clipUrl || '', vodWindow);
         setStatus(
           clipUrl
             ? `Clip publicado ✓\n${clipTitle}\n${clipUrl}`
@@ -1023,7 +1299,7 @@
       return;
     }
     await sleep(1500); // let the editor settle
-    const rangeErr = await setEditorRange(editor, startSec, endSec, vodDurationSec);
+    const rangeErr = await setEditorRange(editor, startSec, endSec);
     if (rangeErr) {
       setStatus(
         `Clique de ${Math.round(endSec - startSec)}s (de ${fmtHms(startSec)} a ${fmtHms(endSec)}) NÃO posicionado no editor (${rangeErr}) — nada foi publicado. Ajuste o trecho no editor e publique você mesmo.`,
@@ -1047,12 +1323,40 @@
       closeAfterFlow(2000);
       return;
     }
+    const vodWindow = vodRangeFromEditorWindow(
+      { start: startSec, end: endSec },
+      confirmedWindow,
+    );
     note('ext_range_confirmed', {
       startSec,
       endSec,
       durationSec: confirmedWindow.dur,
       valuetext: confirmedWindow.start + ' to ' + confirmedWindow.end,
+      vodStart: vodWindow.start,
+      vodEnd: vodWindow.end,
+      flow: 'videos',
     });
+    const offsetsReady = await waitHistoryOffsets(confirmedWindow.start, confirmedWindow.end);
+    const anchor = await anchorGuardOk(startSec, endSec);
+    if (!anchor.ok) {
+      note('ext_anchor_mismatch', {
+        startSec,
+        endSec,
+        durationSec: endSec - startSec,
+        clock: anchor.clock,
+        pos: anchor.pos,
+        historyOffsets: offsetsReady,
+        flow: 'videos',
+      });
+      setStatus(
+        'O vídeo não carregou no editor (posição ' +
+          (anchor.clock || 'indeterminada') +
+          `) — nada foi publicado. Verifique se o VOD ainda existe na Twitch (trecho ${fmtHms(startSec)}–${fmtHms(endSec)}, ${Math.round(endSec - startSec)}s).`,
+        'err',
+      );
+      closeAfterFlow(8000);
+      return;
+    }
 
     // 4. Title — fill only the original title supplied by the app. The editor
     // REQUIRES one ("Adicione um título (obrigatório)"); without it, leave the
@@ -1123,8 +1427,14 @@
         if (shareInput) clipUrl = (shareInput.value || '').trim();
       } catch { /* ignore */ }
       if (!clipUrl) clipUrl = location.href;
+      const ready = await waitForPublishReady();
+      if (!ready) {
+        note('ext_error', { step: 'publish-ready', reason: 'processing-timeout' });
+        setStatus('A Twitch ainda está processando o clipe — deixei a aba aberta; não registrei um clipe incompleto.', 'err');
+        return;
+      }
       note('ext_published', { url: clipUrl, via: published === 'copy' ? 'copy-link' : 'navigation' });
-      recordPublishedClip(clipUrl);
+      recordPublishedClip(clipUrl, vodWindow);
       setStatus(
         clipUrl
           ? `Clip publicado ✓\n${clipTitle}\n${clipUrl}`

@@ -14,6 +14,7 @@ import { apiGet, apiPost } from '../hooks/useApiClient';
 import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
+import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
 
 type Props = {
   settings: AppSettings;
@@ -35,7 +36,7 @@ type Props = {
 /** Fields SettingsTab displays; signature change => "unsaved changes" chip. */
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
-  'start_with_windows',
+  'start_with_windows', 'download_layout', 'download_transcript_sidecar', 'download_chat_before_sec', 'download_chat_after_sec',
   'archive_vod_keep_count', 'whisper_model', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
@@ -265,6 +266,43 @@ export default function SettingsTab({
               {pickingFolder ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
               {pickingFolder ? '...' : t('Browse')}
             </button>
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption>{t('Download folder structure')}</FieldCaption>
+          <div className="flex gap-1.5">
+            <button type="button"
+              onClick={() => setSettings({ ...settings, download_layout: 'flat' })}
+              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest border-2 ${(settings.download_layout || 'typed') === 'flat' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
+              {t('One folder')}
+            </button>
+            <button type="button"
+              onClick={() => setSettings({ ...settings, download_layout: 'typed' })}
+              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest border-2 ${(settings.download_layout || 'typed') === 'typed' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
+              {t('Subfolders')}
+            </button>
+          </div>
+          <pre className="text-[10px] font-mono text-zinc-500 bg-zinc-950 border-2 border-zinc-800 p-2 overflow-x-auto leading-relaxed">
+{previewDownloadTree(settings.download_folder || 'Downloads', (settings.download_layout || 'typed') as DownloadLayout).join(String.fromCharCode(10))}
+          </pre>
+        </div>
+        <Toggle
+          label={t('Save transcript .txt with downloads')}
+          info={t('When a transcript already exists, write a subtitle-style .txt next to the video. On by default.')}
+          checked={settings.download_transcript_sidecar !== false}
+          onChange={(c) => setSettings({ ...settings, download_transcript_sidecar: c })}
+          ariaLabel="save transcript txt with downloads"
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <div className="flex flex-col gap-1.5">
+            <FieldCaption>{t('Chat before (sec)')}</FieldCaption>
+            <NumberField ariaLabel="chat before seconds" value={settings.download_chat_before_sec ?? 120} min={0} max={600} step={10}
+              onChange={(v) => setSettings({ ...settings, download_chat_before_sec: v })} />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <FieldCaption>{t('Chat after (sec)')}</FieldCaption>
+            <NumberField ariaLabel="chat after seconds" value={settings.download_chat_after_sec ?? 30} min={0} max={600} step={10}
+              onChange={(v) => setSettings({ ...settings, download_chat_after_sec: v })} />
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2">

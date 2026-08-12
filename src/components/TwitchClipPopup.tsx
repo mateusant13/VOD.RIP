@@ -1,8 +1,7 @@
 /**
  * Twitch clip mini-preview — the "Twitch clip" button on the main preview and
- * the explore popup opens this floating player on a 95s (1:35) window around
- * the click moment instead of jumping straight to Twitch. The user trims a
- * 5..60s
+ * the explore popup opens this floating player on a 120s window around
+ * the click (60s left + 60s right). The user trims a 5..60s
  * selection on the window timeline, then 'Create clip' opens Twitch's own
  * clip editor in the OS default browser with the selection as vodrip_* params
  * (vod_offset = selection END — see twitchClip.ts); the VOD.RIP cookie
@@ -35,6 +34,7 @@ import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
   clampClipSelection,
+  clipRailDragTarget,
   initialClipSelection,
   openTwitchClipEditorInBrowser,
   reportClipEvent,
@@ -42,11 +42,12 @@ import {
   twitchClipWindow,
 } from '../twitchClip';
 import {
-  PREVIEW_FAST_START_HEIGHT,
+  PREVIEW_SCRUB_HEIGHT,
   attachPreviewBufferingListeners,
   attachProgressivePreview,
   createPreviewSessionWithRetry,
   detachProgressivePreview,
+  pinHlsToLowestLevel,
   playPreviewWithAudio,
   resolvePreviewPlayback,
 } from '../previewPlayerUtils';
@@ -55,9 +56,9 @@ import { PREVIEW_DEFAULT_VOLUME, panelPosAfterResize, startPanelResizeDrag } fro
 import { PanelResizeHandles, type ResizeEdge } from '../explorePopupUtils';
 import type { PanelSize } from '../types';
 import { twitchAdBlockHlsConfig } from '../twitchAdBlock';
+import { pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
 import { formatHmsFull } from '../utils';
 import ClipDurationAdjustButtons from './ClipDurationAdjustButtons';
-import EditableHmsTime from './EditableHmsTime';
 import TwitchLogoIcon from './TwitchLogoIcon';
 
 const POPUP_W = 460;
@@ -93,17 +94,20 @@ const RESIZE_MARGIN = 32;
 const _clipSessionCache = new Map<string, string>();
 const _CLIP_SESSION_CACHE_MAX = 8;
 
-function _cacheClipSession(url: string, sessionId: string): void {
-  const prev = _clipSessionCache.get(url);
+function _clipSessionKey(url: string, start: number, end: number): string {
+  return `${url}#${Math.round(start)}-${Math.round(end)}@${PREVIEW_SCRUB_HEIGHT}`;
+}
+
+function _cacheClipSession(key: string, sessionId: string): void {
+  const prev = _clipSessionCache.get(key);
   if (prev && prev !== sessionId) {
-    // Same VOD, superseded session (stale probe → fresh create).
     void apiDelete(`/api/preview/session/${prev}`).catch(() => {});
   }
-  _clipSessionCache.set(url, sessionId);
+  _clipSessionCache.set(key, sessionId);
   if (_clipSessionCache.size > _CLIP_SESSION_CACHE_MAX) {
-    const oldestUrl = _clipSessionCache.keys().next().value as string;
-    const evicted = _clipSessionCache.get(oldestUrl);
-    _clipSessionCache.delete(oldestUrl);
+    const oldestKey = _clipSessionCache.keys().next().value as string;
+    const evicted = _clipSessionCache.get(oldestKey);
+    _clipSessionCache.delete(oldestKey);
     if (evicted) void apiDelete(`/api/preview/session/${evicted}`).catch(() => {});
   }
 }
@@ -113,14 +117,12 @@ interface TwitchClipPopupProps {
   url: string;
   broadcasterLogin: string;
   vodId: string;
-  /** VOD time of the click — the 95s (1:35) window is centred here (unless
-   * anchorRange is set, which takes precedence). */
+  /** VOD time of the click — the 120s window is 60s left + 60s right of this. */
   playheadSec: number;
   /** VOD length; <=0/unknown → the upper window edge is unclamped. */
   vodDurationSec: number;
-  /** The opening preview's typed trim range (H:M:S fields). When valid
-   * (end > start), the popup window centres on it and the initial clip
-   * selection IS the trim — the clip comes from where the user pointed. */
+  /** Unused for window placement (click always wins). Kept so callers can
+   * still pass a short 5–60s trim as the initial selection. */
   anchorRange?: { start: number; end: number };
   /** Original VOD title; every browser clip uses this title verbatim. */
   vodTitle: string;
@@ -134,6 +136,15 @@ interface TwitchClipPopupProps {
    * re-downloading from the CDN. Skipped when trimTimeline is true (the
    * preview HLS is a short trim, not the full VOD). */
   reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
+  /** When the Download checkbox is on, Create also enqueues this VOD crop. */
+  onDownloadSelection?: (sel: {
+    start: number;
+    end: number;
+    url: string;
+    vodId: string;
+    channel: string;
+    title: string;
+  }) => void;
 }
 
 export default function TwitchClipPopup({
@@ -147,7 +158,7 @@ export default function TwitchClipPopup({
   zIndex,
   onClose,
   initialVolume = PREVIEW_DEFAULT_VOLUME,
-  reuseSession = null,
+  onDownloadSelection,
 }: TwitchClipPopupProps) {
   const { t } = useI18n();
   const volumeRef = useRef(initialVolume);
@@ -158,7 +169,7 @@ export default function TwitchClipPopup({
   const winLen = win.end - win.start;
   const windowTooShort = winLen < TWITCH_CLIP_MIN_SEC;
 
-  const [selection, setSelection] = useState(() => initialClipSelection(win, anchorRange));
+  const [selection, setSelection] = useState(() => initialClipSelection(win, anchorRange, playheadSec));
   const selectionRef = useRef(selection);
   const commitSelection = useCallback((next: { start: number; end: number }) => {
     selectionRef.current = next;
@@ -202,6 +213,17 @@ export default function TwitchClipPopup({
   useEffect(() => {
     popupRef.current?.focus({ preventScroll: true });
   }, []);
+  useEffect(() => {
+    pauseOtherPreviews();
+    const pause = () => {
+      const video = videoRef.current;
+      if (video && !video.paused) {
+        video.pause();
+        setPlaying(false);
+      }
+    };
+    return registerPreviewPlayback(pause);
+  }, []);
   /** In-flight window-body drag (move the whole selection along the VOD). */
   const windowDragRef = useRef<{
     pointerId: number;
@@ -213,6 +235,8 @@ export default function TwitchClipPopup({
   } | null>(null);
   /** A window drag ends with a synthetic click on the bar — suppress its seek. */
   const suppressBarClickRef = useRef(false);
+  /** Range/handle drag is preview-scrubbing; timeupdate must not move the playhead. */
+  const holdPlayheadRef = useRef(false);
   const hlsRef = useRef<Hls | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const timelineOffsetRef = useRef(0);
@@ -232,6 +256,7 @@ export default function TwitchClipPopup({
   const [retryTick, setRetryTick] = useState(0);
   const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
+  const [downloadWithClip, setDownloadWithClip] = useState(false);
 
   const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
     if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
@@ -262,21 +287,17 @@ export default function TwitchClipPopup({
       }
     };
     (async () => {
-      // Priority 1: the opening preview's own session (same VOD).
-      if (reuseSession?.sessionId && !reuseSession.trimTimeline) {
-        if (await adoptSession(reuseSession.sessionId)) return;
-      }
-      // Priority 2: a clip session cached from an earlier open of this VOD —
-      // closing the popup no longer deletes it (see _clipSessionCache), so a
-      // re-open skips the POST and the backend resolve entirely.
-      const cachedSid = _clipSessionCache.get(url);
+      // Dedicated 160p crop of the 120s click window — do not adopt the main
+      // preview's 720p session; scrubbing has to stay ugly and fast.
+      const cacheKey = _clipSessionKey(url, win.start, win.end);
+      const cachedSid = _clipSessionCache.get(cacheKey);
       if (cachedSid && await adoptSession(cachedSid)) return;
       try {
         const res = await createPreviewSessionWithRetry({
           url,
           crop_start: win.start,
           crop_end: win.end,
-          prefer_height: PREVIEW_FAST_START_HEIGHT,
+          prefer_height: PREVIEW_SCRUB_HEIGHT,
         });
         if (cancelled) {
           // ponytail: StrictMode double-invoke — both runs share the SAME
@@ -291,7 +312,7 @@ export default function TwitchClipPopup({
           return;
         }
         sessionIdRef.current = res.session_id;
-        _cacheClipSession(url, res.session_id);
+        _cacheClipSession(_clipSessionKey(url, win.start, win.end), res.session_id);
         // Window-muxed MP4 (trim_timeline) is 0-based; Twitch VOD HLS is
         // absolute VOD time. offset maps video time → VOD time.
         timelineOffsetRef.current = res.trim_timeline === true ? win.start : 0;
@@ -319,7 +340,7 @@ export default function TwitchClipPopup({
       // and LRU cap reclaim idle sessions.
       sessionIdRef.current = null;
     };
-  }, [url, win.start, win.end, retryTick, reuseSession]);
+  }, [url, win.start, win.end, retryTick]);
 
   // ── Playback attach (HLS for Twitch VODs, progressive fallback) ──
   useEffect(() => {
@@ -349,6 +370,7 @@ export default function TwitchClipPopup({
         if (!video.paused) video.pause();
       }
       if (Math.abs(video.currentTime - t) > 0.05) video.currentTime = t;
+      if (holdPlayheadRef.current) return;
       const vodTime = t + base;
       currentTimeRef.current = vodTime;
       setCurrentTime(vodTime);
@@ -361,6 +383,7 @@ export default function TwitchClipPopup({
       setBuffering(false);
       setLoading(false);
       if (video.paused) {
+        pauseOtherPreviews();
         void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
           setPlaying(!video.paused);
         });
@@ -396,12 +419,16 @@ export default function TwitchClipPopup({
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
       testBandwidth: false,
+      startLevel: 0,
+      capLevelToPlayerSize: false,
       ...twitchAdBlockHlsConfig({}),
       startPosition: initialVideoTime,
     });
     hlsRef.current = hls;
+    pinHlsToLowestLevel(hls);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      pinHlsToLowestLevel(hls);
       if (!cancelled) hls.startLoad(initialVideoTime);
     });
     hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -434,11 +461,36 @@ export default function TwitchClipPopup({
   const seekTo = useCallback((vodSec: number) => {
     const video = videoRef.current;
     if (!video) return;
+    pinHlsToLowestLevel(hlsRef.current);
     const t = Math.max(win.start, Math.min(win.end, vodSec));
     video.currentTime = Math.max(0, t - timelineOffsetRef.current);
     currentTimeRef.current = t;
     setCurrentTime(t);
   }, [win]);
+
+  /** Seek the picture without moving the playhead (range/handle preview scrub). */
+  const seekPreview = useCallback((vodSec: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    pinHlsToLowestLevel(hlsRef.current);
+    const t = Math.max(win.start, Math.min(win.end, vodSec));
+    video.currentTime = Math.max(0, t - timelineOffsetRef.current);
+  }, [win]);
+
+  const resumeFromPlayhead = useCallback((wasPlaying: boolean, restoreSec: number) => {
+    const video = videoRef.current;
+    // Seek back to the playhead before releasing the hold, so a late
+    // timeupdate from the preview-scrub position cannot steal it.
+    seekTo(restoreSec);
+    holdPlayheadRef.current = false;
+    if (wasPlaying && video) {
+      void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
+        setPlaying(!video.paused);
+      });
+    } else {
+      setPlaying(false);
+    }
+  }, [seekTo]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -476,6 +528,15 @@ export default function TwitchClipPopup({
     const fixed = which === 'in' ? selectionRef.current.end : selectionRef.current.start;
     const prevUserSelect = document.body.style.userSelect;
     document.body.style.userSelect = 'none';
+    const video = videoRef.current;
+    const wasPlaying = !!(video && !video.paused);
+    const restoreSec = currentTimeRef.current;
+    holdPlayheadRef.current = true;
+    if (video && !video.paused) {
+      video.pause();
+      setPlaying(false);
+    }
+    pinHlsToLowestLevel(hlsRef.current);
 
     const xToSec = (clientX: number) => {
       const rect = rail.getBoundingClientRect();
@@ -494,6 +555,7 @@ export default function TwitchClipPopup({
       handle.removeEventListener('pointercancel', endDrag);
       handle.removeEventListener('lostpointercapture', endDrag);
       try { handle.releasePointerCapture(pointerId); } catch { /* ignore */ }
+      resumeFromPlayhead(wasPlaying, restoreSec);
     };
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== pointerId) return;
@@ -502,12 +564,13 @@ export default function TwitchClipPopup({
         ? clampClipSelection(sec, fixed, win.start, win.end, { move: 'in', fixedEnd: fixed })
         : clampClipSelection(fixed, sec, win.start, win.end, { move: 'out', fixedStart: fixed });
       commitSelection(res);
+      seekPreview(which === 'in' ? res.start : res.end);
     };
     handle.addEventListener('pointermove', onMove);
     handle.addEventListener('pointerup', endDrag);
     handle.addEventListener('pointercancel', endDrag);
     handle.addEventListener('lostpointercapture', endDrag);
-  }, [win, commitSelection, markEndpoint]);
+  }, [win, commitSelection, markEndpoint, resumeFromPlayhead, seekPreview]);
 
   // Grab the selection WINDOW (between the edge handles) and move it along
   // the VOD; the edge handles keep resizing. The grab offset is recorded in
@@ -541,25 +604,44 @@ export default function TwitchClipPopup({
     windowDragRef.current = state;
     suppressBarClickRef.current = false;
     document.body.style.userSelect = 'none';
+    const video = videoRef.current;
+    const wasPlaying = Boolean(video && !video.paused);
+    const restoreSec = currentTimeRef.current;
 
     const endDrag = () => {
       if (windowDragRef.current !== state) return;
       windowDragRef.current = null;
       setWindowDragging(false);
       document.body.style.userSelect = state.prevUserSelect;
-      // pointerup fires a click on the bar — a real drag must not then seek.
-      if (state.moved) suppressBarClickRef.current = true;
+      suppressBarClickRef.current = true;
       target.removeEventListener('pointermove', onMove);
       target.removeEventListener('pointerup', endDrag);
       target.removeEventListener('pointercancel', endDrag);
       target.removeEventListener('lostpointercapture', endDrag);
       try { target.releasePointerCapture(pointerId); } catch { /* ignore */ }
+      if (!state.moved) {
+        holdPlayheadRef.current = false;
+        seekTo(grabSec);
+        if (wasPlaying && video) {
+          void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
+            setPlaying(!video.paused);
+          });
+        }
+        return;
+      }
+      resumeFromPlayhead(wasPlaying, restoreSec);
     };
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== state.pointerId) return;
       if (!state.moved) {
         if (Math.abs(ev.clientX - state.startClientX) < 3) return;
         state.moved = true;
+        holdPlayheadRef.current = true;
+        if (video && !video.paused) {
+          video.pause();
+          setPlaying(false);
+        }
+        pinHlsToLowestLevel(hlsRef.current);
       }
       const r = rail.getBoundingClientRect();
       if (r.width <= 0) return;
@@ -567,12 +649,66 @@ export default function TwitchClipPopup({
       const sec = win.start + frac * winLen;
       const newStart = Math.max(win.start, Math.min(win.end - state.selLen, sec - state.grabOffsetSec));
       commitSelection({ start: newStart, end: newStart + state.selLen });
+      seekPreview(newStart + state.grabOffsetSec);
+    };
+
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', endDrag);
+    target.addEventListener('pointercancel', endDrag);
+    target.addEventListener('lostpointercapture', endDrag);
+  }, [win, commitSelection, resumeFromPlayhead, seekPreview, seekTo]);
+
+  const beginPlayheadScrub = useCallback((e: ReactPointerEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
+    const rail = railRef.current;
+    if (!rail) return;
+    const pointerId = e.pointerId;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget;
+    target.setPointerCapture(pointerId);
+    pinHlsToLowestLevel(hlsRef.current);
+    const video = videoRef.current;
+    const wasPlaying = !!(video && !video.paused);
+    if (video && !video.paused) {
+      video.pause();
+      setPlaying(false);
+    }
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    const xToSec = (clientX: number) => {
+      const rect = rail.getBoundingClientRect();
+      if (rect.width <= 0) return win.start;
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return fracToSec(frac, win);
+    };
+    seekTo(xToSec(e.clientX));
+    let ended = false;
+    const endDrag = () => {
+      if (ended) return;
+      ended = true;
+      document.body.style.userSelect = prevUserSelect;
+      target.removeEventListener('pointermove', onMove);
+      target.removeEventListener('pointerup', endDrag);
+      target.removeEventListener('pointercancel', endDrag);
+      target.removeEventListener('lostpointercapture', endDrag);
+      try { target.releasePointerCapture(pointerId); } catch { /* ignore */ }
+      if (wasPlaying && video) {
+        void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {
+          setPlaying(!video.paused);
+        });
+      }
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      pinHlsToLowestLevel(hlsRef.current);
+      seekTo(xToSec(ev.clientX));
     };
     target.addEventListener('pointermove', onMove);
     target.addEventListener('pointerup', endDrag);
     target.addEventListener('pointercancel', endDrag);
     target.addEventListener('lostpointercapture', endDrag);
-  }, [win, commitSelection]);
+  }, [win, seekTo]);
 
   const adjustSelection = useCallback((buttonDelta: number) => {
     const sel = selectionRef.current;
@@ -588,24 +724,6 @@ export default function TwitchClipPopup({
         { move: 'out', fixedStart: sel.start },
       );
     commitSelection(res);
-  }, [win, commitSelection]);
-
-  // Editable H:M:S input for the clip length — CLIP-RELATIVE, like Twitch's
-  // own editor: Start is always 00:00:00 (the clip begins at its own 0) and
-  // End is the clip duration (e.g. 0:30). The absolute VOD position comes
-  // from where the selection sits on the rail (see the VOD readout below).
-  // Committing End pins the absolute start and enforces the 5..60s length,
-  // capped by the window.
-  const commitDurationInput = useCallback((relSec: number) => {
-    const sel = selectionRef.current;
-    const winLen = win.end - win.start;
-    const minDur = Math.min(TWITCH_CLIP_MIN_SEC, winLen);
-    const maxDur = Math.min(TWITCH_CLIP_MAX_SEC, winLen);
-    const dur = Math.max(minDur, Math.min(relSec, maxDur));
-    commitSelection({
-      start: sel.start,
-      end: Math.min(win.end, sel.start + dur),
-    });
   }, [win, commitSelection]);
 
   // Same range, but driven in the OS browser by the VOD.RIP cookie extension
@@ -690,10 +808,34 @@ export default function TwitchClipPopup({
       endSec: sel.end,
       durationSec: sel.end - sel.start,
       title: clipTitle,
+      download: downloadWithClip,
     });
+    if (downloadWithClip) {
+      const payload = {
+        start: sel.start,
+        end: sel.end,
+        url,
+        vodId,
+        channel: broadcasterLogin,
+        title: clipTitle,
+      };
+      if (onDownloadSelection) {
+        onDownloadSelection(payload);
+      } else {
+        void apiPost('/api/download/video', {
+          url,
+          quality: 'source',
+          crop_start: sel.start,
+          crop_end: sel.end,
+          title: clipTitle,
+          channel: broadcasterLogin,
+          duration: sel.end - sel.start,
+        }).catch(() => {});
+      }
+    }
     openTwitchClipEditorInBrowser(vodId, broadcasterLogin, sel.start, sel.end, clipTitle, vodDurationSec);
     showClipNotice('ok', t('Opened in your browser — the VOD.RIP extension fills the editor and publishes'));
-  }, [vodId, broadcasterLogin, clipTitle, showClipNotice]);
+  }, [vodId, broadcasterLogin, clipTitle, showClipNotice, t, vodDurationSec, downloadWithClip, onDownloadSelection, url]);
 
   const railView = useMemo(() => ({ start: win.start, end: win.end }), [win]);
   const playFrac = secToFrac(currentTime, railView) * 100;
@@ -949,53 +1091,52 @@ export default function TwitchClipPopup({
         )}
       </div>
 
-      {/* Trim rail: 5..60s selection on the 95s (1:35) window timeline */}
+      {/* Trim rail: 5..60s selection on the 120s click window */}
       <div className="px-2 py-1.5 flex flex-col gap-1 shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600">
             {t('Range')}
           </span>
-          <span className="flex items-center gap-1" title={t('Clip start — always 00:00:00 (clip time, like the Twitch editor)')}>
+          <span className="flex items-center gap-1" title={t('Clip start (VOD time)')}>
             <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('Start')}</span>
-            <span className="text-[10px] font-bold text-zinc-500">00:00:00</span>
+            <span className="text-[10px] font-bold text-zinc-300 tabular-nums">{formatHmsFull(selection.start)}</span>
           </span>
           <span className="text-[9px] font-mono text-zinc-600">–</span>
-          <span className="flex items-center gap-1" title={t('Clip length (clip time — the clip ends here)')}>
+          <span className="flex items-center gap-1" title={t('Clip end (VOD time)')}>
             <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">{t('End')}</span>
-            <EditableHmsTime
-              valueSec={selection.end - selection.start}
-              minSec={Math.min(TWITCH_CLIP_MIN_SEC, winLen)}
-              maxSec={Math.min(TWITCH_CLIP_MAX_SEC, winLen)}
-              onChange={commitDurationInput}
-              className="text-[10px] font-bold text-[#9146FF]"
-            />
+            <span className="text-[10px] font-bold text-[#9146FF] tabular-nums">{formatHmsFull(selection.end)}</span>
           </span>
           <span className="ml-auto text-[8px] font-mono uppercase tracking-wider text-zinc-600">
             {t('H:M:S')}
           </span>
         </div>
-        <div className="flex items-center gap-1 pl-9" title={t('Absolute VOD time of the selection (debug)')}>
-          <span className="text-[7px] font-mono uppercase tracking-wider text-zinc-700">{t('VOD')}</span>
-          <span className="text-[8px] font-mono text-zinc-600">
-            {formatHmsFull(selection.start)} – {formatHmsFull(selection.end)}
-          </span>
-        </div>
-        <div className="flex items-stretch gap-2">
+        <div className="flex items-stretch gap-2 pt-1.5">
           <span className="text-[8px] font-mono uppercase w-9 shrink-0 tracking-wider text-zinc-600 self-center">
             {t('Clip')}
           </span>
           <div
             ref={railRef}
-            className="relative flex-1 h-6 bg-zinc-800/80 cursor-pointer"
-            title={t('Drag handles to set the clip range (5–60s)')}
-            onClick={(e) => {
-              if (e.target !== e.currentTarget) return;
+            className="relative flex-1 h-6 bg-zinc-800/80 cursor-pointer overflow-visible"
+            title={t('Click: move playhead. Drag the range: move it. Drag the playhead: scrub.')}
+            onPointerDown={(e) => {
+              if (e.button !== 0 || e.target !== e.currentTarget) return;
               const rail = railRef.current;
               if (!rail) return;
               const rect = rail.getBoundingClientRect();
               if (rect.width <= 0) return;
-              const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              seekTo(fracToSec(frac, railView));
+              const kind = clipRailDragTarget(
+                e.clientX - rect.left, rect.width, playFrac, selStartFrac, selEndFrac,
+              );
+              if (kind === 'playhead') {
+                beginPlayheadScrub(e);
+                return;
+              }
+              if (kind === 'range') {
+                beginWindowDrag(e);
+                return;
+              }
+              seekTo(fracToSec((e.clientX - rect.left) / rect.width, railView));
+              beginPlayheadScrub(e);
             }}
           >
             <div
@@ -1005,28 +1146,37 @@ export default function TwitchClipPopup({
                 width: `${Math.max(0, selEndFrac - selStartFrac)}%`,
                 cursor: windowDragging ? 'grabbing' : 'grab',
               }}
-              title={t('Drag the window to move the clip along the VOD')}
-              onPointerDown={beginWindowDrag}
-              onClick={(e) => {
-                // A drag releases with a synthetic click — don't seek after moving.
-                if (suppressBarClickRef.current) {
-                  suppressBarClickRef.current = false;
-                  return;
-                }
+              title={t('Drag to move the clip range — preview scrubs; release resumes from the playhead')}
+              onPointerDown={(e) => {
                 const rail = railRef.current;
                 if (!rail) return;
                 const rect = rail.getBoundingClientRect();
-                if (rect.width <= 0) return;
-                const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                seekTo(fracToSec(frac, railView));
+                const kind = clipRailDragTarget(
+                  e.clientX - rect.left, rect.width, playFrac, selStartFrac, selEndFrac,
+                );
+                if (kind === 'playhead') {
+                  beginPlayheadScrub(e);
+                  return;
+                }
+                beginWindowDrag(e);
+              }}
+              onClick={() => {
+                // Range click must not steal the playhead — playback stays
+                // on the triangle even when it sits outside the selection.
+                suppressBarClickRef.current = false;
               }}
             >
               <div className="absolute top-1/2 -translate-y-1/2 h-1.5 w-full bg-[#9146FF]/60 pointer-events-none" />
             </div>
             <div
-              className="absolute top-0 bottom-0 w-px bg-white/70 -translate-x-1/2 pointer-events-none z-[1]"
+              className="absolute -top-1.5 bottom-0 w-4 -translate-x-1/2 z-[3] touch-none cursor-ew-resize"
               style={{ left: `${playFrac}%` }}
-            />
+              title={t('Scrub playhead')}
+              onPointerDown={beginPlayheadScrub}
+            >
+              <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[4px] border-r-[4px] border-t-[5px] border-l-transparent border-r-transparent border-t-white" />
+              <div className="absolute top-1.5 bottom-0 left-1/2 w-px bg-white/80 -translate-x-1/2 pointer-events-none" />
+            </div>
             <div
               role="slider"
               aria-label={t('Clip start')}
@@ -1078,6 +1228,20 @@ export default function TwitchClipPopup({
             {t('window {start} – {end}', { start: formatHmsFull(win.start), end: formatHmsFull(win.end) })}
           </span>
           <div className="flex items-center gap-1.5">
+            <label
+              className="flex items-center gap-1 cursor-pointer select-none"
+              title={t('Also download this range when creating the clip')}
+            >
+              <input
+                type="checkbox"
+                checked={downloadWithClip}
+                onChange={(e) => setDownloadWithClip(e.target.checked)}
+                className="accent-[#9146FF]"
+              />
+              <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-400">
+                {t('Download')}
+              </span>
+            </label>
             <button
               type="button"
               onClick={() => void createInBrowser()}

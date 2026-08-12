@@ -226,6 +226,8 @@ export const PREVIEW_CLIP_DEFAULT_HEIGHT = 360;
 export const PREVIEW_YOUTUBE_DEFAULT_HEIGHT = 720;
 /** Fast-start preview tier. 360p starts instantly; quality menu can bump later. */
 export const PREVIEW_FAST_START_HEIGHT = 360;
+/** Ugly-fast scrubbing tier — smallest Twitch ladder step. */
+export const PREVIEW_SCRUB_HEIGHT = 160;
 /** Max prefer_height when variant list unknown. */
 export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
 /** Debounce resize-driven POST /api/preview/session/.../quality (viewport cap changes). */
@@ -237,6 +239,19 @@ export const WINDOW_HLS_SEGMENT_SEC = 4;
 
 export function isYouTubePreviewPlatform(platform: string | null | undefined): boolean {
   return (platform || '').toLowerCase() === 'youtube';
+}
+
+/** Pin an hls.js instance to its lowest variant. Scrubbing stays ugly and fast. */
+export function pinHlsToLowestLevel(hls: { startLevel?: number; currentLevel?: number; nextLevel?: number; loadLevel?: number } | null | undefined): void {
+  if (!hls) return;
+  try {
+    hls.startLevel = 0;
+    hls.currentLevel = 0;
+    hls.nextLevel = 0;
+    hls.loadLevel = 0;
+  } catch {
+    /* ignore */
+  }
 }
 
 /** YouTube preview tiers allowed under the quality policy: VOD (and any

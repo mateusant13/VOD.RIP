@@ -15,8 +15,13 @@ import { apiDelete, apiGet, apiPost } from './hooks/useApiClient';
 export const TWITCH_CLIP_MAX_SEC = 60;
 /** Twitch's own editor rejects selections shorter than this. */
 export const TWITCH_CLIP_MIN_SEC = 5;
-/** Twitch's native editor window length: 1:30 (90s). */
-export const TWITCH_CLIP_WINDOW_SEC = 90;
+/** Mini-preview pad on each side of the click (60s left + 60s right). */
+export const TWITCH_CLIP_PAD_SEC = 60;
+/** Mini-preview window length: 120s around the click. Twitch's native
+ * editor is still ~90s — that constraint lives in the cookie extension. */
+export const TWITCH_CLIP_WINDOW_SEC = TWITCH_CLIP_PAD_SEC * 2;
+/** Pixel hit-radius around the playhead on the mini-preview rail. */
+export const CLIP_PLAYHEAD_HIT_PX = 12;
 
 /**
  * Debugging event sequence for the clip flow: every step of a clip attempt
@@ -30,53 +35,53 @@ export function reportClipEvent(event: string, data: Record<string, unknown> = {
 }
 
 /**
- * Mini-preview window for the "Twitch clip" button: 90s (1:30) around the
- * click moment — the user trims there and creates a 5–60s clip. Live: open
- * the editor directly — no VOD timeline to select from.
- *
- * When `anchor` is a valid range (end > start) — the user's typed trim from
- * the opening preview — the window centres on the anchor's midpoint instead
- * of the playhead, so the trim lands inside the mini-preview.
+ * Mini-preview window for the "Twitch clip" button: 120s around the click
+ * (60s left + 60s right). At VOD edges the missing side is filled from the
+ * other so the window stays 120s when the VOD is long enough. `anchor` is
+ * ignored — the window is always the click moment, not the main trim.
  */
 export function twitchClipWindow(
   playheadSec: number,
   vodDurationSec: number,
-  anchor?: { start: number; end: number },
+  _anchor?: { start: number; end: number },
 ): { start: number; end: number } {
   const dur = Number.isFinite(vodDurationSec) && vodDurationSec > 0
     ? vodDurationSec
     : Number.POSITIVE_INFINITY;
-  const anchorValid = !!anchor && anchor.end > anchor.start;
-  const center = anchorValid ? (anchor.start + anchor.end) / 2 : playheadSec;
-  // Round the start, then add the full native 90s window.
-  const start = Math.max(0, Math.round(center - TWITCH_CLIP_WINDOW_SEC / 2));
+  const click = Number.isFinite(playheadSec) ? playheadSec : 0;
+  let start = click - TWITCH_CLIP_PAD_SEC;
+  let end = click + TWITCH_CLIP_PAD_SEC;
+  if (start < 0) {
+    end = Math.min(dur, end - start);
+    start = 0;
+  }
+  if (end > dur) {
+    start = Math.max(0, start - (end - dur));
+    end = dur;
+  }
   return {
-    start,
-    end: Math.min(dur, start + TWITCH_CLIP_WINDOW_SEC),
+    start: Math.max(0, Math.round(start)),
+    end: Math.round(end),
   };
 }
 
 /**
- * Initial clip selection for the mini-preview. With a valid `anchor` (the
- * user's typed trim range) the selection IS the anchor, clamped into the
- * window, with its length forced into [TWITCH_CLIP_MIN_SEC, TWITCH_CLIP_MAX_SEC]
- * — an over-long anchor keeps its END pinned (start = end − 60, matching the
- * END-reference semantics of the Twitch editor's offsetSeconds), an under-long
- * one grows from its start. Without an anchor, replicate the default: the
- * last 60s of the window, or the whole window when it's shorter.
+ * Initial clip selection for the mini-preview. The click/playhead is the
+ * START of the clip, extending forward up to 60s (so the moment the user
+ * heard is at the left of the purple range, with 60s of past still on the
+ * rail to the left). A short in-window `anchor` (5-60s) still wins when
+ * given; a full-VOD trim is ignored.
  */
 export function initialClipSelection(
   win: { start: number; end: number },
   anchor?: { start: number; end: number },
+  playheadSec?: number,
 ): { start: number; end: number } {
-  if (anchor && anchor.end > anchor.start) {
+  const anchorLen = anchor && anchor.end > anchor.start ? anchor.end - anchor.start : 0;
+  if (anchor && anchorLen >= TWITCH_CLIP_MIN_SEC && anchorLen <= TWITCH_CLIP_MAX_SEC) {
     let start = Math.max(win.start, Math.min(anchor.start, win.end));
     let end = Math.max(win.start, Math.min(anchor.end, win.end));
-    if (end - start > TWITCH_CLIP_MAX_SEC) {
-      // Keep the END anchored (clip END = editor offsetSeconds).
-      start = end - TWITCH_CLIP_MAX_SEC;
-    } else if (end - start < TWITCH_CLIP_MIN_SEC) {
-      // Grow from the start first; at the window edge, pull the start back.
+    if (end - start < TWITCH_CLIP_MIN_SEC) {
       end = Math.min(win.end, Math.max(win.start, start + TWITCH_CLIP_MIN_SEC));
       if (end - start < TWITCH_CLIP_MIN_SEC) {
         start = Math.max(win.start, end - TWITCH_CLIP_MIN_SEC);
@@ -84,10 +89,38 @@ export function initialClipSelection(
     }
     return { start, end };
   }
+  if (Number.isFinite(playheadSec)) {
+    const ph = Math.max(win.start, Math.min(win.end, Math.floor(playheadSec as number)));
+    let start = ph;
+    let end = Math.min(win.end, start + TWITCH_CLIP_MAX_SEC);
+    if (end - start < TWITCH_CLIP_MIN_SEC) {
+      start = Math.max(win.start, end - TWITCH_CLIP_MIN_SEC);
+    }
+    return end - start >= TWITCH_CLIP_MIN_SEC
+      ? { start, end }
+      : clampClipSelection(win.start, win.end, win.start, win.end);
+  }
   if (win.end - win.start > TWITCH_CLIP_MAX_SEC) {
-    return { start: win.end - TWITCH_CLIP_MAX_SEC, end: win.end };
+    return { start: win.start, end: win.start + TWITCH_CLIP_MAX_SEC };
   }
   return clampClipSelection(win.start, win.end, win.start, win.end);
+}
+
+/** Which rail drag to start from a pointer X on the mini-preview slider. */
+export function clipRailDragTarget(
+  x: number,
+  railWidth: number,
+  playFracPct: number,
+  selStartFracPct: number,
+  selEndFracPct: number,
+): 'playhead' | 'range' | 'seek' {
+  if (!(railWidth > 0) || !Number.isFinite(x)) return 'seek';
+  const playX = (playFracPct / 100) * railWidth;
+  if (Math.abs(x - playX) <= CLIP_PLAYHEAD_HIT_PX) return 'playhead';
+  const left = (selStartFracPct / 100) * railWidth;
+  const right = (selEndFracPct / 100) * railWidth;
+  if (x >= Math.min(left, right) && x <= Math.max(left, right)) return 'range';
+  return 'seek';
 }
 
 /**
@@ -147,6 +180,80 @@ export function twitchClipDurationError(durationSec: number): string | null {
   return null;
 }
 
+/** Canonical integer range shared by the app, editor URL, extension, and history. */
+export function canonicalTwitchClipRange(startSec: number, endSec: number): { start: number; end: number } {
+  const start = Math.max(0, Math.floor(Number.isFinite(startSec) ? startSec : 0));
+  const end = Math.max(start, Math.ceil(Number.isFinite(endSec) ? endSec : start));
+  return {
+    start: end - start > TWITCH_CLIP_MAX_SEC ? end - TWITCH_CLIP_MAX_SEC : start,
+    end,
+  };
+}
+
+/**
+ * Map the clip editor's confirmed window back to VOD time.
+ *
+ * Twitch's slider is relative to the ~90s raw-media chunk (e.g. 71-90).
+ * offsetSeconds / vodrip_end is the VOD time at that chunk's end, so
+ * origin = vodEnd - editorEnd. A window already in VOD seconds is kept.
+ */
+export function vodRangeFromEditorWindow(
+  requested: { start: number; end: number },
+  editor?: { start: number; end: number } | null,
+): { start: number; end: number } {
+  const reqStart = Number.isFinite(requested.start) ? requested.start : 0;
+  const reqEnd = Number.isFinite(requested.end) ? requested.end : 0;
+  if (!editor || !Number.isFinite(editor.start) || !Number.isFinite(editor.end)) {
+    return { start: reqStart, end: reqEnd };
+  }
+  if (editor.end <= 93 && reqEnd > editor.end + 2) {
+    const origin = Math.max(0, reqEnd - editor.end);
+    return { start: origin + editor.start, end: origin + editor.end };
+  }
+  return { start: editor.start, end: editor.end };
+}
+
+/**
+ * Ensure the cookie extension is active without blocking the browser tab.
+ * Endpoint failures are non-fatal: the editor can still open and report its
+ * own state, while a completed installer asks the caller to reload the tab.
+ */
+export async function ensureTwitchClipExtension(): Promise<{ ok: boolean; installed: boolean }> {
+  try {
+    const status = await apiGet<{
+      paired: boolean;
+      platforms?: { twitch?: { lastGrabAt?: string | null } };
+    }>('/api/session/cookies/status');
+    if (status.paired) return { ok: true, installed: false };
+    const lastGrab = status.platforms?.twitch?.lastGrabAt;
+    if (lastGrab && Date.now() - new Date(lastGrab).getTime() < 11 * 60_000) {
+      return { ok: true, installed: false };
+    }
+    const inst = await apiPost<{ ok: boolean; started?: boolean; alreadyInstalled?: boolean }>(
+      '/api/session/cookies/auto-install',
+      {},
+    );
+    if (!inst.ok && !inst.started && !inst.alreadyInstalled) return { ok: false, installed: false };
+    const deadline = Date.now() + 700_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      try {
+        const next = await apiGet<{ paired: boolean; auto_install?: { state?: string } }>(
+          '/api/session/cookies/status',
+        );
+        if (next.paired && (!next.auto_install || next.auto_install.state !== 'running')) {
+          return { ok: true, installed: true };
+        }
+      } catch {
+        // Installer restarts the backend briefly; keep polling.
+      }
+    }
+    return { ok: false, installed: true };
+  } catch {
+    return { ok: true, installed: false };
+  }
+}
+
 export interface TwitchClipRecord {
   id: string;
   created_at: string;
@@ -158,6 +265,53 @@ export interface TwitchClipRecord {
   url: string;
   status: string;
 }
+/**
+ * Build the download payload for a history clip.
+ *
+ * Browser-created Twitch clips can remain in Twitch's processing queue with no
+ * media variants. When the original VOD range is stored, download that exact
+ * range instead of asking yt-dlp to resolve an empty clip page.
+ */
+export function twitchClipDownloadRequest(clip: TwitchClipRecord): {
+  url: string;
+  quality: 'source';
+  title?: string;
+  channel: string;
+  duration?: number;
+  crop_start?: number;
+  crop_end?: number;
+} {
+  const title = clip.title?.trim() || undefined;
+  const offset = clip.offset_sec;
+  const duration = clip.duration_sec;
+  if (
+    clip.vod_id
+    && Number.isFinite(offset)
+    && Number.isFinite(duration)
+    && (offset ?? 0) >= 0
+    && (duration ?? 0) > 0
+  ) {
+    const end = Math.floor(offset as number);
+    const length = Math.max(1, Math.round(duration as number));
+    return {
+      url: `https://www.twitch.tv/videos/${encodeURIComponent(clip.vod_id)}`,
+      quality: 'source',
+      title,
+      channel: clip.channel,
+      duration: length,
+      crop_start: Math.max(0, end - length),
+      crop_end: end,
+    };
+  }
+  return {
+    url: clip.url,
+    quality: 'source',
+    title,
+    channel: clip.channel,
+    duration: clip.duration_sec ?? undefined,
+  };
+}
+
 
 export interface TwitchClipError {
   code: string;
@@ -179,29 +333,34 @@ export function openTwitchClipEditorInBrowser(
   endSec: number,
   title: string,
   vodDurationSec?: number,
-): void {
+  targetWindow?: Window | null,
+): Window | null {
   const clipTitle = title.trim();
   if (!clipTitle) throw new Error('Original VOD title is required to create a Twitch clip');
+  const range = canonicalTwitchClipRange(startSec, endSec);
   const p = new URLSearchParams({
     vodrip_clip: '1',
-    vodrip_start: String(Math.max(0, Math.floor(startSec))),
-    vodrip_end: String(Math.max(0, Math.ceil(endSec))),
-    // The browser path is the user's explicit choice ("Open in browser") —
-    // keep the Twitch tab open after the flow so the editor + published clip
-    // stay visible. Default (absent) is close, per the window rule.
+    vodrip_start: String(range.start),
+    vodrip_end: String(range.end),
     vodrip_close: '0',
     vodrip_title: clipTitle,
   });
-  // VOD total length — the editor clamps the clip window at the VOD's last
-  // frame, so the extension needs it to nudge the window off the edge
-  // instead of failing the confirmation (see background.js edge retry).
   if (vodDurationSec && Number.isFinite(vodDurationSec) && vodDurationSec > 0) {
     p.set('vodrip_dur', String(Math.round(vodDurationSec)));
   }
   const url =
-    `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${Math.max(0, Math.floor(endSec))}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
-  reportClipEvent('browser_open', { url, startSec, endSec, title: clipTitle });
-  window.open(url, '_blank', 'noopener,noreferrer');
+    `https://clips.twitch.tv/create?broadcasterLogin=${encodeURIComponent(broadcasterLogin)}&offsetSeconds=${range.end}&vodID=${encodeURIComponent(vodId)}&${p.toString()}`;
+  reportClipEvent('browser_open', {
+    url,
+    startSec: range.start,
+    endSec: range.end,
+    title: clipTitle,
+  });
+  if (targetWindow) {
+    targetWindow.location.href = url;
+    return targetWindow;
+  }
+  return window.open(url, '_blank');
 }
 
 export async function fetchTwitchClipHistory(): Promise<TwitchClipRecord[]> {

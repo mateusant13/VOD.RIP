@@ -12,18 +12,29 @@ extension. The backend only:
 Tests isolate VODRIP_DATA_DIR so the real user history is never touched.
 """
 import json
+import logging
 from pathlib import Path
 
 import pytest
 from httpx import AsyncClient, ASGITransport
 
 from app import app
+from routers.twitch_clips import _CLIP_ECHO_QUIET, _format_clip_event, published_clip_range_from_gql
 
 
 @pytest.fixture()
 def _isolated_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("VODRIP_DATA_DIR", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _skip_clip_gql_enrich(monkeypatch):
+    # Record tests use fake slugs; never hit Twitch GQL unless a test patches this.
+    monkeypatch.setattr(
+        "services.twitch_gql_service.get_clip_info_sync",
+        lambda url: (_ for _ in ()).throw(RuntimeError("gql skipped in tests")),
+    )
 
 
 async def _history(client):
@@ -228,20 +239,52 @@ async def test_clip_events_validation(_isolated_data_dir):
         assert res.status_code == 422
 
 
+def test_clip_event_terminal_line_is_compact():
+    line = _format_clip_event(
+        "ext",
+        "ext_range",
+        {"ok": True, "valuetext": "1:18 to 1:30", "relStart": 78, "census": ["skip"]},
+    )
+    assert line.startswith("CLIP ext ext_range")
+    assert "relStart=78" in line
+    assert "valuetext=1:18 to 1:30" in line
+    assert "census" not in line
+    assert "trace_dom" in _CLIP_ECHO_QUIET
+
+
+@pytest.mark.anyio
+async def test_clip_event_echoes_to_logger(caplog, _isolated_data_dir):
+    caplog.set_level(logging.INFO, logger="routers.twitch_clips")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "ext_start", "data": {"startSec": 12, "endSec": 24}},
+        )
+        assert res.status_code == 200
+        quiet = await client.post(
+            "/api/debug/clip-events",
+            json={"src": "ext", "event": "trace_dom", "data": {"reason": "mutation"}},
+        )
+        assert quiet.status_code == 200
+    messages = [rec.message for rec in caplog.records]
+    assert any("CLIP ext ext_start" in msg and "startSec=12" in msg for msg in messages)
+    assert not any("trace_dom" in msg for msg in messages)
+
+
 @pytest.mark.anyio
 async def test_record_appends_clip_event(_isolated_data_dir):
     """Recording a clip writes an 'api' event line so the flow is replayable."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        bad_src = await client.post("/api/debug/clip-events", json={"src": "nope", "event": "x"})
-        assert bad_src.status_code == 422
-        bad_event = await client.post("/api/debug/clip-events", json={"src": "ext", "event": ""})
-        assert bad_event.status_code == 422
-        big = await client.post(
-            "/api/debug/clip-events",
-            json={"src": "ext", "event": "x", "data": {"blob": "y" * 9000}},
-        )
-        assert big.status_code == 422
-        assert (await client.get("/api/debug/clip-events")).json() == []
+        res = await _record(client, {
+            "url": "https://clips.twitch.tv/CuteSlothOMG1",
+            "channel": "surtepi",
+            "vod_id": "2536167775",
+            "offset_sec": 434,
+            "duration_sec": 30,
+        })
+        assert res.status_code == 200
+        events = (await client.get("/api/debug/clip-events")).json()
+        assert any(e.get("event") == "api_clip_recorded" and e.get("id") == "CuteSlothOMG1" for e in events)
 
 
 @pytest.mark.anyio
@@ -348,3 +391,36 @@ async def test_clip_record_accepts_query_strings_and_mobile_host(_isolated_data_
         rows = await _history(client)
         assert {row["id"] for row in rows} == {"SlugOne", "SlugTwo"}
         assert rows[0]["url"] == "https://clips.twitch.tv/SlugTwo"
+
+def test_published_clip_range_from_gql_uses_offset_as_end():
+    # Live 15s clip: GQL offset 886 duration 15 -> history END 886, start 871.
+    assert published_clip_range_from_gql(886, 15) == (886, 15)
+    # Live 19s clip: GQL offset 896 duration 18 -> END 896, start 878.
+    assert published_clip_range_from_gql(896, 18) == (896, 18)
+
+
+def test_published_clip_range_from_gql_early_vod_is_start():
+    assert published_clip_range_from_gql(10, 19) == (29, 19)
+    assert published_clip_range_from_gql(None, 19) is None
+    assert published_clip_range_from_gql(100, 3) is None
+
+
+@pytest.mark.anyio
+async def test_record_prefers_twitch_gql_range(monkeypatch, _isolated_data_dir):
+    monkeypatch.setattr(
+        "services.twitch_gql_service.get_clip_info_sync",
+        lambda url: {"vod_id": "2844207886", "offset_sec": 896, "duration": 18},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await _record(client, {
+            "url": "https://clips.twitch.tv/RelentlessDarkWrenYouDontSay-55K3Z0K_1ROMFuLm",
+            "channel": "titiltei",
+            "vod_id": "2844207886",
+            "offset_sec": 90,
+            "duration_sec": 19,
+        })
+        assert res.status_code == 200
+        rows = await _history(client)
+        assert rows[0]["offset_sec"] == 896
+        assert rows[0]["duration_sec"] == 18
+        assert rows[0]["vod_id"] == "2844207886"

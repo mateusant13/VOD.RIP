@@ -173,7 +173,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>(langFamily(lang) === 'pt' ? 'pt' : 'en');
   /** Chat author filter ('' = all authors); '@' tolerated, case-insensitive. */
   const [userFilter, setUserFilter] = useState('');
-  const [semanticOn, setSemanticOn] = useState(false);
+  const [searchMode, setSearchMode] = useState<'exact' | 'broad' | 'semantic'>('exact');
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
@@ -529,11 +529,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       dateTo: toOk ? dateTo : fromOk ? today : null,
       lang: langFilter || null,
       username: userFilter || null,
-      limit: semanticOn ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
+      limit: searchMode === 'semantic' ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
       hint: hintDisabled ? false : undefined,
-      // Concept search runs over transcript segments — meaningless without
-      // the transcript source selected.
-      semantic: semanticOn && sourceFilter.includes('transcript'),
+      semantic: searchMode === 'semantic' && sourceFilter.includes('transcript'),
+      mode: searchMode === 'semantic' ? 'semantic' : searchMode,
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -551,7 +550,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         setError(t('Archive search is unavailable — is the backend running?'));
         setStatus('error');
       });
-  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scopeActive, scopeVideoId, everyDay, langFilter, hintDisabled, semanticOn, userFilter]);
+  }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scopeActive, scopeVideoId, everyDay, langFilter, hintDisabled, searchMode, userFilter]);
 
   // Remote YouTube channel-title search: the local index only holds the
   // newest ~100 uploads per saved channel (the panel fetch cap), so old
@@ -1019,26 +1018,31 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               })}
             </div>
           </div>
-          {/* Context toggle on its own row, separated from the source chips. */}
           <div className="flex items-center gap-1.5 min-w-0 pt-1 mt-0.5">
-            <button
-              type="button"
-              aria-pressed={semanticOn}
-              disabled={!sourceFilter.includes('transcript')}
-              onClick={() => setSemanticOn((v) => !v)}
-              title={
-                !sourceFilter.includes('transcript')
+            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">{t('Mode')}</span>
+            {([
+              ['exact', 'EXACT', t('Exact phrase: finds the words in order, even inside a longer sentence')],
+              ['broad', 'BROAD', t('Broad match: close spellings and related words')],
+              ['semantic', 'CONTEXT', t('Context search (semantic): finds moments by meaning, not just exact words')],
+            ] as const).map(([id, label, title]) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={searchMode === id}
+                disabled={id === 'semantic' && !sourceFilter.includes('transcript')}
+                onClick={() => setSearchMode(id)}
+                title={id === 'semantic' && !sourceFilter.includes('transcript')
                   ? t('Context search covers transcripts only')
-                  : t('Context search (semantic): finds moments by meaning, not just exact words')
-              }
-              className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
-                semanticOn
-                  ? 'bg-white text-black border-white'
-                  : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
-              }`}
-            >
-              {t('CONTEXT')}
-            </button>
+                  : title}
+                className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold border transition-colors disabled:opacity-40 ${
+                  searchMode === id
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 text-zinc-400 hover:border-white hover:text-white'
+                }`}
+              >
+                {t(label)}
+              </button>
+            ))}
             {langsPresent.size >= 2 && (
               <div className="flex gap-1 flex-wrap">
                 {ARCHIVE_LANGS.map((l) => (

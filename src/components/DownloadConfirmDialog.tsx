@@ -22,6 +22,7 @@ interface DownloadConfirmDialogProps {
   onFilenameChange?: (value: string) => void;
   onConfirm: () => void;
   onCancel: () => void;
+  extras?: ReactNode;
 }
 
 export default function DownloadConfirmDialog({
@@ -34,6 +35,7 @@ export default function DownloadConfirmDialog({
   onFilenameChange,
   onConfirm,
   onCancel,
+  extras,
 }: DownloadConfirmDialogProps): ReactNode {
   const { t } = useI18n();
   if (!open) return null;
@@ -54,6 +56,7 @@ export default function DownloadConfirmDialog({
         <p className="text-zinc-400 text-xs leading-relaxed whitespace-pre-wrap">
           {message}
         </p>
+        {extras}
         {filenamePlaceholder != null && (
           <input
             type="text"

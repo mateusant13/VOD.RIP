@@ -497,7 +497,7 @@ def _enqueue_transcriptions() -> None:
         archive_db.query(
             """SELECT platform, video_id, channel, title, duration_sec, archive_path
                FROM videos
-               WHERE platform='youtube' AND status='ready'
+               WHERE platform IN ('youtube','twitch','kick') AND status='ready'
                  AND archive_path IS NOT NULL AND archive_path != ''
                  AND NOT EXISTS (SELECT 1 FROM transcripts t
                                  WHERE t.platform=videos.platform
@@ -512,12 +512,13 @@ def _enqueue_transcriptions() -> None:
         if enqueued >= _transcribe_budget():
             break
         vid = r["video_id"]
+        plat = r["platform"]
         if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
             continue  # file evicted — whisper would fail immediately
-        if archive_db.captions_cover("youtube", vid):
+        if plat == "youtube" and archive_db.captions_cover("youtube", vid):
             continue  # yt_subtitles_first: whisper skipped anyway
-        latest = archive_db.latest_job("youtube", vid, kind="transcribe")
-        job_id = f"transcribe-youtube-{vid}"
+        latest = archive_db.latest_job(plat, vid, kind="transcribe")
+        job_id = f"transcribe-{plat}-{vid}"
         if latest:
             if latest["status"] in ("queued", "running"):
                 continue
@@ -544,7 +545,7 @@ def _enqueue_transcriptions() -> None:
                     continue
         try:
             archive_db.enqueue_job(
-                job_id, "transcribe", "youtube", vid, priority=TRANSCRIBE_PRIORITY_LOW
+                job_id, "transcribe", plat, vid, priority=TRANSCRIBE_PRIORITY_LOW
             )
         except sqlite3.IntegrityError:
             continue  # already queued by a search — nothing new
