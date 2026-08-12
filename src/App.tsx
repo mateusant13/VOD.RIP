@@ -10,12 +10,13 @@ import {
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
   GripVertical,
 } from 'lucide-react';
-import { twitchClipDownloadRequest, type TwitchClipRecord } from './twitchClip';
+import { twitchClipDownloadRequest, clipSlugFromUrl, type TwitchClipRecord } from './twitchClip';
+import { EMPTY_CHAT_MARKERS, type ChatMarkers } from './components/ChatRangeMarkers';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
-import { buildArchiveVodUrl, pickLeastOpenedTarget, type ArchiveOpenTarget, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
+import { buildArchiveVodUrl, formatArchiveOffset, pickLeastOpenedTarget, type ArchiveOpenTarget, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
 import { archiveVideoIdFromUrl, isNativeArchiveVideoId } from './archiveScope';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
@@ -392,8 +393,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   start_with_windows: true,
   download_layout: 'typed',
   download_transcript_sidecar: true,
-  download_chat_before_sec: 120,
-  download_chat_after_sec: 30,
 };
 
 export default function App() {
@@ -634,9 +633,23 @@ export default function App() {
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
   const [downloadFilename, setDownloadFilename] = useState('');
   const [dlIncludeTranscript, setDlIncludeTranscript] = useState(true);
-  const [dlIncludeChat, setDlIncludeChat] = useState(false);
-  const [dlChatBefore, setDlChatBefore] = useState(120);
-  const [dlChatAfter, setDlChatAfter] = useState(30);
+  /** Chat start/end markers lifted from the main preview's chat panel —
+   *  when set, the next download of the previewed video also writes a
+   *  <media>.chat.txt covering [start, end] (no timestamps, user: message).
+   *  Reset when the previewed video changes (markers belong to one video). */
+  const [chatStartSec, setChatStartSec] = useState<number | null>(null);
+  const [chatEndSec, setChatEndSec] = useState<number | null>(null);
+  const handleChatMarkersChange = useCallback((m: ChatMarkers) => {
+    setChatStartSec(m.start);
+    setChatEndSec(m.end);
+  }, []);
+  /** Same markers per recorded Twitch clip slug — set in QueueTab's clip
+   *  chat viewer, applied when that clip is downloaded (its chat lives
+   *  under the source VOD id, which the clip's download URL resolves to). */
+  const [clipChatMarkers, setClipChatMarkers] = useState<Record<string, ChatMarkers>>({});
+  const handleClipChatMarkersChange = useCallback((slug: string, m: ChatMarkers) => {
+    setClipChatMarkers((prev) => ({ ...prev, [slug]: m }));
+  }, []);
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
@@ -4086,11 +4099,18 @@ export default function App() {
         thumbnail: videoInfo.thumbnail ?? undefined,
         duration: videoInfo.duration ?? undefined,
       };
+      // Chat .txt export is driven by the START/END markers set in the
+      // chat history: a clip download uses the markers of its recorded clip
+      // slug (QueueTab viewer), everything else uses the main preview's.
+      const clipSlug = clipDownload ? clipSlugFromUrl(url.trim()) : null;
+      const clipMarkers = clipSlug ? (clipChatMarkers[clipSlug] ?? EMPTY_CHAT_MARKERS) : EMPTY_CHAT_MARKERS;
+      const chatStart = clipSlug ? clipMarkers.start : chatStartSec;
+      const chatEnd = clipSlug ? clipMarkers.end : chatEndSec;
       const sidecarBody = {
         include_transcript: dlIncludeTranscript,
-        include_chat: dlIncludeChat,
-        chat_before_sec: dlChatBefore,
-        chat_after_sec: dlChatAfter,
+        include_chat: chatStart != null || chatEnd != null,
+        chat_start_sec: chatStart,
+        chat_end_sec: chatEnd,
       };
       const body = clipDownload
         ? {
@@ -4115,7 +4135,7 @@ export default function App() {
       setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
       setError(err instanceof Error ? err.message : t('Download failed'));
     }
-  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio, dlIncludeTranscript, dlIncludeChat, dlChatBefore, dlChatAfter]);
+  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio, dlIncludeTranscript, chatStartSec, chatEndSec, clipChatMarkers]);
 
   const downloadConfirmCopy = useMemo(() => {
     const clipDownload = isClipUrl(url.trim());
@@ -4152,10 +4172,7 @@ export default function App() {
     if (!downloadConfirmOpen) return;
     setDownloadFilename('');
     setDlIncludeTranscript(settings?.download_transcript_sidecar !== false);
-    setDlIncludeChat(false);
-    setDlChatBefore(Math.min(600, Math.max(0, settings?.download_chat_before_sec ?? 120)));
-    setDlChatAfter(Math.min(600, Math.max(0, settings?.download_chat_after_sec ?? 30)));
-  }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename, settings?.download_transcript_sidecar, settings?.download_chat_before_sec, settings?.download_chat_after_sec]);
+  }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename, settings?.download_transcript_sidecar]);
 
   // ── Cancel download ──
 
@@ -4315,11 +4332,16 @@ export default function App() {
       thumbnail: clip.thumbnail_url ?? null,
     }]);
     try {
+      const clipMarkers = clipChatMarkers[clip.id] ?? EMPTY_CHAT_MARKERS;
+      const includeChat = clipMarkers.start != null || clipMarkers.end != null;
       await apiPost<{ download_id: string }>(
         '/api/download/clip',
         {
           ...twitchClipDownloadRequest(clip),
           include_transcript: settings?.download_transcript_sidecar !== false,
+          include_chat: includeChat,
+          chat_start_sec: clipMarkers.start,
+          chat_end_sec: clipMarkers.end,
         },
       );
     } catch (err: unknown) {
@@ -4327,7 +4349,7 @@ export default function App() {
       setError(err instanceof Error ? err.message : t('Failed to start download'));
     }
     void refreshDownloads();
-  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar]);
+  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar, clipChatMarkers]);
 
   const toggleChannelVodSelection = useCallback((vodUrl: string) => {
     setSelectedChannelVodUrls((prev) => {
@@ -5448,6 +5470,14 @@ export default function App() {
     return archiveVideoIdFromUrl(url);
   }, [videoInfo?.id, url]);
 
+  // Markers belong to the previewed video's chat: switching the previewed
+  // video clears the pair so a stale range can't ride onto another video's
+  // download (the panel also lifts its own clear on video switch).
+  useEffect(() => {
+    setChatStartSec(null);
+    setChatEndSec(null);
+  }, [previewArchiveVideoId, activePlatform]);
+
   /** Stable scope object for the preview-search popup. App rebuilds this
    *  inline on every render (preview time sync re-renders constantly); the
    *  popup's search effect depends on the scope CONTENT, but a raw literal
@@ -6496,6 +6526,9 @@ export default function App() {
               // occupies (see previewPlayerColumnWidth): report it so the
               // player column never flips to portrait when the panel opens.
               onLayoutChange={setPreviewChatLayout}
+              // Start/end markers lifted for the next download's chat .txt
+              // export (the panel clears them on video switch too).
+              onMarkersChange={handleChatMarkersChange}
             />
           </div>
           {!previewFullscreen && (
@@ -7193,6 +7226,7 @@ export default function App() {
             onWatchLocal={openLocalFilePreview}
             onOpenVod={handleOpenVodFromHistory}
             onDownloadClip={handleDownloadClip}
+            onClipChatMarkersChange={handleClipChatMarkersChange}
           />
         )}
 
@@ -7370,21 +7404,17 @@ export default function App() {
               <input type="checkbox" checked={dlIncludeTranscript} onChange={(e) => setDlIncludeTranscript(e.target.checked)} />
               {t('Download transcript (.txt)')}
             </label>
-            <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
-              <input type="checkbox" checked={dlIncludeChat} onChange={(e) => setDlIncludeChat(e.target.checked)} />
-              {t('Download chat history')}
-            </label>
-            {dlIncludeChat && (
-              <div className="flex flex-col gap-1.5 pl-1">
-                <label className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest">
-                  {t('Chat before')} ({Math.round(dlChatBefore / 60)}m)
-                  <input type="range" min={0} max={600} step={10} value={dlChatBefore} onChange={(e) => setDlChatBefore(Number(e.target.value))} className="w-full" />
-                </label>
-                <label className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest">
-                  {t('Chat after')} ({Math.round(dlChatAfter / 60)}m)
-                  <input type="range" min={0} max={600} step={10} value={dlChatAfter} onChange={(e) => setDlChatAfter(Number(e.target.value))} className="w-full" />
-                </label>
-              </div>
+            {chatStartSec != null || chatEndSec != null ? (
+              <p data-chat-txt-note className="text-[9px] font-mono text-[#53fc18]">
+                {t('Chat .txt: {start} → {end}', {
+                  start: chatStartSec != null ? formatArchiveOffset(chatStartSec) : t('—'),
+                  end: chatEndSec != null ? formatArchiveOffset(chatEndSec) : t('—'),
+                })}
+              </p>
+            ) : (
+              <p data-chat-txt-note className="text-[9px] font-mono text-zinc-600">
+                {t('Chat .txt: not included — set START/END markers in the preview chat')}
+              </p>
             )}
           </div>
         )}

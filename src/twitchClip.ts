@@ -403,3 +403,12 @@ export interface TwitchClipChat {
 export async function fetchTwitchClipChat(slug: string): Promise<TwitchClipChat> {
   return apiGet<TwitchClipChat>(`/api/twitch/clips/${encodeURIComponent(slug)}/chat`);
 }
+
+/** Twitch clip slug from a clip URL (clips.twitch.tv/Slug or
+ *  twitch.tv/<channel>/clip/Slug); null when the URL is not a clip URL. */
+export function clipSlugFromUrl(url: string): string | null {
+  const m = (url || '').trim().match(
+    /(?:clips\.twitch\.tv\/|twitch\.tv\/[^/]+\/clip\/)([A-Za-z0-9_-]+)/i,
+  );
+  return m ? m[1] : null;
+}

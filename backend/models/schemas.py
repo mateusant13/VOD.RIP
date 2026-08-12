@@ -7,9 +7,6 @@ class VideoInfo(BaseModel):
     title: Optional[str] = None
     duration: Optional[float] = None
     include_transcript: Optional[bool] = None
-    include_chat: bool = False
-    chat_before_sec: Optional[float] = None
-    chat_after_sec: Optional[float] = None
     duration_string: Optional[str] = None
     uploader: Optional[str] = None
     thumbnail: Optional[str] = None
@@ -38,9 +35,14 @@ class DownloadRequest(BaseModel):
     thumbnail: Optional[str] = None
     duration: Optional[float] = None
     include_transcript: Optional[bool] = None
+    # Chat .txt export is driven by the START/END markers set in the chat
+    # history: when a marker is set the download also writes
+    # <media>.chat.txt with the messages inside [chat_start_sec,
+    # chat_end_sec] (inclusive, no timestamps). Absent markers -> no chat
+    # sidecar (behavior unchanged).
     include_chat: bool = False
-    chat_before_sec: Optional[float] = None
-    chat_after_sec: Optional[float] = None
+    chat_start_sec: Optional[float] = None
+    chat_end_sec: Optional[float] = None
 
 
 class DownloadState(BaseModel):
@@ -162,8 +164,6 @@ class AppSettings(BaseModel):
     # Write a .txt transcript sidecar next to finished downloads when the
     # archive already has a transcript (on by default).
     download_transcript_sidecar: bool = True
-    download_chat_before_sec: int = 120
-    download_chat_after_sec: int = 30
 
 
 class SettingsUpdate(BaseModel):
@@ -212,8 +212,6 @@ class SettingsUpdate(BaseModel):
     ui_language: Optional[str] = None
     download_layout: Optional[str] = None
     download_transcript_sidecar: Optional[bool] = None
-    download_chat_before_sec: Optional[int] = None
-    download_chat_after_sec: Optional[int] = None
 
 
 class OpenFolderRequest(BaseModel):

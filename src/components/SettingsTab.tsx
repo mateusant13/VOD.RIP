@@ -36,7 +36,7 @@ type Props = {
 /** Fields SettingsTab displays; signature change => "unsaved changes" chip. */
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
-  'start_with_windows', 'download_layout', 'download_transcript_sidecar', 'download_chat_before_sec', 'download_chat_after_sec',
+  'start_with_windows', 'download_layout', 'download_transcript_sidecar',
   'archive_vod_keep_count', 'whisper_model', 'asr_engine', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
@@ -300,18 +300,6 @@ export default function SettingsTab({
           onChange={(c) => setSettings({ ...settings, download_transcript_sidecar: c })}
           ariaLabel="save transcript txt with downloads"
         />
-        <div className="grid grid-cols-2 gap-2">
-          <div className="flex flex-col gap-1.5">
-            <FieldCaption>{t('Chat before (sec)')}</FieldCaption>
-            <NumberField ariaLabel="chat before seconds" value={settings.download_chat_before_sec ?? 120} min={0} max={600} step={10}
-              onChange={(v) => setSettings({ ...settings, download_chat_before_sec: v })} />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <FieldCaption>{t('Chat after (sec)')}</FieldCaption>
-            <NumberField ariaLabel="chat after seconds" value={settings.download_chat_after_sec ?? 30} min={0} max={600} step={10}
-              onChange={(v) => setSettings({ ...settings, download_chat_after_sec: v })} />
-          </div>
-        </div>
         <div className="grid grid-cols-2 gap-2">
           <div className="flex flex-col gap-1.5">
             <FieldCaption noWrap>{t('Download Threads')}</FieldCaption>

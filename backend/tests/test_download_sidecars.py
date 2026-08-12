@@ -19,10 +19,12 @@ def test_format_transcript_srt_like():
 
 
 def test_format_chat_lines():
+    """One `user: message` per line — no timestamps (plain text for editors)."""
     body = format_chat_txt([
         {"offset_sec": 75, "username": "bob", "text": "hi"},
+        {"offset_sec": 90, "username": "alice", "text": "hello there"},
     ])
-    assert body.strip() == "[01:15] bob: hi"
+    assert body.strip() == "bob: hi\nalice: hello there"
 
 
 def test_write_thumbnail_sidecar_prefers_ytdlp_jpg(tmp_path: Path):

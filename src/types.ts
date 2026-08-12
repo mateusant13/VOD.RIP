@@ -115,8 +115,6 @@ export interface AppSettings {
   start_with_windows?: boolean;
   download_layout?: 'flat' | 'typed';
   download_transcript_sidecar?: boolean;
-  download_chat_before_sec?: number;
-  download_chat_after_sec?: number;
   cookie_bridge_enabled?: boolean;
   /** One-click extension auto-install: ON offers the install on first run;
    * OFF = manual drag-and-drop only. Absent on older backends -> ON. */

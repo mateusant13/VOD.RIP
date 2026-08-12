@@ -651,4 +651,92 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     expect(document.querySelector('[data-chat-truncated]')).toBeNull();
   });
+
+  it('start/end markers: hover-revealed S/E set the boundary, chips show + clear it, lifted to the host', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    const onMarkersChange = vi.fn();
+    render(
+      <PreviewChatPanel
+        platform="twitch"
+        videoId="v1"
+        currentTime={0}
+        onSeek={onSeek}
+        onMarkersChange={onMarkersChange}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+
+    // Every rendered chat row carries the hover-revealed green S / red E
+    // affordances (pure CSS reveal — present in the DOM regardless).
+    expect(document.querySelectorAll('[data-marker-set="start"]').length).toBeGreaterThan(0);
+    expect(document.querySelectorAll('[data-marker-set="end"]').length).toBeGreaterThan(0);
+
+    // Click the green START on the row at offset 3 (LETS GO): boundary set,
+    // no seek, chip + row badge show the filled state.
+    const row3 = screen.getByText('LETS GO').closest('[data-panel-row]') as HTMLElement;
+    fireEvent.click(row3.querySelector('[data-marker-set="start"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: 3, end: null });
+    });
+    expect(onSeek).not.toHaveBeenCalled(); // marker click must not seek
+    expect(
+      (document.querySelector('[data-marker-chip="start"]') as HTMLElement).textContent,
+    ).toContain('0:03');
+    expect((row3.querySelector('[data-marker-set="start"]') as HTMLElement).className).toContain(
+      'bg-[#53fc18]',
+    );
+
+    // Red END on the row at offset 8 (hi): range is now [3, 8].
+    const row8 = screen.getByText('hi').closest('[data-panel-row]') as HTMLElement;
+    fireEvent.click(row8.querySelector('[data-marker-set="end"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: 3, end: 8 });
+    });
+    expect(
+      (document.querySelector('[data-marker-chip="end"]') as HTMLElement).textContent,
+    ).toContain('0:08');
+
+    // Clamp: setting END before the START pulls START down (never inverted).
+    const row1 = screen.getByText('gg').closest('[data-panel-row]') as HTMLElement;
+    fireEvent.click(row1.querySelector('[data-marker-set="end"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: 1, end: 1 });
+    });
+
+    // Chips clear each boundary.
+    fireEvent.click(document.querySelector('[data-marker-chip="end"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: 1, end: null });
+    });
+    fireEvent.click(document.querySelector('[data-marker-chip="start"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: null, end: null });
+    });
+  });
+
+  it('clears markers when the panel switches to another video', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onMarkersChange = vi.fn();
+    const { rerender } = render(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} onMarkersChange={onMarkersChange} />,
+    );
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    const row3 = screen.getByText('LETS GO').closest('[data-panel-row]') as HTMLElement;
+    fireEvent.click(row3.querySelector('[data-marker-set="start"]') as HTMLElement);
+    await waitFor(() => {
+      expect(onMarkersChange).toHaveBeenLastCalledWith({ start: 3, end: null });
+    });
+
+    // Same panel instance, new video: the pair resets and the host learns
+    // about the clear (a stale range must not ride onto the next download).
+    rerender(
+      <PreviewChatPanel platform="twitch" videoId="v2" currentTime={0} onMarkersChange={onMarkersChange} />,
+    );
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    expect(onMarkersChange).toHaveBeenLastCalledWith({ start: null, end: null });
+    expect(
+      (document.querySelector('[data-marker-chip="start"]') as HTMLElement).textContent,
+    ).not.toContain('0:03');
+  });
 });
