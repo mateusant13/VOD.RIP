@@ -73,7 +73,7 @@ import EditableHmsTime from './components/EditableHmsTime';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGate';
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
-import { fmtDuration, fmtShort, fmtClipDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
+import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
@@ -649,8 +649,7 @@ export default function App() {
   const [lastPreviewTrimEndpoint, setLastPreviewTrimEndpoint] = useState<'in' | 'out'>('out');
 
   // Channel explore players (up to 5 floating popups)
-  const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number; hidden?: boolean }[]>([]);
-  const [parkedExploreId, setParkedExploreId] = useState<string | null>(null);
+  const [explorePopups, setExplorePopups] = useState<{ id: string; vod: ExplorePopupVod; layoutIndex: number }[]>([]);
   const [localFilePopups, setLocalFilePopups] = useState<LocalFilePopupItem[]>([]);
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
   /** Session counters: archive search hits opened per platform (0-init).
@@ -5367,11 +5366,7 @@ export default function App() {
     selectVod(vodUrl, undefined, hint);
   }, [selectVod]);
 
-  const carryExploreToUrl = useCallback((vod: ExplorePopupVod, timeSec = 0, popupId?: string) => {
-    if (popupId) {
-      setExplorePopups((prev) => prev.map((p) => p.id === popupId ? { ...p, hidden: true } : p));
-      setParkedExploreId(popupId);
-    }
+  const carryExploreToUrl = useCallback((vod: ExplorePopupVod, timeSec = 0) => {
     selectVod(vod.url, {
       platform: vod.platform,
       platformListIndex: vod.platformListIndex,
@@ -6136,20 +6131,6 @@ export default function App() {
         })}
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
-        {parkedExploreId && (
-          <button
-            type="button"
-            onClick={() => {
-              const id = parkedExploreId;
-              setExplorePopups((prev) => prev.map((p) => p.id === id ? { ...p, hidden: false } : p));
-              setParkedExploreId(null);
-            }}
-            className={`${previewCtrlBtn(previewFullscreen, true)} flex items-center gap-1.5`}
-            title={t('Back to mini preview')}
-          >
-            {t('Mini')}
-          </button>
-        )}
         {urlPlatform === 'twitch' && !isLive && (
           <button
             type="button"
@@ -6320,6 +6301,19 @@ export default function App() {
               >
                 <Search size={10} className="shrink-0" />
                 {previewArchiveVideoId ? t('SEARCH THIS VIDEO') : t('SEARCH ARCHIVE')}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const trimmed = url.trim();
+                  if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
+                }}
+                disabled={!url.trim()}
+                title={t('Open in browser')}
+                aria-label={t('Open in browser')}
+                className="text-zinc-500 hover:text-white p-1 shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <ExternalLink size={14} />
               </button>
               <button type="button" onClick={() => void resetPreview()} className="text-zinc-500 hover:text-white p-1 shrink-0">
                 <X size={18} />
@@ -7058,11 +7052,6 @@ export default function App() {
                                     <PlatformVodIcon platform={v.platform} />
                                     <span className="truncate">
                                       {v.title || t('Untitled')}
-                                      {durSec != null ? (
-                                        <span className="text-zinc-500 ml-1">
-                                          {isClipItem ? fmtClipDuration(durSec) : fmtShort(durSec)}
-                                        </span>
-                                      ) : null}
                                       {v.channel_language ? (
                                         <span
                                           title={`Channel language: ${v.channel_language}`}
@@ -7214,7 +7203,7 @@ export default function App() {
       {explorePopups.length > 0 && createPortal(
         <>
           {explorePopups.map((entry) => (
-            <div key={entry.id} style={entry.hidden ? { display: 'none' } : undefined}>
+            <div key={entry.id}>
             <ChannelExplorePopup
               id={entry.id}
               vod={entry.vod}
@@ -7222,7 +7211,7 @@ export default function App() {
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
-              onHandoffToMain={(vod, timeSec) => carryExploreToUrl(vod, timeSec, entry.id)}
+              onHandoffToMain={(vod, timeSec) => carryExploreToUrl(vod, timeSec)}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
