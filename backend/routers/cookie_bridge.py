@@ -329,6 +329,37 @@ def _materialize_ext_src() -> Path:
         return src
 
 
+def _firefox_ext_src(src: Path) -> Path:
+    """Materialize a Firefox-compatible variant of the unpacked extension.
+
+    Firefox MV3 supports neither module service workers nor Chromium-style
+    drag-and-drop: the variant flips background.service_worker to a classic
+    background.scripts array and pins a stable addon id so cookies survive
+    extension updates. Idempotent: returns the variant dir once patched.
+    """
+    try:
+        manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return src
+    sw = (manifest.get("background") or {}).get("service_worker") or ""
+    if not sw:
+        return src
+    dest = src.parent / f"{src.name}-firefox"
+    out_manifest = dest / "manifest.json"
+    if out_manifest.exists():
+        return dest
+    shutil.copytree(src, dest, dirs_exist_ok=True)
+    try:
+        m2 = json.loads(out_manifest.read_text(encoding="utf-8"))
+        m2["background"] = {"scripts": [sw]}
+        m2["browser_specific_settings"] = {"gecko": {"id": "vodrip-cookies@vod.rip"}}
+        out_manifest.write_text(json.dumps(m2, indent=2, ensure_ascii=False), encoding="utf-8")
+    except (OSError, ValueError):
+        shutil.rmtree(dest, ignore_errors=True)
+        return src
+    return dest
+
+
 _UPDATE_BADGE_FIX_OLD = re.compile(
     r"const updateBadgeCounter = async \(\) => \{\n"
     r"[^}]*?const \[tab\] = await chrome\.tabs\.query[\s\S]*?\n\};"
