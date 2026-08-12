@@ -36,24 +36,24 @@ beforeEach(() => {
 });
 
 describe("TranscriptionSection", () => {
-  it("shows the resolved model as a read-only value, no free-text input", () => {
+  it("shows parakeet as default engine; whisper model shown when engine=whisper", () => {
     render(
       <TranscriptionSection
         settings={BASE_SETTINGS}
         setSettings={() => {}}
       />,
     );
-    // The model id is displayed, but there is no input the user can type into.
-    expect(screen.getByText("large-v3-turbo")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    // Parakeet is the default engine; the whisper id renders only on whisper.
     const model = screen.getByLabelText("whisper model id (read-only)");
+    expect(model.textContent).toContain("Parakeet (default)");
     expect(model.tagName).toBe("SPAN");
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  it("falls back to large-v3-turbo when the setting is blank", () => {
+  it("falls back to large-v3-turbo when whisper engine selected and setting blank", () => {
     render(
       <TranscriptionSection
-        settings={{ ...BASE_SETTINGS, whisper_model: "" }}
+        settings={{ ...BASE_SETTINGS, asr_engine: "whisper", whisper_model: "" }}
         setSettings={() => {}}
       />,
     );
