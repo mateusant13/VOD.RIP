@@ -482,4 +482,44 @@ describe('QueueTab', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('clip rows render an open-in-browser link to the clip URL (new tab)', async () => {
+    const clip = {
+      id: 'OpenUrlClip',
+      created_at: '2026-08-01T00:00:00Z',
+      channel: 'chan',
+      vod_id: '1001',
+      offset_sec: 434,
+      duration_sec: 30,
+      title: 'T',
+      url: 'https://clips.twitch.tv/OpenUrlClip',
+      status: 'created',
+    };
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/twitch/clips/history')) {
+        return new Response(JSON.stringify([clip]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fn);
+    try {
+      renderTab({ queue: [], history: [] });
+      await waitFor(() => expect(screen.getByTitle('Open in browser')).toBeTruthy());
+      const link = screen.getByTitle('Open in browser') as HTMLAnchorElement;
+      expect(link.getAttribute('href')).toBe('https://clips.twitch.tv/OpenUrlClip');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toContain('noopener');
+      // The labeled editor link still opens the same clip URL.
+      expect(screen.getByTitle('Open Twitch clip editor').getAttribute('href')).toBe('https://clips.twitch.tv/OpenUrlClip');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

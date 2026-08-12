@@ -507,15 +507,27 @@ export default function QueueTab({
                   </span>
                 </div>
                 {/^https?:\/\//.test(c.url) ? (
-                  <a
-                    href={c.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
-                    title={t('Open Twitch clip editor')}
-                  >
-                    <ExternalLink size={12} /> {t('Editor')}
-                  </a>
+                  <>
+                    <a
+                      href={c.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-zinc-400 hover:text-white flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider shrink-0"
+                      title={t('Open Twitch clip editor')}
+                    >
+                      <ExternalLink size={12} /> {t('Editor')}
+                    </a>
+                    <a
+                      href={c.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-label={t('Open in browser')}
+                      title={t('Open in browser')}
+                      className="text-zinc-500 hover:text-white p-1 shrink-0"
+                    >
+                      <ExternalLink size={11} />
+                    </a>
+                  </>
                 ) : (
                   <span className="text-zinc-700 text-[10px] font-mono uppercase tracking-wider shrink-0">
                     {t('—')}
