@@ -303,6 +303,10 @@ def test_worker_backfill_retries_429(monkeypatch):
     assert calls["n"] == atw.BACKOFF_MAX_ATTEMPTS, calls
     assert len(sleeps) == atw.BACKOFF_MAX_ATTEMPTS - 1, "each failed attempt sleeps"
     row = archive_db.query(
-        "SELECT status FROM archive_jobs WHERE id = ?", (job_id,)
+        "SELECT status, attempts, next_retry_at FROM archive_jobs WHERE id = ?", (job_id,)
     )[0]
-    assert row["status"] == "failed", "exhausted worker retries must mark the job failed"
+    assert row["status"] == "queued", (
+        "TASK10: a rate-limited job is requeued (gate-aware), never left terminal"
+    )
+    assert row["attempts"] == 1, "one prior failure recorded"
+    assert row["next_retry_at"] is not None, "retry scheduled after the gate clears"

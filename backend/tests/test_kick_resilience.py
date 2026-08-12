@@ -44,6 +44,7 @@ def scratch_db(tmp_path, monkeypatch):
     """Fresh archive DB per test; module connection rebound to tmp path."""
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(tmp_path / "archive.db"))
     archive_db._conn = None
+    archive_db._schema_ready = False
 
 
 # --- _get_json: retry/backoff --------------------------------------------

@@ -2185,6 +2185,7 @@ def update_job(job_id: str, *, status: Optional[str] = None,
             ("FileNotFound" in err)
             or ("archive-file-missing" in err)
             or ("DownloadError" in err)
+            or ("no HLS source" in err)
         )
         rate = ("429" in err) or ("rate limit" in err.lower()) or ("ratelimit" in err.lower())
         row = query(

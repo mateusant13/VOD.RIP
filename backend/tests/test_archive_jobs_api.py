@@ -8,10 +8,37 @@ updated_at/heartbeat) — this test pins the fields the frontend consumes.
 """
 from __future__ import annotations
 
-import pytest
-from httpx import ASGITransport, AsyncClient
+import os
+import tempfile
+from pathlib import Path
 
-from app import app
+os.environ["VODRIP_ARCHIVE_DB"] = str(
+    Path(tempfile.mkdtemp(prefix="archive-jobs-api-")) / "archive.db")
+
+import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from app import app  # noqa: E402
+from services import archive_db  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _api_scratch_db():
+    """Rebind the shared archive conn to THIS module's scratch DB so the
+    /clear endpoint's counts are not polluted by other modules' leftover
+    terminal rows in the shared conftest DB."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(
+        Path(tempfile.mkdtemp(prefix="archive-jobs-api-")) / "archive.db")
+    archive_db._conn = None
+    archive_db._schema_ready = False
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    archive_db._conn = None
+    archive_db._schema_ready = False
 from services import archive_db
 
 
