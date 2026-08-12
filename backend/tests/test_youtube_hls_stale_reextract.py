@@ -76,11 +76,15 @@ class _FakeResp403:
         raise ytdlp_hls.requests.HTTPError("HTTP 403")
 
 
-def _patch_googlevideo_403(monkeypatch, calls):
+def _patch_googlevideo_403(monkeypatch, calls, url_filter=None):
     import curl_cffi.requests as cffi_requests
 
     def fake_get(url, **kwargs):
-        calls["n"] += 1
+        # Count only the URL(s) under test: a background mux thread from an
+        # earlier real-network test may still be fetching other googlevideo
+        # URLs through this global patch (order-dependent flake otherwise).
+        if url_filter is None or url_filter in url:
+            calls["n"] += 1
         return _FakeResp403()
 
     monkeypatch.setattr(cffi_requests, "get", fake_get)
@@ -89,7 +93,7 @@ def _patch_googlevideo_403(monkeypatch, calls):
 def test_stale_span_detected_by_probe_no_deep_recursion(tmp_path, monkeypatch):
     """A dead URL raises after ONE probe — the bisect tree is never walked."""
     calls = {"n": 0}
-    _patch_googlevideo_403(monkeypatch, calls)
+    _patch_googlevideo_403(monkeypatch, calls, url_filter="cdn.invalid/stale")
     with pytest.raises(ytdlp_hls.StaleGooglevideoUrl):
         ytdlp_hls._fetch_googlevideo_span_resilient(
             "https://cdn.invalid/stale", (0, 8 * 1024 * 1024), {}, str(tmp_path / "w"), None,
@@ -101,7 +105,7 @@ def test_stale_span_detected_by_probe_no_deep_recursion(tmp_path, monkeypatch):
 def test_stale_span_bisect_depth_capped(tmp_path, monkeypatch):
     """The explicit depth cap stops recursion on the same URL."""
     calls = {"n": 0}
-    _patch_googlevideo_403(monkeypatch, calls)
+    _patch_googlevideo_403(monkeypatch, calls, url_filter="cdn.invalid/stale")
     with pytest.raises(ytdlp_hls.StaleGooglevideoUrl, match="depth exceeded"):
         ytdlp_hls._fetch_googlevideo_span_resilient(
             "https://cdn.invalid/stale", (0, 1024), {}, str(tmp_path / "x"), None,
