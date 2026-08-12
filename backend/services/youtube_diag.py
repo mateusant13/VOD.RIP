@@ -59,6 +59,32 @@ def log_extract_ok(video_id: str, source: str, info: dict, session: Any = None) 
         auth_hint(session),
         format_summary(info),
     )
+_AGE_GATE_MARKERS = (
+    "sign in to confirm your age",
+    "confirm your age",
+    "age-restricted",
+    "age restricted",
+    "age-gate",
+    "age gate",
+    "age_verification_required",
+    "inappropriate for some users",
+)
+
+
+def is_age_gate_error(exc: BaseException) -> bool:
+    """True when the error is a definitive YouTube age gate (login required).
+
+    Distinct from the transient bot gate ("Sign in to confirm you're not a
+    bot") — retrying an age-gated video NEVER succeeds without logged-in
+    cookies. Verified against yt-dlp 2026.07.04 + current wiki (2026-08-12):
+    no anonymous player client (web, web_embedded, android_vr, web_safari)
+    passes the age gate anymore; the app's cookie_bridge login flow is the
+    only path.
+    """
+    low = str(exc).lower()
+    return any(marker in low for marker in _AGE_GATE_MARKERS)
+
+
 def youtube_http_status(exc: BaseException) -> int:
     """Map a sanitized YouTube error to an HTTP status code.
 
@@ -66,6 +92,8 @@ def youtube_http_status(exc: BaseException) -> int:
     videos, 503 for transient bot/cookie/auth issues, 500 for unknown.
     """
     low = str(exc).lower()
+    if is_age_gate_error(exc):
+        return 403  # needs a logged-in account — retrying never helps
     if (
         "members-only content" in low
         or "join this channel" in low
@@ -93,6 +121,14 @@ def youtube_http_status(exc: BaseException) -> int:
 def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
     """Sanitize YouTube errors for API/UI — never mention cookies or bot jargon."""
     low = str(exc).lower()
+    # Definitive age gate — retrying never helps without a logged-in account;
+    # the app's YouTube sign-in flow (cookie_bridge) is the only unlock.
+    if is_age_gate_error(exc):
+        return (
+            "This video is age-restricted — sign in to YouTube to watch it."
+            if preview
+            else "This video is age-restricted — sign in to YouTube to download it."
+        )
     if any(
         x in low
         for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in")
@@ -121,10 +157,21 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
 
 assert "restricted" in youtube_user_message(RuntimeError("cookie database locked"), preview=True).lower()
 assert "restricted" in youtube_user_message(RuntimeError("Sign in to confirm you're not a bot"), preview=True).lower()
+# Age gate is definitive (needs login, 403, explicit message) — bot gate stays
+# transient (503, "try again"). Verified 2026-08-12 against yt-dlp 2026.07.04:
+# no anonymous client passes the age gate, so retry messaging would be a lie.
+assert is_age_gate_error(RuntimeError("Sign in to confirm your age"))
+assert is_age_gate_error(RuntimeError("This video is age-restricted"))
+assert not is_age_gate_error(RuntimeError("Sign in to confirm you're not a bot"))
+assert not is_age_gate_error(RuntimeError("This video is unavailable"))
+assert "age-restricted" in youtube_user_message(RuntimeError("Sign in to confirm your age"), preview=True).lower()
+assert "age-restricted" in youtube_user_message(RuntimeError("This video is age-restricted"), preview=False).lower()
+assert "try again" not in youtube_user_message(RuntimeError("Sign in to confirm your age"), preview=False).lower()
 # Transient gate collapses map to 503, definitive dead-video messages to 404 —
 # a soft "Video unavailable" must never surface as a hard 404.
 assert youtube_http_status(RuntimeError("YouTube preview unavailable for this video")) == 503
 assert youtube_http_status(RuntimeError("Sign in to confirm you're not a bot")) == 503
+assert youtube_http_status(RuntimeError("Sign in to confirm your age")) == 403
 assert youtube_http_status(RuntimeError("This video is unavailable")) == 404
 assert youtube_http_status(RuntimeError("This video has been removed by the uploader")) == 404
 assert youtube_http_status(RuntimeError("members-only content")) == 403
