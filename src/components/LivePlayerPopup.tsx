@@ -519,10 +519,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // snapshot at 0 instead of the dragged time).
     // hls.js surface mirrors the mini preview player (App.tsx) except the
     // buffer/live-sync geometry (see the config below): enableWorker,
-    // lowLatencyMode off, long timeouts, the adblock pLoader, and the live
-    // sync knobs. capLevelToPlayerSize is DELIBERATELY absent — the mini
-    // preview caps to its panel size, the live popup must keep the stream's
-    // source resolution.
+    // lowLatencyMode on (LL-HLS part handling), long timeouts, the adblock
+    // pLoader, and the live sync knobs. capLevelToPlayerSize is DELIBERATELY
+    // absent — the mini preview caps to its panel size, the live popup must
+    // keep the stream's source resolution.
     // startLevel: 0 = the LOWEST manifest level — hls.js 1.6.2 sorts levels
     // ascending (dist/hls.mjs: "sort levels from lowest to highest"), so
     // index 0 is the smallest fragment → fastest first frame. MANIFEST_PARSED
@@ -531,17 +531,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       ...twitchAdBlockHlsConfig({ live: true, onAdRotation }),
       enableWorker: true,
       startLevel: 0,
-      lowLatencyMode: false,
-      // Live geometry (buffering fix): the playhead must ride below the live
-      // edge with a real jitter cushion, not the mini preview's play-first
-      // VOD knobs. Every delivery stage adds latency (browser -> backend
-      // proxy -> Twitch CDN, plus the pLoader's fetch+strip on each refresh);
-      // with liveSyncDuration 3 / maxBufferLength 6 the media ahead of the
-      // playhead was ~3s, so any hiccup (manifest refresh, connection-pool
-      // contention, CDN) drained it into a waiting→buffering flash. 8s keeps
-      // the stream feeling live (~2 segments behind edge; hls.js's default
-      // target is liveSyncDurationCount 3) and absorbs the backend's own
-      // ~3-5s live pipeline latency (backend/services/preview/session.py).
+      lowLatencyMode: true,
+      // Live latency target: ONE segment behind the live edge
+      // (liveSyncDurationCount 1) — the ~2-5s band the official Kick/Twitch
+      // pages run. lowLatencyMode also enables LL-HLS part handling; the
+      // backend prefers Twitch LL masters and non-LL playlists play
+      // identically with it on. hls.js THROWS when count and duration sync
+      // variants are mixed, so the count knobs are the only live-sync
+      // geometry here — computeLiveEdgeSec mirrors hls.js's targetLatency
+      // (count × level targetduration) to keep the edge math exact.
+      // maxLiveSyncPlaybackRate 1.5 recovers from any drift by playing up to
+      // 1.5× instead of stalling; liveMaxLatencyDurationCount 6 (≈12s at 2s
+      // segments) is the force-resync ceiling for slow networks. maxBufferLength
+      // 20 keeps the buffer deep so the tighter target does not reintroduce
+      // the old 3s-target rebuffer flash (feat/live-buffering).
       maxBufferLength: 20,
       maxMaxBufferLength: 40,
       // Retained back-buffer = the arrow-seek window: LIVE without a DVR
@@ -552,10 +555,16 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
       testBandwidth: false,
-      liveSyncDuration: 8,
-      // hls.js REQUIRES liveMaxLatencyDuration > liveSyncDuration (config
-      // merge throws otherwise) — keep the catch-up band above the target.
-      liveMaxLatencyDuration: 15,
+      liveSyncDurationCount: 1,
+      // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
+      // (config validation throws otherwise) — 6 ≈ 12s at 2s segments.
+      liveMaxLatencyDurationCount: 6,
+      // twitchAdBlockHlsConfig injects the DURATION variants (liveSyncDuration
+      // 3 / liveMaxLatencyDuration 10) for the mini preview; hls.js throws on
+      // mixing count + duration variants, so null them — the count knobs
+      // above are the popup's only live-sync geometry.
+      liveSyncDuration: undefined,
+      liveMaxLatencyDuration: undefined,
       // liveDurationInfinity false → the browser sees a FINITE live timeline
       // (duration = buffered end) instead of Infinity, so setting currentTime
       // can seek back into the retained back-buffer above.
@@ -1220,11 +1229,27 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // add the configured sync lag for the true edge). Falls back to the
   // seekable end. Used to map currentTime to broadcast-relative seconds AND
   // to clamp the back-buffer arrow seek (no-archive live) below.
+  // The sync lag mirrors hls.js's LiveSyncController.targetLatency: hls.js
+  // writes the computed target into config.liveSyncDuration at runtime; until
+  // then (and for the count-based config) it is liveSyncDurationCount × the
+  // level's targetduration (2s default = one 2s segment).
   const computeLiveEdgeSec = useCallback((): number => {
     const h = hlsRef.current;
     if (h) {
       const pos = typeof h.liveSyncPosition === 'number' ? h.liveSyncPosition : Number.NaN;
-      if (Number.isFinite(pos) && pos > 0) return pos + (h.config.liveSyncDuration ?? 3);
+      if (Number.isFinite(pos) && pos > 0) {
+        const c = h.config;
+        let lag = typeof c.liveSyncDuration === 'number' && Number.isFinite(c.liveSyncDuration)
+          ? c.liveSyncDuration
+          : Number.NaN;
+        if (!Number.isFinite(lag)) {
+          const count = typeof c.liveSyncDurationCount === 'number' ? c.liveSyncDurationCount : 3;
+          const level = h.levels?.[h.loadLevel];
+          const td = level?.details?.targetduration;
+          lag = count * (typeof td === 'number' && td > 0 ? td : 2);
+        }
+        return pos + lag;
+      }
     }
     const v = videoRef.current;
     const s = v?.seekable;

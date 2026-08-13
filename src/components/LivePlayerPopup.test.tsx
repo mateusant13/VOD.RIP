@@ -712,8 +712,8 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
     expect(rail.disabled).toBe(true);
 
-    // Live edge = liveSyncPosition(100) + config.liveSyncDuration(8) = 108;
-    // the back-buffer window is [108−30, 108−0.75] = [78, 107.25].
+    // Live edge = liveSyncPosition(100) + liveSyncDurationCount(1) × 2s = 102;
+    // the back-buffer window is [102−30, 102−0.75] = [72, 101.25].
     hls.liveSyncPosition = 100;
     const video = document.querySelector('video') as HTMLVideoElement;
     video.currentTime = 95;
@@ -724,18 +724,18 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(video.currentTime).toBe(95); // 90 + 5
 
-    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 78.
+    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 72.
     video.currentTime = 5;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
-    expect(video.currentTime).toBe(78);
+    expect(video.currentTime).toBe(72);
 
-    // Clamped just below the live edge (0.75s safety): 106 + 5 → 111 → 107.25.
+    // Clamped just below the live edge (0.75s safety): 106 + 5 → 111 → 101.25.
     video.currentTime = 106;
     fireEvent.keyDown(window, { key: 'ArrowRight' });
-    expect(video.currentTime).toBe(107.25);
+    expect(video.currentTime).toBe(101.25);
 
-    // Never below 0: early stream (edge 20 → window [0, 19.25]).
-    hls.liveSyncPosition = 12; // edge 20
+    // Never below 0: early stream (edge 14 → window [0, 13.25]).
+    hls.liveSyncPosition = 12; // edge 14
     video.currentTime = 0;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
     expect(video.currentTime).toBe(0);
@@ -785,6 +785,38 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     await new Promise((r) => setTimeout(r, 300));
     expect((window as unknown as { __livePopupHls?: unknown }).__livePopupHls).toBeUndefined();
     expect(screen.queryByRole('slider', { name: 'Seek within replay' })).toBeNull();
+  });
+});
+
+describe('LivePlayerPopup live latency config', () => {
+  it('targets a ~2-5s player delay with count-based sync knobs on every platform', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+
+    // Count-based live-sync geometry — 1 segment behind the edge (≈2s target
+    // at 2s Twitch/Kick segments); 6 segments (≈12s) is the force-resync
+    // ceiling. hls.js 1.7 THROWS when count and duration variants are mixed,
+    // so the duration knobs the adblock config injects are nulled out.
+    expect(hls.config.liveSyncDurationCount).toBe(1);
+    expect(hls.config.liveSyncDuration).toBeUndefined();
+    expect(hls.config.liveMaxLatencyDurationCount).toBe(6);
+    expect(hls.config.liveMaxLatencyDuration).toBeUndefined();
+
+    // LL-HLS part handling on (backend prefers Twitch LL masters; non-LL
+    // playlists play identically) + fast 1.5× catch-up when behind.
+    expect(hls.config.lowLatencyMode).toBe(true);
+    expect(hls.config.maxLiveSyncPlaybackRate).toBe(1.5);
+
+    // Buffering-fix geometry retained: deep forward buffer, 30s retained
+    // back-buffer for the arrow seek, finite live timeline (seekable).
+    expect(hls.config.maxBufferLength).toBe(20);
+    expect(hls.config.backBufferLength).toBe(30);
+    expect(hls.config.liveDurationInfinity).toBe(false);
+
+    // Live mode auto-starts; the replay guard still owns replay mode.
+    expect(hls.config.autoStartLoad).toBe(true);
   });
 });
 
