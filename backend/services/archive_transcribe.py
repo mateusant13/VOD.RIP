@@ -2771,13 +2771,18 @@ def _twin_transcribed_while_running(platform: str, video_id: str) -> bool:
 
 
 def _captions_first_skip(platform: str, video_id: str) -> bool:
-    """True when YouTube captions already cover the video and the user opted
-    into captions-first (settings.yt_subtitles_first, default True).
+    """True when a YouTube transcribe job must NOT run ASR (captions-first,
+    settings.yt_subtitles_first, default True).
 
-    Whisper still runs when the toggle is off, the platform isn't YouTube,
-    or no caption rows exist. ponytail: there is no force-transcribe path
-    (archive_jobs has no force flag) — add one there if a job ever needs to
-    bypass this.
+    YouTube transcripts come from captions, never from parakeet/whisper: a
+    video whose captions are ingested already has transcript rows, and a
+    captionless video is served by the caption re-ingest leg (the scheduler
+    never enqueues a NEW job for it, but a search/preview kick can leave a
+    stale one queued) — both resolve to 'done' here instead of spending ASR
+    work. Whisper still runs when the toggle is off (explicit user
+    override) or the platform isn't YouTube. ponytail: there is no
+    force-transcribe path (archive_jobs has no force flag) — add one there
+    if a job ever needs to bypass this.
     """
     if platform != "youtube":
         return False
@@ -2785,7 +2790,7 @@ def _captions_first_skip(platform: str, video_id: str) -> bool:
 
     if not getattr(settings_mgr.get(), "yt_subtitles_first", True):
         return False
-    return bool(archive_db.transcript_for(platform, video_id))
+    return True
 
 
 def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
@@ -2874,7 +2879,10 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             }
 
         if _captions_first_skip(platform, video_id):
-            logger.info("captions already present for %s/%s — skipping whisper", platform, video_id)
+            logger.info(
+                "youtube %s/%s skipped — captions-first (captions are the transcript)",
+                platform, video_id,
+            )
             archive_db.update_job(job_id, status="done", progress=1.0)
             return {
                 "job_id": job_id,

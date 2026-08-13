@@ -2587,9 +2587,12 @@ def worker_heartbeat_age(tag: str) -> Optional[float]:
 def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:
     """True when YouTube captions already cover the video (captions-first on).
 
-    Mirrors archive_transcribe._captions_first_skip: yt_subtitles_first
-    (default True) AND transcript rows exist. The subtitles_first override
-    lets tests probe the helper without the settings singleton."""
+    The ingest-side sibling of archive_transcribe._captions_first_skip (the
+    worker skip no longer checks rows — YouTube never runs ASR when
+    captions-first is on): this helper keeps requiring actual transcript
+    rows because it drives the re-extract decision — a captionless video
+    must stay a re-ingest candidate. The subtitles_first override lets
+    tests probe the helper without the settings singleton."""
     if platform != "youtube":
         return False
     if subtitles_first is None:

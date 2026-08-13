@@ -531,10 +531,19 @@ def _enqueue_transcriptions() -> None:
         plat = r["platform"]
         if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
             continue  # file evicted — whisper would fail immediately
-        if plat == "youtube" and archive_db.captions_cover("youtube", vid):
-            continue  # yt_subtitles_first: whisper skipped anyway
         latest = archive_db.latest_job(plat, vid, kind="transcribe")
         job_id = f"transcribe-{plat}-{vid}"
+        if plat == "youtube" and latest is None:
+            # YouTube transcripts come from captions, never from ASR: a
+            # video whose captions are ingested already has transcript rows
+            # (the SQL's NOT EXISTS above skips it) and a captionless video
+            # is served by the caption re-ingest leg (_ingest_youtube), not
+            # parakeet — so the scheduler NEVER creates a new transcribe
+            # job for YouTube. Existing rows still flow through the retry
+            # logic below (stale-failed requeue in place, fresh-failure
+            # guard, stable job id) and drain via the worker's
+            # captions-first skip instead of stranding unfinished.
+            continue
         if latest:
             if latest["status"] in ("queued", "running"):
                 continue
