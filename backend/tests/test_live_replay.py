@@ -6,8 +6,10 @@ or from the backend directory with:
     python -m tests.test_live_replay
 
 Covers: media-playlist totalduration probing, the growing-VOD crop clamp,
-the low_latency master downgrade, the replay ENDLIST snapshot resource, and
-the per-session playlist TTL. Network is stubbed — no upstream calls.
+the low_latency master downgrade, the replay ENDLIST snapshot resource, the
+per-session playlist TTL, and the previous-broadcast replay guard (a live
+channel must never replay an older VOD). Network is stubbed — no upstream
+calls.
 """
 import time
 from pathlib import Path
@@ -405,6 +407,172 @@ def test_create_live_session_dedup_reuses_active_session() -> None:
         hls_mod._http_get_bytes = real_bytes
 
 
+def test_twitch_archive_info_refuses_previous_vod_while_live() -> None:
+    # Replay guard: a LIVE channel's newest listed VOD is a previous
+    # broadcast (its current VOD is unpublished until the stream ends) —
+    # twitch_archive_info must return None so the frontend rail stays off.
+    import services.twitch_gql_service as gql_mod
+    from services.live_capture import twitch_archive_info
+
+    real_status = gql_mod.get_channel_stream_status_sync
+    real_videos = gql_mod.list_channel_videos_sync
+    real_playback = gql_mod.get_vod_playback_sync
+    gql_mod.get_channel_stream_status_sync = lambda login: {
+        "live": True,
+        "started_at": "2026-08-13T10:00:00Z",
+    }
+    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+        {
+            "id": "111",
+            "platform": "Twitch",
+            "title": "Yesterday's broadcast",
+            "created_at": "2026-08-12T09:00:00Z",
+        }
+    ]
+    playback_calls: list = []
+    gql_mod.get_vod_playback_sync = lambda url_or_id: playback_calls.append(url_or_id) or (
+        "http://cdn.example.com/old-master.m3u8", {}, []
+    )
+    try:
+        assert twitch_archive_info("monstercat") is None
+        assert playback_calls == [], "previous broadcast must never reach playback resolution"
+    finally:
+        gql_mod.get_channel_stream_status_sync = real_status
+        gql_mod.list_channel_videos_sync = real_videos
+        gql_mod.get_vod_playback_sync = real_playback
+
+
+def test_twitch_archive_info_allows_just_ended_broadcast_offline() -> None:
+    # Stream offline -> the newest VOD IS the just-ended broadcast -> replay ok.
+    import services.twitch_gql_service as gql_mod
+    from services.live_capture import twitch_archive_info
+
+    real_status = gql_mod.get_channel_stream_status_sync
+    real_videos = gql_mod.list_channel_videos_sync
+    real_playback = gql_mod.get_vod_playback_sync
+    gql_mod.get_channel_stream_status_sync = lambda login: {"live": False, "started_at": None}
+    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+        {
+            "id": "222",
+            "platform": "Twitch",
+            "title": "Just-ended broadcast",
+            "created_at": "2026-08-13T10:00:00Z",
+        }
+    ]
+    gql_mod.get_vod_playback_sync = lambda url_or_id: (
+        "http://cdn.example.com/new-master.m3u8", {"Referer": "https://www.twitch.tv/"}, []
+    )
+    try:
+        info = twitch_archive_info("monstercat")
+        assert info is not None
+        assert info["vod_id"] == "222"
+        assert info["url"] == "http://cdn.example.com/new-master.m3u8"
+        assert info["platform"] == "Twitch"
+    finally:
+        gql_mod.get_channel_stream_status_sync = real_status
+        gql_mod.list_channel_videos_sync = real_videos
+        gql_mod.get_vod_playback_sync = real_playback
+
+
+def test_twitch_archive_info_status_failure_keeps_old_behavior() -> None:
+    # Transient GQL failure on the stream-status query (None) -> replay must
+    # still resolve exactly as before the guard existed.
+    import services.twitch_gql_service as gql_mod
+    from services.live_capture import twitch_archive_info
+
+    real_status = gql_mod.get_channel_stream_status_sync
+    real_videos = gql_mod.list_channel_videos_sync
+    real_playback = gql_mod.get_vod_playback_sync
+    gql_mod.get_channel_stream_status_sync = lambda login: None  # query failed
+    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+        {
+            "id": "333",
+            "platform": "Twitch",
+            "title": "Latest VOD",
+            "created_at": "2026-08-12T09:00:00Z",
+        }
+    ]
+    gql_mod.get_vod_playback_sync = lambda url_or_id: (
+        "http://cdn.example.com/old-master.m3u8", {}, []
+    )
+    try:
+        info = twitch_archive_info("monstercat")
+        assert info is not None and info["vod_id"] == "333"
+    finally:
+        gql_mod.get_channel_stream_status_sync = real_status
+        gql_mod.list_channel_videos_sync = real_videos
+        gql_mod.get_vod_playback_sync = real_playback
+
+
+def test_resolve_live_archive_vod_url_refuses_previous_broadcast() -> None:
+    # Replay guard on the frontend-passed vod_url: live channel + VOD created
+    # a day before the stream start -> no archive (rail off), and playback
+    # resolution is never attempted for the stale VOD.
+    import services.twitch_gql_service as gql_mod
+
+    sess = _mk_session(
+        "lv1",
+        master_url="https://usher.ttvnw.net/api/channel/hls/monstercat.m3u8",
+    )
+    sess.archive_candidate_url = "https://www.twitch.tv/videos/444"
+    _manager._sessions["lv1"] = sess
+    real_status = gql_mod.get_channel_stream_status_sync
+    real_created = gql_mod.twitch_video_created_at
+    real_playback = gql_mod.get_vod_playback_sync
+    playback_calls: list = []
+    gql_mod.get_channel_stream_status_sync = lambda login: {
+        "live": True,
+        "started_at": "2026-08-13T10:00:00Z",
+    }
+    gql_mod.twitch_video_created_at = lambda url_or_id: "2026-08-12T09:00:00Z"
+    gql_mod.get_vod_playback_sync = lambda url_or_id: playback_calls.append(url_or_id) or (
+        "http://cdn.example.com/old-master.m3u8", {}, []
+    )
+    try:
+        assert _manager._resolve_live_archive(sess, sess.archive_candidate_url) is None
+        assert playback_calls == [], "previous broadcast must never reach playback resolution"
+        # The lazy entry point surfaces the same refusal (archive stays off).
+        assert _manager._ensure_live_archive(sess) is False
+        assert sess.archive_url is None and sess.archive_entry_url is None
+    finally:
+        _manager._sessions.pop("lv1", None)
+        gql_mod.get_channel_stream_status_sync = real_status
+        gql_mod.twitch_video_created_at = real_created
+        gql_mod.get_vod_playback_sync = real_playback
+
+
+def test_resolve_live_archive_vod_url_allows_offline_stream() -> None:
+    # vod_url path, stream offline -> the listed VOD is the just-ended
+    # broadcast -> replay resolves through the normal playback flow.
+    import services.twitch_gql_service as gql_mod
+
+    _stub_http_get_bytes(ARCHIVE_GROWING)
+    sess = _mk_session(
+        "lv2",
+        master_url="https://usher.ttvnw.net/api/channel/hls/monstercat.m3u8",
+    )
+    sess.archive_candidate_url = "https://www.twitch.tv/videos/555"
+    _manager._sessions["lv2"] = sess
+    real_status = gql_mod.get_channel_stream_status_sync
+    real_created = gql_mod.twitch_video_created_at
+    real_playback = gql_mod.get_vod_playback_sync
+    gql_mod.get_channel_stream_status_sync = lambda login: {"live": False, "started_at": None}
+    gql_mod.twitch_video_created_at = lambda url_or_id: "2026-08-13T10:00:00Z"
+    gql_mod.get_vod_playback_sync = lambda url_or_id: (
+        "http://cdn.example.com/new-master.m3u8", {}, []
+    )
+    try:
+        archive = _manager._resolve_live_archive(sess, sess.archive_candidate_url)
+        assert archive is not None
+        master, _media = archive
+        assert master == "http://cdn.example.com/new-master.m3u8"
+    finally:
+        _manager._sessions.pop("lv2", None)
+        gql_mod.get_channel_stream_status_sync = real_status
+        gql_mod.twitch_video_created_at = real_created
+        gql_mod.get_vod_playback_sync = real_playback
+
+
 if __name__ == "__main__":
     test_playlist_total_duration()
     test_strip_low_latency_param()
@@ -416,4 +584,9 @@ if __name__ == "__main__":
     test_iter_upstream_bounded_stall_aborts()
     test_replay_snapshot_reresolves_stale_archive()
     test_create_live_session_dedup_reuses_active_session()
+    test_twitch_archive_info_refuses_previous_vod_while_live()
+    test_twitch_archive_info_allows_just_ended_broadcast_offline()
+    test_twitch_archive_info_status_failure_keeps_old_behavior()
+    test_resolve_live_archive_vod_url_refuses_previous_broadcast()
+    test_resolve_live_archive_vod_url_allows_offline_stream()
     print("test_live_replay self-check OK")
