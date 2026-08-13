@@ -40,6 +40,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# PyInstaller's isolated child + vite spawn processes that use %TMP%; on this
+# machine G:\Temp is slow/flaky (MemoryError in marshal/bytearray, OSError 22
+# in _child.py). Pin TMP to the local profile so every build is reproducible.
+$env:TMP  = Join-Path $env:LOCALAPPDATA 'Temp'
+$env:TEMP = $env:TMP
+
 function Fail([string]$msg) {
     Write-Host "BUILD-INSTALL FAILED: $msg" -ForegroundColor Red
     exit 1
