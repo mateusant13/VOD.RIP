@@ -56,6 +56,7 @@ const ptBR: Record<string, string> = {
   'Clear start marker': 'Limpar marcador de início',
   'Clear end marker': 'Limpar marcador de fim',
   'Hover a message to set markers': 'Passe o mouse sobre uma mensagem para marcar',
+  'What are chat markers?': 'Os marcadores de início e fim escolhem qual parte do chat o download exporta. Quando definidos, o download do vídeo também grava um arquivo .chat.txt ao lado do vídeo, apenas com as mensagens entre os dois marcadores — o chat acompanha exatamente o trecho do vídeo que você escolheu, pronto para editores de vídeo. Sem marcadores, o chat completo é mantido.',
   'Chat .txt: {start} → {end}': 'Chat .txt: {start} → {end}',
   'Chat .txt: not included — set START/END markers in the preview chat': 'Chat .txt: não incluído — defina os marcadores INÍCIO/FIM no chat do preview',
   'Notifications': 'Notificações',
@@ -653,6 +654,7 @@ const en: Record<string, string> = {
   'Clear start marker': 'Clear start marker',
   'Clear end marker': 'Clear end marker',
   'Hover a message to set markers': 'Hover a message to set markers',
+  'What are chat markers?': 'Start and end markers choose which part of the chat the download exports. When set, the video download also writes a .chat.txt file next to the video, with only the messages between the two markers — the chat matches the exact video section you picked, ready for video editors. Leave both unset to keep the whole chat.',
   'Chat .txt: {start} → {end}': 'Chat .txt: {start} → {end}',
   'Chat .txt: not included — set START/END markers in the preview chat': 'Chat .txt: not included — set START/END markers in the preview chat',
   // ── Archive retention (renamed label; explicit EN entry so the UI says what it does) ──
@@ -684,6 +686,7 @@ const es: Record<string, string> = {
   'Clear start marker': 'Limpiar marcador de inicio',
   'Clear end marker': 'Limpiar marcador de fin',
   'Hover a message to set markers': 'Pasa el cursor sobre un mensaje para marcar',
+  'What are chat markers?': 'Los marcadores de inicio y fin eligen qué parte del chat exporta la descarga. Al definirlos, la descarga del vídeo también escribe un archivo .chat.txt junto al vídeo, solo con los mensajes entre ambos marcadores — el chat acompaña exactamente el tramo del vídeo que elegiste, listo para editores de vídeo. Sin marcadores se conserva el chat completo.',
   'Chat .txt: {start} → {end}': 'Chat .txt: {start} → {end}',
   'Chat .txt: not included — set START/END markers in the preview chat': 'Chat .txt: no incluido — define los marcadores INICIO/FIN en el chat del preview',
   'Notifications': 'Notificaciones',

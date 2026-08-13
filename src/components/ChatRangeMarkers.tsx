@@ -16,6 +16,7 @@
 import { X } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { formatArchiveOffset } from '../archiveSearchUtils';
+import InfoHint from './InfoHint';
 
 export type ChatMarkerKind = 'start' | 'end';
 
@@ -162,6 +163,7 @@ export function ChatMarkerChips({
         </span>
         {markers.end != null && <X size={8} className="shrink-0" />}
       </button>
+      <InfoHint text={t('What are chat markers?')} />
       {hint && <span className="text-[8px] font-mono text-zinc-600 truncate">{hint}</span>}
     </div>
   );
