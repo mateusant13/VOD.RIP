@@ -71,12 +71,17 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
         <p className="text-[10px] font-mono text-zinc-500 leading-relaxed">
           {t('Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.')}
         </p>
-        <span
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"
-          aria-label="whisper model id (read-only)"
-        >
-          {engine === 'parakeet' ? t('Parakeet (default)') : whisperModel}
-        </span>
+        {/* Parakeet's label already shows in the select above — only
+            whisper surfaces its resolved model id here, so the default
+            engine renders exactly one field. */}
+        {engine === 'whisper' ? (
+          <span
+            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"
+            aria-label="whisper model id (read-only)"
+          >
+            {whisperModel}
+          </span>
+        ) : null}
       </div>
       <Toggle
         label={t('YouTube subtitles first')}

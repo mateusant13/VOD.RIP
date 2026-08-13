@@ -36,28 +36,30 @@ beforeEach(() => {
 });
 
 describe("TranscriptionSection", () => {
-  it("shows parakeet as default engine; whisper model shown when engine=whisper", () => {
+  it("shows parakeet as default engine with exactly one field (no duplicate read-only row)", () => {
     render(
       <TranscriptionSection
         settings={BASE_SETTINGS}
         setSettings={() => {}}
       />,
     );
-    // Parakeet is the default engine; the whisper id renders only on whisper.
-    const model = screen.getByLabelText("whisper model id (read-only)");
-    expect(model.textContent).toContain("Parakeet (default)");
-    expect(model.tagName).toBe("SPAN");
+    // Parakeet's label lives only in the select — no second "Parakeet (default)" row.
+    const engine = screen.getByLabelText("ASR engine");
+    expect(engine.tagName).toBe("SELECT");
+    expect(screen.queryByLabelText("whisper model id (read-only)")).not.toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  it("falls back to large-v3-turbo when whisper engine selected and setting blank", () => {
+  it("shows the resolved whisper model id when engine=whisper and setting blank", () => {
     render(
       <TranscriptionSection
         settings={{ ...BASE_SETTINGS, asr_engine: "whisper", whisper_model: "" }}
         setSettings={() => {}}
       />,
     );
-    expect(screen.getByText("large-v3-turbo")).toBeInTheDocument();
+    const model = screen.getByLabelText("whisper model id (read-only)");
+    expect(model.textContent).toBe("large-v3-turbo");
+    expect(model.tagName).toBe("SPAN");
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 

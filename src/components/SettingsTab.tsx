@@ -77,7 +77,7 @@ function SettingsCard({
           className="flex items-center gap-2 min-w-0 text-left flex-1"
         >
           <span
-            className={`flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-widest ${
+            className={`flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-wide ${
               danger ? 'text-red-400' : 'text-zinc-300'
             }`}
           >
@@ -280,12 +280,12 @@ export default function SettingsTab({
           <div className="flex gap-1.5">
             <button type="button"
               onClick={() => setSettings({ ...settings, download_layout: 'flat' })}
-              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest border-2 ${(settings.download_layout || 'typed') === 'flat' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
+              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-normal border-2 ${(settings.download_layout || 'typed') === 'flat' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
               {t('One folder')}
             </button>
             <button type="button"
               onClick={() => setSettings({ ...settings, download_layout: 'typed' })}
-              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest border-2 ${(settings.download_layout || 'typed') === 'typed' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
+              className={`px-2 py-1 text-[10px] font-bold uppercase tracking-normal border-2 ${(settings.download_layout || 'typed') === 'typed' ? 'border-white bg-white text-black' : 'border-zinc-800 text-zinc-400'}`}>
               {t('Subfolders')}
             </button>
           </div>
@@ -433,26 +433,12 @@ export default function SettingsTab({
         </button>
       </SettingsCard>
 
-      {/* ── Cookie Bridge (detected → second-to-last, above Save) ── */}
+      {/* ── Cookie Bridge (detected → above Save) ── */}
       {needsCookieSetup ? null : cookieCard}
 
-      {/* ── Save ────────────────────────────────────────────────── */}
-      <div className="flex flex-col gap-1.5 pt-1 pb-1">
-        <button
-          onClick={() => void save()}
-          className="w-full bg-zinc-100 text-black font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-100 hover:bg-zinc-300 hover:border-zinc-300 transition-colors"
-        >
-          {settingsSaved ? <><CheckCircle2 size={16} /> {t('Saved!')}</> : t('Save Settings')}
-        </button>
-        {dirty ? (
-          <span className="text-[11px] font-mono text-amber-400 text-center" role="status">
-            {t('● unsaved changes')}
-          </span>
-        ) : null}
-      </div>
-
-      {/* ── Danger Zone (deliberately last — past Save so a destructive
-          action is never one accidental click away from the rest) ── */}
+      {/* ── Danger Zone (user request: directly above Save — exit stays
+          behind an explicit confirm, just no longer buried under the save
+          row) ── */}
       <SettingsCard
         icon={AlertTriangle}
         title={t('Danger Zone')}
@@ -470,6 +456,22 @@ export default function SettingsTab({
           {t('Exit VOD.RIP')}
         </button>
       </SettingsCard>
+
+      {/* ── Save ────────────────────────────────────────────────── */}
+      <div className="flex flex-col gap-1.5 pt-1 pb-1">
+        <button
+          onClick={() => void save()}
+          className="w-full bg-zinc-100 text-black font-black uppercase py-3 flex items-center justify-center gap-2 text-xs border-2 border-zinc-100 hover:bg-zinc-300 hover:border-zinc-300 transition-colors"
+        >
+          {settingsSaved ? <><CheckCircle2 size={16} /> {t('Saved!')}</> : t('Save Settings')}
+        </button>
+        {dirty ? (
+          <span className="text-[11px] font-mono text-amber-400 text-center" role="status">
+            {t('● unsaved changes')}
+          </span>
+        ) : null}
+      </div>
+
     </div>
   );
 }
