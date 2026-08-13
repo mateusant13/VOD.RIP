@@ -1574,14 +1574,22 @@ def chat_history_for_channel(platform: str, channel: str, limit: int = 50) -> li
     key is chronological too). Best-effort by design: an empty DB or a
     channel with no captures returns [] — the endpoint must never 500."""
     cap = max(1, int(limit))
+    # YouTube chat-room slugs arrive as the bare login ('titiltei') or with
+    # the @ handle prefix ('@titiltei') depending on the caller (settings
+    # store either; liveChatSlugFromUrl's youtube branch returns path[0] of
+    # youtube.com URLs, which carries the @). videos.channel is stored
+    # verbatim from settings. Normalize BOTH sides so every slug form finds
+    # every stored form — one guard for all callers (backlog prefill, search
+    # kick). Twitch/Kick logins never carry a prefix, so they are unaffected.
+    slug = (channel or "").strip().lstrip("@")
     rows = query(
         """SELECT m.username, m.text, m.ts, m.color
            FROM messages m
            JOIN videos v ON v.platform = m.platform AND v.video_id = m.video_id
-           WHERE v.platform = ? AND LOWER(v.channel) = LOWER(?)
+           WHERE v.platform = ? AND LOWER(TRIM(v.channel, '@')) = LOWER(?)
            ORDER BY COALESCE(m.ts, m.video_id || '#' || printf('%020.0f', m.offset_sec)) DESC
            LIMIT ?""",
-        (platform, channel, cap),
+        (platform, slug, cap),
     )
     return [dict(r) for r in reversed(rows)]
 

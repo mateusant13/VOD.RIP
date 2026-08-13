@@ -100,6 +100,27 @@ describe('LiveChatPanel backlog pre-fill', () => {
     expect(texts[2]).toContain('newest one');
   });
 
+  it('pre-fills the YouTube backlog (same mechanism as Twitch/Kick)', async () => {
+    const YT_HISTORY = {
+      messages: [
+        { username: '@alice', text: 'yt old', ts: '2026-08-13T19:00:00.000Z', color: '#ff0000' },
+        { username: '@bob', text: 'yt new', ts: '2026-08-13T19:05:00.000Z', color: null },
+      ],
+    };
+    const fn = mockPanelFetch({ youtube: YT_HISTORY });
+    render(
+      <LiveChatPanel sources={[{ platform: 'youtube', slug: '@titiltei' }]} onClose={() => {}} />,
+    );
+    await waitFor(() => expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(2));
+    const call = fn.mock.calls.find((c) => String(c[0]).includes('/api/chat/history'))!;
+    expect(decodeURIComponent(String(call[0]))).toContain(
+      '/api/chat/history?platform=youtube&slug=@titiltei&limit=300',
+    );
+    const texts = rowTexts();
+    expect(texts[0]).toContain('yt old');
+    expect(texts[1]).toContain('yt new');
+  });
+
   it('merges multiple sources in recency order with per-platform fetches', async () => {
     const fn = mockPanelFetch({ twitch: HISTORY, kick: KICK_HISTORY });
     const sources: LiveChatSource[] = [

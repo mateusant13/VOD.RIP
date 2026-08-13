@@ -418,6 +418,97 @@ describe('LivePlayerPopup live chat', () => {
   });
 });
 
+describe('LivePlayerPopup YouTube live chat', () => {
+  /** YouTube live popup: the backend live status carries the googlevideo
+   *  HLS master URL (no slug in it), so chat sources fall back to the saved
+   *  channel's youtubeSlug — the same mechanism Twitch/Kick use. */
+  function renderYoutubePopup(entryUrl: string) {
+    return render(
+      <LivePlayerPopup
+        entry={{ url: entryUrl, title: 'SOLOQ', platform: 'youtube' }}
+        entries={[{ url: entryUrl, title: 'SOLOQ', platform: 'youtube' }]}
+        channelName="titiltei"
+        onClose={vi.fn()}
+        channelSlug="titiltei"
+        channel={{
+          id: 'c1',
+          displayName: 'titiltei',
+          kickSlug: '',
+          twitchSlug: '',
+          youtubeSlug: 'titiltei',
+          vodVideos: [],
+          clipVideos: [],
+          updatedAt: '2026-08-01T00:00:00Z',
+        }}
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+      />,
+    );
+  }
+
+  function youtubeChatEs(): FakeEventSource[] {
+    return FakeEventSource.instances.filter(
+      (es) => es.url.includes('/api/live/chat/stream') && es.url.includes('platform=youtube'),
+    );
+  }
+
+  it('opens the same chat-history panel as Twitch/Kick for a YouTube live', async () => {
+    const fn = mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderYoutubePopup(
+      'https://rr2---sn-ab5l6n7k.googlevideo.com/videoplayback/expire/1785600000000/master.m3u8',
+    );
+    await screen.findByTitle('Fullscreen');
+
+    // The header toggle exists for YouTube lives too.
+    fireEvent.click(screen.getByTitle('Live chat'));
+    await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeTruthy());
+
+    // Live stream resolves via the saved youtubeSlug (googlevideo master
+    // carries no handle)…
+    const es = youtubeChatEs()[0];
+    expect(es).toBeTruthy();
+    expect(decodeURIComponent(es.url)).toContain('platform=youtube&slug=titiltei');
+
+    // …and the backlog pre-fill hits the SAME /api/chat/history endpoint
+    // as Twitch/Kick, same schema of rows.
+    await waitFor(() =>
+      expect(
+        fn.mock.calls.some((c) =>
+          decodeURIComponent(String(c[0])).includes(
+            '/api/chat/history?platform=youtube&slug=titiltei&limit=300',
+          ),
+        ),
+      ).toBe(true),
+    );
+
+    // A row streamed from the live SSE renders in the panel.
+    es.onopen?.();
+    es.onmessage?.({
+      data: JSON.stringify({ username: '@carlos_x_Y_z', text: 'e o hit nas costas?' }),
+    } as MessageEvent);
+    await waitFor(() => expect(screen.getByText('e o hit nas costas?')).toBeTruthy());
+  });
+
+  it('sends the @-handle slug for youtube.com URLs (the backend normalizes it)', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderYoutubePopup('https://www.youtube.com/@titiltei/live');
+    await screen.findByTitle('Fullscreen');
+
+    fireEvent.click(screen.getByTitle('Live chat'));
+    await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeTruthy());
+
+    // liveChatSlugFromUrl's youtube branch keeps the @ handle — the backend
+    // chat-history lookup strips it, so the backlog still finds the rows.
+    const es = youtubeChatEs()[0];
+    expect(es).toBeTruthy();
+    expect(decodeURIComponent(es.url)).toContain('platform=youtube&slug=@titiltei');
+  });
+});
+
 describe('LivePlayerPopup multi chat', () => {
   /** Multi-stream popup: live on Kick AND Twitch, with a saved channel that
    *  carries both platform slugs (multi-chat sources). */
