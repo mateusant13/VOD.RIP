@@ -476,6 +476,38 @@
     note('ext_modal', { action: 'none', modalText, census });
   };
 
+  /**
+   * The official clip editor checks "Adicionar legendas" (Add captions) by
+   * DEFAULT; the user wants clips published without captions. Idempotently
+   * uncheck before Save/Publish. The checkbox id is dynamic (seen live:
+   * `ScCheckBoxInputBase-* tw-checkbox__input`, data-a-target="tw-checkbox");
+   * match by data-a-target + the label text (PT/EN). If the only checkbox in
+   * scope is the captions one (the clip editor has a single checkbox), use it
+   * as fallback. Never blocks the flow when the checkbox is absent.
+   */
+  const uncheckCaptions = async (scope) => {
+    try {
+      const boxes = [...scope.querySelectorAll('input[data-a-target="tw-checkbox"]')];
+      if (!boxes.length) return false;
+      const labelRe = /adicionar legendas|add captions|captions|legendas/i;
+      const box =
+        boxes.find((b) => {
+          const label = b.closest('label');
+          return label && labelRe.test(label.innerText || '');
+        }) || (boxes.length === 1 ? boxes[0] : null);
+      if (!box) return false;
+      if (box.checked) {
+        click(box);
+        note('ext_captions', { action: 'unchecked' });
+        // React state settles after the click; don't publish mid-flip.
+        await sleep(150);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   /** Parse an editor clock "3:20" (m:ss) or "1:02:05" (h:mm:ss) → seconds. */
   const parseClock = (s) => {
     const value = String(s || '').trim();
@@ -1140,6 +1172,7 @@
           historyOffsets: offsetsReady,
         });
         await sleep(offsetsReady.ok ? 400 : 1500);
+        await uncheckCaptions(document);
         click(save);
         // The portrait-layout modal blocks EVERY save — dismiss it before
         // the publish watcher below starts (else the watcher times out and
@@ -1406,6 +1439,7 @@
     note('ext_publish_clicked', { startSec, endSec, title: clipTitle });
     setStatus(`Publicando clip ${fmtHms(startSec)} → ${fmtHms(endSec)}…`);
     await sleep(1200);
+    await uncheckCaptions(editor || document);
     click(publish);
     // Same portrait-layout modal guard as the /create save flow (above).
     await dismissPortraitModal();
