@@ -23,12 +23,24 @@ _FALLBACK_MBPS: Dict[str, float] = {
     "240p": 0.4,
 }
 
-# Peak HLS BANDWIDTH (no AVERAGE-BANDWIDTH) overstates remux size ~1.5–1.7×.
-_PEAK_BANDWIDTH_TO_AVG = 0.62
-# AVERAGE-BANDWIDTH on Twitch/Kick manifests overstates remux size ~1.1–1.3×
-# after accounting for container overhead; peak BANDWIDTH needs a separate scale.
-_MANIFEST_TO_REMUX_SCALE = 0.55
-
+# ponytail: bitrate/BANDWIDTH values from yt-dlp formats and HLS masters are
+# taken at FACE VALUE (scale 1.0). Calibrated against real CDN segment byte
+# rates (backend/tests/test_size_estimate_twitch.py + live probes):
+#   - Twitch usher master BANDWIDTH == true average: 24 variants across 3 VODs
+#     measured 0.978–1.016x of sampled segment bytes (5871.9 vs 5855.2 kbps
+#     on the repro VOD; segment sampling is exact).
+#   - Kick master BANDWIDTH == near-average: 0.78–1.04x (low tiers are nominal
+#     round numbers; worst case 4.3% high at 1080p).
+# The old _MANIFEST_TO_REMUX_SCALE=0.55 / _PEAK_BANDWIDTH_TO_AVG=0.62 pair was
+# calibrated for masters whose BANDWIDTH is a PEAK (rare on Twitch/Kick) and
+# shrank accurate averages to ~0.34–0.62x, then a content-blind fallback floor
+# lifted them back to constants — the estimate ignored the stream's real rate.
+# Ceiling of this heuristic: a platform whose BANDWIDTH is a true peak (no
+# AVERAGE-BANDWIDTH attr, no measurable media playlist) would overstate by the
+# peak/average ratio. Upgrade path: the measured media-playlist byte rate
+# (size_by_quality_from_hls_master) is exact and already preferred whenever
+# the m3u8 master URL is available; make the Twitch fast path hand it the
+# media playlist URL instead of None.
 _DEFAULT_AUDIO_KBPS = 160.0
 
 
@@ -43,10 +55,6 @@ def _clen_bytes_from_url(url: str) -> Optional[int]:
         return int(m.group(1))
     except ValueError:
         return None
-
-
-def _is_googlevideo_url(url: str) -> bool:
-    return "googlevideo.com" in (url or "").lower()
 
 
 def _label_from_height(height: int, fps: Optional[float] = None) -> str:
@@ -80,9 +88,10 @@ def bytes_from_bitrate_kbps(bitrate_kbps: float, duration_sec: float) -> int:
 
 
 def bytes_from_bandwidth_bps(bandwidth_bps: float, duration_sec: float) -> int:
+    """Full-file bytes from a manifest bandwidth (taken as the stream's average)."""
     if bandwidth_bps <= 0 or duration_sec <= 0:
         return 0
-    return int(bandwidth_bps * duration_sec / 8.0 * _MANIFEST_TO_REMUX_SCALE)
+    return int(bandwidth_bps * duration_sec / 8.0)
 
 
 def _format_bitrate_kbps(fmt: dict) -> Optional[float]:
@@ -132,10 +141,6 @@ def size_by_quality_from_formats(
         return {}
     dur = float(duration_sec)
     by_label: Dict[str, float] = {}
-    # Labels whose value came from a muxed-progressive format with a concrete
-    # byte count (clen, filesize, or filesize_approx). These should not be lifted
-    # by the fallback bitrate floor, which is tuned for video-only DASH estimates.
-    muxed_progressive_labels: set[str] = set()
 
     for fmt in formats or []:
         if not isinstance(fmt, dict):
@@ -160,15 +165,12 @@ def size_by_quality_from_formats(
             fmt.get("acodec") in ("none", None)
             and fmt.get("vcodec") not in ("none", None)
         )
-        is_muxed_progressive = not is_video_only and not is_clip
 
         clen = _clen_bytes_from_url(url)
         if clen and clen > 0:
             total = clen
             if is_video_only:
                 total += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
-            elif is_muxed_progressive:
-                muxed_progressive_labels.add(label)
             by_label[label] = max(by_label.get(label, 0), total)
             continue
 
@@ -179,8 +181,6 @@ def size_by_quality_from_formats(
                 if fs > 0:
                     if is_video_only:
                         fs += bytes_from_bitrate_kbps(_DEFAULT_AUDIO_KBPS, dur)
-                    elif is_muxed_progressive:
-                        muxed_progressive_labels.add(label)
                     by_label[label] = max(by_label.get(label, 0), fs)
                     continue
             except (TypeError, ValueError):
@@ -191,22 +191,12 @@ def size_by_quality_from_formats(
             total_kbps = float(kbps)
             if is_video_only:
                 total_kbps += _DEFAULT_AUDIO_KBPS
-            # googlevideo tbr/clen is direct CDN — don't shrink like HLS manifest BANDWIDTH.
-            scale = 1.0 if _is_googlevideo_url(url) else _MANIFEST_TO_REMUX_SCALE
-            est = bytes_from_bitrate_kbps(total_kbps * scale, dur)
+            # tbr/vbr/abr from yt-dlp are the stream's AVERAGE bitrate (Twitch
+            # usher BANDWIDTH matches sampled segment bytes within 2%) — use
+            # at face value, no peak-BANDWIDTH shrink. Exact byte counts
+            # (clen/filesize) above already take precedence.
+            est = bytes_from_bitrate_kbps(total_kbps, dur)
             by_label[label] = max(by_label.get(label, 0), est)
-
-    # Don't let YouTube fast-preview muxed streams understate the real download.
-    # Skip the floor for labels where we already have a concrete muxed-progressive
-    # byte count (clen/filesize/filesize_approx); the floor protects video-only
-    # DASH estimates that rely on bitrate scaling.
-    if not is_clip:
-        for label, size in list(by_label.items()):
-            if label in muxed_progressive_labels:
-                continue
-            floor = bytes_from_bitrate_kbps(_fallback_mbps(label) * 1000.0, dur)
-            if size < floor:
-                by_label[label] = floor
 
     return {k: int(v) for k, v in by_label.items() if v > 0}
 
@@ -294,11 +284,13 @@ def hls_bandwidth_by_height(
             avg_m = re.search(r"AVERAGE-BANDWIDTH=(\d+)", stripped)
             bw_m = re.search(r"BANDWIDTH=(\d+)", stripped)
             res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", stripped)
-            # Peak BANDWIDTH overstates size ~2×; prefer AVERAGE-BANDWIDTH when present.
+            # Twitch/Kick publish the stream AVERAGE in BANDWIDTH (verified
+            # within ~2% of sampled segment bytes); prefer AVERAGE-BANDWIDTH
+            # when both are present, otherwise take BANDWIDTH at face value.
             if avg_m:
                 pending_bw = int(avg_m.group(1))
             elif bw_m:
-                pending_bw = int(int(bw_m.group(1)) * _PEAK_BANDWIDTH_TO_AVG)
+                pending_bw = int(bw_m.group(1))
             else:
                 pending_bw = 0
             pending_h = int(res_m.group(2)) if res_m else 0
@@ -425,7 +417,7 @@ def _resolve_hls_master_to_media(
             if avg_m:
                 pending_bw = int(avg_m.group(1))
             elif bw_m:
-                pending_bw = int(int(bw_m.group(1)) * _PEAK_BANDWIDTH_TO_AVG)
+                pending_bw = int(bw_m.group(1))
             else:
                 pending_bw = 0
             pending_h = int(res_m.group(2)) if res_m else 0
@@ -668,9 +660,7 @@ def enrich_info_dict(
             labels = [*labels, "source"]
         for label in labels:
             mbps = _fallback_mbps(str(label))
-            size_map[str(label)] = bytes_from_bitrate_kbps(
-                mbps * 1000.0 * _MANIFEST_TO_REMUX_SCALE, dur,
-            )
+            size_map[str(label)] = bytes_from_bitrate_kbps(mbps * 1000.0, dur)
 
     # Audio-only estimate so /api/download/video audio_only=True can size the queue.
     audio_bytes = audio_size_bytes_from_formats(formats, dur)
