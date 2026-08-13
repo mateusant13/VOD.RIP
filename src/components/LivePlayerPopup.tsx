@@ -325,14 +325,18 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     [],
   );
 
-  // Close menus on outside click
+  // Close menus on outside click: a menu stays open only while the pointerdown
+  // lands inside its own layout (wrapper + toggle button). Any other click —
+  // other player buttons included — closes it. Re-registers as the open state
+  // flips so the closure sees the current menu set.
   useEffect(() => {
     if (!qualityMenuOpen && !volumeMenuOpen) return;
     const handler = (e: MouseEvent) => {
-      if (popupRef.current && !popupRef.current.contains(e.target as Node)) {
-        setQualityMenuOpen(false);
-        setVolumeMenuOpen(false);
-      }
+      const target = e.target as HTMLElement;
+      if (volumeMenuOpen && target.closest('[data-volume-menu]')) return;
+      if (qualityMenuOpen && target.closest('[data-quality-menu]')) return;
+      setQualityMenuOpen(false);
+      setVolumeMenuOpen(false);
     };
     window.addEventListener('mousedown', handler);
     return () => window.removeEventListener('mousedown', handler);
@@ -1382,7 +1386,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 {paused ? <Play size={15} /> : <Pause size={15} />}
               </button>
 
-              <div className="relative" data-player-menu>
+              <div className="relative" data-player-menu data-volume-menu>
                 <button
                   type="button"
                   onClick={(e) => {
