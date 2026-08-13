@@ -68,7 +68,35 @@ def format_chat_txt(rows: list[dict]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def write_transcript_sidecar(output_file: str, platform: str, video_id: str) -> Optional[str]:
+def _transcript_rows_in_range(
+    rows: list[dict],
+    crop_start: Optional[float],
+    crop_end: Optional[float],
+) -> list[dict]:
+    """Transcript rows intersecting the trim window (a caption straddling a
+    boundary is kept — it is audible inside the trim). Open sides stay open;
+    both None returns the rows unchanged (whole transcript)."""
+    if crop_start is None and crop_end is None:
+        return rows
+    lo = float(crop_start) if crop_start is not None else float("-inf")
+    hi = float(crop_end) if crop_end is not None else float("inf")
+    kept: list[dict] = []
+    for r in rows:
+        start = float(r.get("start_sec") or r.get("offset_sec") or 0)
+        end = float(r.get("end_sec") or (start + float(r.get("duration") or 2)))
+        if start <= hi and end >= lo:
+            kept.append(r)
+    return kept
+
+
+def write_transcript_sidecar(
+    output_file: str,
+    platform: str,
+    video_id: str,
+    *,
+    crop_start: Optional[float] = None,
+    crop_end: Optional[float] = None,
+) -> Optional[str]:
     if not platform or not video_id:
         return None
     try:
@@ -77,6 +105,7 @@ def write_transcript_sidecar(output_file: str, platform: str, video_id: str) -> 
         if not src:
             return None
         rows = archive_db.transcript_for(src[0], src[1])
+        rows = _transcript_rows_in_range(rows, crop_start, crop_end)
         body = format_transcript_txt(rows)
         if not body.strip():
             return None
@@ -245,14 +274,21 @@ def write_download_sidecars(
         plat = platform.lower()
     out: dict[str, Any] = {}
     if include_transcript:
-        out["transcript"] = write_transcript_sidecar(output_file, plat, vid)
+        out["transcript"] = write_transcript_sidecar(
+            output_file, plat, vid,
+            crop_start=crop_start, crop_end=crop_end,
+        )
     if include_chat:
-        # The chat txt range comes straight from the START/END markers the
-        # user set in the chat history (absolute offsets; crop is irrelevant
-        # to the exported window).
+        # The chat txt range is the user's START/END chat markers when set;
+        # absent markers fall back to the download's trim window so the
+        # exported chat matches the downloaded section; no trim at all
+        # leaves the range open (whole archived chat).
         chat_path = str(Path(output_file).with_suffix(".chat.txt"))
+        cs, ce = chat_start_sec, chat_end_sec
+        if cs is None and ce is None:
+            cs, ce = crop_start, crop_end
         out["chat"] = write_chat_sidecar(
             chat_path, plat, vid,
-            start_sec=chat_start_sec, end_sec=chat_end_sec,
+            start_sec=cs, end_sec=ce,
         )
     return out
