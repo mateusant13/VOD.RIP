@@ -154,6 +154,7 @@ export default function NotificationsPanel() {
             const pct = Math.min(100, Math.max(0, Math.round((j.progress || 0) * 100)));
             const running = j.status === 'running';
             const retrying = isRetryJob(j);
+            const jobTs = j.updated_at || j.created_at;
             return (
               <div key={j.id} className="border-2 border-zinc-800 bg-zinc-950/80 p-2.5 flex flex-col gap-1.5">
                 <div className="flex justify-between items-center gap-2">
@@ -166,17 +167,24 @@ export default function NotificationsPanel() {
                       {j.title || j.video_id}
                     </span>
                   </div>
-                  <span className={`text-[10px] font-mono shrink-0 flex items-center gap-1 ${
-                    j.status === 'running' ? 'text-[#53fc18]' :
-                    j.status === 'failed' ? 'text-red-400' :
-                    retrying ? 'text-amber-400' :
-                    j.status === 'done' ? 'text-zinc-400' : 'text-zinc-500'
-                  }`}>
-                    {j.status === 'running' ? <Loader2 size={11} className="animate-spin" /> : null}
-                    {j.status === 'done' ? <CheckCircle2 size={11} /> : null}
-                    {j.status === 'failed' ? <CircleAlert size={11} /> : null}
-                    {statusLabel(j)}
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {jobTs && (
+                      <span className="text-[9px] font-mono text-zinc-600" title={jobTs}>
+                        {new Date(jobTs).toLocaleString()}
+                      </span>
+                    )}
+                    <span className={`text-[10px] font-mono shrink-0 flex items-center gap-1 ${
+                      j.status === 'running' ? 'text-[#53fc18]' :
+                      j.status === 'failed' ? 'text-red-400' :
+                      retrying ? 'text-amber-400' :
+                      j.status === 'done' ? 'text-zinc-400' : 'text-zinc-500'
+                    }`}>
+                      {j.status === 'running' ? <Loader2 size={11} className="animate-spin" /> : null}
+                      {j.status === 'done' ? <CheckCircle2 size={11} /> : null}
+                      {j.status === 'failed' ? <CircleAlert size={11} /> : null}
+                      {statusLabel(j)}
+                    </span>
+                  </div>
                 </div>
                 {running && (
                   <div className="flex items-center gap-2">

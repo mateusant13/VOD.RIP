@@ -2211,7 +2211,28 @@ def update_job(job_id: str, *, status: Optional[str] = None,
             or ("DownloadError" in err)
             or ("no HLS source" in err)
         )
-        rate = ("429" in err) or ("rate limit" in err.lower()) or ("ratelimit" in err.lower())
+        # Gate-aware retry: YouTube bot-gate failures surface as playability
+        # RuntimeErrors, not HTTP 429s — the string markers alone miss them,
+        # so also run the yt_gate classifier (string-safe) plus the explicit
+        # 'bot-gate' marker the ingest path stamps. rate=True makes
+        # _retry_delay_sec wait out the active yt/kick gates instead of hot-
+        # retrying, and gate/rate failures never exhaust max_attempts: an IP
+        # block is a transient condition, not a per-video verdict, so the
+        # job stays 'retrying' until the gate clears instead of going
+        # terminal after 3 futile attempts.
+        try:
+            from services.yt_gate import classify_youtube_gate_error
+
+            _gate = classify_youtube_gate_error(err)
+        except Exception:
+            _gate = False
+        rate = (
+            ("429" in err)
+            or ("rate limit" in err.lower())
+            or ("ratelimit" in err.lower())
+            or ("bot-gate" in err.lower())
+            or _gate
+        )
         row = query(
             "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
         )
@@ -2219,7 +2240,7 @@ def update_job(job_id: str, *, status: Optional[str] = None,
         max_attempts = int(row[0]["max_attempts"] or 0) or 3 if row else 3
         sets.append("attempts = ?")
         params.append(attempts)
-        if terminal or attempts >= max_attempts:
+        if terminal or (attempts >= max_attempts and not rate):
             status = "failed"  # final — no more retries
         else:
             status = "queued"
@@ -2244,8 +2265,9 @@ def update_job(job_id: str, *, status: Optional[str] = None,
 def _retry_delay_sec(attempts: int, rate: bool) -> float:
     """Backoff before the next attempt: exponential with a cap, gate-aware.
 
-    Rate-limit failures (429 / 'rate limit') wait out the active YouTube
-    / Kick gates (honoring them instead of hot-retrying), floored at 2 min.
+    Rate/gate failures (HTTP 429, 'rate limit', YouTube bot-gate, Kick
+    Cloudflare block) wait out the active YouTube / Kick gates (honoring
+    them instead of hot-retrying), floored at 2 min.
     Everything else: 60 * 2^(attempts-1) seconds, capped at 1 h, plus up to
     30 s of jitter so a batch of failed jobs doesn't retry in lockstep."""
     if rate:

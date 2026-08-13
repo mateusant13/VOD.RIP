@@ -194,6 +194,13 @@ def _ingest_twitch(channel: dict) -> None:
 def _ingest_kick(channel: dict) -> None:
     if not _platform_enabled(channel, "kick"):
         return
+    # Kick Cloudflare/rate-limit freeze: skip the API walk until it lifts
+    # (kick_api_service fails fast while frozen — this just avoids the
+    # per-pass futile hits).
+    from services.kick_gate import kick_gate_active
+
+    if kick_gate_active():
+        return
     slug = (channel.get("kickSlug") or "").strip().lower()
     if not slug:
         return
@@ -272,6 +279,15 @@ def _ingest_one_youtube(video_id: str) -> None:
 
 def _ingest_youtube(channel: dict) -> None:
     if not _platform_enabled(channel, "youtube"):
+        return
+    # Bot-gate freeze: no extract attempts until it lifts — every attempt
+    # fails fast behind the wall (re-arming the freeze) and piles another
+    # job row into the panel. Mirrors the instant-preview scheduler's gate
+    # skip; the 1h in-memory _yt_attempted_at backoff remains the fast path
+    # once the gate clears.
+    from services.yt_gate import youtube_gate_active
+
+    if youtube_gate_active():
         return
     yt_budget = _yt_ingest_budget()
     with _yt_lock:
