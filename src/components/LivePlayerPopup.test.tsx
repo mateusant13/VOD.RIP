@@ -371,7 +371,9 @@ describe('LivePlayerPopup fast clip', () => {
     const url = String(openSpy.mock.calls[0][0]);
     expect(url).toContain('https://www.twitch.tv/titiltei');
     expect(url).toContain('vodrip_clip=1');
+    expect(url).toContain('vodrip_start=0');
     expect(url).toContain('vodrip_end=30');
+    expect(url).toContain('vodrip_close=0');
     expect(url).toContain('vodrip_title=');
     // The browser editor replaces the old server capability call entirely.
     const clipCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/live/clip'));
@@ -379,6 +381,33 @@ describe('LivePlayerPopup fast clip', () => {
     const notice = await screen.findByRole('status');
     expect(notice.textContent).toContain('Opening Twitch clip editor');
     openSpy.mockRestore();
+  });
+
+  it('sits BESIDE the volume button with the SAME height (shared transportBtn class)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const clipBtn = screen.getByTitle('Create a clip of the live stream');
+    const volumeBtn = screen.getByTitle('Volume');
+
+    // Adjacency: the clip group is the volume wrapper's immediate sibling in
+    // the transport row (play → volume → clip → captions → live/quality/fs).
+    const volumeWrapper = volumeBtn.closest('[data-volume-menu]') as HTMLElement;
+    expect(volumeWrapper.nextElementSibling?.contains(clipBtn)).toBe(true);
+
+    // Same height: the clip button reuses the volume button's exact base
+    // class (transportBtn — same p-1.5 + border-2 docked, same glass border
+    // fullscreen), so both render identical heights in every mode.
+    expect(clipBtn.className.startsWith(volumeBtn.className)).toBe(true);
+
+    // Fullscreen flips the base to the glass variant — the clip button must
+    // flip WITH it (the old hardcoded non-fs class kept border-2 → taller).
+    const popupRoot = document.querySelector('[data-live-popup]') as Element;
+    fsElement = popupRoot;
+    document.dispatchEvent(new Event('fullscreenchange'));
+    await screen.findByTitle('Exit fullscreen');
+    expect(clipBtn.className.startsWith(volumeBtn.className)).toBe(true);
   });
 
   it('mounts into the shared preview-pause bus (pauses other previews when a live opens)', async () => {
