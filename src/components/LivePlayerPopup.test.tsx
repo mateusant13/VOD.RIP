@@ -187,7 +187,7 @@ describe('LivePlayerPopup fast clip', () => {
     expect(notice.textContent).toContain('Clip unavailable');
   });
 
-  it('clamps the seconds input to 1..60', async () => {
+  it('clamps the seconds input to 5..60', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
@@ -196,7 +196,7 @@ describe('LivePlayerPopup fast clip', () => {
     fireEvent.change(input, { target: { value: '99' } });
     expect((input as HTMLInputElement).value).toBe('60');
     fireEvent.change(input, { target: { value: '0' } });
-    expect((input as HTMLInputElement).value).toBe('1');
+    expect((input as HTMLInputElement).value).toBe('5');
   });
 
   it('shows a fixed "s" suffix next to the seconds value', async () => {
@@ -223,7 +223,7 @@ describe('LivePlayerPopup fast clip', () => {
     expect(input.value).toBe('15');
   });
 
-  it('Backspace on a fully-selected value removes ONE digit (30 → 3)', async () => {
+  it('Backspace on a fully-selected value removes ONE digit, then clamps (30 → 5)', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
@@ -232,24 +232,26 @@ describe('LivePlayerPopup fast clip', () => {
     fireEvent.focus(input); // select-all on focus (selectionStart 0, end = len)
     input.setSelectionRange(0, input.value.length);
     fireEvent.keyDown(input, { key: 'Backspace' });
-    expect(input.value).toBe('3');
+    expect(input.value).toBe('5');
   });
 });
 
 describe('LivePlayerPopup live chat', () => {
-  it('docks the chat panel by default and guards a missing EventSource (jsdom)', async () => {
+  it('keeps the chat panel closed by default and guards a missing EventSource (jsdom)', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
-    // The panel is docked right of the video (default open).
-    const panel = document.querySelector('[data-live-chat-panel]');
-    expect(panel).toBeTruthy();
+    // Live preview chat is CLOSED by default.
+    expect(document.querySelector('[data-live-chat-panel]')).toBeNull();
+
+    // The header toggle opens the panel…
+    fireEvent.click(screen.getByTitle('Live chat'));
+    expect(document.querySelector('[data-live-chat-panel]')).toBeTruthy();
     // jsdom has no EventSource — the panel must degrade, not crash.
     expect(screen.getByText('Live chat unavailable')).toBeTruthy();
 
-    // The header toggle closes the panel (first match — the panel's own X
-    // shares the title).
+    // …and closes it again (first match — the panel's own X shares the title).
     fireEvent.click(screen.getAllByTitle('Close live chat')[0]);
     await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeNull());
   });
@@ -292,6 +294,9 @@ describe('LivePlayerPopup multi chat', () => {
     renderMultiPopup();
     await screen.findByTitle('Fullscreen');
 
+    // Chat is closed by default — open the dock to mount the merged panel.
+    fireEvent.click(screen.getByTitle('Live chat'));
+
     // Multi-stream → the merged panel exposes All/Kick/Twitch filters
     // (YouTube not live → no chip).
     const filters = document.querySelector('[data-live-chat-filters]');
@@ -311,6 +316,9 @@ describe('LivePlayerPopup multi chat', () => {
     FakeEventSource.instances = [];
     renderMultiPopup();
     await screen.findByTitle('Fullscreen');
+
+    // Chat is closed by default — open the dock to mount the panel.
+    fireEvent.click(screen.getByTitle('Live chat'));
 
     // Both streams open and deliver one row each.
     const kickEs = FakeEventSource.instances.find((es) => es.url.includes('platform=kick'))!;
@@ -345,6 +353,9 @@ describe('LivePlayerPopup multi chat', () => {
     FakeEventSource.instances = [];
     renderMultiPopup();
     await screen.findByTitle('Fullscreen');
+
+    // Chat is closed by default — open the dock to mount the panel.
+    fireEvent.click(screen.getByTitle('Live chat'));
 
     // Twitch CDN master URL → login extracted from the m3u8 filename.
     const twitchEs = FakeEventSource.instances.find((es) => es.url.includes('platform=twitch'))!;

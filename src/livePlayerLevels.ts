@@ -242,7 +242,7 @@ export function livePanelSizeFromAspect(
 /** Fast-clip cooldown: one clip per window; a second click is ignored. */
 export const FAST_CLIP_COOLDOWN_MS = 5000;
 /** Fast-clip duration bounds — the seconds input clamps to this range. */
-export const FAST_CLIP_MIN_SEC = 1;
+export const FAST_CLIP_MIN_SEC = 5;
 export const FAST_CLIP_MAX_SEC = 60;
 export const FAST_CLIP_DEFAULT_SEC = 30;
 
@@ -252,7 +252,7 @@ export function clipCooldownRemaining(lastClipAtMs: number, nowMs: number, coold
   return Math.max(0, lastClipAtMs + cooldownMs - nowMs);
 }
 
-/** Clamp the seconds input to the 1..60 fast-clip range. */
+/** Clamp the seconds input to the 5..60 fast-clip range. */
 export function clampClipSeconds(value: number): number {
   if (!Number.isFinite(value)) return FAST_CLIP_DEFAULT_SEC;
   return Math.min(FAST_CLIP_MAX_SEC, Math.max(FAST_CLIP_MIN_SEC, Math.round(value)));
