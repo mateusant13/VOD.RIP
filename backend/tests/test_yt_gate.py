@@ -155,7 +155,7 @@ def test_claim_clears_when_gate_lifts():
 
 
 def test_chat_pacing_min_interval():
-    at._YOUTUBE_CHAT_MIN_INTERVAL_S = 0.15
+    at._YOUTUBE_CHAT_QUIET_INTERVAL_S = 0.15
     at._youtube_chat_last_start = 0.0
     try:
         t0 = time.monotonic()
@@ -166,7 +166,7 @@ def test_chat_pacing_min_interval():
         # interval, not the exact wall time
         assert elapsed >= 0.10, f"second paced start must wait ~interval, got {elapsed:.3f}s"
     finally:
-        at._YOUTUBE_CHAT_MIN_INTERVAL_S = 12.0
+        at._YOUTUBE_CHAT_QUIET_INTERVAL_S = 60.0
 
 
 # --- two-lane contract (user requirement) ----------------------------------
@@ -187,7 +187,7 @@ def test_pacing_activity_aware(monkeypatch):
     monkeypatch.setattr(
         archive_db, "worker_live", lambda age_s=30, tag="transcribe": False
     )
-    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_MIN_INTERVAL_S
+    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_QUIET_INTERVAL_S
 
 
 def test_interactive_kick_never_paced_or_gated(monkeypatch):
@@ -197,7 +197,7 @@ def test_interactive_kick_never_paced_or_gated(monkeypatch):
     _reset_gate()
     yt_gate.note_youtube_gate("test", freeze_sec=60)
     at._youtube_chat_last_start = time.monotonic()  # pacing budget exhausted
-    at._YOUTUBE_CHAT_MIN_INTERVAL_S = 0.15
+    at._YOUTUBE_CHAT_QUIET_INTERVAL_S = 0.15
     try:
         sleeps = []
 
@@ -222,7 +222,7 @@ def test_interactive_kick_never_paced_or_gated(monkeypatch):
         assert yt_gate.youtube_gate_active(), "interactive traffic must not clear the gate"
     finally:
         _reset_gate()
-        at._YOUTUBE_CHAT_MIN_INTERVAL_S = 12.0
+        at._YOUTUBE_CHAT_QUIET_INTERVAL_S = 60.0
 
 
 def test_interactive_backfill_busy_fails_fast(monkeypatch):

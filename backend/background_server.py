@@ -1,0 +1,216 @@
+"""background_server.py — detached "slow and steady" background daemon.
+
+When the app is CLOSED this process keeps the archive alive at low
+resource cost: scheduler ingests (Twitch/Kick/YouTube metadata, chat
+backfill, transcribe enqueue), live-chat capture, mention/entity
+scanning, and periodic disk hygiene + VOD retention all continue, paced
+by VODRIP_BACKGROUND=1 (6-min passes, budget-1 enqueues, 2.5x chat
+gaps) so the machine stays quiet no matter how long the app stays
+closed. The transcribe queue keeps its own detached consumer
+(worker_server.py), spawned here on demand whenever jobs exist.
+
+Ownership handoff is heartbeat-based, mirroring worker_server.py:
+  - The app stamps 'app-activity' every 30s while it lives. As long as
+    that heartbeat is fresh the app owns the background work and this
+    daemon stands down (checks every TICK_S).
+  - When the heartbeat goes stale (app closed/crashed) this daemon
+    starts the in-process services, spawns the archive worker for any
+    pending queue, and runs periodic hygiene/retention.
+  - When the app comes back the services are stopped (watchdog flushes
+    its sinks) and the daemon returns to watching.
+
+First-wins guard: a fresh 'background' heartbeat means another
+background daemon already owns the machine — print and exit 0 (the
+app spawns this at every boot; only the first instance survives).
+
+Stdlib only.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent
+LOG_PATH = BACKEND_DIR / "logs" / "background.log"
+
+# App-liveness: the app stamps 'app-activity' every 30s while alive, so
+# 120s without a stamp (~4 missed) means it is closed.
+APP_GONE_AFTER_S = 120.0
+TICK_S = 60.0
+HEARTBEAT_EVERY_S = 45.0
+# Disk hygiene + VOD retention cadence (the app runs these once at boot).
+HYGIENE_EVERY_S = 6 * 3600.0
+TAG = "background"
+
+_log = logging.getLogger(__name__)
+
+
+def _app_alive() -> bool:
+    from services import archive_db
+
+    return archive_db.worker_live(age_s=int(APP_GONE_AFTER_S), tag="app-activity")
+
+
+def _maybe_spawn_worker() -> None:
+    """(Re)start the detached archive worker when the queue has work and
+    no worker owns it. worker_server's own first-wins guard dedupes
+    against an in-process or other detached worker, so a losing spawn is
+    a harmless immediate exit 0."""
+    from services import archive_db
+
+    if not archive_db.has_pending_jobs():
+        return
+    if archive_db.worker_live(age_s=45):
+        return
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--archive-worker-launch"]
+    else:
+        cmd = [sys.executable, str(BACKEND_DIR / "worker_server.py")]
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(BACKEND_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                if os.name == "nt" else 0
+            ),
+        )
+        _log.info("spawned archive worker (queue has pending jobs)")
+    except Exception:
+        _log.debug("archive worker spawn failed", exc_info=True)
+
+
+# --- service lifecycle (mirrors app.py lifespan; all start/stop are
+# --- idempotent, so repeated ticks while the app stays closed are no-ops)
+
+_STARTED: set[str] = set()
+
+
+def _start_services() -> None:
+    from services import archive_scheduler, archive_watchdog, entity_watch, mention_irc
+
+    for name, start in (
+        ("scheduler", archive_scheduler.start_archive_scheduler),
+        ("watchdog", archive_watchdog.start_archive_watchdog),
+        ("mention", mention_irc.start_mention_irc),
+        ("entity", entity_watch.start_entity_watcher),
+    ):
+        if name in _STARTED:
+            continue
+        try:
+            start()
+            _STARTED.add(name)
+        except Exception:
+            _log.debug("%s start failed", name, exc_info=True)
+    if _STARTED:
+        _log.info("background services running: %s", ", ".join(sorted(_STARTED)))
+
+
+def _stop_services() -> None:
+    from services import archive_scheduler, archive_watchdog, entity_watch, mention_irc
+
+    for name, stop in (
+        ("scheduler", archive_scheduler.stop_archive_scheduler),
+        ("watchdog", archive_watchdog.stop_archive_watchdog),
+        ("mention", mention_irc.stop_mention_irc),
+        ("entity", entity_watch.stop_entity_watcher),
+    ):
+        if name not in _STARTED:
+            continue
+        try:
+            stop()
+        except Exception:
+            _log.debug("%s stop failed", name, exc_info=True)
+    if _STARTED:
+        _log.info("background services stopped")
+    _STARTED.clear()
+
+
+def _run_hygiene() -> None:
+    """Periodic disk hygiene + VOD retention (mirror of the app's
+    boot-maintenance daemon; best-effort, never fatal)."""
+    try:
+        from services.disk_hygiene import run_startup_hygiene
+
+        run_startup_hygiene()
+    except Exception:
+        _log.debug("hygiene failed", exc_info=True)
+    try:
+        from services.archive_retention import enforce_archive_vod_retention
+
+        stats = enforce_archive_vod_retention()
+        if stats.get("deleted_files"):
+            _log.info(
+                "retention: removed %d video file(s), cleared %d row(s)",
+                stats.get("deleted_files"),
+                stats.get("cleared_rows"),
+            )
+    except Exception:
+        _log.debug("retention failed", exc_info=True)
+
+
+def main() -> int:
+    from services import archive_db
+
+    (BACKEND_DIR / "logs").mkdir(exist_ok=True)
+    logging.basicConfig(
+        filename=str(LOG_PATH),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    _log.info("background daemon starting (log %s)", LOG_PATH)
+
+    # First-wins guard BEFORE starting anything: another background daemon
+    # (e.g. from the previous app session, still alive) owns the machine.
+    if archive_db.worker_live(age_s=90, tag=TAG):
+        _log.info("background daemon already running — nothing to do.")
+        return 0
+
+    # Quiet pacing for every pass/enqueue/child this process starts. Read
+    # per-pass by the scheduler and per-interval by the transcribe child.
+    os.environ["VODRIP_BACKGROUND"] = "1"
+
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop.wait(HEARTBEAT_EVERY_S):
+            try:
+                archive_db.worker_heartbeat(TAG)
+            except Exception:
+                _log.debug("heartbeat failed", exc_info=True)
+
+    threading.Thread(target=_heartbeat, daemon=True, name="background-hb").start()
+    _log.info("background daemon watching (will take over when app closes)")
+
+    last_hygiene = time.monotonic()
+    try:
+        while True:
+            if _app_alive():
+                _stop_services()
+                time.sleep(TICK_S)
+                continue
+            _start_services()
+            _maybe_spawn_worker()
+            if time.monotonic() - last_hygiene >= HYGIENE_EVERY_S:
+                _run_hygiene()
+                last_hygiene = time.monotonic()
+            time.sleep(TICK_S)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        _stop_services()
+        _log.info("background daemon stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

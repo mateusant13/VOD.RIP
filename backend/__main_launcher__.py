@@ -644,9 +644,58 @@ def _shutdown(port: int = 7897):
 # ---------------------------------------------------------------------------
 
 
+def _detach_child(args: list[str]) -> None:
+    """Spawn a detached sibling EXE instance (frozen only) and exit 0,
+    orphaning it — the frozen analogue of the dev tree's two-stage python
+    launcher (stale parent PID → taskkill /T tree-walks never reach it)."""
+    subprocess.Popen(
+        [sys.executable] + args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            if os.name == "nt" else 0
+        ),
+        close_fds=True,
+    )
+    sys.exit(0)
+
+
 def main():
     """Application entry point."""
     multiprocessing.freeze_support()
+
+    # Headless dispatches — used by the detached background daemon and
+    # archive worker when running from the frozen EXE (the EXE cannot run
+    # `python -c`/`python -m` children). Each flag runs the same code the
+    # dev tree runs directly, BEFORE the GUI and the singleton lock, so
+    # the app can spawn and orphan its own background processes without
+    # relaunching the UI.
+    if "--background-server-launch" in sys.argv:
+        _detach_child(["--background-server"])
+    if "--background-server" in sys.argv:
+        from background_server import main as _background_main
+
+        sys.exit(_background_main())
+    if "--archive-worker-launch" in sys.argv:
+        _detach_child(["--archive-worker"])
+    if "--archive-worker" in sys.argv:
+        from worker_server import main as _worker_main
+
+        sys.exit(_worker_main())
+    if "--transcribe-once" in sys.argv:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
+        from services import archive_db
+
+        if archive_db.worker_live(age_s=45):
+            sys.exit(0)
+        from services.archive_transcribe import run_worker
+
+        run_worker(once=True, poll_interval=2.0)
+        sys.exit(0)
 
     port = int(os.environ.get("PORT", 7897))
 

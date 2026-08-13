@@ -117,9 +117,9 @@ def test_background_widens_youtube_chat_pacing(monkeypatch):
     """The quota-sensitive YouTube chat fetch backs off ~2.5x in background."""
     monkeypatch.setattr(at.archive_db, "worker_live", lambda *a, **k: False)
     monkeypatch.delenv("VODRIP_BACKGROUND", raising=False)
-    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_MIN_INTERVAL_S
+    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_QUIET_INTERVAL_S
     monkeypatch.setenv("VODRIP_BACKGROUND", "1")
-    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_MIN_INTERVAL_S * 2.5
+    assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_QUIET_INTERVAL_S * 2.5
     # active-lane case (user at the keyboard): 30 -> 75
     monkeypatch.setattr(at.archive_db, "worker_live", lambda *a, **k: True)
     assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_ACTIVE_INTERVAL_S * 2.5

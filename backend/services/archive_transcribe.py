@@ -2565,18 +2565,20 @@ _CHAT_HEARTBEAT_STALE = timedelta(minutes=10)
 # YouTube chat-backfill pacing: min gap between chat video STARTS. A single
 # worker starts ≤5/min (burst 2 requests each: extract + chat download); the
 # 3-thread pool can run up to 3 concurrently, still under the measured
-# 4-6/min per-IP limiter. Two lanes (user requirement): the interactive lane
+# Two lanes (user requirement): the interactive lane
 # (preview/download/click-chat/search/watch) NEVER consults this pace or the
 # bot gate — pacing exists only in the worker's background lane. While the
-# user is actively using the app (an 'app-activity' heartbeat stamped by the
-# app middleware) the interval grows to _YOUTUBE_CHAT_ACTIVE_INTERVAL_S so
-# background volume stays under the radar and interactive traffic is never
-# collateral damage; when the app is idle the worker ramps back to heavy
-# volume. ponytail: per-process only — cross-process pacing needs a shared
+# app is alive (an 'app-activity' heartbeat stamped by the app every 30s)
+# the interval is _YOUTUBE_CHAT_ACTIVE_INTERVAL_S so background volume stays
+# under the radar and interactive traffic is never collateral damage; when
+# the app is closed the worker falls back to slow-and-steady volume
+# (_YOUTUBE_CHAT_QUIET_INTERVAL_S) — the machine is the user's, so the
+# quota-sensitive YouTube chat fetch throttles to a crawl rather than
+# racing. ponytail: per-process only — cross-process pacing needs a shared
 # lock file if worker_server and the in-process worker ever overlap on one
 # box.
-_YOUTUBE_CHAT_MIN_INTERVAL_S = 12.0
 _YOUTUBE_CHAT_ACTIVE_INTERVAL_S = 30.0
+_YOUTUBE_CHAT_QUIET_INTERVAL_S = 60.0
 _APP_ACTIVITY_AGE_S = 60.0
 _youtube_chat_last_start = 0.0
 _youtube_chat_pace_lock = threading.Lock()
@@ -2584,11 +2586,14 @@ _youtube_chat_pace_lock = threading.Lock()
 
 def _youtube_chat_interval() -> float:
     """Pacing interval: longer while the app's interactive lane is active,
-    longer still in background (autostart) mode — the quota-sensitive
-    YouTube chat fetch backs off to ~2.5x the interactive gap."""
-    base = _YOUTUBE_CHAT_ACTIVE_INTERVAL_S
+    longer still in background (autostart) mode, and longest of all when
+    the app is closed — the quota-sensitive YouTube chat fetch backs off
+    to ~2.5x the interactive gap in autostart, and to 2x in slow-and-steady
+    closed-app mode."""
     if not archive_db.worker_live(age_s=_APP_ACTIVITY_AGE_S, tag="app-activity"):
-        base = _YOUTUBE_CHAT_MIN_INTERVAL_S
+        base = _YOUTUBE_CHAT_QUIET_INTERVAL_S
+    else:
+        base = _YOUTUBE_CHAT_ACTIVE_INTERVAL_S
     if background_mode():
         return base * 2.5
     return base

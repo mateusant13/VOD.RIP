@@ -66,6 +66,24 @@ except ImportError:
     __version__ = "0.0.0"
 
 
+def _detached_launcher_cmd(script: Path) -> list[str]:
+    """Windows two-stage orphan launcher: `python -c <launcher> <script>`.
+
+    The launcher Popen()s the script with CREATE_NEW_PROCESS_GROUP |
+    CREATE_NO_WINDOW and exits immediately, orphaning it (stale parent PID
+    → tree-walk kills like dev-all's taskkill /T never reach the daemon).
+    """
+    launcher = (
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable] + sys.argv[1:], cwd=%r,"
+        " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,"
+        " stderr=subprocess.DEVNULL,"
+        " creationflags=subprocess.CREATE_NEW_PROCESS_GROUP"
+        " | subprocess.CREATE_NO_WINDOW, close_fds=True)\n"
+    ) % str(Path(__file__).resolve().parent)
+    return [sys.executable, "-c", launcher, str(script)]
+
+
 def _spawn_detached_worker() -> Optional[int]:
     """Spawn the detached supervised archive worker (worker_server.py).
 
@@ -80,25 +98,30 @@ def _spawn_detached_worker() -> Optional[int]:
     backend_dir = Path(__file__).resolve().parent
     if getattr(sys, "frozen", False):
         # Packaged app: sys.executable is VOD-RIP.EXE, which cannot run
-        # `-c`/worker_server.py as a child — it would relaunch the whole
-        # GUI (single-instance guard kills it) and the watchdog would wait
-        # out its 120s grace before the in-process fallback. Skip straight
-        # to the in-process worker; the wheel-bundled worker logic runs in
-        # the same process and the ASR stack ships inside the bundle.
-        logger.debug("detached worker spawn skipped (frozen install)")
-        return None
-    if os.name == "nt":
-        launcher = (
-            "import subprocess, sys\n"
-            "subprocess.Popen([sys.executable] + sys.argv[1:], cwd=%r,"
-            " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,"
-            " stderr=subprocess.DEVNULL,"
-            " creationflags=subprocess.CREATE_NEW_PROCESS_GROUP"
-            " | subprocess.CREATE_NO_WINDOW, close_fds=True)\n"
-        ) % str(backend_dir)
+        # `-c`/worker_server.py as a child. The launcher dispatches
+        # --archive-worker-launch (detach a second EXE running
+        # worker_server.main(), no GUI and no singleton lock — the launcher
+        # dispatches before either) so the frozen bundle gets the same
+        # detached worker the dev tree has.
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-c", launcher, str(backend_dir / "worker_server.py")],
+                [sys.executable, "--archive-worker-launch"],
+                cwd=str(backend_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                ),
+            )
+        except Exception:
+            logger.debug("detached worker spawn failed", exc_info=True)
+            return None
+        return proc.pid
+    if os.name == "nt":
+        try:
+            proc = subprocess.Popen(
+                _detached_launcher_cmd(backend_dir / "worker_server.py"),
                 cwd=str(backend_dir),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -122,6 +145,63 @@ def _spawn_detached_worker() -> Optional[int]:
         )
     except Exception:
         logger.debug("detached worker spawn failed", exc_info=True)
+        return None
+    return proc.pid
+
+
+def _spawn_detached_background() -> Optional[int]:
+    """Spawn the detached "slow and steady" background daemon
+    (background_server.py): owns scheduler ingest, live-chat capture,
+    mention/entity scanning and disk hygiene while the app is CLOSED.
+    Same orphan pattern as the worker; frozen EXEs dispatch
+    --background-server-launch. First-wins heartbeat guard inside the
+    daemon makes a second spawn a harmless immediate exit 0.
+    Returns a child pid (the launcher's), or None when the spawn failed.
+    """
+    backend_dir = Path(__file__).resolve().parent
+    if getattr(sys, "frozen", False):
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "--background-server-launch"],
+                cwd=str(backend_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                ),
+            )
+        except Exception:
+            logger.debug("detached background spawn failed", exc_info=True)
+            return None
+        return proc.pid
+    if os.name == "nt":
+        try:
+            proc = subprocess.Popen(
+                _detached_launcher_cmd(backend_dir / "background_server.py"),
+                cwd=str(backend_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                ),
+            )
+        except Exception:
+            logger.debug("detached background spawn failed", exc_info=True)
+            return None
+        return proc.pid
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(backend_dir / "background_server.py")],
+            cwd=str(backend_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        logger.debug("detached background spawn failed", exc_info=True)
         return None
     return proc.pid
 
@@ -660,6 +740,40 @@ async def _app_lifespan(_app: FastAPI):
         logger.info("Archive scheduler started")
     except Exception:
         logger.debug("Archive scheduler start skipped", exc_info=True)
+
+    # App-liveness heartbeat: stamp 'app-activity' every 30s while this
+    # process lives (the request middleware also stamps on traffic). The
+    # detached background daemon reads this signal to know when the app is
+    # closed and it should take over; the archive worker reads it to pace
+    # its YouTube chat fetches. A closed app goes stale in ~120s.
+    def _app_liveness_heartbeat() -> None:
+        while not _warm_shutdown.wait(30.0):
+            try:
+                from services import archive_db
+
+                archive_db.worker_heartbeat("app-activity")
+            except Exception:
+                logger.debug("app-activity heartbeat failed", exc_info=True)
+
+    threading.Thread(
+        target=_app_liveness_heartbeat, daemon=True, name="app-activity-hb"
+    ).start()
+
+    # Detached "slow and steady" background daemon — owns scheduler ingest,
+    # live-chat capture, mention/entity scanning and disk hygiene while the
+    # app is closed. Spawned at every boot; its first-wins heartbeat guard
+    # exits 0 when one is already alive, so restarts never duplicate it.
+    # Fire-and-forget: the daemon runs its own services, nothing to join.
+    try:
+        spawned_bg = _spawn_detached_background()
+        if spawned_bg is not None:
+            logger.info(
+                "Background daemon: detached supervisor spawned (pid %s)", spawned_bg
+            )
+        else:
+            logger.debug("background daemon spawn failed/skipped")
+    except Exception:
+        logger.debug("background daemon spawn skipped", exc_info=True)
 
     # Archive transcribe worker. When the queue has pending work we spawn
     # the DETACHED supervised worker (worker_server.py): it drains

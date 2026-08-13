@@ -74,7 +74,13 @@ def main() -> int:
         return 0
 
     py = sys.executable
-    cmd = [py, "-m", "services.archive_transcribe", "--once", "--poll-interval", "2"]
+    if getattr(sys, "frozen", False):
+        # Frozen EXE cannot run `python -m`; the launcher dispatches
+        # --transcribe-once to services.archive_transcribe.run_worker with
+        # the same once/poll contract as the dev child below.
+        cmd = [py, "--transcribe-once"]
+    else:
+        cmd = [py, "-m", "services.archive_transcribe", "--once", "--poll-interval", "2"]
 
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     enc = locale.getpreferredencoding(False) or "utf-8"
