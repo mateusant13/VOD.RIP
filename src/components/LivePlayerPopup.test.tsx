@@ -63,16 +63,35 @@ let exitFullscreenMock: Mock;
 
 const ENTRY = { url: 'https://kick.com/srdoglol', title: 'Late night', platform: 'kick' };
 
-/** Minimal EventSource stub — tests drive onopen/onmessage per instance. */
+/** Minimal EventSource stub — tests drive onopen/onmessage per instance and
+ *  named events via fire(). */
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((ev: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
+  closed = false;
+  private listeners = new Map<string, Array<(ev: MessageEvent) => void>>();
   constructor(public url: string) {
     FakeEventSource.instances.push(this);
   }
-  close() {}
+  addEventListener(type: string, cb: (ev: MessageEvent) => void) {
+    const list = this.listeners.get(type) ?? [];
+    list.push(cb);
+    this.listeners.set(type, list);
+  }
+  removeEventListener(type: string, cb: (ev: MessageEvent) => void) {
+    const list = this.listeners.get(type) ?? [];
+    this.listeners.set(type, list.filter((c) => c !== cb));
+  }
+  /** Test hook — fire a named event with a JSON payload string. */
+  fire(type: string, data: string) {
+    const ev = { data } as MessageEvent;
+    for (const cb of this.listeners.get(type) ?? []) cb(ev);
+  }
+  close() {
+    this.closed = true;
+  }
 }
 
 function mockFetch() {
@@ -93,6 +112,10 @@ function mockFetch() {
         reason: 'Kick has no public clip-creation API.',
         needed: [],
       }), { status: 200 });
+    }
+    if (url.includes('/api/live/captions/available')) {
+      // Parakeet gate probe — captions available for the playing entry.
+      return new Response(JSON.stringify({ available: true }), { status: 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -425,6 +448,12 @@ describe('LivePlayerPopup multi chat', () => {
     );
   }
 
+  /** Chat-stream EventSources only — the caption SSE shares the instances
+   *  list once the availability probe resolves. */
+  function chatEsInstances(): FakeEventSource[] {
+    return FakeEventSource.instances.filter((es) => es.url.includes('/api/live/chat/stream'));
+  }
+
   it('shows filter chips only when the channel is live on >1 platform', async () => {
     mockFetch();
     vi.stubGlobal('EventSource', FakeEventSource);
@@ -444,8 +473,9 @@ describe('LivePlayerPopup multi chat', () => {
     expect(screen.getByRole('button', { name: 'Twitch' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'YouTube' })).toBeNull();
 
-    // Two chat streams opened — one per live platform.
-    expect(FakeEventSource.instances).toHaveLength(2);
+    // Two chat streams opened — one per live platform (the caption SSE is
+    // a separate connection, filtered out above).
+    expect(chatEsInstances()).toHaveLength(2);
   });
 
   it('filters merged rows by platform (All shows both streams)', async () => {
@@ -459,8 +489,8 @@ describe('LivePlayerPopup multi chat', () => {
     fireEvent.click(screen.getByTitle('Live chat'));
 
     // Both streams open and deliver one row each.
-    const kickEs = FakeEventSource.instances.find((es) => es.url.includes('platform=kick'))!;
-    const twitchEs = FakeEventSource.instances.find((es) => es.url.includes('platform=twitch'))!;
+    const kickEs = chatEsInstances().find((es) => es.url.includes('platform=kick'))!;
+    const twitchEs = chatEsInstances().find((es) => es.url.includes('platform=twitch'))!;
     kickEs.onopen?.();
     twitchEs.onopen?.();
     kickEs.onmessage?.({ data: JSON.stringify({ username: 'kick_user', text: 'hi from kick' }) } as MessageEvent);
@@ -485,8 +515,8 @@ describe('LivePlayerPopup multi chat', () => {
     fireEvent.click(screen.getByRole('button', { name: 'All' }));
     await waitFor(() => expect(screen.getByText('hi from kick')).toBeTruthy());
     expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(2);
-    // Exactly two streams total — filtering never re-opens EventSources.
-    expect(FakeEventSource.instances).toHaveLength(2);
+    // Exactly two chat streams total — filtering never re-opens EventSources.
+    expect(chatEsInstances()).toHaveLength(2);
   });
 
   it('merges multi-stream URLs via the saved channel slugs (CDN masters have no slug)', async () => {
@@ -500,11 +530,109 @@ describe('LivePlayerPopup multi chat', () => {
     fireEvent.click(screen.getByTitle('Live chat'));
 
     // Twitch CDN master URL → login extracted from the m3u8 filename.
-    const twitchEs = FakeEventSource.instances.find((es) => es.url.includes('platform=twitch'))!;
+    const twitchEs = chatEsInstances().find((es) => es.url.includes('platform=twitch'))!;
     expect(twitchEs.url).toContain('slug=srdogg');
     // Kick page URL → slug from the path.
-    const kickEs = FakeEventSource.instances.find((es) => es.url.includes('platform=kick'))!;
+    const kickEs = chatEsInstances().find((es) => es.url.includes('platform=kick'))!;
     expect(kickEs.url).toContain('slug=srdoglol');
+  });
+});
+
+describe('LivePlayerPopup live captions', () => {
+  beforeEach(() => {
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+  });
+
+  it('renders the latest caption block over the video when available (PLAYING entry URL)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    // Captions default ON: the CC button and the caption EventSource appear
+    // once the availability probe resolves.
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    // The stream URL resolves the playing entry's platform + slug (kick).
+    expect(es.url).toContain('/api/live/captions?platform=kick');
+    expect(es.url).toContain('channel=srdoglol');
+
+    act(() => { es.fire('caption', JSON.stringify({ text: 'olá pessoal, bem-vindos ao canal', start: 1, end: 4 })); });
+    expect(screen.getByText('olá pessoal, bem-vindos ao canal')).toBeTruthy();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeTruthy();
+
+    // A newer block REPLACES the previous one — the overlay never stacks.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'segunda legenda', start: 4, end: 7 })); });
+    await waitFor(() => expect(screen.getByText('segunda legenda')).toBeTruthy());
+    expect(screen.queryByText('olá pessoal, bem-vindos ao canal')).toBeNull();
+  });
+
+  it('toggle hides the overlay + closes the EventSource, re-enable reconnects', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'legenda visível', start: 0, end: 3 })); });
+    expect(screen.getByText('legenda visível')).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle('Hide captions'));
+    expect(es.closed).toBe(true);
+    expect(screen.queryByText('legenda visível')).toBeNull();
+    expect(screen.queryByTitle('Hide captions')).toBeNull();
+    expect(screen.getByTitle('Live captions')).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle('Live captions'));
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    expect(FakeEventSource.instances[1].closed).toBe(false);
+    act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'legenda de novo', start: 3, end: 6 })); });
+    expect(screen.getByText('legenda de novo')).toBeTruthy();
+  });
+
+  it('closes the caption EventSource when the popup unmounts', async () => {
+    mockFetch();
+    const view = renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    view.unmount();
+    expect(FakeEventSource.instances[0].closed).toBe(true);
+  });
+
+  it('hides the overlay and stops after an offline event (no reconnect)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'última fala', start: 0, end: 3 })); });
+    expect(screen.getByText('última fala')).toBeTruthy();
+
+    act(() => { es.fire('offline', '{}'); });
+    expect(es.closed).toBe(true);
+    await waitFor(() => expect(screen.queryByText('última fala')).toBeNull());
+    // Availability cleared → no CC button (and no further EventSources).
+    expect(screen.queryByTitle('Hide captions')).toBeNull();
+    expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it('shows no CC button or overlay when the parakeet gate reports unavailable', async () => {
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/preview/live')) {
+        return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        return new Response(JSON.stringify({ available: false, reason: 'parakeet model missing' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(0));
+    expect(screen.queryByTitle('Hide captions')).toBeNull();
+    expect(screen.queryByTitle('Live captions')).toBeNull();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
   });
 });
 

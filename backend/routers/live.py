@@ -46,6 +46,93 @@ class LiveDownloadRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Live captions (real-time ASR captions for the livestream popup)
+# ---------------------------------------------------------------------------
+#
+# The popup's CC overlay subscribes here. One refcounted LiveCaptioner per
+# (platform, channel) polls the live audio-only HLS rendition, buffers ~3s
+# windows and transcribes them with the parakeet engine OFF the asyncio loop
+# (the captioner runs in its own worker thread; caption blocks arrive through
+# the same per-connection queue pattern as the chat SSE). The parakeet gate
+# (sherpa-onnx importable AND model files present) 503s the stream endpoint
+# and the /available probe reports it so the frontend hides the CC toggle.
+_CAPTION_PLATFORMS = ("twitch", "kick")
+
+
+@router.get("/live/captions")
+async def live_captions_stream(
+    request: Request,
+    platform: str = Query(..., description="twitch | kick"),
+    channel: str = Query(..., description="channel slug / login"),
+):
+    """SSE stream of live caption blocks for one channel.
+
+    Emits ``event: caption`` frames (``{text, start, end}``) plus keepalive
+    comments; a confirmed ``event: offline`` ends the stream (the frontend
+    hides the overlay). 503 when the parakeet engine is unavailable — the
+    frontend probes /available first and never opens the stream then. The
+    captioner's refcount drops when the connection closes (generator finally).
+    """
+    plat = (platform or "").lower()
+    chan = (channel or "").strip().lower()
+    if plat not in _CAPTION_PLATFORMS or not chan:
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+    from services.live_captions import captions_available, get_captioner
+
+    ok, reason = await asyncio.to_thread(captions_available, plat)
+    if not ok:
+        raise HTTPException(status_code=503, detail=reason)
+
+    captioner = get_captioner(plat, chan, asyncio.get_running_loop())
+    captioner.acquire()
+    try:
+        return StreamingResponse(
+            _captions_sse_gen(request, captioner),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    except Exception:
+        captioner.release()
+        raise
+
+
+@router.get("/live/captions/available")
+async def live_captions_available(
+    platform: str = Query(..., description="twitch | kick"),
+    channel: str = Query(..., description="channel slug / login"),
+) -> dict:
+    """Parakeet-gate probe: ``{available, reason}`` — the popup renders the
+    CC toggle only when available is true (and never opens the stream 503)."""
+    plat = (platform or "").lower()
+    chan = (channel or "").strip().lower()
+    if plat not in _CAPTION_PLATFORMS or not chan:
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+    from services.live_captions import captions_available
+
+    ok, reason = await asyncio.to_thread(captions_available, plat)
+    return {"available": ok, "reason": reason or None}
+
+
+async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str, None]":
+    """SSE body generator: forward caption blocks, keepalive comments, and
+    release the captioner refcount when the connection closes. Extracted so
+    tests can drive it directly (ASGITransport buffers the whole body)."""
+    try:
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                event, data = await asyncio.wait_for(captioner.events.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if event == "offline":
+                yield "event: offline\ndata: {}\n\n"
+                break
+            yield f"event: caption\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    finally:
+        captioner.release()
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -644,6 +731,7 @@ async def _chat_sse_gen(request: Request, queue: asyncio.Queue, sink) -> "AsyncG
                 yield ": keepalive\n\n"
     finally:
         sink.stop()
+
 
 
 @router.get("/chat/emotes")
