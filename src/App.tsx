@@ -227,8 +227,6 @@ interface ChannelRowProps {
   ch: SavedChannel;
   index: number;
   selected: boolean;
-  isEditing: boolean;
-  editingChannelName: string;
   dragId: string | null;
   dropInsertIndex: number | null;
   isLast: boolean;
@@ -241,10 +239,7 @@ interface ChannelRowProps {
   removeChannel: (id: string) => void;
   refreshChannel: (channelId: string, channelOverride?: SavedChannel, contentMode?: 'vods' | 'clips' | 'streams', opts?: { incremental?: boolean; silent?: boolean; force?: boolean }) => Promise<unknown>;
   clearChannelRefreshFlight: (channelId: string, mode?: 'vods' | 'clips' | 'streams') => void;
-  startRenameChannel: (id: string) => void;
-  commitRenameChannel: () => void;
-  setEditingChannelId: Dispatch<SetStateAction<string | null>>;
-  setEditingChannelName: Dispatch<SetStateAction<string>>;
+  startEditChannelLinks: (id: string) => void;
   removePlatformFromChannel: (channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => void;
   channelContentFilter: 'vods' | 'clips' | 'streams';
   setSavedChannels: Dispatch<SetStateAction<SavedChannel[]>>;
@@ -253,13 +248,12 @@ interface ChannelRowProps {
 }
 
 const ChannelRow = memo(function ChannelRow({
-  ch, index, selected, isEditing, editingChannelName,
+  ch, index, selected,
   dragId, dropInsertIndex, isLast, savedChannelsLength, liveStatus,
   openLivePreview, onOpenChannelSearch,
   channelListRef,
   toggleChannelSelection, removeChannel, refreshChannel, clearChannelRefreshFlight,
-  startRenameChannel, commitRenameChannel,
-  setEditingChannelId, setEditingChannelName,
+  startEditChannelLinks,
   removePlatformFromChannel, channelContentFilter,
   setSavedChannels, setChannelDragId, setChannelDropInsertIndex,
 }: ChannelRowProps) {
@@ -281,9 +275,7 @@ const ChannelRow = memo(function ChannelRow({
         type="button"
         title={t('Drag to reorder')}
         aria-label={t('Reorder {name}', { name: ch.displayName })}
-        disabled={isEditing}
         onPointerDown={(e) => {
-          if (isEditing) return;
           setChannelDropInsertIndex(index);
           startChannelReorderDrag(
             e,
@@ -298,29 +290,18 @@ const ChannelRow = memo(function ChannelRow({
       >
         <GripVertical size={12} />
       </button>
-      {isEditing ? (
-        <input type="text" value={editingChannelName}
-          onChange={(e) => setEditingChannelName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') commitRenameChannel();
-            if (e.key === 'Escape') setEditingChannelId(null);
-          }}
-          onBlur={commitRenameChannel}
-          autoFocus
-          className="flex-1 min-w-0 bg-zinc-950 text-white font-mono text-xs px-1 py-0.5 focus:outline-none" />
-      ) : (
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={() => toggleChannelSelection(ch.id)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              toggleChannelSelection(ch.id);
-            }
-          }}
-          className="flex-1 min-w-0 whitespace-nowrap overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
-        >
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => toggleChannelSelection(ch.id)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            toggleChannelSelection(ch.id);
+          }
+        }}
+        className="flex-1 min-w-0 whitespace-nowrap overflow-visible text-left text-xs font-mono text-zinc-200 hover:text-white select-none cursor-pointer"
+      >
           <ChannelPlatformLabel
             kickSlug={ch.kickSlug}
             twitchSlug={ch.twitchSlug}
@@ -330,7 +311,6 @@ const ChannelRow = memo(function ChannelRow({
             onRemoveYoutube={() => removePlatformFromChannel(ch.id, 'YouTube')}
           />
         </div>
-      )}
       <LiveBadge
         entries={liveEntries}
         invisible={liveEntries.length === 0}
@@ -349,7 +329,7 @@ const ChannelRow = memo(function ChannelRow({
         <Search size={11} />
       </button>
       <button type="button" title={t('Edit')}
-        onClick={(e) => { e.stopPropagation(); startRenameChannel(ch.id); }}
+        onClick={(e) => { e.stopPropagation(); startEditChannelLinks(ch.id); }}
         className="text-zinc-600 hover:text-white p-0.5">
         <Pencil size={11} />
       </button>
@@ -886,8 +866,7 @@ export default function App() {
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [addChannelInput, setAddChannelInput] = useState('');
   const [pendingAddChannel, setPendingAddChannel] = useState<ChannelLinkDraft | null>(null);
-  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
-  const [editingChannelName, setEditingChannelName] = useState('');
+  const [editingChannelLink, setEditingChannelLink] = useState<{ channelId: string; draft: ChannelLinkDraft } | null>(null);
   const [editingSlug, setEditingSlug] = useState<{ channelId: string; platform: 'Kick' | 'Twitch' | 'YouTube' } | null>(null);
   const [editingSlugValue, setEditingSlugValue] = useState('');
   const [addChannelNotice, setAddChannelNotice] = useState<string | null>(null);
@@ -4988,6 +4967,19 @@ export default function App() {
     return null;
   }, [pendingAddChannel, savedChannels]);
 
+  const channelLinkEditDuplicate = useMemo(() => {
+    if (!editingChannelLink) return null;
+    const { channelId, draft } = editingChannelLink;
+    const { kick, twitch, youtube } = channelLinkDraftSlugs(draft);
+    if (!kick && !twitch && !youtube) return null;
+    // The channel being edited must not count as a duplicate of itself.
+    const others = savedChannels.filter((c) => c.id !== channelId);
+    if (isChannelAlreadySaved(kick, twitch, others, youtube)) {
+      return t('This channel is already linked.');
+    }
+    return null;
+  }, [editingChannelLink, savedChannels]);
+
   const commitChannelLink = useCallback(async () => {
     if (!pendingAddChannel) return;
     const { kick, twitch, youtube } = channelLinkDraftSlugs(pendingAddChannel);
@@ -5011,44 +5003,40 @@ export default function App() {
       if (prev === channelId) return null;
       return channelId;
     });
-    setEditingChannelId(null);
+    setEditingChannelLink(null);
     setEditingSlug(null);
   }, []);
 
-  const startRenameChannel = useCallback((channelId: string) => {
+  const startEditChannelLinks = useCallback((channelId: string) => {
     const ch = savedChannels.find((c) => c.id === channelId);
     if (!ch) return;
-    setEditingChannelId(channelId);
-    setEditingChannelName(ch.displayName);
+    setEditingChannelLink({
+      channelId,
+      draft: {
+        kickSlug: ch.kickSlug || '',
+        twitchSlug: ch.twitchSlug || '',
+        youtubeSlug: ch.youtubeSlug || '',
+        kickEnabled: Boolean(ch.kickSlug),
+        twitchEnabled: Boolean(ch.twitchSlug),
+        youtubeEnabled: Boolean(ch.youtubeSlug),
+        detectedFrom: null,
+      },
+    });
   }, [savedChannels]);
 
-  const commitRenameChannel = useCallback(async () => {
-    if (!editingChannelId) return;
-    const nextRaw = editingChannelName.trim();
-    const channelId = editingChannelId;
-    setEditingChannelId(null);
-    setEditingChannelName('');
-    if (!nextRaw) return;
+  const commitEditChannelLinks = useCallback(async () => {
+    if (!editingChannelLink) return;
+    const { channelId, draft } = editingChannelLink;
+    const { kick, twitch, youtube } = channelLinkDraftSlugs(draft);
+    if (!kick && !twitch && !youtube) return;
     const ch = savedChannels.find((c) => c.id === channelId);
     if (!ch) return;
-    // Re-derive slugs from the new name — pasting a Kick/Twitch URL or
-    // channel handle should rebind this saved channel to that target and
-    // re-fetch its VODs/clips, mirroring `handleAddChannel`. Without this
-    // step "rename" only changed the label and left the cached videos
-    // pointing at the old (now unrelated) channel.
-    const parsed = parseChannelInput(nextRaw);
-    const nextKick = parsed.kickSlug || ch.kickSlug;
-    const nextTwitch = parsed.twitchSlug || ch.twitchSlug;
-    const nextDisplay = parsed.displayName || nextRaw;
+    setEditingChannelLink(null);
     const slugChanged =
-      nextKick.toLowerCase() !== (ch.kickSlug || '').toLowerCase() ||
-      nextTwitch.toLowerCase() !== (ch.twitchSlug || '').toLowerCase();
-    if (!slugChanged) {
-      if (nextDisplay !== ch.displayName) {
-        updateChannel(channelId, { displayName: nextDisplay });
-      }
-      return;
-    }
+      kick.toLowerCase() !== (ch.kickSlug || '').toLowerCase() ||
+      twitch.toLowerCase() !== (ch.twitchSlug || '').toLowerCase() ||
+      youtube.toLowerCase() !== (ch.youtubeSlug || '').toLowerCase();
+    if (!slugChanged) return;
     const cleared = {
       vodVideos: [] as ChannelVideo[],
       clipVideos: [] as ChannelVideo[],
@@ -5061,9 +5049,10 @@ export default function App() {
     };
     const updated: SavedChannel = {
       ...ch,
-      displayName: deriveChannelDisplayName(nextKick, nextTwitch),
-      kickSlug: nextKick,
-      twitchSlug: nextTwitch,
+      displayName: deriveChannelDisplayName(kick, twitch),
+      kickSlug: kick,
+      twitchSlug: twitch,
+      youtubeSlug: youtube,
       ...cleared,
     };
     channelRefreshInFlightRef.current.delete(`${channelId}:vods`);
@@ -5071,7 +5060,7 @@ export default function App() {
     channelRefreshInFlightRef.current.delete(`${channelId}:streams`);
     updateChannel(channelId, updated);
     await refreshChannel(channelId, updated);
-  }, [editingChannelId, editingChannelName, savedChannels, updateChannel, refreshChannel]);
+  }, [editingChannelLink, savedChannels, updateChannel, refreshChannel]);
 
   const startEditPlatformSlug = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     const ch = savedChannels.find((c) => c.id === channelId);
@@ -6273,7 +6262,8 @@ export default function App() {
           setMenuOpen={setPreviewQualityMenuOpen}
           onSelect={applyPreviewQuality}
           disabled={!previewVideoReady}
-          buttonClassName={previewCtrlBtn(previewFullscreen)}
+          buttonClassName={previewCtrlBtn(previewFullscreen, true)}
+          iconSize={18}
           onMenuOpen={() => setPreviewVolumeMenuOpen(false)}
           popoverPlacement="up"
           popoverClassName={previewFullscreen
@@ -6540,6 +6530,8 @@ export default function App() {
               platform={activePlatform}
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
+              // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
+              channel={videoInfo?.channel ?? null}
               // Click-to-seek: chat/transcript/event rows and the subtitle
               // caption seek the CURRENT preview player. handlePreviewChatSeek
               // widens the trim when the click falls outside it so the jump
@@ -6749,6 +6741,16 @@ export default function App() {
                 duplicateMessage={channelLinkDuplicate}
               />
             )}
+            {editingChannelLink && tab === 'channels' && (
+              <ChannelLinkCard
+                mode="edit"
+                draft={editingChannelLink.draft}
+                onChange={(draft) => setEditingChannelLink((prev) => (prev ? { ...prev, draft } : prev))}
+                onConfirm={() => void commitEditChannelLinks()}
+                onCancel={() => setEditingChannelLink(null)}
+                duplicateMessage={channelLinkEditDuplicate}
+              />
+            )}
             {addChannelNotice && (
               <p className="text-amber-400 text-[10px] font-mono">{addChannelNotice}</p>
             )}
@@ -6766,8 +6768,6 @@ export default function App() {
                     ch={ch}
                     index={index}
                     selected={ch.id === selectedChannelId}
-                    isEditing={editingChannelId === ch.id}
-                    editingChannelName={editingChannelName}
                     dragId={channelDragId}
                     dropInsertIndex={channelDropInsertIndex}
                     isLast={index === savedChannels.length - 1}
@@ -6778,10 +6778,7 @@ export default function App() {
                     removeChannel={removeChannel}
                     refreshChannel={refreshChannel}
                     clearChannelRefreshFlight={clearChannelRefreshFlight}
-                    startRenameChannel={startRenameChannel}
-                    commitRenameChannel={commitRenameChannel}
-                    setEditingChannelId={setEditingChannelId}
-                    setEditingChannelName={setEditingChannelName}
+                    startEditChannelLinks={startEditChannelLinks}
                     removePlatformFromChannel={removePlatformFromChannel}
                     channelContentFilter={channelContentFilter}
                     setSavedChannels={setSavedChannels}
@@ -7361,6 +7358,7 @@ export default function App() {
             entries={popup.entries}
             channelName={popup.channelName}
             channelSlug={channelSlug}
+            channel={popup.channel}
             vodUrl={vodUrl}
             cascadeIndex={idx}
             zIndex={EXPLORE_POPUP_Z + (popupZOrder[String(popup.id)] ?? 0)}

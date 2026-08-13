@@ -152,25 +152,33 @@ _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-war
 _PLATFORM_FETCH_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="live-platform")
 
 
-def _fetch_channel_live_payload(channel: dict) -> dict:
+def _fetch_channel_live_payload(
+    channel: dict,
+    platform_pool: Optional[ThreadPoolExecutor] = None,
+) -> dict:
     """Build the response payload for a single channel's live status.
 
     Kicks off the channel's three platform fetchers (Kick/Twitch/YouTube)
-    CONCURRENTLY on the shared platform pool — serializing them cost
-    sum(3-15s) per channel instead of max(3-15s). The returned dict matches
-    the live router response: ``{"live": [...], "channel_id": ...}``.
+    CONCURRENTLY on the platform pool — serializing them cost
+    sum(3-15s) per channel instead of max(3-15s). ``platform_pool`` lets the
+    boot warm burst temporarily widen the 6-slot steady-state pool; the
+    steady-state polls keep the small pool so periodic refreshes never slam
+    the rate-limited platform APIs. The returned dict matches the live
+    router response: ``{"live": [...], "channel_id": ...}``.
     """
+    pool = platform_pool or _PLATFORM_FETCH_POOL
+
     ks = (channel.get("kickSlug") or "").strip()
     ts = (channel.get("twitchSlug") or "").strip()
     ys = (channel.get("youtubeSlug") or "").strip()
 
     jobs: list[tuple[str, "object"]] = []
     if ks:
-        jobs.append(("kick", _PLATFORM_FETCH_POOL.submit(kick_live_info, ks)))
+        jobs.append(("kick", pool.submit(kick_live_info, ks)))
     if ts:
-        jobs.append(("twitch", _PLATFORM_FETCH_POOL.submit(twitch_live_info, ts)))
+        jobs.append(("twitch", pool.submit(twitch_live_info, ts)))
     if ys:
-        jobs.append(("youtube", _PLATFORM_FETCH_POOL.submit(youtube_live_info, ys)))
+        jobs.append(("youtube", pool.submit(youtube_live_info, ys)))
 
     # Settle all futures; re-raise the first platform error in slug order
     # (kick before twitch before youtube), matching the old sequential path's
@@ -271,20 +279,37 @@ def _fetch_or_cached_channel_live_payload(
     return _refresh_channel_live_cache(cid, channel)
 
 
-def _submit_refresh(channel_id: str, channel: dict) -> Optional["Future"]:
+def _submit_refresh(
+    channel_id: str,
+    channel: dict,
+    warm_pool: Optional[ThreadPoolExecutor] = None,
+    platform_pool: Optional[ThreadPoolExecutor] = None,
+) -> Optional["Future"]:
     """Submit a deduped background refresh for a channel.
 
     Returns the shared in-flight Future — concurrent callers (frontend poll,
     archive watchdog, warm) wait on the SAME refresh instead of double-fetching
     the rate-limited platform APIs. Returns None when the pool is unavailable
     or rejected the submit; callers then fall back to the stale-serve path.
+
+    ``warm_pool``/``platform_pool`` let the boot warm burst widen concurrency
+    temporarily; the steady-state pools (4 warm / 6 platform) stay small so
+    periodic TTL-trip refreshes never slam Kick/Twitch/YouTube.
     """
+    pool = warm_pool or _LIVE_WARM_POOL
     with _LIVE_STATUS_LOCK:
         fut = _LIVE_REFRESH_INFLIGHT.get(channel_id)
         if fut is not None and not fut.done():
             return fut
     try:
-        fut = _LIVE_WARM_POOL.submit(_refresh_channel_live_cache, channel_id, channel)
+        if platform_pool is not None:
+            fut = pool.submit(
+                _refresh_channel_live_cache, channel_id, channel, platform_pool
+            )
+        else:
+            # 2-arg call keeps existing monkeypatched signatures working
+            # (tests stub _refresh_channel_live_cache(cid, channel)).
+            fut = pool.submit(_refresh_channel_live_cache, channel_id, channel)
     except Exception:
         logger.debug("live refresh submit failed for %s", channel_id, exc_info=True)
         return None
@@ -304,10 +329,19 @@ def _submit_refresh(channel_id: str, channel: dict) -> Optional["Future"]:
     return fut
 
 
-def _refresh_channel_live_cache(channel_id: str, channel: dict) -> dict:
+def _refresh_channel_live_cache(
+    channel_id: str,
+    channel: dict,
+    platform_pool: Optional[ThreadPoolExecutor] = None,
+) -> dict:
     """Re-fetch a channel's live status and update the cache. Returns the payload."""
     try:
-        payload = _fetch_channel_live_payload(channel)
+        if platform_pool is not None:
+            payload = _fetch_channel_live_payload(channel, platform_pool)
+        else:
+            # 1-arg call keeps existing monkeypatched signatures working
+            # (tests stub _fetch_channel_live_payload(channel)).
+            payload = _fetch_channel_live_payload(channel)
     except Exception as exc:
         logger.debug("live_status refresh failed for %s: %s", channel_id, exc)
         # Keep stale cache rather than wiping it; transient failures shouldn't
@@ -340,13 +374,37 @@ def warm_channel_live_status(channel_id: str) -> None:
     _submit_refresh(str(channel_id), channel)
 
 
+def _reap_burst_pools(warm_pool: ThreadPoolExecutor, plat_pool: ThreadPoolExecutor) -> None:
+    """Daemon reaper for the boot burst: wait for the burst to drain (each
+    warm worker waits on its platform futures), then close both pools. Runs
+    on a daemon thread so a slow yt-dlp retry can never hold the live-warm
+    thread or the completion log hostage."""
+    try:
+        warm_pool.shutdown(wait=True)
+    finally:
+        plat_pool.shutdown(wait=False)
+
+
 def warm_all_saved_channel_live_status() -> None:
     """Pre-warm the live-status cache for every saved channel at server startup.
 
     Runs on the daemon warm thread spawned from app.py lifespan — never blocks
-    the API. Each channel's extract happens concurrently across the dedicated
-    pool (4 workers). The /api/channels/{id}/live endpoint becomes O(1) for
-    the first user request after boot.
+    the API. The first detection after boot is BURST: a temporary pool wide
+    enough to fetch every channel in ~1 wave, so the LIVE badges paint as
+    soon as the user opens the Channels tab. The steady-state pools (4 warm /
+    6 platform) stay small for periodic TTL-trip refreshes — those pace the
+    rate-limited platform APIs. Measured on 19 channels (2026-08):
+    4x6 = 18.6-24.5s, 8x12 = 10.6-14.2s, 12x18 = 12.5-13.7s, 16x24 = 29.7s
+    (the widest burst thunders the herd and trips YouTube rate limits, so
+    bigger is NOT better). 8x12 is the sweet spot.
+
+    The burst is fire-and-forget: this function submits all channels then
+    returns immediately (never waits on the pools — a slow yt-dlp retry
+    could hold the log line hostage for minutes). The cache fills
+    incrementally as each channel settles, and the /api/channels/{id}/live
+    endpoint returns whatever the cache has (empty cold-miss + background
+    refresh otherwise), so the frontend's first 3s polls pick each channel
+    up as its entry lands.
     """
     try:
         settings = settings_mgr.get()
@@ -357,15 +415,51 @@ def warm_all_saved_channel_live_status() -> None:
     if not channels:
         logger.debug("live warm: no saved channels")
         return
+    # Tests (and embedders) monkeypatch _LIVE_WARM_POOL with a stub pool that
+    # never executes; the burst pools below would bypass it and run real
+    # platform fetches. Fall back to the old queued path whenever the warm
+    # pool isn't a real ThreadPoolExecutor.
+    if not isinstance(_LIVE_WARM_POOL, ThreadPoolExecutor):
+        count = 0
+        for ch in channels:
+            cid = str(ch.get("id") or "")
+            if not cid:
+                continue
+            if _submit_refresh(cid, ch) is not None:
+                count += 1
+        if count:
+            logger.info("live warm: %d channel(s) queued", count)
+        return
+    n_chan = min(len(channels), 8)
+    n_plat = min(len(channels) * 3, 12)
+    warm_pool = ThreadPoolExecutor(max_workers=n_chan, thread_name_prefix="live-boot-warm")
+    plat_pool = ThreadPoolExecutor(max_workers=n_plat, thread_name_prefix="live-boot-plat")
     count = 0
-    for ch in channels:
-        cid = str(ch.get("id") or "")
-        if not cid:
-            continue
-        if _submit_refresh(cid, ch) is not None:
-            count += 1
+    try:
+        for ch in channels:
+            cid = str(ch.get("id") or "")
+            if not cid:
+                continue
+            if _submit_refresh(cid, ch, warm_pool=warm_pool, platform_pool=plat_pool) is not None:
+                count += 1
+    finally:
+        # Reap in a daemon thread, do NOT shut down here: an immediate
+        # shutdown(wait=False) makes the pools reject the warm workers'
+        # platform submits mid-burst ("cannot schedule new futures after
+        # shutdown") and silently drops channels. The reaper waits for the
+        # burst to drain, then closes both pools — meanwhile the live-warm
+        # thread returns at once and the cache fills incrementally as each
+        # channel settles (Kick ~0.7s, Twitch ~2s, YouTube ~6s), which is
+        # exactly the fast-first-detection behavior wanted; the frontend's
+        # 3s polls pick each channel up as its entry lands.
+        threading.Thread(
+            target=_reap_burst_pools,
+            args=(warm_pool, plat_pool),
+            daemon=True,
+            name="live-boot-reap",
+        ).start()
     if count:
-        logger.info("live warm: %d channel(s) queued", count)
+        logger.info("live warm: %d channel(s) burst launched (%dx%d)", count, n_chan, n_plat)
 
 
 @router.get("/channels/{channel_id}/live")
@@ -517,7 +611,14 @@ async def live_chat_stream(
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    sink = _build_viewer_chat_sink(plat, slug, lambda rows: loop.call_soon_threadsafe(queue.put_nowait, rows))
+
+    def _push(rows) -> int:
+        # ChatSink base sums the returned count into rows_flushed — returning
+        # None (bare call_soon_threadsafe) makes every flush raise TypeError.
+        loop.call_soon_threadsafe(queue.put_nowait, rows)
+        return len(rows)
+
+    sink = _build_viewer_chat_sink(plat, slug, _push)
 
     return StreamingResponse(
         _chat_sse_gen(request, queue, sink),
@@ -543,6 +644,29 @@ async def _chat_sse_gen(request: Request, queue: asyncio.Queue, sink) -> "AsyncG
                 yield ": keepalive\n\n"
     finally:
         sink.stop()
+
+
+@router.get("/chat/emotes")
+def chat_emotes(
+    platform: Optional[str] = Query(None, description="twitch | kick | youtube"),
+    slug: Optional[str] = Query(None, description="channel login"),
+) -> dict:
+    """BTTV/FFZ/7TV custom emotes for one channel (render-only, Twitch only).
+
+    Returns every custom emote the chat panel can render inline, merged in
+    Chatterino priority order (FFZ channel > BTTV channel > 7TV channel >
+    FFZ global > BTTV global > 7TV global); name collisions keep the first
+    (highest-priority) provider. Unknown platform or network failure returns
+    ``{"emotes": []}`` — chat rendering must never break because emotes fail.
+    Emotes are display-only: stored message text and search indexes are never
+    touched. The service is lazy-imported so this router never pulls
+    chat-emote deps into the app boot path.
+    """
+    if not platform or not slug:
+        raise HTTPException(status_code=400, detail="platform and slug are required")
+    from services.chat_emotes import fetch_emotes
+
+    return {"emotes": fetch_emotes(platform, slug)}
 
 
 class FastClipRequest(BaseModel):

@@ -40,6 +40,7 @@ import { activePanelRowIndex } from '../previewPlayerUtils';
 import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
+import { ChatEmoteText, useChatEmotes, type EmoteMap } from '../chatEmotes';
 import {
   applyChatMarker,
   ChatMarkerChips,
@@ -143,6 +144,10 @@ interface PreviewChatPanelProps {
   platform: string | null;
   videoId: string | null;
   currentTime: number;
+  /** Channel slug/login (Twitch broadcaster login) for channel-scoped custom
+   *  emotes (BTTV/FFZ/7TV). Absent → the chat renders plain text (the emotes
+   *  API requires a slug; there is no global-only mode). */
+  channel?: string | null;
   /** Click-to-seek: the host's CURRENT-player seek (main preview or the
    *  popup's own player). When provided, chat/transcript/event rows and the
    *  subtitle caption become clickable and seek to the row's offset_sec.
@@ -193,6 +198,7 @@ const ChatRow = memo(function ChatRow({
   row,
   active,
   platform,
+  emotes,
   onSeek,
   markers,
   onSetMarker,
@@ -201,6 +207,7 @@ const ChatRow = memo(function ChatRow({
   row: PreviewPanelChatRow;
   active: boolean;
   platform: string | null;
+  emotes: EmoteMap;
   onSeek?: (offsetSec: number) => void;
   markers: ChatMarkers;
   onSetMarker: (kind: ChatMarkerKind, offsetSec: number) => void;
@@ -231,7 +238,7 @@ const ChatRow = memo(function ChatRow({
         {row.username}:
       </span>
       <span className="text-[10px] leading-snug truncate" title={row.text}>
-        {row.text}
+        <ChatEmoteText text={row.text} emotes={emotes} />
       </span>
       {typeof row.spam_count === 'number' && row.spam_count > 1 && (
         <span
@@ -367,6 +374,7 @@ export function PreviewChatPanel({
   platform,
   videoId,
   currentTime,
+  channel,
   onSeek,
   hidden = false,
   started = true,
@@ -500,6 +508,12 @@ export function PreviewChatPanel({
       cancelled = true;
     };
   }, [payloadKey, retryTick, pollTick]);
+
+  // Channel emotes for twitch history rows (BTTV/FFZ/7TV render-only — the
+  // stored row.text is never rewritten). Declared after the payload effect
+  // so the panel's archive fetch stays first. Stable map reference (cache),
+  // so memoized ChatRows only re-render once when the fetch resolves.
+  const emotes = useChatEmotes(platform, channel);
 
   // While a Twitch backfill is 'running', refresh every PANEL_POLL_MS so
   // chat appears progressively (the backend bounds each response to a
@@ -1157,6 +1171,7 @@ export function PreviewChatPanel({
                           row={row as PreviewPanelChatRow}
                           active={active}
                           platform={platform}
+                          emotes={emotes}
                           onSeek={onSeek}
                           markers={markers}
                           onSetMarker={handleSetMarker}

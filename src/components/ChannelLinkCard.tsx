@@ -58,6 +58,8 @@ type Props = {
   onCancel: () => void;
   duplicateMessage?: string | null;
   className?: string;
+  /** 'add' = new-channel flow (default); 'edit' = relink an existing channel. */
+  mode?: 'add' | 'edit';
 };
 
 export default function ChannelLinkCard({
@@ -67,6 +69,7 @@ export default function ChannelLinkCard({
   onCancel,
   duplicateMessage,
   className = '',
+  mode = 'add',
 }: Props) {
   const titleId = useId();
   const firstInputRef = useRef<HTMLInputElement>(null);
@@ -107,7 +110,7 @@ export default function ChannelLinkCard({
       <div>
         <div className="flex items-start justify-between gap-2">
           <p id={titleId} className="text-[11px] font-black uppercase text-white tracking-wide">
-            {t('Link channel')}
+            {mode === 'edit' ? t('Edit channel') : t('Link channel')}
           </p>
           <button
             type="button"
@@ -190,7 +193,7 @@ export default function ChannelLinkCard({
 
       {summary ? (
         <p className="text-[9px] font-mono text-zinc-500">
-          {t('Will add: {summary}', { summary })}
+          {mode === 'edit' ? t('Will update: {summary}', { summary }) : t('Will add: {summary}', { summary })}
         </p>
       ) : (
         <p className="text-[9px] font-mono text-zinc-600">{t('Select at least one platform with a username.')}</p>
@@ -207,7 +210,7 @@ export default function ChannelLinkCard({
           disabled={!canSubmit}
           className="flex-1 bg-white text-black font-black uppercase py-1.5 text-[10px] border-2 border-white disabled:opacity-40"
         >
-          {t('Add channel')}
+          {mode === 'edit' ? t('Save') : t('Add channel')}
         </button>
         <button
           type="button"

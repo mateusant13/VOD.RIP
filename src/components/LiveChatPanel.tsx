@@ -6,6 +6,12 @@
  * the app's existing chat sinks (Twitch anon IRC / Kick Pusher / yt-dlp
  * live_chat) with a flush callback that forwards rows instead of archiving.
  *
+ * Multi-stream support: when the channel is live on >1 platform the panel
+ * opens ONE merged stream per platform (each row tagged with its platform)
+ * and shows filter chips (All / Kick / Twitch / YouTube) in the header —
+ * the chips only render when `sources.length > 1`. Single-platform channels
+ * keep the original single-stream behavior, no chips.
+ *
  * Connection is EventSource (auto-reconnects); jsdom lacks EventSource, so
  * the panel degrades to an "unavailable" status there (tests).
  */
@@ -13,6 +19,8 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { resolveChatColor } from '../chatColors';
+import { KICK_COLOR, TWITCH_COLOR, YOUTUBE_COLOR } from '../platformColors';
+import { ChatEmoteText, useChatEmotes, type EmoteMap } from '../chatEmotes';
 
 export interface LiveChatRow {
   username: string;
@@ -22,6 +30,14 @@ export interface LiveChatRow {
   user_id?: string | number | null;
   badges?: string[];
   emotes?: string[];
+}
+
+/** One chat room to merge into the panel (per live platform). */
+export interface LiveChatSource {
+  /** Lowercase platform (kick/twitch/youtube). */
+  platform: string;
+  /** Chat room slug for that platform (login / slug / @handle). */
+  slug: string;
 }
 
 /** Rows kept in the live window — drop the oldest past this (keeps the DOM
@@ -37,7 +53,29 @@ function rowTime(ts: string | null | undefined): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-const ChatRow = memo(function ChatRow({ row, platform }: { row: LiveChatRow; platform: string | null }) {
+function platformColor(platform: string): string {
+  if (platform === 'kick') return KICK_COLOR;
+  if (platform === 'twitch') return TWITCH_COLOR;
+  if (platform === 'youtube') return YOUTUBE_COLOR;
+  return '#a1a1aa';
+}
+
+function platformLabel(platform: string): string {
+  if (platform === 'kick') return 'Kick';
+  if (platform === 'twitch') return 'Twitch';
+  if (platform === 'youtube') return 'YouTube';
+  return platform;
+}
+
+const ChatRow = memo(function ChatRow({
+  row,
+  showPlatform,
+  emotes,
+}: {
+  row: LiveChatRow & { platform: string };
+  showPlatform: boolean;
+  emotes: EmoteMap;
+}) {
   const { t } = useI18n();
   const time = rowTime(row.ts);
   return (
@@ -49,14 +87,22 @@ const ChatRow = memo(function ChatRow({ row, platform }: { row: LiveChatRow; pla
       {time ? (
         <span className="text-zinc-500 font-mono text-[9px] shrink-0">{time}</span>
       ) : null}
+      {showPlatform ? (
+        <span
+          className="text-[8px] font-mono uppercase shrink-0"
+          style={{ color: platformColor(row.platform) }}
+        >
+          {platformLabel(row.platform)}
+        </span>
+      ) : null}
       <span
         className="font-bold text-[10px] shrink-0"
-        style={{ color: resolveChatColor(row.color, row.username, platform) }}
+        style={{ color: resolveChatColor(row.color, row.username, row.platform) }}
       >
         {row.username}:
       </span>
       <span className="text-[10px] leading-snug truncate" title={row.text}>
-        {row.text}
+        <ChatEmoteText text={row.text} emotes={emotes} />
       </span>
       {row.badges?.length ? (
         <span className="text-[8px] font-mono text-zinc-500 shrink-0" title={t('Badges')}>
@@ -70,29 +116,31 @@ const ChatRow = memo(function ChatRow({ row, platform }: { row: LiveChatRow; pla
 type ChatStatus = 'connecting' | 'live' | 'reconnecting' | 'unsupported' | 'offline';
 
 interface LiveChatPanelProps {
-  /** Lowercase platform the stream is playing on (twitch/kick/youtube). */
-  platform: string | null;
-  /** Chat room slug for that platform (login / slug / @handle). */
-  slug?: string;
+  /** Chat rooms to merge — one EventSource per source. */
+  sources: LiveChatSource[];
   /** Close (collapse) the docked panel. */
   onClose: () => void;
 }
 
-export default function LiveChatPanel({ platform, slug, onClose }: LiveChatPanelProps) {
+export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) {
   const { t } = useI18n();
-  const [rows, setRows] = useState<LiveChatRow[]>([]);
+  const [rows, setRows] = useState<(LiveChatRow & { platform: string })[]>([]);
   const [status, setStatus] = useState<ChatStatus>('connecting');
+  const [filter, setFilter] = useState('all');
   const scrollRef = useRef<HTMLDivElement>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const esRefs = useRef<EventSource[]>([]);
 
-  const url = useMemo(() => {
-    if (!slug) return null;
-    const q = new URLSearchParams({ platform: platform ?? '', slug });
-    return `/api/live/chat/stream?${q.toString()}`;
-  }, [platform, slug]);
+  const multi = sources.length > 1;
+  // Stable chip order: kick, twitch, youtube (deduped).
+  const platforms = useMemo(() => {
+    const order = { kick: 0, twitch: 1, youtube: 2 } as Record<string, number>;
+    return [...new Set(sources.map((s) => s.platform))].sort(
+      (a, b) => (order[a] ?? 9) - (order[b] ?? 9),
+    );
+  }, [sources]);
 
   useEffect(() => {
-    if (!url) {
+    if (sources.length === 0) {
       setStatus('offline');
       return;
     }
@@ -103,35 +151,59 @@ export default function LiveChatPanel({ platform, slug, onClose }: LiveChatPanel
     }
     setRows([]);
     setStatus('connecting');
-    const es = new EventSource(url);
-    esRef.current = es;
-    es.onopen = () => setStatus('live');
-    es.onmessage = (ev: MessageEvent) => {
-      try {
-        const row = JSON.parse(ev.data) as LiveChatRow;
-        if (!row || typeof row.username !== 'string') return;
-        setRows((prev) => (prev.length >= MAX_ROWS ? [...prev.slice(prev.length - MAX_ROWS + 1), row] : [...prev, row]));
-      } catch {
-        // Ignore malformed frames — keep the stream alive.
-      }
-    };
-    es.onerror = () => {
-      // EventSource auto-reconnects; surface the flap without killing the panel.
-      setStatus((prev) => (prev === 'live' ? 'reconnecting' : prev === 'connecting' ? 'connecting' : prev));
-    };
+    const esList: EventSource[] = [];
+    for (const src of sources) {
+      const q = new URLSearchParams({ platform: src.platform, slug: src.slug });
+      const es = new EventSource(`/api/live/chat/stream?${q.toString()}`);
+      es.onopen = () => setStatus('live');
+      es.onmessage = (ev: MessageEvent) => {
+        try {
+          const row = JSON.parse(ev.data) as LiveChatRow;
+          if (!row || typeof row.username !== 'string') return;
+          const tagged = { ...row, platform: src.platform };
+          setRows((prev) =>
+            prev.length >= MAX_ROWS ? [...prev.slice(prev.length - MAX_ROWS + 1), tagged] : [...prev, tagged],
+          );
+        } catch {
+          // Ignore malformed frames — keep the stream alive.
+        }
+      };
+      es.onerror = () => {
+        // EventSource auto-reconnects; surface the flap without killing the panel.
+        setStatus((prev) => (prev === 'live' ? 'reconnecting' : prev === 'connecting' ? 'connecting' : prev));
+      };
+      esList.push(es);
+    }
+    esRefs.current = esList;
     return () => {
-      es.close();
-      esRef.current = null;
+      esList.forEach((es) => es.close());
+      esRefs.current = [];
     };
-  }, [url]);
+  }, [sources]);
+
+  // Channel emotes for the panel's twitch source (kick/youtube have no
+  // custom emotes). One map for the whole merged panel — multi-source rows
+  // share the twitch channel's emotes. The map reference is stable (cache),
+  // so memoized ChatRows only re-render once when the fetch resolves.
+  const twitchSlug = useMemo(
+    () => sources.find((s) => s.platform === 'twitch')?.slug?.trim() || null,
+    [sources],
+  );
+  const emotes = useChatEmotes(twitchSlug ? 'twitch' : null, twitchSlug ?? undefined);
+
+  // Rows visible under the active filter (all → every platform).
+  const visibleRows = useMemo(
+    () => (filter === 'all' ? rows : rows.filter((r) => r.platform === filter)),
+    [rows, filter],
+  );
 
   // Follow the live edge (only when the user is already at the bottom).
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el || !rows.length) return;
+    if (!el || !visibleRows.length) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
     if (atBottom) el.scrollTop = el.scrollHeight;
-  }, [rows]);
+  }, [visibleRows]);
 
   const statusLine = status === 'live'
     ? t('Live chat connected')
@@ -160,14 +232,33 @@ export default function LiveChatPanel({ platform, slug, onClose }: LiveChatPanel
           <X size={12} />
         </button>
       </div>
+      {multi ? (
+        <div className="flex items-center gap-0.5 px-1 py-0.5 bg-zinc-900 border-b border-zinc-800 shrink-0" data-live-chat-filters>
+          {['all', ...platforms].map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => setFilter(p)}
+              data-chat-filter={p}
+              className={`px-1 py-0.5 text-[8px] font-mono uppercase tracking-wider border transition-colors ${
+                filter === p
+                  ? 'bg-white text-black border-white'
+                  : 'text-zinc-400 border-zinc-800 hover:text-white hover:border-zinc-500'
+              }`}
+            >
+              {p === 'all' ? t('All') : platformLabel(p)}
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0" data-live-chat-scroll>
-        {rows.length === 0 ? (
+        {visibleRows.length === 0 ? (
           <div className="px-2 py-2 text-[10px] font-mono text-zinc-500">
             {status === 'live' ? t('Waiting for chat…') : statusLine}
           </div>
         ) : (
-          rows.map((row, i) => (
-            <ChatRow key={`${row.user_id ?? ''}-${i}`} row={row} platform={platform} />
+          visibleRows.map((row, i) => (
+            <ChatRow key={`${row.platform}-${row.user_id ?? ''}-${i}`} row={row} showPlatform={multi} emotes={emotes} />
           ))
         )}
       </div>

@@ -176,11 +176,17 @@ class KickPusherSink(ChatSink):
         self._ws = ws
         try:
             ws.connect()
+            # Kick's site subscribes to the v2 chatroom channel WITH an auth
+            # field (even empty) — the old `chat.{id}` channel no longer
+            # delivers messages and omitting `auth` on the v2 channel leaves
+            # the subscription silent. Both quirks verified against the live
+            # site (2026-08): frames only flow with channel=chatrooms.{id}.v2
+            # and data.auth present.
             ws.send_text(json.dumps({
                 "event": "pusher:subscribe",
-                "data": {"channel": f"chat.{self.chatroom_id}"},
+                "data": {"auth": "", "channel": f"chatrooms.{self.chatroom_id}.v2"},
             }))
-            self._log.info("kick pusher subscribed to chat.%s (app key %s...)",
+            self._log.info("kick pusher subscribed to chatrooms.%s.v2 (app key %s...)",
                            self.chatroom_id, self.app_key[:8])
             while not self.stop_requested():
                 # Pusher heartbeats every ~30s; a 30s read timeout races the
@@ -196,7 +202,7 @@ class KickPusherSink(ChatSink):
                     ws.send_text(json.dumps({"event": "pusher:pong", "data": "{}"}))
                     continue
                 if name == "pusher:subscribe_succeeded":
-                    self._log.info("kick pusher subscribe succeeded for chat.%s",
+                    self._log.info("kick pusher subscribe succeeded for chatrooms.%s.v2",
                                    self.chatroom_id)
                     continue
                 if name in (CHAT_EVENT, "chat_message"):

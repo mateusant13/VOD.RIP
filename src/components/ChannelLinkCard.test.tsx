@@ -52,4 +52,23 @@ describe('ChannelLinkCard', () => {
     fireEvent.click(add);
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
+
+  it('edit mode uses edit labels and still fires onConfirm', () => {
+    const onConfirm = vi.fn();
+    render(
+      <ChannelLinkCard
+        mode="edit"
+        draft={DRAFT}
+        onChange={() => {}}
+        onConfirm={onConfirm}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByText('Edit channel')).toBeInTheDocument();
+    expect(screen.getByText(/Will update:/)).toBeInTheDocument();
+    const save = screen.getByRole('button', { name: 'Save' });
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
 });

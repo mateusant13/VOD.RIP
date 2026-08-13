@@ -306,6 +306,12 @@ describe('liveChatSlugFromUrl', () => {
     expect(liveChatSlugFromUrl('https://example.com/whatever', 'twitch')).toBe('whatever');
   });
 
+  it('extracts the login from Twitch HLS master URLs (live entries)', () => {
+    expect(liveChatSlugFromUrl('https://usher.ttvnw.net/api/channel/hls/cellbit.m3u8?allow_source=true', 'twitch')).toBe('cellbit');
+    expect(liveChatSlugFromUrl('https://usher.ttvnw.net/api/channel/hls/jynxzi.m3u8', 'Twitch')).toBe('jynxzi');
+    expect(liveChatSlugFromUrl('https://cdn.ttvnw.net/chunked/hls/srdogg.m3u8', 'twitch')).toBe('srdogg');
+  });
+
   it('falls back to the host when the platform tag is missing', () => {
     expect(liveChatSlugFromUrl('https://kick.com/srdoglol', undefined)).toBe('srdoglol');
     expect(liveChatSlugFromUrl('https://www.twitch.tv/srdogg', '')).toBe('srdogg');

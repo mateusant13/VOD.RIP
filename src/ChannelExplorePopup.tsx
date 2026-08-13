@@ -1568,6 +1568,7 @@ export default function ChannelExplorePopup({
       }}
       disabled={!ready}
       buttonClassName={fs ? fsCtrlBtn : ctrlBtn(false)}
+      iconSize={18}
       onMenuOpen={() => setVolumeMenuOpen(false)}
       popoverClassName={fs
         ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
@@ -1934,7 +1935,7 @@ export default function ChannelExplorePopup({
                   type="button"
                   onClick={() => void toggleFullscreen()}
                   disabled={!ready}
-                  className={platformPreviewCtrlBtn(platform, false, true)}
+                  className={platformPreviewCtrlBtn(platform, false)}
                   title={t('Fullscreen')}
                 >
                   <Maximize2 size={18} />
@@ -1950,6 +1951,8 @@ export default function ChannelExplorePopup({
               platform={platform}
               videoId={vod.videoId ?? null}
               currentTime={currentTime}
+              // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
+              channel={vod.channel}
               defaultOpen={false}
               // Click-to-seek: rows/caption seek this popup's own player
               // (seekVideo clamps to the effective duration and no-ops
@@ -2003,7 +2006,7 @@ export default function ChannelExplorePopup({
                     type="button"
                     onClick={() => void toggleFullscreen()}
                     disabled={!ready}
-                    className={platformPreviewCtrlBtn(platform, false, true)}
+                    className={platformPreviewCtrlBtn(platform, false)}
                     title={t('Exit fullscreen')}
                   >
                     <Minimize2 size={18} />

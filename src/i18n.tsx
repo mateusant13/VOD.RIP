@@ -240,6 +240,8 @@ const ptBR: Record<string, string> = {
 
   // ── Channel link card ─────────────────────────────────────
   'Link channel': 'Vincular canal',
+  'Edit channel': 'Editar canal',
+  'Will update: {summary}': 'Vai atualizar: {summary}',
   'Close': 'Fechar',
   'Usernames can be different on each platform. Edit them before adding.':
     'Os nomes de usuário podem ser diferentes em cada plataforma. Edite-os antes de adicionar.',
@@ -582,6 +584,7 @@ const ptBR: Record<string, string> = {
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
   // ── Live chat / fast clip (livestream) ────────────────────
+  'All': 'Todos',
   'Live chat': 'Chat ao vivo',
   'Live chat connected': 'Chat ao vivo conectado',
   'Connecting…': 'Conectando…',
@@ -833,6 +836,8 @@ const es: Record<string, string> = {
   'Cancel': 'Cancelar',
   'Pause': 'Pausar',
   'Link channel': 'Vincular canal',
+  'Edit channel': 'Editar canal',
+  'Will update: {summary}': 'Se actualizará: {summary}',
   'Close': 'Cerrar',
   'Usernames can be different on each platform. Edit them before adding.': 'Los nombres de usuario pueden diferir en cada plataforma. Edítalos antes de añadir.',
   'Detected from {platform}': 'Detectado desde {platform}',
@@ -1156,6 +1161,7 @@ const es: Record<string, string> = {
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',
   // ── Live chat / fast clip (livestream) ────────────────────
+  'All': 'Todos',
   'Live chat': 'Chat en vivo',
   'Live chat connected': 'Chat en vivo conectado',
   'Connecting…': 'Conectando…',

@@ -49,6 +49,15 @@ _chat_dedupe_done = False
 # waits this long after lifespan start so the API serves in ~2-3s and the
 # first Vite/UI window stays uncontended.
 _BOOT_WARM_GRACE_SEC = float(os.environ.get("VODRIP_BOOT_WARM_GRACE", "8"))
+# The live-status warm waits much less: its burst (~10s for 19 channels)
+# must finish before the user's first Channels-tab poll so the LIVE badges
+# paint on the first round-trip. The yt/embed/ASR warms keep the long grace.
+# Live-status warm fires at lifespan start (before uvicorn accepts requests),
+# so the burst pool registers its futures in _LIVE_REFRESH_INFLIGHT first and
+# the frontend's first polls dedupe onto the 8x12 burst instead of the slow
+# 4-worker steady-state pool. A grace >0 loses that race (polls win, burst
+# no-ops) — keep 0 unless the boot burst must yield to something else.
+_LIVE_WARM_GRACE_SEC = float(os.environ.get("VODRIP_LIVE_WARM_GRACE", "0"))
 _archive_worker_started = False
 
 try:
@@ -575,7 +584,7 @@ async def _app_lifespan(_app: FastAPI):
         hasn't reached yet.
         """
         try:
-            if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+            if _warm_shutdown.wait(_LIVE_WARM_GRACE_SEC):
                 return  # cold live cache is handled by the router's cold-miss path
             from routers.live import warm_all_saved_channel_live_status
 

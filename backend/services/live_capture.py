@@ -366,7 +366,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     """
     import yt_dlp
 
-    from services.ytdlp_guard import ytdlp_console_logger
+    from services.ytdlp_guard import ytdlp_console_logger, ytdlp_js_runtimes
 
     live_url = (
         f"https://www.youtube.com/channel/{handle}/live"

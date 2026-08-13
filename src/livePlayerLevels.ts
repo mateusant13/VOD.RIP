@@ -262,6 +262,12 @@ export function clampClipSeconds(value: number): number {
  * Live chat room slug from the entry URL (twitch.tv/<login>,
  * kick.com/<slug>, youtube.com/@handle) — falls back to the platform slug
  * the archive context resolved. Used to open the per-viewer chat stream.
+ *
+ * Live entries carry the playback HLS master (e.g.
+ * usher.ttvnw.net/api/channel/hls/<login>.m3u8) instead of the channel page,
+ * so path[0] would be junk ("api") — extract the <login> from the m3u8
+ * filename for Twitch media hosts instead. Non-page, non-Twitch-master URLs
+ * yield undefined so callers fall back to the archive-context slug.
  */
 export function liveChatSlugFromUrl(url: string, platform: string | undefined): string | undefined {
   try {
@@ -269,9 +275,29 @@ export function liveChatSlugFromUrl(url: string, platform: string | undefined): 
     const host = u.hostname.toLowerCase();
     const path = u.pathname.split('/').filter(Boolean);
     const plat = (platform || '').toLowerCase();
-    if (plat === 'twitch' || host.includes('twitch.tv')) return path[0] || undefined;
-    if (plat === 'kick' || host.includes('kick.com')) return path[0] || undefined;
-    if (plat === 'youtube' || host.includes('youtube.com') || host === 'youtu.be') return path[0] || undefined;
+
+    // Twitch — channel page (twitch.tv/<login>) or HLS master
+    // (usher/cdn.ttvnw.net/api/channel/hls/<login>.m3u8). The live entry URL
+    // is the playback master, NOT the page — path[0] there is "api" junk.
+    if (plat === 'twitch' || host.includes('twitch.tv') || host.includes('ttvnw.net')) {
+      if (host.includes('ttvnw.net')) {
+        const file = path[path.length - 1] ?? '';
+        const login = file.replace(/\.m3u8(\.vtt)?$/i, '');
+        // Generic segment/playlist names (index-dvr/chunked/…) are NOT logins —
+        // return undefined so callers fall back to the archive-context slug.
+        if (/^(index|chunked|master|playlist|media)(-|\.|$)/i.test(login)) return undefined;
+        return login || undefined;
+      }
+      return path[0] || undefined;
+    }
+    if (plat === 'kick' || host.includes('kick.com')) {
+      if (host.includes('kick.com')) return path[0] || undefined;
+      return undefined; // Kick CDN playback master — no slug in the URL.
+    }
+    if (plat === 'youtube' || host.includes('youtube.com') || host === 'youtu.be') {
+      if (host.includes('youtube.com') || host === 'youtu.be') return path[0] || undefined;
+      return undefined; // googlevideo manifest — no handle in the URL.
+    }
     return path[0] || undefined;
   } catch {
     return undefined;

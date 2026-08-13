@@ -18,6 +18,18 @@ let exitFullscreenMock: Mock;
 
 const ENTRY = { url: 'https://kick.com/srdoglol', title: 'Late night', platform: 'kick' };
 
+/** Minimal EventSource stub — tests drive onopen/onmessage per instance. */
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((ev: MessageEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor(public url: string) {
+    FakeEventSource.instances.push(this);
+  }
+  close() {}
+}
+
 function mockFetch() {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -186,6 +198,42 @@ describe('LivePlayerPopup fast clip', () => {
     fireEvent.change(input, { target: { value: '0' } });
     expect((input as HTMLInputElement).value).toBe('1');
   });
+
+  it('shows a fixed "s" suffix next to the seconds value', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const input = screen.getByLabelText('Clip duration (seconds)');
+    expect((input as HTMLInputElement).value).toBe('30');
+    // The "s" is a sibling span, never part of the input value — it cannot
+    // be deleted, so it always re-appears by construction.
+    const suffix = input.parentElement!.querySelector('span');
+    expect(suffix?.textContent).toBe('s');
+  });
+
+  it('typing over a focused value replaces it (30 → 15)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const input = screen.getByLabelText('Clip duration (seconds)') as HTMLInputElement;
+    fireEvent.focus(input); // select-all on focus
+    fireEvent.change(input, { target: { value: '15' } });
+    expect(input.value).toBe('15');
+  });
+
+  it('Backspace on a fully-selected value removes ONE digit (30 → 3)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const input = screen.getByLabelText('Clip duration (seconds)') as HTMLInputElement;
+    fireEvent.focus(input); // select-all on focus (selectionStart 0, end = len)
+    input.setSelectionRange(0, input.value.length);
+    fireEvent.keyDown(input, { key: 'Backspace' });
+    expect(input.value).toBe('3');
+  });
 });
 
 describe('LivePlayerPopup live chat', () => {
@@ -204,6 +252,106 @@ describe('LivePlayerPopup live chat', () => {
     // shares the title).
     fireEvent.click(screen.getAllByTitle('Close live chat')[0]);
     await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeNull());
+  });
+});
+
+describe('LivePlayerPopup multi chat', () => {
+  /** Multi-stream popup: live on Kick AND Twitch, with a saved channel that
+   *  carries both platform slugs (multi-chat sources). */
+  function renderMultiPopup() {
+    return render(
+      <LivePlayerPopup
+        entry={ENTRY}
+        entries={[
+          { url: 'https://kick.com/srdoglol', title: 'Late night', platform: 'kick' },
+          { url: 'https://usher.ttvnw.net/api/channel/hls/srdogg.m3u8', title: 'Morning', platform: 'twitch' },
+        ]}
+        channelName="srdogg / srdoglol"
+        onClose={vi.fn()}
+        channelSlug="srdoglol"
+        channel={{
+          id: 'c1',
+          displayName: 'srdogg / srdoglol',
+          kickSlug: 'srdoglol',
+          twitchSlug: 'srdogg',
+          youtubeSlug: '',
+          vodVideos: [],
+          clipVideos: [],
+          updatedAt: '2026-08-01T00:00:00Z',
+        }}
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+      />,
+    );
+  }
+
+  it('shows filter chips only when the channel is live on >1 platform', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderMultiPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // Multi-stream → the merged panel exposes All/Kick/Twitch filters
+    // (YouTube not live → no chip).
+    const filters = document.querySelector('[data-live-chat-filters]');
+    expect(filters).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'All' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Kick' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Twitch' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'YouTube' })).toBeNull();
+
+    // Two chat streams opened — one per live platform.
+    expect(FakeEventSource.instances).toHaveLength(2);
+  });
+
+  it('filters merged rows by platform (All shows both streams)', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderMultiPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // Both streams open and deliver one row each.
+    const kickEs = FakeEventSource.instances.find((es) => es.url.includes('platform=kick'))!;
+    const twitchEs = FakeEventSource.instances.find((es) => es.url.includes('platform=twitch'))!;
+    kickEs.onopen?.();
+    twitchEs.onopen?.();
+    kickEs.onmessage?.({ data: JSON.stringify({ username: 'kick_user', text: 'hi from kick' }) } as MessageEvent);
+    twitchEs.onmessage?.({ data: JSON.stringify({ username: 'twitch_user', text: 'hi from twitch' }) } as MessageEvent);
+
+    // All → both rows visible, each tagged with its platform.
+    await screen.findByText('hi from kick');
+    expect(screen.getByText('hi from twitch')).toBeTruthy();
+    expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(2);
+
+    // Twitch filter → only the Twitch row stays.
+    fireEvent.click(screen.getByRole('button', { name: 'Twitch' }));
+    await waitFor(() => expect(screen.queryByText('hi from kick')).toBeNull());
+    expect(screen.getByText('hi from twitch')).toBeTruthy();
+    expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(1);
+
+    // Back to All → both rows return (no data re-fetch).
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    await waitFor(() => expect(screen.getByText('hi from kick')).toBeTruthy());
+    expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(2);
+    // Exactly two streams total — filtering never re-opens EventSources.
+    expect(FakeEventSource.instances).toHaveLength(2);
+  });
+
+  it('merges multi-stream URLs via the saved channel slugs (CDN masters have no slug)', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderMultiPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // Twitch CDN master URL → login extracted from the m3u8 filename.
+    const twitchEs = FakeEventSource.instances.find((es) => es.url.includes('platform=twitch'))!;
+    expect(twitchEs.url).toContain('slug=srdogg');
+    // Kick page URL → slug from the path.
+    const kickEs = FakeEventSource.instances.find((es) => es.url.includes('platform=kick'))!;
+    expect(kickEs.url).toContain('slug=srdoglol');
   });
 });
 

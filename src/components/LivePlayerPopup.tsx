@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Scissors, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { reportClipEvent } from '../twitchClip';
 import { useI18n } from '../i18n';
@@ -28,8 +28,6 @@ import {
   clampClipSeconds,
   clipCooldownRemaining,
   FAST_CLIP_COOLDOWN_MS,
-  FAST_CLIP_MAX_SEC,
-  FAST_CLIP_MIN_SEC,
   FAST_CLIP_DEFAULT_SEC,
   filterLiveLevels,
   liveBroadcastPositionSec,
@@ -40,6 +38,7 @@ import {
   type LivePanelAspectClamp,
 } from '../livePlayerLevels';
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
+import TwitchLogoIcon from './TwitchLogoIcon';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
 import { noteUserUnpause } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
@@ -66,6 +65,9 @@ interface LivePlayerPopupProps {
   onClose: () => void;
   /** Platform slug for the open-channel button (twitchSlug/kickSlug/youtubeSlug). */
   channelSlug?: string;
+  /** Saved channel — its kick/twitch/youtube slugs resolve multi-chat rooms
+   *  when the channel is live on more than one platform. */
+  channel?: SavedChannel | null;
   /** Channel's current (in-progress) VOD URL — DVR REPLAY archive source. */
   vodUrl?: string;
   /** Open an archive hit in the explore-player flow (App owns the popup stack). */
@@ -118,7 +120,7 @@ const REPLAY_RESNAPSHOT_MS = 30_000;
  *  live entry (or surfaces the error) instead of pinning the spinner. */
 const SESSION_STALL_MS = 8_000;
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -276,13 +278,28 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     return `https://www.twitch.tv/${channelSlug}`;
   }, [activeEntry.platform, channelSlug]);
 
-  // Live chat room: prefer the playing entry's URL slug (fallback chain can
-  // advance to a different channel), else the archive-context slug.
-  const chatPlatform = (activeEntry.platform || '').toLowerCase();
-  const chatSlug = useMemo(
-    () => liveChatSlugFromUrl(activeEntry.url, chatPlatform) ?? channelSlug,
-    [activeEntry.url, chatPlatform, channelSlug],
-  );
+  // Live chat rooms — ONE merged source per distinct platform the channel is
+  // live on (multi-stream → multi-chat with filter chips). Each slug prefers
+  // the playing entry's URL (fallback chain can advance to a different
+  // channel), then the channel's own slug for that platform, then the
+  // archive-context slug. Single-platform streams produce one source and the
+  // panel shows no filters (original behavior).
+  const chatSources = useMemo(() => {
+    const order = { kick: 0, twitch: 1, youtube: 2 } as Record<string, number>;
+    const byPlatform = new Map<string, string>();
+    for (const e of allEntries) {
+      const plat = (e.platform || '').toLowerCase();
+      if (!plat || byPlatform.has(plat)) continue;
+      const saved = plat === 'kick' ? channel?.kickSlug
+        : plat === 'twitch' ? channel?.twitchSlug
+        : channel?.youtubeSlug;
+      const slug = liveChatSlugFromUrl(e.url, plat) ?? saved ?? channelSlug;
+      if (slug) byPlatform.set(plat, slug);
+    }
+    return [...byPlatform.entries()]
+      .sort((a, b) => (order[a[0]] ?? 9) - (order[b[0]] ?? 9))
+      .map(([platform, slug]) => ({ platform, slug }));
+  }, [allEntries, channel, channelSlug]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -1072,11 +1089,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // Transport buttons match the main preview player (platform accent when
   // docked, glass when the popup is fullscreen).
-  const transportBtn = platformPreviewCtrlBtn(
-    (activeEntry.platform ?? 'kick') as PlatformStyleKey,
-    isFullscreen,
-    false,
-  );
+  const ctrlPlatform = (activeEntry.platform ?? 'kick') as PlatformStyleKey;
+  const transportBtn = platformPreviewCtrlBtn(ctrlPlatform, isFullscreen, false);
 
   const archiveAvailable = archiveReady;  // Live rail: pinned at the archive edge; dragging back opens REPLAY.
   // Replay rail: full snapshot duration; max follows hls.js video.duration.
@@ -1407,29 +1421,49 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   title={clipCooldownLeft > 0
                     ? t('Clip cooldown {n}s', { n: Math.ceil(clipCooldownLeft / 1000) })
                     : t('Create a clip of the live stream')}
-                  className={`flex items-center gap-1 border-2 px-1.5 py-1 text-[9px] font-bold tracking-wider transition-colors ${
-                    clipCooldownLeft > 0
-                      ? 'border-zinc-700 bg-zinc-900/60 text-zinc-500 cursor-default'
-                      : 'border-red-800 bg-red-950/30 text-red-400 hover:border-red-500 hover:text-red-300'
-                  }`}
+                  className={`${platformPreviewCtrlBtn(ctrlPlatform, false, true)} flex items-center gap-1.5 disabled:pointer-events-none`}
                 >
-                  <Scissors size={12} />
-                  {clipCooldownLeft > 0 ? `${Math.ceil(clipCooldownLeft / 1000)}s` : t('CLIP')}
+                  <TwitchLogoIcon size={15} className="shrink-0" />
+                  {/* Logo already says Twitch — label stays bare "clip" (user request). */}
+                  <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">
+                    {clipCooldownLeft > 0 ? `${Math.ceil(clipCooldownLeft / 1000)}s` : 'clip'}
+                  </span>
                 </button>
-                <input
-                  type="number"
-                  min={FAST_CLIP_MIN_SEC}
-                  max={FAST_CLIP_MAX_SEC}
-                  step={1}
-                  value={clipSeconds}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10);
-                    setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
-                  }}
-                  className="w-11 shrink-0 bg-zinc-900 border-2 border-zinc-700 text-zinc-200 text-[9px] font-mono px-1 py-0.5 text-center"
-                  aria-label={t('Clip duration (seconds)')}
-                  title={t('Clip duration (seconds)')}
-                />
+                <div className="relative shrink-0">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={String(clipSeconds)}
+                    onChange={(e) => {
+                      const digits = e.target.value.replace(/\D/g, '');
+                      const v = digits === '' ? NaN : parseInt(digits, 10);
+                      setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
+                    }}
+                    onFocus={(e) => e.currentTarget.select()}
+                    onKeyDown={(e) => {
+                      // Full-selection Backspace removes ONE digit (30 → 3),
+                      // not the whole value; typing still replaces it all.
+                      const el = e.currentTarget;
+                      if (e.key === 'Backspace' && el.selectionStart === 0 && el.selectionEnd === el.value.length) {
+                        e.preventDefault();
+                        const digits = el.value.slice(0, -1).replace(/\D/g, '');
+                        const v = digits === '' ? NaN : parseInt(digits, 10);
+                        setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
+                        // React re-renders the new value asynchronously; drop
+                        // the caret to the end so typing appends (30→3→35).
+                        requestAnimationFrame(() => {
+                          el.setSelectionRange(el.value.length, el.value.length);
+                        });
+                      }
+                    }}
+                    className="w-10 bg-zinc-900 border-2 border-zinc-700 text-zinc-200 text-[9px] font-mono py-1.5 pl-1 pr-3 text-right"
+                    aria-label={t('Clip duration (seconds)')}
+                    title={t('Clip duration (seconds)')}
+                  />
+                  <span className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-[9px] font-mono text-zinc-500">
+                    s
+                  </span>
+                </div>
               </div>
 
               {clipNotice && (
@@ -1479,11 +1513,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         )}
       </div>
       {/* Docked live chat — same side-dock rule as the archive search panel:
-          hidden while this popup is fullscreen. */}
-      {chatOpen && !isFullscreen && chatSlug && (
+          hidden while this popup is fullscreen. Multi-stream channels merge
+          one stream per live platform (filter chips appear in the panel). */}
+      {chatOpen && !isFullscreen && chatSources.length > 0 && (
         <LiveChatPanel
-          platform={chatPlatform}
-          slug={chatSlug}
+          sources={chatSources}
           onClose={toggleChat}
         />
       )}

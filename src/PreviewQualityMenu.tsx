@@ -10,6 +10,8 @@ interface PreviewQualityMenuProps {
   disabled: boolean;
   buttonClassName: string;
   onMenuOpen?: () => void;
+  /** Icon size — default 15; rows using 18px transport icons pass 18. */
+  iconSize?: number;
   popoverClassName?: string;
   /** Fullscreen controls sit above a trim rail — open downward to avoid clipping. */
   popoverPlacement?: 'up' | 'down';
@@ -26,6 +28,7 @@ export default function PreviewQualityMenu({
   onMenuOpen,
   popoverClassName = 'border-2 border-zinc-600 bg-zinc-950',
   popoverPlacement = 'up',
+  iconSize = 15,
 }: PreviewQualityMenuProps) {
   if (!levels.length) return null;
 
@@ -46,7 +49,7 @@ export default function PreviewQualityMenu({
         className={buttonClassName}
         title="Video quality"
       >
-        <Settings size={15} />
+        <Settings size={iconSize} />
       </button>
       {menuOpen && (
         <div className={`${popoverPos} z-[100] min-w-[7rem] shadow-lg py-1 ${popoverClassName}`}>
