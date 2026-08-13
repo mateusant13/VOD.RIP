@@ -47,6 +47,8 @@ from services.archive_transcribe import (  # noqa: E402
     _plan_chunks,
     _write_manifest_header,
     _append_manifest_entry,
+    _job_engine,
+    _resolve_job_language,
     model_name,
 )
 
@@ -106,6 +108,21 @@ def _build_fixture() -> pathlib.Path:
     return FIXTURE
 
 
+def _worker_engine(platform: str, video_id: str) -> str:
+    """The engine run_worker's _process_job picks for this video — mirror its
+    settings override mapping + _job_engine so the simulated crash manifest
+    matches the engine that resumes the job (a whisper manifest on a parakeet
+    run reads as stale and full re-runs, breaking the resume contract)."""
+    try:
+        from deps import settings_mgr
+        pref = getattr(settings_mgr.get(), "asr_engine", "parakeet") or "parakeet"
+    except Exception:
+        pref = "parakeet"
+    if pref == "whisper":
+        return "whisper"
+    return _job_engine(_resolve_job_language(platform, video_id))
+
+
 def _enqueue_and_run(job_id: str) -> dict:
     archive_db.enqueue_job(job_id, "transcribe", PLATFORM, VIDEO_ID)
     run_worker(once=True, poll_interval=0.5)
@@ -162,7 +179,43 @@ def _run_no_speech() -> None:
     print(f"  wall: {wall:.2f}s | model load: never (patched _get_model/_thread_model)")
 
 
+def _run_once_requeue_exit() -> None:
+    """--once must exit 0 (not spin) when a job requeues: the YouTube
+    bot-gate cooldown requeues the same row until the freeze lifts, so the
+    queue never drains — a --once worker that waits for a drain hangs
+    forever holding the whisper model."""
+    import threading
+    from unittest.mock import patch
+
+    job_id = "__requeue_e2e__"
+    archive_db.upsert_video({
+        "platform": "youtube",
+        "video_id": "__requeue_vid__",
+        "channel": "requeue-channel",
+        "title": "requeue fixture",
+        "status": "ready",
+    })
+    archive_db.enqueue_job(job_id, "transcribe", "youtube", "__requeue_vid__")
+    with patch.object(
+        archive_transcribe, "_process_job",
+        side_effect=lambda job, multi=False: {"requeued": "youtube-gate"},
+    ):
+        t = threading.Thread(
+            target=run_worker, kwargs={"once": True, "poll_interval": 0.05}
+        )
+        t.start()
+        t.join(timeout=15.0)
+    assert not t.is_alive(), "--once must exit after a requeue (no spin)"
+    print("  --once: exits rc 0 on a requeued job (no spin)")
+
+
 def _run() -> None:
+    # Isolation guard: the scratch DB must start EMPTY. _migrate_db_to_data_dir
+    # used to seed a fresh VODRIP_ARCHIVE_DB target with a copy of the real
+    # %APPDATA% archive, so the worker claimed real user jobs instead of the
+    # fixture's and this run failed on them, not on the fixture.
+    _n = archive_db.query("SELECT COUNT(*) AS n FROM archive_jobs")[0]["n"]
+    assert _n == 0, f"scratch DB not empty ({_n} jobs) — real archive leaked in"
     fixture = _build_fixture()
     archive_db.upsert_video({
         "platform": PLATFORM,
@@ -236,7 +289,7 @@ def _run() -> None:
     chunk0_count = sum(1 for s in segs if s["end_sec"] <= speech1_sec + 0.01)
     assert chunk0_count > 0 and chunk0_count < len(segs), chunk0_count
     manifest = _manifest_path(PLATFORM, VIDEO_ID)
-    _write_manifest_header(manifest, chunks)
+    _write_manifest_header(manifest, chunks, engine=_worker_engine(PLATFORM, VIDEO_ID))
     _append_manifest_entry(manifest, 0, int(segs[0]["seg_idx"]), chunk0_count)
     assert manifest.is_file(), "crash-state manifest must exist before resume run"
 
@@ -281,6 +334,7 @@ def _run() -> None:
     print(f"  fixture: {fixture} ({fixture.stat().st_size} bytes)")
 
     _run_no_speech()
+    _run_once_requeue_exit()
 
     # model cache size (download footprint)
     from services.archive_transcribe import _cache_dir

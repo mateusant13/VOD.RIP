@@ -170,9 +170,18 @@ def main() -> int:
 
     # First-wins guard BEFORE starting anything: another background daemon
     # (e.g. from the previous app session, still alive) owns the machine.
-    if archive_db.worker_live(age_s=90, tag=TAG):
-        _log.info("background daemon already running — nothing to do.")
-        return 0
+    # A guard failure (SQLite lock contention) must never let this process
+    # run unguarded — exit 1; the app's next boot respawns it.
+    try:
+        if archive_db.worker_live(age_s=90, tag=TAG):
+            _log.info("background daemon already running — nothing to do.")
+            return 0
+    except Exception:
+        _log.warning(
+            "first-wins guard failed — exiting instead of running unguarded",
+            exc_info=True,
+        )
+        return 1
 
     # Quiet pacing for every pass/enqueue/child this process starts. Read
     # per-pass by the scheduler and per-interval by the transcribe child.

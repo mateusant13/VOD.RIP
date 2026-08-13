@@ -274,6 +274,12 @@ def _migrate_db_to_data_dir(target: Path) -> None:
     archive.db (+ -wal/-shm) and the whisper resume manifests so the switch
     is seamless. Idempotent — no-op when nothing to move or target exists.
     """
+    # An explicit VODRIP_ARCHIVE_DB override means "use exactly this file":
+    # test/CLI scratch DBs must start EMPTY, never seeded from the real
+    # appdata archive. A fresh scratch target otherwise satisfies every
+    # migration condition, so the worker would claim real user jobs from it.
+    if os.environ.get("VODRIP_ARCHIVE_DB", "").strip():
+        return
     src_dir = _settings._get_appdata_dir()
     if src_dir == target.parent:
         return

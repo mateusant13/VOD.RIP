@@ -1421,12 +1421,23 @@ def _transcribe_batch_parakeet(
             getattr(res, "timestamps", []) or [],
             getattr(res, "ys_log_probs", None),
         )
-        last_word_end = (words[-1]["end"] if words else float(ce)) + base
+        # The recognizer only ever sees the per-clip slice, so its word
+        # timestamps are relative to the CLIP, not the video. The absolute
+        # clip start is cs+base (sharded: concat-relative cs + absolute
+        # offset; full-audio: cs is already absolute, base is 0). Without
+        # this offset every clip past the first stored end_sec = the first
+        # clip's speech end and clip-relative word times.
+        clip_start = cs + base
+        last_word_end = (words[-1]["end"] if words else float(ce - cs)) + clip_start
         items = [{
-            "start_sec": round(cs + base, 3),
+            "start_sec": round(clip_start, 3),
             "end_sec": round(min(ce + base, last_word_end + 0.3), 3),
             "text": text,
-            "words": words,
+            "words": [
+                {**w, "start": round(w["start"] + clip_start, 3),
+                 "end": round(w["end"] + clip_start, 3)}
+                for w in words
+            ],
         }]
         out.append((items, language))
     return out
@@ -3446,10 +3457,17 @@ def run_worker(
                 for fut in done:
                     pending.pop(fut, None)
                     try:
-                        fut.result()
+                        result = fut.result()
                     except Exception:
                         logger.exception("worker future crashed")  # belt & braces
+                        result = None
                     _refill()
+                    # --once must not spin on a requeued job: the YouTube
+                    # bot-gate cooldown requeues the same row until the
+                    # freeze lifts, so the queue is NOT drained. Exit 0 and
+                    # let the next invocation retry later.
+                    if once and isinstance(result, dict) and result.get("requeued"):
+                        return
                 if once and not pending:
                     break
     finally:
