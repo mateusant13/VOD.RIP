@@ -981,8 +981,27 @@ class PreviewManager:
         master: Optional[str] = None
         if platform == "twitch":
             if vod_url:
-                from services.twitch_gql_service import get_vod_playback_sync
+                from services.twitch_gql_service import (
+                    get_channel_stream_status_sync,
+                    get_vod_playback_sync,
+                    is_vod_previous_broadcast,
+                    twitch_video_created_at,
+                )
 
+                # Same previous-broadcast guard as twitch_archive_info: while
+                # the channel is live its current VOD is unpublished, so the
+                # URL the frontend lists resolves to a PREVIOUS broadcast →
+                # refuse replay. Stream offline / status failure → allow.
+                login = _twitch_login_from_master(session.master_url)
+                status = get_channel_stream_status_sync(login) if login else None
+                created = twitch_video_created_at(vod_url) if (status or {}).get("live") else None
+                if is_vod_previous_broadcast(created, status):
+                    logger.debug(
+                        "live session %s: VOD %s predates the live stream — no replay",
+                        session.session_id[:8],
+                        vod_url,
+                    )
+                    return None
                 master, _hdrs, _variants = get_vod_playback_sync(vod_url)
             else:
                 from services.live_capture import twitch_archive_info

@@ -947,5 +947,85 @@ def get_video_info_sync(url_or_id: str) -> Dict[str, Any]:
     return payload
 
 
+TWITCH_STREAM_STATUS_QUERY = """
+query ChannelStream($login: String!) {
+  user(login: $login) {
+    stream {
+      id
+      startedAt
+    }
+  }
+}
+"""
+
+# Slack for clock skew when deciding whether a VOD predates the ongoing
+# stream: a live broadcast's own VOD is only published after it ends, so a
+# live stream + a VOD created more than this far before the stream start
+# means the VOD is a PREVIOUS broadcast (never the current one).
+VOD_STREAM_START_TOLERANCE_SEC = 300.0
+
+
+def get_channel_stream_status_sync(login: str) -> Optional[dict]:
+    """Live status for a Twitch channel: ``{live, started_at}`` or None.
+
+    One cheap GQL query (channel stream node). ``started_at`` is the ISO-8601
+    stream start. None means the query failed transiently — callers MUST
+    preserve their pre-status behavior in that case.
+    """
+    login = (login or "").strip().lower()
+    if not login:
+        return None
+    try:
+        data = _gql_request(TWITCH_STREAM_STATUS_QUERY, {"login": login})
+        stream = ((data or {}).get("user") or {}).get("stream")
+    except Exception:
+        return None
+    if not stream:
+        return {"live": False, "started_at": None}
+    return {"live": True, "started_at": stream.get("startedAt") or None}
+
+
+def twitch_video_created_at(vod_id_or_url: str) -> Optional[str]:
+    """ISO-8601 ``createdAt`` for a single Twitch VOD (one GQL query).
+
+    Accepts a video id or a twitch.tv/videos/{id} URL (same shapes as
+    ``_extract_video_id``). None on parse failure, missing video, or a
+    transient query failure.
+    """
+    vid = _extract_video_id(vod_id_or_url)
+    if not vid:
+        return None
+    try:
+        data = _gql_request(VIDEO_INFO_QUERY, {"id": vid})
+        video = (data or {}).get("video") or {}
+        return video.get("createdAt") or None
+    except Exception:
+        return None
+
+
+def is_vod_previous_broadcast(
+    vod_created_at: Optional[str],
+    stream_status: Optional[dict],
+    *,
+    tolerance_sec: float = VOD_STREAM_START_TOLERANCE_SEC,
+) -> bool:
+    """True when a VOD clearly predates the channel's ONGOING live stream.
+
+    A live broadcast's own VOD is published only after the stream ends, so
+    while a stream is live the newest listed VOD is always a PREVIOUS
+    broadcast — unless its ``createdAt`` sits within ``tolerance_sec`` of the
+    stream start (clock skew; the just-ended broadcast case is covered by
+    ``live=False``). Stream offline, missing timestamps, or a failed status
+    query (None) all return False — never break replay on transient failure.
+    """
+    if not stream_status or not stream_status.get("live"):
+        return False
+    stream_start = _iso_ts(stream_status.get("started_at"))
+    vod_ts = _iso_ts(vod_created_at)
+    if stream_start is None or vod_ts is None:
+        return False
+    return abs(stream_start - vod_ts) > tolerance_sec
+
+
 assert "type: ARCHIVE" not in CHANNEL_VIDEOS_QUERY
 assert TWITCH_CLIPS_RANGE_FILTER == "ALL_TIME"

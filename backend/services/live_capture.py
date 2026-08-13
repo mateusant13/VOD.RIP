@@ -236,19 +236,34 @@ def twitch_archive_info(login: str) -> Optional[dict]:
     DVR fallback for the live popup when the frontend has no VOD URL to pass:
     the most recent broadcast from the GQL channel-videos list resolves to a
     usher vod master via the existing VOD playback-token flow. Returns
-    {url, headers, vod_id, platform} or None (offline/never streamed).
+    {url, headers, vod_id, platform} or None (offline/never streamed, or the
+    newest VOD is a PREVIOUS broadcast while the channel is live).
     """
     login = (login or "").strip().lower()
     if not login:
         return None
     try:
-        from services.twitch_gql_service import get_vod_playback_sync, list_channel_videos_sync
+        from services.twitch_gql_service import (
+            get_channel_stream_status_sync,
+            get_vod_playback_sync,
+            is_vod_previous_broadcast,
+            list_channel_videos_sync,
+        )
 
         vids = list_channel_videos_sync(login, limit=1)
         if not vids:
             return None
         vod_id = str(vids[0].get("id") or "").strip()
         if not vod_id:
+            return None
+        # A live stream's own VOD is unpublished until it ends, so the newest
+        # listed VOD while live is a PREVIOUS broadcast — refuse replay
+        # (frontend keeps the rail off) instead of playing yesterday's stream.
+        if is_vod_previous_broadcast(vids[0].get("created_at"), get_channel_stream_status_sync(login)):
+            logger.debug(
+                "twitch_archive_info(%r): VOD %s predates the live stream — no replay",
+                login, vod_id,
+            )
             return None
         master_url, headers, _variants = get_vod_playback_sync(vod_id)
         return {"url": master_url, "headers": headers, "vod_id": vod_id, "platform": "Twitch"}
@@ -272,6 +287,15 @@ def kick_archive_info(slug: str) -> Optional[dict]:
         vids = list_channel_videos_api(slug, limit=1)
         if not vids:
             return None
+        # ponytail: Kick could apply the same previous-broadcast guard as the
+        # Twitch branch — list_channel_videos_api items carry created_at and
+        # the channel API's livestream dict carries the stream start — but
+        # KickChannel does not expose started_at yet, and that lives in
+        # kick_models.py / kick_api_service.py (outside this task's file set).
+        # Until then the newest Kick VOD may replay a previous broadcast while
+        # the channel is live. Upgrade path: add started_at to KickChannel,
+        # then return None here when live and
+        # abs(vod.created_at - stream.started_at) > 300s.
         m3u8 = (vids[0].m3u8_url or "").strip()
         if not m3u8:
             return None
