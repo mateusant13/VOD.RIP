@@ -91,6 +91,17 @@ BEAM_ENV = "VODRIP_WHISPER_BEAM"
 BATCH_ENV = "VODRIP_WHISPER_BATCH"
 PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet CPU lane (whisper int8)
 PARAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"  # sherpa-onnx model cache override
+# Music/no-speech verdict for captionless YouTube ASR: below this fraction
+# of speech (speech_sec / total_sec) the audio is treated as instrumental
+# music — the video is marked transcript_kind='music' (job done, no ASR
+# run, never re-enqueued). Env-tunable.
+MUSIC_SPEECH_FRAC = float(os.environ.get("VODRIP_MUSIC_SPEECH_FRAC", "0.03"))
+# Re-check delay for a transcribe job whose caption question is still open
+# (no captions AND no captions_unavailable_at marker — the ingest leg is
+# extracting/retrying). Aligned with the scheduler's per-video YouTube
+# retry backoff (YOUTUBE_RETRY_BACKOFF_S) so the job re-checks at the same
+# cadence the ingest retry resolves.
+CAPTION_WAIT_RETRY_S = 3600.0
 
 # --- device / compute -----------------------------------------------------
 
@@ -2266,6 +2277,83 @@ def _transcribe_batch(
     return out
 
 
+def _transcribe_youtube_captionless(
+    video_id: str,
+    *,
+    language: Optional[str] = None,
+    progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
+    events_cb: Optional[Callable[..., Optional[dict]]] = None,
+) -> dict:
+    """ASR for a captionless YouTube video (archived metadata-only, no
+    local archive_path).
+
+    Downloads bestaudio at transcribe time via the app's yt-dlp session
+    (cookies + po_token — this machine sits behind the YouTube bot gate,
+    so the download must respect the gate), decodes, VADs and transcribes,
+    then deletes the temp audio. Music/no-speech is decided inside
+    _transcribe_audio_source (speech fraction below VODRIP_MUSIC_SPEECH_FRAC
+    -> transcript_kind='music', done, no ASR).
+
+    Download failures:
+      - bot-gate classified -> _YoutubeGateRequeue (caller requeues the
+        job, never fails — no retry storm),
+      - permanent (DRM / age-gated / deleted / private / geo-blocked) ->
+        videos.transcript_kind='blocked' (terminal — the scheduler never
+        re-enqueues) and a yt_dlp DownloadError with the real reason
+        (update_job treats DownloadError as terminal: no auto-retry),
+      - anything else propagates to the normal job retry machinery."""
+    t0 = time.monotonic()
+    outdir = Path(tempfile.mkdtemp(prefix=f"yt-transcribe-{video_id}-"))
+    try:
+        from services.archive_ytdlp import (
+            _is_gate_error,
+            _is_permanent_download_error,
+            download_bestaudio,
+        )
+
+        try:
+            path = download_bestaudio(video_id, outdir)
+        except Exception as exc:
+            # Permanent FIRST: an age-gate error ("Sign in to confirm your
+            # age") contains the IP-gate marker "sign in to confirm" — a
+            # per-video verdict must not be misread as the IP-level freeze.
+            if _is_permanent_download_error(exc):
+                archive_db.mark_video_transcript_kind("youtube", video_id, "blocked")
+                logger.warning(
+                    "youtube %s audio unavailable (terminal, marked blocked): %s",
+                    video_id, exc,
+                )
+                from yt_dlp.utils import DownloadError
+
+                raise DownloadError(
+                    f"youtube audio download failed permanently for {video_id}: {exc}"
+                ) from exc
+            if _is_gate_error(exc):
+                raise _YoutubeGateRequeue(str(exc)[:400]) from exc
+            raise
+        logger.info("youtube %s audio downloaded for ASR: %s", video_id, path)
+        if _should_shard(str(path)):
+            # Bounded-RAM path (same route as transcribe_video): decode ONCE
+            # into fixed-duration PCM shards and consume them one window at
+            # a time. The temp dir is removed in finally.
+            shard_dir = Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
+            try:
+                return _transcribe_audio_source(
+                    "youtube", video_id, str(path), language,
+                    progress_cb, events_cb, t0,
+                    sharded=True, shard_dir=shard_dir,
+                )
+            finally:
+                shutil.rmtree(shard_dir, ignore_errors=True)
+        return _transcribe_audio_source(
+            "youtube", video_id, str(path), language,
+            progress_cb, events_cb, t0,
+            sharded=False, shard_dir=None,
+        )
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
 def transcribe_video(
     platform: str,
     video_id: str,
@@ -2367,6 +2455,40 @@ def _transcribe_audio_source(
         total_sec, speech_sec, speech_sec / total_sec * 100 if total_sec else 0,
         dead_air_sec,
     )
+
+    # Music / no-speech verdict (captionless YouTube ASR only): an
+    # instrumental video has almost no speech — below
+    # VODRIP_MUSIC_SPEECH_FRAC of the runtime the ASR has nothing to hear
+    # (parakeet would emit no useful words on silence; music-with-lyrics
+    # still has speech and transcribes normally). Persist
+    # transcript_kind='music' so the scheduler never re-enqueues the video,
+    # and report done WITHOUT loading the model or writing a resume
+    # manifest.
+    if platform == "youtube" and total_sec > 0:
+        frac = speech_sec / total_sec
+        if frac < MUSIC_SPEECH_FRAC:
+            archive_db.mark_video_transcript_kind("youtube", video_id, "music")
+            wall = time.monotonic() - t0
+            stats = {
+                "platform": platform,
+                "video_id": video_id,
+                "total_sec": round(total_sec, 3),
+                "speech_sec": round(speech_sec, 3),
+                "dead_air_sec": round(dead_air_sec, 3),
+                "dead_air_pct": round(dead_air_pct, 1),
+                "speech_frac": round(frac, 4),
+                "segments": 0,
+                "words": 0,
+                "wall_sec": round(wall, 3),
+                "skipped": "music",
+            }
+            logger.info(
+                "transcribe youtube/%s marked music: %.1fs speech of %.1fs "
+                "(%.2f%% < %.1f%%) — no ASR",
+                video_id, speech_sec, total_sec, frac * 100,
+                MUSIC_SPEECH_FRAC * 100,
+            )
+            return stats
 
     # No-speech skip: less than 3 s of planned speech is noise — report it
     # WITHOUT loading the model and WITHOUT a resume manifest (nothing to
@@ -2812,27 +2934,59 @@ def _twin_transcribed_while_running(platform: str, video_id: str) -> bool:
     return archive_db.transcribed_on_higher_priority_platform(platform, video_id)
 
 
-def _captions_first_skip(platform: str, video_id: str) -> bool:
-    """True when a YouTube transcribe job must NOT run ASR (captions-first,
-    settings.yt_subtitles_first, default True).
+class _YoutubeGateRequeue(Exception):
+    """Raised by the captionless download when the YouTube bot gate arms
+    mid-download. _process_job requeues (never fails) so the job drains
+    once the freeze lifts — same contract as the claim-time gate check."""
 
-    YouTube transcripts come from captions, never from parakeet/whisper: a
-    video whose captions are ingested already has transcript rows, and a
-    captionless video is served by the caption re-ingest leg (the scheduler
-    never enqueues a NEW job for it, but a search/preview kick can leave a
-    stale one queued) — both resolve to 'done' here instead of spending ASR
-    work. Whisper still runs when the toggle is off (explicit user
-    override) or the platform isn't YouTube. ponytail: there is no
-    force-transcribe path (archive_jobs has no force flag) — add one there
-    if a job ever needs to bypass this.
+
+def _youtube_transcribe_verdict(
+    platform: str, video_id: str, *, subtitles_first: Optional[bool] = None
+) -> str:
+    """ASR decision for one YouTube transcribe job (non-YouTube -> 'run-asr').
+
+    Decision matrix (captions-first, settings.yt_subtitles_first, default
+    True):
+      'skip-captions' — captions-first ON and transcript rows exist: the
+          captions ARE the transcript — resolve the job done, never ASR.
+      'music'         — terminal VAD verdict (speech fraction below
+          VODRIP_MUSIC_SPEECH_FRAC): the video is instrumental — done,
+          never ASR, never re-enqueued.
+      'blocked'       — terminal download verdict (DRM/age-gated/deleted/
+          private): the audio can never be fetched — done, never ASR,
+          never re-enqueued.
+      'wait-caption'  — no captions AND no captions_unavailable_at marker:
+          the ingest leg is still extracting/retrying, so the caption
+          question is undetermined — requeue, never run ASR, never resolve
+          done. (The audio download would fail identically while the
+          extract fails.)
+      'run-asr'       — captions_unavailable_at marker set (permanent
+          caption unavailability -> ASR candidate) OR the subtitles_first
+          override is OFF (explicit user override: always ASR, captions
+          included).
+    ponytail: there is no force-transcribe path (archive_jobs has no force
+    flag) — add one there if a job ever needs to bypass this.
     """
     if platform != "youtube":
-        return False
-    from deps import settings_mgr  # lazy: archive_transcribe is opt-in by design
+        return "run-asr"
+    if subtitles_first is None:
+        try:
+            from deps import settings_mgr  # lazy: archive_transcribe is opt-in by design
 
-    if not getattr(settings_mgr.get(), "yt_subtitles_first", True):
-        return False
-    return True
+            subtitles_first = bool(getattr(settings_mgr.get(), "yt_subtitles_first", True))
+        except Exception:
+            subtitles_first = True
+    kind = archive_db.video_transcript_kind(platform, video_id) or ""
+    if kind == "music":
+        return "music"
+    if kind == "blocked":
+        return "blocked"
+    has_rows = bool(archive_db.transcript_for(platform, video_id))
+    if has_rows and subtitles_first:
+        return "skip-captions"
+    if not has_rows and archive_db.captions_unavailable_at(platform, video_id) is None:
+        return "wait-caption"
+    return "run-asr"
 
 
 def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
@@ -2920,18 +3074,70 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "requeued": "youtube-gate",
             }
 
-        if _captions_first_skip(platform, video_id):
-            logger.info(
-                "youtube %s/%s skipped — captions-first (captions are the transcript)",
-                platform, video_id,
-            )
-            archive_db.update_job(job_id, status="done", progress=1.0)
-            return {
-                "job_id": job_id,
-                "platform": platform,
-                "video_id": video_id,
-                "skipped": "captions-first",
-            }
+        if platform == "youtube":
+            verdict = _youtube_transcribe_verdict(platform, video_id)
+            if verdict == "skip-captions":
+                logger.info(
+                    "youtube %s/%s skipped — captions-first (captions are the transcript)",
+                    platform, video_id,
+                )
+                archive_db.update_job(job_id, status="done", progress=1.0)
+                return {
+                    "job_id": job_id,
+                    "platform": platform,
+                    "video_id": video_id,
+                    "skipped": "captions-first",
+                }
+            if verdict in ("music", "blocked"):
+                # Terminal verdicts (VAD music/no-speech or DRM-blocked):
+                # the video can never produce a useful ASR transcript —
+                # resolve done, no model load, no re-enqueue.
+                logger.info(
+                    "youtube %s/%s skipped — terminal transcript verdict (%s)",
+                    platform, video_id, verdict,
+                )
+                archive_db.update_job(job_id, status="done", progress=1.0)
+                return {
+                    "job_id": job_id,
+                    "platform": platform,
+                    "video_id": video_id,
+                    "skipped": verdict,
+                }
+            if verdict == "wait-caption":
+                # No captions AND no availability marker: the ingest leg is
+                # still extracting/retrying, so the caption question is
+                # undetermined. Requeue with a delay — never run ASR (the
+                # download would fail identically) and never resolve done —
+                # the job re-checks once the ingest retry resolves.
+                err = (
+                    "waiting for caption decision — no captions and no "
+                    f"availability verdict (retry in {int(CAPTION_WAIT_RETRY_S)}s)"
+                )
+                archive_db.execute(
+                    "UPDATE archive_jobs SET status='queued', error=?, updated_at=?, "
+                    "heartbeat=?, next_retry_at=? WHERE id=?",
+                    (
+                        err,
+                        _now_iso(),
+                        _now_iso(),
+                        (datetime.now(timezone.utc) + timedelta(seconds=CAPTION_WAIT_RETRY_S))
+                        .isoformat(timespec="seconds"),
+                        job_id,
+                    ),
+                )
+                logger.info(
+                    "youtube %s/%s requeued: waiting for caption decision",
+                    platform, video_id,
+                )
+                return {
+                    "job_id": job_id,
+                    "platform": platform,
+                    "video_id": video_id,
+                    "requeued": "waiting-caption",
+                }
+            # verdict == 'run-asr': captions_unavailable_at marker set
+            # (permanent caption unavailability -> ASR candidate) or the
+            # yt_subtitles_first override is OFF (always ASR).
 
         if archive_db.transcribed_on_higher_priority_platform(platform, video_id):
             # The same live/VOD exists on a higher-priority platform
@@ -2982,14 +3188,42 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         except Exception:
             pref = "parakeet"
         _engine_override_tls.engine = "whisper" if pref == "whisper" else None
-        try:
-            engine = _job_engine(resolved_lang)
-            try:
-                stats = transcribe_video(
-                    platform, video_id,
+
+        def _run_transcribe() -> dict:
+            if platform == "youtube":
+                # Captionless YouTube (no archive_path): download bestaudio
+                # at transcribe time via the app's yt-dlp session.
+                return _transcribe_youtube_captionless(
+                    video_id,
                     language=resolved_lang,
                     progress_cb=_progress, events_cb=events_cb,
                 )
+            return transcribe_video(
+                platform, video_id,
+                language=resolved_lang,
+                progress_cb=_progress, events_cb=events_cb,
+            )
+
+        try:
+            engine = _job_engine(resolved_lang)
+            try:
+                stats = _run_transcribe()
+            except _YoutubeGateRequeue as exc:
+                # The bot gate armed DURING the audio download (it was
+                # clear at claim time) — requeue, never fail: the freeze
+                # lifts with one probe and the job drains then.
+                archive_db.update_job(
+                    job_id, status="queued",
+                    error=f"youtube bot-gate cooldown active — requeued ({exc})"[:400],
+                )
+                logger.info(
+                    "youtube job %s requeued: bot-gate during audio download",
+                    job_id,
+                )
+                return {
+                    "job_id": job_id, "platform": platform, "video_id": video_id,
+                    "requeued": "youtube-gate",
+                }
             except Exception as exc:
                 # TASK9: whisper large-v3-turbo is the fallback when parakeet
                 # itself fails (decode error, recognizer crash) — retry the SAME
@@ -3006,11 +3240,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 )
                 _engine_override_tls.engine = "whisper"
                 try:
-                    stats = transcribe_video(
-                        platform, video_id,
-                        language=resolved_lang,
-                        progress_cb=_progress, events_cb=events_cb,
-                    )
+                    stats = _run_transcribe()
                 finally:
                     _engine_override_tls.engine = "whisper" if pref == "whisper" else None
         finally:

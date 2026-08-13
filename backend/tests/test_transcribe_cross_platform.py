@@ -170,6 +170,7 @@ def test_process_job_youtube_not_skipped_by_kick_mirror(monkeypatch):
     _seed_video("kick", "k8", "ck-ytjob")
     _seed_video("youtube", "y8", "ck-ytjob")
     _seed_transcript("kick", "k8")
+    archive_db.mark_captions_unavailable("youtube", "y8")
     job_id = _seed_job("youtube", "y8")
     # Toggle OFF so the captions-first skip does not preempt the dedupe
     # check: with whisper explicitly allowed on YouTube, the one-way rule
@@ -178,7 +179,7 @@ def test_process_job_youtube_not_skipped_by_kick_mirror(monkeypatch):
     # covered by test_higher_priority_never_skipped_by_lower).
     with patch("deps.settings_mgr") as mgr, \
          patch.object(
-        archive_transcribe, "transcribe_video",
+        archive_transcribe, "_transcribe_youtube_captionless",
         return_value={"segments": 1},
     ) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)

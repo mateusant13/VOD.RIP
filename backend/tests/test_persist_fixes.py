@@ -328,20 +328,28 @@ def _seed_ready_youtube(vid: str, path: pathlib.Path) -> None:
     })
 
 
-def test_scheduler_never_enqueues_new_youtube_transcribe_job(scratch_db, tmp_path):
-    """Captions-first policy: the scheduler must never CREATE a transcribe
-    job for a YouTube video — caption-covered videos already have transcript
-    rows (the SQL's NOT EXISTS) and captionless ones are served by the
-    caption re-ingest leg, not parakeet/whisper."""
+def test_scheduler_youtube_transcribe_job_requires_marker(scratch_db, tmp_path):
+    """Captions-first policy: the scheduler creates a YouTube transcribe job
+    ONLY when the video has NO transcript rows AND captions_unavailable_at
+    is set (permanent caption unavailability -> ASR candidate, audio
+    downloaded at transcribe time). Never while captions are pending."""
     media = tmp_path / "v.mp4"
     media.write_bytes(b"not really media")
     _seed_ready_youtube(_VID, media)
 
+    # No marker -> captions pending -> never created.
     archive_scheduler._enqueue_transcriptions()
-
     assert archive_db.latest_job("youtube", _VID, kind="transcribe") is None, (
-        "YouTube must never get a NEW parakeet transcribe job"
+        "no captions + no marker must never create a transcribe job"
     )
+
+    # Marker set -> ASR candidate -> created with the stable job id.
+    archive_db.mark_captions_unavailable("youtube", _VID)
+    archive_scheduler._enqueue_transcriptions()
+    job = archive_db.latest_job("youtube", _VID, kind="transcribe")
+    assert job is not None, "captions_unavailable_at + no transcripts -> ASR job"
+    assert job["id"] == f"transcribe-youtube-{_VID}", "stable job id"
+    assert job["status"] == "queued"
 
 
 def test_scheduler_still_enqueues_twitch_transcribe_job(scratch_db, tmp_path):

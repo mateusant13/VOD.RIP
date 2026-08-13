@@ -904,6 +904,83 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     return report
 
 
+# --- transcribe-time audio download ----------------------------------------
+
+def download_bestaudio(video_id: str, outdir: Path) -> Path:
+    """Download the best audio track of one video into outdir.
+
+    Reuses the app's YouTube auth conditioning (cookies + po_token +
+    visitor_data, anonymous bootstrap fallback) and the bot-gate-aware
+    guard: a gate/rate-limit failure arms the process-wide cooldown
+    (services.yt_gate) and propagates so the transcribe worker requeues
+    the job instead of failing it. Returns the downloaded media file
+    (webm/m4a — decode_audio handles either)."""
+    from services.ytdlp_guard import guarded_youtube_dl
+
+    url = _video_url(video_id)
+    opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "outtmpl": str(outdir / "%(id)s.%(ext)s"),
+        **_ytdlp_engine_opts(),
+    }
+    _apply_youtube_session(opts, video_id=video_id)
+    try:
+        with guarded_youtube_dl(opts) as ydl:
+            ydl.extract_info(url, download=True)
+    except Exception as exc:
+        from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
+
+        if classify_youtube_gate_error(exc) or _is_gate_error(exc):
+            note_youtube_gate(str(exc)[:200])
+        raise
+    files = [f for f in outdir.iterdir() if f.is_file()]
+    if not files:
+        raise RuntimeError(f"yt-dlp produced no audio for {video_id}")
+    return max(files, key=lambda f: f.stat().st_size)
+
+
+def _is_permanent_download_error(exc: BaseException) -> bool:
+    """True when the audio download failure can never resolve.
+
+    DRM-protected, age-gated, deleted, private and geo-blocked videos
+    return the same error on every attempt — retrying them only hammers
+    YouTube. The worker marks such videos transcript_kind='blocked'
+    (terminal) instead of letting the retry machinery re-enqueue forever.
+    Gate markers ('not a bot' etc.) are NOT permanent — the caller checks
+    those first. Transient network errors are not listed either: they flow
+    through the normal backoff."""
+    msg = (str(exc) or "").lower()
+    return any(
+        m in msg
+        for m in (
+            "drm",
+            "protected by drm",
+            "sign in to confirm your age",
+            "age-restricted",
+            "age restricted",
+            "confirm your age",
+            "this video is unavailable",
+            "video unavailable",
+            "this video is private",
+            "private video",
+            "has been removed",
+            "was removed",
+            "removed by the uploader",
+            "not available in your country",
+            "geo-restricted",
+            "geo blocked",
+            "geo-blocked",
+            "playback on other websites",
+            "members-only",
+            "premium content",
+        )
+    )
+
+
 def backfill_live_chat(video_id: str) -> dict:
     """Retro chat-only backfill for one already-ingested YouTube video.
 

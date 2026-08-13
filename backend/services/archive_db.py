@@ -359,6 +359,7 @@ def get_conn() -> sqlite3.Connection:
             _ensure_channel_language_column(_conn)
             _ensure_original_columns(_conn)
             _ensure_captions_unavailable_column(_conn)
+            _ensure_transcript_kind_column(_conn)
             _ensure_original_failed_column(_conn)
             _ensure_lang_column(_conn)
             _ensure_spam_column(_conn)
@@ -547,6 +548,20 @@ def _ensure_captions_unavailable_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
     if "captions_unavailable_at" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN captions_unavailable_at TEXT")
+
+
+def _ensure_transcript_kind_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.transcript_kind (terminal ASR verdict).
+
+    Persists the music/no-speech verdict (a captionless YouTube ASR run
+    whose VAD speech fraction fell below VODRIP_MUSIC_SPEECH_FRAC) and the
+    blocked verdict (permanent audio-download failure — DRM/age-gated/
+    deleted/private) so the scheduler never re-enqueues a video that can
+    never produce a useful transcript. Plain nullable TEXT column — same
+    pattern as _ensure_captions_unavailable_column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "transcript_kind" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN transcript_kind TEXT")
 
 
 def _ensure_original_failed_column(conn: sqlite3.Connection) -> None:
@@ -2587,12 +2602,13 @@ def worker_heartbeat_age(tag: str) -> Optional[float]:
 def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:
     """True when YouTube captions already cover the video (captions-first on).
 
-    The ingest-side sibling of archive_transcribe._captions_first_skip (the
-    worker skip no longer checks rows — YouTube never runs ASR when
-    captions-first is on): this helper keeps requiring actual transcript
-    rows because it drives the re-extract decision — a captionless video
-    must stay a re-ingest candidate. The subtitles_first override lets
-    tests probe the helper without the settings singleton."""
+    The ingest-side sibling of the worker's captions-first skip
+    (archive_transcribe._youtube_transcribe_verdict): it requires actual
+    transcript rows because it drives the re-extract decision — a
+    captionless video must stay a re-ingest candidate even while the worker
+    treats a captions_unavailable_at-stamped video as an ASR candidate.
+    The subtitles_first override lets tests probe the helper without the
+    settings singleton."""
     if platform != "youtube":
         return False
     if subtitles_first is None:
@@ -2639,6 +2655,30 @@ def captions_unavailable_at(platform: str, video_id: str) -> Optional[str]:
         (platform, video_id),
     )
     return row[0]["captions_unavailable_at"] if row else None
+
+
+def mark_video_transcript_kind(platform: str, video_id: str, kind: str) -> None:
+    """Persist a terminal transcript verdict on the video row.
+
+    'music' — VAD found (almost) no speech in the captionless-YouTube ASR
+    run (instrumental video): the job resolved done without running the
+    model and the scheduler never re-enqueues. 'blocked' — the audio can
+    never be downloaded (DRM / age-gated / deleted / private): the job
+    failed with the real reason and the scheduler never re-enqueues.
+    No row (platform+video_id absent) writes nothing."""
+    execute(
+        "UPDATE videos SET transcript_kind = ? WHERE platform = ? AND video_id = ?",
+        (kind, platform, video_id),
+    )
+
+
+def video_transcript_kind(platform: str, video_id: str) -> Optional[str]:
+    """Stored terminal transcript verdict ('music' | 'blocked') or None."""
+    row = query(
+        "SELECT transcript_kind FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return row[0]["transcript_kind"] if row else None
 
 
 def optimize_fts() -> None:
