@@ -34,6 +34,7 @@ from routers import (
     info,
     live,
     preview,
+    previews,
     settings,
     subtitles,
     system,
@@ -945,6 +946,7 @@ if static_dir.exists():
 # Include routers
 app.include_router(settings.router)
 app.include_router(preview.router)
+app.include_router(previews.router)
 app.include_router(channels.router)
 app.include_router(info.router)
 app.include_router(live.router)

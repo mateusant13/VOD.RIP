@@ -567,6 +567,15 @@ def _run_pass() -> None:
         _ingest_twitch(ch)
         _ingest_kick(ch)
         _ingest_youtube(ch)
+    # Instant previews (first 6s of each channel's newest VOD, one platform
+    # per channel) — kicked on a background thread so a download never blocks
+    # this pass; a channel add/edit (kick_scheduler_pass) also refreshes it.
+    try:
+        from services.instant_preview import refresh_async
+
+        refresh_async(channels)
+    except Exception:  # noqa: BLE001 — the kick must never break a pass
+        logger.debug("instant preview kick failed", exc_info=True)
     _backfill_twitch_chat(channels)
     _backfill_youtube_chat()
     _backfill_original_titles(channels)
