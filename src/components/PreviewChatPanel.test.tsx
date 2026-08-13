@@ -303,6 +303,24 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy()); // cached, no refetch
   });
 
+  it('controlled mode: host owns open state, no collapsed strip, collapse reports out', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onOpenChange = vi.fn();
+    const { rerender } = render(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} open={false} onOpenChange={onOpenChange} />,
+    );
+    // Host-owned open: the collapsed side strip never renders (the explore
+    // mini preview opens chat from its own button next to 'Search this video').
+    expect(document.querySelector('[data-preview-chat-panel-collapsed]')).toBeNull();
+    // Host flips the prop → panel renders without internal state.
+    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} open onOpenChange={onOpenChange} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    // Collapse button reports the close intent to the host instead of
+    // closing itself.
+    fireEvent.click(screen.getByTitle('Collapse panel'));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it('retries after a fetch error', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD, 200, () => true); // always fail
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);

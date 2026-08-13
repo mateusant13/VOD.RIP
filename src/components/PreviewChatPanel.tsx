@@ -168,6 +168,13 @@ interface PreviewChatPanelProps {
    *  so the mini preview stays player-sized by default; the main preview
    *  keeps the panel open. */
   defaultOpen?: boolean;
+  /** Controlled mode: when `open` is provided the HOST owns the open state
+   *  (changes flow out via onOpenChange) and the collapsed side strip is NOT
+   *  rendered — the host shows its own toggle button instead. Used by the
+   *  explore mini preview, whose chat opens from a button next to
+   *  'Search this video'. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   /** Cap on the rendered width. The host reserves player space so the video
    *  never drops below its layout minimum; below PANEL_MIN_W there is no room
    *  at all and the panel collapses to zero width (no strip). Defaults to the
@@ -382,9 +389,17 @@ export function PreviewChatPanel({
   maxWidth: maxWidthProp,
   onLayoutChange,
   onMarkersChange,
+  open: controlledOpen,
+  onOpenChange,
 }: PreviewChatPanelProps) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(defaultOpen);
+  const controlled = controlledOpen !== undefined;
+  const [internalOpen, setInternalOpen] = useState(defaultOpen);
+  const open = controlled ? controlledOpen : internalOpen;
+  const changeOpen = useCallback((v: boolean) => {
+    if (controlled) onOpenChange?.(v);
+    else setInternalOpen(v);
+  }, [controlled, onOpenChange]);
   const [tab, setTab] = useState<PreviewPanelTab>('chat');
   const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
   /** Start/end chat markers (green/red). One pair per surface — the host
@@ -806,7 +821,7 @@ export function PreviewChatPanel({
   // ── Self-contained width resize (rAF + pointer capture + direct writes) ---
   const widthCap = Math.min(PANEL_MAX_W, maxWidthProp ?? PANEL_MAX_W);
   const spaceForced = open && widthCap < PANEL_MIN_W;
-  const renderedW = spaceForced ? 0 : open ? Math.min(width, widthCap) : PANEL_STRIP_W;
+  const renderedW = spaceForced ? 0 : open ? Math.min(width, widthCap) : controlled ? 0 : PANEL_STRIP_W;
   const widthRef = useRef(renderedW);
   widthRef.current = renderedW;
 
@@ -876,6 +891,7 @@ export function PreviewChatPanel({
       style={spaceForced ? { width: 0 } : open ? { width: renderedW } : undefined}
     >
       {spaceForced ? null : !open ? (
+        controlled ? null : (
         <button
           type="button"
           data-preview-chat-panel-collapsed
@@ -886,7 +902,7 @@ export function PreviewChatPanel({
             // row under the playhead.
             prevActiveIdxRef.current = null;
             setFollow(true);
-            setOpen(true);
+            changeOpen(true);
           }}
           className="w-7 h-full flex flex-col items-center justify-center gap-1.5 border-l-2 border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-white hover:bg-zinc-900"
           title={subtitlesOnly ? t('Open preview subtitles') : t('Open preview chat panel')}
@@ -896,6 +912,7 @@ export function PreviewChatPanel({
             {subtitlesOnly ? t('Subs') : t('Chat')}
           </span>
         </button>
+        )
       ) : (
         <div className="relative h-full flex flex-col bg-zinc-950 border-l-2 border-zinc-800 min-w-0">
           <div
@@ -953,7 +970,7 @@ export function PreviewChatPanel({
             )}
             <button
               type="button"
-              onClick={() => setOpen(false)}
+              onClick={() => changeOpen(false)}
               className="text-zinc-500 hover:text-white p-1"
               title={t('Collapse panel')}
             >

@@ -4,7 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, Download, Loader2, RefreshCw, Search, AlertCircle } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, Download, Loader2, RefreshCw, Search, AlertCircle, MessageSquare } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
@@ -231,6 +231,9 @@ export default function ChannelExplorePopup({
   const [error, setError] = useState<string | null>(null);
   /** Docked archive-search panel (SEARCH THIS VIDEO) inside this popup. */
   const [archiveSearchOpen, setArchiveSearchOpen] = useState(false);
+  /** Chat column open state — host-controlled (button next to Search), so
+   *  the panel renders no collapsed side strip. */
+  const [chatOpen, setChatOpen] = useState(false);
   // Per-media preview retry: which single media failed + how many retries
   // already failed, so the overlay's RETRY button escalates stage → full.
   const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
@@ -1758,6 +1761,20 @@ export default function ChannelExplorePopup({
               )}
               <button
                 type="button"
+                onClick={() => setChatOpen((o) => !o)}
+                aria-pressed={chatOpen}
+                title={chatOpen ? t('Close preview chat panel') : t('Open preview chat panel')}
+                className={`flex items-center gap-1 border px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                  chatOpen
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 text-zinc-400 hover:text-white hover:border-white'
+                }`}
+              >
+                <MessageSquare size={10} className="shrink-0" />
+                {chatOpen ? t('Close chat') : t('Chat')}
+              </button>
+              <button
+                type="button"
                 onClick={() => onClose()}
                 className="text-zinc-500 hover:text-white p-0.5 shrink-0"
                 title={t('Close player')}
@@ -1984,7 +2001,10 @@ export default function ChannelExplorePopup({
               currentTime={currentTime}
               // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
               channel={vod.channel}
-              defaultOpen={false}
+              // Host-controlled: opens from the Chat button next to Search
+              // this video (no collapsed side strip).
+              open={chatOpen}
+              onOpenChange={setChatOpen}
               // Click-to-seek: rows/caption seek this popup's own player
               // (seekVideo clamps to the effective duration and no-ops
               // until ready).
