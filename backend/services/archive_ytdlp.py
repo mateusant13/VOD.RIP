@@ -844,6 +844,16 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
             # next attempt by CAPTIONS_UNAVAILABLE_FRESH_S.
             if report["transcript_segments"] > 0:
                 _db_write(archive_db.clear_captions_unavailable, PLATFORM, video_id)
+                # Race: a transcribe job may have been queued before the
+                # captions landed (search/preview kick, an earlier scheduler
+                # pass). Captions now serve as the transcript — resolve the
+                # job as done so no ASR work is spent on the video.
+                _db_write(
+                    archive_db.execute,
+                    "UPDATE archive_jobs SET status='done', progress=1.0 "
+                    "WHERE id=? AND status IN ('queued','running')",
+                    (f"transcribe-youtube-{video_id}",),
+                )
             else:
                 _db_write(archive_db.mark_captions_unavailable, PLATFORM, video_id)
 

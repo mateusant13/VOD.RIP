@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -170,10 +171,17 @@ def test_process_job_youtube_not_skipped_by_kick_mirror(monkeypatch):
     _seed_video("youtube", "y8", "ck-ytjob")
     _seed_transcript("kick", "k8")
     job_id = _seed_job("youtube", "y8")
-    with patch.object(
+    # Toggle OFF so the captions-first skip does not preempt the dedupe
+    # check: with whisper explicitly allowed on YouTube, the one-way rule
+    # must still hold — a lower-priority kick mirror never blocks a YouTube
+    # job (the DB-level transcribed_on_higher_priority_platform guard is
+    # covered by test_higher_priority_never_skipped_by_lower).
+    with patch("deps.settings_mgr") as mgr, \
+         patch.object(
         archive_transcribe, "transcribe_video",
         return_value={"segments": 1},
     ) as tv:
+        mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)
         stats = archive_transcribe._process_job(
             {"id": job_id, "platform": "youtube", "video_id": "y8"}
         )

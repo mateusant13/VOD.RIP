@@ -101,21 +101,18 @@ def _job_status(job_id: str) -> str:
     return rows[0]["status"] if rows else None
 
 
-def _caption_rows(_platform: str, video_id: str) -> list[dict]:
-    return [{"seg_idx": 0, "text": "Não sei."}]
-
-
 def test_captions_first_skips_whisper_when_captions_exist(monkeypatch):
     """Toggle on + youtube + non-empty transcripts -> job done, whisper never runs."""
+    archive_db.insert_transcript("youtube", "vid1", [
+        {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "Não sei."},
+    ])
     job_id = _seed_job("youtube", "vid1")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_db, "transcript_for", side_effect=_caption_rows) as tf, \
          patch.object(archive_transcribe, "transcribe_video",
                       side_effect=AssertionError("whisper must not run")) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=True)
         stats = archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid1"})
     assert stats["skipped"] == "captions-first"
-    tf.assert_called_once_with("youtube", "vid1")
     tv.assert_not_called()
     assert _job_status(job_id) == "done"
 
@@ -123,7 +120,6 @@ def test_captions_first_skips_whisper_when_captions_exist(monkeypatch):
 def test_captions_first_toggle_off_runs_whisper(monkeypatch):
     job_id = _seed_job("youtube", "vid2")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_db, "transcript_for", side_effect=_caption_rows), \
          patch.object(archive_transcribe, "transcribe_video",
                       return_value={"segments": 1}) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)
@@ -135,15 +131,17 @@ def test_captions_first_toggle_off_runs_whisper(monkeypatch):
 
 def test_missing_archive_file_skips_gracefully(monkeypatch):
     """FileNotFoundError (archive file evicted) -> failed job + skipped marker,
-    no traceback-level error and nothing propagates out of _process_job."""
-    job_id = _seed_job("youtube", "vid-missing")
+    no traceback-level error and nothing propagates out of _process_job.
+    Runs on Twitch: YouTube never reaches transcribe_video (captions-first
+    skip fires first)."""
+    job_id = _seed_job("twitch", "vid-missing")
     with patch.object(
         archive_transcribe, "transcribe_video",
         side_effect=FileNotFoundError(
-            f"archive file missing for youtube/vid-missing: {job_id}"),
+            f"archive file missing for twitch/vid-missing: {job_id}"),
     ) as tv:
         stats = archive_transcribe._process_job(
-            {"id": job_id, "platform": "youtube", "video_id": "vid-missing"})
+            {"id": job_id, "platform": "twitch", "video_id": "vid-missing"})
     assert stats["skipped"] == "archive-file-missing"
     tv.assert_called_once()
     assert _job_status(job_id) == "failed"
@@ -153,7 +151,6 @@ def test_captions_first_defaults_on_when_setting_absent(monkeypatch):
     """Old settings objects lack yt_subtitles_first -> treated as True."""
     job_id = _seed_job("youtube", "vid3")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_db, "transcript_for", return_value=[{"seg_idx": 0}]), \
          patch.object(archive_transcribe, "transcribe_video",
                       side_effect=AssertionError("whisper must not run")) as tv:
         mgr.get.return_value = SimpleNamespace()
@@ -175,16 +172,19 @@ def test_captions_first_non_youtube_still_transcribes(monkeypatch):
     assert _job_status(job_id) == "done"
 
 
-def test_captions_first_no_captions_still_transcribes(monkeypatch):
+def test_captions_first_no_captions_skips_whisper(monkeypatch):
+    """Toggle on + youtube + NO caption rows -> job done, whisper never runs:
+    a captionless YouTube video is served by the caption re-ingest leg, not
+    by parakeet/whisper."""
     job_id = _seed_job("youtube", "vid5")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_db, "transcript_for", return_value=[]) as tf, \
          patch.object(archive_transcribe, "transcribe_video",
-                      return_value={"segments": 1}) as tv:
+                      side_effect=AssertionError("whisper must not run")) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=True)
-        archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid5"})
-    tf.assert_called_once_with("youtube", "vid5")
-    tv.assert_called_once()
+        stats = archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid5"})
+    assert stats["skipped"] == "captions-first"
+    tv.assert_not_called()
+    assert _job_status(job_id) == "done"
 
 
 # --- caption fetch format fallback + parsing -------------------------------

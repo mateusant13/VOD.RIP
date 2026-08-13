@@ -328,6 +328,76 @@ def _seed_ready_youtube(vid: str, path: pathlib.Path) -> None:
     })
 
 
+def test_scheduler_never_enqueues_new_youtube_transcribe_job(scratch_db, tmp_path):
+    """Captions-first policy: the scheduler must never CREATE a transcribe
+    job for a YouTube video — caption-covered videos already have transcript
+    rows (the SQL's NOT EXISTS) and captionless ones are served by the
+    caption re-ingest leg, not parakeet/whisper."""
+    media = tmp_path / "v.mp4"
+    media.write_bytes(b"not really media")
+    _seed_ready_youtube(_VID, media)
+
+    archive_scheduler._enqueue_transcriptions()
+
+    assert archive_db.latest_job("youtube", _VID, kind="transcribe") is None, (
+        "YouTube must never get a NEW parakeet transcribe job"
+    )
+
+
+def test_scheduler_still_enqueues_twitch_transcribe_job(scratch_db, tmp_path):
+    """Twitch/Kick ASR stays unchanged: a ready Twitch VOD without
+    transcripts still gets a transcribe job from the scheduler."""
+    media = tmp_path / "tw.mp4"
+    media.write_bytes(b"not really media")
+    archive_db.upsert_video({
+        "platform": "twitch",
+        "video_id": "tw-vid-0001",
+        "channel": "chan",
+        "title": "t",
+        "kind": "vod",
+        "status": "ready",
+        "archive_path": str(media),
+        "duration_sec": 120.0,
+    })
+
+    archive_scheduler._enqueue_transcriptions()
+
+    job = archive_db.latest_job("twitch", "tw-vid-0001", kind="transcribe")
+    assert job is not None, "Twitch must still get ASR jobs"
+    assert job["id"] == "transcribe-twitch-tw-vid-0001", "stable job id"
+    assert job["status"] == "queued"
+
+
+def test_caption_ingest_flips_queued_transcribe_job_to_done(scratch_db, monkeypatch):
+    """Race: a transcribe job queued before the captions land is resolved to
+    done the moment ingest_video stores caption segments — no ASR work is
+    ever spent on the video."""
+    archive_db.upsert_video({
+        "platform": "youtube",
+        "video_id": _VID,
+        "channel": "chan",
+        "title": "t",
+        "kind": "vod",
+    })
+    job_id = f"transcribe-youtube-{_VID}"
+    archive_db.enqueue_job(job_id, "transcribe", "youtube", _VID, priority=0)
+    assert archive_db.latest_job("youtube", _VID, kind="transcribe")["status"] == "queued"
+
+    monkeypatch.setattr(
+        archive_ytdlp, "_guarded_youtube_dl", _fake_guarded_ydl(_ingest_info())
+    )
+    monkeypatch.setattr(
+        archive_ytdlp, "_fetch_captions",
+        lambda ydl, info, family=None: [("pt", "vtt", _VTT_WITH_CUE)],
+    )
+    report = archive_ytdlp.ingest_video(_VID)
+    assert report["transcript_segments"] > 0, "captions must have been stored"
+    job = archive_db.latest_job("youtube", _VID, kind="transcribe")
+    assert job is not None and job["status"] == "done", (
+        "queued transcribe job must flip to done when captions land"
+    )
+
+
 def test_stale_failed_transcribe_job_requeued(scratch_db, tmp_path):
     media = tmp_path / "v.mp4"
     media.write_bytes(b"not really media")
