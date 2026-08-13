@@ -44,6 +44,7 @@ import {
   liveChatSlugFromUrl,
   livePanelSizeFromAspect,
   parsePlaylistTotalSec,
+  qualityLevelForPolicy,
   replaySeekTarget,
   type LivePanelAspectClamp,
 } from '../livePlayerLevels';
@@ -139,6 +140,47 @@ const LIVE_BACK_BUFFER_SEC = 30;
 /** Never land the back-buffer arrow seek ON the live edge — stay a hair below
  *  it (hls.js's own sync target rides ~liveSyncDuration behind the edge). */
 const LIVE_EDGE_SEEK_SAFETY_SEC = 0.75;
+
+// ---------------------------------------------------------------------------
+// Live quality policy registry (module-scope — ponytail: a plain counter +
+// subscriber Set, no store dependency; the whole policy is one number).
+//
+// Every open live popup registers on mount and unregisters on unmount. The
+// count drives each player's fixed quality (see qualityLevelForPolicy):
+// ONE player → SOURCE (highest quality); MULTIPLE players → the ≤480p ladder.
+// Subscribers are notified with the NEW count on every register/unregister so
+// ALL registered players re-apply their policy immediately — opening a second
+// live caps every player, closing one restores the rest to source.
+// ---------------------------------------------------------------------------
+const liveQualitySubscribers = new Set<(count: number) => void>();
+let liveQualityCount = 0;
+
+/** Register a live player; returns the unregister function. The subscriber
+ *  fires synchronously on register (count includes this player). */
+export function registerLivePlayer(subscriber: (count: number) => void): () => void {
+  liveQualitySubscribers.add(subscriber);
+  liveQualityCount += 1;
+  for (const sub of liveQualitySubscribers) sub(liveQualityCount);
+  return () => {
+    // Idempotent: a second unregister (StrictMode cleanup double-invoke,
+    // defensive consumer calls) must not decrement again — the count drives
+    // every other player's quality.
+    if (!liveQualitySubscribers.delete(subscriber)) return;
+    liveQualityCount = Math.max(0, liveQualityCount - 1);
+    for (const sub of liveQualitySubscribers) sub(liveQualityCount);
+  };
+}
+
+/** Current number of registered live players — the policy's multi input. */
+export function liveQualityCountNow(): number {
+  return liveQualityCount;
+}
+
+/** Test hook — reset the module-level registry between tests. */
+export function __resetLivePlayerRegistryForTests(): void {
+  liveQualitySubscribers.clear();
+  liveQualityCount = 0;
+}
 
 export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
   const { t } = useI18n();
@@ -347,6 +389,29 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     setQualityMenuOpen(false);
   }, []);
 
+  // Live quality policy — apply the FIXED level the open-player count demands
+  // (single → SOURCE, multiple → ≤480p ladder). Runs on MANIFEST_PARSED and on
+  // every registry count change. A pinned currentLevel disables ABR: hls.js's
+  // autoLevelEnabled is a getter-only (manualLevel !== -1 ⇒ false) — assigning
+  // it directly would throw in strict mode, and it stays off for the session
+  // (the hls instance is destroyed on unmount, so there is no auto-level state
+  // to restore). The quality menu can still override — the next count change
+  // re-applies the policy on top.
+  const applyQualityPolicy = useCallback(() => {
+    const hls = hlsRef.current;
+    if (!hls || modeRef.current !== 'live' || !hls.levels || hls.levels.length === 0) return;
+    const multi = liveQualityCountNow() > 1;
+    const idx = qualityLevelForPolicy(hls.levels, multi);
+    if (idx < 0) return;
+    hls.currentLevel = idx;
+    setCurrentLevel(idx);
+  }, []);
+
+  // Registry membership: register on mount (notifies every player — this one
+  // no-ops until its manifest parses), unregister on unmount (reverts the
+  // remaining players to their policy for the lower count).
+  useEffect(() => registerLivePlayer(() => { applyQualityPolicy(); }), [applyQualityPolicy]);
+
   // vaft midroll rotation: after repeated stitched segments the backend swaps
   // this session's usher master to the next player type in place — reloading
   // the same proxied URL serves the rotated stream. Failure = keep stripping.
@@ -485,7 +550,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     setRetryTick((t) => t + 1);
   }, []);
 
-  /** Create an hls.js instance for *src*; live mode defaults 360p after parse. */
+  /** Create an hls.js instance for *src*; live mode applies the quality policy after parse. */
   const createHlsPlayer = useCallback(async (src: string, startPos: number): Promise<any | null> => {
     const video = videoRef.current;
     if (!video) return null;
@@ -526,7 +591,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // startLevel: 0 = the LOWEST manifest level — hls.js 1.6.2 sorts levels
     // ascending (dist/hls.mjs: "sort levels from lowest to highest"), so
     // index 0 is the smallest fragment → fastest first frame. MANIFEST_PARSED
-    // then moves loadLevel to the policy default (closest to 360p).
+    // then pins currentLevel to the quality policy (SOURCE alone, ≤480p ladder
+    // with multiple open players) — see applyQualityPolicy.
     const hls = new Hls({
       ...twitchAdBlockHlsConfig({ live: true, onAdRotation }),
       enableWorker: true,
@@ -586,11 +652,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         // to source (highest manifest level — may exceed 1080p); YouTube live
         // offers exactly the policy ladder 360/720/1080, or 360-only when the
         // session is anonymous (no user cookies).
-        // Default stays the level closest to 360, set AFTER MANIFEST_PARSED
-        // (config startLevel: 0 already picked the lowest level for the first
-        // fragment; loadLevel governs everything from here on).
+        // The MENU offers the filterLiveLevels set (YouTube allowHeights
+        // policy, 360 floor) while PLAYBACK pins the open-player-count policy:
+        // one popup → SOURCE (highest bitrate), several → ≤480p ladder
+        // (see qualityLevelForPolicy). startLevel: 0 already picked the lowest
+        // level for the first fragment; the policy is a fixed currentLevel
+        // (autoLevelEnabled off) from here on.
         const isYoutube = sessionPlatformRef.current === 'youtube';
-        const { levels: filtered, defaultIndex } = filterLiveLevels(
+        const { levels: filtered } = filterLiveLevels(
           hls.levels.map((l, i) => ({
             index: i,
             height: l.height || 0,
@@ -608,10 +677,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           label: l.height > 0 ? `${l.height}p` : 'Auto',
           height: l.height,
         })));
-        if (defaultIndex >= 0 && defaultIndex < hls.levels.length) {
-          hls.loadLevel = defaultIndex;
-          setCurrentLevel(defaultIndex);
-        }
+        applyQualityPolicy();
       } else {
         // REPLAY: single-level ENDLIST snapshot — hls.js reports the duration.
         if (Number.isFinite(video.duration)) {
@@ -686,7 +752,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, applyQualityPolicy]);
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
