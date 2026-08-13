@@ -83,7 +83,7 @@ import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
-import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, previewPlayerColumnWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
+import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, previewPlayerColumnWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, repairInconsistentPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
@@ -791,28 +791,40 @@ export default function App() {
       livePanelWidth: pl.livePanelWidth ?? fallback.livePanelWidth,
       owned: pl.owned,
     });
+    // Repair VERY inconsistent rows persisted by the pre-fix persist bug
+    // (squeezed runtime widths saved as the preferred widths) — same guard as
+    // loadPanelLayout, so the backend-synced layout heals at boot too.
+    const repaired = repairInconsistentPanelLayout(healed);
     // Preferred (dragged) widths are restored from storage as-is, within hard caps.
     // Runtime viewport clamps happen via effectiveLayoutFromPreferred each render.
     // No localStorage write here — the user's stored preferred widths must survive.
-    previewPanelWidthRef.current = healed.previewPanelWidth;
-    urlAsidePanelSizeRef.current = healed.urlAside;
-    mainPanelSizeRef.current = healed.main;
-    setPreviewPanelWidth(healed.previewPanelWidth);
-    setUrlAsidePanelSize(healed.urlAside);
-    setMainPanelSize(healed.main);
-    preferredDragRef.current = { ...healed.owned };
+    previewPanelWidthRef.current = repaired.previewPanelWidth;
+    urlAsidePanelSizeRef.current = repaired.urlAside;
+    mainPanelSizeRef.current = repaired.main;
+    setPreviewPanelWidth(repaired.previewPanelWidth);
+    setUrlAsidePanelSize(repaired.urlAside);
+    setMainPanelSize(repaired.main);
+    preferredDragRef.current = userOwnedWidthsFrom(repaired);
     ownedPanelHeightRef.current = {
-      urlAside: ownedPanelHeightSeed('urlAside', healed.urlAside.w, healed.urlAside.h),
-      main: ownedPanelHeightSeed('main', healed.main.w, healed.main.h),
+      urlAside: ownedPanelHeightSeed('urlAside', repaired.urlAside.w, repaired.urlAside.h),
+      main: ownedPanelHeightSeed('main', repaired.main.w, repaired.main.h),
     };
   }, []);
 
-  const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => ({
-    previewPanelWidth: previewPanelWidthRef.current,
-    urlAside: { ...urlAsidePanelSizeRef.current },
-    main: { ...mainPanelSizeRef.current },
-    owned: { ...preferredDragRef.current },
-  }), []);
+  // Persist the USER-PREFERRED widths (preferredDragRef), never the runtime
+  // row: preview-open sibling squeezes and small-viewport clamps live only in
+  // the runtime layer (state/refs) and must not be saved as the visual
+  // widths — otherwise a squeezed close loads squeezed on the next boot.
+  // Heights stay runtime as today (viewport-coupled by design).
+  const readCurrentPanelLayout = useCallback((): PersistedPanelLayout => {
+    const preferred = preferredDragRef.current;
+    return {
+      previewPanelWidth: preferred.preview,
+      urlAside: { w: preferred.urlAside, h: urlAsidePanelSizeRef.current.h },
+      main: { w: preferred.main, h: mainPanelSizeRef.current.h },
+      owned: { ...preferred },
+    };
+  }, []);
 
   const flushPanelLayoutToBackend = useCallback(() => {
     if (!panelLayoutPersistReadyRef.current) return;
@@ -857,11 +869,16 @@ export default function App() {
   // preferred widths.
   useEffect(() => {
     if (!panelLayoutPersistReadyRef.current) return;
+    // Write the user-preferred widths, not the runtime visual widths — the
+    // runtime row carries preview-open squeezes and viewport clamps that must
+    // never be persisted as the restore shape (see readCurrentPanelLayout).
+    // Heights stay runtime as today (viewport-coupled; F2 close-restore).
+    const preferred = preferredDragRef.current;
     persistPanelLayout({
-      previewPanelWidth,
-      urlAside: urlAsidePanelSize,
-      main: mainPanelSize,
-      owned: { ...preferredDragRef.current },
+      previewPanelWidth: preferred.preview,
+      urlAside: { w: preferred.urlAside, h: urlAsidePanelSize.h },
+      main: { w: preferred.main, h: mainPanelSize.h },
+      owned: { ...preferred },
     });
     if (panelLayoutSaveTimerRef.current) {
       window.clearTimeout(panelLayoutSaveTimerRef.current);

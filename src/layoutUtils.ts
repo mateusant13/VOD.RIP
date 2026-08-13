@@ -909,6 +909,62 @@ export function healSqueezedPanelLayout(
     owned: healedOwned,
   };
 }
+/**
+ * Repair for layouts persisted with squeezed/clamped runtime widths (the
+ * pre-fix persist bug): the persist effect saved the RUNTIME row — including
+ * preview-open sibling squeezes and small-viewport clamps — as both the
+ * visual and `owned` widths. healSqueezedPanelLayout only heals legacy
+ * owned-less data, so modern layouts loaded squeezed forever. This detects
+ * VERY inconsistent rows — all three owned widths parked at their minimums,
+ * or the owned sum below 60% of the all-three-visible row budget — and
+ * resets them to the default shape. Guard: only repair when the current
+ * viewport actually fits the default row, so a genuinely small window is
+ * never fought (no repair, no overwrite). The live popup is not part of this
+ * row, so its width survives a repair.
+ */
+export function repairInconsistentPanelLayout(
+  layout: PersistedPanelLayout,
+): PersistedPanelLayout {
+  const owned = userOwnedWidthsFrom(layout);
+  const allMin =
+    owned.preview <= PREVIEW_PANEL_MIN_W + 1 &&
+    owned.urlAside <= PANEL_MIN.w + 1 &&
+    owned.main <= PANEL_MIN.w + 1;
+  // All-three-visible budget is the conservative (tightest) row budget, so a
+  // repair never overflows the row no matter which panels actually render.
+  const budget =
+    typeof window === 'undefined'
+      ? 0
+      : layoutRowWidthBudget({
+          previewOpen: true,
+          urlPanelAside: true,
+          preview: { w: layout.previewPanelWidth, h: 0 },
+          urlAside: layout.urlAside,
+          main: layout.main,
+        });
+  const ownedSum = owned.preview + owned.urlAside + owned.main;
+  const sumBelowBudget = budget > 0 && ownedSum < 0.6 * budget;
+  if (!allMin && !sumBelowBudget) return layout;
+
+  const defaults = defaultPanelLayout();
+  // Guard: the default row (three panels; the budget already accounts for the
+  // inter-panel gaps) must fit the current viewport — a small window must
+  // keep its squeezed-but-fitting layout untouched.
+  if (defaults.previewPanelWidth + defaults.urlAside.w + defaults.main.w > budget) {
+    return layout;
+  }
+  return {
+    ...defaults,
+    // The live popup is not part of this row — keep its stored width when
+    // present and sane, else the default.
+    livePanelWidth: clampLayoutNumber(
+      layout.livePanelWidth,
+      LIVE_PANEL_MIN_W,
+      panelMaxW(),
+      defaults.livePanelWidth ?? LIVE_PANEL_DEFAULT_W,
+    ),
+  };
+}
 export function loadPanelLayout(): PersistedPanelLayout {
   const fallback = defaultPanelLayout();
   try {
@@ -936,7 +992,7 @@ export function loadPanelLayout(): PersistedPanelLayout {
           )
         : fallback.livePanelWidth,
     };
-    return healSqueezedPanelLayout({ ...base, owned: parsed.owned });
+    return repairInconsistentPanelLayout(healSqueezedPanelLayout({ ...base, owned: parsed.owned }));
   } catch {
     return fallback;
   }
