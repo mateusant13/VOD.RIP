@@ -131,9 +131,12 @@ def test_real_watchdog_is_affected_by_archive_db_change():
     cache[_rel(wd)] = {"pass_hashes": [module_sha, closure_sha]}
     assert should_skip(wd, {"services/archive_db.py"}, cache, _BACKEND) is False
     # A changed file OUTSIDE its closure + cached-passing -> skippable.
+    # (archive_retention is now IN the closure: archive_watchdog ->
+    #  chat_sinks.kick_pusher -> archive_kick -> archive_retention — a
+    #  retention change legitimately must not be skipped.)
     _m, _c, rel = closure_info(wd, _BACKEND)
-    assert "backend/services/archive_retention.py" not in rel
-    assert should_skip(wd, {"services/archive_retention.py"}, cache, _BACKEND) is True
+    assert "backend/services/app_lifecycle.py" not in rel
+    assert should_skip(wd, {"services/app_lifecycle.py"}, cache, _BACKEND) is True
 
 
 # ---------------------------------------------------------------------------
