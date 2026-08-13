@@ -669,6 +669,29 @@ def chat_emotes(
     return {"emotes": fetch_emotes(platform, slug)}
 
 
+@router.get("/chat/history")
+def chat_history(
+    platform: str = Query(..., description="twitch | kick | youtube"),
+    slug: str = Query(..., description="channel login"),
+    limit: int = Query(50, ge=1, le=500, description="max backlog rows"),
+) -> dict:
+    """Archived chat captured BEFORE the current session for one channel —
+    the Chatterino-style backlog the live panel pre-fills on open (e.g. a
+    channel added now still shows earlier captured chat). Spans every
+    archived video of the channel (watchdog live captures included, matched
+    case-insensitively on videos.channel), ordered oldest→newest. Best-
+    effort: empty DB / no captures / unknown channel → ``{"messages": []}``,
+    never 500 — the panel treats the backlog as optional. The service is
+    lazy-imported so this router never pulls archive deps into boot.
+    """
+    plat = (platform or "").lower()
+    if plat not in _CHAT_PLATFORM_KWARG or not slug:
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube and slug is required")
+    from services.archive_db import chat_history_for_channel
+
+    return {"messages": chat_history_for_channel(plat, slug, limit)}
+
+
 class FastClipRequest(BaseModel):
     platform: str = Field(..., description="twitch | kick | youtube")
     slug: str = Field(..., description="channel slug / login / @handle")

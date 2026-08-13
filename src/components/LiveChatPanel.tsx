@@ -1,10 +1,14 @@
 /**
  * LIVE chat panel for the livestream player popup — real-time messages from
  * the stream's chat, docked to the right of the video (same visual language
- * as PreviewChatPanel rows). NOT history: rows stream in live over SSE from
- * the per-viewer chat stream endpoint (/api/live/chat/stream), which reuses
- * the app's existing chat sinks (Twitch anon IRC / Kick Pusher / yt-dlp
- * live_chat) with a flush callback that forwards rows instead of archiving.
+ * as PreviewChatPanel rows). On open it pre-fills a Chatterino-style backlog
+ * from GET /api/chat/history (chat captured BEFORE this session by the
+ * archive watchdog), then rows stream in live over SSE from the per-viewer
+ * chat stream endpoint (/api/live/chat/stream), which reuses the app's
+ * existing chat sinks (Twitch anon IRC / Kick Pusher / yt-dlp live_chat)
+ * with a flush callback that forwards rows instead of archiving. The
+ * backlog fetch is best-effort: async, silent on failure (no backlog ≠ no
+ * chat), and never blocks the live stream.
  *
  * Multi-stream support: when the channel is live on >1 platform the panel
  * opens ONE merged stream per platform (each row tagged with its platform)
@@ -183,6 +187,61 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
     return () => {
       esList.forEach((es) => es.close());
       esRefs.current = [];
+    };
+  }, [sources]);
+
+  // Chatterino-style backlog: pre-fill the panel with chat captured BEFORE
+  // this session (the archive watchdog archives 24/7) — a channel added now
+  // still shows its earlier chat. One fetch per source; merged oldest→newest
+  // and truncated to MAX_ROWS. Best-effort by design: async + silent failure
+  // (network/API errors just mean no backlog); the fetch never throws.
+  useEffect(() => {
+    if (sources.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const batches = await Promise.all(
+          sources.map(async (src) => {
+            const q = new URLSearchParams({
+              platform: src.platform,
+              slug: src.slug,
+              limit: String(MAX_ROWS),
+            });
+            const res = await fetch(`/api/chat/history?${q.toString()}`);
+            if (!res.ok) return [];
+            const data = (await res.json()) as { messages?: LiveChatRow[] };
+            return (data.messages ?? [])
+              .filter((m) => m && typeof m.username === 'string' && typeof m.text === 'string')
+              .map((m) => ({ ...m, platform: src.platform }));
+          }),
+        );
+        if (cancelled) return;
+        const backlog = batches.flat();
+        // Merge recency across platforms (ISO ts sorts lexicographically);
+        // untimed rows count as oldest. Keep only the newest MAX_ROWS.
+        backlog.sort((a, b) => {
+          const at = a.ts ?? '\u0000';
+          const bt = b.ts ?? '\u0000';
+          return at < bt ? -1 : at > bt ? 1 : 0;
+        });
+        const kept = backlog.slice(-MAX_ROWS);
+        setRows((prev) => {
+          // Prepend the backlog under any live rows already streaming and
+          // drop rows the live stream already delivered (both sinks capture
+          // the same IRC — the boundary would otherwise duplicate).
+          const seen = new Set(prev.map((r) => `${r.platform}\u0000${r.username}\u0000${r.text}`));
+          const fresh = kept.filter(
+            (r) => !seen.has(`${r.platform}\u0000${r.username}\u0000${r.text}`),
+          );
+          const merged = [...fresh, ...prev];
+          return merged.length > MAX_ROWS ? merged.slice(merged.length - MAX_ROWS) : merged;
+        });
+      } catch {
+        // Silent — no backlog; live chat below is unaffected.
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, [sources]);
 

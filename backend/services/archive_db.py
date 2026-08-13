@@ -1547,6 +1547,30 @@ def chat_group_members(platform: str, video_id: str) -> list[dict]:
     return out
 
 
+def chat_history_for_channel(platform: str, channel: str, limit: int = 50) -> list[dict]:
+    """Newest ``limit`` chat rows captured for one channel, oldest→newest —
+    the Chatterino-style backlog the live panel pre-fills from.
+
+    Spans every archived video of the channel (live captures included: the
+    watchdog stores synthetic ``<platform>-live-<slug>-<epoch-ms>`` ids with
+    the login in videos.channel, matched case-insensitively). Recency key is
+    ts (ISO, lexicographically sortable) when present, else the
+    video_id/offset_sec fallback (synthetic live ids embed epoch ms, so that
+    key is chronological too). Best-effort by design: an empty DB or a
+    channel with no captures returns [] — the endpoint must never 500."""
+    cap = max(1, int(limit))
+    rows = query(
+        """SELECT m.username, m.text, m.ts, m.color
+           FROM messages m
+           JOIN videos v ON v.platform = m.platform AND v.video_id = m.video_id
+           WHERE v.platform = ? AND LOWER(v.channel) = LOWER(?)
+           ORDER BY COALESCE(m.ts, m.video_id || '#' || printf('%020.0f', m.offset_sec)) DESC
+           LIMIT ?""",
+        (platform, channel, cap),
+    )
+    return [dict(r) for r in reversed(rows)]
+
+
 # --- preview chat panel (WS-2) --------------------------------------------
 
 def has_transcript(platform: str, video_id: str) -> bool:
