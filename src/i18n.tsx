@@ -606,8 +606,8 @@ const ptBR: Record<string, string> = {
   'Clip created': 'Clipe criado!',
   'Clip unavailable': 'Clipe indisponível',
   'CLIP': 'CLIPE',
-  'Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).':
-    'Clipes ao vivo do Twitch precisam de um token OAuth Helix com escopo clips:edit (POST /helix/clips).',
+  'Twitch live clips are created in the browser clip editor (cookie extension flow).':
+    'Clipes ao vivo do Twitch são criados no editor de clipes do navegador (fluxo da extensão de cookies).',
   'Kick has no public clip-creation API.': 'O Kick não tem API pública de criação de clipes.',
   'YouTube has no public live-clip API.': 'O YouTube não tem API pública de clipes ao vivo.',
   // ── Experimental AI ask-about-channel ──────────────────────
@@ -1208,8 +1208,8 @@ const es: Record<string, string> = {
   'Clip created': '¡Clip creado!',
   'Clip unavailable': 'Clip no disponible',
   'CLIP': 'CLIP',
-  'Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).':
-    'Los clips en vivo de Twitch necesitan un token OAuth de Helix con ámbito clips:edit (POST /helix/clips).',
+  'Twitch live clips are created in the browser clip editor (cookie extension flow).':
+    'Los clips en vivo de Twitch se crean en el editor de clips del navegador (flujo de la extensión de cookies).',
   'Kick has no public clip-creation API.': 'Kick no tiene una API pública de creación de clips.',
   'YouTube has no public live-clip API.': 'YouTube no tiene una API pública de clips en vivo.',
   // ── Experimental AI ask-about-channel ──────────────────────

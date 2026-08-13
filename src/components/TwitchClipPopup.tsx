@@ -257,6 +257,14 @@ export default function TwitchClipPopup({
   const [muted, setMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(currentTimeRef.current);
   const [retryTick, setRetryTick] = useState(0);
+  // The <video> is autoPlay: with the click's user activation the browser can
+  // start playback at the element's default volume (1.0) BEFORE canplay fires,
+  // so the play() call never runs and the 0.3 default is never applied. Pin
+  // the volume on mount and on every retry/src swap — deterministic 30%.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video) video.volume = volumeRef.current;
+  }, [retryTick]);
   const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
   const [downloadWithClip, setDownloadWithClip] = useState(false);
@@ -388,6 +396,7 @@ export default function TwitchClipPopup({
       setReady(true);
       setBuffering(false);
       setLoading(false);
+      video.volume = volumeRef.current;
       if (video.paused) {
         autoPauseOtherPreviews(loadingSinceRef.current);
         void playPreviewWithAudio(video, setMuted, volumeRef.current).then(() => {

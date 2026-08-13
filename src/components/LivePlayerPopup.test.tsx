@@ -3,6 +3,7 @@ import type { Mock } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { LivePlayerPopup } from './LivePlayerPopup';
 import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
+import { registerPreviewPlayback } from '../previewPlaybackBus';
 
 /**
  * hls.js needs MediaSource, which jsdom lacks — stub the module so the
@@ -321,6 +322,53 @@ describe('LivePlayerPopup fast clip', () => {
     input.setSelectionRange(0, input.value.length);
     fireEvent.keyDown(input, { key: 'Backspace' });
     expect(input.value).toBe('5');
+  });
+
+  it('TWITCH live clip opens the browser editor — NO /api/live/clip call (no Helix path)', async () => {
+    const fetchMock = mockFetch();
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    render(
+      <LivePlayerPopup
+        entry={{ url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' }}
+        entries={[{ url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' }]}
+        channelName="titiltei"
+        channelSlug="titiltei"
+        onClose={vi.fn()}
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+      />,
+    );
+    await screen.findByTitle('Fullscreen');
+
+    fireEvent.click(screen.getByTitle('Create a clip of the live stream'));
+
+    await waitFor(() => expect(openSpy).toHaveBeenCalledTimes(1));
+    const url = String(openSpy.mock.calls[0][0]);
+    expect(url).toContain('https://www.twitch.tv/titiltei');
+    expect(url).toContain('vodrip_clip=1');
+    expect(url).toContain('vodrip_end=30');
+    expect(url).toContain('vodrip_title=');
+    // The browser editor replaces the old server capability call entirely.
+    const clipCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/live/clip'));
+    expect(clipCalls).toHaveLength(0);
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Opening Twitch clip editor');
+    openSpy.mockRestore();
+  });
+
+  it('mounts into the shared preview-pause bus (pauses other previews when a live opens)', async () => {
+    const pauseSpy = vi.fn();
+    const unreg = registerPreviewPlayback(pauseSpy);
+    try {
+      mockFetch();
+      renderPopup();
+      await screen.findByTitle('Fullscreen');
+      // The live popup's mount calls pauseOtherPreviews() — any other
+      // registered preview (VOD preview, clip popup) is paused.
+      expect(pauseSpy).toHaveBeenCalled();
+    } finally {
+      unreg();
+    }
   });
 });
 

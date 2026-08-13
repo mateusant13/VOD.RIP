@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import { ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
-import { reportClipEvent } from '../twitchClip';
+import { openTwitchLiveClipEditorInBrowser, reportClipEvent } from '../twitchClip';
 import { useI18n } from '../i18n';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -50,7 +50,7 @@ import {
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
-import { noteUserUnpause } from '../previewPlaybackBus';
+import { noteUserUnpause, pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
 import { fmtDuration } from '../formatters';
 import { createFullscreenGate, nativeFullscreenAdapter, type FullscreenGate } from '../utils/fullscreenGate';
@@ -149,6 +149,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // is the active surface the moment it opens.
   useEffect(() => {
     popupRef.current?.focus({ preventScroll: true });
+  }, []);
+  // Join the shared preview-pause bus: opening a live pauses every other
+  // preview, and opening a clip/preview elsewhere pauses this live. Without
+  // this, a live kept playing audio under any new preview (user report).
+  useEffect(() => {
+    pauseOtherPreviews();
+    const pause = () => {
+      const video = videoRef.current;
+      if (video && !video.paused) {
+        video.pause();
+        setPaused(true);
+      }
+    };
+    return registerPreviewPlayback(pause);
   }, []);
   const hlsRef = useRef<Hls | null>(null);
   const hlsCtorRef = useRef<typeof Hls | null>(null);
@@ -1137,6 +1151,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
     if (clipCooldownTimerRef.current != null) window.clearTimeout(clipCooldownTimerRef.current);
     tick();
+    if (platform === 'twitch') {
+      // Twitch live clips run in Twitch's own browser editor (player Clip
+      // button) driven by the cookie extension — no Helix/OAuth server path
+      // (audited; backend live.py has no clip mutation). Open the editor and
+      // let the extension fill + publish with the session cookie.
+      try {
+        const title = (activeEntry.title || '').trim();
+        openTwitchLiveClipEditorInBrowser(slug, durationSec, title);
+        reportClipEvent('live_clip_editor_open', { platform, slug, durationSec, title });
+        showClipNotice(t('Opening Twitch clip editor…'));
+      } catch (err) {
+        showClipNotice(`${t('Clip unavailable')}: ${err instanceof Error ? err.message : ''}`);
+      }
+      return;
+    }
     try {
       const res = await apiPost<LiveClipCapability>('/api/live/clip', {
         platform,
@@ -1151,7 +1180,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     } catch (err) {
       showClipNotice(`${t('Clip unavailable')}: ${err instanceof Error ? err.message : ''}`);
     }
-  }, [activeEntry.url, activeEntry.platform, channelSlug, clipSeconds, showClipNotice, t]);
+  }, [activeEntry.url, activeEntry.platform, activeEntry.title, channelSlug, clipSeconds, showClipNotice, t]);
 
   // --- Resize: aspect-locked (video keeps the stream's aspect; chat docks
   //     right of the video, so the video area = popup − chat panel width) ---

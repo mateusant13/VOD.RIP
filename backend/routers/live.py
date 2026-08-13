@@ -706,10 +706,10 @@ def fast_live_clip(req: FastClipRequest) -> dict:
     """Fast-clip capability report — HONEST, never fakes a clip.
 
     There is NO server-side live clip path in this build (audited):
-    - Twitch: Helix ``POST /helix/clips`` needs an OAuth user token with the
-      ``clips:edit`` scope + a Client-Id header; the old implementation was
-      removed in c609e93 and no OAuth client creds remain. The session-cookie
-      auth this app uses is not accepted by Helix.
+    - Twitch: the app routes live clips to Twitch's own browser editor
+      (twitch.tv/<channel> → player Clip button) driven by the VOD.RIP cookie
+      extension with the session cookie — no Helix token/scopes, no server
+      mutation. The frontend never calls this endpoint for Twitch anymore.
     - Kick: has no public clip-creation API.
     - YouTube: has no public live-clip API.
     So the payload always reports ``available: false`` with the exact
@@ -719,11 +719,10 @@ def fast_live_clip(req: FastClipRequest) -> dict:
     if plat == "twitch":
         return {
             "available": False,
-            "reason": "Twitch live clips need a Helix OAuth user token with clips:edit scope (POST /helix/clips).",
+            "reason": "Twitch live clips are created in the browser clip editor (cookie extension flow).",
             "needed": [
-                "OAuth user token with clips:edit scope",
-                "Client-Id header",
-                "POST https://api.twitch.tv/helix/clips",
+                "Logged-in Twitch session cookie in the browser",
+                "VOD.RIP cookie extension (clip_assist content script)",
             ],
         }
     if plat == "kick":
