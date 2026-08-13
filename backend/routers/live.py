@@ -651,16 +651,19 @@ def chat_emotes(
     platform: Optional[str] = Query(None, description="twitch | kick | youtube"),
     slug: Optional[str] = Query(None, description="channel login"),
 ) -> dict:
-    """BTTV/FFZ/7TV custom emotes for one channel (render-only, Twitch only).
+    """Custom + official emotes for one channel (render-only; Twitch + Kick).
 
-    Returns every custom emote the chat panel can render inline, merged in
-    Chatterino priority order (FFZ channel > BTTV channel > 7TV channel >
-    FFZ global > BTTV global > 7TV global); name collisions keep the first
-    (highest-priority) provider. Unknown platform or network failure returns
-    ``{"emotes": []}`` — chat rendering must never break because emotes fail.
-    Emotes are display-only: stored message text and search indexes are never
-    touched. The service is lazy-imported so this router never pulls
-    chat-emote deps into the app boot path.
+    Twitch returns BTTV/FFZ/7TV customs plus official Twitch globals, merged
+    in Chatterino priority order (FFZ channel > BTTV channel > 7TV channel >
+    FFZ global > BTTV global > 7TV global > Twitch global); name collisions
+    keep the first (highest-priority) provider, so channel/global customs
+    shadow official Twitch emotes like LUL. Kick returns 7TV channel emotes
+    plus BTTV/7TV custom globals (no FFZ, no official Twitch emotes).
+    Unknown platform or network failure returns ``{"emotes": []}`` — chat
+    rendering must never break because emotes fail. Emotes are display-only:
+    stored message text and search indexes are never touched. The service is
+    lazy-imported so this router never pulls chat-emote deps into the app
+    boot path.
     """
     if not platform or not slug:
         raise HTTPException(status_code=400, detail="platform and slug are required")
