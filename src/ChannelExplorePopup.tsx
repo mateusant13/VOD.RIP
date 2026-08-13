@@ -1890,17 +1890,14 @@ export default function ChannelExplorePopup({
           )}
         </div>
         {!fullscreen && archiveSearchOpen && vod.videoId && (
-          <div className="shrink-0 min-h-0 flex flex-col" style={{ height: '45vh' }}>
-            <ArchiveSearchPopup
-              embedded
-              zIndex={0}
-              onClose={() => setArchiveSearchOpen(false)}
-              onOpenHit={onOpenHit}
-              onSeekHit={(hit) => seekVideo(hit.offset_sec)}
-              onSeekOffset={(sec) => seekVideo(sec)}
-              scope={{ videoId: vod.videoId, title: vod.title }}
-            />
-          </div>
+          <ArchiveSearchPopup
+            zIndex={zIndex + 50}
+            onClose={() => setArchiveSearchOpen(false)}
+            onOpenHit={onOpenHit}
+            onSeekHit={(hit) => seekVideo(hit.offset_sec)}
+            onSeekOffset={(sec) => seekVideo(sec)}
+            scope={{ videoId: vod.videoId, title: vod.title }}
+          />
         )}
         {!fullscreen && (
           <>
