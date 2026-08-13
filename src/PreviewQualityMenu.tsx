@@ -37,7 +37,7 @@ export default function PreviewQualityMenu({
     : 'absolute bottom-full left-0 mb-1';
 
   return (
-    <div className="relative" data-player-menu>
+    <div className="relative" data-player-menu data-quality-menu>
       <button
         type="button"
         onClick={(e) => {

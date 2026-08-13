@@ -422,3 +422,50 @@ describe('LivePlayerPopup z-order', () => {
     expect(document.querySelector('[data-live-popup]')).toBeNull();
   });
 });
+
+describe('LivePlayerPopup volume menu outside-click', () => {
+  it('closes on a mousedown on any other player button', async () => {
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // Open the volume menu.
+    fireEvent.click(screen.getByTitle('Volume'));
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+
+    // A mousedown on ANOTHER transport button (fullscreen) closes the menu —
+    // the click lands outside the volume menu's own layout.
+    fireEvent.mouseDown(screen.getByTitle('Fullscreen'));
+    expect(screen.queryByLabelText('Volume')).toBeNull();
+  });
+
+  it('keeps the menu open for clicks inside it and the slider drag still works', async () => {
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    fireEvent.click(screen.getByTitle('Volume'));
+    const slider = screen.getByLabelText('Volume') as HTMLInputElement;
+    expect(slider).toBeTruthy();
+
+    // mousedown on the slider (inside the menu layout) must NOT close it…
+    fireEvent.mouseDown(slider);
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+
+    // …and dragging still adjusts the volume while the menu stays open.
+    fireEvent.change(slider, { target: { value: '0.5' } });
+    expect((screen.getByLabelText('Volume') as HTMLInputElement).value).toBe('0.5');
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+  });
+
+  it('the toggle still opens and closes the menu', async () => {
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const toggle = screen.getByTitle('Volume');
+    fireEvent.click(toggle);
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(screen.queryByLabelText('Volume')).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+  });
+});

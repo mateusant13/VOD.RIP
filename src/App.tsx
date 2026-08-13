@@ -548,6 +548,10 @@ export default function App() {
   const previewSeekDebounceRef = useRef<number | null>(null);
   const previewPlaybackKindRef = useRef<'hls' | 'progressive'>('progressive');
   const previewPendingSeekSecRef = useRef<number | null>(null);
+  /** Position carried from the explore popup's handoff — replayed when the
+   *  player flips ready if the 500ms attempt landed too early (non-YouTube
+   *  paths drop a not-ready seek silently). */
+  const handoffSeekSecRef = useRef<number | null>(null);
   const previewSeekTargetRef = useRef<number | null>(null);
   const previewCachedProgressiveRef = useRef(false);
   // ── Shared preview hook (quality state machine) ──────────────────────────
@@ -630,6 +634,13 @@ export default function App() {
   const handleClipChatMarkersChange = useCallback((slug: string, m: ChatMarkers) => {
     setClipChatMarkers((prev) => ({ ...prev, [slug]: m }));
   }, []);
+  /** Chat range carried from the explore popup's handoff. Applied by the
+   *  effect below (after the video-switch clear), not synchronously in the
+   *  handoff: switching the previewed video clears chatStartSec/chatEndSec
+   *  after commit, so a synchronous write would be wiped. The tick forces a
+   *  re-run even when the handoff reuses the already-loaded video. */
+  const carriedChatMarkersRef = useRef<ChatMarkers | null>(null);
+  const [carriedChatMarkersTick, setCarriedChatMarkersTick] = useState(0);
   const trimStartSecRef = useRef(0);
   const trimEndSecRef = useRef(3600);
   const trimDragOriginRef = useRef(0);
@@ -1257,6 +1268,8 @@ export default function App() {
     setPreviewRetryBoth(null);
     const sid = previewSessionId;
     destroyPreviewPlayer();
+    // A user-initiated close abandons any still-pending handoff seek.
+    handoffSeekSecRef.current = null;
     setPreviewOpen(false);
     setPreviewSessionId(null);
     setIsLive(false);
@@ -1542,6 +1555,17 @@ export default function App() {
       seekPreviewVideoImmediate(sec, false);
     }, PREVIEW_SEEK_DEBOUNCE_MS);
   }, [seekPreviewVideoImmediate]);
+
+  // Handoff seek retry: the 500ms attempt can land before the player is ready
+  // (session/HLS init) and the non-YouTube paths drop a not-ready seek
+  // silently. Replay the carried position once the player flips ready.
+  useEffect(() => {
+    if (!previewVideoReady || previewYoutubeEmbedUrl) return;
+    const target = handoffSeekSecRef.current;
+    if (target == null) return;
+    handoffSeekSecRef.current = null;
+    seekPreviewVideo(target, true);
+  }, [previewVideoReady, previewYoutubeEmbedUrl, seekPreviewVideo]);
 
   const openPreview = useCallback(async (): Promise<boolean> => {
     if (!url.trim()) return false;
@@ -3094,14 +3118,18 @@ export default function App() {
     if (!anyPlayerMenuOpen) return;
     const onPointerDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('[data-player-menu]')) return;
+      // A menu stays open only while the pointerdown lands inside its own
+      // layout (wrapper + toggle button); any other click — other player
+      // buttons included — closes it.
+      if (previewVolumeMenuOpen && target.closest('[data-volume-menu]')) return;
+      if (previewQualityMenuOpen && target.closest('[data-quality-menu]')) return;
       setPreviewQualityMenuOpen(false);
       setPreviewVolumeMenuOpen(false);
       setExploreVolumeMenuCloseTick((t) => t + 1);
     };
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
-  }, [anyPlayerMenuOpen]);
+  }, [previewVolumeMenuOpen, previewQualityMenuOpen, anyExploreVolumeMenuOpen]);
 
   useEffect(() => {
     if (!previewOpen || !previewVideoReady) return;
@@ -5426,6 +5454,7 @@ export default function App() {
     vod: ExplorePopupVod,
     timeSec = 0,
     trim?: { start: number; end: number } | null,
+    chat?: ChatMarkers | null,
   ) => {
     selectVod(vod.url, {
       platform: vod.platform,
@@ -5456,9 +5485,22 @@ export default function App() {
       setPreviewTrimStart(start);
       setPreviewTrimEnd(end);
     }
+    // Carry the mini preview's chat range so the next download writes the
+    // same chat txt. Applied via effect (not here): switching the previewed
+    // video clears chatStartSec/chatEndSec after commit, so a synchronous
+    // write would be wiped.
+    if (chat && (chat.start != null || chat.end != null)) {
+      carriedChatMarkersRef.current = { start: chat.start, end: chat.end };
+      setCarriedChatMarkersTick((t) => t + 1);
+    }
     const seekTo = Number.isFinite(timeSec) ? Math.max(0, timeSec) : 0;
     if (seekTo > 0) {
-      window.setTimeout(() => seekPreviewVideo(seekTo, true), 500);
+      // Fallback for the not-ready case below: replay once the player is ready.
+      handoffSeekSecRef.current = seekTo;
+      window.setTimeout(() => {
+        if (previewVideoReadyRef.current) handoffSeekSecRef.current = null;
+        seekPreviewVideo(seekTo, true);
+      }, 500);
     }
   }, [selectVod, seekPreviewVideo]);
 
@@ -5504,6 +5546,17 @@ export default function App() {
     setChatStartSec(null);
     setChatEndSec(null);
   }, [previewArchiveVideoId, activePlatform]);
+
+  // Apply the explore popup's carried chat range AFTER the video-switch clear
+  // above — effects run in declaration order for the same commit, so a handoff
+  // that loads a new video clears first, then this re-applies the carried
+  // range; the tick covers same-video handoffs where the clear never fires.
+  useEffect(() => {
+    const markers = carriedChatMarkersRef.current;
+    if (!markers) return;
+    carriedChatMarkersRef.current = null;
+    handleChatMarkersChange(markers);
+  }, [carriedChatMarkersTick, handleChatMarkersChange]);
 
   /** Stable scope object for the preview-search popup. App rebuilds this
    *  inline on every render (preview time sync re-renders constantly); the
@@ -5925,7 +5978,7 @@ export default function App() {
       ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
       : 'border-2 border-zinc-600 bg-zinc-950';
     return (
-      <div className="relative" data-player-menu>
+      <div className="relative" data-player-menu data-volume-menu>
         <button
           type="button"
           onClick={(e) => {
@@ -7310,7 +7363,7 @@ export default function App() {
               stackIndex={entry.layoutIndex}
               volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
-              onHandoffToMain={(vod, timeSec, trim) => carryExploreToUrl(vod, timeSec, trim)}
+              onHandoffToMain={(vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null, chat?: ChatMarkers | null) => carryExploreToUrl(vod, timeSec, trim, chat)}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
               onVolumeMenuOpen={handleExploreVolumeMenuOpen}
