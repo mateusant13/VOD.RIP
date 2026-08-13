@@ -52,6 +52,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -67,7 +68,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from services import archive_db
+from services import archive_db, transcript_fix
 from services.archive_events import detect_events_video, events_enabled
 from services.autostart import background_mode
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
@@ -1305,7 +1306,11 @@ def _parakeet_model() -> Any:
         return _parakeet_global
 
 
-def _parakeet_words(tokens: list[str], timestamps: list[float]) -> list[dict]:
+def _parakeet_words(
+    tokens: list[str],
+    timestamps: list[float],
+    log_probs: Optional[list[float]] = None,
+) -> list[dict]:
     """Word-level items from the recognizer's per-token timestamps.
 
     The HF-converted vocab marks word-initial pieces with a leading space
@@ -1313,33 +1318,49 @@ def _parakeet_words(tokens: list[str], timestamps: list[float]) -> list[dict]:
     word ('de 10'), so a new word starts only on a piece that begins with a
     space and is longer than one char. Word end = the last token's start
     time (monotonic; matches whisper's word shape). Validated on real audio:
-    concatenating the pieces reconstructs result.text exactly."""
+    concatenating the pieces reconstructs result.text exactly.
+
+    log_probs (sherpa-onnx ``ys_log_probs``, parallel to tokens; absent on
+    old builds) aggregates per word: word_conf = exp(mean(token log-probs)).
+    The sign convention is sanity-checked here — sherpa may emit costs
+    (positive) instead of log-probs (negative); positive values are inverted
+    so the confidence stays in (0, 1]. No conf key when log_probs is absent,
+    which silently disables the transcript-fix weak path on old sherpa."""
+    def finalize(word: str, start: Optional[float], end: Optional[float],
+                 lps: list[float]) -> dict:
+        item = {
+            "word": word,
+            "start": round(start or 0.0, 3),
+            "end": round(end or 0.0, 3),
+        }
+        if lps:
+            mean = sum(lps) / len(lps)
+            if mean > 0:
+                mean = -mean  # costs (positive) -> log-probs (sign sanity)
+            item["conf"] = math.exp(mean)
+        return item
+
     words: list[dict] = []
     cur = ""
     start: Optional[float] = None
     end: Optional[float] = None
-    for tok, ts in zip(tokens, timestamps):
+    cur_lps: list[float] = []
+    for ti, (tok, ts) in enumerate(zip(tokens, timestamps)):
         word_start = tok.startswith(" ") and len(tok) > 1
         if word_start and cur:
-            words.append({
-                "word": cur,
-                "start": round(start or 0.0, 3),
-                "end": round(end or 0.0, 3),
-            })
-            cur, start = tok.lstrip(" "), ts
+            words.append(finalize(cur, start, end, cur_lps))
+            cur, start, cur_lps = tok.lstrip(" "), ts, []
         elif word_start:
-            cur, start = tok.lstrip(" "), ts
+            cur, start, cur_lps = tok.lstrip(" "), ts, []
         elif not cur:
-            cur, start = tok, ts  # stream opened mid-word (not seen in practice)
+            cur, start, cur_lps = tok, ts, []
         else:
             cur += tok
         end = ts
+        if log_probs is not None and ti < len(log_probs):
+            cur_lps.append(log_probs[ti])
     if cur:
-        words.append({
-            "word": cur,
-            "start": round(start or 0.0, 3),
-            "end": round(end or 0.0, 3),
-        })
+        words.append(finalize(cur, start, end, cur_lps))
     return words
 
 
@@ -1378,6 +1399,7 @@ def _transcribe_batch_parakeet(
         words = _parakeet_words(
             getattr(res, "tokens", []) or [],
             getattr(res, "timestamps", []) or [],
+            getattr(res, "ys_log_probs", None),
         )
         last_word_end = (words[-1]["end"] if words else float(ce)) + base
         items = [{
@@ -2229,6 +2251,8 @@ def _transcribe_batch(
                     "word": w.word,
                     "start": round(float(w.start) + base, 3),
                     "end": round(float(w.end) + base, 3),
+                    **({"conf": float(w.probability)}
+                       if getattr(w, "probability", None) is not None else {}),
                 }
                 for w in (seg.words or [])
             ]
@@ -2406,6 +2430,11 @@ def _transcribe_audio_source(
     words = 0
     speech_done = 0.0
     detected_lang: Optional[str] = None
+    # Champion-name post-fix (transcript_fix): runs at the ONE choke point
+    # shared by both engines, right before rows land. Per-job stats merge
+    # into the returned dict under 'transcript_fix' and are logged at info.
+    fix_stats = transcript_fix.new_stats()
+    fix_on = transcript_fix.enabled()
     missing_set = set(missing)
     ci = 0
     n_chunks = len(chunks)
@@ -2442,6 +2471,10 @@ def _transcribe_audio_source(
                 if seg_idx in existing:
                     seg_idx += 1
                     continue
+                if fix_on:
+                    transcript_fix.fix_segment(
+                        seg, engine=engine, language=lang, stats=fix_stats,
+                    )
                 batch_rows.append({
                     "seg_idx": seg_idx,
                     "start_sec": seg["start_sec"],
@@ -2524,6 +2557,15 @@ def _transcribe_audio_source(
         # detection). The done-time channel-language correction uses it.
         "lang": detected_lang if language is None else None,
     }
+    if fix_on:
+        stats["transcript_fix"] = fix_stats
+        logger.info(
+            "transcribe %s/%s transcript-fix: %d segments touched, %d strong, "
+            "%d weak, %d blocklisted near-misses",
+            platform, video_id,
+            fix_stats["segments_touched"], fix_stats["strong_replaced"],
+            fix_stats["weak_replaced"], fix_stats["blocked_hits"],
+        )
     logger.info(
         "transcribe %s/%s done: %d segs, %d words, %.1f%% dead air skipped, "
         "%.2fx realtime on %s/%s (%s)",
