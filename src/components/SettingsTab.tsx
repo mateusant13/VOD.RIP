@@ -1,6 +1,6 @@
 import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, StopCircle,
+  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
@@ -41,6 +41,7 @@ const SETTING_KEYS = [
   'asr_language',
   'cache_dir', 'data_dir',
   'auto_install_extension', 'twitch_monitor_enabled',
+  'experimental_ai_enabled',
 ] as const;
 const settingsSignature = (s: AppSettings) =>
   JSON.stringify(SETTING_KEYS.map((k) => s[k] ?? null));
@@ -170,6 +171,13 @@ export default function SettingsTab({
     window.setTimeout(() => setTutorialToast(false), 3000);
   };
 
+  /** Write-only AI key: kept in local state, never rendered back. dirty =
+   *  the user edited the field ('' after a typed-then-cleared field REMOVES
+   *  the stored key on save; an untouched field leaves it alone). */
+  const [aiKey, setAiKey] = useState('');
+  const [aiKeyDirty, setAiKeyDirty] = useState(false);
+  const [aiKeyError, setAiKeyError] = useState<string | null>(null);
+
   const cookieCard = (
     <SettingsCard
       icon={ShieldCheck}
@@ -210,7 +218,21 @@ export default function SettingsTab({
   );
 
   const save = async () => {
-    await onSave();
+    setAiKeyError(null);
+    try {
+      // Key is write-only: POST it alone (before the main save, so the
+      // toggle-on validation sees the fresh key), only when edited.
+      if (aiKeyDirty) {
+        await apiPost('/api/settings', { ai_api_key: aiKey.trim() });
+        setSettings((prev) => ({ ...prev, ai_api_key_set: aiKey.trim() !== '' }));
+        setAiKey('');
+        setAiKeyDirty(false);
+      }
+      await onSave();
+    } catch (err) {
+      setAiKeyError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     setSavedSig(settingsSignature(settings));
   };
 
@@ -435,6 +457,49 @@ export default function SettingsTab({
 
       {/* ── Cookie Bridge (detected → above Save) ── */}
       {needsCookieSetup ? null : cookieCard}
+
+      {/* ── Experimental ──────────────────────────────────────── */}
+      <SettingsCard
+        icon={Sparkles}
+        title={t('Experimental')}
+        open={!!openCards.experimental}
+        onToggle={() => toggleCard('experimental')}
+      >
+        <Toggle
+          label={t('Experimental: AI search & answers')}
+          info={t('Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.')}
+          checked={settings.experimental_ai_enabled === true}
+          onChange={(c) => setSettings({ ...settings, experimental_ai_enabled: c })}
+          ariaLabel="experimental ai enabled"
+        />
+        <div className="flex flex-col gap-1.5">
+          <FieldCaption noWrap>{t('AI API key (OpenAI-compatible)')}</FieldCaption>
+          <input
+            type="password"
+            value={aiKey}
+            onChange={(e) => { setAiKey(e.target.value); setAiKeyDirty(true); }}
+            placeholder={settings.ai_api_key_set ? '••••••••' : ''}
+            autoComplete="off"
+            aria-label="ai api key"
+            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
+          />
+          {settings.ai_api_key_set ? (
+            <span className="text-[10px] font-mono text-zinc-500">
+              {t('A key is set — the stored key is never shown. Type a new key to replace it, or clear the field and save to remove it.')}
+            </span>
+          ) : null}
+        </div>
+        {settings.experimental_ai_enabled === true && !settings.ai_api_key_set && !aiKey.trim() ? (
+          <span className="text-[11px] font-mono text-red-400" role="alert">
+            {t('Add an AI API key first — the feature cannot run without one.')}
+          </span>
+        ) : null}
+        {aiKeyError ? (
+          <span className="text-[11px] font-mono text-red-400" role="alert">
+            {aiKeyError}
+          </span>
+        ) : null}
+      </SettingsCard>
 
       {/* ── Danger Zone (user request: directly above Save — exit stays
           behind an explicit confirm, just no longer buried under the save

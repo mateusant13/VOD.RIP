@@ -91,7 +91,7 @@ describe("SettingsTab", () => {
   it("renders all grouped sections, collapsed by default", () => {
     stubFetch();
     render(<Harness />);
-    for (const title of ["General", "Transcription", "Disk & Storage", "Cookie Bridge", "Updates", "Danger Zone"]) {
+    for (const title of ["General", "Transcription", "Disk & Storage", "Cookie Bridge", "Updates", "Experimental", "Danger Zone"]) {
       expect(screen.getByText(title)).toBeInTheDocument();
     }
     expect(screen.getByText("Save Settings")).toBeInTheDocument();
@@ -219,17 +219,69 @@ describe("SettingsTab", () => {
     await screen.findByText(/paired/);
     const sections = [...document.querySelectorAll("section")];
     // Danger Zone renders directly above the Save row (user request);
-    // Cookie Bridge stays second-to-last among the cards.
+    // Cookie Bridge stays among the last cards (Experimental now sits
+    // between Cookie Bridge and Danger Zone).
     const last = sections[sections.length - 1];
     expect(last.textContent).toContain("Danger Zone");
     expect(last.textContent).not.toContain("Cookie Bridge");
     const secondToLast = sections[sections.length - 2];
-    expect(secondToLast.textContent).toContain("Cookie Bridge");
+    expect(secondToLast.textContent).toContain("Experimental");
+    expect(secondToLast.textContent).not.toContain("Cookie Bridge");
+    const thirdToLast = sections[sections.length - 3];
+    expect(thirdToLast.textContent).toContain("Cookie Bridge");
     // The Save button must come AFTER the Danger Zone card in the DOM.
     const saveBtn = screen.getByText("Save Settings");
     expect(last.compareDocumentPosition(saveBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // i18n: a Language card now sits at the top, before General.
     expect(sections[0].textContent).toContain("Language");
     expect(sections[1].textContent).toContain("General");
+  });
+
+  it("renders the Experimental AI card with the toggle off by default", () => {
+    stubFetch();
+    render(<Harness />);
+    expandCard("Experimental");
+    expect(screen.getByLabelText("experimental ai enabled")).not.toBeChecked();
+    // Password input masks; the bullet placeholder only appears once a key
+    // is reported set.
+    expect(screen.getByLabelText("ai api key")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("ai api key")).toHaveAttribute("placeholder", "");
+  });
+
+  it("shows the bullet placeholder when a key is set (never the key itself)", () => {
+    stubFetch();
+    render(<Harness initial={{ ...BASE, ai_api_key_set: true }} />);
+    expandCard("Experimental");
+    expect(screen.getByLabelText("ai api key")).toHaveAttribute("placeholder", "••••••••");
+    expect(screen.getByText(/never shown/)).toBeInTheDocument();
+  });
+
+  it("shows an inline error when the toggle is on without a key", () => {
+    stubFetch();
+    render(<Harness />);
+    expandCard("Experimental");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("experimental ai enabled"));
+    expect(screen.getByLabelText("experimental ai enabled")).toBeChecked();
+    expect(screen.getByRole("alert")).toHaveTextContent(/API key first/);
+    // Typing a key clears the inline error.
+    fireEvent.change(screen.getByLabelText("ai api key"), { target: { value: "sk-abc" } });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("posts a typed AI key (write-only) and marks it set", async () => {
+    stubFetch();
+    render(<Harness />);
+    expandCard("Experimental");
+    fireEvent.change(screen.getByLabelText("ai api key"), { target: { value: "sk-abc-123" } });
+    fireEvent.click(screen.getByText("Save Settings"));
+    await waitFor(() => {
+      const posts = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([url]) => String(url) === "/api/settings")
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+      expect(posts.some((b) => b.ai_api_key === "sk-abc-123")).toBe(true);
+    });
+    // After saving, the placeholder reflects the stored key.
+    expect(screen.getByLabelText("ai api key")).toHaveAttribute("placeholder", "••••••••");
   });
 });

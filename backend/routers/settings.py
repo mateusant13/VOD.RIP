@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["settings"])
 
 
+def _redact_ai_key(settings: AppSettings) -> AppSettings:
+    """Never serialize the write-only AI key: GET/POST settings responses
+    report ai_api_key_set (bool) instead of the key itself."""
+    return settings.model_copy(update={
+        "ai_api_key": "",
+        "ai_api_key_set": bool(settings.ai_api_key),
+    })
+
+
 def _prioritize_new_channels(old: list, new: list) -> None:
     """Top-priority the archive scheduler for channels that were just added.
 
@@ -52,7 +61,7 @@ def _prioritize_new_channels(old: list, new: list) -> None:
 
 @router.get("/api/settings", response_model=AppSettings)
 async def get_settings():
-    return settings_mgr.get()
+    return _redact_ai_key(settings_mgr.get())
 
 
 @router.get("/api/settings/youtube-auth")
@@ -224,9 +233,21 @@ async def update_settings(update: SettingsUpdate):
         current.download_layout = layout if layout in ('flat', 'typed') else 'typed'
     if update.download_transcript_sidecar is not None:
         current.download_transcript_sidecar = bool(update.download_transcript_sidecar)
+    # Write-only AI key: handled BEFORE the toggle so a single save that sets
+    # both key and toggle-on validates against the fresh key.
+    if update.ai_api_key is not None:
+        current.ai_api_key = (update.ai_api_key or "").strip()
+        current.ai_api_key_set = bool(current.ai_api_key)
+    if update.experimental_ai_enabled is not None:
+        if update.experimental_ai_enabled and not current.ai_api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot enable experimental AI without an API key — add your OpenAI-compatible key first.",
+            )
+        current.experimental_ai_enabled = bool(update.experimental_ai_enabled)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
-    return current
+    return _redact_ai_key(current)
 
 
 @router.get("/api/settings/recommended")

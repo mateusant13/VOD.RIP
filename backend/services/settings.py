@@ -77,6 +77,9 @@ class SettingsManager:
                 if "video_encoder" not in data:
                     data["video_encoder"] = "auto"
                 settings = AppSettings(**data)
+                # The write-only key flag is derived from the actual key —
+                # never trust a stale persisted copy.
+                settings.ai_api_key_set = bool(settings.ai_api_key)
                 return settings
         except Exception:
         # ponytail: best-effort — return AppSettings(**data)
