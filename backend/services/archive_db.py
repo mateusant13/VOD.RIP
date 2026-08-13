@@ -2536,6 +2536,9 @@ def worker_heartbeat_age(tag: str) -> Optional[float]:
     if at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
     return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
+
+
+def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:
     """True when YouTube captions already cover the video (captions-first on).
 
     Mirrors archive_transcribe._captions_first_skip: yt_subtitles_first
