@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -75,6 +76,230 @@ def _duration_string_from_sec(sec: int) -> str:
     m, s = divmod(max(0, int(sec)), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# yt-dlp's parse_count knows k/K/m/M/b/B suffixes and dot decimals, but not
+# pt/es suffixes ("mil", "milhão", "bi") nor comma decimals. With the app's
+# lang=pt translated tab fields ("8,7 mil visualizações") it emits 87 for an
+# 8.7k-view short (comma stripped, "mil" treated as x1). parse_abbreviated_
+# view_count repairs exactly those forms; anything else falls back to yt-dlp.
+_LOCALE_COUNT_RE = re.compile(
+    r"(?P<num>\d+(?:[.,]\d+)?)\s*"
+    r"(?P<unit>milh[oõ]es|milh[ãa]o|bilh[oõ]es|bilh[ãa]o|mil|mi|bi|k|m|b)?"
+    r"(?=\s|$)",
+    re.IGNORECASE,
+)
+_LOCALE_COUNT_UNITS = {
+    "k": 1_000,
+    "m": 1_000_000,
+    "b": 1_000_000_000,
+    "mil": 1_000,
+    "mi": 1_000_000,
+    "milhão": 1_000_000, "milhao": 1_000_000,
+    "milhões": 1_000_000, "milhoes": 1_000_000,
+    "bi": 1_000_000_000,
+    "bilhão": 1_000_000_000, "bilhao": 1_000_000_000,
+    "bilhões": 1_000_000_000, "bilhoes": 1_000_000_000,
+}
+
+
+def parse_abbreviated_view_count(text: Optional[str]) -> Optional[int]:
+    """Parse abbreviated/locale view-count text into the TRUE integer count.
+
+    Handles '8.7K', '8,7 mil', '19 mil', '1,2 mi', '1,2 bilhão', '8.700' and
+    plain ints; returns None when no recognizable count is present (callers
+    then fall back to yt-dlp's own parser).
+    """
+    if not text:
+        return None
+    m = _LOCALE_COUNT_RE.search(str(text).strip())
+    if not m:
+        return None
+    num_str, unit = m.group("num"), (m.group("unit") or "").lower()
+    if "," in num_str and "." in num_str:
+        # pt/es: dot is thousands, comma is the decimal separator ("8.700,5")
+        num = float(num_str.replace(".", "").replace(",", "."))
+    elif "," in num_str:
+        tail = num_str.split(",", 1)[1]
+        if len(tail) == 3:
+            num = float(num_str.replace(",", ""))  # en-style thousands "8,700"
+        else:
+            num = float(num_str.replace(",", "."))  # pt/es decimal "8,7"
+    elif "." in num_str and not unit:
+        groups = num_str.split(".")
+        if 1 <= len(groups[0]) <= 3 and all(len(g) == 3 for g in groups[1:]):
+            num = float(num_str.replace(".", ""))  # pt thousands "8.700"
+        else:
+            return None  # ambiguous — let yt-dlp's parser decide
+    else:
+        num = float(num_str)
+    return int(round(num * _LOCALE_COUNT_UNITS.get(unit, 1)))
+
+
+_LOCALIZED_PARSE_INSTALLED = False
+
+
+def _install_localized_count_parser() -> None:
+    """Teach yt-dlp's count parser pt/es suffixes + comma decimals.
+
+    The app requests lang=pt translated tab fields (youtube_session), so flat
+    tab entries carry strings like "8,7 mil visualizações"; yt-dlp's
+    parse_count misparses them (87 for 8.7k). Patch both the canonical
+    yt_dlp.utils.parse_count and the copy imported into the youtube extractor
+    module (yt_dlp.extractor.youtube._base). Idempotent per process.
+    """
+    global _LOCALIZED_PARSE_INSTALLED
+    if _LOCALIZED_PARSE_INSTALLED:
+        return
+    try:
+        import yt_dlp.utils as _utils
+
+        _orig = _utils.parse_count
+        if getattr(_orig, "_vodrip_localized", False):
+            _LOCALIZED_PARSE_INSTALLED = True
+            return
+
+        def _parse_count_localized(text):
+            parsed = parse_abbreviated_view_count(text)
+            return parsed if parsed is not None else _orig(text)
+
+        _parse_count_localized._vodrip_localized = True  # type: ignore[attr-defined]
+        _utils.parse_count = _parse_count_localized
+        try:
+            from yt_dlp.extractor.youtube import _base as _yt_base
+
+            _yt_base.parse_count = _parse_count_localized
+        except Exception:  # noqa: BLE001 — module layout drift must not break listings
+            pass
+    except Exception as exc:  # noqa: BLE001 — parser install is best-effort
+        logger.debug("localized count parser install failed: %s", exc)
+    _LOCALIZED_PARSE_INSTALLED = True
+
+
+# RSS-shorts freshness: the /shorts tab (yt-dlp) can lag new uploads by hours
+# or days, so the channel's atom RSS feed (authoritative newest-first uploads)
+# is unioned into shorts listings. Candidates missing from the tab are probed
+# (one flat extract each) to classify short vs stream vs video; probes are
+# bounded per listing and cached module-wide across listings.
+_RSS_SHORT_PROBE_BUDGET = 4
+_RSS_SHORT_PROBE_CACHE: dict[str, Optional[dict[str, Any]]] = {}
+
+
+def _make_rss_probe():
+    """Return probe(vid) -> metadata dict | None for RSS-only shorts candidates.
+
+    Probes run one FULL single-video extract: the flat-tab path's
+    player_client override (ios/mweb/web) plus extract_flat breaks single-
+    video metadata ("Requested format is not available"), so the probe builds
+    its own opts with the default client set (same as archive_ytdlp).
+    Results are cached module-wide across listings.
+    """
+
+    def probe(vid: str) -> Optional[dict[str, Any]]:
+        if vid in _RSS_SHORT_PROBE_CACHE:
+            return _RSS_SHORT_PROBE_CACHE[vid]
+        from services.ytdlp_guard import guarded_youtube_dl_channel
+        from services.youtube_session import (
+            apply_ytdlp_cookie_opts,
+            youtube_session_from_settings,
+            ytdlp_extractor_args,
+        )
+
+        meta: Optional[dict[str, Any]] = None
+        try:
+            session = youtube_session_from_settings()
+            try:
+                from deps import settings_mgr
+                auto_auth = getattr(settings_mgr.get(), "youtube_auto_auth", True)
+            except Exception:
+                auto_auth = True
+            probe_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "ignoreerrors": True,
+                "socket_timeout": 12,
+                "extractor_args": ytdlp_extractor_args(session, auto_auth=auto_auth),
+            }
+            apply_ytdlp_cookie_opts(probe_opts, session, auto_auth=auto_auth)
+            with guarded_youtube_dl_channel(probe_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            dur = info.get("duration")
+            duration_sec = int(float(dur)) if dur is not None else None
+            live_status = info.get("live_status")
+            if live_status in ("live", "is_live", "is_upcoming", "was_live", "post_live"):
+                kind = "stream"
+            elif duration_sec is not None and duration_sec < 180:
+                # Shorts window: YouTube accepts up to 3-minute shorts. The tab
+                # fetch classifies by /shorts/ URL, which flat probes lack.
+                # ponytail: yt-dlp exposes no isShort flag here; upgrade path =
+                # probe the /shorts/<id> URL and detect the reel marker.
+                kind = "short"
+            else:
+                kind = "video"
+            meta = {"content_kind": kind, "duration": duration_sec, "availability": info.get("availability")}
+        except Exception as exc:  # noqa: BLE001 — probe is best-effort
+            logger.debug("youtube rss-short probe %s failed: %s", vid, exc)
+        _RSS_SHORT_PROBE_CACHE[vid] = meta
+        if len(_RSS_SHORT_PROBE_CACHE) > 2000:
+            _RSS_SHORT_PROBE_CACHE.clear()
+        return meta
+
+    return probe
+
+
+def _union_rss_shorts(
+    rows: list[dict[str, Any]],
+    channel_id: Optional[str],
+    probe,
+    *,
+    budget: int = _RSS_SHORT_PROBE_BUDGET,
+) -> list[dict[str, Any]]:
+    """Merge brand-new shorts from the channel RSS feed into a shorts listing.
+
+    Returns the input rows plus any RSS-only entries the probe classifies as
+    shorts (dedup by video id; streams/VODs and member-only entries excluded).
+    The caller sorts and applies :limit afterwards, so union rows participate
+    in the normal date ordering.
+    """
+    if not channel_id or not rows:
+        return rows
+    rss = _fetch_youtube_rss_rows(channel_id)
+    if not rss:
+        return rows
+    have = {r.get("id") for r in rows if r.get("id")}
+    merged = list(rows)
+    probed = 0
+    for r in rss:
+        vid = r.get("id")
+        if not vid or vid in have:
+            continue
+        if probed >= budget:
+            break
+        probed += 1
+        meta = probe(vid) if probe else None
+        if not meta or meta.get("content_kind") != "short":
+            continue
+        if meta.get("availability") == "subscriber_only":
+            continue  # keep member-only filtering at the union boundary too
+        duration_sec = meta.get("duration")
+        merged.append({
+            "_list_order": len(merged) + 1,
+            "id": vid,
+            "platform": "YouTube",
+            "title": r.get("title") or "Untitled",
+            "duration": duration_sec,
+            "duration_string": _duration_string_from_sec(duration_sec) if duration_sec else None,
+            "created_at": r.get("created_at"),
+            "views": r.get("views"),  # RSS statistics views: exact ints
+            "thumbnail_url": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            "url": f"https://www.youtube.com/shorts/{vid}",
+            "channel": channel_id,
+            "content_kind": "short",
+            "availability": None,
+        })
+        have.add(vid)
+    return merged
 
 
 
@@ -212,6 +437,14 @@ def _enrich_with_rss_dates(rows: list[dict[str, Any]], channel_id: Optional[str]
                 row["created_at"] = r["created_at"]
             if row.get("views") is None and r.get("views") is not None:
                 row["views"] = r["views"]
+            elif (
+                row.get("views") is not None
+                and r.get("views") is not None
+                and abs(int(r["views"]) - int(row["views"])) > 3 * max(int(row["views"]), 1)
+            ):
+                # RSS counts are exact; a flat-tab value >3x off is a broken
+                # localized parse — never ship a count off by ~10/100/1000.
+                row["views"] = r["views"]
 
 
 def list_channel_videos_sync(
@@ -230,6 +463,7 @@ def list_channel_videos_sync(
         ytdlp_extractor_args,
     )
 
+    _install_localized_count_parser()
     session = youtube_session_from_settings()
     try:
         from deps import settings_mgr
@@ -341,6 +575,12 @@ def list_channel_videos_sync(
     else:
         filtered = [v for v in all_videos.values() if not _memb_only(v)]
 
+    # Shorts freshness: the /shorts tab can lag new uploads — union the
+    # channel's atom RSS feed and keep only entries the probe classifies as
+    # shorts. Best-effort and bounded (see _RSS_SHORT_PROBE_BUDGET).
+    if pl == "shorts" and enrich and channel_id and filtered:
+        filtered = _union_rss_shorts(filtered, channel_id, _make_rss_probe())
+
     # Sort by date newest first; items without dates preserve playlist order
     filtered.sort(key=lambda v: (_parse_video_ts(v.get("created_at")) or 0, -(v.get("_list_order", 0))), reverse=True)
     filtered = filtered[:limit]
@@ -380,6 +620,7 @@ def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list
         ytdlp_extractor_args,
     )
 
+    _install_localized_count_parser()
     session = youtube_session_from_settings()
     try:
         from deps import settings_mgr
@@ -452,3 +693,16 @@ assert _created_at_from_entry({"upload_date": "20240511"}) is not None
 assert _created_at_from_entry({"timestamp": 1_700_000_000}) is not None
 assert _duration_string_from_sec(125) == "2:05"
 assert _enrich_with_rss_dates([], "dummy") is None  # self-check: no-op on empty input
+
+# View-count parse self-checks (localized abbreviated forms -> true ints).
+assert parse_abbreviated_view_count("8.7K views") == 8700
+assert parse_abbreviated_view_count("8,7 mil visualizações") == 8700
+assert parse_abbreviated_view_count("19 mil") == 19000
+assert parse_abbreviated_view_count("2,5 mil") == 2500
+assert parse_abbreviated_view_count("1 mil") == 1000
+assert parse_abbreviated_view_count("1,2 mi") == 1_200_000
+assert parse_abbreviated_view_count("8.700") == 8700
+assert parse_abbreviated_view_count("8700") == 8700
+assert parse_abbreviated_view_count("") is None
+assert parse_abbreviated_view_count("no views") is None
+assert _union_rss_shorts([], "UCdummy", probe=None) == []  # self-check: no-op on empty input

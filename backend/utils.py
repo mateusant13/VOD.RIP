@@ -818,6 +818,11 @@ def looks_like_clip_entry(entry: dict) -> bool:
         pass
     elif "/clip/" in url:
         pass
+    elif entry.get("content_kind") == "short" and str(entry.get("platform") or "").lower() == "youtube":
+        # YouTube shorts (up to 3 min, /shorts/ urls) belong in the Shorts
+        # listing — the clips filter was written when shorts were classified
+        # "clip"; the "short" kind must not be dropped here.
+        pass
     elif entry.get("content_kind") != "clip":
         return False
     duration = entry.get("duration")
