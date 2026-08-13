@@ -46,13 +46,6 @@ const MAX_ROWS = 300;
 /** Panel width — the popup's aspect-lock reserves this from the video area. */
 export const LIVE_CHAT_PANEL_W = 260;
 
-function rowTime(ts: string | null | undefined): string {
-  if (!ts) return '';
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
 function platformColor(platform: string): string {
   if (platform === 'kick') return KICK_COLOR;
   if (platform === 'twitch') return TWITCH_COLOR;
@@ -76,17 +69,12 @@ const ChatRow = memo(function ChatRow({
   showPlatform: boolean;
   emotes: EmoteMap;
 }) {
-  const { t } = useI18n();
-  const time = rowTime(row.ts);
   return (
     <div
       data-live-chat-row
       className="flex items-baseline gap-1 px-2 py-0.5 overflow-hidden border-l-2 border-transparent whitespace-nowrap text-zinc-200 hover:bg-zinc-900/70"
       title={row.text}
     >
-      {time ? (
-        <span className="text-zinc-500 font-mono text-[9px] shrink-0">{time}</span>
-      ) : null}
       {showPlatform ? (
         <span
           className="text-[8px] font-mono uppercase shrink-0"
@@ -104,11 +92,6 @@ const ChatRow = memo(function ChatRow({
       <span className="text-[10px] leading-snug truncate" title={row.text}>
         <ChatEmoteText text={row.text} emotes={emotes} />
       </span>
-      {row.badges?.length ? (
-        <span className="text-[8px] font-mono text-zinc-500 shrink-0" title={t('Badges')}>
-          {row.badges.join(' ')}
-        </span>
-      ) : null}
     </div>
   );
 });
