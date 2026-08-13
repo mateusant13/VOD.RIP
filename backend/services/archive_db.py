@@ -302,6 +302,9 @@ _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 _conn_path: Optional[str] = None
 _schema_ready = False
+# worker_heartbeats gained a pid column for daemon take-over detection
+# (ALTER applied lazily on first heartbeat with a pid).
+_HB_PID_COL = False
 
 
 def get_conn() -> sqlite3.Connection:
@@ -2552,15 +2555,45 @@ def recent_transcripts(platform: str, video_id: str, limit: int = 200) -> list[d
     ]
 
 
-def worker_heartbeat(tag: str) -> None:
+def worker_heartbeat(tag: str, pid: Optional[int] = None) -> None:
     """Stamp a worker liveness row (upsert); workers call this every poll
     iteration so search enrichment can tell an honest 'Indexing…' line from
-    a queue nobody consumes."""
+    a queue nobody consumes. The background daemon passes its pid so a
+    replacement daemon can detect take-over; other callers leave it None
+    and the existing pid (if any) is preserved."""
+    global _HB_PID_COL
+    if not _HB_PID_COL:
+        try:
+            execute("ALTER TABLE worker_heartbeats ADD COLUMN pid INTEGER")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+        _HB_PID_COL = True
     execute(
-        "INSERT INTO worker_heartbeats (tag, at) VALUES (?, ?) "
-        "ON CONFLICT(tag) DO UPDATE SET at = excluded.at",
-        (tag, _now_iso()),
+        "INSERT INTO worker_heartbeats (tag, at, pid) VALUES (?, ?, ?) "
+        "ON CONFLICT(tag) DO UPDATE SET "
+        "at = excluded.at, pid = COALESCE(excluded.pid, worker_heartbeats.pid)",
+        (tag, _now_iso(), pid),
     )
+
+
+def worker_heartbeat_owner(tag: str, age_s: int = 30) -> Optional[int]:
+    """PID of the process that owns *tag*'s live heartbeat, or None when
+    stale or never stamped. The daemon uses this to detect that another
+    daemon took over the machine (owner != own pid → exit 0)."""
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
+            timespec="seconds"
+        )
+        row = query(
+            "SELECT pid FROM worker_heartbeats WHERE tag = ? AND at >= ?",
+            (tag, cutoff),
+        )
+        return row[0][0] if row else None
+    except sqlite3.Error:
+        return None
 
 
 def worker_live(age_s: int = 30, tag: str = "transcribe") -> bool:

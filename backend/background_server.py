@@ -192,7 +192,7 @@ def main() -> int:
     def _heartbeat() -> None:
         while not stop.wait(HEARTBEAT_EVERY_S):
             try:
-                archive_db.worker_heartbeat(TAG)
+                archive_db.worker_heartbeat(TAG, pid=os.getpid())
             except Exception:
                 _log.debug("heartbeat failed", exc_info=True)
 
@@ -202,6 +202,24 @@ def main() -> int:
     last_hygiene = time.monotonic()
     try:
         while True:
+            # First-wins is only checked at start; a replacement daemon that
+            # won the guard later (heartbeat aged out) must make the loser
+            # exit instead of piling up (41 duplicates observed). Exit 0
+            # whenever a DIFFERENT process owns the live heartbeat.
+            try:
+                owner = archive_db.worker_heartbeat_owner(TAG, age_s=90)
+                if owner is not None and owner != os.getpid():
+                    _log.info("another background daemon took over — exiting.")
+                    return 0
+            except Exception:
+                _log.debug("take-over check failed", exc_info=True)
+            # A test/CLI scratch DB that vanished means the harness that
+            # spawned this daemon is gone — never outlive it (spawned with
+            # a per-test scratch DB, the guard is invisible between them).
+            scratch = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
+            if scratch and not Path(scratch).exists():
+                _log.info("scratch DB removed — exiting.")
+                return 0
             if _app_alive():
                 _stop_services()
                 time.sleep(TICK_S)

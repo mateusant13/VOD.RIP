@@ -216,6 +216,12 @@ def _run() -> None:
     # fixture's and this run failed on them, not on the fixture.
     _n = archive_db.query("SELECT COUNT(*) AS n FROM archive_jobs")[0]["n"]
     assert _n == 0, f"scratch DB not empty ({_n} jobs) — real archive leaked in"
+    # Daemon take-over detection: pid stamped on heartbeat round-trips back
+    # through worker_heartbeat_owner, and a None pid never clobbers it.
+    archive_db.worker_heartbeat("e2e-hb", pid=os.getpid())
+    assert archive_db.worker_heartbeat_owner("e2e-hb", age_s=90) == os.getpid()
+    archive_db.worker_heartbeat("e2e-hb")
+    assert archive_db.worker_heartbeat_owner("e2e-hb", age_s=90) == os.getpid()
     fixture = _build_fixture()
     archive_db.upsert_video({
         "platform": PLATFORM,
