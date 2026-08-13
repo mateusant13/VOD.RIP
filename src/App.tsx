@@ -8,7 +8,7 @@ import {
   Users, Database, Settings2, Loader2, Search,
   AlertCircle, RefreshCw, Pencil, Plus,
   ExternalLink, Eye, Volume2, VolumeX, Maximize2, Minimize2,
-  GripVertical,
+  GripVertical, MessageSquare,
 } from 'lucide-react';
 import { twitchClipDownloadRequest, clipSlugFromUrl, type TwitchClipRecord } from './twitchClip';
 import { EMPTY_CHAT_MARKERS, type ChatMarkers } from './components/ChatRangeMarkers';
@@ -65,6 +65,9 @@ import {
   shieldPreviewBuffering,
   createPreviewSessionWithRetry,
   pinHlsToLowestLevel,
+  waitForPreviewMuxReady,
+  shouldWaitForPreviewMux,
+  previewPlaylistPollMaxMs,
   type PreviewLevelOption,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable, notePreviewGesture } from './previewTiming';
@@ -478,6 +481,9 @@ export default function App() {
   }));
   const previewChatLayoutRef = useRef(previewChatLayout);
   previewChatLayoutRef.current = previewChatLayout;
+  /** Main-preview chat panel open state (header toggle). Mirrors the panel's
+   *  own defaultOpen=true; reset on close so the next preview opens with chat. */
+  const [previewChatOpen, setPreviewChatOpen] = useState(true);
   /** Load start of the current preview session — any user unpause at/after
    *  this timestamp suppresses the load-complete auto-pause. */
   const previewLoadSinceRef = useRef(0);
@@ -1305,6 +1311,7 @@ export default function App() {
     setPreviewTimeUi(0);
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
+    setPreviewChatOpen(true);
     setTrimPanelHeight(0);
     setPreviewLevels([]);
     setPreviewQualityLevel(0);
@@ -1803,10 +1810,35 @@ export default function App() {
       // knobs (liveSyncDuration/liveDurationInfinity) or playback stalls at the
       // playlist edge because duration keeps growing.
       if (res.growing_vod || res.is_live) previewIsLiveRef.current = true;
-      const playback = resolvePreviewPlayback(url.trim(), res);
-      if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
+      // Window-HLS mux races the attach: a cold YouTube session (first click,
+      // shorts/channel-list batch warm is resolve-only, no mux preflight)
+      // returns from create with an EMPTY window playlist. Attaching hls.js
+      // then stalls forever — no fragments, no error, no media-playlist
+      // retry — and the start-phase guard kills the preview. Wait for
+      // playlist/seg0 instead; muxed-CDN-HLS and already-ready sessions
+      // short-circuit immediately (shouldWaitForPreviewMux).
+      if (youtubePreview && res.kind === 'hls' && shouldWaitForPreviewMux(res, 'hls')) {
+        timing.mark('wait_mux');
+        const muxReady = await waitForPreviewMuxReady(
+          res.session_id,
+          apiGet,
+          undefined,
+          previewPlaylistPollMaxMs(),
+        );
+        if (guard.handled) return false;
+        if (bailIfSuperseded()) return false;
+        if (!muxReady) {
+          // Backend mux never produced a playable window playlist — surface
+          // the retry UI (session-stage: a fresh create re-muxes) instead of
+          // attaching to an empty playlist and spinning until the guard.
+          timing.mark('wait_mux_timeout');
+          throw new Error(t('Preview took too long — try again'));
+        }
+        timing.mark('mux_ready');
+      } else if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
         timing.mark('attach_before_segments');
       }
+      const playback = resolvePreviewPlayback(url.trim(), res);
       setPreviewPlayback({
         ...playback,
         variantHeights: res.variant_heights ?? [],
@@ -3536,6 +3568,28 @@ export default function App() {
       const targetMainH = Math.min(maxH, Math.max(PANEL_MIN.h, ownedPanelHeightRef.current.main));
       if (mainPanelSizeRef.current.h !== targetMainH) {
         const nextMain = { ...mainPanelSizeRef.current, h: targetMainH };
+        mainPanelSizeRef.current = nextMain;
+        setMainPanelSize(nextMain);
+        if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, nextMain);
+      }
+      // Preview-open preview/URL-aside drags squeeze the SIBLING widths and
+      // commit them to state (applyLayoutRowSizes persists the fitted row);
+      // closing the preview must release them. Restore the widths the user
+      // last deliberately dragged each panel to (preferredDragRef — sibling
+      // squeezes never write it), like the height fallback above. A deliberate
+      // closed-preview S-edge drag is never clobbered: it only runs on the
+      // open→closed transition, and the owned width is the user's own choice.
+      const ownedW = preferredDragRef.current;
+      const targetUrlW = Math.max(PANEL_MIN.w, Number.isFinite(ownedW.urlAside) ? ownedW.urlAside : urlAsidePanelSizeRef.current.w);
+      if (urlAsidePanelSizeRef.current.w !== targetUrlW) {
+        const nextUrl = { ...urlAsidePanelSizeRef.current, w: targetUrlW };
+        urlAsidePanelSizeRef.current = nextUrl;
+        setUrlAsidePanelSize(nextUrl);
+        if (urlAsidePanelRef.current) applyPanelSize(urlAsidePanelRef.current, nextUrl);
+      }
+      const targetMainW = Math.max(PANEL_MIN.w, Number.isFinite(ownedW.main) ? ownedW.main : mainPanelSizeRef.current.w);
+      if (mainPanelSizeRef.current.w !== targetMainW) {
+        const nextMain = { ...mainPanelSizeRef.current, w: targetMainW };
         mainPanelSizeRef.current = nextMain;
         setMainPanelSize(nextMain);
         if (mainPanelRef.current) applyPanelSize(mainPanelRef.current, nextMain);
@@ -6535,6 +6589,20 @@ export default function App() {
               </button>
               <button
                 type="button"
+                onClick={() => setPreviewChatOpen((o) => !o)}
+                aria-pressed={previewChatOpen}
+                title={previewChatOpen ? t('Close preview chat panel') : t('Open preview chat panel')}
+                className={`flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                  previewChatOpen
+                    ? 'bg-white text-black border-white'
+                    : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+                }`}
+              >
+                <MessageSquare size={10} className="shrink-0" />
+                {previewChatOpen ? t('Close chat') : t('Chat')}
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   const trimmed = url.trim();
                   if (trimmed) window.open(trimmed, '_blank', 'noopener,noreferrer');
@@ -6691,6 +6759,8 @@ export default function App() {
               platform={activePlatform}
               videoId={previewArchiveVideoId}
               currentTime={previewTimeUi}
+              open={previewChatOpen}
+              onOpenChange={setPreviewChatOpen}
               // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
               channel={videoInfo?.channel ?? null}
               // Click-to-seek: chat/transcript/event rows and the subtitle

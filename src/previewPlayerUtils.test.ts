@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyPolicyHeights,
   resolveHlsPreviewLevels,
   resolveProgressivePreviewLevels,
+  shouldWaitForPreviewMux,
+  waitForPreviewMuxReady,
   youtubePreviewAllowHeights,
 } from './previewPlayerUtils';
 
@@ -127,5 +129,84 @@ describe('resolveHlsPreviewLevels policy cap', () => {
       { initialHeight: 360, fallbackHeights: [360, 720, 1080], allowHeights: [360] },
     );
     expect(mapped.map((m) => m.height)).toEqual([360]);
+  });
+});
+
+describe('shouldWaitForPreviewMux (attach vs mux-wait gate)', () => {
+  it('cold window-HLS (short ≥60s: trim_timeline=false, empty playlist) MUST wait', () => {
+    expect(shouldWaitForPreviewMux(
+      { playlist_ready: false, segment_buffer_ready: false, trim_timeline: false, mux_ready: false },
+      'hls',
+    )).toBe(true);
+  });
+
+  it('trim-window window-HLS waits for seg0', () => {
+    expect(shouldWaitForPreviewMux(
+      { playlist_ready: false, segment_buffer_ready: false, trim_timeline: true, mux_ready: false },
+      'hls',
+    )).toBe(true);
+  });
+
+  it('muxed CDN HLS with a live playlist attaches immediately', () => {
+    expect(shouldWaitForPreviewMux(
+      { playlist_ready: true, segment_buffer_ready: false, trim_timeline: false, mux_ready: false },
+      'hls',
+    )).toBe(false);
+  });
+
+  it('a session whose playlist/seg0 already landed never waits', () => {
+    expect(shouldWaitForPreviewMux(
+      { playlist_ready: true, segment_buffer_ready: true, trim_timeline: true, mux_ready: false },
+      'hls',
+    )).toBe(false);
+    expect(shouldWaitForPreviewMux(
+      { playlist_ready: false, segment_buffer_ready: false, trim_timeline: false, mux_ready: true },
+      'hls',
+    )).toBe(false);
+  });
+});
+
+describe('waitForPreviewMuxReady (window-HLS readiness poll)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns true as soon as the backend reports playlist_ready', async () => {
+    const apiGet = vi.fn()
+      .mockResolvedValueOnce({ playlist_ready: false, segment_buffer_ready: false, mux_ready: false })
+      .mockResolvedValueOnce({ playlist_ready: true, segment_buffer_ready: true, mux_ready: false });
+    const done = waitForPreviewMuxReady('s1', apiGet, undefined, 15_000);
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(done).resolves.toBe(true);
+    expect(apiGet).toHaveBeenCalledWith('/api/preview/session/s1/status');
+  });
+
+  it('returns false when the session never becomes playable before the deadline', async () => {
+    const apiGet = vi.fn().mockResolvedValue({ playlist_ready: false, segment_buffer_ready: false, mux_ready: false });
+    const done = waitForPreviewMuxReady('s1', apiGet, undefined, 15_000);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(done).resolves.toBe(false);
+  });
+
+  it('aborts early when the open was superseded (signal gen mismatch)', async () => {
+    const apiGet = vi.fn().mockResolvedValue({ playlist_ready: false, segment_buffer_ready: false, mux_ready: false });
+    const signal = { gen: 1, current: 1 };
+    const done = waitForPreviewMuxReady('s1', apiGet, signal, 15_000);
+    signal.current = 2; // newer open superseded this wait
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(done).resolves.toBe(false);
+    expect(apiGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('survives transient status errors and keeps polling', async () => {
+    const apiGet = vi.fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ playlist_ready: true, segment_buffer_ready: false, mux_ready: false });
+    const done = waitForPreviewMuxReady('s1', apiGet, undefined, 15_000);
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(done).resolves.toBe(true);
   });
 });
