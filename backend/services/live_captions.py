@@ -1,0 +1,546 @@
+"""Real-time live captions — a refcounted per-(platform, channel) captioner.
+
+The livestream popup's CC overlay needs a rolling transcription of the live
+audio. One ``LiveCaptioner`` per (platform, channel) polls the channel's live
+HLS media playlist (audio-only rendition — a fraction of the bandwidth),
+downloads NEW segments (a seen-set skips re-downloads), decodes them to mono
+16 kHz PCM via ffmpeg, buffers a ~3s caption window, VAD-splits the window
+and transcribes the speech with the parakeet engine — reusing
+``archive_transcribe``'s recognizer (``_parakeet_model`` +
+``_transcribe_batch_parakeet``) so the model cache/download logic is shared
+with the archive worker. The whole loop runs in its own worker thread (SSE /
+HTTP stay responsive); caption blocks are pushed into a bounded asyncio queue
+via ``call_soon_threadsafe`` — the same per-connection queue pattern as the
+live chat SSE.
+
+Lifecycle: refcounted by active SSE subscribers — the first ``acquire()``
+starts the worker thread, the last ``release()`` stops it. Transcription
+imports ``archive_transcribe`` LAZILY inside the worker thread, so network
+I/O never holds the model lock and the archive transcribe worker can run
+concurrently (VAD serializes on its own lock; parakeet inference is lock-free
+per recognizer owner).
+
+Failures: transient (playlist fetch error, decode error) back off and retry,
+keeping the loop alive; a channel confirmed offline (resolver returns None
+``_OFFLINE_STRIKES`` times in a row, or the playlist carries ENDLIST) emits
+an ``offline`` event and stops. The SSE generator turns that into the last
+frame; the frontend hides the overlay. The worker NEVER raises into the
+generator.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import subprocess as sp
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+from urllib.parse import urljoin
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_PLATFORMS = ("twitch", "kick")
+
+# --- env knobs (all optional) ------------------------------------------------
+WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
+POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
+# ~3s of speech is a usable caption block (~2-4 words per second of speech);
+# a 1s window would yield 2-3 words — too short to read. The player's ~1-2s
+# behind-live plus ~1-1.5s transcribe means captions land ~2-4s behind the
+# live edge, matching closed-caption expectations.
+WINDOW_SEC = 3.0
+POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
+_MASTER_TTL_SEC = 300.0  # re-resolve the live master (fresh usher tokens)
+_MASTER_403_TTL_SEC = 60.0  # ...or sooner after a 403 (expired token)
+_OFFLINE_STRIKES = 3  # consecutive offline resolutions -> offline event + stop
+_BACKOFF_INITIAL_SEC = 1.0
+_BACKOFF_MAX_SEC = 15.0
+_QUEUE_MAX = 8  # bounded subscriber queue — slow consumers drop blocks
+_HTTP_TIMEOUT = 10.0
+_SEGMENT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+class _Offline(RuntimeError):
+    """Channel confirmed offline or the stream ended."""
+
+
+# --- HLS parsing (master audio rendition + media playlist) -------------------
+
+_ATTR_RE = re.compile(r'([A-Z0-9-]+)="([^"]*)"')
+_PDT_RE = re.compile(r"#EXT-X-PROGRAM-DATE-TIME:\s*(.+)")
+_EXTINF_RE = re.compile(r"#EXTINF:\s*([\d.]+)")
+
+
+def _parse_master_audio_url(master_text: str, master_url: str) -> Optional[str]:
+    """Pick the audio-only rendition URI from an HLS master playlist.
+
+    Twitch usher masters (allow_audio_only=true) carry
+    ``#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_only",NAME="Audio Only",...
+    URI="..."``; Kick masters use a GROUP-ID/NAME without the audio_only
+    marker. Prefer an audio_only-ish group/name, else any TYPE=AUDIO line;
+    fall back to the first ``#EXT-X-STREAM-INF`` variant when the master has
+    no audio rendition. Relative URIs resolve against the master URL.
+    """
+    best: Optional[tuple[int, str]] = None
+    for line in master_text.splitlines():
+        if not line.startswith("#EXT-X-MEDIA:TYPE=AUDIO"):
+            continue
+        attrs = dict(_ATTR_RE.findall(line))
+        uri = attrs.get("URI", "")
+        if not uri:
+            continue
+        group = (attrs.get("GROUP-ID") or "").lower()
+        name = (attrs.get("NAME") or "").lower()
+        score = 2 if ("audio_only" in group or "audio only" in name) else 1
+        if best is None or score > best[0]:
+            best = (score, uri)
+    if best is not None:
+        return urljoin(master_url, best[1])
+    for block in master_text.split("#EXT-X-STREAM-INF")[1:]:
+        for line in block.splitlines()[1:]:
+            stripped = line.strip()
+            if stripped:
+                return urljoin(master_url, stripped)
+    return None
+
+
+def _parse_iso_epoch(value: str) -> float:
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _parse_media_playlist(text: str, base_url: str) -> tuple[list[dict], bool]:
+    """Parse a live media playlist.
+
+    Returns ``(segments, is_live)``: segments are ``{uri, dur, pdt}`` dicts
+    in playlist order (pdt = epoch seconds of the segment start, or None),
+    and ``is_live`` is False when the playlist carries ``#EXT-X-ENDLIST``
+    (the stream ended). LL-HLS ``#EXT-X-PART`` lines and map headers are
+    ignored — only COMPLETE ``#EXTINF`` segments are transcribed.
+    """
+    segments: list[dict] = []
+    is_live = True
+    cur_dur = 0.0
+    cur_pdt: Optional[float] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-ENDLIST"):
+            is_live = False
+        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME"):
+            m = _PDT_RE.match(line)
+            if m:
+                try:
+                    cur_pdt = _parse_iso_epoch(m.group(1))
+                except ValueError:
+                    cur_pdt = None
+        elif line.startswith("#EXTINF"):
+            m = _EXTINF_RE.search(line)
+            if m:
+                cur_dur = float(m.group(1))
+        elif line.startswith("#"):
+            continue
+        elif line and cur_dur > 0:
+            segments.append({"uri": urljoin(base_url, line), "dur": cur_dur, "pdt": cur_pdt})
+            cur_dur = 0.0
+            cur_pdt = None
+    return segments, is_live
+
+
+# --- fetch / decode ----------------------------------------------------------
+
+def _fetch(url: str, headers: dict) -> bytes:
+    """GET *url* with the resolver's headers (+ a browser UA). Raises on any
+    non-2xx — the worker treats that as a transient failure."""
+    import requests
+
+    hdrs = dict(headers or {})
+    # Same quirk the preview proxy handles (services/preview/session.py
+    # _request_headers): Twitch edge CDNs (*.ttvnw.net) 403 an EMPTY body for
+    # any request carrying an Origin header — the usher master fetch needs
+    # Origin, the CDN playlist/segment fetches must not send it.
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    if host == "ttvnw.net" or host.endswith(".ttvnw.net"):
+        hdrs = {k: v for k, v in hdrs.items() if k.lower() != "origin"}
+    hdrs.setdefault("User-Agent", _SEGMENT_UA)
+    resp = requests.get(url, headers=hdrs, timeout=_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _decode_audio_bytes(data: bytes) -> "Any":
+    """Decode one HLS segment (TS / fMP4 / ADTS AAC) to mono 16 kHz float32.
+
+    Same output contract as ``archive_transcribe.decode_audio`` (16k mono
+    float32 numpy array) but feeds the raw bytes through ffmpeg's stdin — no
+    temp files, one subprocess per segment (~100ms).
+    """
+    import numpy as np
+
+    from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+
+    cmd = [
+        _resolve_ffmpeg_exe(), "-v", "error", "-i", "pipe:0",
+        "-f", "f32le", "-ac", "1", "-ar", "16000", "-",
+    ]
+    proc = sp.run(cmd, input=data, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        raise RuntimeError(f"ffmpeg segment decode failed: {stderr}")
+    samples = np.frombuffer(proc.stdout, dtype=np.float32)
+    return samples.copy()  # writable copy, mirrors archive_transcribe.decode_audio
+
+
+def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
+    """Resolve the live master playlist — reuses the SAME resolver the
+    ``/api/live/{platform}`` endpoint uses (services.live_capture), so auth /
+    token / ad-rotation logic stays in one place. Returns ``{url, headers}``
+    or None when the channel is offline / unreachable."""
+    from services.live_capture import kick_live_info, twitch_live_info
+
+    info = twitch_live_info(channel) if platform == "twitch" else kick_live_info(channel)
+    if not info or not info.get("url"):
+        return None
+    return {"url": info["url"], "headers": info.get("headers") or {}}
+
+
+def _transcribe_window(audio: "Any", duration: float) -> str:
+    """VAD-split one decoded window and transcribe the speech with parakeet.
+
+    archive_transcribe is imported HERE, inside the worker thread (never on
+    the asyncio loop): the import is heavy (torch/numpy) and the model lock
+    must not be held during network I/O. Empty return = no speech (dead air /
+    music) — the caller emits no caption block.
+    """
+    from services import archive_transcribe as at
+
+    speech = at.vad_speech_seconds(audio)
+    if not speech:
+        return ""
+    rec = at._parakeet_model()
+    results = at._transcribe_batch_parakeet(rec, audio, speech, None)
+    texts: list[str] = []
+    for items, _lang in results:
+        for item in items:
+            text = (item.get("text") or "").strip()
+            if text:
+                texts.append(text)
+    return " ".join(texts)
+
+
+# --- captioner registry ------------------------------------------------------
+
+_CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def get_captioner(
+    platform: str, channel: str, loop: asyncio.AbstractEventLoop
+) -> "LiveCaptioner":
+    """The shared captioner for (platform, channel), created on first use."""
+    key = (platform, channel)
+    with _REGISTRY_LOCK:
+        c = _CAPTIONERS.get(key)
+        if c is None:
+            c = LiveCaptioner(platform, channel, loop)
+            _CAPTIONERS[key] = c
+        return c
+
+
+def _unregister(captioner: "LiveCaptioner") -> None:
+    key = (captioner.platform, captioner.channel)
+    with _REGISTRY_LOCK:
+        if _CAPTIONERS.get(key) is captioner:
+            _CAPTIONERS.pop(key, None)
+
+
+def captions_available(platform: str) -> tuple[bool, str]:
+    """(available, reason) gate — captions need the parakeet engine importable
+    AND its model files present locally (a live captioner must not trigger a
+    multi-GB download mid-stream). Runs off-loop via asyncio.to_thread."""
+    plat = (platform or "").lower()
+    if plat not in SUPPORTED_PLATFORMS:
+        return False, "captions support twitch and kick only"
+    try:
+        from services import archive_transcribe as at
+    except Exception as exc:  # pragma: no cover - env-specific
+        return False, f"transcription engine unavailable: {exc}"
+    if not at._parakeet_available():
+        return False, "parakeet engine unavailable (sherpa-onnx missing or VODRIP_PARAAKEET=0)"
+    if at._parakeet_resolve_dir() is None:
+        return False, "parakeet model not downloaded yet — run a transcription job to fetch it"
+    return True, ""
+
+
+# --- the captioner -----------------------------------------------------------
+
+class LiveCaptioner:
+    """One worker per (platform, channel), refcounted by SSE subscribers."""
+
+    def __init__(
+        self,
+        platform: str,
+        channel: str,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        window_sec: Optional[float] = None,
+        poll_sec: Optional[float] = None,
+    ):
+        self.platform = platform
+        self.channel = channel
+        self.loop = loop
+        # (event, data) tuples — consumed by the SSE generator. Bounded so a
+        # slow subscriber drops blocks instead of stalling the worker.
+        self.events: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+        self.window_sec = window_sec if window_sec is not None else _env_float(WINDOW_SEC_ENV, WINDOW_SEC)
+        self.poll_sec = poll_sec if poll_sec is not None else _env_float(POLL_SEC_ENV, POLL_SEC)
+        self._life_lock = threading.Lock()
+        self._refcount = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # Worker-owned state (touched only by the worker thread).
+        self._seen: set[str] = set()
+        self._buffer: Any = None  # np float32 16 kHz samples of the window
+        self._buffer_sec = 0.0
+        self._origin: Optional[float] = None  # epoch of stream time 0 (PDT-derived)
+        self._stream_sec = 0.0  # cumulative duration of ingested segments
+        self._master: Optional[dict] = None
+        self._master_at = 0.0
+        self._media_url: Optional[str] = None
+        self._offline_strikes = 0
+
+    # --- lifecycle -------------------------------------------------------
+
+    def acquire(self) -> None:
+        """Refcount++ — starts the worker thread on the first subscriber."""
+        with self._life_lock:
+            self._refcount += 1
+            if self._refcount == 1:
+                th = self._thread
+                if th is not None and th.is_alive():
+                    # The last release set _stop; wait for the old thread so a
+                    # restart never runs two polling loops (bounded — the
+                    # worker checks _stop between every step).
+                    th.join(timeout=2.0)
+                # Fresh pipeline on restart: the seen-set / buffer / master of
+                # a previous run must not leak into the new one.
+                self._seen = set()
+                self._buffer = None
+                self._buffer_sec = 0.0
+                self._origin = None
+                self._stream_sec = 0.0
+                self._master = None
+                self._master_at = 0.0
+                self._media_url = None
+                self._offline_strikes = 0
+                self._stop.clear()
+                self._thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name=f"live-captions-{self.platform}-{self.channel}",
+                )
+                self._thread.start()
+
+    def release(self) -> None:
+        """Refcount-- — stops the worker thread when the last subscriber
+        leaves. Idempotent-safe (refcount never goes negative)."""
+        with self._life_lock:
+            self._refcount = max(0, self._refcount - 1)
+            if self._refcount == 0:
+                self._stop.set()
+
+    # --- worker ----------------------------------------------------------
+
+    def _run(self) -> None:
+        try:
+            self._run_loop()
+        except Exception:
+            logger.exception(
+                "live captions worker crashed for %s/%s", self.platform, self.channel
+            )
+            self._emit("offline", {})
+        finally:
+            _unregister(self)
+
+    def _run_loop(self) -> None:
+        backoff = _BACKOFF_INITIAL_SEC
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                segments = self._poll_segments()
+            except _Offline:
+                self._offline_strikes += 1
+                if self._offline_strikes >= _OFFLINE_STRIKES:
+                    logger.info(
+                        "live captions %s/%s offline (confirmed)",
+                        self.platform, self.channel,
+                    )
+                    self._emit("offline", {})
+                    return
+                # Recheck at a poll-scaled cadence — the resolver call itself
+                # is the expensive part, so a short fixed pause per strike.
+                self._stop.wait(max(self.poll_sec * 3, 0.1))
+                continue
+            except Exception as exc:
+                # Transient: playlist fetch error / expired token / decode —
+                # back off and retry, keeping the loop (and the SSE) alive.
+                logger.debug(
+                    "live captions %s/%s transient error: %s",
+                    self.platform, self.channel, exc,
+                )
+                backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
+                self._stop.wait(backoff)
+                continue
+            backoff = _BACKOFF_INITIAL_SEC
+            self._offline_strikes = 0
+            for seg in segments:
+                if self._stop.is_set():
+                    return
+                try:
+                    self._ingest(seg)
+                except Exception as exc:
+                    # One bad segment must not kill the stream — skip it
+                    # (a brief caption gap) and keep polling.
+                    logger.debug(
+                        "live captions %s/%s segment skipped: %s",
+                        self.platform, self.channel, exc,
+                    )
+                    continue
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(0.05, self.poll_sec - elapsed))
+
+    def _poll_segments(self) -> list[dict]:
+        """Resolve/refresh the master as needed, fetch the media playlist,
+        and return NEW segments (not in the seen-set). Raises _Offline when
+        the channel is offline or the stream ended."""
+        now = time.monotonic()
+        if self._master is None or (now - self._master_at) >= _MASTER_TTL_SEC:
+            self._master = self._resolve_master()
+            self._master_at = now
+            self._media_url = None
+        master = self._master
+        try:
+            master_text = _fetch(master["url"], master["headers"]).decode("utf-8", "replace")
+        except Exception as exc:
+            if _is_http_403(exc):
+                # Expired usher token — re-resolve sooner than the TTL.
+                self._master = None
+                self._master_at = 0.0
+            raise
+        if self._media_url is None:
+            media = _parse_master_audio_url(master_text, master["url"])
+            if media is None:
+                raise RuntimeError("no media rendition in master playlist")
+            self._media_url = media
+        try:
+            playlist = _fetch(self._media_url, master["headers"]).decode("utf-8", "replace")
+        except Exception as exc:
+            if _is_http_403(exc):
+                self._master = None
+                self._master_at = 0.0
+            raise
+        segments, is_live = _parse_media_playlist(playlist, self._media_url)
+        if not is_live:
+            raise _Offline("stream ended")
+        new = [s for s in segments if s["uri"] not in self._seen]
+        for s in new:
+            self._seen.add(s["uri"])
+        return new
+
+    def _resolve_master(self) -> dict:
+        master = _resolve_live_master(self.platform, self.channel)
+        if master is None:
+            raise _Offline("channel offline")
+        logger.info("live captions %s/%s master resolved", self.platform, self.channel)
+        return master
+
+    def _ingest(self, seg: dict) -> None:
+        """Download, decode and buffer one segment; flush a caption when the
+        window fills."""
+        import numpy as np
+
+        master = self._master
+        data = _fetch(seg["uri"], master["headers"])
+        samples = _decode_audio_bytes(data)
+        if samples is None or len(samples) == 0:
+            return
+        dur = seg.get("dur") or (len(samples) / 16000.0)
+        if self._origin is None and seg.get("pdt") is not None:
+            # pdt is the segment's wall-clock start; stream time 0 = pdt
+            # minus the duration already consumed before this segment.
+            self._origin = seg["pdt"] - self._stream_sec
+        if self._buffer is None:
+            self._buffer = samples
+        else:
+            self._buffer = np.concatenate([self._buffer, samples])
+        self._buffer_sec += dur
+        self._stream_sec += dur
+        if self._buffer_sec >= self.window_sec:
+            self._flush()
+
+    def _flush(self) -> None:
+        """Transcribe the buffered window and emit one caption block.
+
+        The window rolls either way: dead air / no speech emits nothing (a
+        silent stretch must not accumulate forever), speech emits one block
+        with the window's absolute stream time (PDT-anchored when the
+        playlist carries PROGRAM-DATE-TIME, else stream-relative seconds)."""
+        audio = self._buffer
+        buffer_sec = self._buffer_sec
+        win_start_off = self._stream_sec - buffer_sec
+        self._buffer = None
+        self._buffer_sec = 0.0
+        try:
+            text = _transcribe_window(audio, buffer_sec)
+        except Exception as exc:
+            # ASR failure (model load hiccup, VAD error) — drop the window,
+            # keep rolling; never raise into the poll loop.
+            logger.debug("live captions %s/%s flush failed: %s", self.platform, self.channel, exc)
+            return
+        if not text:
+            return
+        logger.info(
+            "live captions %s/%s transcribed %.1fs window via parakeet: %s",
+            self.platform, self.channel, buffer_sec, text[:80],
+        )
+        start = win_start_off + (self._origin or 0.0)
+        self._emit("caption", {
+            "text": text,
+            "start": round(start, 3),
+            "end": round(start + buffer_sec, 3),
+        })
+
+    def _emit(self, event: str, data: dict) -> None:
+        def _put(q: asyncio.Queue, ev: str, payload: dict) -> None:
+            try:
+                q.put_nowait((ev, payload))
+            except asyncio.QueueFull:
+                pass  # slow subscriber — drop rather than stall the worker
+
+        self.loop.call_soon_threadsafe(_put, self.events, event, data)
+
+
+# --- helpers -----------------------------------------------------------------
+
+def _is_http_403(exc: BaseException) -> bool:
+    resp = getattr(exc, "response", None)
+    return resp is not None and getattr(resp, "status_code", None) == 403
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return max(0.1, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return default

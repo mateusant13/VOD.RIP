@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { Captions, ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { reportClipEvent } from '../twitchClip';
 import { useI18n } from '../i18n';
@@ -336,6 +336,65 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       .sort((a, b) => (order[a[0]] ?? 9) - (order[b[0]] ?? 9))
       .map(([platform, slug]) => ({ platform, slug }));
   }, [allEntries, channel, channelSlug]);
+
+  // --- Real-time live captions (CC overlay) ---
+  // The backend runs ONE captioner per (platform, channel) — audio-only HLS
+  // rendition, ~3s windows, parakeet ASR — and streams caption blocks over
+  // SSE. The popup probes /available once per playing entry (the parakeet
+  // gate 503s otherwise) and only then shows the CC toggle; the overlay
+  // renders the latest block. Captions are ON by default when available
+  // (the user's intent: the transcript IS the feature), toggle hides them.
+  const captionSource = useMemo(() => {
+    const plat = (activeEntry.platform || '').toLowerCase();
+    if (plat !== 'twitch' && plat !== 'kick') return null;
+    const saved = plat === 'kick' ? channel?.kickSlug : channel?.twitchSlug;
+    const slug = liveChatSlugFromUrl(activeEntry.url, plat) ?? saved ?? channelSlug;
+    return slug ? { platform: plat, channel: slug } : null;
+  }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
+  const [captionsAvailable, setCaptionsAvailable] = useState(false);
+  const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  const [caption, setCaption] = useState<{ text: string; start: number; end: number } | null>(null);
+
+  useEffect(() => {
+    setCaption(null); // a new stream starts with a clean overlay
+    if (!captionSource) {
+      setCaptionsAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/live/captions/available?${new URLSearchParams(captionSource)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        if (!cancelled) setCaptionsAvailable(body?.available === true);
+      })
+      .catch(() => {
+        if (!cancelled) setCaptionsAvailable(false);
+      });
+    return () => { cancelled = true; };
+  }, [captionSource]);
+
+  useEffect(() => {
+    if (!captionSource || !captionsAvailable || !captionsEnabled) return;
+    // jsdom has no EventSource — the chat panel degrades the same way; the
+    // tests stub it and drive the handlers directly.
+    if (typeof EventSource === 'undefined') return;
+    const es = new EventSource(`/api/live/captions?${new URLSearchParams(captionSource)}`);
+    es.addEventListener('caption', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { text: string; start: number; end: number };
+        setCaption(data);
+      } catch {
+        // malformed frame — keep the last caption
+      }
+    });
+    es.addEventListener('offline', () => {
+      // Stream ended / channel offline — hide the overlay and stop the
+      // native EventSource auto-retry (it would hammer the dead stream).
+      setCaptionsAvailable(false);
+      es.close();
+    });
+    return () => es.close();
+  }, [captionSource, captionsAvailable, captionsEnabled]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -1666,6 +1725,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
+              {/* Live captions toggle — CC overlay over the video. Only
+                  rendered when the parakeet gate reports available (503 /
+                  missing engine → no button, no overlay). */}
+              {captionsAvailable && (
+                <button
+                  type="button"
+                  onClick={() => setCaptionsEnabled((on) => !on)}
+                  aria-pressed={captionsEnabled}
+                  title={captionsEnabled ? t('Hide captions') : t('Live captions')}
+                  className={transportBtn}
+                >
+                  <Captions size={15} />
+                </button>
+              )}
+
               {/* Fast CLIP — one click, no popups: seconds input (5..60) +
                   5s cooldown; the backend reports its real capability
                   (never fakes a clip). */}
@@ -1766,6 +1840,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Live captions overlay — the latest caption block sits above the
+            transport and NEVER intercepts pointer events (video/controls
+            stay fully clickable). */}
+        {captionsAvailable && captionsEnabled && caption && !loading && !error && (
+          <div
+            data-live-captions-overlay
+            className="pointer-events-none absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
+          >
+            <p className="line-clamp-2 max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center text-sm font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]">
+              {caption.text}
+            </p>
           </div>
         )}
       </div>
