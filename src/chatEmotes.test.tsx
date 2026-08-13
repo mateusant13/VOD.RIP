@@ -127,12 +127,34 @@ describe('useChatEmotes', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('skips the fetch entirely for non-twitch platforms and missing slug', () => {
-    const fetchMock = mockEmotesFetch([]);
+  it('fetches channel emotes for kick too, keyed by platform+slug', async () => {
+    const fetchMock = mockEmotesFetch([{ name: 'LULW', url: 'https://cdn.example/LULW.png' }]);
     const { rerender } = render(<HookProbe platform="kick" slug="srdoglol" />);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      '/api/chat/emotes?platform=kick&slug=srdoglol',
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId('emotes').getAttribute('data-count')).toBe('1'),
+    );
+    expect(screen.getByTestId('emotes').textContent).toBe('LULW=https://cdn.example/LULW.png');
+    // Cache key includes the platform: same slug on twitch is a separate entry.
+    rerender(<HookProbe platform="twitch" slug="srdoglol" />);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toContain(
+      '/api/chat/emotes?platform=twitch&slug=srdoglol',
+    );
+  });
+
+  it('skips the fetch entirely for youtube/unknown platforms and missing slug', () => {
+    const fetchMock = mockEmotesFetch([]);
+    const { rerender } = render(<HookProbe platform="youtube" slug="srdoglol" />);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(screen.getByTestId('emotes').getAttribute('data-count')).toBe('0');
     rerender(<HookProbe platform="twitch" slug={null} />);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId('emotes').getAttribute('data-count')).toBe('0');
+    rerender(<HookProbe platform={null} slug="x" />);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(screen.getByTestId('emotes').getAttribute('data-count')).toBe('0');
   });

@@ -245,15 +245,27 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
     };
   }, [sources]);
 
-  // Channel emotes for the panel's twitch source (kick/youtube have no
-  // custom emotes). One map for the whole merged panel — multi-source rows
-  // share the twitch channel's emotes. The map reference is stable (cache),
-  // so memoized ChatRows only re-render once when the fetch resolves.
+  // Channel emotes: first twitch source, then first kick source (youtube has
+  // no custom emotes). One merged map for the whole panel — twitch wins name
+  // collisions, kick fills the rest. Map references are stable (cache), so
+  // memoized ChatRows only re-render once when the fetches resolve.
   const twitchSlug = useMemo(
     () => sources.find((s) => s.platform === 'twitch')?.slug?.trim() || null,
     [sources],
   );
-  const emotes = useChatEmotes(twitchSlug ? 'twitch' : null, twitchSlug ?? undefined);
+  const kickSlug = useMemo(
+    () => sources.find((s) => s.platform === 'kick')?.slug?.trim() || null,
+    [sources],
+  );
+  const twitchEmotes = useChatEmotes(twitchSlug ? 'twitch' : null, twitchSlug ?? undefined);
+  const kickEmotes = useChatEmotes(kickSlug ? 'kick' : null, kickSlug ?? undefined);
+  const emotes = useMemo(() => {
+    const merged = new Map(twitchEmotes);
+    for (const [name, url] of kickEmotes) {
+      if (!merged.has(name)) merged.set(name, url);
+    }
+    return merged;
+  }, [twitchEmotes, kickEmotes]);
 
   // Rows visible under the active filter (all → every platform).
   const visibleRows = useMemo(

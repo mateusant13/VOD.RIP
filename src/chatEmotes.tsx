@@ -9,12 +9,12 @@
  * token that matches renders as an inline <img>; every other token stays
  * verbatim text (original whitespace preserved).
  *
- * Emote source: GET /api/chat/emotes?platform=twitch&slug={login} →
- * {"emotes": [{name, provider ("bttv"|"ffz"|"7tv"), url, global}]}, names
- * already deduped server-side by Chatterino priority (FFZ channel > BTTV
- * channel > 7TV channel > FFZ global > BTTV global > 7TV global). slug is
- * REQUIRED (missing → HTTP 400; there is no global-only mode), so the hook
- * skips the call entirely without a login.
+ * Emote source: GET /api/chat/emotes?platform={twitch|kick}&slug={login} →
+ * {"emotes": [{name, provider ("bttv"|"ffz"|"7tv"|"twitch"), url, global}]},
+ * names already deduped server-side by Chatterino priority (FFZ channel >
+ * BTTV channel > 7TV channel > FFZ global > BTTV global > 7TV global >
+ * Twitch global). slug is REQUIRED (missing → HTTP 400; there is no
+ * global-only mode), so the hook skips the call entirely without a login.
  */
 import { useEffect, useState } from 'react';
 
@@ -51,8 +51,8 @@ interface EmotesResponse {
   emotes?: Array<{ name?: string; provider?: string; url?: string; global?: boolean }>;
 }
 
-async function loadEmotes(slug: string): Promise<EmoteMap> {
-  const q = new URLSearchParams({ platform: 'twitch', slug });
+async function loadEmotes(platform: string, slug: string): Promise<EmoteMap> {
+  const q = new URLSearchParams({ platform, slug });
   const res = await fetch(`/api/chat/emotes?${q.toString()}`);
   if (!res.ok) throw new Error(`emote fetch failed: HTTP ${res.status}`);
   const data = (await res.json()) as EmotesResponse;
@@ -64,12 +64,12 @@ async function loadEmotes(slug: string): Promise<EmoteMap> {
 }
 
 /**
- * Channel emotes for a chat surface. Twitch + login → fetches once per slug
- * (module-level cache; concurrent calls dedupe on one in-flight request).
- * Kick / youtube / unknown platform / missing login → empty map WITHOUT
- * fetching (the API requires a slug and has no global-only mode). Never
- * throws: errors/offline yield the empty map so chat never breaks.
- * ponytail: no TTL — one fetch per login per app run; upgrade path: a
+ * Channel emotes for a chat surface. Twitch/Kick + login → fetches once per
+ * (platform, slug) pair (module-level cache; concurrent calls dedupe on one
+ * in-flight request). YouTube / unknown platform / missing login → empty map
+ * WITHOUT fetching (the API requires a slug and has no global-only mode).
+ * Never throws: errors/offline yield the empty map so chat never breaks.
+ * ponytail: no TTL — one fetch per pair per app run; upgrade path: a
  * short-lived cache or re-fetch on panel open if emote sets ever rotate
  * mid-session.
  */
@@ -77,13 +77,15 @@ export function useChatEmotes(
   platform: string | null | undefined,
   slug?: string | null,
 ): EmoteMap {
-  const cacheKey = platform === 'twitch' && slug?.trim() ? slug.trim() : null;
+  const supported = platform === 'twitch' || platform === 'kick';
+  const trimmed = supported ? slug?.trim() || null : null;
+  const cacheKey = trimmed ? `${platform}:${trimmed}` : null;
   const [emotes, setEmotes] = useState<EmoteMap>(() =>
     cacheKey ? emoteCache.get(cacheKey) ?? EMPTY_EMOTES : EMPTY_EMOTES,
   );
   useEffect(() => {
     if (!cacheKey) {
-      // Platform flipped away from twitch (or login dropped) — drop the map.
+      // Platform flipped away from twitch/kick (or login dropped) — drop the map.
       setEmotes(EMPTY_EMOTES);
       return;
     }
@@ -95,7 +97,9 @@ export function useChatEmotes(
     let cancelled = false;
     let p = emoteInflight.get(cacheKey);
     if (!p) {
-      p = loadEmotes(cacheKey)
+      // cacheKey is non-null only for twitch/kick, so platform is a string here.
+      const plat = platform as string;
+      p = loadEmotes(plat, trimmed as string)
         .then((m) => {
           emoteCache.set(cacheKey, m);
           return m;

@@ -1,9 +1,11 @@
-"""Chat emotes: official Twitch globals + custom (BTTV/FFZ/7TV) merge.
+"""Chat emotes: official Twitch globals + custom (BTTV/FFZ/7TV) merge, and
+the Kick path (7TV channel + BTTV/7TV custom globals).
 
 Service tests swap services.chat_emotes._SESSION for a canned fake so no
-network is touched; the endpoint tests patch fetch_emotes entirely. The live
-GQL/static-cdn path (URLs must return HTTP 200) is the opt-in real test at
-the bottom of this file — run with ``pytest -m real``.
+network is touched (the Kick user-id lookup is patched separately); the
+endpoint tests patch fetch_emotes entirely. The live GQL/static-cdn and
+Kick paths (URLs must return HTTP 200) are the opt-in real tests at the
+bottom of this file — run with ``pytest -m real``.
 """
 import pytest
 
@@ -201,6 +203,62 @@ async def test_endpoint_shape_unchanged(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Kick: 7TV channel (user-id keyed) + BTTV/7TV custom globals, no official
+# Twitch emotes, same cache machinery
+# ---------------------------------------------------------------------------
+
+_KICK_7TV_HOST = {"host": {"url": "//cdn.7tv.app/emote/01KICKED", "files": [{"name": "3x.webp", "format": "WEBP"}]}}
+_KICK_7TV_USER_URL = ce._SEVENTV_KICK_USER_URL.format(user_id="676")
+
+
+def test_kick_resolves_seventv_channel_and_custom_globals(fake_session, monkeypatch):
+    monkeypatch.setattr(ce, "_resolve_kick_user_id", lambda login: "676")
+    fake_session.gets[_KICK_7TV_USER_URL] = _FakeResponse(200, {
+        "id": "676", "platform": "KICK", "emote_set": {"emotes": [{"name": "LULW", "data": _KICK_7TV_HOST}]},
+    })
+    fake_session.gets[ce._BTTV_GLOBAL_URL] = _FakeResponse(200, [{"id": "lulw-id", "code": "KEKW"}])
+
+    by_name = {e["name"]: e for e in ce.fetch_emotes("kick", "xqc")}
+    # 7TV channel emote (LULW-type) present, channel-scoped.
+    assert by_name["LULW"] == {
+        "name": "LULW", "provider": "7tv",
+        "url": "https://cdn.7tv.app/emote/01KICKED/3x.webp", "global": False,
+    }
+    # Custom globals ride along.
+    assert by_name["KEKW"]["provider"] == "bttv" and by_name["KEKW"]["global"] is True
+    # Official Twitch globals do NOT apply on Kick.
+    assert "LUL" not in by_name
+
+
+def test_kick_globals_cached_second_call(fake_session, monkeypatch):
+    monkeypatch.setattr(ce, "_resolve_kick_user_id", lambda login: "676")
+    ce.fetch_emotes("kick", "xqc")
+    first = fake_session.get_calls.count(ce._BTTV_GLOBAL_URL)
+    assert first == 1
+    ce.fetch_emotes("kick", "xqc")
+    assert fake_session.get_calls.count(ce._BTTV_GLOBAL_URL) == first == 1
+
+
+def test_kick_id_lookup_failure_degrades_to_globals(fake_session, monkeypatch):
+    monkeypatch.setattr(ce, "_resolve_kick_user_id", lambda login: None)
+    fake_session.gets[ce._BTTV_GLOBAL_URL] = _FakeResponse(200, [{"id": "lulw-id", "code": "LULW"}])
+    by_name = {e["name"]: e for e in ce.fetch_emotes("kick", "xqc")}
+    assert by_name["LULW"]["provider"] == "bttv" and by_name["LULW"]["global"] is True
+    assert "LUL" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_endpoint_kick_shape(client, monkeypatch):
+    def fake_fetch(platform, slug):
+        return [{"name": "LULW", "provider": "7tv", "url": "u1", "global": False}]
+
+    monkeypatch.setattr(ce, "fetch_emotes", fake_fetch)
+    resp = await client.get("/api/chat/emotes", params={"platform": "kick", "slug": "xqc"})
+    assert resp.status_code == 200
+    assert resp.json() == {"emotes": [{"name": "LULW", "provider": "7tv", "url": "u1", "global": False}]}
+
+
+# ---------------------------------------------------------------------------
 # Live guard (opt-in): the real GQL set resolves and static-cdn urls serve.
 # ---------------------------------------------------------------------------
 
@@ -215,5 +273,27 @@ def test_twitch_global_urls_serve_live_real():
     assert lul is not None and lul["provider"] == "twitch"
     assert lul["url"] == "https://static-cdn.jtvnw.net/emoticons/v2/425618/default/dark/1.0"
     for e in [lul, by_name["Kappa"], by_name["Kreygasm"]]:
+        resp = requests.get(e["url"], timeout=10)
+        assert resp.status_code == 200, f"{e['name']} url {e['url']} -> HTTP {resp.status_code}"
+
+
+@pytest.mark.real
+def test_kick_emotes_live_real():
+    """Kick: 7TV channel emotes (LULW-type) + custom globals, no official
+    Twitch emotes; sampled URLs must return HTTP 200."""
+    import requests
+
+    by_name = {e["name"]: e for e in ce.fetch_emotes("kick", "xqc")}
+    assert by_name, "expected kick emotes"
+    # Official Twitch globals must NOT leak onto kick.
+    assert "LUL" not in by_name
+    # LULW is a 7TV channel emote on xqc — the LULW-type path must come through.
+    lulw = by_name.get("LULW")
+    assert lulw is not None and lulw["provider"] == "7tv" and lulw["global"] is False
+    # A custom global (bttv/7tv) is present too.
+    globals_ = [e for e in ce.fetch_emotes("kick", "xqc") if e["global"] is True]
+    assert globals_, "expected bttv/7tv custom globals on kick"
+    # Probe channel + global urls.
+    for e in [lulw, globals_[0]]:
         resp = requests.get(e["url"], timeout=10)
         assert resp.status_code == 200, f"{e['name']} url {e['url']} -> HTTP {resp.status_code}"

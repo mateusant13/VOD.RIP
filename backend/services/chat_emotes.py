@@ -17,7 +17,10 @@ with the same anonymous Client-Id the app already uses for VOD playback
 map to stable static-cdn.jtvnw.net v2 URLs. Any custom emote — channel or
 global — with the same name shadows the official one (customs win).
 
-Kick/YouTube have no BTTV/FFZ/7TV presence -> they return [].
+Kick/YouTube: the merge is Twitch-focused. Kick gets 7TV channel emotes
+(user-id keyed) plus BTTV/7TV custom globals — BTTV's Kick user routes are
+gone from the public API (probed 2026-08) and FrankerFaceZ has no Kick
+presence; official Twitch emotes do not apply. YouTube returns [].
 
 Twitch id resolution: BTTV's name-based lookup (`/cached/users/twitch?name=`)
 was REMOVED upstream (the route 404s with "Route not found", and the by-id
@@ -61,6 +64,10 @@ _FFZ_ROOM_URL = "https://api.frankerfacez.com/v1/room/id/{twitch_id}"
 _FFZ_GLOBAL_URL = "https://api.frankerfacez.com/v1/set/global"
 _SEVENTV_USER_URL = "https://7tv.io/v3/users/twitch/{twitch_id}"
 _SEVENTV_GLOBAL_URL = "https://7tv.io/v3/emote-sets/global"
+# Kick: 7TV channel emotes keyed by the Kick *user* id (probed live; the
+# channel id 404s). BTTV kick lookup is gone from the public API.
+_KICK_CHANNEL_PATH = "/api/v2/channels/{slug}"
+_SEVENTV_KICK_USER_URL = "https://7tv.io/v3/users/kick/{user_id}"
 # Official Twitch global emotes: the GQL `emoteSet(id: 0)` set (GLOBALS +
 # SMILIES), same endpoint + anonymous Client-Id as the VOD playback queries.
 _TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
@@ -85,31 +92,35 @@ _CACHE_LOCK = threading.Lock()
 
 
 def fetch_emotes(platform: str, slug: str) -> list[dict]:
-    """All custom emotes for a channel, merged in Chatterino priority order.
+    """All emotes for a channel, merged in Chatterino priority order.
 
-    Returns a list of {"name", "provider" ("bttv"|"ffz"|"7tv"), "url",
-    "global"} with name collisions resolved to the highest-priority provider.
-    Non-Twitch platforms and total network failure return [] (never raises).
+    Twitch: BTTV/FFZ/7TV channel + custom globals + official Twitch globals.
+    Kick: 7TV channel + BTTV/7TV custom globals (BTTV's Kick user routes are
+    gone from the public API and FFZ is Twitch-only; official Twitch emotes
+    do not apply). Returns a list of {"name", "provider" ("bttv"|"ffz"|"7tv"|
+    "twitch"), "url", "global"} with name collisions resolved to the
+    highest-priority provider. Unsupported platforms and total network
+    failure return [] (never raises).
     """
     plat = (platform or "").strip().lower()
-    if plat != "twitch" or not slug:
+    if plat not in ("twitch", "kick") or not slug:
         return []
     login = slug.strip()
-    key = f"twitch:{login.lower()}"
+    key = f"{plat}:{login.lower()}"
     now = time.monotonic()
     with _CACHE_LOCK:
         ch = _CACHE.get(key)
-        gl = _GLOBAL_CACHE.get("global")
+        gl = _GLOBAL_CACHE.get(plat)
     if ch is None or now - ch[0] >= _CHANNEL_TTL_SEC:
-        channel = _fetch_channel(login)
+        channel = _fetch_channel(plat, login)
         with _CACHE_LOCK:
             _CACHE[key] = (time.monotonic(), channel)
     else:
         channel = ch[1]
     if gl is None or now - gl[0] >= _GLOBAL_TTL_SEC:
-        globals_merged = _fetch_globals()
+        globals_merged = _fetch_globals(plat)
         with _CACHE_LOCK:
-            _GLOBAL_CACHE["global"] = (time.monotonic(), globals_merged)
+            _GLOBAL_CACHE[plat] = (time.monotonic(), globals_merged)
     else:
         globals_merged = gl[1]
     return _merge([channel, globals_merged])
@@ -119,10 +130,16 @@ def fetch_emotes(platform: str, slug: str) -> list[dict]:
 # Channel emotes (per login)
 # ---------------------------------------------------------------------------
 
-def _fetch_channel(login: str) -> list[dict]:
-    """Channel emotes only. Resolve the Twitch id, then fetch BTTV/FFZ/7TV
-    channel emotes in parallel. A failed resolution degrades to global-only
-    (fetch_emotes merges globals afterwards) — never an error."""
+def _fetch_channel(platform: str, login: str) -> list[dict]:
+    if platform == "twitch":
+        return _fetch_twitch_channel(login)
+    return _fetch_kick_channel(login)
+
+
+def _fetch_twitch_channel(login: str) -> list[dict]:
+    """Twitch channel emotes only. Resolve the Twitch id, then fetch
+    BTTV/FFZ/7TV channel emotes in parallel. A failed resolution degrades to
+    global-only (fetch_emotes merges globals afterwards) — never an error."""
     twitch_id = _resolve_twitch_id(login)
     if not twitch_id:
         # Degradation: the id resolver failed or the login is unknown, so no
@@ -138,6 +155,35 @@ def _fetch_channel(login: str) -> list[dict]:
     # other providers (channelEmotes + sharedEmotes).
     bttv = _bttv_emotes_from_user(_get_json(_BTTV_USER_BY_ID_URL.format(twitch_id=twitch_id)))
     return _merge([fut_ffz.result(), bttv, fut_7tv.result()])
+
+
+def _fetch_kick_channel(login: str) -> list[dict]:
+    """Kick channel emotes: 7TV only. BTTV's Kick routes are gone from the
+    public API (``/3/users/kick/*`` -> 403 unauthorized, ``/3/cached/users/
+    kick/*`` -> user not found, probed 2026-08) and FrankerFaceZ has no Kick
+    presence, so the channel bucket is 7TV alone; BTTV/7TV globals still
+    ride along via fetch_emotes. Same degrade-to-global-only behavior."""
+    user_id = _resolve_kick_user_id(login)
+    if not user_id:
+        logger.debug("chat_emotes: no kick user id for %r — channel emotes skipped", login)
+        return []
+    data = _get_json(_SEVENTV_KICK_USER_URL.format(user_id=user_id))
+    return _parse_seventv_emotes(_seventv_channel_emotes(data), global_flag=False)
+
+
+def _resolve_kick_user_id(login: str) -> Optional[str]:
+    """Kick user id for a slug, via the app's Kick API client (browser
+    impersonation + Cloudflare/rate-limit gate). None on any failure -> the
+    channel bucket degrades to global-only."""
+    try:
+        from services.kick_api_service import _get_json as kick_get_json
+
+        data = kick_get_json(f"/api/v2/channels/{login}", f"https://kick.com/{login}", timeout=15.0)
+        user_id = (data or {}).get("user_id")
+        return str(user_id) if user_id else None
+    except Exception:  # noqa: BLE001 — gate blocks, 404, transport: all degrade
+        logger.debug("chat_emotes: kick user id lookup failed for %r", login, exc_info=True)
+        return None
 
 
 def _resolve_twitch_id(login: str) -> Optional[str]:
@@ -195,20 +241,31 @@ def _seventv_channel_emotes(data: Optional[dict]) -> list:
 # Global emote sets (fetched in parallel, cached 1h)
 # ---------------------------------------------------------------------------
 
-def _fetch_globals() -> list[dict]:
+def _fetch_globals(platform: str) -> list[dict]:
+    if platform == "twitch":
+        futs = {
+            "bttv": _POOL.submit(_get_json, _BTTV_GLOBAL_URL),
+            "ffz": _POOL.submit(_get_json, _FFZ_GLOBAL_URL),
+            "7tv": _POOL.submit(_get_json, _SEVENTV_GLOBAL_URL),
+            "twitch": _POOL.submit(_fetch_twitch_globals),
+        }
+        buckets = [
+            _parse_ffz_global(futs["ffz"].result()),
+            _parse_bttv_emotes(futs["bttv"].result(), global_flag=True),
+            _parse_seventv_emotes((futs["7tv"].result() or {}).get("emotes"), global_flag=True),
+            futs["twitch"].result(),
+        ]
+        return _merge(buckets)
+    # Kick: BTTV + 7TV custom globals. No FFZ (Twitch-only) and no official
+    # Twitch emotes on Kick.
     futs = {
         "bttv": _POOL.submit(_get_json, _BTTV_GLOBAL_URL),
-        "ffz": _POOL.submit(_get_json, _FFZ_GLOBAL_URL),
         "7tv": _POOL.submit(_get_json, _SEVENTV_GLOBAL_URL),
-        "twitch": _POOL.submit(_fetch_twitch_globals),
     }
-    buckets = [
-        _parse_ffz_global(futs["ffz"].result()),
+    return _merge([
         _parse_bttv_emotes(futs["bttv"].result(), global_flag=True),
         _parse_seventv_emotes((futs["7tv"].result() or {}).get("emotes"), global_flag=True),
-        futs["twitch"].result(),
-    ]
-    return _merge(buckets)
+    ])
 
 
 def _fetch_twitch_globals() -> list[dict]:
@@ -535,8 +592,8 @@ assert _merge([[{"name": "LUL", "provider": "bttv", "url": "custom", "global": F
 assert _merge([[{"name": "A", "provider": "bttv", "url": "g", "global": True}]])[0]["global"] is True
 # Case-sensitive: KEKW and kekw are distinct emotes.
 assert len(_merge([_bttv_global, [{"name": "kekw", "provider": "7tv", "url": "s", "global": False}]])) == 3
-# fetch_emotes degrades to [] for non-Twitch platforms and empty slugs.
-assert fetch_emotes("kick", "x") == []
+# fetch_emotes degrades to [] for unsupported platforms and empty slugs.
 assert fetch_emotes("youtube", "x") == []
 assert fetch_emotes("twitch", "") == []
+assert fetch_emotes("kick", "") == []
 assert fetch_emotes("", "x") == []
