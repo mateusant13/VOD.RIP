@@ -15,6 +15,7 @@ import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/Previe
 import type { ChatMarkers } from './components/ChatRangeMarkers';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
+import { useInstantPreview } from './hooks/useInstantPreview';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
   attachProgressivePreview,
@@ -423,6 +424,15 @@ export default function ChannelExplorePopup({
         markPreviewError('playback');
       }
     },
+  });
+
+  // Instant preview: play the local 6s clip while the mini session boots.
+  // The mini preview always opens at offset 0, so the clip window always applies.
+  const instantPreview = useInstantPreview({
+    url: vod.url,
+    active: true,
+    remoteReady: ready,
+    startSec: 0,
   });
 
 
@@ -1856,6 +1866,19 @@ export default function ChannelExplorePopup({
             }}
             onPause={() => setPlaying(false)}
           />
+          )}
+          {!youtubeEmbed && instantPreview.show && instantPreview.matched && (
+            <video
+              ref={instantPreview.videoRef}
+              className="absolute inset-0 w-full h-full object-contain pointer-events-none z-30"
+              src={instantPreview.matched.media_url}
+              autoPlay
+              muted
+              playsInline
+              preload="auto"
+              onEnded={instantPreview.onOverlayEnded}
+              onError={instantPreview.onOverlayError}
+            />
           )}
           {loading && !ready && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40 z-20">

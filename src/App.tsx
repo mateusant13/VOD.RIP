@@ -98,6 +98,8 @@ import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { useViewportTier } from './useViewportTier';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
+import { useInstantPreview } from './hooks/useInstantPreview';
+import { refreshInstantPreviews } from './instantPreview';
 import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
@@ -587,6 +589,15 @@ export default function App() {
   const msePlayer = useDirectMSEPlayer(previewVideoRef);
   const msePlayerRef = useRef<typeof msePlayer | null>(null);
   msePlayerRef.current = msePlayer;
+
+  // Instant preview: if the opened VOD has a local 6s clip, play it right away
+  // (overlay) while the remote session boots; hand off when the remote is ready.
+  const instantPreview = useInstantPreview({
+    url: previewLoadedUrlRef.current ?? url.trim(),
+    active: previewOpen,
+    remoteReady: previewVideoReady,
+    startSec: previewTrimStart,
+  });
 
   useEffect(() => {
     previewPlaybackKindRef.current = previewPlayback?.kind ?? 'progressive';
@@ -1193,6 +1204,13 @@ export default function App() {
   useEffect(() => {
     vodDurationSecRef.current = vodDurationSec;
   }, [vodDurationSec]);
+
+  // Instant-preview status: fetch once on mount (and again after every channel
+  // save) so an opened VOD that has a local 6s clip plays it instantly. Any
+  // failure silently degrades to an empty map.
+  useEffect(() => {
+    void refreshInstantPreviews();
+  }, []);
 
   // Keep previewOpenRef in sync
   useEffect(() => {
@@ -4417,6 +4435,9 @@ export default function App() {
     }
     channelsSaveTimerRef.current = window.setTimeout(() => {
       apiPost('/api/settings', { saved_channels: payload }).catch(() => {});
+      // Channel list changed — the backend may have (re)generated instant
+      // preview clips for the new set; pick them up right away.
+      void refreshInstantPreviews(true);
     }, 2000);
     return () => {
       if (channelsSaveTimerRef.current) {
@@ -6525,6 +6546,19 @@ export default function App() {
                       setPreviewPlaying(true);
                     }}
                     onPause={() => setPreviewPlaying(false)}
+                  />
+                )}
+                {!previewYoutubeEmbedUrl && instantPreview.show && instantPreview.matched && (
+                  <video
+                    ref={instantPreview.videoRef}
+                    className="absolute inset-0 w-full h-full object-contain pointer-events-none z-30"
+                    src={instantPreview.matched.media_url}
+                    autoPlay
+                    muted
+                    playsInline
+                    preload="auto"
+                    onEnded={instantPreview.onOverlayEnded}
+                    onError={instantPreview.onOverlayError}
                   />
                 )}
                 {previewVideoLoading && !previewVideoReady && (

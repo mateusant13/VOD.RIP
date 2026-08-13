@@ -149,9 +149,9 @@ const ptBR: Record<string, string> = {
   '{label}: freed {bytes}': '{label}: {bytes} liberados',
   'Total': 'Total',
   'FREE': 'LIVRE',
-  'Archive VODs Keep': 'Manter VODs arquivados',
+  'Archive VODs Keep': 'Manter últimos N VODs por plataforma',
   'Oldest VODs kept per platform — applies on Save Settings':
-    'VODs mais antigos mantidos por plataforma — aplica ao salvar configurações',
+    'Mantém apenas os N VODs mais recentes por plataforma — aplica ao salvar configurações',
   'Cookie Bridge': 'Cookie Bridge',
   '● paired': '● pareado',
   '○ not paired': '○ não pareado',
@@ -655,6 +655,9 @@ const en: Record<string, string> = {
   'Hover a message to set markers': 'Hover a message to set markers',
   'Chat .txt: {start} → {end}': 'Chat .txt: {start} → {end}',
   'Chat .txt: not included — set START/END markers in the preview chat': 'Chat .txt: not included — set START/END markers in the preview chat',
+  // ── Archive retention (renamed label; explicit EN entry so the UI says what it does) ──
+  'Archive VODs Keep': 'Keep last N VODs per platform',
+  'Oldest VODs kept per platform — applies on Save Settings': 'Keeps only the newest N archived VODs per platform — applies on Save Settings',
 }
 
 const es: Record<string, string> = {
@@ -763,8 +766,8 @@ const es: Record<string, string> = {
   '{label}: freed {bytes}': '{label}: liberados {bytes}',
   'Total': 'Total',
   'FREE': 'LIBERAR',
-  'Archive VODs Keep': 'Retención de VODs archivados',
-  'Oldest VODs kept per platform — applies on Save Settings': 'VODs más antiguos conservados por plataforma — se aplica al guardar ajustes',
+  'Archive VODs Keep': 'Conservar los últimos N VODs por plataforma',
+  'Oldest VODs kept per platform — applies on Save Settings': 'Conserva solo los N VODs más recientes por plataforma — se aplica al guardar ajustes',
   'Cookie Bridge': 'Cookie Bridge',
   '● paired': '● emparejado',
   '○ not paired': '○ no emparejado',
