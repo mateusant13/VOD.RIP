@@ -6,13 +6,17 @@ import type { PreviewRetryStage } from './previewRetry';
  * or a terminal error surfaces. Covers the session-create POST, the attach
  * effect, the HLS manifest/fragment loads and the first frame.
  *
- * The backend YouTube create worst case is the 8s fast race + 24s fallback
- * chain; anything past 20s is a hung create (stuck yt-dlp/innerTube pass) or
- * a session whose playback never starts (e.g. window-HLS mux failure serving
- * an empty VOD playlist forever). The guard turns both into the retry UI
- * instead of an infinite spinner.
+ * The backend YouTube create is capped by a hard wall-clock timeout
+ * (VODRIP_PREVIEW_CREATE_TIMEOUT_SEC, default 45s — a cold extract races an
+ * 8s fast pass against a 24s+ fallback chain), and a cold window-HLS session
+ * additionally needs its mux poll (≤15s) before the attach. The budget must
+ * cover BOTH or the guard kills a legitimate cold create: 45s backend hard
+ * ceiling + 15s mux wait + attach/first frame = 60s. A hung create (stuck
+ * yt-dlp/innerTube pass) or a session whose playback never starts (e.g.
+ * window-HLS mux failure serving an empty VOD playlist forever) still trips
+ * the guard into the retry UI instead of an infinite spinner.
  */
-export const PREVIEW_START_TIMEOUT_MS = 20_000;
+export const PREVIEW_START_TIMEOUT_MS = 60_000;
 
 export interface PreviewStartTimeoutCallbacks {
   /**
