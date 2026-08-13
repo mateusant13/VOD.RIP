@@ -4,6 +4,7 @@ Preview routes — preview sessions for HLS/MP4 playback.
 
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -53,11 +54,28 @@ from services.preview_service import (
 )
 
 from services.youtube_diag import youtube_http_status, youtube_user_message
+from services.ytdlp_service import detect_platform
 from services.preview_timing import log_preview_timing
 from services import archive_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
+
+# Hard wall-clock cap for ONE YouTube preview session-create POST. The extract
+# chain is bounded between passes (8s fast race + 24s fallback), but a single
+# stuck yt-dlp/innerTube pass (no per-read socket activity, wedged JS runtime,
+# DNS) can hold a PREVIEW_EXECUTOR worker forever — with 12 workers a few of
+# those wedge every create behind them and the frontend's 'Starting YouTube
+# preview…' spinner has no terminal event. The executor thread keeps running
+# after the 504 (threads cannot be killed), but the request returns promptly
+# and the worker is freed; the aborted create still populates the resolve
+# cache, so the frontend RETRY usually lands instantly. Non-YouTube creates
+# (fast Twitch/Kick CDN fetches, legit 30-60s yt-dlp VOD fallbacks) are NOT
+# capped — no regression to their paths.
+_YOUTUBE_CREATE_HARD_TIMEOUT_SEC = max(
+    5.0,
+    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "45") or "45"),
+)
 
 
 def _preview_user_message(exc: Exception) -> str:
@@ -454,7 +472,7 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     try:
         import time as _time
         t0 = _time.monotonic()
-        session = await asyncio.get_running_loop().run_in_executor(
+        create_future = asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
             lambda: create_session(
                 preview_url,
@@ -463,6 +481,27 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 prefer_height=req.prefer_height,
             ),
         )
+        if detect_platform(preview_url) == "YouTube":
+            try:
+                session = await asyncio.wait_for(
+                    create_future, timeout=_YOUTUBE_CREATE_HARD_TIMEOUT_SEC
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "preview session create timed out url=%s after %.1fs",
+                    preview_url[:100],
+                    _YOUTUBE_CREATE_HARD_TIMEOUT_SEC,
+                )
+                # The executor thread keeps running (threads cannot be killed)
+                # and still populates the resolve/extract caches — the client's
+                # RETRY reuses that work. Surface the 504 so the frontend's
+                # create promise rejects instead of hanging the spinner.
+                raise HTTPException(
+                    status_code=504,
+                    detail="Preview timed out — try again.",
+                )
+        else:
+            session = await create_future
         resolve_ms = (_time.monotonic() - t0) * 1000.0
         logger.info(
             "preview session created id=%s kind=%s url=%s",
@@ -484,6 +523,10 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 exc_info=True,
             )
         return _preview_session_response(session)
+    except HTTPException:
+        # Already-shaped responses (e.g. the 504 create hard-timeout) must not
+        # be re-wrapped by the generic handler below into a 500.
+        raise
     except ValueError as e:
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
