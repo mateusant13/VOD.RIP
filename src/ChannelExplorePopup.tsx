@@ -12,6 +12,7 @@ import { useI18n } from './i18n';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
+import type { ChatMarkers } from './components/ChatRangeMarkers';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
 import {
@@ -122,9 +123,14 @@ interface ChannelExplorePopupProps {
   volumeMenuCloseTick: number;
   onClose: () => void;
   /** Hand the mini preview to the app MAIN preview: plays `timeSec` (VOD
-   *  absolute) and carries the explore trim (In/Out) so the main preview
-   *  opens with the same window. */
-  onHandoffToMain: (vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null) => void;
+   *  absolute). `chat` carries the chat-range markers selected in the mini
+   *  preview's chat panel (null when neither start nor end is set). */
+  onHandoffToMain: (
+    vod: ExplorePopupVod,
+    timeSec: number,
+    trim?: { start: number; end: number } | null,
+    chat?: ChatMarkers | null,
+  ) => void;
   onRegisterPause: (id: string, pause: () => void) => void;
   onUnregisterPause: (id: string) => void;
   onVolumeMenuOpen: (id: string, open: boolean) => void;
@@ -183,17 +189,12 @@ export default function ChannelExplorePopup({
   /** Twitch clip editor open — transient notice in the transport row. */
   const [clipNotice, setClipNotice] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   /** Twitch clip mini-preview — opened at the current playhead. */
-  const [exploreTrimStart, setExploreTrimStart] = useState(0);
-  const [exploreTrimEnd, setExploreTrimEnd] = useState(0);
   const [clipPopup, setClipPopup] = useState<{
     url: string;
     broadcasterLogin: string;
     vodId: string;
     playheadSec: number;
     vodDurationSec: number;
-    /** Explore trim (In/Out) — the mini preview starts its selection there,
-     *  mirroring how the main preview anchors on its own trim. */
-    anchorRange?: { start: number; end: number } | null;
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
@@ -214,6 +215,14 @@ export default function ChannelExplorePopup({
   const chatTotal = chatInfo.open ? chatInfo.width + 8 : chatInfo.width; // gap-2 row
   chatTotalRef.current = chatTotal;
   const containerW = panelWidth + chatTotal;
+  /** Chat-range markers (start/end) selected in the mini preview's chat
+   *  panel — lifted via onMarkersChange so the Download handoff can carry
+   *  them to the main preview (the next download writes the chat txt over
+   *  [start, end]). */
+  const chatMarkersRef = useRef<ChatMarkers>({ start: null, end: null });
+  const handleChatMarkersChange = useCallback((markers: ChatMarkers) => {
+    chatMarkersRef.current = markers;
+  }, []);
   const [videoAspect, setVideoAspect] = useState(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const [pos, setPos] = useState<PanelPos | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
@@ -438,6 +447,23 @@ export default function ChannelExplorePopup({
     setVolumeMenuOpen(false);
     setQualityMenuOpen(false);
   }, [volumeMenuCloseTick]);
+
+  // Click-outside: close the volume/quality menus on ANY mousedown outside
+  // their own [data-player-menu] wrappers — including clicks on other
+  // buttons INSIDE this popup (same rule App.tsx applies to its own player
+  // menus). The App-side volumeMenuCloseTick effect above still works as a
+  // second path (App may tick it when one of ITS menus closes).
+  useEffect(() => {
+    if (!volumeMenuOpen && !qualityMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.closest('[data-player-menu]')) return;
+      setVolumeMenuOpen(false);
+      setQualityMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [volumeMenuOpen, qualityMenuOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1492,10 +1518,10 @@ export default function ChannelExplorePopup({
       </span>
       <input
         type="range"
-        min={exploreTrimStart}
-        max={exploreTrimEnd > exploreTrimStart ? exploreTrimEnd : effectiveDurationSec}
+        min={0}
+        max={effectiveDurationSec}
         step={0.25}
-        value={Math.min(Math.max(currentTime, exploreTrimStart), exploreTrimEnd > exploreTrimStart ? exploreTrimEnd : effectiveDurationSec)}
+        value={Math.min(currentTime, effectiveDurationSec)}
         disabled={!ready}
         onChange={(e) => seekVideoDebounced(parseFloat(e.target.value))}
         className="flex-1 accent-white disabled:opacity-40 h-1 min-w-0"
@@ -1503,18 +1529,6 @@ export default function ChannelExplorePopup({
       <span className={`text-[9px] font-mono w-10 shrink-0 text-right ${fullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}>
         {formatHmsFull(effectiveDurationSec)}
       </span>
-    </div>
-    <div className="flex items-center gap-1.5 w-full shrink-0 flex-wrap">
-      <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('In')}</span>
-      <input type="range" min={0} max={effectiveDurationSec} step={0.25}
-        value={Math.min(exploreTrimStart, effectiveDurationSec)}
-        onChange={(e) => setExploreTrimStart(Math.min(parseFloat(e.target.value), (exploreTrimEnd || effectiveDurationSec) - 1))}
-        className="flex-1 accent-zinc-400 h-1 min-w-0" />
-      <span className="text-[8px] font-mono text-zinc-500 uppercase w-10 shrink-0">{t('Out')}</span>
-      <input type="range" min={0} max={effectiveDurationSec} step={0.25}
-        value={exploreTrimEnd > 0 ? exploreTrimEnd : effectiveDurationSec}
-        onChange={(e) => setExploreTrimEnd(Math.max(parseFloat(e.target.value), exploreTrimStart + 1))}
-        className="flex-1 accent-zinc-400 h-1 min-w-0" />
     </div>
     </>
   );
@@ -1607,12 +1621,6 @@ export default function ChannelExplorePopup({
       vodId,
       playheadSec: currentTime,
       vodDurationSec: vod.durationSec,
-      // Same trim as main preview: a 5–60s In/Out selection seeds the mini
-      // preview's initial clip selection, exactly like the main preview
-      // passes its trim as anchorRange.
-      anchorRange: exploreTrimEnd > exploreTrimStart
-        ? { start: exploreTrimStart, end: exploreTrimEnd }
-        : null,
       reuseSession: sessionIdRef.current
         ? { sessionId: sessionIdRef.current, trimTimeline: trimTimelineRef.current }
         : null,
@@ -1917,7 +1925,10 @@ export default function ChannelExplorePopup({
                   onClick={() => onHandoffToMain(
                     vod,
                     currentTime,
-                    exploreTrimEnd > exploreTrimStart ? { start: exploreTrimStart, end: exploreTrimEnd } : null,
+                    null,
+                    chatMarkersRef.current.start != null || chatMarkersRef.current.end != null
+                      ? chatMarkersRef.current
+                      : null,
                   )}
                   className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
                   title={t('Open in main preview to download')}
@@ -1960,6 +1971,7 @@ export default function ChannelExplorePopup({
               // chat backfill kicks off before canplay.
               started={ready}
               onLayoutChange={setChatInfo}
+              onMarkersChange={handleChatMarkersChange}
             />
           )}
         </div>
@@ -1988,7 +2000,10 @@ export default function ChannelExplorePopup({
                     onClick={() => onHandoffToMain(
                     vod,
                     currentTime,
-                    exploreTrimEnd > exploreTrimStart ? { start: exploreTrimStart, end: exploreTrimEnd } : null,
+                    null,
+                    chatMarkersRef.current.start != null || chatMarkersRef.current.end != null
+                      ? chatMarkersRef.current
+                      : null,
                   )}
                     className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
                     title={t('Open in main preview to download')}
@@ -2030,7 +2045,6 @@ export default function ChannelExplorePopup({
           vodId={clipPopup.vodId}
           playheadSec={clipPopup.playheadSec}
           vodDurationSec={clipPopup.vodDurationSec}
-          anchorRange={clipPopup.anchorRange ?? undefined}
           reuseSession={clipPopup.reuseSession}
           // The clip title defaults to the VOD's title (user-mandated:
           // the clip keeps the ORIGINAL title) — sent as vodrip_title so
