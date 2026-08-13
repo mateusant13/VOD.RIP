@@ -118,9 +118,20 @@ def test_captions_first_skips_whisper_when_captions_exist(monkeypatch):
 
 
 def test_captions_first_toggle_off_runs_whisper(monkeypatch):
+    """Toggle OFF is the explicit override: youtube ALWAYS runs ASR (even a
+    captionless video — the marker makes it an ASR candidate, audio is
+    downloaded at transcribe time)."""
+    archive_db.upsert_video({
+        "platform": "youtube",
+        "video_id": "vid2",
+        "channel": "chan",
+        "title": "t",
+        "kind": "vod",
+    })
+    archive_db.mark_captions_unavailable("youtube", "vid2")
     job_id = _seed_job("youtube", "vid2")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_transcribe, "transcribe_video",
+         patch.object(archive_transcribe, "_transcribe_youtube_captionless",
                       return_value={"segments": 1}) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)
         stats = archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid2"})
@@ -132,8 +143,8 @@ def test_captions_first_toggle_off_runs_whisper(monkeypatch):
 def test_missing_archive_file_skips_gracefully(monkeypatch):
     """FileNotFoundError (archive file evicted) -> failed job + skipped marker,
     no traceback-level error and nothing propagates out of _process_job.
-    Runs on Twitch: YouTube never reaches transcribe_video (captions-first
-    skip fires first)."""
+    Runs on Twitch: YouTube ASR goes through the captionless download path
+    (no local archive_path), which is covered in test_yt_transcribe_policy."""
     job_id = _seed_job("twitch", "vid-missing")
     with patch.object(
         archive_transcribe, "transcribe_video",
@@ -148,7 +159,11 @@ def test_missing_archive_file_skips_gracefully(monkeypatch):
 
 
 def test_captions_first_defaults_on_when_setting_absent(monkeypatch):
-    """Old settings objects lack yt_subtitles_first -> treated as True."""
+    """Old settings objects lack yt_subtitles_first -> treated as True
+    (captions-first skip fires when caption rows exist)."""
+    archive_db.insert_transcript("youtube", "vid3", [
+        {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "legenda."},
+    ])
     job_id = _seed_job("youtube", "vid3")
     with patch("deps.settings_mgr") as mgr, \
          patch.object(archive_transcribe, "transcribe_video",
@@ -157,6 +172,7 @@ def test_captions_first_defaults_on_when_setting_absent(monkeypatch):
         stats = archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid3"})
     assert stats["skipped"] == "captions-first"
     tv.assert_not_called()
+    assert _job_status(job_id) == "done"
 
 
 def test_captions_first_non_youtube_still_transcribes(monkeypatch):
@@ -172,19 +188,24 @@ def test_captions_first_non_youtube_still_transcribes(monkeypatch):
     assert _job_status(job_id) == "done"
 
 
-def test_captions_first_no_captions_skips_whisper(monkeypatch):
-    """Toggle on + youtube + NO caption rows -> job done, whisper never runs:
-    a captionless YouTube video is served by the caption re-ingest leg, not
-    by parakeet/whisper."""
+def test_captions_first_no_captions_no_marker_waits(monkeypatch):
+    """Toggle on + youtube + NO caption rows + NO availability marker ->
+    the job is REQUEUED with 'waiting for caption decision' (never done,
+    never ASR): the caption question is undetermined while the ingest leg
+    is still extracting/retrying."""
     job_id = _seed_job("youtube", "vid5")
     with patch("deps.settings_mgr") as mgr, \
-         patch.object(archive_transcribe, "transcribe_video",
-                      side_effect=AssertionError("whisper must not run")) as tv:
+         patch.object(archive_transcribe, "_transcribe_youtube_captionless",
+                      side_effect=AssertionError("ASR must not run")) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=True)
         stats = archive_transcribe._process_job({"id": job_id, "platform": "youtube", "video_id": "vid5"})
-    assert stats["skipped"] == "captions-first"
+    assert stats["requeued"] == "waiting-caption"
     tv.assert_not_called()
-    assert _job_status(job_id) == "done"
+    assert _job_status(job_id) == "queued"
+    row = archive_db.query(
+        "SELECT error, next_retry_at FROM archive_jobs WHERE id = ?", (job_id,))[0]
+    assert "waiting for caption decision" in row["error"]
+    assert row["next_retry_at"] is not None, "must re-check after a delay"
 
 
 # --- caption fetch format fallback + parsing -------------------------------

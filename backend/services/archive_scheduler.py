@@ -23,9 +23,11 @@ kick_scheduler_pass()):
                chat. Each fetch is incremental (seeds from the deepest
                stored offset); Twitch backfills self-cap at 2 concurrent
                inside backfill_chat (per-IP GQL 429 limiter, measured).
-  5. Transcribe queue — top up whisper jobs at TRANSCRIBE_PRIORITY_LOW for
-               downloaded YouTube files with no captions/transcripts.
-               A transcript-source search re-enqueues at
+  5. Transcribe queue — top up ASR jobs at TRANSCRIBE_PRIORITY_LOW for
+               Twitch/Kick VODs without transcripts and for YouTube videos
+               whose captions are permanently unavailable
+               (captions_unavailable_at marker) — audio is downloaded at
+               transcribe time. A transcript-source search re-enqueues at
                TRANSCRIBE_PRIORITY_HIGH (routers/archive.py) and the
                worker's ORDER BY priority DESC makes those jump the queue.
 """
@@ -513,8 +515,10 @@ def _enqueue_transcriptions() -> None:
         archive_db.query(
             """SELECT platform, video_id, channel, title, duration_sec, archive_path
                FROM videos
-               WHERE platform IN ('youtube','twitch','kick') AND status='ready'
-                 AND archive_path IS NOT NULL AND archive_path != ''
+               WHERE platform IN ('youtube','twitch','kick')
+                 AND (status='ready' OR platform='youtube')
+                 AND (archive_path IS NOT NULL AND archive_path != ''
+                      OR platform='youtube')
                  AND NOT EXISTS (SELECT 1 FROM transcripts t
                                  WHERE t.platform=videos.platform
                                    AND t.video_id=videos.video_id)
@@ -529,21 +533,28 @@ def _enqueue_transcriptions() -> None:
             break
         vid = r["video_id"]
         plat = r["platform"]
-        if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
+        if plat != "youtube" and (
+            not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file()
+        ):
             continue  # file evicted — whisper would fail immediately
         latest = archive_db.latest_job(plat, vid, kind="transcribe")
         job_id = f"transcribe-{plat}-{vid}"
-        if plat == "youtube" and latest is None:
-            # YouTube transcripts come from captions, never from ASR: a
-            # video whose captions are ingested already has transcript rows
-            # (the SQL's NOT EXISTS above skips it) and a captionless video
-            # is served by the caption re-ingest leg (_ingest_youtube), not
-            # parakeet — so the scheduler NEVER creates a new transcribe
-            # job for YouTube. Existing rows still flow through the retry
-            # logic below (stale-failed requeue in place, fresh-failure
-            # guard, stable job id) and drain via the worker's
-            # captions-first skip instead of stranding unfinished.
-            continue
+        if plat == "youtube":
+            # Captions-first policy: create a transcribe job ONLY when the
+            # caption question is settled AND there is nothing that already
+            # serves as the transcript — captions_unavailable_at set
+            # (permanent unavailability -> ASR candidate) with no transcript
+            # rows (the SQL's NOT EXISTS above) and no terminal verdict.
+            # Never create while captions are still pending (no marker: the
+            # ingest leg is extracting/retrying — the worker requeues any
+            # kicked job with 'waiting for caption decision'), never for
+            # music/no-speech or DRM-blocked videos. The audio is
+            # downloaded at transcribe time (no local archive_path).
+            kind = archive_db.video_transcript_kind(plat, vid) or ""
+            if kind in ("music", "blocked"):
+                continue
+            if latest is None and archive_db.captions_unavailable_at(plat, vid) is None:
+                continue
         if latest:
             if latest["status"] in ("queued", "running"):
                 continue
