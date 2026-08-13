@@ -11,9 +11,13 @@ import {
   previewPlayerColumnWidth,
   panelPosAfterResize,
   healSqueezedPanelLayout,
+  repairInconsistentPanelLayout,
+  loadPanelLayout,
+  defaultPanelLayout,
   aspectHeightForWidth,
   ownedPanelHeightSeed,
   rowPanelHeightFromPreview,
+  PANEL_LAYOUT_STORAGE_KEY,
   PREVIEW_PANEL_MIN_W,
   LIVE_PANEL_MIN_W,
   PANEL_MIN,
@@ -553,6 +557,126 @@ describe('previewContainerHeight aspect constraint', () => {
     expect(previewContainerHeight(0, 280, 9 / 16, 120)).toBe(498);
     // Never collapse below the video-fit height.
     expect(previewContainerHeight(300, 280, 9 / 16, 120)).toBe(498);
+  });
+});
+
+describe('repairInconsistentPanelLayout — persistent squeezed-layout recovery', () => {
+  const ROOMY_W = 1600;
+  const ROOMY_H = 900;
+
+  const setViewport = (w: number, h: number) => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: w });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: h });
+  };
+
+  afterEach(() => {
+    // Restore the file-wide default so sibling describes never inherit a test viewport.
+    setViewport(1024, 768);
+  });
+
+  const squeezedAllMin = () => ({
+    previewPanelWidth: PREVIEW_PANEL_MIN_W,
+    urlAside: { w: PANEL_MIN.w, h: 480 },
+    main: { w: PANEL_MIN.w, h: 448 },
+    owned: { preview: PREVIEW_PANEL_MIN_W, urlAside: PANEL_MIN.w, main: PANEL_MIN.w },
+  });
+
+  it('repairs an all-min owned row to the defaults on a roomy viewport', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    const defaults = defaultPanelLayout();
+    // Sanity: the roomy viewport actually fits the default row (guard precondition).
+    expect(
+      defaults.previewPanelWidth + defaults.urlAside.w + defaults.main.w,
+    ).toBeLessThanOrEqual(layoutRowWidthBudget({ previewOpen: true, urlPanelAside: true, preview: { w: defaults.previewPanelWidth, h: 0 }, urlAside: defaults.urlAside, main: defaults.main }));
+
+    const repaired = repairInconsistentPanelLayout(squeezedAllMin());
+    expect(repaired.previewPanelWidth).toBe(defaults.previewPanelWidth);
+    expect(repaired.urlAside).toEqual(defaults.urlAside);
+    expect(repaired.main).toEqual(defaults.main);
+    expect(repaired.owned).toEqual(defaults.owned);
+    expect(repaired.previewPanelWidth).toBeGreaterThan(PREVIEW_PANEL_MIN_W);
+    expect(repaired.urlAside.w).toBeGreaterThan(PANEL_MIN.w);
+    expect(repaired.main.w).toBeGreaterThan(PANEL_MIN.w);
+  });
+
+  it('repairs an owned sum below 60% of the row budget on a roomy viewport', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    // Not all-min (preview 350 > 281, main 260 > 241) but the owned sum
+    // (850) is under 0.6 * budget(1480) = 888 — a squeeze artifact.
+    const layout = {
+      previewPanelWidth: 350,
+      urlAside: { w: 240, h: 480 },
+      main: { w: 260, h: 448 },
+      owned: { preview: 350, urlAside: 240, main: 260 },
+    };
+    const budget = layoutRowWidthBudget({ previewOpen: true, urlPanelAside: true, preview: { w: layout.previewPanelWidth, h: 0 }, urlAside: layout.urlAside, main: layout.main });
+    expect(layout.owned.preview + layout.owned.urlAside + layout.owned.main).toBeLessThan(0.6 * budget);
+
+    const defaults = defaultPanelLayout();
+    const repaired = repairInconsistentPanelLayout(layout);
+    expect(repaired.previewPanelWidth).toBe(defaults.previewPanelWidth);
+    expect(repaired.urlAside.w).toBe(defaults.urlAside.w);
+    expect(repaired.main.w).toBe(defaults.main.w);
+    expect(repaired.owned).toEqual(defaults.owned);
+  });
+
+  it('leaves a healthy custom layout untouched', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    const layout = {
+      previewPanelWidth: 500,
+      urlAside: { w: 350, h: 480 },
+      main: { w: 600, h: 448 },
+      owned: { preview: 500, urlAside: 350, main: 600 },
+    };
+    expect(repairInconsistentPanelLayout(layout)).toBe(layout);
+  });
+
+  it('leaves a single min-parked panel untouched when the row is otherwise healthy', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    const layout = {
+      previewPanelWidth: 640,
+      urlAside: { w: PANEL_MIN.w, h: 480 },
+      main: { w: 600, h: 448 },
+      owned: { preview: 640, urlAside: PANEL_MIN.w, main: 600 },
+    };
+    expect(repairInconsistentPanelLayout(layout)).toBe(layout);
+  });
+
+  it('never repairs on a small viewport that cannot fit the defaults', () => {
+    setViewport(1024, 768);
+    const allMin = squeezedAllMin();
+    const budget = layoutRowWidthBudget({ previewOpen: true, urlPanelAside: true, preview: { w: allMin.previewPanelWidth, h: 0 }, urlAside: allMin.urlAside, main: allMin.main });
+    const defaults = defaultPanelLayout();
+    // Sanity: the small viewport genuinely cannot fit the default row.
+    expect(defaults.previewPanelWidth + defaults.urlAside.w + defaults.main.w).toBeGreaterThan(budget);
+
+    const layout = squeezedAllMin();
+    expect(repairInconsistentPanelLayout(layout)).toBe(layout);
+  });
+
+  it('keeps a sane livePanelWidth across the repair (live popup is not part of the row)', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    const repaired = repairInconsistentPanelLayout({
+      ...squeezedAllMin(),
+      livePanelWidth: 800,
+    });
+    expect(repaired.livePanelWidth).toBe(800);
+  });
+
+  it('loadPanelLayout repairs a squeezed persisted layout at boot', () => {
+    setViewport(ROOMY_W, ROOMY_H);
+    localStorage.clear();
+    localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(squeezedAllMin()));
+    try {
+      const loaded = loadPanelLayout();
+      const defaults = defaultPanelLayout();
+      expect(loaded.previewPanelWidth).toBe(defaults.previewPanelWidth);
+      expect(loaded.urlAside.w).toBe(defaults.urlAside.w);
+      expect(loaded.main.w).toBe(defaults.main.w);
+      expect(loaded.owned).toEqual(defaults.owned);
+    } finally {
+      localStorage.clear();
+    }
   });
 });
 
