@@ -6510,7 +6510,7 @@ export default function App() {
   const rowEdgeInsets = edgePinnedRow ? layoutRowEdgeInsets() : null;
 
   return (
-    <div
+    <main
       className="vod-app-shell h-screen max-h-screen min-h-0 flex justify-center items-center overflow-hidden p-4 selection:bg-white selection:text-black bg-[#09090b]"
       style={{
         backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)',
@@ -7734,6 +7734,6 @@ export default function App() {
         onConfirm={() => void executeStartDownload()}
         onCancel={() => setDownloadConfirmOpen(false)}
       />
-    </div>
+    </main>
   );
 }

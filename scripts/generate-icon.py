@@ -71,6 +71,13 @@ def main() -> None:
     app_frames = _frames_multisize(ico_path)
     _save_ico(ICO, app_frames)
 
+    # Publish into vite's public/ so the built app serves /assets/icon.*
+    # (favicon links in index.html; previously always 404 -> console errors).
+    PUBLIC = ROOT / "public" / "assets"
+    PUBLIC.mkdir(parents=True, exist_ok=True)
+    (PUBLIC / "icon.ico").write_bytes(ICO.read_bytes())
+    (PUBLIC / "icon.png").write_bytes(PNG.read_bytes())
+
     print(f"App icon ready: {ICO} ({ICO.stat().st_size} bytes), {PNG}")
 
 
