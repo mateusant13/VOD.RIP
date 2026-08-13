@@ -37,6 +37,12 @@ def test_youtube_create_returns_504_when_create_session_hangs():
         time.sleep(60)  # simulates a wedged extract — must never return here
         raise AssertionError("stubbed create_session returned — timeout failed")
 
+    # The env var is read at app-import time; in a full-suite run another
+    # test imports the app first and the 0.5 never applies. Pin the module
+    # constant directly so this test is order-independent (5.0 = the clamp
+    # floor the env path would produce for 0.5).
+    original_timeout = preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC
+    preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC = 5.0
     original = preview_router.create_session
     preview_router.create_session = _stuck
     try:
@@ -46,6 +52,7 @@ def test_youtube_create_returns_504_when_create_session_hangs():
             elapsed = time.monotonic() - t0
     finally:
         preview_router.create_session = original
+        preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC = original_timeout
 
     assert resp.status_code == 504, (
         f"expected 504 from timed-out YouTube create, got {resp.status_code}: "

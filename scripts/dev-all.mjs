@@ -29,6 +29,7 @@ let apiSpec = null; // last API launch spec — hot-reload respawn source
 let reloading = false; // hot reload in flight: exit handler delegates to reloadApi
 let healthMonitorStop = null; // anti-hang watchdog cleanup (paused during reload)
 let watcherTimer = null; // backend poll interval
+let pendingAfterReload = null; // change detected mid-reload — re-applied when the reload settles
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -431,7 +432,22 @@ function start(label, command, args, cwd, extraEnv = {}) {
       // double-start race with the wait loop below). Just acknowledge.
       return;
     }
-    if (signal) return;
+    if (signal) {
+      // POSIX: the anti-hang watchdog kills with SIGKILL → exit event has
+      // signal set (Windows taskkill produces a code instead). The API must
+      // still respawn, never idle dead.
+      if (label === "api" && !reloading && restartAttempts < 3) {
+        restartAttempts += 1;
+        const delaySec = restartAttempts * 3;
+        console.error(
+          `[dev] API killed by signal ${signal} — restarting in ${delaySec}s (attempt ${restartAttempts}/3)`,
+        );
+        setTimeout(() => start(label, command, args, cwd, extraEnv), delaySec * 1000);
+      } else if (label === "api") {
+        shutdown(1);
+      }
+      return;
+    }
     if (label === "api" && code === 0 && restartAttempts < 3) {
       // Exit 0 is the "another healthy API won" race — but if nothing
       // answers :apiPort the API vanished cleanly (graceful /api/exit)
@@ -577,27 +593,50 @@ function startBackendWatcher() {
   let lastTrigger = 0;
   watcherTimer = setInterval(() => {
     const next = backendWatchFiles();
+    // Path-keyed diff — readdirSync ordering is not guaranteed, so index
+    // pairing would occasionally spuriously reload or mask a real change.
+    const snapshotByPath = new Map(snapshot.map((f) => [f.p, f]));
+    const nextByPath = new Map(next.map((f) => [f.p, f]));
     let changed = null;
-    if (next.length !== snapshot.length) {
-      changed = next.length > snapshot.length ? next[next.length - 1] : snapshot[snapshot.length - 1];
-    } else {
-      for (let i = 0; i < next.length; i++) {
-        if (next[i].m !== snapshot[i].m || next[i].s !== snapshot[i].s) {
-          changed = next[i];
+    for (const f of snapshot) {
+      const nf = nextByPath.get(f.p);
+      if (!nf || nf.m !== f.m || nf.s !== f.s) {
+        changed = nf ?? f;
+        break;
+      }
+    }
+    if (!changed) {
+      for (const f of next) {
+        if (!snapshotByPath.has(f.p)) {
+          changed = f;
           break;
         }
       }
     }
     snapshot = next;
-    if (!changed || reloading || shuttingDown) return;
+    if (!changed) return;
+    if (reloading) {
+      // Change saved while a reload is in flight: stash and re-apply once
+      // the reload settles — otherwise the edit is silently dropped.
+      pendingAfterReload = changed;
+      return;
+    }
+    if (shuttingDown) return;
     if (pendingTimer) return; // already debouncing a burst
-    pendingTimer = setTimeout(() => {
+    const fire = () => {
       pendingTimer = null;
       if (shuttingDown || reloading) return;
-      if (Date.now() - lastTrigger < 1000) return; // min 1s between reloads
+      const since = Date.now() - lastTrigger;
+      if (since < 1000) {
+        // Min-1s gap: re-arm with the REMAINDER instead of dropping the
+        // change (a fast reload + quick save would lose the edit).
+        pendingTimer = setTimeout(fire, 1000 - since);
+        return;
+      }
       lastTrigger = Date.now();
       void reloadApi(changed.p);
-    }, reloadDebounceMs);
+    };
+    pendingTimer = setTimeout(fire, reloadDebounceMs);
   }, reloadPollMs);
   console.log(
     `[dev] watching backend/ for changes (poll ${reloadPollMs}ms) — edit a .py to hot-reload the API`,
@@ -615,13 +654,7 @@ async function reloadApi(changedFile) {
   );
   reloading = true;
   restartAttempts = 0;
-  if (healthMonitorStop) {
-    healthMonitorStop();
-    healthMonitorStop = null;
-  }
-  const ok = await gracefulApiExit();
-  if (!ok && apiProcess && apiProcess.exitCode === null) {
-    // API unresponsive — force-kill its tree so the port frees.
+  const killTree = () => {
     if (process.platform === "win32") {
       spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
         stdio: "ignore",
@@ -634,16 +667,72 @@ async function reloadApi(changedFile) {
         /* already gone */
       }
     }
+  };
+  let healthy = false;
+  try {
+    if (healthMonitorStop) {
+      healthMonitorStop();
+      healthMonitorStop = null;
+    }
+    const ok = await gracefulApiExit();
+    if (!ok && apiProcess && apiProcess.exitCode === null) {
+      // API unresponsive — force-kill its tree so the port frees.
+      killTree();
+    }
+    let portFreed = await waitPortFree(apiPort, 15000);
+    if (!portFreed && apiProcess && apiProcess.exitCode === null) {
+      // Graceful teardown stalled past 15s (long flush/downloads): the old
+      // process would keep serving OLD code. Force-kill and re-check.
+      console.error("[dev] API teardown stalled — force-killing to free the port");
+      killTree();
+      portFreed = await waitPortFree(apiPort, 10000);
+    }
+    if (!portFreed) {
+      console.error("[dev] API port did not free — aborting reload, scheduling crash restart");
+      restartAttempts += 1;
+      setTimeout(
+        () => start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv),
+        restartAttempts * 3000,
+      );
+      return;
+    }
+    start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv);
+    for (let i = 0; i < 240 && !shuttingDown; i++) {
+      await sleep(500);
+      // Broken code (syntax error/bad import) exits within ~1s: detect the
+      // death instead of probing a dead port for 120s.
+      if (apiProcess.exitCode !== null) break;
+      if (await apiHealthy(apiPort)) {
+        healthy = true;
+        break;
+      }
+    }
+    if (!shuttingDown && !healthy && apiProcess.exitCode !== null) {
+      // The fresh API died — standard crash restart (the exit handler
+      // delegates while reloading, so this is the single respawn point).
+      console.error(
+        `[dev] API exited during reload (code ${apiProcess.exitCode}) — scheduling crash restart`,
+      );
+      restartAttempts += 1;
+      setTimeout(
+        () => start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv),
+        restartAttempts * 3000,
+      );
+      return;
+    }
+    if (!shuttingDown && healthy) {
+      startApiHealthMonitor();
+      console.log(`[dev] API reloaded (${path.relative(root, changedFile)})`);
+    }
+  } finally {
+    reloading = false;
   }
-  await waitPortFree(apiPort, 15000);
-  start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv);
-  for (let i = 0; i < 240 && !shuttingDown; i++) {
-    await sleep(500);
-    if (await apiHealthy(apiPort)) break;
+  if (!shuttingDown && pendingAfterReload) {
+    // Edit saved mid-reload — apply it now that the reload settled.
+    const p = pendingAfterReload.p;
+    pendingAfterReload = null;
+    setTimeout(() => void reloadApi(p), 100);
   }
-  reloading = false;
-  if (!shuttingDown) startApiHealthMonitor();
-  console.log(`[dev] API reloaded (${path.relative(root, changedFile)})`);
 }
 
 /** Anti-hang watchdog wrapper: paused while a hot reload is in flight so the
