@@ -103,6 +103,7 @@ import { refreshInstantPreviews } from './instantPreview';
 import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
+import { PreviewStartTimeout } from './previewStartTimeout';
 
 // ─── TYPES (migrated to src/types.ts) ───────────────
 
@@ -437,6 +438,8 @@ export default function App() {
   const previewYoutubeIframeRef = useRef<HTMLIFrameElement>(null);
   const previewVideoLoadingRef = useRef(false);
   const previewVideoReadyRef = useRef(false);
+  /** Hard bound for the 'Starting…' phase — see PreviewStartTimeout. */
+  const previewStartTimeoutRef = useRef<PreviewStartTimeout | null>(null);
   const [previewTimeUi, setPreviewTimeUi] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewMuted, setPreviewMuted] = useState(false);
@@ -1280,6 +1283,7 @@ export default function App() {
 
   const resetPreview = useCallback(async () => {
     previewGenRef.current += 1; // cancel any in-flight openPreview
+    previewStartTimeoutRef.current?.settle();
     previewStartedRef.current = false;
     previewLoadedUrlRef.current = null;
     previewRetryingRef.current = false;
@@ -1585,6 +1589,30 @@ export default function App() {
     seekPreviewVideo(target, true);
   }, [previewVideoReady, previewYoutubeEmbedUrl, seekPreviewVideo]);
 
+  // Arm the 'Starting…' phase hard bound (see PreviewStartTimeout). Called by
+  // openPreview (fresh open) and retryPreview's playback-stage retry (re-attach
+  // to the same session) — BOTH can hang on a session whose playback never
+  // starts, so both must carry a terminal timeout.
+  const armPreviewStartTimeout = (mediaUrl: string): PreviewStartTimeout => {
+    const armedGen = previewGenRef.current;
+    const guard = new PreviewStartTimeout(mediaUrl, {
+      onTimeout: (url, stage) => {
+        if (armedGen !== previewGenRef.current) return false;
+        previewStartedRef.current = false;
+        previewLoadedUrlRef.current = null;
+        setError(t('Preview took too long — try again'));
+        markPreviewError(url, stage);
+        destroyPreviewPlayer();
+        setPreviewOpen(false);
+        setPreviewVideoLoading(false);
+        return true;
+      },
+    });
+    previewStartTimeoutRef.current = guard;
+    guard.start();
+    return guard;
+  };
+
   const openPreview = useCallback(async (): Promise<boolean> => {
     if (!url.trim()) return false;
     // Unknown duration (in-progress VOD): both ends are 0 — open anyway so the
@@ -1676,6 +1704,15 @@ export default function App() {
     setPreviewPlayback(null);
     setPreviewVideoLoading(true);
     setPreviewVideoReady(false);
+    // Hard bound on the 'Starting…' phase (create POST + attach + first frame).
+    // On expiry without ready, the guard tears the player down, surfaces the
+    // retry UI, and aborts the in-flight session create — the spinner can no
+    // longer persist forever behind a hung create or a session whose playback
+    // never starts (e.g. window-HLS mux failure serving an empty playlist).
+    // Superseded opens (gen mismatch) return false: the newer open owns the
+    // phase and the old create fetch keeps running (its in-flight dedup may
+    // serve the newer open; the stale continuation is discarded by gen).
+    const guard = armPreviewStartTimeout(trimmedUrl);
     // Auto-pause guard: any user unpause at/after this instant suppresses the
     // load-complete pause (see autoPauseOtherPreviews).
     previewLoadSinceRef.current = Date.now();
@@ -1714,8 +1751,9 @@ export default function App() {
         crop_start: start,
         crop_end: end,
         prefer_height: previewPreferHeight,
-      });
+      }, guard.signal ?? undefined);
       if (bailIfSuperseded()) return false;
+      guard.markCreateResolved();
       timing.setSessionId(res.session_id);
       timing.mark('session_ready', `kind=${res.kind} trim=${res.trim_timeline === true}`);
       previewExtractSourceRef.current = res.extract_source ?? '';
@@ -1778,10 +1816,17 @@ export default function App() {
       previewLoadedUrlRef.current = trimmedUrl;
       return true;
     } catch (err: any) {
+      if (guard.handled) {
+        // The start-phase timeout already tore the player down and marked the
+        // error; the abort rejection of the create lands here — settle quietly.
+        return false;
+      }
+      guard.settle();
       previewStartedRef.current = false;
       previewLoadedUrlRef.current = null;
-      setError(err.message || t('Preview failed'));
-      markPreviewError(trimmedUrl, 'session');
+      const aborted = err instanceof DOMException && err.name === 'AbortError';
+      setError(aborted ? t('Preview took too long — try again') : (err.message || t('Preview failed')));
+      markPreviewError(trimmedUrl, aborted ? (guard.createResolved ? 'playback' : 'session') : 'session');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);
       return false;
@@ -1835,6 +1880,10 @@ export default function App() {
         // Stage retry: re-attach playback to the SAME session. The attach
         // effect reports success (canplay clears the context) or failure
         // (markPreviewError escalates attempts). No new session, no refresh.
+        // A fresh guard bounds this phase too — the retry can land on the same
+        // never-starting session (empty window-HLS playlist) and must not spin
+        // forever a second time.
+        armPreviewStartTimeout(ctx.url);
         setPreviewRetryTick((t) => t + 1);
         return;
       }
@@ -2036,6 +2085,7 @@ export default function App() {
       // Playback genuinely started — any in-flight retry succeeded.
       previewRetryingRef.current = false;
       setPreviewRetryBoth(null);
+      previewStartTimeoutRef.current?.markReady();
       setPreviewVideoReady(true);
       setPreviewBuffering(false);
       setPreviewVideoLoading(false);
@@ -2066,6 +2116,17 @@ export default function App() {
       setPreviewBuffering(false);
     };
     video.addEventListener('playing', clearStallUi);
+    // Native (non-hls.js) playback error — no Hls.Events.ERROR pipeline exists,
+    // so a dead source must surface here or the spinner never terminates.
+    const onNativeError = () => {
+      if (cancelled) return;
+      setError(t('Preview playback failed — try again'));
+      setPreviewVideoLoading(false);
+      previewStartedRef.current = false;
+      previewLoadedUrlRef.current = null;
+      markPreviewError(previewPageUrl, 'playback');
+      previewStartTimeoutRef.current?.settle();
+    };
     const onFirstPlaying = () => {
       previewTimingRef.current?.markFirstPlayable();
     };
@@ -2149,6 +2210,7 @@ export default function App() {
           setError(t('Preview interrupted — try again'));
           setPreviewVideoLoading(false);
           markPreviewError(previewPageUrl, 'playback');
+          previewStartTimeoutRef.current?.settle();
         },
         onSessionRefresh: (res) => {
           previewPendingSeekSecRef.current = previewSeekTargetRef.current ?? video.currentTime;
@@ -2184,6 +2246,7 @@ export default function App() {
         setError("Preview session missing");
         setPreviewVideoLoading(false);
         markPreviewError(previewPageUrl, 'session');
+        previewStartTimeoutRef.current?.settle();
         return;
       }
       const mse = msePlayerRef.current;
@@ -2191,6 +2254,7 @@ export default function App() {
         setError("MSE player unavailable");
         setPreviewVideoLoading(false);
         markPreviewError(previewPageUrl, 'playback');
+        previewStartTimeoutRef.current?.settle();
         return;
       }
       mse.attach(sid)
@@ -2233,6 +2297,7 @@ export default function App() {
         previewStartedRef.current = false;
         previewLoadedUrlRef.current = null;
         markPreviewError(previewPageUrl, 'session');
+        previewStartTimeoutRef.current?.settle();
         try { hls.stopLoad(); hls.destroy(); } catch { /* ignore */ }
         previewHlsRef.current = null;
         setHlsRef(null);
@@ -2405,6 +2470,7 @@ export default function App() {
                   setPreviewVideoLoading(false);
                   previewStartedRef.current = false;
                   markPreviewError(previewPageUrl, 'playback');
+                  previewStartTimeoutRef.current?.settle();
                   hls.destroy();
                   previewHlsRef.current = null;
                 });
@@ -2414,6 +2480,7 @@ export default function App() {
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
             markPreviewError(previewPageUrl, 'playback');
+            previewStartTimeoutRef.current?.settle();
             hls.destroy();
             previewHlsRef.current = null;
             break;
@@ -2425,6 +2492,7 @@ export default function App() {
             setPreviewVideoLoading(false);
             previewStartedRef.current = false;
             markPreviewError(previewPageUrl, 'playback');
+            previewStartTimeoutRef.current?.settle();
             hls.destroy();
             previewHlsRef.current = null;
             break;
@@ -2452,8 +2520,12 @@ export default function App() {
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = playbackUrl;
       video.addEventListener('canplay', onCanPlay, { once: true });
+      // Native playback has no hls.js ERROR pipeline — without this listener a
+      // dead source (404/expired URL) left the 'Starting…' spinner forever.
+      video.addEventListener('error', onNativeError, { once: true });
       cleanup = () => {
         video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('error', onNativeError);
         video.removeEventListener('playing', clearStallUi);
         video.removeAttribute('src');
         video.load();
@@ -2464,6 +2536,7 @@ export default function App() {
     setError(t('HLS playback is not supported in this browser'));
     setPreviewVideoLoading(false);
     markPreviewError(previewPageUrl, 'playback');
+    previewStartTimeoutRef.current?.settle();
     };
 
     setup();
@@ -6521,6 +6594,7 @@ export default function App() {
                       allow="autoplay; encrypted-media; picture-in-picture"
                       tabIndex={-1}
                       onLoad={() => {
+                        previewStartTimeoutRef.current?.markReady();
                         setPreviewVideoReady(true);
                         setPreviewVideoLoading(false);
                         youtubeIframeListen(previewYoutubeIframeRef.current);

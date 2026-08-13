@@ -44,12 +44,15 @@ const _PREVIEW_CREATE_RETRIES = 2;
  * a second later (inflight dedupe makes the retry cheap). Permanent failures
  * (members-only/unavailable/private) throw immediately.
  */
-export async function createPreviewSessionWithRetry(body: {
-  url: string;
-  crop_start: number;
-  crop_end: number;
-  prefer_height: number;
-}): Promise<PreviewSessionResponse> {
+export async function createPreviewSessionWithRetry(
+  body: {
+    url: string;
+    crop_start: number;
+    crop_end: number;
+    prefer_height: number;
+  },
+  signal?: AbortSignal,
+): Promise<PreviewSessionResponse> {
   // In-flight dedup: concurrent calls with the same body share one POST.
   // Handles React StrictMode double-invoke and user double-clicks.
   const key = JSON.stringify(body);
@@ -57,9 +60,18 @@ export async function createPreviewSessionWithRetry(body: {
     let lastErr: unknown;
     for (let attempt = 0; attempt <= _PREVIEW_CREATE_RETRIES; attempt++) {
       try {
-        return await apiPost<PreviewSessionResponse>('/api/preview/session', body);
+        return await apiPost<PreviewSessionResponse>(
+          '/api/preview/session',
+          body,
+          signal ? { signal } : undefined,
+        );
       } catch (err: unknown) {
         lastErr = err;
+        // Caller-initiated cancellation (start-phase timeout) is not retried —
+        // mirrors apiFetch, which never retries an intentional abort. Without
+        // this the 20s timeout would add two dead 1.2s/2.4s backoff sleeps
+        // before the error surfaces.
+        if (err instanceof DOMException && err.name === 'AbortError') throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (_PREVIEW_CREATE_FATAL_RE.test(msg)) throw err;
         if (attempt < _PREVIEW_CREATE_RETRIES) {
