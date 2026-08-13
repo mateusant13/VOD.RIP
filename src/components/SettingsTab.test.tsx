@@ -218,13 +218,16 @@ describe("SettingsTab", () => {
     expandCard("Cookie Bridge");
     await screen.findByText(/paired/);
     const sections = [...document.querySelectorAll("section")];
-    // Danger Zone is deliberately LAST — past Save; Cookie Bridge is
-    // second-to-last, above Save.
+    // Danger Zone renders directly above the Save row (user request);
+    // Cookie Bridge stays second-to-last among the cards.
     const last = sections[sections.length - 1];
     expect(last.textContent).toContain("Danger Zone");
     expect(last.textContent).not.toContain("Cookie Bridge");
     const secondToLast = sections[sections.length - 2];
     expect(secondToLast.textContent).toContain("Cookie Bridge");
+    // The Save button must come AFTER the Danger Zone card in the DOM.
+    const saveBtn = screen.getByText("Save Settings");
+    expect(last.compareDocumentPosition(saveBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // i18n: a Language card now sits at the top, before General.
     expect(sections[0].textContent).toContain("Language");
     expect(sections[1].textContent).toContain("General");
