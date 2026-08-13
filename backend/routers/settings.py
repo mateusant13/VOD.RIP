@@ -129,6 +129,18 @@ async def update_settings(update: SettingsUpdate):
         current.window_geometry = update.window_geometry
     if update.saved_channels is not None:
         _prioritize_new_channels(current.saved_channels, update.saved_channels)
+        # Instant previews are keyed by channel id — drop preview files of
+        # channels removed from the saved list so stale media never lingers.
+        try:
+            from services.instant_preview import remove_channel_previews
+
+            old_ids = {str(c.get("id") or "") for c in (current.saved_channels or [])}
+            for ch in (update.saved_channels or []):
+                old_ids.discard(str(ch.get("id") or ""))
+            for cid in old_ids:
+                remove_channel_previews(cid)
+        except Exception:  # noqa: BLE001 — cleanup must never fail the save
+            logger.debug("instant preview cleanup skipped", exc_info=True)
         current.saved_channels = update.saved_channels
         # A channel was added/edited/removed — wake the archive scheduler
         # so indexing for the new channel starts immediately instead of
