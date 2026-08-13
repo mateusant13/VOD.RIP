@@ -1,14 +1,21 @@
-"""Chat custom emotes (BetterTTV + FrankerFaceZ + 7TV) — render-only, Twitch only.
+"""Chat emotes (BetterTTV + FrankerFaceZ + 7TV + official Twitch globals) — render-only, Twitch only.
 
 Merges channel + global emote sets for a Twitch login into a flat
 name -> {provider, url} map in Chatterino priority order:
 
-    FFZ channel > BTTV channel > 7TV channel > FFZ global > BTTV global > 7TV global
+    FFZ channel > BTTV channel > 7TV channel > FFZ global > BTTV global > 7TV global > Twitch global
 
 (first provider holding a name wins). The chat panel replaces exact
 case-sensitive whole-word tokens with inline <img>; stored message text and
 search indexes are NEVER touched — the text column stays verbatim and the
 emotes column is never selected by search.
+
+Official Twitch globals ride along at the BOTTOM of the ladder: the global
+set (`emoteSet(id: 0)` — GLOBALS + SMILIES) resolves on the GQL endpoint
+with the same anonymous Client-Id the app already uses for VOD playback
+(services.twitch_gql_service.TWITCH_GQL_CLIENT_ID, no OAuth), and emote ids
+map to stable static-cdn.jtvnw.net v2 URLs. Any custom emote — channel or
+global — with the same name shadows the official one (customs win).
 
 Kick/YouTube have no BTTV/FFZ/7TV presence -> they return [].
 
@@ -39,6 +46,8 @@ from typing import Any, Optional
 
 import requests
 
+from services.twitch_gql_service import TWITCH_GQL_CLIENT_ID
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SEC = 12.0
@@ -52,11 +61,22 @@ _FFZ_ROOM_URL = "https://api.frankerfacez.com/v1/room/id/{twitch_id}"
 _FFZ_GLOBAL_URL = "https://api.frankerfacez.com/v1/set/global"
 _SEVENTV_USER_URL = "https://7tv.io/v3/users/twitch/{twitch_id}"
 _SEVENTV_GLOBAL_URL = "https://7tv.io/v3/emote-sets/global"
+# Official Twitch global emotes: the GQL `emoteSet(id: 0)` set (GLOBALS +
+# SMILIES), same endpoint + anonymous Client-Id as the VOD playback queries.
+_TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+_TWITCH_GLOBAL_SET_QUERY = """query EmoteSet($id: ID!) {
+  emoteSet(id: $id) {
+    id
+    emotes { id token }
+  }
+}"""
+_TWITCH_EMOTE_URL_TEMPLATE = "https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}/default/dark/1.0"
 
 _SESSION = requests.Session()
 
 # Bounded pool so a slow provider can't serialize the other fetches; the
-# 5 parallel calls (2 channel + 3 global) each time out at _TIMEOUT_SEC.
+# channel fetch (2 parallel + 1 inline) and the global fetch (4 parallel)
+# each time out at _TIMEOUT_SEC.
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chat-emotes")
 
 _CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -180,13 +200,68 @@ def _fetch_globals() -> list[dict]:
         "bttv": _POOL.submit(_get_json, _BTTV_GLOBAL_URL),
         "ffz": _POOL.submit(_get_json, _FFZ_GLOBAL_URL),
         "7tv": _POOL.submit(_get_json, _SEVENTV_GLOBAL_URL),
+        "twitch": _POOL.submit(_fetch_twitch_globals),
     }
     buckets = [
         _parse_ffz_global(futs["ffz"].result()),
         _parse_bttv_emotes(futs["bttv"].result(), global_flag=True),
         _parse_seventv_emotes((futs["7tv"].result() or {}).get("emotes"), global_flag=True),
+        futs["twitch"].result(),
     ]
     return _merge(buckets)
+
+
+def _fetch_twitch_globals() -> list[dict]:
+    """Official Twitch global emotes via GQL — no OAuth.
+
+    `emoteSet(id: 0)` is the global set (GLOBALS + SMILIES). It resolves on
+    the same GQL endpoint with the same anonymous Client-Id the app already
+    uses for VOD playback; emote ids feed the stable static-cdn v2 URL
+    template, and the 1h global cache absorbs any upstream deletion. Any
+    failure returns [] (degrades like the other providers — never raises).
+    """
+    try:
+        resp = _SESSION.post(
+            _TWITCH_GQL_URL,
+            json=[{"query": _TWITCH_GLOBAL_SET_QUERY, "variables": {"id": "0"}}],
+            headers={"Client-Id": TWITCH_GQL_CLIENT_ID, "Content-Type": "application/json"},
+            timeout=_TIMEOUT_SEC,
+        )
+        if resp.status_code != 200:
+            logger.debug("chat_emotes: twitch global emotes HTTP %d", resp.status_code)
+            return []
+        return _parse_twitch_emotes(resp.json())
+    except (requests.RequestException, ValueError, OSError):
+        logger.debug("chat_emotes: twitch global emotes fetch failed", exc_info=True)
+        return []
+
+
+def _parse_twitch_emotes(data: Optional[Any]) -> list[dict]:
+    """GQL `emoteSet(id: 0)` payload -> [{name, provider: "twitch", url, global}].
+
+    The batch response is a list with one operation result; the set nests
+    under ``data.emoteSet.emotes`` as {id, token} pairs. Duplicate tokens
+    (Twitch ships a few) collapse in the merge below."""
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return []
+    emote_set = (data[0].get("data") or {}).get("emoteSet") or {}
+    if not isinstance(emote_set, dict):
+        return []
+    out: list[dict] = []
+    for emote in emote_set.get("emotes") or []:
+        if not isinstance(emote, dict):
+            continue
+        token = emote.get("token")
+        eid = emote.get("id")
+        if not token or not eid:
+            continue
+        out.append({
+            "name": str(token),
+            "provider": "twitch",
+            "url": _TWITCH_EMOTE_URL_TEMPLATE.format(emote_id=eid),
+            "global": True,
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +492,29 @@ assert [e["name"] for e in _parse_seventv_emotes(_seventv_channel_emotes(_sevent
 assert _seventv_channel_emotes({"emotes": [{"name": "x"}]})[0]["name"] == "x"
 assert _seventv_channel_emotes(None) == []
 
+# Official Twitch globals: emoteSet(id: 0) batch payload -> static-cdn v2 urls.
+_twitch_gql_fix = [
+    {"data": {"emoteSet": {"id": "0", "emotes": [
+        {"id": "425618", "token": "LUL"},
+        {"id": "25", "token": "Kappa"},
+        {"id": "", "token": "skip-no-id"},
+        {"id": "x", "token": ""},
+        {"id": "425618", "token": "LUL"},  # duplicate token collapses later
+    ]}}}
+]
+_twitch_global = _parse_twitch_emotes(_twitch_gql_fix)
+assert _twitch_global[0] == {
+    "name": "LUL",
+    "provider": "twitch",
+    "url": "https://static-cdn.jtvnw.net/emoticons/v2/425618/default/dark/1.0",
+    "global": True,
+}
+assert len(_twitch_global) == 3
+assert _parse_twitch_emotes(None) == []
+assert _parse_twitch_emotes([{}]) == []
+assert _parse_twitch_emotes([{"data": {"emoteSet": {"emotes": []}}}]) == []
+assert _parse_twitch_emotes({"data": {"emoteSet": {"emotes": [{"id": "1", "token": "a"}]}}}) == []
+
 # Chatterino priority ladder: FFZ ch > BTTV ch > 7TV ch > FFZ glob > BTTV glob > 7TV glob.
 _ladder = _merge([
     [{"name": "A", "provider": "ffz", "url": "f", "global": False}],
@@ -427,6 +525,12 @@ _ladder = _merge([
     [{"name": "A", "provider": "7tv", "url": "g", "global": True}],
 ])
 assert len(_ladder) == 1 and _ladder[0]["provider"] == "ffz" and _ladder[0]["url"] == "f"
+# Official Twitch globals sit BELOW every custom bucket (customs win), and a
+# custom with the same name beats the official emote.
+assert _merge([_ladder, _twitch_global])[0]["provider"] == "ffz"
+assert _merge([[{"name": "LUL", "provider": "bttv", "url": "custom", "global": False}], _twitch_global])[0] == {
+    "name": "LUL", "provider": "bttv", "url": "custom", "global": False,
+}
 # Global wins only when no channel bucket holds the name.
 assert _merge([[{"name": "A", "provider": "bttv", "url": "g", "global": True}]])[0]["global"] is True
 # Case-sensitive: KEKW and kekw are distinct emotes.
