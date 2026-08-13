@@ -35,11 +35,11 @@ class DownloadRequest(BaseModel):
     thumbnail: Optional[str] = None
     duration: Optional[float] = None
     include_transcript: Optional[bool] = None
-    # Chat .txt export is driven by the START/END markers set in the chat
-    # history: when a marker is set the download also writes
-    # <media>.chat.txt with the messages inside [chat_start_sec,
-    # chat_end_sec] (inclusive, no timestamps). Absent markers -> no chat
-    # sidecar (behavior unchanged).
+    # Chat .txt export: the user toggles "Download chat history (.txt)" on
+    # the download confirm form; chat_start_sec/chat_end_sec carry the
+    # START/END markers from the chat history when set, else null — the
+    # sidecar writer then falls back to the download's trim window (whole
+    # chat when there is no trim).
     include_chat: bool = False
     chat_start_sec: Optional[float] = None
     chat_end_sec: Optional[float] = None

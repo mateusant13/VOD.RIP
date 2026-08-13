@@ -631,6 +631,10 @@ export default function App() {
   const [downloadConfirmOpen, setDownloadConfirmOpen] = useState(false);
   const [downloadFilename, setDownloadFilename] = useState('');
   const [dlIncludeTranscript, setDlIncludeTranscript] = useState(true);
+  /** Explicit 'Download chat history (.txt)' toggle on the confirm form.
+   *  Chat sidecar bounds follow the chat-section markers when set, else the
+   *  download's trim range (backend falls back); unchecked = no chat sidecar. */
+  const [dlIncludeChat, setDlIncludeChat] = useState(true);
   /** Chat start/end markers lifted from the main preview's chat panel —
    *  when set, the next download of the previewed video also writes a
    *  <media>.chat.txt covering [start, end] (no timestamps, user: message).
@@ -4209,18 +4213,20 @@ export default function App() {
         thumbnail: videoInfo.thumbnail ?? undefined,
         duration: videoInfo.duration ?? undefined,
       };
-      // Chat .txt export is driven by the START/END markers set in the
-      // chat history: a clip download uses the markers of its recorded clip
-      // slug (QueueTab viewer), everything else uses the main preview's.
+      // Chat .txt export: the user toggle decides whether a chat sidecar is
+      // written at all; the START/END chat markers bound it when set (a clip
+      // download uses its recorded clip slug's markers, everything else the
+      // main preview's), otherwise null ranges — the backend falls back to
+      // the download's trim window.
       const clipSlug = clipDownload ? clipSlugFromUrl(url.trim()) : null;
       const clipMarkers = clipSlug ? (clipChatMarkers[clipSlug] ?? EMPTY_CHAT_MARKERS) : EMPTY_CHAT_MARKERS;
       const chatStart = clipSlug ? clipMarkers.start : chatStartSec;
       const chatEnd = clipSlug ? clipMarkers.end : chatEndSec;
       const sidecarBody = {
         include_transcript: dlIncludeTranscript,
-        include_chat: chatStart != null || chatEnd != null,
-        chat_start_sec: chatStart,
-        chat_end_sec: chatEnd,
+        include_chat: dlIncludeChat,
+        chat_start_sec: dlIncludeChat ? chatStart : null,
+        chat_end_sec: dlIncludeChat ? chatEnd : null,
       };
       const body = clipDownload
         ? {
@@ -4245,7 +4251,7 @@ export default function App() {
       setQueueDownloads((prev) => prev.filter((d) => d.download_id !== pendingId));
       setError(err instanceof Error ? err.message : t('Download failed'));
     }
-  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio, dlIncludeTranscript, chatStartSec, chatEndSec, clipChatMarkers]);
+  }, [videoInfo, url, quality, effectiveDownloadTrim, ensureDownloadFolder, refreshDownloads, downloadFilename, downloadAsAudio, dlIncludeTranscript, dlIncludeChat, chatStartSec, chatEndSec, clipChatMarkers]);
 
   const downloadConfirmCopy = useMemo(() => {
     const clipDownload = isClipUrl(url.trim());
@@ -4282,6 +4288,7 @@ export default function App() {
     if (!downloadConfirmOpen) return;
     setDownloadFilename('');
     setDlIncludeTranscript(settings?.download_transcript_sidecar !== false);
+    setDlIncludeChat(true);
   }, [downloadConfirmOpen, downloadConfirmCopy.defaultFilename, settings?.download_transcript_sidecar]);
 
   // ── Cancel download ──
@@ -4443,15 +4450,14 @@ export default function App() {
     }]);
     try {
       const clipMarkers = clipChatMarkers[clip.id] ?? EMPTY_CHAT_MARKERS;
-      const includeChat = clipMarkers.start != null || clipMarkers.end != null;
       await apiPost<{ download_id: string }>(
         '/api/download/clip',
         {
           ...twitchClipDownloadRequest(clip),
           include_transcript: settings?.download_transcript_sidecar !== false,
-          include_chat: includeChat,
-          chat_start_sec: clipMarkers.start,
-          chat_end_sec: clipMarkers.end,
+          include_chat: dlIncludeChat,
+          chat_start_sec: dlIncludeChat ? clipMarkers.start : null,
+          chat_end_sec: dlIncludeChat ? clipMarkers.end : null,
         },
       );
     } catch (err: unknown) {
@@ -4459,7 +4465,7 @@ export default function App() {
       setError(err instanceof Error ? err.message : t('Failed to start download'));
     }
     void refreshDownloads();
-  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar, clipChatMarkers]);
+  }, [refreshDownloads, ensureDownloadFolder, settings?.download_transcript_sidecar, clipChatMarkers, dlIncludeChat]);
 
   const toggleChannelVodSelection = useCallback((vodUrl: string) => {
     setSelectedChannelVodUrls((prev) => {
@@ -7601,18 +7607,42 @@ export default function App() {
               <input type="checkbox" checked={dlIncludeTranscript} onChange={(e) => setDlIncludeTranscript(e.target.checked)} />
               {t('Download transcript (.txt)')}
             </label>
-            {chatStartSec != null || chatEndSec != null ? (
-              <p data-chat-txt-note className="text-[9px] font-mono text-[#53fc18]">
-                {t('Chat .txt: {start} → {end}', {
-                  start: chatStartSec != null ? formatArchiveOffset(chatStartSec) : t('—'),
-                  end: chatEndSec != null ? formatArchiveOffset(chatEndSec) : t('—'),
-                })}
-              </p>
-            ) : (
-              <p data-chat-txt-note className="text-[9px] font-mono text-zinc-600">
-                {t('Chat .txt: not included — set START/END markers in the preview chat')}
-              </p>
-            )}
+            <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
+              <input type="checkbox" checked={dlIncludeChat} onChange={(e) => setDlIncludeChat(e.target.checked)} />
+              {t('Download chat history (.txt)')}
+            </label>
+            {(() => {
+              const clipSlug = isClipUrl(url.trim()) ? clipSlugFromUrl(url.trim()) : null;
+              const start = clipSlug ? (clipChatMarkers[clipSlug]?.start ?? null) : chatStartSec;
+              const end = clipSlug ? (clipChatMarkers[clipSlug]?.end ?? null) : chatEndSec;
+              const trimStart = previewOpen ? previewTrimStart : trimStartSec;
+              const trimEnd = previewOpen ? previewTrimEnd : trimEndSec;
+              if (!dlIncludeChat) {
+                return (
+                  <p data-chat-txt-note className="text-[9px] font-mono text-zinc-600">
+                    {t('Chat .txt: not included')}
+                  </p>
+                );
+              }
+              if (start != null || end != null) {
+                return (
+                  <p data-chat-txt-note className="text-[9px] font-mono text-[#53fc18]">
+                    {t('Chat .txt: {start} → {end}', {
+                      start: start != null ? formatArchiveOffset(start) : t('—'),
+                      end: end != null ? formatArchiveOffset(end) : t('—'),
+                    })}
+                  </p>
+                );
+              }
+              return (
+                <p data-chat-txt-note className="text-[9px] font-mono text-zinc-400">
+                  {t('Chat .txt: trim {start} → {end}', {
+                    start: formatArchiveOffset(trimStart),
+                    end: formatArchiveOffset(trimEnd),
+                  })}
+                </p>
+              );
+            })()}
           </div>
         )}
         onConfirm={() => void executeStartDownload()}
