@@ -121,8 +121,23 @@ const confirmReloadDone = (version) => {
   })();
 };
 
+// A pending reload is only honored after TWO consecutive status polls
+// report the SAME target. The staged folder the user has loaded unpacked
+// is overwritten in place by builds; a reload sighted while that write is
+// in flight makes Chrome re-fetch background.js from a half-written tree
+// and the SW registration dies with "Service worker registration failed.
+// Status code: 10" (kErrorNetwork — script fetch failed) until a manual
+// reload, because Chrome stops retrying after ~3 backoff attempts. Two
+// sightings (alarm period 30s, persisted in chrome.storage so SW idle
+// restarts don't reset the count) mean the folder was complete for 30+
+// seconds before the reload.
+const RELOAD_SEEN_KEY = 'vodrip_reload_target_seen';
+const readReloadSeen = async () =>
+  ((await chrome.storage.local.get(RELOAD_SEEN_KEY))[RELOAD_SEEN_KEY] ?? null);
+const clearReloadSeen = () => chrome.storage.local.remove(RELOAD_SEEN_KEY);
+
 /** Check the directive without opening or reloading any browser page. */
-const checkReloadDirective = async () => {
+export const checkReloadDirective = async () => {
   let body;
   try {
     const res = await fetch(`${await getApiBase()}/api/extension/status`);
@@ -131,13 +146,22 @@ const checkReloadDirective = async () => {
   } catch {
     return; // backend offline — the alarm retries
   }
-  if (!body || !body.reloadTo) return;
+  if (!body || !body.reloadTo) {
+    await clearReloadSeen();
+    return;
+  }
   const manifestVersion = chrome.runtime.getManifest().version;
   if (body.reloadTo === manifestVersion) {
+    await clearReloadSeen();
     confirmReloadDone(manifestVersion);
     return;
   }
-  chrome.runtime.reload();
+  if ((await readReloadSeen()) === body.reloadTo) {
+    await clearReloadSeen();
+    chrome.runtime.reload();
+    return;
+  }
+  await chrome.storage.local.set({ [RELOAD_SEEN_KEY]: body.reloadTo });
 };
 
 chrome.alarms.onAlarm.addListener((alarm) => {

@@ -1,0 +1,5 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "Makes node treat the extension's .js modules as ESM (Chrome loads background.js as a module via manifest type:module). Not staged or packaged — src/ is the only staged tree."
+}
