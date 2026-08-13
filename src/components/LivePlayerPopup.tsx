@@ -1820,24 +1820,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
-              {/* Live captions toggle — CC overlay over the video. Only
-                  rendered when the parakeet gate reports available (503 /
-                  missing engine → no button, no overlay). */}
-              {captionsAvailable && (
-                <button
-                  type="button"
-                  onClick={() => setCaptionsEnabled((on) => !on)}
-                  aria-pressed={captionsEnabled}
-                  title={captionsEnabled ? t('Hide captions') : t('Live captions')}
-                  className={transportBtn}
-                >
-                  <Captions size={15} />
-                </button>
-              )}
-
               {/* Fast CLIP — one click, no popups: seconds input (5..60) +
                   5s cooldown; the backend reports its real capability
-                  (never fakes a clip). */}
+                  (never fakes a clip). Sits BESIDE the volume button and
+                  shares its transportBtn class so both render the SAME
+                  height docked and fullscreen (user request). */}
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
@@ -1846,7 +1833,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   title={clipCooldownLeft > 0
                     ? t('Clip cooldown {n}s', { n: Math.ceil(clipCooldownLeft / 1000) })
                     : t('Create a clip of the live stream')}
-                  className={`${platformPreviewCtrlBtn(ctrlPlatform, false)} flex items-center gap-1.5 disabled:pointer-events-none`}
+                  className={`${transportBtn} flex items-center gap-1.5 disabled:pointer-events-none`}
                 >
                   <TwitchLogoIcon size={15} className="shrink-0" />
                   {/* Logo already says Twitch — label stays bare "clip" (user request). */}
@@ -1891,6 +1878,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   </span>
                 </div>
               </div>
+
+              {/* Live captions toggle — CC overlay over the video. Only
+                  rendered when the parakeet gate reports available (503 /
+                  missing engine → no button, no overlay). */}
+              {captionsAvailable && (
+                <button
+                  type="button"
+                  onClick={() => setCaptionsEnabled((on) => !on)}
+                  aria-pressed={captionsEnabled}
+                  title={captionsEnabled ? t('Hide captions') : t('Live captions')}
+                  className={transportBtn}
+                >
+                  <Captions size={15} />
+                </button>
+              )}
 
               {clipNotice && (
                 <div
