@@ -1,0 +1,48 @@
+# VOD.RIP
+
+> A desktop app for downloading Twitch, Kick, and YouTube VODs, clips, highlights, and live streams. Paste a link, preview the content, trim what you need, save an editor-ready file. Works offline, keeps everything on your machine, no account required.
+
+Important URLs:
+- [Repository](https://github.com/mateusant13/VOD.RIP)
+- [README](https://github.com/mateusant13/VOD.RIP/blob/main/README.md)
+- [Releases](https://github.com/mateusant13/VOD.RIP/releases)
+- [License (MIT)](https://github.com/mateusant13/VOD.RIP/blob/main/LICENSE.txt)
+
+## What VOD.RIP is
+
+- Cross-platform desktop app (Windows `.exe`, macOS `.app`, Linux portable `.zip`) built on Python/FastAPI (backend) + React/TypeScript (frontend), rendered in a WebView2 shell.
+- Downloads VODs, clips, and highlights from Twitch, Kick, and YouTube — full streams or trimmed segments, at the chosen quality.
+- Records live streams from Twitch, Kick, or YouTube as they happen.
+- Everything runs locally: no account, no uploads, no telemetry.
+
+## Key features
+
+- In-app preview before downloading (no commitment to a download just to inspect content).
+- Trim to the moment — keep only the segment you want from a multi-hour stream.
+- Download queue with live progress, pause, resume, and cancel.
+- Pinned creator feeds for Twitch, Kick, and YouTube side by side, with live badges.
+- Pop-out preview windows (detachable overlay player).
+- Local searchable archive with filters, dedupe, and transcripts for saved content.
+- Built-in ad-blocking for Twitch previews.
+- Disk management (what is taking space, cleanup without leaving the app).
+- Local media import: open a video file, trim it, export like anything else.
+- Real-time live captions (speech-to-text over the livestream) and live chat history.
+- Resizable panels that remember layout, keyboard shortcuts, adjustable UI scale.
+
+## Project layout
+
+- `backend/` — Python/FastAPI service (routers, services, models). ASR/transcription via whisper and sherpa-onnx parakeet; downloads via yt-dlp; live chat sinks for Twitch IRC, Kick, and YouTube.
+- `src/` — React/TypeScript frontend (Vite + Tailwind). Main app shell, channel explorer, live player popup, settings.
+- `vendor/cookie-extension/` — optional browser extension that bridges session cookies for authenticated flows (e.g. Twitch clip creation).
+- `scripts/` — build and tooling (`generate-icon.py`, `dev-all.mjs`, `build-install.ps1`).
+
+## Build from source
+
+- `npm install`, then `cd backend && pip install -r requirements.txt`, then `npm run dev` for development.
+- Production bundle: `npm run build-dist` (Vite build + PyInstaller onedir + extension staging + signing).
+- Windows install script: `scripts/build-install.ps1` (builds, backs up the previous install, deploys, and smoke-tests).
+
+## Testing
+
+- Frontend: `vitest` (test files colocated in `src/`).
+- Backend: `pytest` from `backend/` (run with `-p no:cacheprovider`).
