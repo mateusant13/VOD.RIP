@@ -30,3 +30,20 @@ def test_muxed_360_not_shrunk_when_clen_present():
     }]
     sizes = size_by_quality_from_formats(formats, 60.0)
     assert sizes["360p"] == 5_000_000
+
+
+def test_googlevideo_tbr_used_at_face_value_plus_audio():
+    """Video-only DASH without clen: tbr is the stream average (YouTube itag
+    bandwidth) — used at face value with the audio addition. Guards the old
+    0.55 manifest-shrink that halved it."""
+    formats = [{
+        "url": "https://rr1---sn-x.googlevideo.com/videoplayback?mime=video%2Fmp4&itag=137",
+        "height": 1080,
+        "vcodec": "avc1",
+        "acodec": "none",
+        "tbr": 8000.0,
+        "format_id": "adaptive-137",
+        "protocol": "https",
+    }]
+    sizes = size_by_quality_from_formats(formats, 360.0)
+    assert sizes["1080p"] == int((8000.0 + 160.0) * 1000.0 / 8.0 * 360.0)
