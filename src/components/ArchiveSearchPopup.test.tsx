@@ -363,11 +363,10 @@ describe('ArchiveSearchPopup', () => {
     expect(targetsArg[0].video).toMatchObject({ video_id: 'v1' });
   });
 
-  it('source filter + kind badges translate (pt-BR fala/vídeo, es habla/Video)', async () => {
+  it('source filter + kind badges translate (pt-BR fala, es habla)', async () => {
     const fetchMock = mockFetch([HIT]);
     setLanguage('pt-BR');
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    expect(screen.getByRole('button', { name: 'vídeo' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'fala' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
     // No 'ambos'/'both' chip anymore — every source is a real toggle, all ON.
@@ -380,7 +379,7 @@ describe('ArchiveSearchPopup', () => {
     // Live language switch re-renders the same popup.
     setLanguage('es');
     await waitFor(() => expect(screen.getByRole('button', { name: 'habla' })).toBeInTheDocument());
-    expect(screen.getByRole('button', { name: 'Video' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
     expect(within(row).getByText('habla')).toBeInTheDocument();
   });
 
@@ -392,20 +391,22 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('source=');
 
-    // Deselect speech → video+chat goes as a comma-joined subset
-    // (URLSearchParams percent-encodes the comma).
+    // Deselect speech → chat alone goes as a single source
+    // (URLSearchParams percent-encodes nothing here — one value).
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=video%2Cchat')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy(),
     );
 
-    // Deselect chat too → only video remains.
+    // Deselect chat too — the last chip can't be removed (never-empty
+    // guard), so the filter snaps back to all and the param disappears.
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
-    await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=video')).toBeTruthy(),
-    );
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).not.toContain('source=');
+    });
 
-    // Re-select both — back to all three, the param disappears again.
+    // Re-select both — back to all, the param disappears again.
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() => {
@@ -432,7 +433,7 @@ describe('ArchiveSearchPopup', () => {
     // Concept search covers transcripts only — deselecting speech disables it.
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled());
-    expect(searchUrlWith(fetchMock, 'q=zebra&source=video%2Cchat')).not.toContain('semantic=');
+    expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).not.toContain('semantic=');
 
     // Re-selecting speech re-enables it (state preserved).
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
@@ -1306,23 +1307,21 @@ describe('ArchiveSearchPopup batch-3', () => {
     channel: 'srdogg',
   };
 
-  it('video source chip: 3 chips, deselecting speech+chat leaves video only, disables CONTEXT', async () => {
+  it('source chips: 2 chips, deselecting speech leaves chat only, disables CONTEXT', async () => {
     const fetchMock = mockFetch([]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    const video = screen.getByRole('button', { name: 'video' });
-    expect(video).toBeInTheDocument();
-    // All three chips are ON by default (aria-pressed).
-    for (const name of ['video', 'speech', 'chat']) {
+    // All source chips are ON by default (aria-pressed) — no 'video' chip.
+    for (const name of ['speech', 'chat']) {
       expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'true');
     }
-    // Deselect speech and chat → video-only subset.
+    expect(screen.queryByRole('button', { name: 'video' })).toBeNull();
+    // Deselect speech → chat-only subset.
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
-    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=video')).toBeTruthy());
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy());
     expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled();
-    // Semantic never reaches the wire for video-title filters.
+    // Semantic never reaches the wire for chat-only filters.
     expect(searchUrls(fetchMock).every((u) => !u.includes('semantic='))).toBe(true);
   });
 
