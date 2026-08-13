@@ -138,6 +138,11 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
   const [filter, setFilter] = useState('all');
   const scrollRef = useRef<HTMLDivElement>(null);
   const esRefs = useRef<EventSource[]>([]);
+  // Armed while the panel should sit at the live edge: starts true (the panel
+  // opens on the newest messages once the backlog prefill lands), and is
+  // disarmed by any user scroll away from the bottom so a late prefill never
+  // yanks them back down.
+  const stickRef = useRef(true);
 
   const multi = sources.length > 1;
   // Stable chip order: kick, twitch, youtube (deduped).
@@ -261,12 +266,17 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
     [rows, filter],
   );
 
-  // Follow the live edge (only when the user is already at the bottom).
+  // Follow the live edge (only when the user is already at the bottom, or
+  // when the panel is still armed — the initial backlog land must open at
+  // the newest messages, not the top of the prefill).
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || !visibleRows.length) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-    if (atBottom) el.scrollTop = el.scrollHeight;
+    if (stickRef.current || atBottom) {
+      el.scrollTop = el.scrollHeight;
+      stickRef.current = true;
+    }
   }, [visibleRows]);
 
   const statusLine = status === 'live'
@@ -315,7 +325,17 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
           ))}
         </div>
       ) : null}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0" data-live-chat-scroll>
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          if (el.scrollHeight - el.scrollTop - el.clientHeight >= 24) {
+            stickRef.current = false;
+          }
+        }}
+        className="flex-1 overflow-y-auto min-h-0"
+        data-live-chat-scroll
+      >
         {visibleRows.length === 0 ? (
           <div className="px-2 py-2 text-[10px] font-mono text-zinc-500">
             {status === 'live' ? t('Waiting for chat…') : statusLine}

@@ -12,7 +12,7 @@
  * LivePlayerPopup.test.tsx).
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import LiveChatPanel, { type LiveChatSource } from './LiveChatPanel';
 
 const HISTORY = {
@@ -165,5 +165,45 @@ describe('LiveChatPanel backlog pre-fill', () => {
     const texts = rowTexts();
     expect(texts[0]).toContain('old one');
     expect(texts[3]).toContain('just now');
+  });
+});
+
+describe('LiveChatPanel initial scroll position', () => {
+  /**
+   * jsdom has no layout, so the scroll container reads 0/0/0 by default.
+   * Model a container whose backlog overflows the viewport (scrollHeight
+   * 1000 > clientHeight 100) — the panel must land at the bottom (scrollTop
+   * == scrollHeight) when the prefill lands, not at the top (scrollTop 0).
+   */
+  function mockOverflowingScroll(): HTMLElement {
+    const scrollEl = document.querySelector('[data-live-chat-scroll]') as HTMLElement;
+    Object.defineProperty(scrollEl, 'clientHeight', { value: 100, configurable: true });
+    Object.defineProperty(scrollEl, 'scrollHeight', { value: 1000, configurable: true });
+    scrollEl.scrollTop = 0;
+    return scrollEl;
+  }
+
+  it('opens scrolled to the newest messages (bottom) once the backlog prefill lands', async () => {
+    mockPanelFetch();
+    render(
+      <LiveChatPanel sources={[{ platform: 'twitch', slug: 'chan' }]} onClose={() => {}} />,
+    );
+    const scrollEl = mockOverflowingScroll();
+    await waitFor(() => expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(3));
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(1000));
+  });
+
+  it('does not yank a user scrolled up when the prefill lands late', async () => {
+    mockPanelFetch();
+    render(
+      <LiveChatPanel sources={[{ platform: 'twitch', slug: 'chan' }]} onClose={() => {}} />,
+    );
+    const scrollEl = mockOverflowingScroll();
+    // User reads history (scrolls up) while the backlog fetch is in flight.
+    scrollEl.scrollTop = 800;
+    fireEvent.scroll(scrollEl);
+    await waitFor(() => expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(3));
+    // The late prefill must not yank them back to the live edge.
+    expect(scrollEl.scrollTop).toBe(800);
   });
 });
