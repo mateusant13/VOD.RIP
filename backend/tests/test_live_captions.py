@@ -256,6 +256,42 @@ async def test_captioner_offline_event_after_consecutive_strikes(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_captioner_surfaces_repeated_asr_failures_as_offline(monkeypatch):
+    """A persistently broken ASR engine must NOT leave the SSE alive with
+    keepalives and no captions: after _FLUSH_FAIL_LIMIT consecutive flush
+    failures the worker emits offline and stops (the failure is surfaced,
+    never silent)."""
+    long_playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n" + "".join(
+        f"#EXTINF:1.0,\nseg{i}.ts\n" for i in range(1, 9)
+    )
+
+    class _FailingPipeline(_FakePipeline):
+        def transcribe_window(self, audio, duration):
+            raise RuntimeError("simulated parakeet failure")
+
+    pipeline = _FailingPipeline([long_playlist], [])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire()
+    try:
+        ev, data = await _wait_event(captioner.events)
+        assert ev == "offline"
+        assert "asr failure" in (data.get("reason") or "")
+    finally:
+        captioner.release()
+        th = captioner._thread
+        assert th is not None
+        th.join(timeout=3.0)
+        assert not th.is_alive()
+    # the worker removed itself from the registry on exit
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
+@pytest.mark.anyio
 async def test_captioner_refcount_starts_and_stops_worker(monkeypatch):
     """First acquire starts the worker; releasing back to zero stops it. A
     second acquire restarts a FRESH worker (registry entry reused)."""

@@ -1242,11 +1242,20 @@ def _asr_model_name(engine: str) -> str:
 
 
 def _parakeet_provider() -> str:
-    """'cuda' on a CUDA-pinned slot with CUDA sherpa present, else 'cpu'.
+    """'cuda' on a CUDA-pinned pool slot with CUDA sherpa present, else 'cpu'.
 
-    Mirrors the whisper thread's device pin: off-pool callers and CPU slots
-    get the plain CPU provider (the int8 recognizer they always had)."""
-    device, _ = _thread_pin() or _effective_device()
+    Mirrors the whisper thread's device pin. Off-pool callers (the live
+    captions worker, tests, any direct call) ALWAYS get the plain CPU int8
+    recognizer — never the CUDA EP: on a box where CUDA cannot actually
+    load (no real GPU — e.g. a Virtual Display Driver), the EP append
+    raises AND the in-process CPU fallback access-violates the process
+    (reproduced: the captioner's CUDA attempt crashed the whole API
+    listener). The real-time captioner must never touch CUDA; pool threads
+    keep their pinned slot device."""
+    pin = _thread_pin()
+    if pin is None:
+        return "cpu"
+    device, _ = pin
     if device == "cuda" and _parakeet_cuda_available():
         return "cuda"
     return "cpu"
