@@ -95,7 +95,7 @@ import SettingsTab from './components/SettingsTab';
 import BotGateBanner from './components/BotGateBanner';
 import CookieInstallOffer from './components/CookieInstallOffer';
 import { isFirstTime as isFirstTimeFlag } from './lib/firstTime';
-import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
+import PreviewChatPanel from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
@@ -471,18 +471,10 @@ export default function App() {
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
-  /** Attached chat panel's rendered footprint in the preview row (open width,
-   *  collapsed strip, or 0 when space-forced shut). The player container
-   *  height derives from the column width LEFT after the chat, so the
-   *  container can never flip to portrait while the chat is attached. */
-  const [previewChatLayout, setPreviewChatLayout] = useState<{ open: boolean; width: number }>(() => ({
-    open: true,
-    width: readPreviewChatPanelWidth(),
-  }));
-  const previewChatLayoutRef = useRef(previewChatLayout);
-  previewChatLayoutRef.current = previewChatLayout;
-  /** Main-preview chat panel open state (header toggle). Mirrors the panel's
-   *  own defaultOpen=true; reset on close so the next preview opens with chat. */
+  /** Main-preview chat open state (header toggle). Mirrors the panel's own
+   *  defaultOpen=true; reset on close so the next preview opens with chat.
+   *  The chat FLOATS over the video (see data-preview-chat-overlay), so no
+   *  layout footprint is tracked anymore. */
   const [previewChatOpen, setPreviewChatOpen] = useState(true);
   /** Load start of the current preview session — any user unpause at/after
    *  this timestamp suppresses the load-complete auto-pause. */
@@ -3199,11 +3191,10 @@ export default function App() {
 
   // Height explosion guard: PreviewChatPanel's self-stretching column grows
   // to the unbounded virtualized list (topPad/bottomPad spacers ~112k px for
-  // a long VOD), and in an auto-height flex row the chat's content height
-  // wins over the player column's explicit height — the whole preview card
-  // balloons and the chat fills the screen. Pin the row to the player
-  // column's content height (same fix as ChannelExplorePopup, 3a2b9d4); the
-  // chat's internal `flex-1 min-h-0 overflow-y-auto` then scrolls inside it.
+  // a long VOD). The main-preview chat now floats over the video
+  // (data-preview-chat-overlay, absolutely positioned inside the player
+  // column) so it can no longer stretch the row — the pin is kept because
+  // the row is still content-driven and must never outgrow the column.
   useLayoutEffect(() => {
     const row = previewRowRef.current;
     const col = previewContainerRef.current;
@@ -3485,13 +3476,14 @@ export default function App() {
    *  taller than wide). The frozen ref is NOT overwritten here — it holds
    *  the user's picked height so the render-time clamp restores it when the
    *  width grows back. The height derives from the PLAYER COLUMN width
-   *  (card minus the attached chat panel), never the card width — a height
-   *  from the card width makes the container portrait while the chat is
-   *  open. */
+   *  (card minus chrome) — never the card width, or the container goes
+   *  portrait the moment the card shrinks. The chat floats over the video
+   *  (data-preview-chat-overlay) and no longer eats into the column, so the
+   *  column width is the full row width: chat footprint = 0. */
   const applyPreviewWidthWithHeight = useCallback((w: number) => {
     previewPanelWidthRef.current = w;
     if (previewPanelRef.current) applyPanelWidth(previewPanelRef.current, w);
-    const colW = previewPlayerColumnWidth(w, previewChatLayoutRef.current.width);
+    const colW = previewPlayerColumnWidth(w, 0);
     const h = previewContainerHeight(
       previewPanelHeightRef.current,
       colW,
@@ -3688,11 +3680,10 @@ export default function App() {
     // aspect change can't collapse the panel; a user resize must re-derive it
     // from the new width or the panel stays locked on the vertical axis. The
     // constraint keeps a landscape panel from ever flipping to portrait. The
-    // height derives from the PLAYER COLUMN width (card minus the attached
-    // chat panel), never the card width — otherwise the panel goes portrait
-    // the moment the chat opens.
+    // height derives from the PLAYER COLUMN width (card minus chrome); the
+    // chat floats over the video and takes no column space anymore.
     const setPreviewHeightFromWidth = (w: number) => {
-      const colW = previewPlayerColumnWidth(w, previewChatLayoutRef.current.width);
+      const colW = previewPlayerColumnWidth(w, 0);
       const h = previewContainerHeight(
         Math.round(colW / Math.max(0.01, aspect)),
         colW,
@@ -6648,7 +6639,7 @@ export default function App() {
                   ? 'relative flex-1 min-w-0 border-0'
                   : 'relative flex-1 min-w-0 shrink-0 border-2 border-zinc-700'
               }`}
-              style={!previewFullscreen ? { height: previewContainerHeight(previewPanelHeightRef.current, previewPlayerColumnWidth(effectivePreviewPanelWidth, previewChatLayoutRef.current.width), previewVideoAspect, previewChromeHRef.current), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
+              style={!previewFullscreen ? { height: previewContainerHeight(previewPanelHeightRef.current, previewPlayerColumnWidth(effectivePreviewPanelWidth, 0), previewVideoAspect, previewChromeHRef.current), maxHeight: previewVideoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' } : undefined}
 
             >
               <div
@@ -6760,43 +6751,49 @@ export default function App() {
                   onClick={() => void togglePreviewFullscreen()}
                 />
               )}
+              {previewChatOpen && (
+                <div
+                  data-preview-chat-overlay
+                  // Floating overlay anchored to the right edge of the player
+                  // container: above the video (z-0) and the transport controls
+                  // (z-10), below the fullscreen exit (z-30). The chat no
+                  // longer occupies row width — the player column keeps its
+                  // full width whether the chat is open or closed. `hidden`
+                  // (fullscreen) keeps the panel mounted so its state survives.
+                  className="absolute top-0 right-0 bottom-0 z-20 flex max-w-full"
+                >
+                  <PreviewChatPanel
+                    platform={activePlatform}
+                    videoId={previewArchiveVideoId}
+                    currentTime={previewTimeUi}
+                    open={previewChatOpen}
+                    onOpenChange={setPreviewChatOpen}
+                    // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
+                    channel={videoInfo?.channel ?? null}
+                    // Click-to-seek: chat/transcript/event rows and the subtitle
+                    // caption seek the CURRENT preview player. handlePreviewChatSeek
+                    // widens the trim when the click falls outside it so the jump
+                    // always lands on the archive-absolute offset (seekPreviewVideo
+                    // no-ops until the player is ready; the shared seekToTimestamp
+                    // helper owns the dispatch).
+                    onSeek={handlePreviewChatSeek}
+                    hidden={previewFullscreen}
+                    // Gates only the URL-only live-captions fetch (video-first);
+                    // the archive payload starts at session-create so the Twitch
+                    // chat backfill kicks off before canplay.
+                    started={previewVideoReady}
+                    // Clamp the overlay to the player container's width so a
+                    // narrow preview never overflows it. Container = card minus
+                    // p-4(16) and border-2(2) per side = 36. The panel's own
+                    // PANEL_MIN_W collapse below 220px is handled internally.
+                    maxWidth={Math.max(0, effectivePreviewPanelWidth - 36)}
+                    // Start/end markers lifted for the next download's chat .txt
+                    // export (the panel clears them on video switch too).
+                    onMarkersChange={handleChatMarkersChange}
+                  />
+                </div>
+              )}
             </div>
-            <PreviewChatPanel
-              platform={activePlatform}
-              videoId={previewArchiveVideoId}
-              currentTime={previewTimeUi}
-              open={previewChatOpen}
-              onOpenChange={setPreviewChatOpen}
-              // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
-              channel={videoInfo?.channel ?? null}
-              // Click-to-seek: chat/transcript/event rows and the subtitle
-              // caption seek the CURRENT preview player. handlePreviewChatSeek
-              // widens the trim when the click falls outside it so the jump
-              // always lands on the archive-absolute offset (seekPreviewVideo
-              // no-ops until the player is ready; the shared seekToTimestamp
-              // helper owns the dispatch).
-              onSeek={handlePreviewChatSeek}
-              hidden={previewFullscreen}
-              // Gates only the URL-only live-captions fetch (video-first);
-              // the archive payload starts at session-create so the Twitch
-              // chat backfill kicks off before canplay.
-              started={previewVideoReady}
-              // Reserve the player's layout minimum: the chat panel may never
-              // eat into it, whatever the user's stored panel width says.
-              // Row budget = card - p-4(16) - border-2(2) per side, minus the
-              // PREVIEW_PANEL_MIN_W(280) player reserve and the row's gap-2(8).
-              // Below the panel's own minimum there is no room for chat at all
-              // and it collapses to zero width. Keep the 36 in sync with the
-              // card's p-4/border-2 classes.
-              maxWidth={Math.max(0, effectivePreviewPanelWidth - PREVIEW_PANEL_MIN_W - 8 - 36)}
-              // The container height derives from the width the chat actually
-              // occupies (see previewPlayerColumnWidth): report it so the
-              // player column never flips to portrait when the panel opens.
-              onLayoutChange={setPreviewChatLayout}
-              // Start/end markers lifted for the next download's chat .txt
-              // export (the panel clears them on video switch too).
-              onMarkersChange={handleChatMarkersChange}
-            />
           </div>
           {!previewFullscreen && (
             <PanelResizeHandles onPointerDown={onPreviewPanelResize} />
