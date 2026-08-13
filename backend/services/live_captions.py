@@ -48,11 +48,20 @@ SUPPORTED_PLATFORMS = ("twitch", "kick")
 WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
 POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
 # ~3s of speech is a usable caption block (~2-4 words per second of speech);
-# a 1s window would yield 2-3 words — too short to read. The player's ~1-2s
-# behind-live plus ~1-1.5s transcribe means captions land ~2-4s behind the
-# live edge, matching closed-caption expectations.
+# a 1s window would yield 2-3 words — too short to read.
+#
+# INTENTIONAL DELAY: the transcript needs the audio it describes, so a
+# caption for window [t0, t1] is emitted right after t1 plus the transcribe
+# latency — never before the window's audio is complete. Parakeet (CPU
+# int8) on a 3s window transcribes in ~0.5-1.5s, so the caption text lands
+# ~1s after the words it transcribes; the player's own ~1-2s behind-live
+# then puts it ~2-4s behind the live edge, matching closed-caption
+# expectations. That ~1s past-the-audio delay is deliberate and tuned by
+# WINDOW_SEC/POLL_SEC (a smaller window cuts the delay but makes blocks
+# too short to read).
 WINDOW_SEC = 3.0
 POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
+_FLUSH_FAIL_LIMIT = 3  # consecutive ASR flush failures -> offline (never a silent dead stream)
 _MASTER_TTL_SEC = 300.0  # re-resolve the live master (fresh usher tokens)
 _MASTER_403_TTL_SEC = 60.0  # ...or sooner after a 403 (expired token)
 _OFFLINE_STRIKES = 3  # consecutive offline resolutions -> offline event + stop
@@ -267,9 +276,18 @@ def _unregister(captioner: "LiveCaptioner") -> None:
 
 
 def captions_available(platform: str) -> tuple[bool, str]:
-    """(available, reason) gate — captions need the parakeet engine importable
-    AND its model files present locally (a live captioner must not trigger a
-    multi-GB download mid-stream). Runs off-loop via asyncio.to_thread."""
+    """(available, reason) gate — captions need the parakeet MODEL files
+    present locally (a live captioner must not trigger a multi-GB download
+    mid-stream).
+
+    Deliberately checks ONLY the model dir (stdlib file probe) and never
+    imports sherpa_onnx in the API process: the +cuda wheel's onnxruntime
+    DLL import can crash the HTTP listener natively on boxes where CUDA is
+    broken (frozen-bundle repro: the first /available request killed the
+    server). Engine importability is probed lazily in the worker thread at
+    transcribe time; repeated flush failures surface as an 'offline' event
+    instead of a silent keepalive stream. Runs off-loop via
+    asyncio.to_thread."""
     plat = (platform or "").lower()
     if plat not in SUPPORTED_PLATFORMS:
         return False, "captions support twitch and kick only"
@@ -277,8 +295,6 @@ def captions_available(platform: str) -> tuple[bool, str]:
         from services import archive_transcribe as at
     except Exception as exc:  # pragma: no cover - env-specific
         return False, f"transcription engine unavailable: {exc}"
-    if not at._parakeet_available():
-        return False, "parakeet engine unavailable (sherpa-onnx missing or VODRIP_PARAAKEET=0)"
     if at._parakeet_resolve_dir() is None:
         return False, "parakeet model not downloaded yet — run a transcription job to fetch it"
     return True, ""
@@ -316,6 +332,7 @@ class LiveCaptioner:
         self._buffer_sec = 0.0
         self._origin: Optional[float] = None  # epoch of stream time 0 (PDT-derived)
         self._stream_sec = 0.0  # cumulative duration of ingested segments
+        self._flush_failures = 0  # consecutive ASR flush failures (-> offline)
         self._master: Optional[dict] = None
         self._master_at = 0.0
         self._media_url: Optional[str] = None
@@ -341,6 +358,7 @@ class LiveCaptioner:
                 self._buffer_sec = 0.0
                 self._origin = None
                 self._stream_sec = 0.0
+                self._flush_failures = 0
                 self._master = None
                 self._master_at = 0.0
                 self._media_url = None
@@ -506,9 +524,26 @@ class LiveCaptioner:
             text = _transcribe_window(audio, buffer_sec)
         except Exception as exc:
             # ASR failure (model load hiccup, VAD error) — drop the window,
-            # keep rolling; never raise into the poll loop.
-            logger.debug("live captions %s/%s flush failed: %s", self.platform, self.channel, exc)
+            # keep rolling; but a persistently broken engine must not leave
+            # the SSE alive with keepalives and NO captions forever: after
+            # _FLUSH_FAIL_LIMIT consecutive failures, surface it as an
+            # offline event so the frontend hides the overlay (never a
+            # silent dead stream).
+            self._flush_failures += 1
+            logger.warning(
+                "live captions %s/%s flush failed (%d/%d): %s",
+                self.platform, self.channel, self._flush_failures,
+                _FLUSH_FAIL_LIMIT, exc,
+            )
+            if self._flush_failures >= _FLUSH_FAIL_LIMIT:
+                logger.error(
+                    "live captions %s/%s disabled — %d consecutive ASR failures: %s",
+                    self.platform, self.channel, self._flush_failures, exc,
+                )
+                self._emit("offline", {"reason": f"asr failure: {exc}"})
+                self._stop.set()
             return
+        self._flush_failures = 0
         if not text:
             return
         logger.info(

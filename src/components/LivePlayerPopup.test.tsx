@@ -605,15 +605,27 @@ describe('LivePlayerPopup live captions', () => {
     act(() => { es.fire('caption', JSON.stringify({ text: 'legenda visível', start: 0, end: 3 })); });
     expect(screen.getByText('legenda visível')).toBeTruthy();
 
-    fireEvent.click(screen.getByTitle('Hide captions'));
+    // ON by default and LIT with the kick accent; OFF dims the button.
+    const litBtn = screen.getByTitle('Hide captions');
+    expect(litBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(litBtn.className).toContain('text-[#53fc18]');
+    expect(litBtn.className).not.toContain('opacity-40');
+
+    fireEvent.click(litBtn);
     expect(es.closed).toBe(true);
     expect(screen.queryByText('legenda visível')).toBeNull();
     expect(screen.queryByTitle('Hide captions')).toBeNull();
-    expect(screen.getByTitle('Live captions')).toBeTruthy();
+    const dimBtn = screen.getByTitle('Live captions');
+    expect(dimBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(dimBtn.className).toContain('opacity-40');
+    expect(dimBtn.className).not.toContain('text-[#53fc18]');
 
-    fireEvent.click(screen.getByTitle('Live captions'));
+    fireEvent.click(dimBtn);
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
     expect(FakeEventSource.instances[1].closed).toBe(false);
+    const relitBtn = screen.getByTitle('Hide captions');
+    expect(relitBtn.className).toContain('text-[#53fc18]');
+    expect(relitBtn.className).not.toContain('opacity-40');
     act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'legenda de novo', start: 3, end: 6 })); });
     expect(screen.getByText('legenda de novo')).toBeTruthy();
   });

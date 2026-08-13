@@ -1368,6 +1368,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // docked, glass when the popup is fullscreen).
   const ctrlPlatform = (activeEntry.platform ?? 'kick') as PlatformStyleKey;
   const transportBtn = platformPreviewCtrlBtn(ctrlPlatform, isFullscreen, false);
+  // Captions toggle lit/unlit — ON lights up with the platform accent
+  // (same color as the transport shadow), OFF dims the plain transport
+  // button so the state reads at a glance. Captions only exist for
+  // twitch/kick, so the accent map never needs the youtube fallback.
+  const ccAccent = ctrlPlatform === 'kick'
+    ? { border: 'border-[#53fc18]', bg: 'bg-[#53fc18]/15', text: 'text-[#53fc18]', hover: 'hover:bg-[#53fc18]/30' }
+    : { border: 'border-[#9146FF]', bg: 'bg-[#9146FF]/15', text: 'text-[#9146FF]', hover: 'hover:bg-[#9146FF]/30' };
+  const ccBtnLit = `border-2 ${ccAccent.border} ${ccAccent.bg} ${ccAccent.text} p-1.5 ${platformButtonShadow(ctrlPlatform)} ${ccAccent.hover}`;
 
   const archiveAvailable = archiveReady;  // Live rail: pinned at the archive edge; dragging back opens REPLAY.
   // Replay rail: full snapshot duration; max follows hls.js video.duration.
@@ -1888,7 +1896,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   onClick={() => setCaptionsEnabled((on) => !on)}
                   aria-pressed={captionsEnabled}
                   title={captionsEnabled ? t('Hide captions') : t('Live captions')}
-                  className={transportBtn}
+                  className={captionsEnabled ? ccBtnLit : `${transportBtn} opacity-40`}
                 >
                   <Captions size={15} />
                 </button>
