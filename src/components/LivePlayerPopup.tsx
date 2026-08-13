@@ -129,6 +129,16 @@ const REPLAY_RESNAPSHOT_MS = 30_000;
 /** Live session POST stall budget — after this the popup advances to the next
  *  live entry (or surfaces the error) instead of pinning the spinner. */
 const SESSION_STALL_MS = 8_000;
+/** Inactivity fade for the transport + header ('rapido' per the user) — the
+ *  App fullscreen pattern is 200ms; the live popup watches at 2500ms so a
+ *  paused read of the rail/menus never flickers. */
+const LIVE_CONTROLS_HIDE_MS = 2_500;
+/** Retained live back-buffer (hls.js backBufferLength) — ArrowLeft/Right seek
+ *  inside it when the live has NO DVR archive (the rail stays disabled). */
+const LIVE_BACK_BUFFER_SEC = 30;
+/** Never land the back-buffer arrow seek ON the live edge — stay a hair below
+ *  it (hls.js's own sync target rides ~liveSyncDuration behind the edge). */
+const LIVE_EDGE_SEEK_SAFETY_SEC = 0.75;
 
 export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
   const { t } = useI18n();
@@ -259,6 +269,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // play() promise aborting on a live-sync seek) auto-resume instead.
   const userPausedRef = useRef(false);
 
+  // Inactivity auto-hide for the transport + header: a ref-backed timer
+  // hides ~2.5s after the last interaction; any mousemove/keydown/pointerdown/
+  // touchstart bumps it back. The timer only ARMS when a hide-block is clear —
+  // paused/loading/error/open menus keep the controls up regardless.
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const controlsHideTimerRef = useRef<number | null>(null);
+
   // DVR state — LIVE (default, live master) vs REPLAY (ENDLIST snapshot of the
   // channel's in-progress VOD). Mode switches recreate the hls instance so a
   // seek never breaks the other mode's playback.
@@ -360,6 +377,57 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     window.addEventListener('mousedown', handler);
     return () => window.removeEventListener('mousedown', handler);
   }, [qualityMenuOpen, volumeMenuOpen]);
+
+  // --- Auto-hide: bump + hide-block rules ---
+  // This build has no clip-seconds POPOVER (the seconds field is inline in
+  // the transport); the focused-text-input check below covers the equivalent
+  // pause: while the user is actively editing the field the controls stay up.
+  const isTransportTextFocused = () => {
+    const el = document.activeElement;
+    return el instanceof HTMLElement
+      && el.closest('[data-live-transport]') !== null
+      && el.tagName === 'INPUT'
+      && (el as HTMLInputElement).type === 'text';
+  };
+  const hideBlocked = paused || loading || error !== null
+    || volumeMenuOpen || qualityMenuOpen || isTransportTextFocused();
+  const hideBlockedRef = useRef(hideBlocked);
+  hideBlockedRef.current = hideBlocked;
+  const controlsHidden = !controlsVisible && !hideBlocked;
+
+  /** Interaction anywhere in the popup — show the controls and restart the
+   *  inactivity countdown (same bump-on-interaction UX as App's fullscreen
+   *  player, just a longer window). */
+  const bumpControls = useCallback(() => {
+    setControlsVisible(true);
+    if (controlsHideTimerRef.current != null) {
+      window.clearTimeout(controlsHideTimerRef.current);
+      controlsHideTimerRef.current = null;
+    }
+    if (hideBlockedRef.current) return;
+    controlsHideTimerRef.current = window.setTimeout(() => {
+      controlsHideTimerRef.current = null;
+      setControlsVisible(false);
+    }, LIVE_CONTROLS_HIDE_MS);
+  }, []);
+
+  // Block flips cancel the countdown (a pause/menu must not hide on a stale
+  // timer); clearing a block — or bump() re-showing — re-arms it so the fade
+  // always restarts from the LAST interaction.
+  useEffect(() => {
+    if (hideBlocked) {
+      if (controlsHideTimerRef.current != null) {
+        window.clearTimeout(controlsHideTimerRef.current);
+        controlsHideTimerRef.current = null;
+      }
+      return;
+    }
+    if (!controlsVisible || controlsHideTimerRef.current != null) return;
+    controlsHideTimerRef.current = window.setTimeout(() => {
+      controlsHideTimerRef.current = null;
+      setControlsVisible(false);
+    }, LIVE_CONTROLS_HIDE_MS);
+  }, [hideBlocked, controlsVisible]);
 
   const destroyHls = useCallback(() => {
     if (replayTimerRef.current != null) {
@@ -476,7 +544,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // ~3-5s live pipeline latency (backend/services/preview/session.py).
       maxBufferLength: 20,
       maxMaxBufferLength: 40,
-      backBufferLength: 12,
+      // Retained back-buffer = the arrow-seek window: LIVE without a DVR
+      // archive still lets ArrowLeft/Right rewind ~30s into the stream (the
+      // rail stays disabled — see the keydown listener below).
+      backBufferLength: LIVE_BACK_BUFFER_SEC,
       startFragPrefetch: true,
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
@@ -485,7 +556,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // hls.js REQUIRES liveMaxLatencyDuration > liveSyncDuration (config
       // merge throws otherwise) — keep the catch-up band above the target.
       liveMaxLatencyDuration: 15,
-      liveDurationInfinity: true,
+      // liveDurationInfinity false → the browser sees a FINITE live timeline
+      // (duration = buffered end) instead of Infinity, so setting currentTime
+      // can seek back into the retained back-buffer above.
+      liveDurationInfinity: false,
       maxLiveSyncPlaybackRate: 1.5,
       startPosition: -1,
       autoStartLoad: !replay,
@@ -614,6 +688,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (clipNoticeTimerRef.current != null) {
       window.clearTimeout(clipNoticeTimerRef.current);
       clipNoticeTimerRef.current = null;
+    }
+    if (controlsHideTimerRef.current != null) {
+      window.clearTimeout(controlsHideTimerRef.current);
+      controlsHideTimerRef.current = null;
     }
     abortRef.abort();
     destroyHls();
@@ -1140,8 +1218,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // Live edge on the player timeline (liveSyncPosition is real stream time;
   // add the configured sync lag for the true edge). Falls back to the
-  // seekable end. Used to map currentTime to broadcast-relative seconds.
-  const liveEdgeSec = (() => {
+  // seekable end. Used to map currentTime to broadcast-relative seconds AND
+  // to clamp the back-buffer arrow seek (no-archive live) below.
+  const computeLiveEdgeSec = useCallback((): number => {
     const h = hlsRef.current;
     if (h) {
       const pos = typeof h.liveSyncPosition === 'number' ? h.liveSyncPosition : Number.NaN;
@@ -1150,7 +1229,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     const v = videoRef.current;
     const s = v?.seekable;
     return s && s.length > 0 ? s.end(s.length - 1) : 0;
-  })();
+  }, []);
+  const liveEdgeSec = computeLiveEdgeSec();
   // Timestamps (current / total) — ticking from timeupdate. LIVE totals the
   // growing archive (broadcast duration); REPLAY totals the snapshot.
   const totalSec = mode === 'replay'
@@ -1215,23 +1295,44 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // ArrowLeft/ArrowRight ±PREVIEW_KEY_SKIP_SEC seek on the live popup.
   // Window-level so the rail needs no focus; Space/ArrowUp/ArrowDown/F stay
   // with the popup's buttons. railTime is read via a ref so the listener
-  // does not reattach on every timeupdate.
+  // does not reattach on every timeupdate. WITHOUT an archive the rail stays
+  // disabled/undraggable (user asked for KEYBOARD seek only), so the arrows
+  // instead seek inside the retained live back-buffer — hls.js retains
+  // LIVE_BACK_BUFFER_SEC behind the playhead (backBufferLength 30) and the
+  // finite live timeline (liveDurationInfinity false) makes currentTime
+  // seeks land in it. The listener is window-level, so it keeps working
+  // while the auto-hidden controls are pointer-events-none.
   useEffect(() => {
-    if (railDisabled) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (shouldIgnorePlayerKeyEvent(e as unknown as React.KeyboardEvent)) return;
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       e.preventDefault();
       e.stopPropagation();
-      if (e.key === 'ArrowLeft') {
-        handleRailChange(Math.max(0, railTimeRef.current - PREVIEW_KEY_SKIP_SEC));
-      } else {
-        handleRailChange(Math.min(railMax, railTimeRef.current + PREVIEW_KEY_SKIP_SEC));
+      if (!railDisabled) {
+        if (e.key === 'ArrowLeft') {
+          handleRailChange(Math.max(0, railTimeRef.current - PREVIEW_KEY_SKIP_SEC));
+        } else {
+          handleRailChange(Math.min(railMax, railTimeRef.current + PREVIEW_KEY_SKIP_SEC));
+        }
+        return;
       }
+      // LIVE without archive — seek within the retained back-buffer, clamped
+      // to [max(0, edge − 30), edge − 0.75] so the playhead never lands on
+      // (or past) the live edge. No-op while the session is still loading or
+      // before the edge is known (edgeSec 0).
+      if (loading) return;
+      const video = videoRef.current;
+      const edgeSec = computeLiveEdgeSec();
+      if (!video || edgeSec <= 0) return;
+      const lo = Math.max(0, edgeSec - LIVE_BACK_BUFFER_SEC);
+      const hi = edgeSec - LIVE_EDGE_SEEK_SAFETY_SEC;
+      if (hi <= lo) return;
+      const delta = e.key === 'ArrowLeft' ? -PREVIEW_KEY_SKIP_SEC : PREVIEW_KEY_SKIP_SEC;
+      video.currentTime = Math.min(hi, Math.max(lo, video.currentTime + delta));
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [railDisabled, railMax, handleRailChange]);
+  }, [railDisabled, railMax, handleRailChange, computeLiveEdgeSec, loading]);
 
   return createPortal(
     <div
@@ -1240,6 +1341,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       className="group border-2 border-zinc-700 bg-zinc-950"
       data-live-popup
       onPointerDownCapture={onBringToFront}
+      // Inactivity auto-hide: any interaction inside the popup (mouse move,
+      // click/touch, key — the popup root holds focus, so keydown from a
+      // focused descendant bubbles here) bumps the controls back up.
+      onMouseMove={bumpControls}
+      onPointerDown={bumpControls}
+      onTouchStart={bumpControls}
+      onKeyDown={bumpControls}
       style={{
         position: 'fixed',
         left: position.x,
@@ -1263,8 +1371,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           close X). */}
       <div
         ref={headerRef}
+        data-live-header
         onMouseDown={handleMouseDown}
-        className="flex items-start justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0"
+        className={`flex items-start justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0 transition-opacity duration-300 ${
+          controlsHidden ? 'opacity-0 pointer-events-none' : 'opacity-100'
+        }`}
         style={{ cursor: drag ? 'grabbing' : 'grab' }}
       >
         <div className="flex items-start gap-1.5 min-w-0">
@@ -1357,7 +1468,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         }}
       >
         <div
-          className="absolute inset-0 z-0 cursor-pointer"
+          data-live-video-area
+          className={`absolute inset-0 z-0 ${controlsHidden ? 'cursor-none' : 'cursor-pointer'}`}
           onClick={() => {
             if (!loading && !error) togglePlay();
           }}
@@ -1435,7 +1547,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         {!loading && !error && (
           <div
             data-live-transport
-            className="px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0"
+            className={`px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0 transition-all duration-300 ${
+              controlsHidden ? 'opacity-0 translate-y-2 pointer-events-none' : 'opacity-100 translate-y-0'
+            }`}
             style={{
               position: 'absolute',
               insetInline: 0,

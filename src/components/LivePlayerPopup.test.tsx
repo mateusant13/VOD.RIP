@@ -119,6 +119,30 @@ function mockFetchWithArchive(sec = 100) {
   return fn;
 }
 
+/** Live-session mock that resolves a REAL master URL → createHlsPlayer runs
+ *  with the FakeHls instance (window.__livePopupHls). No DVR archive (404) →
+ *  the rail stays disabled and the arrows seek the retained back-buffer. */
+function mockFetchWithLiveSrc() {
+  const fn = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/api/preview/live')) {
+      return new Response(JSON.stringify({
+        session_id: 's1',
+        kind: 'hls',
+        master_url: 'https://edge/live/master.m3u8',
+        playback_url: 'https://edge/live/master.m3u8',
+        archive_duration: 0,
+      }), { status: 200 });
+    }
+    if (url.includes('/api/preview/hls/s1/resource')) {
+      return new Response('', { status: 404 });
+    }
+    return new Response(JSON.stringify({}), { status: 404 });
+  });
+  vi.stubGlobal('fetch', fn);
+  return fn;
+}
+
 function renderPopup() {
   return render(
     <LivePlayerPopup
@@ -673,8 +697,75 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     expect(hls2.startLoad).toHaveBeenCalledWith(100);
   });
 
-  it('ignores arrow seeks while the rail is disabled (no archive)', async () => {
-    renderPopup(); // default mock — no DVR archive → rail disabled
+  it('ArrowLeft/ArrowRight seek ±5s inside the retained back-buffer when there is no archive', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    // The session resolved a live master URL → the FakeHls instance exists;
+    // MANIFEST_PARSED clears loading so the transport renders.
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Fullscreen');
+
+    // No DVR archive → the rail stays disabled/undraggable (the user asked
+    // only for KEYBOARD seek in the buffer).
+    const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    expect(rail.disabled).toBe(true);
+
+    // Live edge = liveSyncPosition(100) + config.liveSyncDuration(8) = 108;
+    // the back-buffer window is [108−30, 108−0.75] = [78, 107.25].
+    hls.liveSyncPosition = 100;
+    const video = document.querySelector('video') as HTMLVideoElement;
+    video.currentTime = 95;
+
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(video.currentTime).toBe(90); // 95 − 5, inside the window
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(video.currentTime).toBe(95); // 90 + 5
+
+    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 78.
+    video.currentTime = 5;
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(video.currentTime).toBe(78);
+
+    // Clamped just below the live edge (0.75s safety): 106 + 5 → 111 → 107.25.
+    video.currentTime = 106;
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(video.currentTime).toBe(107.25);
+
+    // Never below 0: early stream (edge 20 → window [0, 19.25]).
+    hls.liveSyncPosition = 12; // edge 20
+    video.currentTime = 0;
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(video.currentTime).toBe(0);
+
+    // Still live, still no replay switch — the buffer seek never touches hls.
+    expect(screen.queryByRole('slider', { name: 'Seek within replay' })).toBeNull();
+    expect(rail.disabled).toBe(true);
+  });
+
+  it('is a no-op while the stream is still loading (manifest not parsed yet)', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    hls.liveSyncPosition = 100;
+
+    const video = document.querySelector('video') as HTMLVideoElement;
+    video.currentTime = 95;
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+
+    // loading → arrows are a no-op, no replay switch, no hls re-creation.
+    expect(video.currentTime).toBe(95);
+    await new Promise((r) => setTimeout(r, 300));
+    expect((window as unknown as { __livePopupHls?: unknown }).__livePopupHls).toBe(hls);
+    expect(screen.queryByRole('slider', { name: 'Seek within replay' })).toBeNull();
+  });
+
+  it('is a no-op when the live edge is unknown (no hls instance, no seekable range)', async () => {
+    renderPopup(); // default mock — no src → no hls instance
     await screen.findByTitle('Fullscreen');
 
     const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
@@ -687,12 +778,118 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
 
-    // No seek and no replay switch: still live, playhead untouched, no hls
+    // edgeSec 0 → nothing happens: playhead untouched, still live, no hls
     // instance even after the debounce window.
     expect(video.currentTime).toBe(10);
     expect(rail.disabled).toBe(true);
     await new Promise((r) => setTimeout(r, 300));
     expect((window as unknown as { __livePopupHls?: unknown }).__livePopupHls).toBeUndefined();
     expect(screen.queryByRole('slider', { name: 'Seek within replay' })).toBeNull();
+  });
+});
+
+describe('LivePlayerPopup auto-hide controls', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Flush the session microtask chain (fetch mock → session resolve → lazy
+   *  archive probe → setLoading(false)) — waitFor cannot poll under fake
+   *  timers, and each await re-queues the next chain link. */
+  async function flushSession() {
+    for (let i = 0; i < 30 && !document.querySelector('[data-live-transport]'); i++) {
+      await act(async () => {});
+    }
+    expect(document.querySelector('[data-live-transport]')).toBeTruthy();
+  }
+
+  it('fades transport + header after ~2.5s idle and restores them on mousemove (cursor hidden with them)', async () => {
+    vi.useFakeTimers();
+    renderPopup();
+    await flushSession();
+
+    const popup = document.querySelector('[data-live-popup]')!;
+    const transport = document.querySelector('[data-live-transport]')!;
+    const header = document.querySelector('[data-live-header]')!;
+    const videoArea = document.querySelector('[data-live-video-area]')!;
+    expect(transport.className).toContain('opacity-100');
+    expect(header.className).toContain('opacity-100');
+    expect(videoArea.className).toContain('cursor-pointer');
+
+    // 2.5s idle → transport + header fade out, cursor hidden over the video.
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(transport.className).toContain('opacity-0');
+    expect(transport.className).toContain('pointer-events-none');
+    expect(header.className).toContain('opacity-0');
+    expect(header.className).toContain('pointer-events-none');
+    expect(videoArea.className).toContain('cursor-none');
+
+    // Mousemove anywhere in the popup → instant restore + fresh countdown.
+    fireEvent.mouseMove(popup);
+    expect(transport.className).toContain('opacity-100');
+    expect(header.className).toContain('opacity-100');
+    expect(videoArea.className).toContain('cursor-pointer');
+
+    // …and it fades again after another 2.5s.
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(transport.className).toContain('opacity-0');
+  });
+
+  it('restores controls on any key while the popup is focused', async () => {
+    vi.useFakeTimers();
+    renderPopup();
+    await flushSession();
+
+    const popup = document.querySelector('[data-live-popup]')!;
+    const transport = document.querySelector('[data-live-transport]')!;
+
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(transport.className).toContain('opacity-0');
+
+    // The popup root holds focus (tabIndex −1, focused on mount) — a keydown
+    // from it (or any focused descendant) bumps the controls back.
+    fireEvent.keyDown(popup, { key: 'a' });
+    expect(transport.className).toContain('opacity-100');
+  });
+
+  it('stays visible while paused and while the volume menu is open', async () => {
+    vi.useFakeTimers();
+    renderPopup();
+    await flushSession();
+
+    const transport = document.querySelector('[data-live-transport]')!;
+    const popup = document.querySelector('[data-live-popup]')!;
+    const video = document.querySelector('video') as HTMLVideoElement;
+
+    // Pause → the countdown is cancelled, controls stay up indefinitely.
+    fireEvent(video, new Event('pause'));
+    act(() => { vi.advanceTimersByTime(6000); });
+    expect(transport.className).toContain('opacity-100');
+
+    // Resume → a FRESH 2.5s countdown starts from the unpause.
+    fireEvent(video, new Event('play'));
+    act(() => { vi.advanceTimersByTime(2000); });
+    expect(transport.className).toContain('opacity-100');
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(transport.className).toContain('opacity-0');
+
+    // Menu open (bump first so the controls are visible) → never hides.
+    fireEvent.mouseMove(popup);
+    fireEvent.click(screen.getByTitle('Volume'));
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+    act(() => { vi.advanceTimersByTime(6000); });
+    expect(transport.className).toContain('opacity-100');
+  });
+
+  it('keeps the header visible while the session is still loading', async () => {
+    vi.useFakeTimers();
+    // The session POST never resolves — loading stays true past any countdown.
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+    renderPopup();
+    await act(async () => {});
+
+    const header = document.querySelector('[data-live-header]')!;
+    act(() => { vi.advanceTimersByTime(6000); }); // < SESSION_STALL_MS (8s)
+    expect(header.className).toContain('opacity-100');
   });
 });
