@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { LivePlayerPopup } from './LivePlayerPopup';
+import { LivePlayerPopup, __resetLivePlayerRegistryForTests, liveQualityCountNow, registerLivePlayer } from './LivePlayerPopup';
 import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
 import { registerPreviewPlayback } from '../previewPlaybackBus';
 
@@ -23,6 +23,8 @@ const { FakeHls } = vi.hoisted(() => {
     liveSyncPosition: number | undefined = undefined;
     currentLevel = -1;
     loadLevel = -1;
+    /** Mirrors real hls.js: auto ABR only while no manual level is pinned. */
+    get autoLevelEnabled() { return this.currentLevel === -1; }
     loadSource = vi.fn();
     attachMedia = vi.fn();
     startLoad = vi.fn();
@@ -971,5 +973,125 @@ describe('LivePlayerPopup auto-hide controls', () => {
     const header = document.querySelector('[data-live-header]')!;
     act(() => { vi.advanceTimersByTime(6000); }); // < SESSION_STALL_MS (8s)
     expect(header.className).toContain('opacity-100');
+  });
+});
+
+describe('LivePlayerPopup live quality registry', () => {
+  beforeEach(() => { __resetLivePlayerRegistryForTests(); });
+  afterEach(() => { __resetLivePlayerRegistryForTests(); });
+
+  it('counts registered players and notifies every subscriber on register/unregister', () => {
+    expect(liveQualityCountNow()).toBe(0);
+    const seenA: number[] = [];
+    const seenB: number[] = [];
+    const unsubA = registerLivePlayer((count) => seenA.push(count));
+    expect(liveQualityCountNow()).toBe(1);
+    expect(seenA).toEqual([1]); // A notified on its own register
+    const unsubB = registerLivePlayer((count) => seenB.push(count));
+    expect(liveQualityCountNow()).toBe(2);
+    expect(seenA).toEqual([1, 2]); // A re-notified with the new count
+    expect(seenB).toEqual([2]);
+    unsubA();
+    expect(liveQualityCountNow()).toBe(1);
+    expect(seenB).toEqual([2, 1]); // B re-applies for the lower count
+    unsubB();
+    expect(liveQualityCountNow()).toBe(0);
+    expect(seenA).toEqual([1, 2]);
+    expect(seenB).toEqual([2, 1]); // B leaves before the final count — never notified of its own removal
+  });
+
+  it('unregister is idempotent and drops only that subscriber', () => {
+    const seen: number[] = [];
+    const unsub = registerLivePlayer((count) => seen.push(count));
+    const unsub2 = registerLivePlayer((count) => seen.push(count));
+    unsub();
+    unsub(); // double-unregister is a no-op
+    expect(liveQualityCountNow()).toBe(1);
+    expect(seen).toEqual([1, 2, 2, 1]);
+    unsub2();
+    expect(liveQualityCountNow()).toBe(0);
+  });
+
+  it('a mounted popup registers itself and unregisters on unmount', async () => {
+    __resetLivePlayerRegistryForTests();
+    mockFetch();
+    const { unmount } = renderPopup();
+    await act(async () => {});
+    expect(liveQualityCountNow()).toBe(1);
+    unmount();
+    expect(liveQualityCountNow()).toBe(0);
+  });
+});
+
+describe('LivePlayerPopup live quality policy', () => {
+  beforeEach(() => { __resetLivePlayerRegistryForTests(); });
+  afterEach(() => { __resetLivePlayerRegistryForTests(); });
+
+  /** Live session resolving a real master URL, with a 360/720/1080 ladder. */
+  async function mountLiveWithLevels() {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    hls.levels = [
+      { height: 360, bitrate: 1_000_000 },
+      { height: 720, bitrate: 3_000_000 },
+      { height: 1080, bitrate: 6_000_000 },
+    ];
+    return hls;
+  }
+
+  it('pins SOURCE on MANIFEST_PARSED with one player; a second player caps it to ≤480p; closing restores SOURCE', async () => {
+    const hls = await mountLiveWithLevels();
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    // Single player → SOURCE (highest bitrate = 1080p), auto ABR off (fixed level).
+    expect(hls.currentLevel).toBe(2);
+    expect(hls.autoLevelEnabled).toBe(false);
+
+    // A second player registers → every player re-applies: multi → highest ≤480 (360).
+    let unsub2: (() => void) | undefined;
+    await act(async () => { unsub2 = registerLivePlayer(() => {}); });
+    expect(hls.currentLevel).toBe(0);
+    expect(hls.autoLevelEnabled).toBe(false);
+
+    // Back to one player → revert to SOURCE.
+    await act(async () => { unsub2!(); });
+    expect(hls.currentLevel).toBe(2);
+    expect(hls.autoLevelEnabled).toBe(false);
+  });
+
+  it('re-applies at MANIFEST_PARSED when the second player opened before the manifest parsed', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    // Second player opens while levels are still empty — the count-change
+    // apply no-ops; the parse-time apply must read the CURRENT count.
+    let unsub2: (() => void) | undefined;
+    await act(async () => { unsub2 = registerLivePlayer(() => {}); });
+    expect(hls.currentLevel).toBe(-1); // nothing parsed yet, nothing applied
+    hls.levels = [
+      { height: 360, bitrate: 1_000_000 },
+      { height: 480, bitrate: 2_500_000 },
+      { height: 1080, bitrate: 6_000_000 },
+    ];
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls.currentLevel).toBe(1); // multi → 480
+    expect(hls.autoLevelEnabled).toBe(false);
+    await act(async () => { unsub2!(); });
+    expect(hls.currentLevel).toBe(2); // back to single → source
+  });
+
+  it('count changes before the manifest parses are safe no-ops', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => {
+      const unsub2 = registerLivePlayer(() => {});
+      unsub2();
+    });
+    expect(hls.currentLevel).toBe(-1);
+    expect(hls.autoLevelEnabled).toBe(true);
   });
 });

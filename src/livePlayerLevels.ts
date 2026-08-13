@@ -104,6 +104,73 @@ export function filterLiveLevels(
   return { levels: source, defaultIndex };
 }
 
+/** Minimal structural shape of an hls.js Level for the quality policy —
+ *  no hls.js import keeps this module vitest-friendly (same rule as the rest
+ *  of the file). */
+export interface QualityPolicyLevel {
+  height?: number;
+  bitrate?: number;
+}
+
+/**
+ * Live quality policy — the FIXED level index for a popup, driven by how many
+ * live players are open:
+ *
+ * single (multi=false) — SOURCE: the level with the highest bitrate (ties →
+ * highest height); when no level carries bitrate info, the highest height;
+ * when no height info either, index 0.
+ *
+ * multi (multi=true) — bandwidth cap: the highest level whose height is ≤480
+ * (preferred), else the highest ≤360; when no level fits either cap (or no
+ * height info exists), the LOWEST bitrate level (safest for bandwidth), with
+ * index 0 as the final fallback.
+ */
+export function qualityLevelForPolicy(levels: QualityPolicyLevel[], multi: boolean): number {
+  if (!levels.length) return -1;
+  const hasBitrate = levels.some((l) => (l.bitrate ?? 0) > 0);
+  const hasHeight = levels.some((l) => (l.height ?? 0) > 0);
+
+  if (!multi) {
+    let best = 0;
+    for (let i = 1; i < levels.length; i++) {
+      const cur = levels[best];
+      const cand = levels[i];
+      const cb = cand.bitrate ?? 0;
+      const bb = cur.bitrate ?? 0;
+      const ch = cand.height ?? 0;
+      const bh = cur.height ?? 0;
+      const better = hasBitrate
+        ? cb > bb || (cb === bb && ch > bh)
+        : hasHeight ? ch > bh : false;
+      if (better) best = i;
+    }
+    return best;
+  }
+
+  for (const cap of [480, 360]) {
+    let best = -1;
+    let bestHeight = 0;
+    for (let i = 0; i < levels.length; i++) {
+      const h = levels[i].height ?? 0;
+      if (h > 0 && h <= cap && h > bestHeight) {
+        bestHeight = h;
+        best = i;
+      }
+    }
+    if (best >= 0) return best;
+  }
+  // No height info (or nothing fits the caps — e.g. a 1080-only manifest):
+  // lowest bitrate is the safest multi-player pick.
+  if (hasBitrate) {
+    let best = 0;
+    for (let i = 1; i < levels.length; i++) {
+      if ((levels[i].bitrate ?? 0) < (levels[best].bitrate ?? 0)) best = i;
+    }
+    return best;
+  }
+  return 0;
+}
+
 export interface ReplaySeekDecision {
   /** True when the target is inside the current snapshot — native seek. */
   inSnapshot: boolean;

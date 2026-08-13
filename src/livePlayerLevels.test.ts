@@ -12,6 +12,7 @@ import {
   liveChatSlugFromUrl,
   livePanelSizeFromAspect,
   parsePlaylistTotalSec,
+  qualityLevelForPolicy,
   replaySeekTarget,
 } from './livePlayerLevels';
 import type { SavedChannel } from './types';
@@ -321,5 +322,84 @@ describe('liveChatSlugFromUrl', () => {
   it('returns undefined for garbage', () => {
     expect(liveChatSlugFromUrl('not-a-url', 'twitch')).toBeUndefined();
     expect(liveChatSlugFromUrl('', 'kick')).toBeUndefined();
+  });
+});
+
+describe('qualityLevelForPolicy', () => {
+  const withHeights = (heights: number[]) => heights.map((height) => ({ height }));
+  const withBitrates = (bitrates: number[]) => bitrates.map((bitrate) => ({ bitrate }));
+  const ladder = (heights: number[], bitrates = heights.map((h) => h * 1_000_000)) =>
+    heights.map((height, i) => ({ height, bitrate: bitrates[i] }));
+
+  it('single: picks the highest bitrate (SOURCE), ties broken by height', () => {
+    expect(qualityLevelForPolicy(ladder([360, 720, 1080]), false)).toBe(2);
+    // 720 vs 1080 at the same bitrate → higher height wins.
+    expect(qualityLevelForPolicy([
+      { height: 720, bitrate: 3_000_000 },
+      { height: 1080, bitrate: 3_000_000 },
+    ], false)).toBe(1);
+    // Equal bitrate AND height → the first level wins (stable).
+    expect(qualityLevelForPolicy([
+      { height: 720, bitrate: 3_000_000 },
+      { height: 720, bitrate: 3_000_000 },
+    ], false)).toBe(0);
+  });
+
+  it('single: falls back to the highest height when bitrate info is absent', () => {
+    expect(qualityLevelForPolicy(withHeights([360, 480, 1080]), false)).toBe(2);
+  });
+
+  it('single: falls back to level 0 when no info at all', () => {
+    expect(qualityLevelForPolicy([{}, {}], false)).toBe(0);
+  });
+
+  it('single: bitrate-only manifests use bitrate directly', () => {
+    expect(qualityLevelForPolicy(withBitrates([500_000, 6_000_000, 2_500_000]), false)).toBe(1);
+  });
+
+  it('multi: prefers the highest level ≤480, then ≤360', () => {
+    expect(qualityLevelForPolicy(ladder([360, 480, 720, 1080]), true)).toBe(1); // 480
+    expect(qualityLevelForPolicy(ladder([360, 720, 1080]), true)).toBe(0); // 360
+    expect(qualityLevelForPolicy(ladder([160, 360, 480]), true)).toBe(2); // 480
+  });
+
+  it('multi: exactly 480 qualifies, exactly 360 is the second rung', () => {
+    expect(qualityLevelForPolicy(ladder([480, 1080]), true)).toBe(0);
+    expect(qualityLevelForPolicy(ladder([360]), true)).toBe(0);
+    expect(qualityLevelForPolicy(ladder([360, 480]), true)).toBe(1);
+  });
+
+  it('multi: a 1080-only manifest (nothing fits the caps) falls to the lowest bitrate', () => {
+    expect(qualityLevelForPolicy(ladder([1080]), true)).toBe(0);
+    expect(qualityLevelForPolicy(ladder([1080, 1080], [6_000_000, 2_500_000]), true)).toBe(1);
+  });
+
+  it('multi: no height info at all → lowest bitrate (safest for bandwidth)', () => {
+    expect(qualityLevelForPolicy(withBitrates([6_000_000, 1_000_000, 2_500_000]), true)).toBe(1);
+  });
+
+  it('multi: no height OR bitrate info → level 0', () => {
+    expect(qualityLevelForPolicy([{}, {}, {}], true)).toBe(0);
+  });
+
+  it('multi: within one cap rung, the first level at the best height wins', () => {
+    expect(qualityLevelForPolicy([
+      { height: 360, bitrate: 1_000_000 },
+      { height: 360, bitrate: 2_000_000 },
+    ], true)).toBe(0);
+  });
+
+  it('handles empty input with -1', () => {
+    expect(qualityLevelForPolicy([], false)).toBe(-1);
+    expect(qualityLevelForPolicy([], true)).toBe(-1);
+  });
+
+  it('height-0 entries (source media playlist without RESOLUTION) count as no height info', () => {
+    // Single: the only level is the pick. Multi: lowest bitrate among them.
+    expect(qualityLevelForPolicy([{ height: 0, bitrate: 6_000_000 }], false)).toBe(0);
+    expect(qualityLevelForPolicy([
+      { height: 0, bitrate: 6_000_000 },
+      { height: 0, bitrate: 1_000_000 },
+    ], true)).toBe(1);
   });
 });
