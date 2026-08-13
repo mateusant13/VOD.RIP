@@ -160,6 +160,95 @@ function truncateIfLarge(filePath) {
   }
 }
 
+// --- single-instance lock + attach mode ------------------------------------
+// A second `npm run dev` must NOT kill the running dev-all (its
+// ensurePortFree would taskkill the live API, the old supervisor counts that
+// as a crash, and the loser of the bind race ends up with no API at all —
+// exit-0 "won" is not retried). Instead the new session ATTACHES to the
+// owner's log files (tmp/vodrip-devall-{api,web}.log — always written by
+// attachChildLogger) and prints them until Ctrl+C. `--kill` forces a real
+// takeover: stop the owner's whole tree, then boot everything fresh.
+const lockPath = path.join(root, "tmp", "dev-all.lock");
+let ownsLock = false;
+
+function readLock() {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const lock = JSON.parse(raw);
+    if (typeof lock?.pid !== "number") return null;
+    try {
+      process.kill(lock.pid, 0); // throws when the pid is gone
+    } catch {
+      return null; // stale lock — owner died
+    }
+    return lock;
+  } catch {
+    return null;
+  }
+}
+
+function tryWriteLock() {
+  try {
+    fs.mkdirSync(path.join(root, "tmp"), { recursive: true });
+    const fd = fs.openSync(lockPath, "wx"); // atomic — EEXIST when racing
+    fs.writeSync(
+      fd,
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), apiPort }),
+    );
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    return false; // another dev-all won the race
+  }
+}
+
+function removeLock() {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    /* missing — nothing to remove */
+  }
+}
+
+async function tailLog(name) {
+  // Poll the owner's log file from the end and print new lines verbatim
+  // (the lines already carry `ISO [api|web] ` tags from attachChildLogger).
+  const p = path.join(root, "tmp", `vodrip-devall-${name}.log`);
+  let pos = 0;
+  try {
+    pos = fs.statSync(p).size;
+  } catch {
+    /* file not created yet — start from 0 */
+  }
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await sleep(400);
+    try {
+      const size = fs.statSync(p).size;
+      if (size < pos) pos = 0; // truncated by --kill-logs or rotation
+      if (size > pos) {
+        const fd = fs.openSync(p, "r");
+        const buf = Buffer.alloc(size - pos);
+        fs.readSync(fd, buf, 0, buf.length, pos);
+        fs.closeSync(fd);
+        pos = size;
+        process.stdout.write(buf.toString("utf8"));
+      }
+    } catch {
+      /* file vanished — keep polling */
+    }
+  }
+}
+
+async function attachToDevAll(lock) {
+  console.log(`[dev] dev-all already running (pid ${lock.pid}) — attaching to its logs.`);
+  console.log(`[dev] Ctrl+C detaches. Run \`npm run dev -- --kill\` to stop it and take over.\n`);
+  // Attach has no children and no lock — a plain exit, never shutdown().
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  await Promise.all([tailLog("api"), tailLog("web")]);
+}
+
 /**
  * Touch every app source file once (parallel). A cold first-touch costs up to
  * ~13s/file (cold OS page cache + AV scan-on-open); reading each file here
@@ -281,6 +370,7 @@ function shutdown(code = 0) {
       /* ignore */
     }
   }
+  if (ownsLock) removeLock();
   setTimeout(() => process.exit(code), 300);
 }
 
@@ -310,7 +400,35 @@ async function main() {
     process.exit(0);
   }
 
-  await ensurePortFree(apiPort, "API");
+  // Single-instance protocol: attach to a live dev-all by default; only
+  // `--kill` takes over (stop the owner's tree, then boot everything fresh).
+  const forceTakeover = process.argv.includes("--kill");
+  let lock = readLock();
+  if (forceTakeover) {
+    if (lock) {
+      console.log(`[dev] --kill: stopping existing dev-all (pid ${lock.pid}) and taking over`);
+      killWinPid(lock.pid); // /F then /T — kills the owner's whole tree
+      await waitPortFree(apiPort, 15000);
+    }
+    removeLock(); // stale or just-killed owner
+    await ensurePortFree(apiPort, "API");
+  } else if (lock) {
+    await attachToDevAll(lock);
+    return;
+  } else {
+    removeLock(); // stale lock (owner died without cleanup)
+    await ensurePortFree(apiPort, "API");
+  }
+  if (!tryWriteLock()) {
+    // Lost a boot race with another dev-all — attach to the winner instead
+    // of fighting over the port.
+    const winner = readLock();
+    if (winner) {
+      await attachToDevAll(winner);
+      return;
+    }
+  }
+  ownsLock = true;
 
   if (fastPreview) {
     console.log(
