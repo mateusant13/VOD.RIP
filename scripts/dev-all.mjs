@@ -25,6 +25,10 @@ const previewFastEnv = fastPreview ? { VODRIP_PREVIEW_FAST_ONLY: "1" } : {};
 
 const children = [];
 let apiProcess = null; // current API child — health monitor + graceful exit target
+let apiSpec = null; // last API launch spec — hot-reload respawn source
+let reloading = false; // hot reload in flight: exit handler delegates to reloadApi
+let healthMonitorStop = null; // anti-hang watchdog cleanup (paused during reload)
+let watcherTimer = null; // backend poll interval
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -416,9 +420,18 @@ function start(label, command, args, cwd, extraEnv = {}) {
   if (!disableLog) {
     attachChildLogger(label, child);
   }
-  if (label === "api") apiProcess = child;
+  if (label === "api") {
+    apiProcess = child;
+    apiSpec = { command, args, cwd, extraEnv };
+  }
   child.on("exit", async (code, signal) => {
-    if (signal || shuttingDown) return;
+    if (shuttingDown) return;
+    if (label === "api" && reloading) {
+      // Hot reload: reloadApi() owns the respawn (single point — avoids a
+      // double-start race with the wait loop below). Just acknowledge.
+      return;
+    }
+    if (signal) return;
     if (label === "api" && code === 0 && restartAttempts < 3) {
       // Exit 0 is the "another healthy API won" race — but if nothing
       // answers :apiPort the API vanished cleanly (graceful /api/exit)
@@ -455,6 +468,14 @@ let shuttingDown = false;
 async function shutdown(code = 0) {
   if (shuttingDown) return; // SIGINT during a graceful exit
   shuttingDown = true;
+  if (watcherTimer) {
+    clearInterval(watcherTimer);
+    watcherTimer = null;
+  }
+  if (healthMonitorStop) {
+    healthMonitorStop();
+    healthMonitorStop = null;
+  }
   await reportHealth("stopping");
   // Graceful first: POST /api/exit lets the app flush watchdog sinks and
   // cancel downloads cleanly; force-kill is only the fallback.
@@ -493,6 +514,157 @@ try {
   process.on("SIGHUP", () => shutdown(0));
 } catch {
   // unsupported on Windows — no-op
+}
+
+// --- backend hot reload ----------------------------------------------------
+// Poll mtimes (NOT fs.watch): Windows fs.watch can drop events under bursts
+// (AV scan, git merge/checkout touching many files at once), and polling is
+// deterministic. A ~1s scan of the backend tree (only *.py, tests/tmp/
+// __pycache__/venvs excluded) is negligible. Bursts collapse to ONE reload
+// via the debounce; a minimum 1s gap between reloads rate-limits edit loops.
+// ponytail: if sub-second reload latency is ever needed, upgrade to fs.watch
+// recursive with a hash fallback — polling keeps this bomb-proof instead.
+const reloadPollMs = Number(process.env.VODRIP_DEVALL_RELOAD_POLL_MS || "1000");
+const reloadDebounceMs = Number(process.env.VODRIP_DEVALL_RELOAD_DEBOUNCE_MS || "400");
+const backendRoot = path.join(root, "backend");
+
+function backendWatchFiles() {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (
+          entry.name === "tmp" ||
+          entry.name === "tests" ||
+          entry.name === "__pycache__" ||
+          entry.name === "venv" ||
+          entry.name === ".venv"
+        ) {
+          continue;
+        }
+        walk(p);
+      } else if (entry.name.endsWith(".py")) {
+        try {
+          const st = fs.statSync(p);
+          out.push({ p, m: st.mtimeMs, s: st.size });
+        } catch {
+          /* vanished mid-scan */
+        }
+      }
+    }
+  };
+  walk(backendRoot);
+  return out;
+}
+
+function startBackendWatcher() {
+  if (
+    process.argv.includes("--no-reload") ||
+    process.env.VODRIP_DEVALL_NO_RELOAD === "1"
+  ) {
+    console.log("[dev] backend hot reload disabled (--no-reload)");
+    return;
+  }
+  let snapshot = backendWatchFiles();
+  let pendingTimer = null;
+  let lastTrigger = 0;
+  watcherTimer = setInterval(() => {
+    const next = backendWatchFiles();
+    let changed = null;
+    if (next.length !== snapshot.length) {
+      changed = next.length > snapshot.length ? next[next.length - 1] : snapshot[snapshot.length - 1];
+    } else {
+      for (let i = 0; i < next.length; i++) {
+        if (next[i].m !== snapshot[i].m || next[i].s !== snapshot[i].s) {
+          changed = next[i];
+          break;
+        }
+      }
+    }
+    snapshot = next;
+    if (!changed || reloading || shuttingDown) return;
+    if (pendingTimer) return; // already debouncing a burst
+    pendingTimer = setTimeout(() => {
+      pendingTimer = null;
+      if (shuttingDown || reloading) return;
+      if (Date.now() - lastTrigger < 1000) return; // min 1s between reloads
+      lastTrigger = Date.now();
+      void reloadApi(changed.p);
+    }, reloadDebounceMs);
+  }, reloadPollMs);
+  console.log(
+    `[dev] watching backend/ for changes (poll ${reloadPollMs}ms) — edit a .py to hot-reload the API`,
+  );
+}
+
+/** Restart the API with the new code. The exit handler delegates to this
+ * function (single respawn point) while `reloading` is set. The anti-hang
+ * watchdog is paused so the down-time during reload never counts strikes. */
+async function reloadApi(changedFile) {
+  if (shuttingDown || !apiProcess || apiProcess.exitCode !== null) return;
+  if (!apiSpec) return;
+  console.log(
+    `[dev] backend changed: ${path.relative(root, changedFile)} — reloading API`,
+  );
+  reloading = true;
+  restartAttempts = 0;
+  if (healthMonitorStop) {
+    healthMonitorStop();
+    healthMonitorStop = null;
+  }
+  const ok = await gracefulApiExit();
+  if (!ok && apiProcess && apiProcess.exitCode === null) {
+    // API unresponsive — force-kill its tree so the port frees.
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } else {
+      try {
+        apiProcess.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  await waitPortFree(apiPort, 15000);
+  start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv);
+  for (let i = 0; i < 240 && !shuttingDown; i++) {
+    await sleep(500);
+    if (await apiHealthy(apiPort)) break;
+  }
+  reloading = false;
+  if (!shuttingDown) startApiHealthMonitor();
+  console.log(`[dev] API reloaded (${path.relative(root, changedFile)})`);
+}
+
+/** Anti-hang watchdog wrapper: paused while a hot reload is in flight so the
+ * reload's natural down-time never trips the hung-process detection. */
+function startApiHealthMonitor() {
+  healthMonitorStop = startHealthMonitor({
+    onUnhealthy: () => {
+      if (shuttingDown || reloading || !apiProcess || apiProcess.exitCode !== null) return;
+      console.error(
+        `[dev] API on :${apiPort} unresponsive for ~45s — treating as hung, restarting`,
+      );
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } else {
+        apiProcess.kill("SIGKILL");
+      }
+    },
+  });
 }
 
 async function main() {
@@ -634,26 +806,8 @@ async function main() {
 
   await reportHealth("health");
 
-  // Anti-hang watchdog: the exit handler restarts on crashes, but a live
-  // process that stops answering (deadlocked sqlite, stuck thread) needs
-  // this monitor — 3 missed probes (~45s) = hung, force-kill, exit handler
-  // restarts it.
-  startHealthMonitor({
-    onUnhealthy: () => {
-      if (shuttingDown || !apiProcess || apiProcess.exitCode !== null) return;
-      console.error(
-        `[dev] API on :${apiPort} unresponsive for ~45s — treating as hung, restarting`,
-      );
-      if (process.platform === "win32") {
-        spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
-          stdio: "ignore",
-          windowsHide: true,
-        });
-      } else {
-        apiProcess.kill("SIGKILL");
-      }
-    },
-  });
+  startApiHealthMonitor();
+  startBackendWatcher();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
