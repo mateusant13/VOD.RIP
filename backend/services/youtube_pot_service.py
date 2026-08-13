@@ -37,7 +37,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from services.os_services import _NO_WINDOW, register_child_pid
+from services.os_services import _NO_WINDOW
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +375,16 @@ def _spawn_pot_server() -> Optional[subprocess.Popen]:
     except OSError as exc:
         logger.debug("POT server log open failed: %s", exc)
 
+    # Detached by design (survives the app): the background daemon keeps
+    # ingesting YouTube after the app closes and needs PO tokens. Port 4416
+    # + ensure_pot_server_started()'s ping-first check are the single-instance
+    # guard — a live server is reused, a dead one is respawned. DETACHED
+    # implies no console window, so _NO_WINDOW is deliberately not combined
+    # (CREATE_NO_WINDOW|DETACHED_PROCESS is invalid on some Windows builds).
+    _detached = 0
+    if os.name == "nt":
+        _detached = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+
     try:
         proc = subprocess.Popen(
             [node_exe, "build/main.js", "--port", str(POT_DEFAULT_PORT)],
@@ -382,7 +392,7 @@ def _spawn_pot_server() -> Optional[subprocess.Popen]:
             stdin=subprocess.DEVNULL,
             stdout=log_file if log_file is not None else subprocess.DEVNULL,
             stderr=log_file if log_file is not None else subprocess.DEVNULL,
-            creationflags=_NO_WINDOW,
+            creationflags=_detached,
         )
     # ponytail: subprocess spawn must never raise into callers — fall back to None
     except (OSError, ValueError) as exc:
@@ -393,16 +403,6 @@ def _spawn_pot_server() -> Optional[subprocess.Popen]:
             except OSError:
                 pass
         return None
-
-    # register_child_pid is the project's single channel for "kill my
-    # children on shutdown". The bgutil server is a child of VOD.RIP and
-    # should be reaped with us; trusting the PID via os_services is the
-    # correct use here.
-    try:
-        register_child_pid(proc.pid)
-    # ponytail: best-effort — pid tracking is a hint, not a contract
-    except Exception as exc:
-        logger.debug("POT server pid tracking failed: %s", exc)
 
     logger.info("POT server spawned pid=%d port=%d", proc.pid, POT_DEFAULT_PORT)
     return proc

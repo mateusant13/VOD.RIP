@@ -74,6 +74,43 @@ async def server_info():
     }
 
 
+@router.get("/api/health")
+async def health():
+    """Aggregate liveness for external supervisors (dev-all, launcher watchdog).
+
+    Answering 200 is itself the liveness proof; the fields let a supervisor
+    tell the app's real state: queue backlog, detached worker/background
+    daemons, and the age of the app's own 30s heartbeat (stale heartbeat
+    with a live process = hung app). Best-effort — a DB hiccup degrades
+    fields to None/False, never raises."""
+    from services import archive_db
+
+    try:
+        pending = archive_db.has_pending_jobs()
+    except Exception:
+        pending = None
+    try:
+        worker = archive_db.worker_live(age_s=45, tag="transcribe")
+    except Exception:
+        worker = False
+    try:
+        background = archive_db.worker_live(age_s=90, tag="background")
+    except Exception:
+        background = False
+    try:
+        activity_age = archive_db.worker_heartbeat_age("app-activity")
+    except Exception:
+        activity_age = None
+    return {
+        "ok": True,
+        "name": "VOD.RIP",
+        "queue_pending": pending,
+        "worker_alive": worker,
+        "background_alive": background,
+        "app_activity_age_s": activity_age,
+    }
+
+
 @router.get("/api/app/version")
 async def app_version():
     try:

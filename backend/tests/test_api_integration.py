@@ -169,6 +169,23 @@ class TestSystemAPI:
         assert "version" in data
 
     @pytest.mark.asyncio
+    async def test_health_endpoint(self, client):
+        """Aggregate liveness consumed by dev-all / launcher watchdog."""
+        resp = await client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["name"] == "VOD.RIP"
+        # Every field must be present and typed; the exact values depend on
+        # live worker state (tests run without a worker), so assert shape.
+        assert isinstance(data["queue_pending"], bool) or data["queue_pending"] is None
+        assert isinstance(data["worker_alive"], bool)
+        assert isinstance(data["background_alive"], bool)
+        assert data["app_activity_age_s"] is None or isinstance(
+            data["app_activity_age_s"], (int, float)
+        )
+
+    @pytest.mark.asyncio
     async def test_ytdlp_status(self, client):
         resp = await client.get("/api/ytdlp/status")
         assert resp.status_code == 200

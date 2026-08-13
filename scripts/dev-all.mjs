@@ -4,7 +4,7 @@ import { execSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
-import { fileURLToPath } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -24,6 +24,7 @@ const fastPreview =
 const previewFastEnv = fastPreview ? { VODRIP_PREVIEW_FAST_ONLY: "1" } : {};
 
 const children = [];
+let apiProcess = null; // current API child — health monitor + graceful exit target
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -120,18 +121,101 @@ async function ensurePortFree(port, label) {
   process.exit(1);
 }
 
-function apiHealthy(port) {
+function apiHealthy(port, timeoutMs = 2500) {
   return new Promise((resolve) => {
     const req = http.get(`http://127.0.0.1:${port}/api/settings`, (res) => {
       resolve(res.statusCode === 200);
       res.resume();
     });
     req.on("error", () => resolve(false));
-    req.setTimeout(2500, () => {
+    req.setTimeout(timeoutMs, () => {
       req.destroy();
       resolve(false);
     });
   });
+}
+
+/** POST /api/exit — the app's own graceful shutdown (flush watchdog sinks,
+ * cancel downloads cleanly). Resolves true when the app confirmed. */
+function gracefulApiExit(timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const body = "";
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: apiPort,
+        path: "/api/exit",
+        method: "POST",
+        timeout: timeoutMs,
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode === 200));
+      },
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end(body);
+  });
+}
+
+/** Print the app's aggregate health (queue, detached workers) to the dev
+ * terminal — boot and shutdown visibility into what keeps running. */
+async function reportHealth(label) {
+  try {
+    const body = await new Promise((resolve, reject) => {
+      const req = http.get(`http://127.0.0.1:${apiPort}/api/health`, (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
+      });
+      req.on("error", reject);
+      req.setTimeout(3000, () => {
+        req.destroy();
+        reject(new Error("timeout"));
+      });
+    });
+    const h = JSON.parse(body);
+    console.log(
+      `[dev] ${label}: queue_pending=${h.queue_pending} worker_alive=${h.worker_alive} ` +
+        `background_alive=${h.background_alive} app_activity_age=${h.app_activity_age_s}s`,
+    );
+  } catch {
+    /* health endpoint is optional — boot/exit must not fail on it */
+  }
+}
+
+/** Anti-hang watchdog: poll the API; N consecutive missed probes while the
+ * process is alive = hung (deadlocked sqlite, stuck thread) → onUnhealthy.
+ * Exported so scripts/_health_monitor_test.mjs can exercise the real code
+ * against a fake server. */
+export function startHealthMonitor({
+  port = apiPort,
+  healthIntervalMs = 15000,
+  maxStrikes = 3,
+  healthTimeoutMs = 2500,
+  onUnhealthy,
+}) {
+  let strikes = 0;
+  const timer = setInterval(async () => {
+    const ok = await apiHealthy(port, healthTimeoutMs);
+    if (ok) {
+      strikes = 0;
+      return;
+    }
+    strikes += 1;
+    if (strikes === maxStrikes) {
+      try {
+        onUnhealthy(strikes);
+      } catch {
+        /* watchdog must never throw into the interval */
+      }
+    }
+  }, healthIntervalMs);
+  return () => clearInterval(timer);
 }
 
 function viteHealthy(port) {
@@ -332,8 +416,19 @@ function start(label, command, args, cwd, extraEnv = {}) {
   if (!disableLog) {
     attachChildLogger(label, child);
   }
-  child.on("exit", (code, signal) => {
-    if (signal) return;
+  if (label === "api") apiProcess = child;
+  child.on("exit", async (code, signal) => {
+    if (signal || shuttingDown) return;
+    if (label === "api" && code === 0 && restartAttempts < 3) {
+      // Exit 0 is the "another healthy API won" race — but if nothing
+      // answers :apiPort the API vanished cleanly (graceful /api/exit)
+      // and the dev server must stay up. Re-spawn instead of idling.
+      if (await apiHealthy(apiPort)) return;
+      console.error(`[dev] API exited with code 0 but :${apiPort} is unserved — restarting`);
+      restartAttempts += 1;
+      setTimeout(() => start(label, command, args, cwd, extraEnv), 3000);
+      return;
+    }
     if (code !== 0 && code !== null) {
       console.error(`[${label}] exited with code ${code}`);
       if (label === "api" && restartAttempts < 3) {
@@ -355,7 +450,24 @@ function start(label, command, args, cwd, extraEnv = {}) {
   return child;
 }
 
-function shutdown(code = 0) {
+let shuttingDown = false;
+
+async function shutdown(code = 0) {
+  if (shuttingDown) return; // SIGINT during a graceful exit
+  shuttingDown = true;
+  await reportHealth("stopping");
+  // Graceful first: POST /api/exit lets the app flush watchdog sinks and
+  // cancel downloads cleanly; force-kill is only the fallback.
+  if (process.platform === "win32") {
+    const ok = await gracefulApiExit();
+    if (ok) {
+      console.log("[dev] API graceful exit requested — waiting for it to stop");
+      for (let i = 0; i < 16; i++) {
+        await sleep(500);
+        if (!(await isPortListening(apiPort))) break;
+      }
+    }
+  }
   for (const child of children) {
     try {
       if (process.platform === "win32") {
@@ -407,6 +519,10 @@ async function main() {
   if (forceTakeover) {
     if (lock) {
       console.log(`[dev] --kill: stopping existing dev-all (pid ${lock.pid}) and taking over`);
+      // Graceful first: the owner's API flushes watchdog sinks / cancels
+      // downloads; force-kill of the owner's tree is the fallback.
+      await gracefulApiExit();
+      await waitPortFree(apiPort, 8000);
       killWinPid(lock.pid); // /F then /T — kills the owner's whole tree
       await waitPortFree(apiPort, 15000);
     }
@@ -515,9 +631,34 @@ async function main() {
       return;
     }
   }
+
+  await reportHealth("health");
+
+  // Anti-hang watchdog: the exit handler restarts on crashes, but a live
+  // process that stops answering (deadlocked sqlite, stuck thread) needs
+  // this monitor — 3 missed probes (~45s) = hung, force-kill, exit handler
+  // restarts it.
+  startHealthMonitor({
+    onUnhealthy: () => {
+      if (shuttingDown || !apiProcess || apiProcess.exitCode !== null) return;
+      console.error(
+        `[dev] API on :${apiPort} unresponsive for ~45s — treating as hung, restarting`,
+      );
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } else {
+        apiProcess.kill("SIGKILL");
+      }
+    },
+  });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

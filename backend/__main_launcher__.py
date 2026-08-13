@@ -346,6 +346,53 @@ def _server_supervisor(port: int):
     logger.info("API server supervisor stopped")
 
 
+def _server_health_watchdog(port: int) -> None:
+    """Force-restart a HUNG API (alive but unresponsive).
+
+    Waits for the first healthy response (the boot can take 35-90s+ on a
+    warm archive / frozen cold import), then polls /api/info every 15s.
+    After 3 consecutive misses the API is treated as hung — stop uvicorn
+    via server_lifecycle so the supervisor's restart path takes over.
+    """
+    from services.server_lifecycle import should_stop_supervisor, stop_api_server
+
+    logger = logging.getLogger("VOD.RIP")
+    miss_interval = 15.0
+    max_misses = 3
+
+    def _probe() -> bool:
+        try:
+            r = http_requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    # Boot grace: wait for the first healthy response (the supervisor's
+    # own _wait_for_server governs the boot deadline, not us).
+    while not should_stop_supervisor() and not _probe():
+        time.sleep(5)
+    if should_stop_supervisor():
+        return
+
+    misses = 0
+    while not should_stop_supervisor():
+        time.sleep(miss_interval)
+        if _probe():
+            misses = 0
+            continue
+        misses += 1
+        if misses >= max_misses:
+            logger.error(
+                "API unresponsive for %.0fs — treating as hung, restarting",
+                miss_interval * max_misses,
+            )
+            try:
+                stop_api_server(port)
+            except Exception as exc:
+                logger.debug("stop_api_server failed: %s", exc)
+            misses = 0
+
+
 def _wait_for_server(port: int, timeout_sec: int = 90) -> bool:
     """Poll the API health endpoint. Returns ``True`` when ready.
 
@@ -763,6 +810,14 @@ def main():
 
     server_thread = threading.Thread(target=_server_supervisor, args=(port,), daemon=True)
     server_thread.start()
+    # Anti-hang watchdog: the supervisor only restarts on crashes (uvicorn
+    # exits); a process that is alive but deadlocked (sqlite lock storm,
+    # hung executor) would otherwise sit unresponsive forever. Poll the
+    # health endpoint; after repeated misses ask uvicorn to stop — the
+    # supervisor sees the exit and restarts in 2s.
+    threading.Thread(
+        target=_server_health_watchdog, args=(port,), daemon=True, name="health-watchdog"
+    ).start()
 
     if not _wait_for_server(port):
         logger.critical("FastAPI server did not become ready within timeout")

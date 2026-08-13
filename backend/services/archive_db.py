@@ -2513,7 +2513,29 @@ def worker_live(age_s: int = 30, tag: str = "transcribe") -> bool:
         return False
 
 
-def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:
+def worker_heartbeat_age(tag: str) -> Optional[float]:
+    """Seconds since *tag*'s last heartbeat, or None when never stamped.
+
+    The health endpoint and dev tooling read this to tell a live-but-hung
+    app (heartbeat stale) from a healthy one — the app stamps 'app-activity'
+    every 30s while alive. Timestamps are _now_iso() (UTC, seconds)."""
+    from datetime import datetime, timezone
+
+    try:
+        rows = query(
+            "SELECT at FROM worker_heartbeats WHERE tag = ? LIMIT 1", (tag,)
+        )
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    try:
+        at = datetime.fromisoformat(rows[0]["at"])
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
     """True when YouTube captions already cover the video (captions-first on).
 
     Mirrors archive_transcribe._captions_first_skip: yt_subtitles_first

@@ -197,6 +197,16 @@ def main() -> int:
                 _stop_services()
                 time.sleep(TICK_S)
                 continue
+            # The detached scheduler keeps ingesting YouTube with the app
+            # closed; that needs PO tokens, and the POT server is now a
+            # detached orphan that outlives the app. Ping-first + respawn,
+            # so this is a no-op while a live POT answers on 4416.
+            try:
+                from services import youtube_pot_service
+
+                youtube_pot_service.ensure_pot_server_started()
+            except Exception:
+                _log.debug("POT ensure failed", exc_info=True)
             _start_services()
             _maybe_spawn_worker()
             if time.monotonic() - last_hygiene >= HYGIENE_EVERY_S:

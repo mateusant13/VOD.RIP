@@ -30,6 +30,15 @@ from services import archive_db  # noqa: E402  (env must be set first)
 from routers.archive import _maybe_enrich, archive_search  # noqa: E402
 
 
+def test_worker_heartbeat_age():
+    """The health endpoint's liveness probe: age of the last stamp, None if
+    never stamped (missing row is not a crash)."""
+    archive_db.worker_heartbeat("test-hb")
+    age = archive_db.worker_heartbeat_age("test-hb")
+    assert age is not None and 0 <= age < 60
+    assert archive_db.worker_heartbeat_age("never-stamped-tag") is None
+
+
 def _upsert(platform: str, video_id: str, **kw) -> None:
     archive_db.upsert_video({
         "platform": platform,
