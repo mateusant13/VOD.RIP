@@ -123,3 +123,5 @@ assets/readme/_frames/
 icon.ico
 .crew/
 public/assets/
+backend/tests/_chat_history_scratch.db
+backend/tests/._chat_history_scratch.db.*
