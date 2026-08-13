@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from services import archive_db
+from services import archive_db, transcript_fix
 from services.chat_sinks.yt_live import _base_usec_from_info
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 from services.ytdlp_guard import guarded_youtube_dl, guarded_youtube_dl_channel
@@ -824,6 +824,19 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
                 for lang, fmt, data in tracks:
                     segments = _parse_caption(fmt, data)
                     if segments:
+                        # Champion-name post-fix: STRONG path only (engine
+                        # "captions" is never weak-path eligible) and only on
+                        # segments whose words reconstruct the text (no inline
+                        # timestamps -> skipped inside fix_segment), so the
+                        # join(words) == text contract is preserved.
+                        fix_stats = transcript_fix.new_stats()
+                        if transcript_fix.enabled():
+                            for seg in segments:
+                                transcript_fix.fix_segment(
+                                    seg, engine="captions", language=lang,
+                                    stats=fix_stats,
+                                )
+                            report["transcript_fix"] = fix_stats
                         _db_write(
                             archive_db.insert_transcript,
                             PLATFORM, video_id, segments,
