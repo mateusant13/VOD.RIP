@@ -20,6 +20,7 @@ import html
 import json
 import logging
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -500,6 +501,31 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
         raise
 
 
+def _is_gate_error(exc: BaseException) -> bool:
+    """True when the extract failure signals the IP-level YouTube gate.
+
+    The canonical classifier (services.yt_gate.classify_youtube_gate_error)
+    covers the EN bot-wall spellings ("Sign in to confirm you're not a bot",
+    "preview unavailable..."). YouTube's player API also serves the gate as
+    a localized transient block — observed live: an entire channel failing
+    with "Esse conteúdo não está disponível. Tente de novo mais tarde."
+    ("This content is not available. Please try again later.") while the
+    yt_gate/warm cooldowns were armed. The 'try again later' family is
+    transient by wording (a dead video says "unavailable" with no retry
+    hint), so classifying it as gate is safe: worst case one short freeze.
+    ponytail: per-locale marker list; upgrade path is a shared classifier in
+    yt_gate that maps localized playability reasons once they stabilize."""
+    from services.yt_gate import classify_youtube_gate_error
+
+    if classify_youtube_gate_error(exc):
+        return True
+    msg = (str(exc) or "").lower()
+    return (
+        ("try again later" in msg or "tente de novo mais tarde" in msg)
+        and ("not available" in msg or "não está disponível" in msg)
+    )
+
+
 def _lang_group(lang: str) -> Optional[str]:
     """Language family of a caption track code: 'pt' | 'en' | 'es' | None."""
     base = (lang or "").lower().split("-")[0]
@@ -715,8 +741,17 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
     """
     url = _video_url(id_or_url)
     video_id = _video_id_from_url(url, id_or_url.strip())
-    job_id = f"yt-ingest-{video_id}-{int(time.time())}"
-    _db_write(archive_db.enqueue_job, job_id, "ingest", PLATFORM, video_id, priority=0)
+    # Stable job id: the scheduler re-attempts a failed ingest on its own
+    # (kind='ingest' rows are visibility-only — the worker never claims
+    # them), so a per-attempt timestamped id piled one permanent 'retrying'
+    # row into the jobs panel per attempt. Reusing one row per video keeps
+    # the panel truthful: attempts/error/deadline update in place and a
+    # successful re-ingest flips the same row to done.
+    job_id = f"yt-ingest-{video_id}"
+    try:
+        _db_write(archive_db.enqueue_job, job_id, "ingest", PLATFORM, video_id, priority=0)
+    except sqlite3.IntegrityError:
+        pass  # row from an earlier attempt — reuse it in place
     report: dict = {
         "video_id": video_id,
         "title": "",
@@ -816,9 +851,22 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
             _db_write(archive_db.update_job, job_id, status="done", progress=1.0)
         except Exception as exc:  # job bookkeeping must not fail the ingest
             logger.warning("job status update failed for %s: %s", video_id, exc)
-    except Exception:
+    except Exception as exc:
         try:
-            _db_write(archive_db.update_job, job_id, status="failed", error="extract error")
+            # Truthful job error: the old generic 'extract error' hid the
+            # real cause (bot-gate / DRM / dead video) AND kept the TASK10
+            # requeue on the plain exponential curve — the gate-aware rate
+            # path keys off the error text, and 'extract error' alone never
+            # matched it. A gate-classified failure names the gate so the
+            # retry deadline tracks the freeze instead of hot-retrying.
+            if _is_gate_error(exc):
+                from services.yt_gate import note_youtube_gate
+
+                note_youtube_gate(str(exc)[:200])
+                error = "extract error: YouTube bot-gate active — retrying after it clears"
+            else:
+                error = f"extract error: {exc}"
+            _db_write(archive_db.update_job, job_id, status="failed", error=error)
         except Exception:
             pass
         raise
