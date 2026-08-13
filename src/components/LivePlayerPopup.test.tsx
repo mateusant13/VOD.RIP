@@ -1,8 +1,50 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { LivePlayerPopup } from './LivePlayerPopup';
 import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
+
+/**
+ * hls.js needs MediaSource, which jsdom lacks — stub the module so the
+ * popup's REPLAY switch (arrow seek) creates a controllable instance: tests
+ * fire MANIFEST_PARSED and assert the position handed to startLoad. The real
+ * module is only reached via the dynamic import inside createHlsPlayer, and
+ * the existing tests' session mock carries no src, so they never import it.
+ */
+const { FakeHls } = vi.hoisted(() => {
+  class FakeHls {
+    static isSupported = () => true;
+    static Events = { MANIFEST_PARSED: 'manifestParsed', LEVEL_SWITCHED: 'levelSwitched', ERROR: 'error' };
+    static ErrorDetails = { BUFFER_STALLED_ERROR: 'bufferStalledError' };
+    static ErrorTypes = { NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError' };
+    config: Record<string, unknown>;
+    levels: { height: number; bitrate: number }[] = [];
+    liveSyncPosition: number | undefined = undefined;
+    currentLevel = -1;
+    loadLevel = -1;
+    loadSource = vi.fn();
+    attachMedia = vi.fn();
+    startLoad = vi.fn();
+    stopLoad = vi.fn();
+    destroy = vi.fn();
+    recoverMediaError = vi.fn();
+    private handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    constructor(config: Record<string, unknown>) {
+      this.config = config;
+    }
+    on(event: string, cb: (...args: unknown[]) => void) {
+      const list = this.handlers.get(event) ?? [];
+      list.push(cb);
+      this.handlers.set(event, list);
+    }
+    /** Test hook — fire a registered hls.js event handler. */
+    trigger(event: string, ...args: unknown[]) {
+      for (const cb of this.handlers.get(event) ?? []) cb({}, ...args);
+    }
+  }
+  return { FakeHls };
+});
+vi.mock('hls.js', () => ({ default: FakeHls }));
 
 /**
  * jsdom does not implement the Fullscreen API (no requestFullscreen /
@@ -48,6 +90,28 @@ function mockFetch() {
         reason: 'Kick has no public clip-creation API.',
         needed: [],
       }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 404 });
+  });
+  vi.stubGlobal('fetch', fn);
+  return fn;
+}
+
+/** Archive-ready fetch mock — the lazy DVR snapshot request returns a
+ *  playlist whose EXTINF lines sum to `sec`, so the rail enables
+ *  (archiveAvailable) with railMax = sec. */
+function mockFetchWithArchive(sec = 100) {
+  const fn = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/api/preview/live')) {
+      return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+    }
+    if (url.includes('/api/preview/hls/s1/resource')) {
+      const half = sec / 2;
+      return new Response(
+        `#EXTM3U\n#EXT-X-TARGETDURATION:${Math.ceil(half)}\n#EXTINF:${half},no\nseg0.ts\n#EXTINF:${half},no\nseg1.ts\n#EXT-X-ENDLIST\n`,
+        { status: 200 },
+      );
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -467,5 +531,168 @@ describe('LivePlayerPopup volume menu outside-click', () => {
     expect(screen.queryByLabelText('Volume')).toBeNull();
     fireEvent.click(toggle);
     expect(screen.getByLabelText('Volume')).toBeTruthy();
+  });
+});
+
+describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
+  beforeEach(() => {
+    // The component sets this e2e probe hook in createHlsPlayer and never
+    // clears it on unmount — reset it so a prior test's instance cannot be
+    // mistaken for this test's replay switch.
+    delete (window as unknown as { __livePopupHls?: unknown }).__livePopupHls;
+  });
+
+  it('wheel on the rail zooms min/max around the cursor; full zoom-out restores 0..railMax', async () => {
+    mockFetchWithArchive();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    expect(rail.disabled).toBe(false);
+    expect(rail.min).toBe('0');
+    expect(rail.max).toBe('100');
+
+    // jsdom reports a zero-size rect — give the rail real geometry so the
+    // cursor fraction (pointer x within the rail) is computable.
+    vi.spyOn(rail, 'getBoundingClientRect').mockReturnValue({
+      left: 0, right: 200, top: 0, bottom: 4, width: 200, height: 4, x: 0, y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    // Wheel up at the centre → ×1.5 window [≈16.7, ≈83.3], finer step, badge
+    // + hint; the live playhead stays pinned at the (zoomed) archive edge.
+    fireEvent.wheel(rail, { clientX: 100, deltaY: -100 });
+    expect(parseFloat(rail.min)).toBeCloseTo(100 / 6, 5);
+    expect(parseFloat(rail.max)).toBeCloseTo(500 / 6, 5);
+    expect(rail.step).toBe('0.1');
+    expect(parseFloat(rail.value)).toBeCloseTo(500 / 6, 5);
+    expect(screen.getByText('×1.5')).toBeTruthy();
+    expect(rail.title).toContain('Scroll on the rail to zoom');
+
+    // Wheel down → back to the full 0..railMax, coarse step, badge + hint gone.
+    fireEvent.wheel(rail, { clientX: 100, deltaY: 100 });
+    expect(rail.min).toBe('0');
+    expect(rail.max).toBe('100');
+    expect(rail.step).toBe('0.5');
+    expect(screen.queryByText('×1.5')).toBeNull();
+    expect(rail.title).not.toContain('Scroll on the rail to zoom');
+  });
+
+  it('ArrowLeft in live mode switches to replay at railTime − 5s', async () => {
+    mockFetchWithArchive();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    // The DVR archive resolves lazily — wait until the rail enables so the
+    // window keydown listener is attached before firing arrows.
+    const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    await waitFor(() => expect(rail.disabled).toBe(false));
+    await waitFor(() => expect(rail.max).toBe('100'));
+
+    const video = document.querySelector('video') as HTMLVideoElement;
+    video.currentTime = 42;
+    fireEvent(video, new Event('timeupdate'));
+
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+
+    // 250 ms debounce → switchToReplay(max(0, 42 − 5)) = switchToReplay(37).
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls.startLoad).toHaveBeenCalledWith(37);
+    // Mode switched: the rail is now a replay seek bar.
+    expect(screen.getByRole('slider', { name: 'Seek within replay' })).toBeTruthy();
+  });
+
+  it('ArrowRight in live mode switches to replay at railTime + 5s', async () => {
+    mockFetchWithArchive();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    await waitFor(() => expect(rail.disabled).toBe(false));
+    await waitFor(() => expect(rail.max).toBe('100'));
+
+    const video = document.querySelector('video') as HTMLVideoElement;
+    video.currentTime = 42;
+    fireEvent(video, new Event('timeupdate'));
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls.startLoad).toHaveBeenCalledWith(47);
+    expect(screen.getByRole('slider', { name: 'Seek within replay' })).toBeTruthy();
+  });
+
+  it('ArrowLeft/ArrowRight seek ±5s inside replay (clamped to the snapshot)', async () => {
+    mockFetchWithArchive();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    const rail0 = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    await waitFor(() => expect(rail0.disabled).toBe(false));
+    await waitFor(() => expect(rail0.max).toBe('100'));
+    const video = document.querySelector('video') as HTMLVideoElement;
+
+    // Enter replay first: ArrowRight from live (railTime 0 → 5).
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByRole('slider', { name: 'Seek within replay' });
+
+    // Give the snapshot a real duration — jsdom reports NaN by default.
+    Object.defineProperty(video, 'duration', { configurable: true, value: 100 });
+    fireEvent(video, new Event('durationchange'));
+    const rail = screen.getByRole('slider', { name: 'Seek within replay' }) as HTMLInputElement;
+    await waitFor(() => expect(rail.max).toBe('100'));
+
+    // ±5s around the playhead, directly on the snapshot timeline.
+    video.currentTime = 42;
+    fireEvent(video, new Event('timeupdate'));
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(video.currentTime).toBe(47);
+    // The seek moved the playhead — a real timeupdate syncs railTime.
+    fireEvent(video, new Event('timeupdate'));
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(video.currentTime).toBe(42);
+
+    // Clamped at the start: −5 below 0 stops at 0.
+    video.currentTime = 2;
+    fireEvent(video, new Event('timeupdate'));
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(video.currentTime).toBe(0);
+
+    // Clamped at the end: +5 past the snapshot edge re-snapshots at railMax
+    // (inSnapshot is false beyond duration − 0.5) — the new session lands there.
+    video.currentTime = 97;
+    fireEvent(video, new Event('timeupdate'));
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    await waitFor(() => expect(hls.destroy).toHaveBeenCalled()); // parked instance replaced
+    const hls2 = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls2.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls2.startLoad).toHaveBeenCalledWith(100);
+  });
+
+  it('ignores arrow seeks while the rail is disabled (no archive)', async () => {
+    renderPopup(); // default mock — no DVR archive → rail disabled
+    await screen.findByTitle('Fullscreen');
+
+    const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
+    expect(rail.disabled).toBe(true);
+
+    const video = document.querySelector('video') as HTMLVideoElement;
+    video.currentTime = 10;
+    fireEvent(video, new Event('timeupdate'));
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+
+    // No seek and no replay switch: still live, playhead untouched, no hls
+    // instance even after the debounce window.
+    expect(video.currentTime).toBe(10);
+    expect(rail.disabled).toBe(true);
+    await new Promise((r) => setTimeout(r, 300));
+    expect((window as unknown as { __livePopupHls?: unknown }).__livePopupHls).toBeUndefined();
+    expect(screen.queryByRole('slider', { name: 'Seek within replay' })).toBeNull();
   });
 });

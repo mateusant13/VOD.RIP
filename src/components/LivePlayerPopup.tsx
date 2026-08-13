@@ -17,11 +17,21 @@ import {
   LIVE_PANEL_MIN_H,
   LIVE_PANEL_MIN_W,
   LIVE_POPUP_ACTIVE_Z,
+  PREVIEW_KEY_SKIP_SEC,
   PREVIEW_VIDEO_ASPECT_DEFAULT,
   panelPosAfterResize,
   startPanelResizeDrag,
 } from '../layoutUtils';
+import { shouldIgnorePlayerKeyEvent } from '../keyboardUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
+import {
+  TRIM_ZOOM_STEP,
+  type TrimViewWindow,
+  maxTrimZoomForDuration,
+  secToFrac,
+  zoomTrimViewAround,
+  zoomWindowFromView,
+} from '../trimUtils';
 import { platformButtonShadow, platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import {
@@ -124,6 +134,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
+  const railRef = useRef<HTMLInputElement>(null);
   // Spawned windows take focus (shared raise-to-front contract) — the popup
   // is the active surface the moment it opens.
   useEffect(() => {
@@ -258,12 +269,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const [archiveReady, setArchiveReady] = useState(false);
   const [snapshotDuration, setSnapshotDuration] = useState(0); // replay: video.duration
   const [railTime, setRailTime] = useState(0);
+  // Wheel-zoom on the replay rail — same precision UX as the main preview
+  // trim rail: (zoom, anchorFrac) fully describes the visible window.
+  const [railZoom, setRailZoom] = useState(1);
+  const [railAnchorFrac, setRailAnchorFrac] = useState(0.5);
+  // Mirror railTime for the window keydown/wheel listeners — reattaching on
+  // every timeupdate (4 Hz) would churn the listeners for no reason.
+  const railTimeRef = useRef(0);
   const replayTimerRef = useRef<number | null>(null);
 
   // Keep refs in sync with state (drag/resize use the latest size without re-subscribing)
   useEffect(() => { sizeRef.current = size; }, [size]);
   useEffect(() => { posRef.current = position; }, [position]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { railTimeRef.current = railTime; }, [railTime]);
 
   /** Cache-busted archive snapshot URL — each new URL forces a fresh ENDLIST snapshot. */
   const replaySnapshotUrl = useCallback((sid: string) => {
@@ -1144,6 +1163,76 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // a total smaller than the current position.
   const displayTotal = Math.max(totalSec, currentSec);
 
+  // Zoomed rail window — zoom=1 → the full 0..railMax (pixel-identical to
+  // the unzoomed rail); otherwise the window anchored at railAnchorFrac.
+  const railView: TrimViewWindow = useMemo(
+    () => zoomWindowFromView(railZoom, railAnchorFrac, railMax),
+    [railZoom, railAnchorFrac, railMax],
+  );
+
+  // Clamp the zoom when the rail duration shrinks (new session / mode
+  // switch): a window wider than the new rail is meaningless — fall back to
+  // the full view (zoom 1, anchor reset).
+  useEffect(() => {
+    const max = maxTrimZoomForDuration(railMax);
+    if (railZoom > max) {
+      setRailZoom(1);
+      setRailAnchorFrac(0.5);
+    }
+  }, [railZoom, railMax]);
+
+  // Wheel-to-zoom on the replay rail. React's synthetic onWheel is passive at
+  // the root, so preventDefault would not stop page scroll — attach a native
+  // non-passive listener instead (same pattern as App.tsx's preview trim
+  // rail, reattached when the view/window changes).
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail || railDisabled || railMax <= 0) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = rail.getBoundingClientRect();
+      // Cursor fraction: the pointer position when it is over the rail,
+      // else the current rail position (zoom around the playhead).
+      const cursorFrac = rect.width > 0 && e.clientX >= rect.left && e.clientX <= rect.right
+        ? Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+        : secToFrac(
+            modeRef.current === 'replay'
+              ? Math.min(Math.max(0, railTimeRef.current), railMax)
+              : railMax,
+            railView,
+          );
+      const factor = e.deltaY < 0 ? TRIM_ZOOM_STEP : 1 / TRIM_ZOOM_STEP;
+      // zoomTrimViewAround clamps the result so the window stays inside
+      // [0, railMax] and never narrower than TRIM_MIN_WINDOW_SEC.
+      const next = zoomTrimViewAround(railView, cursorFrac, factor, railMax);
+      setRailZoom(next.zoom);
+      setRailAnchorFrac(next.anchorFrac);
+    };
+    rail.addEventListener('wheel', onWheel, { passive: false });
+    return () => rail.removeEventListener('wheel', onWheel);
+  }, [railDisabled, railMax, railView]);
+
+  // ArrowLeft/ArrowRight ±PREVIEW_KEY_SKIP_SEC seek on the live popup.
+  // Window-level so the rail needs no focus; Space/ArrowUp/ArrowDown/F stay
+  // with the popup's buttons. railTime is read via a ref so the listener
+  // does not reattach on every timeupdate.
+  useEffect(() => {
+    if (railDisabled) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (shouldIgnorePlayerKeyEvent(e as unknown as React.KeyboardEvent)) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'ArrowLeft') {
+        handleRailChange(Math.max(0, railTimeRef.current - PREVIEW_KEY_SKIP_SEC));
+      } else {
+        handleRailChange(Math.min(railMax, railTimeRef.current + PREVIEW_KEY_SKIP_SEC));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [railDisabled, railMax, handleRailChange]);
+
   return createPortal(
     <div
       ref={popupRef}
@@ -1358,20 +1447,34 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               <span className="w-11 shrink-0 font-mono text-[9px] text-zinc-300">
                 {fmtDuration(currentSec)}
               </span>
-              <input
-                type="range"
-                min={0}
-                max={railMax}
-                step={0.5}
-                value={railValue}
-                disabled={railDisabled}
-                onChange={(e) => handleRailChange(parseFloat(e.target.value))}
-                className={`h-1 flex-1 ${mode === 'replay' ? 'accent-blue-400' : 'accent-red-500'} ${railDisabled ? 'opacity-60' : ''}`}
-                aria-label={mode === 'replay' ? t('Seek within replay') : t('Seek back into the broadcast (replay)')}
-                title={mode === 'replay'
-                  ? t('Replay of the current broadcast — drag to seek')
-                  : (railDisabled ? t('Replay unavailable for this channel') : t('Drag back to watch the past part of the stream'))}
-              />
+              <div className="relative flex-1 min-w-0">
+                <input
+                  ref={railRef}
+                  type="range"
+                  min={railView.start}
+                  max={railView.end}
+                  step={railZoom > 1 ? 0.1 : 0.5}
+                  value={Math.min(railView.end, Math.max(railView.start, railValue))}
+                  disabled={railDisabled}
+                  onChange={(e) => handleRailChange(parseFloat(e.target.value))}
+                  className={`h-1 w-full ${mode === 'replay' ? 'accent-blue-400' : 'accent-red-500'} ${railDisabled ? 'opacity-60' : ''}`}
+                  aria-label={mode === 'replay' ? t('Seek within replay') : t('Seek back into the broadcast (replay)')}
+                  title={
+                    (mode === 'replay'
+                      ? t('Replay of the current broadcast — drag to seek')
+                      : (railDisabled ? t('Replay unavailable for this channel') : t('Drag back to watch the past part of the stream')))
+                    + (railZoom > 1 ? ` (${t('Scroll on the rail to zoom')})` : '')
+                  }
+                />
+                {railZoom > 1 && (
+                  <span
+                    className="pointer-events-none absolute -top-1.5 right-0 font-mono text-[7px] text-zinc-500"
+                    title={t('Scroll on the rail to zoom')}
+                  >
+                    ×{railZoom >= 10 ? Math.round(railZoom) : railZoom.toFixed(1)}
+                  </span>
+                )}
+              </div>
               <span className="w-11 shrink-0 text-right font-mono text-[9px] text-zinc-400">
                 {fmtDuration(displayTotal)}
               </span>
