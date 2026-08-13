@@ -4,7 +4,7 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
-import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, Download, Loader2, RefreshCw, Search, AlertCircle, MessageSquare } from 'lucide-react';
+import { Play, Pause, X, Volume2, VolumeX, Maximize2, Minimize2, Download, Loader2, RefreshCw, Search, AlertCircle, MessageSquare, Sparkles, ChevronDown } from 'lucide-react';
 import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
@@ -75,7 +75,7 @@ import {
 } from './explorePopupUtils';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
-import type { PreviewSessionResponse } from './types';
+import type { PreviewSessionResponse, AiAskResponse } from './types';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
@@ -234,6 +234,17 @@ export default function ChannelExplorePopup({
   /** Chat column open state — host-controlled (button next to Search), so
    *  the panel renders no collapsed side strip. */
   const [chatOpen, setChatOpen] = useState(false);
+  /** Experimental AI ask-about-channel. aiEnabled comes from a GET
+   *  /api/settings on mount (the feature is off by default); the ask row is
+   *  hidden entirely while disabled. */
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
+  const [askQuestion, setAskQuestion] = useState('');
+  const [askScope, setAskScope] = useState<'chat' | 'transcript' | 'all'>('all');
+  const [askDays, setAskDays] = useState('');
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [askResult, setAskResult] = useState<AiAskResponse | null>(null);
   // Per-media preview retry: which single media failed + how many retries
   // already failed, so the overlay's RETRY button escalates stage → full.
   const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
@@ -308,6 +319,42 @@ export default function ChannelExplorePopup({
     };
     return registerPreviewPlayback(pause);
   }, []);
+  /** Experimental AI flag — off by default; the ask row renders only when
+   *  the user enabled the feature + saved a key in Settings. */
+  useEffect(() => {
+    let alive = true;
+    apiGet<{ experimental_ai_enabled?: boolean }>('/api/settings')
+      .then((s) => { if (alive) setAiEnabled(s.experimental_ai_enabled === true); })
+      .catch(() => { /* backend unreachable → feature stays hidden */ });
+    return () => { alive = false; };
+  }, []);
+  /** One RAG question: local archive search + one LLM call (backend). */
+  const askAi = async () => {
+    const question = askQuestion.trim();
+    if (!question || askLoading) return;
+    setAskLoading(true);
+    setAskError(null);
+    try {
+      const daysRaw = askDays.trim();
+      const daysNum = daysRaw === '' ? null : Number(daysRaw);
+      const days = daysNum !== null && Number.isFinite(daysNum) && daysNum >= 1
+        ? Math.floor(daysNum)
+        : null;
+      const res = await apiPost<AiAskResponse>('/api/ai/ask', {
+        channel: vod.channel ?? '',
+        platform: vod.platform,
+        question,
+        scope: askScope,
+        days,
+      });
+      setAskResult(res);
+    } catch (err) {
+      setAskError(err instanceof Error ? err.message : String(err));
+      setAskResult(null);
+    } finally {
+      setAskLoading(false);
+    }
+  };
   const seekDebounceRef = useRef<number | null>(null);
   const playbackKindRef = useRef<'hls' | 'progressive'>('progressive');
   const pendingSeekSecRef = useRef<number | null>(null);
@@ -1784,6 +1831,97 @@ export default function ChannelExplorePopup({
             </div>
           </div>
         )}
+        {!fullscreen && aiEnabled && vod.channel ? (
+          <div className="shrink-0 border-2 border-zinc-800 bg-zinc-950/60">
+            <button
+              type="button"
+              onClick={() => setAskOpen((o) => !o)}
+              aria-expanded={askOpen}
+              className="w-full flex items-center gap-1.5 px-2 py-1 text-left"
+            >
+              <Sparkles size={10} className="text-amber-300 shrink-0" />
+              <span className="text-[8px] font-mono uppercase tracking-widest font-bold text-zinc-400 truncate">
+                {t('Ask about this channel')}
+              </span>
+              <ChevronDown
+                size={10}
+                className={`ml-auto shrink-0 transition-transform text-zinc-500 ${askOpen ? 'rotate-180' : ''}`}
+              />
+            </button>
+            {askOpen ? (
+              <div className="p-2 flex flex-col gap-2 border-t-2 border-zinc-800">
+                <input
+                  type="text"
+                  value={askQuestion}
+                  onChange={(e) => setAskQuestion(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void askAi(); }}
+                  maxLength={500}
+                  placeholder={t('Ask about this channel…')}
+                  aria-label="ai ask question"
+                  className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1.5 px-2 text-[11px] focus:outline-none focus:border-white"
+                />
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <select
+                    value={askScope}
+                    onChange={(e) => setAskScope(e.target.value as 'chat' | 'transcript' | 'all')}
+                    aria-label="ai ask scope"
+                    className="bg-zinc-950 border-2 border-zinc-800 text-zinc-200 font-mono py-1 px-1.5 text-[10px] focus:outline-none focus:border-white"
+                  >
+                    <option value="all">{t('All')}</option>
+                    <option value="chat">{t('Chat')}</option>
+                    <option value="transcript">{t('Transcript')}</option>
+                  </select>
+                  <input
+                    type="number"
+                    min={1}
+                    value={askDays}
+                    onChange={(e) => setAskDays(e.target.value)}
+                    placeholder={t('Days')}
+                    title={t('Days (blank = entire history)')}
+                    aria-label="ai ask days"
+                    className="w-16 bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-1 px-1.5 text-[10px] focus:outline-none focus:border-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void askAi()}
+                    disabled={askLoading || !askQuestion.trim()}
+                    className="flex items-center gap-1 border px-2 py-1 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors border-zinc-700 text-zinc-300 hover:text-white hover:border-white disabled:opacity-40"
+                  >
+                    {askLoading ? <Loader2 size={10} className="animate-spin" /> : <Sparkles size={10} />}
+                    {askLoading ? t('Asking…') : t('Ask')}
+                  </button>
+                </div>
+                {askError ? (
+                  <p className="text-[10px] font-mono text-red-400" role="alert">{askError}</p>
+                ) : null}
+                {askResult ? (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-[11px] text-zinc-200 whitespace-pre-wrap leading-relaxed">
+                      {askResult.answer}
+                    </p>
+                    {askResult.sources.length > 0 ? (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 font-bold">
+                          {t('Sources')}
+                        </span>
+                        {askResult.sources.map((s, i) => (
+                          <span
+                            key={i}
+                            className="text-[9px] font-mono text-zinc-500 truncate"
+                            title={s.matched_text}
+                          >
+                            {s.video_title}
+                            {s.created_at ? ` · ${s.created_at.slice(0, 10)}` : ''}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div
           ref={playerRowRef}
           // Height is pinned by the height-explosion guard via direct style

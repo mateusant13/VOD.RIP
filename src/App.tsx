@@ -379,6 +379,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   start_with_windows: true,
   download_layout: 'typed',
   download_transcript_sidecar: true,
+  experimental_ai_enabled: false,
+  ai_api_key_set: false,
 };
 
 export default function App() {

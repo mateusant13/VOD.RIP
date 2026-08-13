@@ -139,6 +139,22 @@ export interface AppSettings {
   /** App UI language: 'en' | 'pt-BR' | 'es'. Absent/'' = not set yet —
    * the FE seeds it from the system language on first run. */
   ui_language?: string;
+  /** Experimental AI ask-about-channel (single-turn RAG over the local
+   * archive). The key is WRITE-ONLY — the API never returns it, only
+   * ai_api_key_set (presence flag). */
+  experimental_ai_enabled?: boolean;
+  ai_api_key_set?: boolean;
+}
+
+export interface AiAskSource {
+  video_title: string;
+  created_at?: string | null;
+  matched_text: string;
+}
+
+export interface AiAskResponse {
+  answer: string;
+  sources: AiAskSource[];
 }
 
 export interface DiskUsage {

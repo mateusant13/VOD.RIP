@@ -610,6 +610,22 @@ const ptBR: Record<string, string> = {
     'Clipes ao vivo do Twitch precisam de um token OAuth Helix com escopo clips:edit (POST /helix/clips).',
   'Kick has no public clip-creation API.': 'O Kick não tem API pública de criação de clipes.',
   'YouTube has no public live-clip API.': 'O YouTube não tem API pública de clipes ao vivo.',
+  // ── Experimental AI ask-about-channel ──────────────────────
+  'Experimental': 'Experimental',
+  'Experimental: AI search & answers': 'Experimental: busca e respostas com IA',
+  'Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.':
+    'Faça perguntas sobre canais arquivados. As respostas vêm apenas do arquivo local (chat + transcrições) usando sua própria chave de API compatível com OpenAI.',
+  'AI API key (OpenAI-compatible)': 'Chave da API de IA (compatível com OpenAI)',
+  'A key is set — the stored key is never shown. Type a new key to replace it, or clear the field and save to remove it.':
+    'Uma chave está salva — a chave armazenada nunca é exibida. Digite uma chave nova para substituí-la, ou limpe o campo e salve para removê-la.',
+  'Add an AI API key first — the feature cannot run without one.':
+    'Adicione uma chave de API de IA primeiro — o recurso não funciona sem ela.',
+  'Ask about this channel': 'Perguntar sobre este canal',
+  'Ask about this channel…': 'Pergunte sobre este canal…',
+  'Ask': 'Perguntar',
+  'Asking…': 'Perguntando…',
+  'Days (blank = entire history)': 'Dias (vazio = histórico inteiro)',
+  'Sources': 'Fontes',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
@@ -1196,6 +1212,22 @@ const es: Record<string, string> = {
     'Los clips en vivo de Twitch necesitan un token OAuth de Helix con ámbito clips:edit (POST /helix/clips).',
   'Kick has no public clip-creation API.': 'Kick no tiene una API pública de creación de clips.',
   'YouTube has no public live-clip API.': 'YouTube no tiene una API pública de clips en vivo.',
+  // ── Experimental AI ask-about-channel ──────────────────────
+  'Experimental': 'Experimental',
+  'Experimental: AI search & answers': 'Experimental: búsqueda y respuestas con IA',
+  'Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.':
+    'Haz preguntas sobre canales archivados. Las respuestas provienen solo del archivo local (chat + transcripciones) usando tu propia clave de API compatible con OpenAI.',
+  'AI API key (OpenAI-compatible)': 'Clave de API de IA (compatible con OpenAI)',
+  'A key is set — the stored key is never shown. Type a new key to replace it, or clear the field and save to remove it.':
+    'Hay una clave guardada — la clave almacenada nunca se muestra. Escribe una clave nueva para reemplazarla, o vacía el campo y guarda para eliminarla.',
+  'Add an AI API key first — the feature cannot run without one.':
+    'Añade primero una clave de API de IA — la función no puede funcionar sin ella.',
+  'Ask about this channel': 'Preguntar sobre este canal',
+  'Ask about this channel…': 'Pregunta sobre este canal…',
+  'Ask': 'Preguntar',
+  'Asking…': 'Preguntando…',
+  'Days (blank = entire history)': 'Días (vacío = historial completo)',
+  'Sources': 'Fuentes',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so

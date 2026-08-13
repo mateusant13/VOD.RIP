@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from deps import settings_mgr, download_mgr
 from routers import (
+    ai,
     archive,
     channels,
     cookie_bridge,
@@ -945,6 +946,7 @@ if static_dir.exists():
 
 # Include routers
 app.include_router(settings.router)
+app.include_router(ai.router)
 app.include_router(preview.router)
 app.include_router(previews.router)
 app.include_router(channels.router)

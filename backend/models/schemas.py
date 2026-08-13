@@ -164,6 +164,13 @@ class AppSettings(BaseModel):
     # Write a .txt transcript sidecar next to finished downloads when the
     # archive already has a transcript (on by default).
     download_transcript_sidecar: bool = True
+    # Experimental AI ask-about-channel: single-turn RAG over the local
+    # archive (chat + transcripts). The API key is WRITE-ONLY — GET never
+    # returns it (ai_api_key_set reports presence instead); only the update
+    # path accepts it (empty string clears).
+    experimental_ai_enabled: bool = False
+    ai_api_key: str = ""
+    ai_api_key_set: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -212,10 +219,34 @@ class SettingsUpdate(BaseModel):
     ui_language: Optional[str] = None
     download_layout: Optional[str] = None
     download_transcript_sidecar: Optional[bool] = None
+    experimental_ai_enabled: Optional[bool] = None
+    ai_api_key: Optional[str] = None
 
 
 class OpenFolderRequest(BaseModel):
     path: str
+
+
+class AiAskRequest(BaseModel):
+    """POST /api/ai/ask body — single-turn RAG over one channel's archive."""
+    channel: str
+    platform: str
+    question: str
+    # 'chat' | 'transcript' | 'all' — which indexed content to search.
+    scope: str = "all"
+    # Optional window: only videos from the last N days (None = entire history).
+    days: Optional[int] = None
+
+
+class AiSource(BaseModel):
+    video_title: str
+    created_at: Optional[str] = None
+    matched_text: str
+
+
+class AiAskResponse(BaseModel):
+    answer: str
+    sources: List[AiSource] = []
 
 
 class PreviewWarmRequest(BaseModel):
