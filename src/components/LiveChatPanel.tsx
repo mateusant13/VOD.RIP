@@ -21,6 +21,7 @@ import { useI18n } from '../i18n';
 import { resolveChatColor } from '../chatColors';
 import { KICK_COLOR, TWITCH_COLOR, YOUTUBE_COLOR } from '../platformColors';
 import { ChatEmoteText, useChatEmotes, type EmoteMap } from '../chatEmotes';
+import { TWITCH_GLYPH_PATH } from './TwitchLogoIcon';
 
 export interface LiveChatRow {
   username: string;
@@ -60,6 +61,34 @@ function platformLabel(platform: string): string {
   return platform;
 }
 
+/** Inline brand logos (simple-icons paths, viewBox 24x24) — no asset fetch,
+ * offline-safe, inherits the platform accent via currentColor. */
+const PLATFORM_LOGOS: Record<string, string> = {
+  kick: 'M1.333 0h8v5.333H12V2.667h2.667V0h8v8H20v2.667h-2.667v2.666H20V16h2.667v8h-8v-2.667H12v-2.666H9.333V24h-8Z',
+  twitch: TWITCH_GLYPH_PATH,
+  youtube: 'M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z',
+};
+
+const PlatformLogo = memo(function PlatformLogo({ platform }: { platform: string }) {
+  const key = platform.toLowerCase();
+  const d = PLATFORM_LOGOS[key];
+  if (!d) return null;
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={11}
+      height={11}
+      fill="currentColor"
+      className="shrink-0 self-center"
+      style={{ color: platformColor(key) }}
+      role="img"
+      aria-label={platformLabel(key)}
+    >
+      <path d={d} />
+    </svg>
+  );
+});
+
 const ChatRow = memo(function ChatRow({
   row,
   showPlatform,
@@ -75,14 +104,7 @@ const ChatRow = memo(function ChatRow({
       className="flex items-baseline gap-1 px-2 py-0.5 overflow-hidden border-l-2 border-transparent whitespace-nowrap text-zinc-200 hover:bg-zinc-900/70"
       title={row.text}
     >
-      {showPlatform ? (
-        <span
-          className="text-[8px] font-mono uppercase shrink-0"
-          style={{ color: platformColor(row.platform) }}
-        >
-          {platformLabel(row.platform)}
-        </span>
-      ) : null}
+      {showPlatform ? <PlatformLogo platform={row.platform} /> : null}
       <span
         className="font-bold text-[10px] shrink-0"
         style={{ color: resolveChatColor(row.color, row.username, row.platform) }}

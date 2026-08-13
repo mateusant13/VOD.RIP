@@ -332,6 +332,10 @@ describe('LivePlayerPopup multi chat', () => {
     await screen.findByText('hi from kick');
     expect(screen.getByText('hi from twitch')).toBeTruthy();
     expect(document.querySelectorAll('[data-live-chat-row]')).toHaveLength(2);
+    // Platform label replaced by the brand logo next to the username.
+    expect(screen.getByRole('img', { name: 'Kick' })).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Twitch' })).toBeTruthy();
+    expect(screen.queryByRole('img', { name: 'YouTube' })).toBeNull();
 
     // Twitch filter → only the Twitch row stays.
     fireEvent.click(screen.getByRole('button', { name: 'Twitch' }));
