@@ -22,7 +22,7 @@ import {
   startPanelResizeDrag,
 } from '../layoutUtils';
 import PreviewQualityMenu from '../PreviewQualityMenu';
-import { platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
+import { platformButtonShadow, platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import {
   clampClipSeconds,
@@ -99,9 +99,9 @@ interface LevelInfo {
 const POPUP_WIDTH = 480;
 const POPUP_HEIGHT = 320;
 const RESIZE_MARGIN = 32; // keep at least 16px of the popup on screen while resizing
-/** Live chat docks right of the video by default (parent request) — the
- *  popup opens wide enough that the VIDEO keeps the classic 480px slot. */
-const INITIAL_CHAT_OPEN = true;
+/** Live preview chat stays CLOSED by default — the header toggle opens it
+ *  (the popup then grows to fit the docked panel). */
+const INITIAL_CHAT_OPEN = false;
 /** Fallback header height for the aspect-lock math when the header has not
  *  been measured yet (drag starts before the first paint). */
 const POPUP_HEADER_EST = 52;
@@ -161,7 +161,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const [chatOpen, setChatOpen] = useState(INITIAL_CHAT_OPEN);
   const chatOpenRef = useRef(INITIAL_CHAT_OPEN);
   useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
-  // Fast CLIP: seconds input (1..60) + 5s cooldown + transient notification.
+  // Fast CLIP: seconds input (5..60) + 5s cooldown + transient notification.
   const [clipSeconds, setClipSeconds] = useState(FAST_CLIP_DEFAULT_SEC);
   const lastClipAtRef = useRef(0);
   const [clipCooldownLeft, setClipCooldownLeft] = useState(0);
@@ -1410,7 +1410,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
-              {/* Fast CLIP — one click, no popups: seconds input (1..60) +
+              {/* Fast CLIP — one click, no popups: seconds input (5..60) +
                   5s cooldown; the backend reports its real capability
                   (never fakes a clip). */}
               <div className="flex items-center gap-1.5">
@@ -1421,7 +1421,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   title={clipCooldownLeft > 0
                     ? t('Clip cooldown {n}s', { n: Math.ceil(clipCooldownLeft / 1000) })
                     : t('Create a clip of the live stream')}
-                  className={`${platformPreviewCtrlBtn(ctrlPlatform, false, true)} flex items-center gap-1.5 disabled:pointer-events-none`}
+                  className={`${platformPreviewCtrlBtn(ctrlPlatform, false)} flex items-center gap-1.5 disabled:pointer-events-none`}
                 >
                   <TwitchLogoIcon size={15} className="shrink-0" />
                   {/* Logo already says Twitch — label stays bare "clip" (user request). */}
@@ -1441,8 +1441,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                     }}
                     onFocus={(e) => e.currentTarget.select()}
                     onKeyDown={(e) => {
-                      // Full-selection Backspace removes ONE digit (30 → 3),
-                      // not the whole value; typing still replaces it all.
+                      // Full-selection Backspace removes ONE digit (30 → 3,
+                      // clamped to 5), not the whole value; typing still
+                      // replaces it all.
                       const el = e.currentTarget;
                       if (e.key === 'Backspace' && el.selectionStart === 0 && el.selectionEnd === el.value.length) {
                         e.preventDefault();
@@ -1450,13 +1451,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                         const v = digits === '' ? NaN : parseInt(digits, 10);
                         setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
                         // React re-renders the new value asynchronously; drop
-                        // the caret to the end so typing appends (30→3→35).
+                        // the caret to the end so typing appends (30→5→5X).
                         requestAnimationFrame(() => {
                           el.setSelectionRange(el.value.length, el.value.length);
                         });
                       }
                     }}
-                    className="w-10 bg-zinc-900 border-2 border-zinc-700 text-zinc-200 text-[9px] font-mono py-1.5 pl-1 pr-3 text-right"
+                    className={`w-10 bg-black border-2 border-white/60 text-white text-[9px] font-mono py-1.5 pl-1 pr-3 text-right caret-white focus:border-white focus:bg-zinc-900 focus:outline-none ${platformButtonShadow(ctrlPlatform)}`}
                     aria-label={t('Clip duration (seconds)')}
                     title={t('Clip duration (seconds)')}
                   />
