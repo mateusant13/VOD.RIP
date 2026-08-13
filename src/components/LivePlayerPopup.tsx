@@ -426,11 +426,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // Replay: autoStartLoad off — the position is applied in MANIFEST_PARSED
     // (startLoad before the manifest parses is a no-op, which would start the
     // snapshot at 0 instead of the dragged time).
-    // hls.js surface mirrors the mini preview player exactly (App.tsx):
-    // enableWorker, lowLatencyMode off, small buffers, long timeouts, the
-    // adblock pLoader, and the live sync knobs. capLevelToPlayerSize is
-    // DELIBERATELY absent — the mini preview caps to its panel size, the
-    // live popup must keep the stream's source resolution.
+    // hls.js surface mirrors the mini preview player (App.tsx) except the
+    // buffer/live-sync geometry (see the config below): enableWorker,
+    // lowLatencyMode off, long timeouts, the adblock pLoader, and the live
+    // sync knobs. capLevelToPlayerSize is DELIBERATELY absent — the mini
+    // preview caps to its panel size, the live popup must keep the stream's
+    // source resolution.
     // startLevel: 0 = the LOWEST manifest level — hls.js 1.6.2 sorts levels
     // ascending (dist/hls.mjs: "sort levels from lowest to highest"), so
     // index 0 is the smallest fragment → fastest first frame. MANIFEST_PARSED
@@ -440,15 +441,27 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       enableWorker: true,
       startLevel: 0,
       lowLatencyMode: false,
-      maxBufferLength: 6,
-      maxMaxBufferLength: 12,
+      // Live geometry (buffering fix): the playhead must ride below the live
+      // edge with a real jitter cushion, not the mini preview's play-first
+      // VOD knobs. Every delivery stage adds latency (browser -> backend
+      // proxy -> Twitch CDN, plus the pLoader's fetch+strip on each refresh);
+      // with liveSyncDuration 3 / maxBufferLength 6 the media ahead of the
+      // playhead was ~3s, so any hiccup (manifest refresh, connection-pool
+      // contention, CDN) drained it into a waiting→buffering flash. 8s keeps
+      // the stream feeling live (~2 segments behind edge; hls.js's default
+      // target is liveSyncDurationCount 3) and absorbs the backend's own
+      // ~3-5s live pipeline latency (backend/services/preview/session.py).
+      maxBufferLength: 20,
+      maxMaxBufferLength: 40,
       backBufferLength: 12,
       startFragPrefetch: true,
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
       testBandwidth: false,
-      liveSyncDuration: 3,
-      liveMaxLatencyDuration: 10,
+      liveSyncDuration: 8,
+      // hls.js REQUIRES liveMaxLatencyDuration > liveSyncDuration (config
+      // merge throws otherwise) — keep the catch-up band above the target.
+      liveMaxLatencyDuration: 15,
       liveDurationInfinity: true,
       maxLiveSyncPlaybackRate: 1.5,
       startPosition: -1,
