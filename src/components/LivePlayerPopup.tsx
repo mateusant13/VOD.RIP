@@ -1310,20 +1310,17 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           </div>
         )}
 
-        {/* Docked archive-search panel — never over the video while this
-            popup is fullscreen (matches ChannelExplorePopup's pattern). */}
+        {/* Floating archive-search popup — standalone window over the
+            video (App's floating variant), never embedded in the small
+            player. Hidden while this popup is fullscreen; state survives:
+            the popup reopens on exit. */}
         {!isFullscreen && searchOpen && (
-          <div
-            className="absolute inset-0 z-20 flex flex-col bg-zinc-950"
-          >
-            <ArchiveSearchPopup
-              embedded
-              zIndex={0}
-              onClose={() => setSearchOpen(false)}
-              onOpenHit={onOpenHit}
-              savedChannels={savedChannels}
-            />
-          </div>
+          <ArchiveSearchPopup
+            zIndex={(zIndex ?? LIVE_POPUP_ACTIVE_Z) + 50}
+            onClose={() => setSearchOpen(false)}
+            onOpenHit={onOpenHit}
+            savedChannels={savedChannels}
+          />
         )}
 
         {/* Transport controls — same layout as the mini preview player: a
