@@ -153,6 +153,74 @@ async def test_history_fallback_order_for_ts_missing_rows(client):
     assert all(m["ts"] is None for m in resp.json()["messages"])
 
 
+async def test_history_youtube_matches_bare_and_at_handle_slugs(client):
+    """YouTube chat rows persist with the SAME schema and the endpoint serves
+    them under BOTH slug forms ('titiltei' and '@titiltei') — the watchdog
+    stores the bare settings login in videos.channel while the frontend's
+    liveChatSlugFromUrl returns the @-prefixed path segment for youtube.com
+    URLs; the @ normalization must never hide captured YouTube chat."""
+    _reset_db()
+    # Watchdog live capture row: channel stored as the bare settings login.
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "Ed9ph4z7RyU", "channel": "titiltei",
+        "title": "SOLOQ", "started_at": "2026-08-13T19:46:06+00:00", "kind": "live",
+    })
+    # A second capture whose stored channel DOES carry the @ (settings saved
+    # the handle verbatim) — the bare slug must match it too.
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "youtube-live-@titiltei-1785650000000",
+        "channel": "@titiltei", "title": "soloq", "started_at": "2026-08-12T20:00:00+00:00",
+        "kind": "live",
+    })
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "v-other-yt", "channel": "someone",
+        "title": "VOD", "started_at": "2026-08-01T00:00:00Z", "kind": "vod",
+    })
+    # Same message-row schema as Twitch/Kick: offset_sec, username, text, ts,
+    # color (YouTube rows carry the @handle in username + a chat color).
+    archive_db.insert_messages("youtube", "Ed9ph4z7RyU", [
+        {"offset_sec": 5.0, "username": "@carlos_x_Y_z", "text": "e o hit nas costas?",
+         "ts": "2026-08-13T19:13:52+00:00", "color": "#ff0000"},
+        {"offset_sec": 60.0, "username": "@tio_wolf7", "text": "titizinho",
+         "ts": "2026-08-13T19:44:17+00:00"},
+    ])
+    archive_db.insert_messages("youtube", "youtube-live-@titiltei-1785650000000", [
+        {"offset_sec": 0.0, "username": "@fan", "text": "stored with @ channel",
+         "ts": "2026-08-12T20:01:00+00:00"},
+    ])
+    archive_db.insert_messages("youtube", "v-other-yt", [
+        {"offset_sec": 1.0, "username": "@eve", "text": "other channel",
+         "ts": "2026-09-01T00:00:00Z"},
+    ])
+
+    # Bare settings login.
+    resp = await client.get(
+        "/api/chat/history",
+        params={"platform": "youtube", "slug": "titiltei", "limit": 50},
+    )
+    assert resp.status_code == 200
+    msgs = resp.json()["messages"]
+    assert [m["text"] for m in msgs] == [
+        "stored with @ channel", "e o hit nas costas?", "titizinho",
+    ]
+    for m in msgs:
+        assert set(m) == {"username", "text", "ts", "color"}
+        assert isinstance(m["username"], str) and m["username"]
+        assert isinstance(m["text"], str) and m["text"]
+        assert m["ts"] is None or isinstance(m["ts"], str)
+        assert m["color"] is None or isinstance(m["color"], str)
+    assert "other channel" not in {m["text"] for m in msgs}
+
+    # @-prefixed handle (liveChatSlugFromUrl's youtube.com path segment) —
+    # the exact mismatch that used to hide ALL YouTube chat history.
+    resp2 = await client.get(
+        "/api/chat/history",
+        params={"platform": "youtube", "slug": "@titiltei", "limit": 50},
+    )
+    assert resp2.status_code == 200
+    assert [m["text"] for m in resp2.json()["messages"]] == [m["text"] for m in msgs]
+
+
 async def test_history_empty_db_returns_empty(client):
     _reset_db()
     resp = await client.get(
