@@ -125,6 +125,16 @@ interface LiveClipCapability {
   reason?: string;
   needed?: string[];
 }
+
+/** One live-caption block: the wall-clock window in epoch seconds (PDT-
+ *  anchored from the media playlist) + the backend's pipeline latency (wall
+ *  ms since the window's audio completed; absent without a PDT anchor). */
+interface CaptionBlock {
+  text: string;
+  start: number;
+  end: number;
+  latencyMs?: number;
+}
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
 /** Live session POST stall budget — after this the popup advances to the next
@@ -140,6 +150,29 @@ const LIVE_BACK_BUFFER_SEC = 30;
 /** Never land the back-buffer arrow seek ON the live edge — stay a hair below
  *  it (hls.js's own sync target rides ~liveSyncDuration behind the edge). */
 const LIVE_EDGE_SEEK_SAFETY_SEC = 0.75;
+
+// ---------------------------------------------------------------------------
+// Live captions clock anchor
+// ---------------------------------------------------------------------------
+//
+// The backend streams caption blocks with WALL-CLOCK window times (start/end
+// in epoch seconds, PDT-anchored from the media playlist). Rendering on
+// arrival drifts: the transcript trails the audio by the transcribe latency
+// AND the player lags the live edge, so "arrival time" means different wall
+// times on different machines. Instead the overlay is anchored to the VIDEO
+// clock: FRAG_BUFFERED frags carry their program date time, giving a 1:1
+// currentTime → wall-epoch map; a block is shown once the mapped epoch
+// reaches its window and skipped if the player already live-synced past it.
+// The offset is then SELF-ADAPTIVE per machine — stalls freeze the video
+// clock and pause the overlay automatically, no configuration.
+/** A block shows when the video clock reaches end − lead (a hair before its
+ *  window finishes, so the text is on screen as the speech completes). */
+const CAPTION_LEAD_SEC = 0.25;
+/** A block whose window ended more than this long before the video clock is
+ *  stale (the player live-synced/seeked past it) — dropped, never shown. */
+const CAPTION_STALE_SKIP_SEC = 1.0;
+/** Newest (pos → pdt) frag anchors kept for the currentTime→wall map. */
+const CAPTION_MAX_PDT_ANCHORS = 16;
 
 // ---------------------------------------------------------------------------
 // Live quality policy registry (module-scope — ponytail: a plain counter +
@@ -395,11 +428,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // --- Real-time live captions (CC overlay) ---
   // The backend runs ONE captioner per (platform, channel) — audio-only HLS
-  // rendition, ~3s windows, parakeet ASR — and streams caption blocks over
+  // rendition, ~2s windows, parakeet ASR — and streams caption blocks over
   // SSE. The popup probes /available once per playing entry (the parakeet
   // gate 503s otherwise) and only then shows the CC toggle; the overlay
-  // renders the latest block. Captions are ON by default when available
-  // (the user's intent: the transcript IS the feature), toggle hides them.
+  // shows the latest block whose window the VIDEO clock reached (blocks are
+  // anchored to the wall clock via the frag PDT map — see CAPTION_LEAD_SEC /
+  // captionClockSync below). Captions are ON by default when available (the
+  // user's intent: the transcript IS the feature), toggle hides them.
   const captionSource = useMemo(() => {
     const plat = (activeEntry.platform || '').toLowerCase();
     if (plat !== 'twitch' && plat !== 'kick') return null;
@@ -409,7 +444,77 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
   const [captionsAvailable, setCaptionsAvailable] = useState(false);
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
-  const [caption, setCaption] = useState<{ text: string; start: number; end: number } | null>(null);
+  const [caption, setCaption] = useState<CaptionBlock | null>(null);
+  // Caption clock anchor state — refs (mutated by hls events + SSE, read by
+  // the timeupdate sync; no re-render needed for the map itself):
+  const pdtAnchorsRef = useRef<{ pos: number; pdt: number }[]>([]);
+  const captionOriginRef = useRef<number | null>(null);
+  const pendingCaptionsRef = useRef<CaptionBlock[]>([]);
+  const captionEdgeRef = useRef(0);
+  const archiveDurationRef = useRef(0);
+
+  /** Map the video's timeline position to the wall-clock epoch the backend's
+   *  caption times live on. Primary: the nearest frag (pos → pdt) anchor
+   *  from FRAG_BUFFERED — a 1:1 timeline→wall map (Twitch/Kick live
+   *  playlists carry PROGRAM-DATE-TIME). Fallback (no anchors yet / no-PDT
+   *  stream): broadcast-relative seconds + an origin calibrated from the
+   *  first caption's window (the video sits at the block's due point when it
+   *  arrives — the transcript trails the video by design). NaN = unmapped —
+   *  callers degrade to show-on-arrival. */
+  const captionEpochOf = useCallback((currentTime: number): number => {
+    const anchors = pdtAnchorsRef.current;
+    if (anchors.length > 0) {
+      let best = anchors[0];
+      let bestDist = Math.abs(best.pos - currentTime);
+      for (const a of anchors) {
+        const d = Math.abs(a.pos - currentTime);
+        if (d < bestDist) {
+          best = a;
+          bestDist = d;
+        }
+      }
+      return best.pdt + (currentTime - best.pos);
+    }
+    const origin = captionOriginRef.current;
+    if (origin === null) return Number.NaN;
+    return origin + liveBroadcastPositionSec(
+      archiveDurationRef.current,
+      captionEdgeRef.current,
+      currentTime,
+    );
+  }, []);
+
+  /** Promote pending captions whose window the video clock has reached, drop
+   *  stale ones, and hide a shown caption the clock ran far past (live-sync
+   *  seek / resume after a stall). Runs on every timeupdate + caption
+   *  arrival — stalls freeze the clock, so the overlay pauses automatically
+   *  and the queued blocks catch up when playback resumes. */
+  const captionClockSync = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const epoch = captionEpochOf(video.currentTime);
+    const pending = pendingCaptionsRef.current;
+    if (!Number.isFinite(epoch)) {
+      // No clock map yet (pre-first-fragment / pre-first-caption) — show the
+      // newest arrival rather than nothing (graceful degradation).
+      if (pending.length > 0) setCaption(pending[pending.length - 1]);
+      return;
+    }
+    // Stale head: blocks the video already played past (stall recovery/seek).
+    while (pending.length > 0 && pending[0].end < epoch - CAPTION_STALE_SKIP_SEC) {
+      pending.shift();
+    }
+    let promoted = false;
+    while (pending.length > 0 && pending[0].end - CAPTION_LEAD_SEC <= epoch) {
+      setCaption(pending.shift()!); // newest due block wins (React batches)
+      promoted = true;
+    }
+    if (!promoted) {
+      // Nothing due — hide a shown caption the clock ran past without a
+      // fresh block queued behind it.
+      setCaption((cur) => (cur && cur.end < epoch - CAPTION_STALE_SKIP_SEC ? null : cur));
+    }
+  }, [captionEpochOf]);
 
   useEffect(() => {
     setCaption(null); // a new stream starts with a clean overlay
@@ -437,8 +542,31 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     const es = new EventSource(`/api/live/captions?${new URLSearchParams(captionSource)}`);
     es.addEventListener('caption', (ev) => {
       try {
-        const data = JSON.parse((ev as MessageEvent).data) as { text: string; start: number; end: number };
-        setCaption(data);
+        const data = JSON.parse((ev as MessageEvent).data) as CaptionBlock;
+        const video = videoRef.current;
+        // First block on a no-anchor timeline calibrates the fallback
+        // origin — the video sits at the block's due point when it arrives
+        // (the transcript trails the video by design). Runs BEFORE epochOf:
+        // epoch is NaN until the origin exists, and the calibration itself
+        // is what makes the mapping finite.
+        if (video && pdtAnchorsRef.current.length === 0 && captionOriginRef.current === null) {
+          const b = liveBroadcastPositionSec(
+            archiveDurationRef.current,
+            captionEdgeRef.current,
+            video.currentTime,
+          );
+          if (Number.isFinite(b)) captionOriginRef.current = data.end - CAPTION_LEAD_SEC - b;
+        }
+        const epoch = video ? captionEpochOf(video.currentTime) : Number.NaN;
+        if (Number.isFinite(epoch)) {
+          // The player already live-synced past the window — skip the stale
+          // block (never render text the video has finished).
+          if (data.end < epoch - CAPTION_STALE_SKIP_SEC) return;
+        }
+        // Hold the block until the video clock reaches its window
+        // (captionClockSync promotes it; stalls pause the overlay).
+        pendingCaptionsRef.current.push(data);
+        captionClockSync();
       } catch {
         // malformed frame — keep the last caption
       }
@@ -449,8 +577,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       setCaptionsAvailable(false);
       es.close();
     });
-    return () => es.close();
-  }, [captionSource, captionsAvailable, captionsEnabled]);
+    return () => {
+      es.close();
+      // A new stream / toggle must not inherit the previous timeline's queue.
+      pendingCaptionsRef.current = [];
+    };
+  }, [captionSource, captionsAvailable, captionsEnabled, captionEpochOf, captionClockSync]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -589,6 +721,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       }
       hlsRef.current = null;
     }
+    // The caption clock map belongs to the OLD timeline — a new hls instance
+    // (mode switch / session recreate) starts from a fresh anchor set.
+    pdtAnchorsRef.current = [];
+    captionOriginRef.current = null;
   }, []);
 
   // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
@@ -671,19 +807,25 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       enableWorker: true,
       startLevel: 0,
       lowLatencyMode: true,
-      // Live latency target: ONE segment behind the live edge
-      // (liveSyncDurationCount 1) — the ~2-5s band the official Kick/Twitch
-      // pages run. lowLatencyMode also enables LL-HLS part handling; the
+      // Live latency target: ZERO segments behind the live edge. hls.js
+      // 1.6.2 VALIDATES count 0 fine (the only constraint is
+      // liveMaxLatencyDurationCount > liveSyncDurationCount — 6 > 0 passes)
+      // and its targetLatency getter treats 0 as "no count override",
+      // falling back to the LL partHoldBack/holdBack, while liveSyncPosition
+      // clamps to at most one PART (partTarget ≈0.33s on Twitch LL) behind
+      // the edge — an intentional delay < 1s instead of the old one-segment
+      // (~2s) target. lowLatencyMode also enables LL-HLS part handling; the
       // backend prefers Twitch LL masters and non-LL playlists play
       // identically with it on. hls.js THROWS when count and duration sync
       // variants are mixed, so the count knobs are the only live-sync
       // geometry here — computeLiveEdgeSec mirrors hls.js's targetLatency
-      // (count × level targetduration) to keep the edge math exact.
-      // maxLiveSyncPlaybackRate 1.5 recovers from any drift by playing up to
-      // 1.5× instead of stalling; liveMaxLatencyDurationCount 6 (≈12s at 2s
-      // segments) is the force-resync ceiling for slow networks. maxBufferLength
-      // 20 keeps the buffer deep so the tighter target does not reintroduce
-      // the old 3s-target rebuffer flash (feat/live-buffering).
+      // (count × level targetduration, 0 × td = 0) to keep the edge math
+      // exact. maxLiveSyncPlaybackRate 1.5 recovers from any drift by
+      // playing up to 1.5× instead of stalling; liveMaxLatencyDurationCount
+      // 6 (≈12s at 2s segments) is the force-resync ceiling for slow
+      // networks. maxBufferLength 20 keeps the buffer deep so the tighter
+      // target does not reintroduce the old 3s-target rebuffer flash
+      // (feat/live-buffering).
       maxBufferLength: 20,
       maxMaxBufferLength: 40,
       // Retained back-buffer = the arrow-seek window: LIVE without a DVR
@@ -694,7 +836,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
       testBandwidth: false,
-      liveSyncDurationCount: 1,
+      liveSyncDurationCount: 0,
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
       // (config validation throws otherwise) — 6 ≈ 12s at 2s segments.
       liveMaxLatencyDurationCount: 6,
@@ -772,6 +914,28 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // Guard -1 (auto): ABR switches report -1 and would highlight nothing.
       if (modeRef.current === 'replay') return;
       if (typeof data?.level === 'number' && data.level >= 0) setCurrentLevel(data.level);
+    });
+
+    // Caption clock anchor: every buffered fragment carries its program date
+    // time (wall epoch ms) — keep a small (pos → pdt) map so the overlay can
+    // be shown against the VIDEO clock instead of on arrival (see
+    // captionEpochOf). Frags re-buffer on live-sync seeks / level switches;
+    // dedupe by position and cap the list to the newest frags.
+    hls.on(Hls.Events.FRAG_BUFFERED, (_e, data) => {
+      const frag = data?.frag;
+      if (!frag) return;
+      const pos = frag.start;
+      const pdt = typeof frag.programDateTime === 'number'
+        ? frag.programDateTime / 1000
+        : Number.NaN;
+      if (typeof pos !== 'number' || !Number.isFinite(pos) || !Number.isFinite(pdt)) return;
+      const anchors = pdtAnchorsRef.current;
+      const existing = anchors.findIndex((a) => a.pos === pos);
+      if (existing >= 0) anchors[existing] = { pos, pdt };
+      else anchors.push({ pos, pdt });
+      if (anchors.length > CAPTION_MAX_PDT_ANCHORS) {
+        anchors.splice(0, anchors.length - CAPTION_MAX_PDT_ANCHORS);
+      }
     });
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -1020,7 +1184,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       }
     };
     const onVolumeChange = () => { setMuted(video.muted); setVolume(video.volume); };
-    const onTime = () => setRailTime(video.currentTime);
+    const onTime = () => {
+      setRailTime(video.currentTime);
+      // Caption clock anchor — promotes queued blocks whose window the video
+      // reached (and hides stale ones after live-sync seeks).
+      captionClockSync();
+    };
     const onDuration = () => {
       if (modeRef.current === 'replay' && Number.isFinite(video.duration)) {
         setSnapshotDuration(video.duration);
@@ -1059,7 +1228,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       video.removeEventListener('timeupdate', onFirstFrame);
       video.removeEventListener('canplay', clearBuffering);
     };
-  }, [showBuffering, clearBuffering]);
+  }, [showBuffering, clearBuffering, captionClockSync]);
 
   // Track fullscreen state — element-equality like App.tsx and
   // ChannelExplorePopup: this popup only claims fullscreen when IT is the
@@ -1394,7 +1563,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // The sync lag mirrors hls.js's LiveSyncController.targetLatency: hls.js
   // writes the computed target into config.liveSyncDuration at runtime; until
   // then (and for the count-based config) it is liveSyncDurationCount × the
-  // level's targetduration (2s default = one 2s segment).
+  // level's targetduration — 0 × 2s = 0 with the zero-count target, so the
+  // true edge IS liveSyncPosition (the sub-second part clamp is hls.js's
+  // liveSyncPosition, not part of the edge lag).
   const computeLiveEdgeSec = useCallback((): number => {
     const h = hlsRef.current;
     if (h) {
@@ -1418,6 +1589,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     return s && s.length > 0 ? s.end(s.length - 1) : 0;
   }, []);
   const liveEdgeSec = computeLiveEdgeSec();
+  // Render-scope mirrors for the caption clock anchor (refs keep the SSE +
+  // timeupdate listeners on stable callbacks).
+  captionEdgeRef.current = liveEdgeSec;
+  archiveDurationRef.current = archiveDuration;
   // Timestamps (current / total) — ticking from timeupdate. LIVE totals the
   // growing archive (broadcast duration); REPLAY totals the snapshot.
   const totalSec = mode === 'replay'

@@ -15,7 +15,12 @@ import { registerPreviewPlayback } from '../previewPlaybackBus';
 const { FakeHls } = vi.hoisted(() => {
   class FakeHls {
     static isSupported = () => true;
-    static Events = { MANIFEST_PARSED: 'manifestParsed', LEVEL_SWITCHED: 'levelSwitched', ERROR: 'error' };
+    static Events = {
+      MANIFEST_PARSED: 'manifestParsed',
+      LEVEL_SWITCHED: 'levelSwitched',
+      FRAG_BUFFERED: 'fragBuffered',
+      ERROR: 'error',
+    };
     static ErrorDetails = { BUFFER_STALLED_ERROR: 'bufferStalledError' };
     static ErrorTypes = { NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError' };
     config: Record<string, unknown>;
@@ -162,6 +167,9 @@ function mockFetchWithLiveSrc() {
     }
     if (url.includes('/api/preview/hls/s1/resource')) {
       return new Response('', { status: 404 });
+    }
+    if (url.includes('/api/live/captions/available')) {
+      return new Response(JSON.stringify({ available: true }), { status: 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -682,7 +690,13 @@ describe('LivePlayerPopup live captions', () => {
     expect(document.querySelector('[data-live-captions-overlay]')).toBeTruthy();
 
     // A newer block REPLACES the previous one — the overlay never stacks.
+    // Blocks are anchored to the video clock: the second window [4,7] is not
+    // due while the video sits at t=0, so it is queued until the clock
+    // reaches it (the fallback origin maps the first block's due point).
     act(() => { es.fire('caption', JSON.stringify({ text: 'segunda legenda', start: 4, end: 7 })); });
+    expect(screen.queryByText('segunda legenda')).toBeNull();
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => { video.currentTime = 3; fireEvent(video, new Event('timeupdate')); });
     await waitFor(() => expect(screen.getByText('segunda legenda')).toBeTruthy());
     expect(screen.queryByText('olá pessoal, bem-vindos ao canal')).toBeNull();
   });
@@ -718,6 +732,11 @@ describe('LivePlayerPopup live captions', () => {
     expect(relitBtn.className).toContain('text-[#53fc18]');
     expect(relitBtn.className).not.toContain('opacity-40');
     act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'legenda de novo', start: 3, end: 6 })); });
+    // Anchored to the video clock: window [3,6] needs the clock at the due
+    // point (t=3 → epoch 5.75) before it renders.
+    expect(screen.queryByText('legenda de novo')).toBeNull();
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => { video.currentTime = 3; fireEvent(video, new Event('timeupdate')); });
     expect(screen.getByText('legenda de novo')).toBeTruthy();
   });
 
@@ -765,6 +784,37 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.queryByTitle('Hide captions')).toBeNull();
     expect(screen.queryByTitle('Live captions')).toBeNull();
     expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+  });
+
+  it('shows a caption only when the mapped video clock reaches its wall window (frag PDT anchor)', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); }); // clears loading → transport renders
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+
+    // Frag anchor: timeline position 0 ↔ wall epoch 1000 (frag PDT in ms).
+    act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
+
+    // Caption window [1002, 1004] wall — the video clock (epoch 1000) has
+    // not reached its due point (end − 0.25s): the overlay must NOT appear.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'sincronizada', start: 1002, end: 1004, latency_ms: 800 })); });
+    expect(screen.queryByText('sincronizada')).toBeNull();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+
+    // Mid-window (epoch 1002 < 1003.75): still not shown — no future drift.
+    at(2);
+    expect(screen.queryByText('sincronizada')).toBeNull();
+
+    // The video clock reaches the due point (epoch 1004 ≥ 1003.75) → shown.
+    at(4);
+    expect(screen.getByText('sincronizada')).toBeTruthy();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeTruthy();
   });
 });
 
@@ -1022,8 +1072,8 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
     expect(rail.disabled).toBe(true);
 
-    // Live edge = liveSyncPosition(100) + liveSyncDurationCount(1) × 2s = 102;
-    // the back-buffer window is [102−30, 102−0.75] = [72, 101.25].
+    // Live edge = liveSyncPosition(100) + 0 (zero-count target: 0 × 2s) = 100;
+    // the back-buffer window is [100−30, 100−0.75] = [70, 99.25].
     hls.liveSyncPosition = 100;
     const video = document.querySelector('video') as HTMLVideoElement;
     video.currentTime = 95;
@@ -1034,18 +1084,18 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(video.currentTime).toBe(95); // 90 + 5
 
-    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 72.
+    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 70.
     video.currentTime = 5;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
-    expect(video.currentTime).toBe(72);
+    expect(video.currentTime).toBe(70);
 
-    // Clamped just below the live edge (0.75s safety): 106 + 5 → 111 → 101.25.
+    // Clamped just below the live edge (0.75s safety): 106 + 5 → 111 → 99.25.
     video.currentTime = 106;
     fireEvent.keyDown(window, { key: 'ArrowRight' });
-    expect(video.currentTime).toBe(101.25);
+    expect(video.currentTime).toBe(99.25);
 
-    // Never below 0: early stream (edge 14 → window [0, 13.25]).
-    hls.liveSyncPosition = 12; // edge 14
+    // Never below 0: early stream (edge 12 → window [0, 11.25]).
+    hls.liveSyncPosition = 12; // edge 12 (zero-count lag)
     video.currentTime = 0;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
     expect(video.currentTime).toBe(0);
@@ -1099,17 +1149,21 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
 });
 
 describe('LivePlayerPopup live latency config', () => {
-  it('targets a ~2-5s player delay with count-based sync knobs on every platform', async () => {
+  it('targets a sub-second player delay with count-based sync knobs on every platform', async () => {
     mockFetchWithLiveSrc();
     renderPopup();
     await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
 
-    // Count-based live-sync geometry — 1 segment behind the edge (≈2s target
-    // at 2s Twitch/Kick segments); 6 segments (≈12s) is the force-resync
-    // ceiling. hls.js 1.7 THROWS when count and duration variants are mixed,
-    // so the duration knobs the adblock config injects are nulled out.
-    expect(hls.config.liveSyncDurationCount).toBe(1);
+    // Count-based live-sync geometry — ZERO segments behind the edge: hls.js
+    // 1.6.2 validates count 0 (liveMaxLatencyDurationCount 6 > 0) and its
+    // targetLatency treats 0 as no override, falling back to the LL
+    // partHoldBack while liveSyncPosition clamps to at most one PART
+    // (partTarget ≈0.33s on Twitch LL) — an intentional delay < 1s. 6
+    // segments (≈12s) is the force-resync ceiling. hls.js THROWS when count
+    // and duration variants are mixed, so the duration knobs the adblock
+    // config injects are nulled out.
+    expect(hls.config.liveSyncDurationCount).toBe(0);
     expect(hls.config.liveSyncDuration).toBeUndefined();
     expect(hls.config.liveMaxLatencyDurationCount).toBe(6);
     expect(hls.config.liveMaxLatencyDuration).toBeUndefined();
