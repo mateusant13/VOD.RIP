@@ -125,7 +125,7 @@ def test_embed_models_follow_models_folder_not_cache_dir(monkeypatch, tmp_path):
     NOT the heavy cache_dir — model weights never resolve under the cache
     disk (storage-ownership fix)."""
     monkeypatch.delenv("VODRIP_EMBED_CACHE", raising=False)
-    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)  # parakeet e2e sets it at collection
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)  # env cleared so the setting wins
     monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
     with patch("deps.settings_mgr") as mgr:
         mgr.get.return_value = SimpleNamespace(

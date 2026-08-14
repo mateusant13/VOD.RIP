@@ -29,14 +29,13 @@ import sys
 import tempfile
 import time
 
+import pytest
+
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-transcribe-"))
-os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
-os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
-os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from services import archive_db, archive_transcribe  # noqa: E402  (env must be set before import)
+from services import archive_db, archive_transcribe  # noqa: E402
 from services.os_services import _NO_WINDOW  # noqa: E402
 from services.archive_transcribe import (  # noqa: E402
     run_worker,
@@ -358,10 +357,33 @@ def _run() -> None:
     shutil.rmtree(_TMP, ignore_errors=True)
 
 
-def test_transcribe_worker_e2e_real() -> None:
-    if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
-        import pytest
+@pytest.fixture(scope="module")
+def _real_env():
+    """Apply the scratch-DB/whisper env only when the test actually runs.
 
+    pytest imports every test module to read markers; module-level writes
+    (VODRIP_ARCHIVE_DB/WHISPER_MODEL/WHISPER_IDLE_CLOSE) would leak into the
+    whole session on every run. The env is scoped here and the archive_db
+    connection is rebound to the scratch DB."""
+    prev = {k: v for k, v in os.environ.items() if k.startswith("VODRIP_")}
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
+    os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
+    os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    yield
+    for k in list(os.environ):
+        if k.startswith("VODRIP_"):
+            os.environ.pop(k, None)
+    os.environ.update(prev)
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+
+
+def test_transcribe_worker_e2e_real(_real_env) -> None:
+    if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
         pytest.skip(
             "archive_db already bound to another DB in this process — "
             "run standalone: python tests/test_archive_transcribe_e2e_real.py"

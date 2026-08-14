@@ -28,9 +28,7 @@ _DB = _TMP / "archive.db"
 # Empty scratch DB: the app's own DDL is applied on first connect.
 sqlite3.connect(str(_DB)).close()
 
-os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
-
-from services import archive_db  # noqa: E402  (env must be set first)
+from services import archive_db  # noqa: E402
 from services import archive_twitch  # noqa: E402
 
 pytestmark = pytest.mark.real
@@ -70,7 +68,27 @@ def _gql_reachable() -> bool:
         return False
 
 
-def test_real_sweep_passes_10_minutes_of_chat():
+@pytest.fixture(scope="module")
+def _real_env():
+    """Point archive_db at the scratch DB only when the test actually runs
+    (a module-level write would leak VODRIP_ARCHIVE_DB into every pytest
+    session at collection)."""
+    prev = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    yield
+    if prev is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+
+
+def test_real_sweep_passes_10_minutes_of_chat(_real_env):
     """The full-chat sweep on a real multi-hour VOD must store chat well
     beyond the old ~6-minute head (bounded by max_messages)."""
     if not _gql_reachable():

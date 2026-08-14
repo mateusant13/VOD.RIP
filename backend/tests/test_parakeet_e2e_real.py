@@ -34,21 +34,12 @@ import tempfile
 import threading
 import time
 
+import pytest
+
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-parakeet-e2e-"))
-os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
-os.environ.setdefault("VODRIP_APP_DATA", str(_TMP / "app"))
-os.environ.setdefault("VODRIP_CACHE_DIR", str(_TMP / "cache"))
-os.environ.setdefault("VODRIP_DATA_DIR", str(_TMP / "data"))
-os.environ["VODRIP_WHISPER_DEVICE"] = "cpu"  # deterministic CPU-only worker
-os.environ["VODRIP_EVENTS_ENABLED"] = "0"  # ASR-only measurement (PANNs is default-ON in production)
-os.environ.setdefault("VODRIP_TRANSCRIBE_WORKERS", "2")
-os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
-os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
-os.environ.setdefault("VODRIP_WHISPER_CACHE", str(_TMP / "whisper-models"))
-# Parakeet model: seed dir when given (files at its root), else fresh cache
-# -> auto-download on first use.
+# Read-only at import; the _real_env fixture applies the actual env when the
+# test runs (module-level writes would leak into every pytest session).
 _SEED = os.environ.get("VODRIP_PARAAKEET_SEED", "").strip()
-os.environ.setdefault("VODRIP_SHERRPA_CACHE", _SEED or str(_TMP / "sherpa-cache"))
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -368,7 +359,43 @@ def _run() -> None:
     print("\nE2E OK — parakeet CPU lane verified through the real worker path.")
 
 
-def test_parakeet_e2e_real() -> None:
+@pytest.fixture(scope="module")
+def _real_env():
+    """Apply the worker env only when this real test actually runs.
+
+    pytest imports every test module to read markers; module-level writes
+    would hard-set VODRIP_WHISPER_DEVICE=cpu / VODRIP_EVENTS_ENABLED=0 for
+    the whole session on every run. The env is scoped here (plus the
+    conftest per-test restore as a safety net), so collection stays clean
+    and the archive_db connection is rebound to the scratch DB."""
+    prev = {k: v for k, v in os.environ.items() if k.startswith("VODRIP_")}
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
+    os.environ.setdefault("VODRIP_APP_DATA", str(_TMP / "app"))
+    os.environ.setdefault("VODRIP_CACHE_DIR", str(_TMP / "cache"))
+    os.environ.setdefault("VODRIP_DATA_DIR", str(_TMP / "data"))
+    os.environ["VODRIP_WHISPER_DEVICE"] = "cpu"  # deterministic CPU-only worker
+    os.environ["VODRIP_EVENTS_ENABLED"] = "0"  # ASR-only measurement (PANNs is default-ON in production)
+    os.environ.setdefault("VODRIP_TRANSCRIBE_WORKERS", "2")
+    os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
+    os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
+    os.environ.setdefault("VODRIP_WHISPER_CACHE", str(_TMP / "whisper-models"))
+    # Parakeet model: seed dir when given (files at its root), else fresh
+    # cache -> auto-download on first use.
+    os.environ.setdefault("VODRIP_SHERRPA_CACHE", _SEED or str(_TMP / "sherpa-cache"))
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    yield
+    for k in list(os.environ):
+        if k.startswith("VODRIP_"):
+            os.environ.pop(k, None)
+    os.environ.update(prev)
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+
+
+def test_parakeet_e2e_real(_real_env) -> None:
     if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
         raise AssertionError("archive DB env mismatch — run the test file directly")
     try:

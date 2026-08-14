@@ -31,9 +31,9 @@ _DB = _TMP / "archive.db"
 # Empty scratch DB: the app's own DDL is applied on first connect.
 sqlite3.connect(str(_DB)).close()
 
-os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
-
-from services import archive_db, archive_embed  # noqa: E402  (env must be set first)
+# VODRIP_ARCHIVE_DB is applied by the _semantic_scratch_db fixture below
+# (module-level writes would leak into every pytest session at collection).
+from services import archive_db, archive_embed  # noqa: E402
 
 
 def _models_present() -> bool:

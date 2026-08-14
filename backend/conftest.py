@@ -24,7 +24,17 @@ def pytest_collection_modifyitems(config, items):
     They are expensive (~15min for the full set) and fail for environmental
     reasons that are not regressions. pytest.ini's ``addopts = -m "not real"``
     skips them by default; run them explicitly with ``pytest -m real``.
+
+    Explicit invocation of a *_real* file is itself the opt-in: when every
+    collected item lives in a *_real* file, the default 'not real'
+    deselection is flipped to 'real' so `pytest tests/test_foo_real.py`
+    collects the tests instead of exiting 5 with '0 tests (1 deselected)'.
+    Directory/merged runs keep the default opt-in behavior.
     """
     for item in items:
         if item.path.name.endswith("_real.py"):
             item.add_marker("real")
+    if items and all(item.path.name.endswith("_real.py") for item in items):
+        # Runs before pytest's own deselect_by_mark (conftest hooks are
+        # registered later), so this override takes effect for this run only.
+        config.option.markexpr = "real"
