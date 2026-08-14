@@ -687,6 +687,35 @@ async def _app_lifespan(_app: FastAPI):
 
     threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
 
+    # Periodic preview pre-warm: the startup wave runs once per boot and the
+    # session snapshots it lands expire after 1h (and any bot-gate pause or
+    # dead-video grind can leave warm dead for hours). Re-run the recent-
+    # per-channel warm on a timer so warm data stays alive for the whole
+    # session. Bounded: same selection + executors as the startup wave;
+    # kickoff_youtube_batch_warm dedups in-flight, respects the gate pause,
+    # and skip_fresh drops videos whose snapshot is still warm — so a steady
+    # state pass only re-resolves the videos that actually expired.
+    _YOUTUBE_PREWARM_PERIOD_SEC = 15 * 60
+
+    def _periodic_prewarm() -> None:
+        from services.preview.warm import warm_youtube_recent_channels
+
+        while not _warm_shutdown.wait(_YOUTUBE_PREWARM_PERIOD_SEC):
+            try:
+                s = settings_mgr.get()
+                if getattr(s, "skip_youtube_startup_warm", False):
+                    continue
+                _saved = getattr(s, "saved_channels", None) or []
+                if not _saved:
+                    continue
+                n = warm_youtube_recent_channels(_saved, per_channel=5, skip_fresh=True)
+                if n:
+                    logger.info("PERIODIC_PREWARM: refreshed %d URL(s)", n)
+            except Exception:
+                logger.debug("periodic prewarm skipped", exc_info=True)
+
+    threading.Thread(target=_periodic_prewarm, daemon=True, name="yt-prewarm-periodic").start()
+
     # Semantic-embedding backfill — embed transcript segments that lack a
     # vector, in the background, so the first SEMANTIC search doesn't pay
     # the inline backfill cost (up to 50k segments through torch on the

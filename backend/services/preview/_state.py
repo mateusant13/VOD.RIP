@@ -80,6 +80,18 @@ _CHANNEL_WARM_SLOTS_LOCK = threading.Lock()
 _YOUTUBE_WARM_CONSECUTIVE_FAILURES: int = 0
 _PRINTED_COOLDOWN: bool = False
 
+# --- Per-video warm dead-skip ---
+# A video whose FULL warm extract chain failed as "preview unavailable"
+# (members-only / age-gated / region-blocked / deleted-but-listed) is skipped
+# by WARM passes for this long. One dead row in a channel's recent list must
+# never re-grind ~20s per warm attempt — and must never arm the global
+# bot-gate pause that kills warm for EVERY video (observed: one dead VOD
+# re-armed the 2h pause 14 times in a 12h window; warm was dead the whole
+# session and every preview open went cold).
+_WARM_DEAD_VID_TTL_SEC: int = 6 * 3600
+_WARM_DEAD_VIDS: dict[str, float] = {}  # video_id -> time.monotonic() until
+_WARM_DEAD_VIDS_LOCK = threading.Lock()
+
 # --- Full warm dedup set ---
 _full_warm_queued: set = set()
 

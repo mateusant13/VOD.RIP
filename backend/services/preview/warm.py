@@ -50,6 +50,9 @@ from services.preview._state import (
     _WARMED_URLS,
     _WARMED_URLS_LOCK,
     _WARM_COOLDOWN_SEC,
+    _WARM_DEAD_VIDS,
+    _WARM_DEAD_VIDS_LOCK,
+    _WARM_DEAD_VID_TTL_SEC,
     _YOUTUBE_WARM_CACHE,
     _YOUTUBE_WARM_CACHE_LOCK,
     _YOUTUBE_WARM_CONSECUTIVE_FAILURES,
@@ -243,7 +246,7 @@ def kickoff_youtube_batch_warm(
     if preview_fast_only_mode():
         return
     key = _youtube_warm_inflight_key(url)
-    if not key:
+    if not key or _warm_vid_dead(key):
         return
     # Register in-flight at ENQUEUE time (not run start) so create_session's
     # 1.5s + 3.0s wait can join a queued-but-not-running warm (startup storm
@@ -256,6 +259,8 @@ def kickoff_youtube_batch_warm(
 
     def _run() -> None:
         try:
+            if _warm_vid_dead(key):
+                return
             if time.monotonic() < _warm_bot_gate_pause_until:
                 return
             # Rate-limit circuit breaker: skip if YouTube is rate-limiting us
@@ -657,7 +662,7 @@ def kickoff_youtube_warm(
     if preview_fast_only_mode():
         return
     key = _youtube_warm_inflight_key(url)
-    if not key:
+    if not key or _warm_vid_dead(key):
         return
     # Register in-flight at ENQUEUE time (not run start) so create_session's
     # 1.5s + 3.0s wait can join a warm that is queued but not yet running
@@ -670,6 +675,8 @@ def kickoff_youtube_warm(
 
     def _run() -> None:
         try:
+            if _warm_vid_dead(key):
+                return
             if time.monotonic() < _warm_bot_gate_pause_until:
                 return
             if not force:
@@ -750,14 +757,18 @@ def kickoff_youtube_full_mux_warm(
                 )
             except Exception as exc:
                 from services.ytdlp_hls import _youtube_soft_neg_error
+                from services.youtube_innertube import extract_video_id as _fevid
 
                 if _youtube_soft_neg_error(exc):
-                    if (
-                        _warm_note_soft_neg()
-                        and time.monotonic() >= _warm_bot_gate_pause_until
-                    ):
-                        _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                        logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+                    if _warm_gate_signal(exc):
+                        if (
+                            _warm_note_soft_neg()
+                            and time.monotonic() >= _warm_bot_gate_pause_until
+                        ):
+                            _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                            logger.warning(f"YouTube bot-gate detected ({_SOFT_NEG_PAUSE_THRESHOLD} consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+                    else:
+                        _mark_vid_warm_dead(_fevid(url) or "")
                 logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
                 return
             _warm_note_success()
@@ -863,6 +874,134 @@ def _warm_note_success() -> None:
     _warm_soft_neg_streak = 0
 
 
+def _warm_vid_dead(vid: str) -> bool:
+    """True when warm passes must skip *vid* (its full chain already failed).
+
+    Per-video, not global: one unplayable row in a channel's recent list must
+    not starve warm for the other 200 videos.
+    """
+    if not vid:
+        return False
+    with _WARM_DEAD_VIDS_LOCK:
+        until = _WARM_DEAD_VIDS.get(vid, 0.0)
+        if until and time.monotonic() >= until:
+            _WARM_DEAD_VIDS.pop(vid, None)
+            until = 0.0
+    return until > 0.0
+
+
+def _mark_vid_warm_dead(vid: str, ttl_sec: Optional[float] = None) -> None:
+    """Record *vid* as unwarmable for the TTL (default 6h).
+
+    The video is NOT globally banned: interactive create_session still
+    resolves it (the user may have cookies that unlock it later); only warm
+    passes skip it, and the TTL lets warm re-validate once the membership/
+    age/region state changes.
+    """
+    if not vid:
+        return
+    with _WARM_DEAD_VIDS_LOCK:
+        _WARM_DEAD_VIDS[vid] = time.monotonic() + (ttl_sec or _WARM_DEAD_VID_TTL_SEC)
+
+
+def _warm_gate_signal(exc: BaseException) -> bool:
+    """True only for genuine YouTube bot-gate signals.
+
+    "preview unavailable for this video" (all fallbacks exhausted) is a
+    PER-VIDEO outcome — members-only/age-gated/deleted rows produce it every
+    attempt while the IP is healthy. Counting it toward the global streak
+    made one dead VOD arm the 2h all-warm pause repeatedly (observed: 14
+    pauses / 12h; warm was dead the whole session). Only IP-level challenge
+    markers may arm the global pause.
+    """
+    msg = (str(exc) or "").lower()
+    return "sign in to confirm" in msg or "not a bot" in msg
+
+
+def select_youtube_warm_urls(
+    saved_channels: list,
+    per_channel: int = 5,
+    *,
+    skip_fresh: bool = False,
+) -> list[tuple[str, str]]:
+    """Recent-first YouTube VOD URLs to warm, per-channel capped, deduped.
+
+    Mirrors the frontend channel listing the user actually sees (settings
+    saved_channels vodVideos/clipVideos, newest first by date). Shorts are
+    excluded; per-channel cap = ``per_channel``; videos on the warm dead-skip
+    list are never selected. ``skip_fresh=True`` also drops videos whose
+    session snapshot is still fresh (periodic refresh must not re-extract
+    what the click path can already reuse).
+
+    Returns [(url, channel_key)].
+    """
+    from services.youtube_innertube import extract_video_id
+
+    out: list[tuple[str, str]] = []
+    seen_vids: set[str] = set()
+    for ch in saved_channels or []:
+        if not isinstance(ch, dict):
+            continue
+        videos: list[dict] = []
+        for key in ("vodVideos", "clipVideos"):
+            for v in ch.get(key) or []:
+                if not isinstance(v, dict):
+                    continue
+                url = (v.get("url") or "").strip()
+                if "youtube.com" not in url and "youtu.be" not in url:
+                    continue
+                ckind = v.get("content_kind") or ""
+                if ckind == "short" or "/shorts/" in url:
+                    continue  # skip shorts, only warm VODs
+                videos.append(v)
+        if not videos:
+            continue
+        videos.sort(
+            key=lambda v: (
+                v.get("created_at") or v.get("published_at") or v.get("upload_date") or ""
+            ),
+            reverse=True,
+        )
+        ch_key = str(ch.get("id") or "")
+        for v in videos[:per_channel]:
+            url = (v.get("url") or "").strip()
+            vid = extract_video_id(url)
+            if not vid or vid in seen_vids:
+                continue
+            if _warm_vid_dead(vid):
+                continue
+            if skip_fresh:
+                if _get_session_snapshot(vid, 360) is not None:
+                    continue
+            seen_vids.add(vid)
+            out.append((url, ch_key))
+    return out
+
+
+def warm_youtube_recent_channels(
+    saved_channels: list,
+    per_channel: int = 5,
+    *,
+    skip_fresh: bool = False,
+) -> int:
+    """Fire-and-forget warm for the recent YouTube videos of *saved_channels*.
+
+    Bounded: selection is per-channel capped, dead vids are skipped, in-flight
+    dedup lives inside kickoff_youtube_batch_warm, and the executors pace the
+    actual extract work. Returns the number of URLs submitted.
+    """
+    n = 0
+    for url, ch_key in select_youtube_warm_urls(
+        saved_channels, per_channel=per_channel, skip_fresh=skip_fresh
+    ):
+        try:
+            kickoff_youtube_batch_warm(url, prefer_height=360, channel_key=ch_key)
+            n += 1
+        except Exception as exc:
+            logger.debug("prewarm submit failed for %s: %s", url[:60], exc)
+    return n
+
+
 def _enqueue_full_warm(
     url: str, cookies_file: Optional[str], prefer_height: int
 ) -> None:
@@ -874,24 +1013,24 @@ def _enqueue_full_warm(
     _full_warm_queued.add(url)
 
     def _run() -> None:
-        global _full_warm_backoff_until
-        global _warm_bot_gate_pause_until
+        from services.youtube_innertube import extract_video_id
+
+        if _warm_vid_dead(extract_video_id(url)):
+            return
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
         try:
+            # warm_youtube_preview_resolve owns the failure classification:
+            # genuine gate signals arm the global pause there; per-video
+            # exhaustion marks the vid dead there. This wrapper must NOT
+            # re-count the streak (it used to — one failure double-incremented,
+            # arming the 2h pause after just 2 attempts instead of 3).
             warm_youtube_preview_resolve(
                 url, cookies_file=cookies_file, prefer_height=prefer_height,
                 reraise=True,
             )
-        except Exception as exc:
-            from services.ytdlp_hls import _youtube_soft_neg_error
-
-            if _youtube_soft_neg_error(exc):
-                if _warm_note_soft_neg():
-                    _full_warm_backoff_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                    if time.monotonic() >= _warm_bot_gate_pause_until:
-                        _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                        logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+        except Exception:
+            pass
         finally:
             _full_warm_queued.discard(url)
 
@@ -915,6 +1054,11 @@ def warm_youtube_preview_resolve(
     from services.preview.session import create_session
     from services.preview.session import kickoff_youtube_prog_head_warm
     from services.preview.session import resolve_stream_info
+    from services.youtube_innertube import extract_video_id
+
+    vid0 = extract_video_id((url or "").strip())
+    if _warm_vid_dead(vid0 or ""):
+        return False
     try:
         resolve_result = resolve_stream_info(
             url, prefer_height=prefer_height
@@ -925,13 +1069,28 @@ def warm_youtube_preview_resolve(
         from services.ytdlp_hls import _youtube_soft_neg_error
 
         if _youtube_soft_neg_error(exc):
-            global _warm_bot_gate_pause_until
-            if (
-                _warm_note_soft_neg()
-                and time.monotonic() >= _warm_bot_gate_pause_until
-            ):
-                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+            if _warm_gate_signal(exc):
+                global _warm_bot_gate_pause_until
+                if (
+                    _warm_note_soft_neg()
+                    and time.monotonic() >= _warm_bot_gate_pause_until
+                ):
+                    _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                    logger.warning(
+                        f"YouTube bot-gate detected ({_SOFT_NEG_PAUSE_THRESHOLD} consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h"
+                    )
+            else:
+                # FULL chain exhausted on THIS video (members-only/age-gated/
+                # region-blocked/deleted-but-listed): dead-skip warm for it
+                # instead of re-grinding ~20s every pass — and never touch the
+                # global pause. Interactive create_session still resolves it.
+                _mark_vid_warm_dead(vid0 or "")
+                logger.info(
+                    "YouTube warm dead-skip %s for %dh: %s",
+                    (vid0 or "?")[:11],
+                    (_WARM_DEAD_VID_TTL_SEC // 3600),
+                    exc,
+                )
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         if reraise:
             raise
@@ -976,6 +1135,10 @@ def warm_youtube_resolve_only(
     from services.preview.session import _prog_head_paths
     from services.preview.session import resolve_stream_info
     from services.preview.session import kickoff_youtube_prog_head_warm
+    from services.youtube_innertube import extract_video_id as _warm_evid
+
+    if _warm_vid_dead(_warm_evid((url or "").strip()) or ""):
+        return False
     try:
         resolve_result = resolve_stream_info(
             url, prefer_height=prefer_height, warm_light=True
@@ -990,13 +1153,19 @@ def warm_youtube_resolve_only(
         from services.ytdlp_hls import _youtube_soft_neg_error
 
         if _youtube_soft_neg_error(exc):
-            global _warm_bot_gate_pause_until
-            if (
-                _warm_note_soft_neg()
-                and time.monotonic() >= _warm_bot_gate_pause_until
-            ):
-                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                logger.warning(f"YouTube bot-gate detected (2 consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+            if _warm_gate_signal(exc):
+                global _warm_bot_gate_pause_until
+                if (
+                    _warm_note_soft_neg()
+                    and time.monotonic() >= _warm_bot_gate_pause_until
+                ):
+                    _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                    logger.warning(
+                        f"YouTube bot-gate detected ({_SOFT_NEG_PAUSE_THRESHOLD} consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h"
+                    )
+            # else: per-video unavailability (members-only/age-gated/deleted).
+            # NEVER count it toward the global bot-gate streak — the full-chain
+            # warm decides whether the video is dead and dead-skips it alone.
         from services.ytdlp_hls import _youtube_fatal_extract_error
 
         if not _youtube_fatal_extract_error(exc):
