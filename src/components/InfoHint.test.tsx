@@ -2,6 +2,30 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import InfoHint from "./InfoHint";
 
+const rect = (top: number, left: number, width: number, height: number): DOMRect =>
+  ({
+    top,
+    left,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    x: left,
+    y: top,
+    toJSON: () => ({}),
+  }) as DOMRect;
+
+const px = (v: string) => parseInt(v, 10);
+
+/** jsdom reports a 1024x768 viewport. Pin the button's rect for every
+ *  element and the scroller's own rect for the .custom-scrollbar wrapper. */
+function pinLayout(buttonRect: DOMRect, scrollerRect?: DOMRect) {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    if (scrollerRect && this.classList.contains("custom-scrollbar")) return scrollerRect;
+    return buttonRect;
+  });
+}
+
 describe("InfoHint", () => {
   afterEach(() => {
     document.body.innerHTML = "";
@@ -31,6 +55,8 @@ describe("InfoHint", () => {
     fireEvent.click(btn);
     expect(screen.getByText("Click hint")).toBeInTheDocument();
     expect(btn).toHaveAttribute("aria-expanded", "true");
+    // pinned box is interactive so long text can be scrolled inside it
+    expect(screen.getByRole("tooltip").className).toContain("pointer-events-auto");
     fireEvent.click(btn);
     expect(screen.queryByText("Click hint")).not.toBeInTheDocument();
     expect(btn).toHaveAttribute("aria-expanded", "false");
@@ -50,37 +76,84 @@ describe("InfoHint", () => {
     expect(screen.queryByText("Outside hint")).not.toBeInTheDocument();
   });
 
+  it("closes the pinned popover on Escape", () => {
+    render(<InfoHint text="Esc hint" />);
+    const btn = screen.getByRole("button", { name: "Esc hint" });
+    fireEvent.click(btn);
+    expect(screen.getByText("Esc hint")).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByText("Esc hint")).not.toBeInTheDocument();
+  });
+
   it("has no native tooltip: only the in-DOM box shows on hover", () => {
     render(<InfoHint text="No native tooltip" />);
     const btn = screen.getByRole("button", { name: "No native tooltip" });
     expect(btn).not.toHaveAttribute("title");
   });
 
-  it("clamps into the viewport: flips above and aligns right near the bottom-right edge", () => {
-    // jsdom reports 1024x768; pin the button near the bottom-right corner.
-    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      top: 700, left: 900, right: 916, bottom: 716, width: 16, height: 16,
-      x: 900, y: 700, toJSON: () => ({}),
-    } as DOMRect);
+  it("stays inside the viewport near the bottom-right edge: flips above and right-aligns", () => {
+    const buttonRect = rect(700, 900, 16, 16);
+    pinLayout(buttonRect);
     render(<InfoHint text="Edge hint" />);
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Edge hint" }));
     const tip = screen.getByRole("tooltip");
     expect(tip.className).toContain("bottom-full");
-    expect(tip.className).toContain("right-0");
     expect(tip.className).toContain("z-50");
     expect(tip.className).toContain("pointer-events-none");
+    // right-aligned: box right edge = button right edge = 916
+    expect(px(tip.style.left)).toBe(916 - 224 - 900);
+    const boxLeft = 900 + px(tip.style.left);
+    expect(boxLeft).toBeGreaterThanOrEqual(0);
+    expect(boxLeft + px(tip.style.maxWidth)).toBeLessThanOrEqual(1024);
     expect(screen.getByText("Edge hint")).toBeInTheDocument();
   });
 
   it("stays below/left-aligned when the button has room on both sides", () => {
-    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      top: 200, left: 300, right: 316, bottom: 216, width: 16, height: 16,
-      x: 300, y: 200, toJSON: () => ({}),
-    } as DOMRect);
+    pinLayout(rect(200, 300, 16, 16));
     render(<InfoHint text="Middle hint" />);
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Middle hint" }));
     const tip = screen.getByRole("tooltip");
     expect(tip.className).toContain("top-full");
-    expect(tip.className).toContain("left-0");
+    expect(px(tip.style.left)).toBe(0);
+  });
+
+  it("caps long text to the available room with internal scroll, no layout overflow", () => {
+    const LONG = "x".repeat(300);
+    const buttonRect = rect(150, 20, 16, 16);
+    const scrollerRect = rect(0, 0, 300, 180); // button near the bottom edge
+    pinLayout(buttonRect, scrollerRect);
+    render(
+      <div className="custom-scrollbar">
+        <InfoHint text={LONG} />
+      </div>
+    );
+    fireEvent.mouseEnter(screen.getByRole("button", { name: LONG }));
+    const tip = screen.getByRole("tooltip");
+    // 300 chars need ~164px; only 144px fit above the button → capped, scrolls
+    expect(tip.className).toContain("overflow-y-auto");
+    expect(tip.className).toContain("bottom-full");
+    expect(px(tip.style.maxHeight)).toBe(144 - 2);
+    expect(px(tip.style.maxHeight)).toBeLessThan(164);
+    // box stays inside the scroller's visible area (no truncation)
+    const boxTop = buttonRect.top - 6 - px(tip.style.maxHeight);
+    expect(boxTop).toBeGreaterThanOrEqual(0);
+    expect(20 + px(tip.style.maxWidth) + 6).toBeLessThanOrEqual(300);
+  });
+
+  it("clamps horizontally inside a container narrower than the box", () => {
+    const buttonRect = rect(100, 150, 16, 16);
+    const scrollerRect = rect(0, 0, 200, 400); // 188px of room, box wants 224
+    pinLayout(buttonRect, scrollerRect);
+    render(
+      <div className="custom-scrollbar">
+        <InfoHint text="Narrow hint" />
+      </div>
+    );
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Narrow hint" }));
+    const tip = screen.getByRole("tooltip");
+    expect(px(tip.style.maxWidth)).toBe(200 - 12);
+    const boxLeft = 150 + px(tip.style.left);
+    expect(boxLeft).toBeGreaterThanOrEqual(6);
+    expect(boxLeft + px(tip.style.maxWidth)).toBeLessThanOrEqual(200 - 6);
   });
 });
