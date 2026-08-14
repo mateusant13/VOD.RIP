@@ -59,24 +59,38 @@ class LiveDownloadRequest(BaseModel):
 _CAPTION_PLATFORMS = ("twitch", "kick")
 
 
+_CAPTION_LANGS = ("pt", "en", "es")  # in-player selector (pt-BR / English / Español)
+
+
 @router.get("/live/captions")
 async def live_captions_stream(
     request: Request,
     platform: str = Query(..., description="twitch | kick"),
     channel: str = Query(..., description="channel slug / login"),
+    lang: Optional[str] = Query(None, description="caption translate-target family override: pt | en | es (default: app language)"),
 ):
     """SSE stream of live caption blocks for one channel.
 
     Emits ``event: caption`` frames (``{text, start, end}``) plus keepalive
     comments; a confirmed ``event: offline`` ends the stream (the frontend
-    hides the overlay). 503 when the parakeet engine is unavailable — the
-    frontend probes /available first and never opens the stream then. The
-    captioner's refcount drops when the connection closes (generator finally).
+    retries with backoff — a fresh connection restarts the captioner, so a
+    recovered ASR/translate pipeline resumes captions without user action).
+    503 when the parakeet engine is unavailable — the frontend probes
+    /available first and never opens the stream then. The captioner's
+    refcount drops when the connection closes (generator finally).
+
+    ``lang`` overrides the translate target per session (the captioner is
+    shared per (platform, channel), so the LAST explicit selection wins for
+    all current subscribers; None follows the app language at flush time).
     """
     plat = (platform or "").lower()
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
         raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+    if lang is not None:
+        lang = lang.strip().lower()
+        if lang not in _CAPTION_LANGS:
+            raise HTTPException(status_code=400, detail="lang must be one of pt/en/es")
     from services.live_captions import captions_available, get_captioner
 
     ok, reason = await asyncio.to_thread(captions_available, plat)
@@ -84,7 +98,7 @@ async def live_captions_stream(
         raise HTTPException(status_code=503, detail=reason)
 
     captioner = get_captioner(plat, chan, asyncio.get_running_loop())
-    captioner.acquire()
+    captioner.acquire(lang)
     try:
         return StreamingResponse(
             _captions_sse_gen(request, captioner),

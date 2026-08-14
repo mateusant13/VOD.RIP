@@ -162,13 +162,38 @@ const CAPTION_LEAD_SEC = 0.25;
 const CAPTION_STALE_SKIP_SEC = 1.0;
 /** Newest (pos → pdt) frag anchors kept for the currentTime→wall map. */
 const CAPTION_MAX_PDT_ANCHORS = 16;
-/** Caption overlay font-size control — A−/A+ steps the transport row's CC
- *  buttons between the default `text-sm` (14px) and 48px; the choice is
- *  persisted so a preference survives popup reopen. */
+/** Caption-box resize is MOUSE-DRAG ONLY (the old A−/A+ buttons are gone):
+ *  the overlay's corner grip maps vertical drag distance onto this font-size
+ *  clamp; the choice persists under the same key the buttons used. */
 const CAPTION_FONT_MIN_PX = 14;
 const CAPTION_FONT_MAX_PX = 48;
-const CAPTION_FONT_STEP_PX = 2;
+/** Drag distance (px) per 1px of font growth — 2px of drag ≈ one old A−/A+
+ *  step, so the resize feel is unchanged. */
+const CAPTION_FONT_DRAG_DIVISOR = 2;
 const CAPTION_FONT_STORAGE_KEY = 'vodrip.live.captionFontSize';
+/** Per-session caption translate-target override — the in-player selector
+ *  (pt-BR / English / Español) sends ?lang= on the caption SSE so the
+ *  backend NLLB target follows the selection; null = follow the app
+ *  language (backend default). Persisted like the font size. */
+const CAPTION_LANG_OPTIONS = [
+  { value: 'pt', label: 'pt-BR' },
+  { value: 'en', label: 'English' },
+  { value: 'es', label: 'Español' },
+] as const;
+type CaptionLang = (typeof CAPTION_LANG_OPTIONS)[number]['value'];
+const CAPTION_LANG_STORAGE_KEY = 'vodrip.live.captionLang';
+/** Caption SSE reconnect budget — bounded backoff (1.5s/3s/6s) so a
+ *  recovered ASR/translate pipeline resumes captions WITHOUT user action,
+ *  but a truly dead stream (channel offline, engine gone) gives up and hides
+ *  the CC cluster instead of hammering the backend forever. */
+const CAPTION_RECONNECT_MAX = 3;
+const CAPTION_RECONNECT_BASE_MS = 1500;
+/** Quality-pin gate: the fixed policy level is applied only after the player
+ *  buffered a safe cushion ahead of the playhead (see armQualityPin). */
+const QUALITY_PIN_BUFFER_SEC = 8;
+/** Safety timer — pin the policy level even if the buffer never crosses the
+ *  cushion (slow network) so the multi-player cap still lands. */
+const QUALITY_PIN_SAFETY_MS = 15_000;
 /** Tolerance matching the cached VOD's created_at to the current session
  *  start (fast-clip guard): the CURRENT broadcast's VOD row is created at
  *  stream start; a PREVIOUS broadcast is hours older. ±5 min absorbs clock
@@ -471,9 +496,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
   const [captionsAvailable, setCaptionsAvailable] = useState(false);
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
-  // Overlay font size (px) — seeded from localStorage, A−/A+ steps it in the
-  // transport row; the save effect below writes every change back so the
-  // user's preference survives reopen (storage blocked → keep the default).
+  // Overlay font size (px) — seeded from localStorage; the overlay's corner
+  // drag grip (mouse-drag resize only, no A−/A+ buttons) steps it within the
+  // clamp; the save effect below writes every change back so the user's
+  // preference survives reopen (storage blocked → keep the default).
   const [captionFontSize, setCaptionFontSize] = useState<number>(() => {
     try {
       const n = Number(localStorage.getItem(CAPTION_FONT_STORAGE_KEY));
@@ -490,12 +516,69 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       /* storage blocked — the preference simply won't persist */
     }
   }, [captionFontSize]);
+  // Caption translate-target override — the in-player selector (pt-BR /
+  // English / Español) reconnects the caption SSE with ?lang= so the backend
+  // NLLB target follows the selection; null = follow the app language.
+  const [captionLang, setCaptionLang] = useState<CaptionLang | null>(() => {
+    try {
+      const v = localStorage.getItem(CAPTION_LANG_STORAGE_KEY);
+      if (v === 'pt' || v === 'en' || v === 'es') return v;
+    } catch {
+      /* storage unavailable */
+    }
+    return null;
+  });
+  useEffect(() => {
+    try {
+      if (captionLang) localStorage.setItem(CAPTION_LANG_STORAGE_KEY, captionLang);
+      else localStorage.removeItem(CAPTION_LANG_STORAGE_KEY);
+    } catch {
+      /* storage blocked — the choice simply won't persist */
+    }
+  }, [captionLang]);
+  const [captionLangMenuOpen, setCaptionLangMenuOpen] = useState(false);
   const [caption, setCaption] = useState<CaptionBlock | null>(null);
   // Caption clock anchor state — refs (mutated by hls events + SSE, read by
   // the timeupdate sync; no re-render needed for the map itself):
   const pdtAnchorsRef = useRef<{ pos: number; pdt: number }[]>([]);
   const captionOriginRef = useRef<number | null>(null);
   const pendingCaptionsRef = useRef<CaptionBlock[]>([]);
+  // Caption SSE reconnect budget — survives effect cleanups so the bounded
+  // backoff spans reconnects (a cleanup-per-tick reset would unbounded the
+  // retries); resets on a healthy caption or a stream change.
+  const captionRetryRef = useRef<{ attempt: number; timer: number | null }>({ attempt: 0, timer: null });
+  // Bumping re-opens the caption EventSource (see the SSE effect).
+  const [captionSseTick, setCaptionSseTick] = useState(0);
+  // Caption-box drag-resize grip state (mouse-drag only — no A−/A+ buttons).
+  const captionResizeRef = useRef<{ startY: number; startPx: number } | null>(null);
+  /** Start a caption-box resize drag from the overlay's corner grip. */
+  const startCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    captionResizeRef.current = { startY: e.clientY, startPx: captionFontSize };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* jsdom lacks pointer capture — the drag still works via synthetic moves */
+    }
+  };
+  /** Resize while dragging — drag DOWN = grow (the grip hangs off the box's
+   *  bottom-right corner); 2px of drag per 1px of font (the old A−/A+ feel),
+   *  clamped to the persisted floor/ceiling. */
+  const moveCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const st = captionResizeRef.current;
+    if (!st) return;
+    const next = st.startPx + Math.round((e.clientY - st.startY) / CAPTION_FONT_DRAG_DIVISOR);
+    setCaptionFontSize(Math.min(CAPTION_FONT_MAX_PX, Math.max(CAPTION_FONT_MIN_PX, next)));
+  };
+  const endCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
+    captionResizeRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* not captured */
+    }
+  };
   // Cold-start fallback: the newest block dropped by the stale-head shift
   // when EVERY queued block is stale (first anchor landed after the pending
   // windows passed) — re-shown while nothing fresh is due so the overlay
@@ -593,20 +676,48 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   useEffect(() => {
     setCaption(null); // a new stream starts with a clean overlay
-    if (!captionSource) {
-      setCaptionsAvailable(false);
-      return;
-    }
+    setCaptionsAvailable(false); // …and a clean availability (per-stream)
+    const st = captionRetryRef.current;
+    if (st.timer != null) window.clearTimeout(st.timer);
+    captionRetryRef.current = { attempt: 0, timer: null }; // fresh stream — fresh retry budget
+    if (!captionSource) return;
     let cancelled = false;
-    fetch(`/api/live/captions/available?${new URLSearchParams(captionSource)}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((body) => {
-        if (!cancelled) setCaptionsAvailable(body?.available === true);
-      })
-      .catch(() => {
-        if (!cancelled) setCaptionsAvailable(false);
-      });
-    return () => { cancelled = true; };
+    let probeAttempt = 0;
+    const probe = () => {
+      fetch(`/api/live/captions/available?${new URLSearchParams(captionSource)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((body) => {
+          if (cancelled) return;
+          if (body?.available === true) {
+            setCaptionsAvailable(true);
+            return;
+          }
+          // Unavailable (models missing) or empty — bounded re-probe: the
+          // parakeet gate can flip mid-session (model install), and a
+          // transient failure at open must not leave the CC cluster dead
+          // (captions "not activating" until manual interaction). After the
+          // budget the stream simply has no captions.
+          probeAttempt += 1;
+          if (probeAttempt < CAPTION_RECONNECT_MAX) {
+            st.timer = window.setTimeout(probe, CAPTION_RECONNECT_BASE_MS * 2 ** (probeAttempt - 1));
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          probeAttempt += 1;
+          if (probeAttempt < CAPTION_RECONNECT_MAX) {
+            st.timer = window.setTimeout(probe, CAPTION_RECONNECT_BASE_MS * 2 ** (probeAttempt - 1));
+          }
+        });
+    };
+    probe();
+    return () => {
+      cancelled = true;
+      if (st.timer != null) {
+        window.clearTimeout(st.timer);
+        st.timer = null;
+      }
+    };
   }, [captionSource]);
 
   useEffect(() => {
@@ -614,17 +725,53 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // jsdom has no EventSource — the chat panel degrades the same way; the
     // tests stub it and drive the handlers directly.
     if (typeof EventSource === 'undefined') return;
-    const es = new EventSource(`/api/live/captions?${new URLSearchParams(captionSource)}`);
+    const params = new URLSearchParams(captionSource);
+    // Per-session translate-target override — the backend captioner follows
+    // the selector's family instead of the app language.
+    if (captionLang) params.set('lang', captionLang);
+    const es = new EventSource(`/api/live/captions?${params}`);
+    let heardCaption = false;
+    /** Bounded backoff reconnect: a fresh SSE connection restarts the
+     *  backend captioner worker (get_captioner → acquire), so an ASR /
+     *  translate pipeline failure self-heals WITHOUT user action. After the
+     *  budget is exhausted the stream is truly dead → hide the CC cluster. */
+    const armReconnect = () => {
+      const st = captionRetryRef.current;
+      if (st.timer != null) return;
+      if (st.attempt >= CAPTION_RECONNECT_MAX) {
+        setCaptionsAvailable(false);
+        es.close();
+        return;
+      }
+      st.attempt += 1;
+      st.timer = window.setTimeout(() => {
+        st.timer = null;
+        // Re-probe the parakeet gate (models may be gone) before re-opening.
+        fetch(`/api/live/captions/available?${new URLSearchParams(captionSource)}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((body) => {
+            if (body?.available === true) setCaptionSseTick((n) => n + 1);
+            else setCaptionsAvailable(false);
+          })
+          .catch(() => setCaptionSseTick((n) => n + 1)); // transient probe failure — still retry
+      }, CAPTION_RECONNECT_BASE_MS * 2 ** (st.attempt - 1));
+    };
     es.addEventListener('caption', (ev) => {
+      heardCaption = true;
+      captionRetryRef.current.attempt = 0; // healthy frame — reset the retry budget
       try {
         const data = JSON.parse((ev as MessageEvent).data) as CaptionBlock;
         const video = videoRef.current;
-        // First block on a no-anchor timeline calibrates the fallback
+        // First block on a no-anchor LIVE timeline calibrates the fallback
         // origin — the video sits at the block's due point when it arrives
         // (the transcript trails the video by design). Runs BEFORE epochOf:
         // epoch is NaN until the origin exists, and the calibration itself
-        // is what makes the mapping finite.
-        if (video && pdtAnchorsRef.current.length === 0 && captionOriginRef.current === null) {
+        // is what makes the mapping finite. Replay is excluded: the video
+        // sits at a dragged/stale position, so arrival-due would anchor the
+        // whole replay timeline wrong (replay snapshots carry PDT and get
+        // real anchors instead).
+        if (video && modeRef.current === 'live'
+          && pdtAnchorsRef.current.length === 0 && captionOriginRef.current === null) {
           const b = liveBroadcastPositionSec(
             archiveDurationRef.current,
             captionEdgeRef.current,
@@ -647,18 +794,38 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       }
     });
     es.addEventListener('offline', () => {
-      // Stream ended / channel offline — hide the overlay and stop the
-      // native EventSource auto-retry (it would hammer the dead stream).
-      setCaptionsAvailable(false);
+      // Pipeline failure (ASR crash / confirmed offline / translate break) —
+      // close and reconnect with backoff; a fresh connection restarts the
+      // captioner. Never a silent dead stream, never an endless reconnect
+      // storm (bounded budget above).
       es.close();
+      armReconnect();
+    });
+    es.addEventListener('error', () => {
+      // Before the first caption: likely a gate 503 (models missing) or a
+      // connect failure — own the retry (bounded) instead of EventSource's
+      // unbounded native auto-reconnect. After the first caption: a
+      // transient network blip — the native auto-reconnect handles it.
+      if (!heardCaption) {
+        es.close();
+        armReconnect();
+      }
     });
     return () => {
       es.close();
+      const st = captionRetryRef.current;
+      if (st.timer != null) {
+        window.clearTimeout(st.timer);
+        st.timer = null;
+      }
+      // NOTE: attempt is NOT reset here — the bounded budget spans
+      // reconnects (a cleanup-per-tick reset would make retries unbounded).
+      // It resets on a healthy caption or a stream change (probe effect).
       // A new stream / toggle must not inherit the previous timeline's queue.
       pendingCaptionsRef.current = [];
       staleFallbackRef.current = null;
     };
-  }, [captionSource, captionsAvailable, captionsEnabled, captionEpochOf, captionClockSync]);
+  }, [captionSource, captionsAvailable, captionsEnabled, captionEpochOf, captionClockSync, captionLang, captionSseTick]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -678,7 +845,17 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // (the hls instance is destroyed on unmount, so there is no auto-level state
   // to restore). The quality menu can still override — the next count change
   // re-applies the policy on top.
+  // Quality-pin gate: the policy level is applied only once the player has
+  // buffered a safe cushion ahead of the playhead. Pinning at MANIFEST_PARSED
+  // switched levels while the live-edge buffer was ~1-2s deep (targetLatency
+  // 0) — the SOURCE-level fragment fetch (high bitrate, proxied) underran it
+  // and playback stalled ~3s in, right after the <1s start (user report).
+  // ABR stays on the fast low level during warm-up; armQualityPin lands the
+  // pin once the forward buffer crosses QUALITY_PIN_BUFFER_SEC.
+  const qualityPinArmedRef = useRef(false);
+  const qualityPinTimerRef = useRef<number | null>(null);
   const applyQualityPolicy = useCallback(() => {
+    if (!qualityPinArmedRef.current) return; // warm-up — never switch on a shallow buffer
     const hls = hlsRef.current;
     if (!hls || modeRef.current !== 'live' || !hls.levels || hls.levels.length === 0) return;
     const multi = liveQualityCountNow() > 1;
@@ -687,6 +864,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     hls.currentLevel = idx;
     setCurrentLevel(idx);
   }, []);
+
+  /** Arm + apply the quality-policy level. Called from FRAG_BUFFERED once
+   *  the forward buffer crosses the cushion (and from a safety timer) —
+   *  NEVER from MANIFEST_PARSED, where the switch would drain the shallow
+   *  live-edge buffer and stall playback. */
+  const armQualityPin = useCallback(() => {
+    if (qualityPinArmedRef.current) return;
+    qualityPinArmedRef.current = true;
+    if (qualityPinTimerRef.current != null) {
+      window.clearTimeout(qualityPinTimerRef.current);
+      qualityPinTimerRef.current = null;
+    }
+    applyQualityPolicy();
+  }, [applyQualityPolicy]);
 
   // Registry membership: register on mount (notifies every player — this one
   // no-ops until its manifest parses), unregister on unmount (reverts the
@@ -712,17 +903,19 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // other player buttons included — closes it. Re-registers as the open state
   // flips so the closure sees the current menu set.
   useEffect(() => {
-    if (!qualityMenuOpen && !volumeMenuOpen) return;
+    if (!qualityMenuOpen && !volumeMenuOpen && !captionLangMenuOpen) return;
     const handler = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (volumeMenuOpen && target.closest('[data-volume-menu]')) return;
       if (qualityMenuOpen && target.closest('[data-quality-menu]')) return;
+      if (captionLangMenuOpen && target.closest('[data-caption-lang-menu]')) return;
       setQualityMenuOpen(false);
       setVolumeMenuOpen(false);
+      setCaptionLangMenuOpen(false);
     };
     window.addEventListener('mousedown', handler);
     return () => window.removeEventListener('mousedown', handler);
-  }, [qualityMenuOpen, volumeMenuOpen]);
+  }, [qualityMenuOpen, volumeMenuOpen, captionLangMenuOpen]);
 
   // --- Auto-hide: bump + hide-block rules ---
   // This build has no clip-seconds POPOVER (the seconds field is inline in
@@ -736,7 +929,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       && (el as HTMLInputElement).type === 'text';
   };
   const hideBlocked = paused || loading || error !== null
-    || volumeMenuOpen || qualityMenuOpen || isTransportTextFocused();
+    || volumeMenuOpen || qualityMenuOpen || captionLangMenuOpen || isTransportTextFocused();
   const hideBlockedRef = useRef(hideBlocked);
   hideBlockedRef.current = hideBlocked;
   const controlsHidden = !controlsVisible && !hideBlocked;
@@ -801,6 +994,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // (mode switch / session recreate) starts from a fresh anchor set.
     pdtAnchorsRef.current = [];
     captionOriginRef.current = null;
+    // A new instance re-arms the quality pin from its own MANIFEST_PARSED.
+    if (qualityPinTimerRef.current != null) {
+      window.clearTimeout(qualityPinTimerRef.current);
+      qualityPinTimerRef.current = null;
+    }
+    qualityPinArmedRef.current = false;
   }, []);
 
   // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
@@ -968,7 +1167,16 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           label: l.height > 0 ? `${l.height}p` : 'Auto',
           height: l.height,
         })));
-        applyQualityPolicy();
+        // DEFERRED quality pin — see armQualityPin: applying the policy
+        // level here switches while the live-edge buffer is ~1-2s deep and
+        // stalls playback ~3s in. The FRAG_BUFFERED handler applies it once
+        // the forward buffer is deep; the safety timer covers slow networks.
+        qualityPinArmedRef.current = false;
+        if (qualityPinTimerRef.current != null) {
+          window.clearTimeout(qualityPinTimerRef.current);
+          qualityPinTimerRef.current = null;
+        }
+        qualityPinTimerRef.current = window.setTimeout(armQualityPin, QUALITY_PIN_SAFETY_MS);
       } else {
         // REPLAY: single-level ENDLIST snapshot — hls.js reports the duration.
         if (Number.isFinite(video.duration)) {
@@ -1001,6 +1209,17 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       const frag = data?.frag;
       if (!frag) return;
       const pos = frag.start;
+      // Deferred quality-pin arming (live only): once the forward buffer
+      // crosses the safety cushion, the policy level can switch without
+      // stalling the live edge (see armQualityPin). Runs even without a PDT
+      // anchor (the anchor path below may skip the frag).
+      if (modeRef.current === 'live' && typeof pos === 'number' && Number.isFinite(pos)) {
+        const v = videoRef.current;
+        const dur = typeof frag.duration === 'number' ? frag.duration : 0;
+        if (v && !qualityPinArmedRef.current && pos + dur - v.currentTime >= QUALITY_PIN_BUFFER_SEC) {
+          armQualityPin();
+        }
+      }
       // Re-parse the raw PDT tag (UTC-default, same base as the backend's
       // caption times) instead of trusting hls.js's local-zone Date.parse
       // — naive PDTs would drift the anchor clock by the user's UTC offset.
@@ -1069,7 +1288,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, applyQualityPolicy]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin]);
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
@@ -2118,30 +2337,44 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   >
                     <Captions size={15} />
                   </button>
-                  {/* Caption text size — A−/A+ step the overlay font between
-                      14px and 48px (2px per click, disabled at the ends).
-                      Font only: the anchored timing/position logic is
-                      untouched. */}
-                  <button
-                    type="button"
-                    onClick={() => setCaptionFontSize((s) => Math.max(CAPTION_FONT_MIN_PX, s - CAPTION_FONT_STEP_PX))}
-                    disabled={captionFontSize <= CAPTION_FONT_MIN_PX}
-                    title={t('Smaller captions')}
-                    aria-label={t('Smaller captions')}
-                    className={`${transportBtn} px-1 font-mono text-xs font-bold leading-none`}
-                  >
-                    A−
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCaptionFontSize((s) => Math.min(CAPTION_FONT_MAX_PX, s + CAPTION_FONT_STEP_PX))}
-                    disabled={captionFontSize >= CAPTION_FONT_MAX_PX}
-                    title={t('Larger captions')}
-                    aria-label={t('Larger captions')}
-                    className={`${transportBtn} px-1 font-mono text-xs font-bold leading-none`}
-                  >
-                    A+
-                  </button>
+                  {/* Caption language — per-session translate-target override
+                      (pt-BR / English / Español) for the live captions,
+                      INSIDE the player next to the CC toggle. ?lang= on the
+                      caption SSE makes the backend NLLB target follow the
+                      selection; "Auto" = the app language (default). */}
+                  <div className="relative" data-caption-lang-menu>
+                    <button
+                      type="button"
+                      onClick={() => setCaptionLangMenuOpen((o) => !o)}
+                      aria-haspopup="menu"
+                      aria-expanded={captionLangMenuOpen}
+                      title={t('Caption language')}
+                      className={`${transportBtn} px-1 font-mono text-[10px] font-bold leading-none`}
+                    >
+                      {(captionLang ?? 'auto').toUpperCase()}
+                    </button>
+                    {captionLangMenuOpen && (
+                      <div className="absolute bottom-full left-0 z-30 mb-1.5 flex flex-col border-2 border-zinc-600 bg-zinc-950 shadow-lg">
+                        {CAPTION_LANG_OPTIONS.map((o) => (
+                          <button
+                            key={o.value}
+                            type="button"
+                            onClick={() => { setCaptionLang(o.value); setCaptionLangMenuOpen(false); }}
+                            className={`px-2 py-1 text-left text-[10px] font-bold ${captionLang === o.value ? ccAccent.text : 'text-zinc-300 hover:bg-zinc-800'}`}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => { setCaptionLang(null); setCaptionLangMenuOpen(false); }}
+                          className={`px-2 py-1 text-left text-[10px] font-bold ${captionLang === null ? ccAccent.text : 'text-zinc-300 hover:bg-zinc-800'}`}
+                        >
+                          Auto
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
 
@@ -2193,18 +2426,38 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
         {/* Live captions overlay — the latest caption block sits above the
             transport and NEVER intercepts pointer events (video/controls
-            stay fully clickable). */}
+            stay fully clickable); only the resize grip itself is interactive. */}
         {captionsAvailable && captionsEnabled && caption && !loading && !error && (
           <div
             data-live-captions-overlay
             className="pointer-events-none absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
           >
-            <p
-              className={`${captionFontSize >= 34 ? 'line-clamp-4' : captionFontSize >= 24 ? 'line-clamp-3' : 'line-clamp-2'} max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]`}
-              style={{ fontSize: captionFontSize }}
-            >
-              {caption.text}
-            </p>
+            <div className="relative max-w-[95%]">
+              <p
+                className={`${captionFontSize >= 34 ? 'line-clamp-4' : captionFontSize >= 24 ? 'line-clamp-3' : 'line-clamp-2'} rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]`}
+                style={{ fontSize: captionFontSize }}
+              >
+                {caption.text}
+              </p>
+              {/* Mouse-drag resize grip — the ONLY caption-size control (the
+                  A−/A+ buttons are gone): pulling the corner down grows the
+                  box within the clamp; the choice persists via the font-size
+                  effect above. pointer-events-auto: the only clickable part
+                  of the overlay. */}
+              <button
+                type="button"
+                data-caption-resize-grip
+                aria-label={t('Resize captions (drag)')}
+                title={t('Resize captions (drag)')}
+                onPointerDown={startCaptionResize}
+                onPointerMove={moveCaptionResize}
+                onPointerUp={endCaptionResize}
+                onPointerCancel={endCaptionResize}
+                className="pointer-events-auto absolute -bottom-2.5 -right-2.5 cursor-nwse-resize rounded-sm bg-black/70 p-1 text-zinc-300 hover:text-white"
+              >
+                <span className="block h-2 w-2 border-b-2 border-r-2 border-current" />
+              </button>
+            </div>
           </div>
         )}
       </div>

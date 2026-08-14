@@ -310,15 +310,15 @@ def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
         return None
 
 
-def _warm_translate(evidence: Optional[str]) -> None:
+def _warm_translate(evidence: Optional[str], target_family: Optional[str] = None) -> None:
     """Pre-load the translator models OFF the worker's critical path.
 
     Only when translation can ever be needed: evidence unknown (the SLID
-    gate may flip) or known-different from the app language. Loads in a
-    background daemon thread (~1 s NLLB ct2-int8 load) so the first captions
-    arrive raw and switch to translated once the model is resident — a
-    blocking warm would delay the first caption past the "few seconds"
-    contract."""
+    gate may flip) or known-different from the effective target (the app
+    language, or the per-session ?lang= override). Loads in a background
+    daemon thread (~1 s NLLB ct2-int8 load) so the first captions arrive
+    raw and switch to translated once the model is resident — a blocking
+    warm would delay the first caption past the "few seconds" contract."""
     try:
         from services import caption_translate as ct
     except Exception:
@@ -326,8 +326,9 @@ def _warm_translate(evidence: Optional[str]) -> None:
     if not ct.enabled() or ct.nllb_dir() is None:
         return
     try:
-        if evidence and evidence == ct.app_language_family():
-            return  # stream known to be in the app language — never translates
+        app = target_family or ct.app_language_family()
+        if evidence and evidence == app:
+            return  # stream known to be in the effective target — never translates
     except Exception:
         pass
     threading.Thread(
@@ -340,8 +341,11 @@ def _maybe_translate(
 ) -> tuple[str, bool]:
     """Language-gated best-effort translation of one caption window.
 
-    Gate: channel-language evidence first; without it, the SLID majority over
-    recent speech windows (see caption_translate.needs_translation). Any
+    Target: the per-session ?lang= override (``captioner._target_family``)
+    when set, else the app language. Gate: channel-language evidence first;
+    without it, the SLID majority over recent speech windows (see
+    caption_translate.needs_translation — the source-vs-target comparison
+    makes an explicit target behave exactly like the app family). Any
     failure degrades to the raw ASR text — captions never block on
     translation. Returns (caption_text, translated)."""
     try:
@@ -354,7 +358,7 @@ def _maybe_translate(
             fam = ct.detect_language(audio)
             if fam:
                 captioner._lang_votes.append(fam)
-        app = ct.app_language_family()
+        app = captioner._target_family or ct.app_language_family()
         if not ct.needs_translation(evidence, app, captioner._lang_votes):
             return text, False
         out = ct.translate(text, app)
@@ -466,11 +470,22 @@ class LiveCaptioner:
         # the majority gate when evidence is unknown (caption_translate).
         self._evidence_family: Optional[str] = None
         self._lang_votes: Deque[str] = deque(maxlen=5)
+        # Per-session translate-target override (?lang= on the SSE) — the
+        # LAST explicit selection wins for all subscribers of the shared
+        # captioner; None = follow the app language at flush time. ponytail:
+        # a per-connection target would need per-viewer translation; the
+        # shared captioner emits one stream, so one target applies.
 
     # --- lifecycle -------------------------------------------------------
 
-    def acquire(self) -> None:
-        """Refcount++ — starts the worker thread on the first subscriber."""
+    def acquire(self, lang: Optional[str] = None) -> None:
+        """Refcount++ — starts the worker thread on the first subscriber.
+
+        ``lang`` (pt | en | es) overrides the caption translate-target for
+        the session; None on a fresh session resets to the app-language
+        default and None on an active session keeps the current target.
+        The worker's session-active toggle stays keyed on the 0->1 refcount
+        transition regardless of the lang arg."""
         with self._life_lock:
             self._refcount += 1
             if self._refcount == 1:
@@ -494,6 +509,7 @@ class LiveCaptioner:
                 self._offline_strikes = 0
                 self._evidence_family = None
                 self._lang_votes = deque(maxlen=5)
+                self._target_family = lang  # fresh session: explicit selection or app-language default
                 self._stop.clear()
                 self._thread = threading.Thread(
                     target=self._run,
@@ -501,7 +517,6 @@ class LiveCaptioner:
                     name=f"live-captions-{self.platform}-{self.channel}",
                 )
                 self._thread.start()
-
     def release(self) -> None:
         """Refcount-- — stops the worker thread when the last subscriber
         leaves. Idempotent-safe (refcount never goes negative)."""
@@ -516,7 +531,7 @@ class LiveCaptioner:
         try:
             self._evidence_family = _resolve_evidence(self.platform, self.channel)
             _warm_asr()
-            _warm_translate(self._evidence_family)
+            _warm_translate(self._evidence_family, self._target_family)
             self._run_loop()
         except Exception:
             logger.exception(
