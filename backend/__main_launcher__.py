@@ -739,8 +739,9 @@ def main():
 
         if archive_db.worker_live(age_s=45):
             sys.exit(0)
-        from services.archive_transcribe import run_worker
+        from services.archive_transcribe import _set_worker_low_priority, run_worker
 
+        _set_worker_low_priority()  # background work — don't stutter the box
         run_worker(once=True, poll_interval=2.0)
         sys.exit(0)
 

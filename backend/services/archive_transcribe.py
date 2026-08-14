@@ -933,6 +933,7 @@ def _get_model() -> Any:
                 device=device,
                 compute_type=compute_type,
                 download_root=str(_cache_dir()),
+                **({"cpu_threads": _whisper_threads()} if device == "cpu" else {}),
             )
         except Exception as exc:
             if device == "cuda":
@@ -946,6 +947,7 @@ def _get_model() -> Any:
                     device=device,
                     compute_type=compute_type,
                     download_root=str(_cache_dir()),
+                    cpu_threads=_whisper_threads(),
                 )
             else:
                 raise
@@ -1503,6 +1505,18 @@ def _parakeet_threads() -> int:
     lanes = max(1, _cpu_worker_ceiling() or _cpu_auto_workers())  # 0 == auto on CPU-only hosts
     cores = os.cpu_count() or 4
     return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes))
+
+
+_WHISPER_MAX_THREADS = 8  # same A/B sweet spot as parakeet CPU decode
+
+
+def _whisper_threads() -> int:
+    """ctranslate2 decode threads per whisper CPU lane — same sizing as the
+    parakeet lane, so a whisper fallback never hogs the whole box (an
+    uncapped lane used every core: 18/20 threads, the system stutter)."""
+    lanes = max(1, _cpu_worker_ceiling() or _cpu_auto_workers())
+    cores = os.cpu_count() or 4
+    return max(1, min(_WHISPER_MAX_THREADS, cores // lanes))
 
 
 def _slot_engine(device: str) -> str:
@@ -4394,6 +4408,30 @@ def schedule_gpu_sherpa_ensure() -> threading.Thread:
     return t
 
 
+_BELOW_NORMAL_PRIORITY_CLASS = 0x00004000  # Windows priority class
+
+
+def _set_worker_low_priority() -> None:
+    """Lower this worker's Windows priority class to BelowNormal.
+
+    Archive transcription is background work: at Normal priority its decode
+    threads compete evenly with the user's interactive apps and the machine
+    stutters. BelowNormal keeps the queue draining while Windows schedules
+    foreground work first. No-op on non-Windows / non-frozen runs. ponytail:
+    per-process call at the worker entry points (module __main__, frozen
+    launcher); the supervisor could also set it at spawn — this covers every
+    spawn path with one call."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), _BELOW_NORMAL_PRIORITY_CLASS)
+    except Exception:
+        pass  # best-effort — never fail a worker start over priority
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -4410,6 +4448,7 @@ if __name__ == "__main__":
         help="seconds between idle queue polls (default 2.0)",
     )
     args = ap.parse_args()
+    _set_worker_low_priority()  # background work — don't stutter the box
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
