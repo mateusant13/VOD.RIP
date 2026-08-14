@@ -1,21 +1,33 @@
 {
   "name": "Kick Overlay",
-  "description": "Ad-free Twitch: when a streamer is live on Kick too, plays the real Kick player over the Twitch player (Kick has no ads). Toggle from the toolbar.",
-  "version": "0.2.0",
+  "description": "Ad-free Twitch: when a streamer is live on Kick too, plays their real Kick stream (full HD, Kick's own playback_url) over the Twitch player — Twitch ads become invisible and inaudible. Toggle from the toolbar.",
+  "version": "0.3.0",
   "manifest_version": 3,
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
-    "https://www.twitch.tv/*"
+    "https://www.twitch.tv/*",
+    "https://live-video.net/*"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ko-aca",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "content_scripts": [
     {
       "matches": [
         "https://www.twitch.tv/*"
       ],
       "js": [
+        "hls.min.js",
         "content.js"
       ],
       "run_at": "document_idle"
