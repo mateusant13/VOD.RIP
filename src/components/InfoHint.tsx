@@ -1,29 +1,43 @@
 /** Compact info affordance: hover shows the description as an immediate
  *  tooltip; click pins it as a small popover (closes on re-click, outside
- *  click, or Esc). No native title — the in-DOM box is the only tooltip, and
- *  it flips/clamps inside both the viewport and its paint-contained scroll
- *  container (.custom-scrollbar clips absolutely-positioned descendants), so
- *  it never overflows or gets cut off.
+ *  click, or Esc). No native title — the in-DOM box is the only tooltip.
+ *
+ *  The box is absolutely positioned inside the tab scroll container, which
+ *  carries .custom-scrollbar { contain: layout paint } and therefore clips
+ *  absolutely-positioned descendants at its padding box. Placement is
+ *  measured against that scroller (falling back to the viewport): the box is
+ *  capped to the space actually available — maxWidth shrinks a narrow
+ *  container, maxHeight + overflow-y-auto scroll long text internally — and
+ *  pinned inside the bounds with an inline left. It flips above when there
+ *  is no room below, re-measures with the real box size once mounted, and
+ *  re-positions on scroll/resize while pinned, so it never overflows or gets
+ *  cut off.
  *  ponytail: no tooltip lib — a positioned span; if anchored popovers are
  *  ever needed elsewhere, extract a shared useAnchoredPopover hook. */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Info } from 'lucide-react';
 
-const TIP_W = 224; // w-56
-const TIP_H = 64; // ~3 lines at text-[11px] leading-snug + py-1.5 — flip decision only
+const TIP_W = 224; // preferred width (w-56)
+const TIP_H = 64; // conservative height floor for the pre-mount flip decision
 const MARGIN = 6;
+const PAD_H = 14; // py-1.5 + 2px borders — vertical size estimate
+const LINE_H = 15; // ~11px text at leading-snug
+const CHARS_PER_LINE = 33; // w-56 minus px-2 padding, ~11px font
+const MIN_H = 24; // never collapse the box below a readable sliver
 
-type Pos = { above: boolean; alignRight: boolean };
+type Pos = { above: boolean; left: number; maxWidth: number; maxHeight: number };
 
 export default function InfoHint({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
-  const [pos, setPos] = useState<Pos>({ above: false, alignRight: false });
+  const [pos, setPos] = useState<Pos>({ above: false, left: 0, maxWidth: TIP_W, maxHeight: 0 });
   const rootRef = useRef<HTMLSpanElement>(null);
+  const tipRef = useRef<HTMLSpanElement>(null);
 
-  // Prefer below; flip above when there is no room; tie-break to the side
-  // with more room. Horizontally, align right when a left-aligned tooltip
-  // would stick out past the right edge (and a right-aligned one fits).
+  /** Height estimate used before the box is mounted (first pass, jsdom). */
+  const estimateH = () =>
+    Math.max(TIP_H, PAD_H + Math.ceil(text.length / CHARS_PER_LINE) * LINE_H);
+
   const measure = () => {
     const root = rootRef.current;
     if (!root) return;
@@ -34,13 +48,37 @@ export default function InfoHint({ text }: { text: string }) {
     const maxX = s ? Math.min(s.right, window.innerWidth) : window.innerWidth;
     const minY = s ? Math.max(s.top, 0) : 0;
     const maxY = s ? Math.min(s.bottom, window.innerHeight) : window.innerHeight;
-    const fitsBelow = b.bottom + MARGIN + TIP_H <= maxY;
-    const fitsAbove = b.top - MARGIN - TIP_H >= minY;
-    const above = !fitsBelow && (fitsAbove || b.top - minY > maxY - b.bottom);
-    // ponytail: degenerate containers narrower than the tooltip still overflow;
-    // upgrade path is measuring actual tooltip width and clamping with max-w.
-    const alignRight = b.left + TIP_W + MARGIN > maxX && b.right - TIP_W - MARGIN >= minX;
-    setPos({ above, alignRight });
+
+    // Never wider than the room: shrink w-56 when the container is narrow so
+    // the box always fits horizontally.
+    const maxWidth = Math.min(TIP_W, Math.max(1, maxX - minX - 2 * MARGIN));
+    // Real content height once mounted (scrollHeight ignores the maxHeight
+    // cap); estimate otherwise.
+    const tip = tipRef.current;
+    const h = tip && tip.scrollHeight ? tip.scrollHeight : estimateH();
+
+    const roomBelow = maxY - b.bottom - MARGIN;
+    const roomAbove = b.top - minY - MARGIN;
+    // Prefer below; flip above when there is no room; tie-break to the side
+    // with more room. The maxHeight cap makes the choice safe even when
+    // neither side fits: the box scrolls internally instead of clipping.
+    const above = h > roomBelow && (roomAbove >= h || roomAbove > roomBelow);
+    const room = above ? roomAbove : roomBelow;
+
+    // Pin horizontally: left-aligned by default; right-align when that would
+    // stick out past the right edge; clamp when neither fits (narrow box).
+    let left = 0;
+    if (b.left + maxWidth + MARGIN > maxX) {
+      left = b.right - maxWidth - b.left;
+    }
+    left = Math.max(minX + MARGIN - b.left, Math.min(maxX - MARGIN - maxWidth - b.left, left));
+
+    setPos((prev) =>
+      prev.above === above && prev.left === left &&
+        prev.maxWidth === maxWidth && prev.maxHeight === Math.max(MIN_H, room - 2)
+        ? prev
+        : { above, left, maxWidth, maxHeight: Math.max(MIN_H, room - 2) }
+    );
   };
 
   useEffect(() => {
@@ -51,13 +89,24 @@ export default function InfoHint({ text }: { text: string }) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpen(false);
     };
+    const scroller: EventTarget = rootRef.current?.closest('.custom-scrollbar') ?? window;
+    scroller.addEventListener('scroll', measure, { passive: true });
+    window.addEventListener('resize', measure);
     document.addEventListener('pointerdown', onPointerDown);
     document.addEventListener('keydown', onKey);
     return () => {
+      scroller.removeEventListener('scroll', measure);
+      window.removeEventListener('resize', measure);
       document.removeEventListener('pointerdown', onPointerDown);
       document.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
+  // Re-measure with the real box size once it is mounted — runs before paint,
+  // so the position is final by the time the user sees it.
+  useLayoutEffect(() => {
+    if (tipRef.current) measure();
+  });
 
   const visible = hovered || open;
 
@@ -82,10 +131,12 @@ export default function InfoHint({ text }: { text: string }) {
       </button>
       {visible ? (
         <span
+          ref={tipRef}
           role="tooltip"
-          className={`pointer-events-none absolute z-50 w-56 border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-[11px] leading-snug text-zinc-300 shadow-lg ${
+          className={`absolute z-50 overflow-y-auto border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-[11px] leading-snug text-zinc-300 shadow-lg ${
             pos.above ? 'bottom-full mb-1.5' : 'top-full mt-1.5'
-          } ${pos.alignRight ? 'right-0' : 'left-0'}`}
+          } ${open ? 'pointer-events-auto' : 'pointer-events-none'}`}
+          style={{ left: pos.left, width: pos.maxWidth, maxWidth: pos.maxWidth, maxHeight: pos.maxHeight }}
         >
           {text}
         </span>
