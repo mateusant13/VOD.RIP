@@ -195,3 +195,63 @@ describe("ChannelExplorePopup AI ask", () => {
     expect(screen.queryByText("Ask about this channel")).not.toBeInTheDocument();
   });
 });
+
+describe("ChannelExplorePopup mini-preview transport buttons", () => {
+  it("renders the clip and Download buttons icon-only with a11y labels", async () => {
+    stubFetch();
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+
+    const clipBtn = screen.getByRole("button", {
+      name: "Open the Twitch clip mini-preview at the playhead",
+    });
+    expect(clipBtn.querySelector("svg")).toBeTruthy();
+    expect(clipBtn.textContent?.trim()).toBe("");
+    expect(clipBtn).toHaveAttribute("title", "Open the Twitch clip mini-preview at the playhead");
+    expect(clipBtn).toHaveAttribute("aria-label", "Open the Twitch clip mini-preview at the playhead");
+
+    const dlBtn = screen.getByRole("button", { name: "Open in main preview to download" });
+    expect(dlBtn.querySelector("svg")).toBeTruthy();
+    expect(dlBtn.textContent?.trim()).toBe("");
+    expect(dlBtn).toHaveAttribute("title", "Open in main preview to download");
+    expect(dlBtn).toHaveAttribute("aria-label", "Open in main preview to download");
+  });
+
+  it("clip button still opens the Twitch clip mini-preview popup", async () => {
+    stubFetch();
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "Open the Twitch clip mini-preview at the playhead",
+    }));
+    await waitFor(() =>
+      expect(document.querySelector("[data-twitch-clip-popup]")).toBeTruthy()
+    );
+  });
+
+  it("Download button still hands the VOD to the main preview on click", async () => {
+    stubFetch();
+    const onHandoffToMain = vi.fn();
+    render(
+      <ChannelExplorePopup
+        id="popup-1"
+        vod={VOD}
+        zIndex={100}
+        stackIndex={0}
+        volumeMenuCloseTick={0}
+        onClose={() => {}}
+        onHandoffToMain={onHandoffToMain}
+        onRegisterPause={() => {}}
+        onUnregisterPause={() => {}}
+        onVolumeMenuOpen={() => {}}
+        onBringToFront={() => {}}
+        onOpenHit={() => {}}
+      />
+    );
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in main preview to download" }));
+    expect(onHandoffToMain).toHaveBeenCalledTimes(1);
+  });
+});

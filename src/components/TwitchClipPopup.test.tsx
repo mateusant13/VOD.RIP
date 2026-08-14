@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import type * as PreviewPlayerUtils from '../previewPlayerUtils';
 import TwitchClipPopup, { CLIP_PANEL_MIN_H, CLIP_PANEL_MIN_W } from './TwitchClipPopup';
 
@@ -71,6 +71,17 @@ const WIDEST_ROW_REQUIREMENT = 36 + 8 + 100 + 8 + 44 + 100 + 16;
 // Min height needs header (~40) + video at min width (320 * 9/16 = 180) +
 // the trim section (~129) to fit uncut.
 const CONTENT_HEIGHT_REQUIREMENT = 40 + 180 + 129;
+
+describe('TwitchClipPopup create button', () => {
+  it('renders the Create clip button icon-only with a11y label and title', () => {
+    renderPopup();
+    const btn = screen.getByRole('button', { name: 'Create clip' });
+    expect(btn.querySelector('svg')).toBeTruthy();
+    expect(btn.textContent?.trim()).toBe('');
+    expect(btn).toHaveAttribute('aria-label', 'Create clip');
+    expect(btn).toHaveAttribute('title');
+  });
+});
 
 describe('TwitchClipPopup min-size contract', () => {
   it('min width guarantees the widest button row fits uncut', () => {

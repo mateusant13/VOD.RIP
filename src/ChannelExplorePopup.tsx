@@ -1687,23 +1687,23 @@ export default function ChannelExplorePopup({
     });
   }, [vod.channel, vod.videoId, vod.url, vod.durationSec, currentTime, showClipNotice]);
 
-  const exploreClipBtn = (fs: boolean) => (
-    <button
-      type="button"
-      onClick={() => void openExploreTwitchClip()}
-      disabled={!vod.channel?.trim()}
-      className={`${fs ? fsCtrlBtn : ctrlBtn(false)} flex items-center gap-1.5`}
-      title={
-        !vod.channel?.trim()
-          ? t('Channel login missing — cannot open the Twitch editor')
-          : t('Open the Twitch clip mini-preview at the playhead')
-      }
-    >
-      <TwitchLogoIcon size={16} className="shrink-0" />
-      {/* Logo already says Twitch — label stays bare "clip" (user request). */}
-      <span className="text-[8px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
-    </button>
-  );
+  const exploreClipBtn = (fs: boolean) => {
+    const clipLabel = !vod.channel?.trim()
+      ? t('Channel login missing — cannot open the Twitch editor')
+      : t('Open the Twitch clip mini-preview at the playhead');
+    return (
+      <button
+        type="button"
+        onClick={() => void openExploreTwitchClip()}
+        disabled={!vod.channel?.trim()}
+        className={fs ? fsCtrlBtn : ctrlBtn(false)}
+        title={clipLabel}
+        aria-label={clipLabel}
+      >
+        <TwitchLogoIcon size={16} className="shrink-0" />
+      </button>
+    );
+  };
 
   const clipNoticeUi = (
     <div className={`flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider px-1 ${
@@ -2108,11 +2108,11 @@ export default function ChannelExplorePopup({
                       ? chatMarkersRef.current
                       : null,
                   )}
-                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40 flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                  className="border-2 border-zinc-600 text-zinc-200 hover:border-white hover:text-white px-2 py-2 disabled:opacity-40"
                   title={t('Open in main preview to download')}
+                  aria-label={t('Open in main preview to download')}
                 >
                   <Download size={14} />
-                  {t('Download')}
                 </button>
               </div>
               <div className="flex items-center gap-1.5 ml-auto">
@@ -2186,11 +2186,11 @@ export default function ChannelExplorePopup({
                       ? chatMarkersRef.current
                       : null,
                   )}
-                    className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px] flex items-center gap-1 text-[8px] font-bold uppercase tracking-wider"
+                    className="border border-white/20 bg-black/25 text-zinc-100 px-2 py-2 backdrop-blur-[1px]"
                     title={t('Open in main preview to download')}
+                    aria-label={t('Open in main preview to download')}
                   >
                     <Download size={14} />
-                    {t('Download')}
                   </button>
                 </div>
                 <div className="flex items-center gap-1.5 ml-auto">
