@@ -8,10 +8,12 @@ downloads NEW segments (a seen-set skips re-downloads), decodes them to mono
 and transcribes the speech with the parakeet engine — reusing
 ``archive_transcribe``'s recognizer (``_parakeet_model`` +
 ``_transcribe_batch_parakeet``) so the model cache/download logic is shared
-with the archive worker. The whole loop runs in its own worker thread (SSE /
-HTTP stay responsive); caption blocks are pushed into a bounded asyncio queue
-via ``call_soon_threadsafe`` — the same per-connection queue pattern as the
-live chat SSE.
+with the archive worker. When the app language differs from the stream's
+language the caption text is translated by ``caption_translate`` (NLLB ct2
+int8 + SLID gating) — every failure degrades to the raw ASR text. The whole
+loop runs in its own worker thread (SSE / HTTP stay responsive); caption
+blocks are pushed into a bounded asyncio queue via ``call_soon_threadsafe``
+— the same per-connection queue pattern as the live chat SSE.
 
 Lifecycle: refcounted by active SSE subscribers — the first ``acquire()``
 starts the worker thread, the last ``release()`` stops it. Transcription
@@ -36,8 +38,9 @@ import re
 import subprocess as sp
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Deque, Optional
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
@@ -294,6 +297,76 @@ def _warm_asr() -> None:
         )
 
 
+def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
+    """Best-effort channel-language family (platform clue / transcript tally).
+
+    None when unknown or the archive DB is unavailable — the per-window SLID
+    gate then decides (see caption_translate). Never raises."""
+    try:
+        from services.channel_language import aggregate_channel_language
+
+        return aggregate_channel_language(platform, channel).get("language")
+    except Exception:
+        return None
+
+
+def _warm_translate(evidence: Optional[str]) -> None:
+    """Pre-load the translator models OFF the worker's critical path.
+
+    Only when translation can ever be needed: evidence unknown (the SLID
+    gate may flip) or known-different from the app language. Loads in a
+    background daemon thread (~1 s NLLB ct2-int8 load) so the first captions
+    arrive raw and switch to translated once the model is resident — a
+    blocking warm would delay the first caption past the "few seconds"
+    contract."""
+    try:
+        from services import caption_translate as ct
+    except Exception:
+        return
+    if not ct.enabled() or ct.nllb_dir() is None:
+        return
+    try:
+        if evidence and evidence == ct.app_language_family():
+            return  # stream known to be in the app language — never translates
+    except Exception:
+        pass
+    threading.Thread(
+        target=ct.prewarm, daemon=True, name="live-captions-translate-warm"
+    ).start()
+
+
+def _maybe_translate(
+    captioner: "LiveCaptioner", text: str, audio: "Any"
+) -> tuple[str, bool]:
+    """Language-gated best-effort translation of one caption window.
+
+    Gate: channel-language evidence first; without it, the SLID majority over
+    recent speech windows (see caption_translate.needs_translation). Any
+    failure degrades to the raw ASR text — captions never block on
+    translation. Returns (caption_text, translated)."""
+    try:
+        from services import caption_translate as ct
+
+        if not ct.enabled() or ct.nllb_dir() is None:
+            return text, False
+        evidence = captioner._evidence_family
+        if evidence is None and ct.slid_dir() is not None:
+            fam = ct.detect_language(audio)
+            if fam:
+                captioner._lang_votes.append(fam)
+        app = ct.app_language_family()
+        if not ct.needs_translation(evidence, app, captioner._lang_votes):
+            return text, False
+        out = ct.translate(text, app)
+        return (out, True) if out else (text, False)
+    except Exception as exc:
+        logger.debug(
+            "live captions %s/%s translate skipped: %s",
+            captioner.platform, captioner.channel, exc,
+        )
+        return text, False
+
+
 # --- captioner registry ------------------------------------------------------
 
 _CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
@@ -388,6 +461,11 @@ class LiveCaptioner:
         self._master_at = 0.0
         self._media_url: Optional[str] = None
         self._offline_strikes = 0
+        # Translation state (worker-owned): channel-language evidence resolved
+        # once at start; SLID detections for the last 5 speech windows feed
+        # the majority gate when evidence is unknown (caption_translate).
+        self._evidence_family: Optional[str] = None
+        self._lang_votes: Deque[str] = deque(maxlen=5)
 
     # --- lifecycle -------------------------------------------------------
 
@@ -414,6 +492,8 @@ class LiveCaptioner:
                 self._master_at = 0.0
                 self._media_url = None
                 self._offline_strikes = 0
+                self._evidence_family = None
+                self._lang_votes = deque(maxlen=5)
                 self._stop.clear()
                 self._thread = threading.Thread(
                     target=self._run,
@@ -434,7 +514,9 @@ class LiveCaptioner:
 
     def _run(self) -> None:
         try:
+            self._evidence_family = _resolve_evidence(self.platform, self.channel)
             _warm_asr()
+            _warm_translate(self._evidence_family)
             self._run_loop()
         except Exception:
             logger.exception(
@@ -643,9 +725,13 @@ class LiveCaptioner:
         self._flush_failures = 0
         if not text:
             return
+        text, translated = _maybe_translate(self, text, audio)
+        if not text:
+            return
         logger.info(
-            "live captions %s/%s transcribed %.1fs window via parakeet: %s",
-            self.platform, self.channel, buffer_sec, text[:80],
+            "live captions %s/%s transcribed %.1fs window via parakeet%s: %s",
+            self.platform, self.channel, buffer_sec,
+            " + translate" if translated else "", text[:80],
         )
         start = win_start_off + (self._origin or 0.0)
         end = start + buffer_sec
@@ -654,6 +740,8 @@ class LiveCaptioner:
             "start": round(start, 3),
             "end": round(end, 3),
         }
+        if translated:
+            payload["translated"] = True
         if self._origin is not None:
             # Wall-clock pipeline latency: ms since the window's audio
             # completed. The frontend anchors captions to the VIDEO clock,

@@ -177,8 +177,20 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
 
     # Loop tests exercise the polling/transcribe path, not the engine warm-up
     # (a real _parakeet_model() load must never run in unit tests) — the
-    # warm-up has its own dedicated test below.
+    # warm-up has its own dedicated test below. The channel-language evidence
+    # and translation pre-warm are likewise stubbed (a real archive-DB read
+    # would create the live archive file in unit tests); the translation
+    # path itself has its own tests in test_caption_translate.py.
     monkeypatch.setattr(live_captions, "_warm_asr", lambda: None)
+    monkeypatch.setattr(live_captions, "_warm_translate", lambda evidence: None)
+    monkeypatch.setattr(live_captions, "_resolve_evidence", lambda platform, channel: None)
+    # _maybe_translate must never touch the real SLID/NLLB models in unit
+    # tests (they are present on dev hosts — the detect_language call would
+    # run real inference on the fake audio buffer).
+    monkeypatch.setattr(
+        live_captions, "_maybe_translate",
+        lambda captioner, text, audio: (text, False),
+    )
     monkeypatch.setattr(live_captions, "_resolve_live_master", pipeline.resolve_master)
     monkeypatch.setattr(live_captions, "_fetch", pipeline.fetch)
     monkeypatch.setattr(live_captions, "_decode_audio_bytes", pipeline.decode)
