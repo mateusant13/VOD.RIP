@@ -114,15 +114,6 @@ const INITIAL_CHAT_OPEN = false;
  *  been measured yet (drag starts before the first paint). */
 const POPUP_HEADER_EST = 52;
 
-/** Honest fast-clip capability payload — this build has NO server-side live
- *  clip path, so `available` is always false and `reason`/`needed` document
- *  the exact backend requirement (never a fake clip id). */
-interface LiveClipCapability {
-  available: boolean;
-  reason?: string;
-  needed?: string[];
-}
-
 /** One live-caption block: the wall-clock window in epoch seconds (PDT-
  *  anchored from the media playlist) + the backend's pipeline latency (wall
  *  ms since the window's audio completed; absent without a PDT anchor). */
