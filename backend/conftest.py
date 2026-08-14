@@ -29,24 +29,61 @@ from pathlib import Path
 
 
 def _wipe_vodrip_scratch(min_age_s: float) -> None:
-    """Delete leftover ``vodrip-*`` scratch dirs in the system temp dir.
+    """Delete leftover test/scratch dirs in the system temp dir.
 
-    Tests mkdtemp scratch dirs (vodrip-tests-*, vodrip-ws2-panel-*, …) at
+    Tests mkdtemp scratch dirs (vodrip-tests-*, ai-ask-tests-*, …) at
     MODULE IMPORT — every pytest process, even --collect-only, leaks one,
     and killed/interrupted runs never clean the transcribe shard dirs
     (vodrip-shards-*). Observed: 1,497 dirs / ~44 GB on a dev box.
     Live worker shards are never touched here (the worker reaps its own
-    stale ones); only dirs untouched for min_age_s are removed."""
+    stale ones); only dirs untouched for min_age_s are removed.
+
+    DISK-01: the wipe used to glob only ``vodrip-*`` — every non-vodrip
+    test prefix (archive-*, ai-ask-*, kd_test/, …) leaked forever. The
+    prefix list below mirrors every mkdtemp(prefix=…) in backend/tests
+    today; new test scratch MUST use the ``vodrip-`` prefix so the generic
+    rule covers it (the list is the safety net for legacy names)."""
     tdir = Path(tempfile.gettempdir())
     now = time.time()
-    for p in tdir.glob("vodrip-*"):
-        if p.name.startswith("vodrip-shards-"):
+    for p in tdir.iterdir():
+        name = p.name
+        if not (
+            name.startswith(_SCRATCH_PREFIXES) or name in _SCRATCH_NAMES
+        ):
+            continue
+        if name.startswith("vodrip-shards-"):
             continue  # worker-owned, transient while a job runs
         try:
             if now - p.stat().st_mtime >= min_age_s:
                 shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
+
+
+# Every scratch dir prefix tests create in the system temp dir (mkdtemp).
+_SCRATCH_PREFIXES = (
+    "vodrip-", "ai-ask-tests-", "archive-chat-group-", "archive-enrich-v2-",
+    "archive-jobs-api-", "archive-jobs-retry-", "archive-phonetic-",
+    "archive-ranking-", "archive-robust-", "archive-search-filters-",
+    "archive-semantic-", "archive-semantic-real-", "archive-spam-collapse-",
+    "archive-transcribe-download-", "chat-backfill-jobs-",
+    "chat-full-history-", "chat-full-history-real-", "chat-txt-export-",
+    "content-dedup-test-", "dash_clip_", "dash_window_hls_test_",
+    "gv_deep_", "gv_par_", "hls_clip_", "hook-job-media-",
+    "impact-selfcheck-", "ingest-chat-backfill-", "instant-preview-",
+    "instant-preview-app-", "instant-preview-cache-", "instant-preview-data-",
+    "kind-rebuild-", "kind-rebuild-alter-", "persist-fixes-", "prefetch-",
+    "prefetch-app-", "prefetch-cache-", "prefetch-data-", "preflight_adopt_",
+    "prog-head-grace-", "prog_clip_", "retention-test-",
+    "scheduler-yt-chat-backfill-", "search-titles-", "tk-local-",
+    "transcribe-cross-", "transcribe-cross-app-", "transcript-fix-",
+    "transcript-fix-app-", "transcript-pipeline-", "transcript-pipeline-app-",
+    "twitch-clip-chat-", "watchdog-test-", "window_hls_test_",
+    "ws1-arch-", "ws1-queue-", "yt-captions-test-", "yt-display-names-",
+    "yt-gate-", "yt-policy-test-", "ytdlp_aud_", "ytdlp_seg_",
+)
+# Bare scratch dir names (not mkdtemp-prefixed) in the temp dir.
+_SCRATCH_NAMES = ("kd_test", "vodrip-search-lab")
 
 
 @pytest.fixture(scope="session", autouse=True)

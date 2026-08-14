@@ -75,8 +75,10 @@ def sweep_orphaned_temps(temp_dir: Path, app_data: Path) -> dict:
                     removed += 1
     stats["kd_preview"] = removed
 
-    # 2) vodrip-transcribe-* e2e temp dirs (the worker itself never creates
-    #    them — they come from the standalone transcribe e2e test).
+    # 2) vodrip-transcribe-* temp dirs: the worker's at-transcribe-time
+    #    audio dirs (vodrip-transcribe-<platform>-<vid>-) AND the
+    #    standalone transcribe e2e test's scratch — crashed/killed workers
+    #    leave the former behind.
     removed = 0
     for entry in temp_dir.glob("vodrip-transcribe-*"):
         if entry.is_dir() and _stale(entry, orphan_cutoff):

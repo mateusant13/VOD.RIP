@@ -84,6 +84,7 @@ DEFAULT_CLASSES = [
 ]
 
 _sed: Any = None  # lazily-built SoundEventDetection (module-global, like the whisper cache)
+_sed_device: Optional[str] = None  # device the loaded _sed copy was built for
 
 
 # --- configuration -------------------------------------------------------
@@ -119,14 +120,26 @@ def event_classes(available: Optional[list[str]] = None) -> list[str]:
 
 
 def _effective_device() -> str:
+    """Device for the PANNs SED model — honors the transcribe-lane pin.
+
+    GPU-01: a CPU-lane events job must never steal the RTX from the parakeet
+    GPU lane. The device is the calling pool thread's pin (set by
+    archive_transcribe._worker_thread_init) when present, else the compute-
+    probe default (_detect_device, which ignores Virtual Display Driver
+    adapters — never adapter names). The old torch.cuda.is_available() check
+    returned True on the virtual display and ignored the pin entirely.
+    """
     forced = os.environ.get(DEVICE_ENV, "").strip().lower()
     if forced in ("cuda", "cpu"):
         return forced
     try:
-        import torch
+        from services.archive_transcribe import _detect_device, _thread_pin
 
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:  # torch import failing -> CPU is the honest fallback
+        pin = _thread_pin()
+        if pin is not None:
+            return pin[0]
+        return _detect_device()[0]
+    except Exception:  # standalone import (no archive_transcribe) -> CPU
         return "cpu"
 
 
@@ -209,8 +222,19 @@ def _ensure_checkpoint() -> str:
 
 
 def _sed_model() -> Any:
-    """Lazy singleton SoundEventDetection (heavy imports stay out of module load)."""
-    global _sed
+    """Lazy singleton SoundEventDetection (heavy imports stay out of module load).
+
+    GPU-01: the singleton is per-device — a CPU-lane job that found the CUDA
+    copy from a previous GPU-lane run reloads on CPU (and vice versa), so a
+    CPU-pinned events job never runs inference on the RTX parakeet lane is
+    using. Reload is cheap (model already on disk); VRAM is the scarce part."""
+    global _sed, _sed_device
+    want = _effective_device()
+    if _sed is not None and _sed_device != want:
+        logger.info("PANNs SED lane switch %s -> %s (dropping %s copy)",
+                    _sed_device, want, _sed_device)
+        _sed = None
+        _sed_device = None
     if _sed is None:
         import os as _os
 
@@ -219,10 +243,33 @@ def _sed_model() -> Any:
 
         ckpt = _ensure_checkpoint()
         t0 = time.monotonic()
-        _sed = SoundEventDetection(checkpoint_path=ckpt, device=_effective_device())
+        _sed = SoundEventDetection(checkpoint_path=ckpt, device=want)
+        _sed_device = want
         logger.info("PANNs SED loaded from %s in %.1fs (device=%s)",
-                    ckpt, time.monotonic() - t0, _effective_device())
+                    ckpt, time.monotonic() - t0, want)
     return _sed
+
+
+def _release_sed_on_idle() -> None:
+    """Drop the SED singleton when the calling thread is a CPU-pinned lane.
+
+    GPU-01: the module-global CUDA copy must not outlive the GPU lane that
+    loaded it — otherwise a later CPU-lane events job reuses it and keeps
+    holding VRAM / running inference on the RTX while parakeet waits. GPU
+    lanes keep their copy (the lane owns the card anyway)."""
+    global _sed, _sed_device
+    if _sed is None:
+        return
+    try:
+        from services.archive_transcribe import _thread_pin
+
+        pin = _thread_pin()
+        if pin is not None and pin[0] != "cuda":
+            logger.info("PANNs SED released on idle (CPU lane)")
+            _sed = None
+            _sed_device = None
+    except Exception:
+        pass
 
 
 # --- pure detection core (no model — unit-testable) ----------------------
@@ -431,25 +478,28 @@ def detect_events_video(
 
     # No-speech skip: same 3 s rule as transcription — report without ever
     # loading the model (which costs ~10 s + VRAM).
-    if speech_sec < 3.0:
-        stats.update({"events": 0, "wall_sec": round(time.monotonic() - t0, 3),
-                      "speed_x": 0.0, "skipped": "no-speech"})
-        return stats
+    try:
+        if speech_sec < 3.0:
+            stats.update({"events": 0, "wall_sec": round(time.monotonic() - t0, 3),
+                          "speed_x": 0.0, "skipped": "no-speech"})
+            return stats
 
-    classes = event_classes(_labels_of(_sed_model()))
-    events = detect_events(audio, speech, classes, progress_cb=progress_cb, shards=shards)
-    archive_db.delete_audio_events(platform, video_id)  # replace-on-rerun
-    archive_db.insert_audio_events(platform, video_id, events)
-    wall = time.monotonic() - t0
-    stats.update({
-        "events": len(events),
-        "classes": len(classes),
-        "wall_sec": round(wall, 3),
-        "speed_x": round(total_sec / wall, 2) if wall > 0 else 0.0,
-    })
-    logger.info("events %s/%s: %d rows (%.1fs total, %.1f%% dead air skipped)",
-                platform, video_id, len(events), total_sec, stats["dead_air_pct"])
-    return stats
+        classes = event_classes(_labels_of(_sed_model()))
+        events = detect_events(audio, speech, classes, progress_cb=progress_cb, shards=shards)
+        archive_db.delete_audio_events(platform, video_id)  # replace-on-rerun
+        archive_db.insert_audio_events(platform, video_id, events)
+        wall = time.monotonic() - t0
+        stats.update({
+            "events": len(events),
+            "classes": len(classes),
+            "wall_sec": round(wall, 3),
+            "speed_x": round(total_sec / wall, 2) if wall > 0 else 0.0,
+        })
+        logger.info("events %s/%s: %d rows (%.1fs total, %.1f%% dead air skipped)",
+                    platform, video_id, len(events), total_sec, stats["dead_air_pct"])
+        return stats
+    finally:
+        _release_sed_on_idle()
 
 
 # --- module self-check (pure logic — no model load, no GPU) ---------------

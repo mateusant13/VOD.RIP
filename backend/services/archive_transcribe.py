@@ -2506,7 +2506,7 @@ def _transcribe_youtube_captionless(
 
             try:
                 path = download_bestaudio(
-                    video_id, outdir := Path(tempfile.mkdtemp(prefix=f"yt-transcribe-{video_id}-")),
+                    video_id, outdir := Path(tempfile.mkdtemp(prefix=f"vodrip-transcribe-youtube-{video_id}-")),
                     progress_hook=_dl_progress,
                 )
             except Exception as exc:
@@ -2739,7 +2739,7 @@ def _transcribe_remote_twitch_kick(
         if cached is not None:
             wav = cached
         else:
-            outdir = Path(tempfile.mkdtemp(prefix=f"{platform}-transcribe-{video_id}-"))
+            outdir = Path(tempfile.mkdtemp(prefix=f"vodrip-transcribe-{platform}-{video_id}-"))
             wav = outdir / "audio.wav"
             try:
                 _fetch_remote_audio_wav(platform, video_id, channel, wav)
@@ -4189,387 +4189,399 @@ if __name__ == "__main__":
             raise SystemExit(0)
     run_worker(once=args.once, poll_interval=max(0.1, args.poll_interval))
 
+def _run_module_selfcheck() -> None:
+    """Import-time invariants (pure logic; no model load, no GPU, no
+    downloads). Gated behind VODRIP_TRANSCRIBE_SELFCHECK=1 so pytest and
+    app imports stay cheap — the block used to run unconditionally,
+    spawning an nvidia-smi probe + a scratch mkdtemp on every import."""
+    global _cpu_load_high, _cuda_runtime_vram, _free_system_ram_bytes
+    global _gpu_free_vram_bytes, _gpu_held_by_other, _gpu_util
+    global _nvidia_smi_vram, _parakeet_cuda_ok, _parakeet_ok
+    global _parakeet_provider, _vram_free_at, _vram_free_bytes
 # --- module self-check (pure logic — no model load, no GPU, no downloads) --
 
-_speech = [(0.0, 5.0), (5.8, 6.2), (20.0, 30.0)]
-assert _plan_chunks(_speech, merge_gap=1.0, min_len=0.25) == [(0.0, 6.2), (20.0, 30.0)], (
-    "speech regions within the merge gap must fuse"
-)
-assert _plan_chunks([(0.0, 0.2)]) == [], "sub-minimum chunks must be dropped"
-assert _plan_chunks([]) == [], "empty VAD output must plan no chunks"
-assert _plan_chunks([(0.0, 5.0), (10.0, 15.0)]) == [(0.0, 5.0), (10.0, 15.0)], (
-    "wide gaps must stay separate chunks"
-)
-assert _plan_chunks([(0.0, 95.0)]) == [
-    (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
-], "chunks must be capped at the 30 s chunking window (uncapped clips truncate)"
-assert _plan_chunks([(0.0, 25.0), (25.4, 70.0)]) == [
-    (0.0, 30.0), (30.0, 60.0), (60.0, 70.0),
-], "cap must apply across merged regions"
-# sharded decode: cross-shard merge + shard sample contiguity (VAD regions
-# are per-shard with overlap; the merge gap stays below _plan_chunks' so the
-# final chunk plan matches the full-array path).
-assert _merge_speech_regions([(0.0, 5.0), (5.2, 6.0)]) == [(0.0, 6.0)], (
-    "regions within the 0.5 s merge gap must fuse"
-)
-assert _merge_speech_regions([(0.0, 5.0), (5.6, 6.0)]) == [(0.0, 5.0), (5.6, 6.0)], (
-    "wider gaps must stay separate"
-)
-assert _merge_speech_regions([(4.9, 5.1), (4.9, 5.1)]) == [(4.9, 5.1)], (
-    "duplicate cross-boundary regions must collapse"
-)
-_b1 = _shard_sample_bounds(1, 5.0)
-assert _b1 == (80000, 160000) and _b1[0] == _shard_sample_bounds(0, 5.0)[1], (
-    "shards must tile the timeline contiguously"
-)
-assert _detect_device() in (("cuda", "int8"), ("cpu", "int8")), (
-    "device settings must be a known pair (nvidia -> cuda/int8, else cpu/int8)"
-)
-assert _sanitize_key("abc/def:123") == "abc_def_123"
-_header = {"chunks": [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0)], "model": PARAKEET_MODEL}
-_entries = {0: {"ci": 0, "first": 0, "count": 2}, 1: {"ci": 1, "first": 2, "count": 3}}
-_missing, _next = _resume_plan(_header["chunks"], _header, _entries, {0, 1, 2, 3, 4})
-assert _missing == [2] and _next == 5, "manifest-matched chunks must be skipped"
-_missing, _next = _resume_plan(_header["chunks"], _header, _entries, {0, 3, 4})
-assert _missing == [0, 1, 2] and _next == 1, "deleted rows must re-mark their chunk and reuse the lowest gap"
-_missing, _next = _resume_plan(_header["chunks"], None, _entries, {0, 1})
-assert _missing == [0, 1, 2] and _next == 2, "missing manifest -> full re-run"
-_stale = dict(_header, model="different-model")
-_missing, _ = _resume_plan(_header["chunks"], _stale, _entries, {0, 1})
-assert _missing == [0, 1, 2], "model change must invalidate stale manifest entries"
-_missing, _next = _resume_plan([], None, {}, set())
-assert _missing == [] and _next == 0, "no chunks -> nothing to do"
-# worker budget: no GPU_COPIES env -> 1 copy regardless of VRAM; the VRAM
-# clamp caps copies at free_vram // (model_est + 2 GiB headroom), never
-# below 1 (the ladder's lane gate owns the 0-copies decision); CPU honors
-# VODRIP_TRANSCRIBE_WORKERS and defaults to 2.
-_per_copy = _gpu_model_vram_est() + _GPU_VRAM_HEADROOM
-assert _clamp_cuda_copies(1, 100 << 30) == 1, "no GPU copies env -> 1 (probe skipped)"
-assert _clamp_cuda_copies(4, 4 * _per_copy + 1) == 4, "env within the VRAM budget passes through"
-assert _clamp_cuda_copies(8, 2 * _per_copy + 1) == 2, "VRAM budget clamps copies"
-assert _clamp_cuda_copies(8, _per_copy - 1) == 1, "VRAM budget never drops below 1"
-_saved_pin_ov, _saved_workers = getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV)
-_saved_free_ram = _free_system_ram_bytes
-_saved_vram = _gpu_free_vram_bytes
-_saved_cpu = _cpu_load_high
-try:
-    _multi_tls.pin = ("cpu", "int8")
-    _free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM clamp must not bind here
-    _cpu_load_high = lambda: False
-    os.environ[WORKERS_ENV] = "4"
-    assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
-    os.environ.pop(WORKERS_ENV, None)
-    assert _worker_budget() == _cpu_auto_workers(), (
-        "CPU budget must default to the thread-count ladder"
+    _speech = [(0.0, 5.0), (5.8, 6.2), (20.0, 30.0)]
+    assert _plan_chunks(_speech, merge_gap=1.0, min_len=0.25) == [(0.0, 6.2), (20.0, 30.0)], (
+        "speech regions within the merge gap must fuse"
     )
-    assert _cpu_auto_workers() >= 2, "dynamic default never below the legacy floor"
-    # system-RAM clamp: 3 GiB free + 1.5 GiB/worker -> usable 2.4 GiB -> 1
-    # (2 workers would use 100% of free RAM; the 20% headroom forbids it);
-    # 4 GiB free -> usable 3.2 GiB -> 2; 1 GiB free -> floor 1.
-    _free_system_ram_bytes = lambda: 3 * 1024 ** 3
-    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "headroom clamps 3 GiB free to 1 worker"
-    _free_system_ram_bytes = lambda: 4 * 1024 ** 3
-    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 2, "4 GiB free fits 2 workers"
-    _free_system_ram_bytes = lambda: 1 * 1024 ** 3
-    assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "RAM clamp never drops below 1"
-finally:
-    _multi_tls.pin = _saved_pin_ov
-    _free_system_ram_bytes = _saved_free_ram
-    _gpu_free_vram_bytes = _saved_vram
-    _cpu_load_high = _saved_cpu
-    if _saved_workers is None:
+    assert _plan_chunks([(0.0, 0.2)]) == [], "sub-minimum chunks must be dropped"
+    assert _plan_chunks([]) == [], "empty VAD output must plan no chunks"
+    assert _plan_chunks([(0.0, 5.0), (10.0, 15.0)]) == [(0.0, 5.0), (10.0, 15.0)], (
+        "wide gaps must stay separate chunks"
+    )
+    assert _plan_chunks([(0.0, 95.0)]) == [
+        (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
+    ], "chunks must be capped at the 30 s chunking window (uncapped clips truncate)"
+    assert _plan_chunks([(0.0, 25.0), (25.4, 70.0)]) == [
+        (0.0, 30.0), (30.0, 60.0), (60.0, 70.0),
+    ], "cap must apply across merged regions"
+    # sharded decode: cross-shard merge + shard sample contiguity (VAD regions
+    # are per-shard with overlap; the merge gap stays below _plan_chunks' so the
+    # final chunk plan matches the full-array path).
+    assert _merge_speech_regions([(0.0, 5.0), (5.2, 6.0)]) == [(0.0, 6.0)], (
+        "regions within the 0.5 s merge gap must fuse"
+    )
+    assert _merge_speech_regions([(0.0, 5.0), (5.6, 6.0)]) == [(0.0, 5.0), (5.6, 6.0)], (
+        "wider gaps must stay separate"
+    )
+    assert _merge_speech_regions([(4.9, 5.1), (4.9, 5.1)]) == [(4.9, 5.1)], (
+        "duplicate cross-boundary regions must collapse"
+    )
+    _b1 = _shard_sample_bounds(1, 5.0)
+    assert _b1 == (80000, 160000) and _b1[0] == _shard_sample_bounds(0, 5.0)[1], (
+        "shards must tile the timeline contiguously"
+    )
+    assert _detect_device() in (("cuda", "int8"), ("cpu", "int8")), (
+        "device settings must be a known pair (nvidia -> cuda/int8, else cpu/int8)"
+    )
+    assert _sanitize_key("abc/def:123") == "abc_def_123"
+    _header = {"chunks": [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0)], "model": PARAKEET_MODEL}
+    _entries = {0: {"ci": 0, "first": 0, "count": 2}, 1: {"ci": 1, "first": 2, "count": 3}}
+    _missing, _next = _resume_plan(_header["chunks"], _header, _entries, {0, 1, 2, 3, 4})
+    assert _missing == [2] and _next == 5, "manifest-matched chunks must be skipped"
+    _missing, _next = _resume_plan(_header["chunks"], _header, _entries, {0, 3, 4})
+    assert _missing == [0, 1, 2] and _next == 1, "deleted rows must re-mark their chunk and reuse the lowest gap"
+    _missing, _next = _resume_plan(_header["chunks"], None, _entries, {0, 1})
+    assert _missing == [0, 1, 2] and _next == 2, "missing manifest -> full re-run"
+    _stale = dict(_header, model="different-model")
+    _missing, _ = _resume_plan(_header["chunks"], _stale, _entries, {0, 1})
+    assert _missing == [0, 1, 2], "model change must invalidate stale manifest entries"
+    _missing, _next = _resume_plan([], None, {}, set())
+    assert _missing == [] and _next == 0, "no chunks -> nothing to do"
+    # worker budget: no GPU_COPIES env -> 1 copy regardless of VRAM; the VRAM
+    # clamp caps copies at free_vram // (model_est + 2 GiB headroom), never
+    # below 1 (the ladder's lane gate owns the 0-copies decision); CPU honors
+    # VODRIP_TRANSCRIBE_WORKERS and defaults to 2.
+    _per_copy = _gpu_model_vram_est() + _GPU_VRAM_HEADROOM
+    assert _clamp_cuda_copies(1, 100 << 30) == 1, "no GPU copies env -> 1 (probe skipped)"
+    assert _clamp_cuda_copies(4, 4 * _per_copy + 1) == 4, "env within the VRAM budget passes through"
+    assert _clamp_cuda_copies(8, 2 * _per_copy + 1) == 2, "VRAM budget clamps copies"
+    assert _clamp_cuda_copies(8, _per_copy - 1) == 1, "VRAM budget never drops below 1"
+    _saved_pin_ov, _saved_workers = getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV)
+    _saved_free_ram = _free_system_ram_bytes
+    _saved_vram = _gpu_free_vram_bytes
+    _saved_cpu = _cpu_load_high
+    try:
+        _multi_tls.pin = ("cpu", "int8")
+        _free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM clamp must not bind here
+        _cpu_load_high = lambda: False
+        os.environ[WORKERS_ENV] = "4"
+        assert _worker_budget() == 4, "CPU budget must honor VODRIP_TRANSCRIBE_WORKERS"
         os.environ.pop(WORKERS_ENV, None)
-    else:
-        os.environ[WORKERS_ENV] = _saved_workers
-# hybrid pool plan: CUDA host -> 1 GPU copy + 2 CPU threads by default;
-# WORKERS=0 disables the CPU side (the exact single-model plan);
-# WORKERS=3 -> 1 GPU + 3 CPU slots. RAM is patched ample so the clamp never
-# binds; the VRAM probe is patched per tier so the GPU-lane VRAM floor
-# decides whether the GPU lane exists at all (parakeet is one int8 model on
-# every tier — the old whisper model/precision ladder is gone).
-_saved_plan_pin, _saved_plan_w, _saved_plan_g = (
-    getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
-)
-_saved_plan_vram, _saved_plan_cpu = _gpu_free_vram_bytes, _cpu_load_high
-_saved_plan_held = _gpu_held_by_other
-_saved_plan_util = _gpu_util
-try:
-    _multi_tls.pin = ("cuda", "int8")
-    _free_system_ram_bytes = lambda: 64 * 1024 ** 3
-    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM — clamp must not bind
-    _gpu_held_by_other = lambda: False
-    _gpu_util = lambda: None
-    _cpu_load_high = lambda: False
-    os.environ.pop(WORKERS_ENV, None)
-    os.environ.pop(GPU_COPIES_ENV, None)
-    assert _worker_plan() == [("cuda", "int8")] + [("cpu", "int8")] * _cpu_auto_workers(), (
-        "CUDA host defaults to 1 GPU copy + dynamic CPU lanes"
+        assert _worker_budget() == _cpu_auto_workers(), (
+            "CPU budget must default to the thread-count ladder"
+        )
+        assert _cpu_auto_workers() >= 2, "dynamic default never below the legacy floor"
+        # system-RAM clamp: 3 GiB free + 1.5 GiB/worker -> usable 2.4 GiB -> 1
+        # (2 workers would use 100% of free RAM; the 20% headroom forbids it);
+        # 4 GiB free -> usable 3.2 GiB -> 2; 1 GiB free -> floor 1.
+        _free_system_ram_bytes = lambda: 3 * 1024 ** 3
+        assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "headroom clamps 3 GiB free to 1 worker"
+        _free_system_ram_bytes = lambda: 4 * 1024 ** 3
+        assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 2, "4 GiB free fits 2 workers"
+        _free_system_ram_bytes = lambda: 1 * 1024 ** 3
+        assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "RAM clamp never drops below 1"
+    finally:
+        _multi_tls.pin = _saved_pin_ov
+        _free_system_ram_bytes = _saved_free_ram
+        _gpu_free_vram_bytes = _saved_vram
+        _cpu_load_high = _saved_cpu
+        if _saved_workers is None:
+            os.environ.pop(WORKERS_ENV, None)
+        else:
+            os.environ[WORKERS_ENV] = _saved_workers
+    # hybrid pool plan: CUDA host -> 1 GPU copy + 2 CPU threads by default;
+    # WORKERS=0 disables the CPU side (the exact single-model plan);
+    # WORKERS=3 -> 1 GPU + 3 CPU slots. RAM is patched ample so the clamp never
+    # binds; the VRAM probe is patched per tier so the GPU-lane VRAM floor
+    # decides whether the GPU lane exists at all (parakeet is one int8 model on
+    # every tier — the old whisper model/precision ladder is gone).
+    _saved_plan_pin, _saved_plan_w, _saved_plan_g = (
+        getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
     )
-    os.environ[WORKERS_ENV] = "0"
-    assert _worker_plan() == [("cuda", "int8")], "WORKERS=0 -> exclusive-GPU plan"
-    os.environ[WORKERS_ENV] = "3"
-    assert _worker_plan() == [
-        ("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
-    ], "WORKERS=3 -> 1 GPU + 3 CPU slots"
-    # machine-aware scale-down: tight VRAM (another app holds the GPU model)
-    # -> GPU copy 0, CPU slots cover; busy box -> at most 1 CPU slot; both ->
-    # the 1-CPU-slot floor keeps the queue draining. (WORKERS back to the
-    # dynamic default for these — the 3-slot plan above was a ceiling check.)
-    os.environ.pop(WORKERS_ENV, None)
-    _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3  # < 2 GiB floor
-    assert _worker_plan() == [("cpu", "int8")] * _cpu_auto_workers(), (
-        "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
-    )
-    # GPU-lane VRAM floor (parakeet-only): 2 GiB floor -> lane off; at/above
-    # it the lane is the fixed int8 plan on every tier.
-    _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == (None, "int8"), ">= 2 GiB -> GPU lane usable (int8)"
-    _gpu_free_vram_bytes = lambda: int(5.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == (None, "int8"), "5 GiB -> same int8 lane"
-    _gpu_free_vram_bytes = lambda: int(8.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == (None, "int8"), "8 GiB+ -> same int8 lane (no fp16 tier)"
-    _cpu_slots = [("cpu", "int8")] * _cpu_auto_workers()
-    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
-        "8 GiB tier -> GPU lane + dynamic CPU lanes"
-    )
-    _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
-    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
-        "3 GiB tier -> the same GPU slot + dynamic CPU lanes"
-    )
-    # compute-apps guard: another process holds a GPU model -> CPU only
-    _gpu_free_vram_bytes = lambda: 16 * 1024 ** 3
-    _gpu_held_by_other = lambda: True
-    assert _worker_plan() == _cpu_slots, (
-        "held GPU model must drop the GPU lane (never stack)"
-    )
-    _gpu_held_by_other = lambda: False
-    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM restored
-    # busy GPU: a second copy is capped at 1 when util >= 70%
-    os.environ[GPU_COPIES_ENV] = "3"
-    _gpu_util = lambda: 0.85
-    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
-        "busy GPU caps copies at 1"
-    )
-    _gpu_util = lambda: 0.4
-    assert _worker_plan() == [
-        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
-    ] + _cpu_slots, "idle GPU + ample VRAM allows the configured 3 copies"
-    os.environ.pop(GPU_COPIES_ENV, None)
-    # contended box: at most 1 CPU slot
-    _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3
-    _cpu_load_high = lambda: True
-    assert _worker_plan() == [("cuda", "int8"), ("cpu", "int8")], (
-        "contended box must keep at most 1 CPU slot"
-    )
-    _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3
-    assert _worker_plan() == [("cpu", "int8")], (
-        "tight VRAM + busy box -> 1 CPU slot floor"
-    )
-finally:
-    _multi_tls.pin = _saved_plan_pin
-    _free_system_ram_bytes = _saved_free_ram
-    _gpu_free_vram_bytes = _saved_plan_vram
-    _cpu_load_high = _saved_plan_cpu
-    _gpu_held_by_other = _saved_plan_held
-    _gpu_util = _saved_plan_util
-    if _saved_plan_w is None:
+    _saved_plan_vram, _saved_plan_cpu = _gpu_free_vram_bytes, _cpu_load_high
+    _saved_plan_held = _gpu_held_by_other
+    _saved_plan_util = _gpu_util
+    try:
+        _multi_tls.pin = ("cuda", "int8")
+        _free_system_ram_bytes = lambda: 64 * 1024 ** 3
+        _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM — clamp must not bind
+        _gpu_held_by_other = lambda: False
+        _gpu_util = lambda: None
+        _cpu_load_high = lambda: False
         os.environ.pop(WORKERS_ENV, None)
-    else:
-        os.environ[WORKERS_ENV] = _saved_plan_w
-    if _saved_plan_g is None:
         os.environ.pop(GPU_COPIES_ENV, None)
-    else:
-        os.environ[GPU_COPIES_ENV] = _saved_plan_g
+        assert _worker_plan() == [("cuda", "int8")] + [("cpu", "int8")] * _cpu_auto_workers(), (
+            "CUDA host defaults to 1 GPU copy + dynamic CPU lanes"
+        )
+        os.environ[WORKERS_ENV] = "0"
+        assert _worker_plan() == [("cuda", "int8")], "WORKERS=0 -> exclusive-GPU plan"
+        os.environ[WORKERS_ENV] = "3"
+        assert _worker_plan() == [
+            ("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
+        ], "WORKERS=3 -> 1 GPU + 3 CPU slots"
+        # machine-aware scale-down: tight VRAM (another app holds the GPU model)
+        # -> GPU copy 0, CPU slots cover; busy box -> at most 1 CPU slot; both ->
+        # the 1-CPU-slot floor keeps the queue draining. (WORKERS back to the
+        # dynamic default for these — the 3-slot plan above was a ceiling check.)
+        os.environ.pop(WORKERS_ENV, None)
+        _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3  # < 2 GiB floor
+        assert _worker_plan() == [("cpu", "int8")] * _cpu_auto_workers(), (
+            "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
+        )
+        # GPU-lane VRAM floor (parakeet-only): 2 GiB floor -> lane off; at/above
+        # it the lane is the fixed int8 plan on every tier.
+        _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
+        assert _gpu_lane_plan() == (None, "int8"), ">= 2 GiB -> GPU lane usable (int8)"
+        _gpu_free_vram_bytes = lambda: int(5.0 * 1024 ** 3)
+        assert _gpu_lane_plan() == (None, "int8"), "5 GiB -> same int8 lane"
+        _gpu_free_vram_bytes = lambda: int(8.0 * 1024 ** 3)
+        assert _gpu_lane_plan() == (None, "int8"), "8 GiB+ -> same int8 lane (no fp16 tier)"
+        _cpu_slots = [("cpu", "int8")] * _cpu_auto_workers()
+        assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+            "8 GiB tier -> GPU lane + dynamic CPU lanes"
+        )
+        _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
+        assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+            "3 GiB tier -> the same GPU slot + dynamic CPU lanes"
+        )
+        # compute-apps guard: another process holds a GPU model -> CPU only
+        _gpu_free_vram_bytes = lambda: 16 * 1024 ** 3
+        _gpu_held_by_other = lambda: True
+        assert _worker_plan() == _cpu_slots, (
+            "held GPU model must drop the GPU lane (never stack)"
+        )
+        _gpu_held_by_other = lambda: False
+        _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM restored
+        # busy GPU: a second copy is capped at 1 when util >= 70%
+        os.environ[GPU_COPIES_ENV] = "3"
+        _gpu_util = lambda: 0.85
+        assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+            "busy GPU caps copies at 1"
+        )
+        _gpu_util = lambda: 0.4
+        assert _worker_plan() == [
+            ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
+        ] + _cpu_slots, "idle GPU + ample VRAM allows the configured 3 copies"
+        os.environ.pop(GPU_COPIES_ENV, None)
+        # contended box: at most 1 CPU slot
+        _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3
+        _cpu_load_high = lambda: True
+        assert _worker_plan() == [("cuda", "int8"), ("cpu", "int8")], (
+            "contended box must keep at most 1 CPU slot"
+        )
+        _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3
+        assert _worker_plan() == [("cpu", "int8")], (
+            "tight VRAM + busy box -> 1 CPU slot floor"
+        )
+    finally:
+        _multi_tls.pin = _saved_plan_pin
+        _free_system_ram_bytes = _saved_free_ram
+        _gpu_free_vram_bytes = _saved_plan_vram
+        _cpu_load_high = _saved_plan_cpu
+        _gpu_held_by_other = _saved_plan_held
+        _gpu_util = _saved_plan_util
+        if _saved_plan_w is None:
+            os.environ.pop(WORKERS_ENV, None)
+        else:
+            os.environ[WORKERS_ENV] = _saved_plan_w
+        if _saved_plan_g is None:
+            os.environ.pop(GPU_COPIES_ENV, None)
+        else:
+            os.environ[GPU_COPIES_ENV] = _saved_plan_g
 
-# engine routing — parakeet is the ONLY ASR engine (pure logic: the import
-# probe is pinned via the cached _parakeet_ok flag, sherpa-onnx is never
-# imported here and nothing downloads; the sherpa cache is pointed at a
-# scratch dir with a controlled tokens.txt for the intersection check).
-_saved_pok, _saved_pin = _parakeet_ok, getattr(_multi_tls, "pin", None)
-_saved_pcache = os.environ.get(PARAKEET_CACHE_ENV)
-_saved_penv = os.environ.get(PARAKEET_ENV)
-_saved_pcuda = _parakeet_cuda_ok
-_saved_pvram = (_vram_free_bytes, _vram_free_at)
-_scratch_sherpa = Path(tempfile.mkdtemp(prefix="vodrip-parakeet-selfcheck-"))
-try:
-    os.environ[PARAKEET_CACHE_ENV] = str(_scratch_sherpa)  # no model dir yet
-    _parakeet_ok = True
-    _parakeet_cuda_ok = True
-    _vram_free_bytes = 64 * 1024 ** 3
-    _vram_free_at = time.monotonic()
-    _multi_tls.pin = ("cpu", "int8")
-    assert _job_engine("pt") == "parakeet", "pt routes to parakeet on a CPU lane"
-    assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
-    assert _job_engine("es") == "parakeet", "es routes to parakeet on a CPU lane"
-    assert _job_engine(None) == "parakeet", "parakeet is the DEFAULT for unknown language"
-    assert _job_engine("") == "parakeet", "empty language is auto-detect"
+    # engine routing — parakeet is the ONLY ASR engine (pure logic: the import
+    # probe is pinned via the cached _parakeet_ok flag, sherpa-onnx is never
+    # imported here and nothing downloads; the sherpa cache is pointed at a
+    # scratch dir with a controlled tokens.txt for the intersection check).
+    _saved_pok, _saved_pin = _parakeet_ok, getattr(_multi_tls, "pin", None)
+    _saved_pcache = os.environ.get(PARAKEET_CACHE_ENV)
+    _saved_penv = os.environ.get(PARAKEET_ENV)
+    _saved_pcuda = _parakeet_cuda_ok
+    _saved_pvram = (_vram_free_bytes, _vram_free_at)
+    _scratch_sherpa = Path(tempfile.mkdtemp(prefix="vodrip-parakeet-selfcheck-"))
+    try:
+        os.environ[PARAKEET_CACHE_ENV] = str(_scratch_sherpa)  # no model dir yet
+        _parakeet_ok = True
+        _parakeet_cuda_ok = True
+        _vram_free_bytes = 64 * 1024 ** 3
+        _vram_free_at = time.monotonic()
+        _multi_tls.pin = ("cpu", "int8")
+        assert _job_engine("pt") == "parakeet", "pt routes to parakeet on a CPU lane"
+        assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
+        assert _job_engine("es") == "parakeet", "es routes to parakeet on a CPU lane"
+        assert _job_engine(None) == "parakeet", "parakeet is the DEFAULT for unknown language"
+        assert _job_engine("") == "parakeet", "empty language is auto-detect"
 
-    def _expect_unsupported(lang: str) -> None:
-        try:
-            _job_engine(lang)
-        except _AsrUnsupportedLanguage as _e:
-            assert "ASR unsupported" in str(_e) and lang in str(_e), (
-                "the clean failure must name the language and the marker"
-            )
-            assert "26 European languages" in str(_e), (
-                "the clean failure must state the coverage"
-            )
-            return
-        raise AssertionError(f"{lang!r} must fail cleanly as unsupported language")
+        def _expect_unsupported(lang: str) -> None:
+            try:
+                _job_engine(lang)
+            except _AsrUnsupportedLanguage as _e:
+                assert "ASR unsupported" in str(_e) and lang in str(_e), (
+                    "the clean failure must name the language and the marker"
+                )
+                assert "26 European languages" in str(_e), (
+                    "the clean failure must state the coverage"
+                )
+                return
+            raise AssertionError(f"{lang!r} must fail cleanly as unsupported language")
 
-    _expect_unsupported("ja")
-    _expect_unsupported("ko")
-    _expect_unsupported("zh")
-    _expect_unsupported("ar")
+        _expect_unsupported("ja")
+        _expect_unsupported("ko")
+        _expect_unsupported("zh")
+        _expect_unsupported("ar")
 
-    def _expect_lane_unavailable(fn: Any) -> None:
-        try:
-            fn()
-        except _AsrLaneUnavailable as _e:
-            assert "ASR unavailable" in str(_e), (
-                "the clean failure must carry the terminal marker"
-            )
-            return
-        raise AssertionError("must fail cleanly as lane unavailable")
+        def _expect_lane_unavailable(fn: Any) -> None:
+            try:
+                fn()
+            except _AsrLaneUnavailable as _e:
+                assert "ASR unavailable" in str(_e), (
+                    "the clean failure must carry the terminal marker"
+                )
+                return
+            raise AssertionError("must fail cleanly as lane unavailable")
 
-    _multi_tls.pin = ("cuda", "int8")
-    assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots run parakeet"
-    assert _job_engine("pt") == "parakeet", (
-        "GPU slot + CUDA sherpa + ample VRAM + supported lang -> parakeet"
-    )
-    _expect_unsupported("ja")  # GPU slots fail cleanly too — no whisper
-    _parakeet_cuda_ok = False
-    _expect_lane_unavailable(lambda: _slot_engine("cuda"))
-    _expect_lane_unavailable(lambda: _job_engine("pt"))
-    _parakeet_cuda_ok = True
-    _vram_free_bytes = 1 * 1024 ** 3  # tight VRAM — fresh cache read
-    _expect_lane_unavailable(lambda: _job_engine("pt"))
-    _vram_free_bytes = 64 * 1024 ** 3
-    _multi_tls.pin = ("cpu", "int8")
-    os.environ[PARAKEET_ENV] = "0"
-    _expect_lane_unavailable(lambda: _slot_engine("cpu"))
-    _expect_lane_unavailable(lambda: _job_engine("pt"))
-    os.environ.pop(PARAKEET_ENV, None)
-    _parakeet_ok = False
-    _expect_lane_unavailable(lambda: _job_engine("pt"))
-    assert _parakeet_langs() == frozenset(), "import-fail lane routes no languages"
-    _parakeet_ok = True
-    assert _parakeet_langs() == PARAKEET_LANG_CANDIDATES, (
-        "the candidate set is authoritative until the model dir exists"
-    )
-    assert 1 <= _parakeet_threads() <= _PARAAKEET_MAX_THREADS, (
-        "thread budget must be positive and capped at the A/B sweet spot"
-    )
-    # tokens.txt present -> the candidate set must narrow to the model's
-    # actual lang tokens (a swapped model missing a language is a clean
-    # unsupported-language failure for that job).
-    _pd = _scratch_sherpa / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-    _pd.mkdir(parents=True, exist_ok=True)
-    for _f in _PARAKEET_FILES:
-        (_pd / _f).write_text("x", encoding="utf-8")  # existence is all the resolver checks
-    (_pd / "tokens.txt").write_text(
-        "<|pt|> 0\n<|ja|> 1\n<|zh|> 2\n", encoding="utf-8"
-    )
-    assert _parakeet_langs() == {"pt"}, (
-        "routing must intersect the candidate set with the model's lang tokens"
-    )
-    assert _job_engine("pt") == "parakeet", "narrowed model still runs pt"
-    _expect_unsupported("en")  # model swap dropped en -> clean failure
-    # word assembly: the real vocab convention (space-prefixed word-initial
-    # pieces, lone-space piece inside a word) must produce transcript-shaped words.
-    _toks = [" N", "eg", "an", " de", " ", "1", "0", " minut", "os", ",", " né", "?"]
-    _ts = [0.32, 0.48, 0.56, 0.8, 1.04, 1.12, 1.12, 1.2, 1.28, 1.36, 2.08, 2.24]
-    _ws = _parakeet_words(_toks, _ts)
-    assert [w["word"] for w in _ws] == ["Negan", "de 10", "minutos,", "né?"], _ws
-    assert _ws[0] == {"word": "Negan", "start": 0.32, "end": 0.56}, _ws[0]
-finally:
-    _parakeet_ok = _saved_pok
-    _parakeet_cuda_ok = _saved_pcuda
-    _vram_free_bytes, _vram_free_at = _saved_pvram
-    _multi_tls.pin = _saved_pin
-    if _saved_pcache is None:
-        os.environ.pop(PARAKEET_CACHE_ENV, None)
-    else:
-        os.environ[PARAKEET_CACHE_ENV] = _saved_pcache
-    if _saved_penv is None:
+        _multi_tls.pin = ("cuda", "int8")
+        assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots run parakeet"
+        assert _job_engine("pt") == "parakeet", (
+            "GPU slot + CUDA sherpa + ample VRAM + supported lang -> parakeet"
+        )
+        _expect_unsupported("ja")  # GPU slots fail cleanly too — no whisper
+        _parakeet_cuda_ok = False
+        _expect_lane_unavailable(lambda: _slot_engine("cuda"))
+        _expect_lane_unavailable(lambda: _job_engine("pt"))
+        _parakeet_cuda_ok = True
+        _vram_free_bytes = 1 * 1024 ** 3  # tight VRAM — fresh cache read
+        _expect_lane_unavailable(lambda: _job_engine("pt"))
+        _vram_free_bytes = 64 * 1024 ** 3
+        _multi_tls.pin = ("cpu", "int8")
+        os.environ[PARAKEET_ENV] = "0"
+        _expect_lane_unavailable(lambda: _slot_engine("cpu"))
+        _expect_lane_unavailable(lambda: _job_engine("pt"))
         os.environ.pop(PARAKEET_ENV, None)
-    else:
-        os.environ[PARAKEET_ENV] = _saved_penv
-    shutil.rmtree(_scratch_sherpa, ignore_errors=True)
+        _parakeet_ok = False
+        _expect_lane_unavailable(lambda: _job_engine("pt"))
+        assert _parakeet_langs() == frozenset(), "import-fail lane routes no languages"
+        _parakeet_ok = True
+        assert _parakeet_langs() == PARAKEET_LANG_CANDIDATES, (
+            "the candidate set is authoritative until the model dir exists"
+        )
+        assert 1 <= _parakeet_threads() <= _PARAAKEET_MAX_THREADS, (
+            "thread budget must be positive and capped at the A/B sweet spot"
+        )
+        # tokens.txt present -> the candidate set must narrow to the model's
+        # actual lang tokens (a swapped model missing a language is a clean
+        # unsupported-language failure for that job).
+        _pd = _scratch_sherpa / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+        _pd.mkdir(parents=True, exist_ok=True)
+        for _f in _PARAKEET_FILES:
+            (_pd / _f).write_text("x", encoding="utf-8")  # existence is all the resolver checks
+        (_pd / "tokens.txt").write_text(
+            "<|pt|> 0\n<|ja|> 1\n<|zh|> 2\n", encoding="utf-8"
+        )
+        assert _parakeet_langs() == {"pt"}, (
+            "routing must intersect the candidate set with the model's lang tokens"
+        )
+        assert _job_engine("pt") == "parakeet", "narrowed model still runs pt"
+        _expect_unsupported("en")  # model swap dropped en -> clean failure
+        # word assembly: the real vocab convention (space-prefixed word-initial
+        # pieces, lone-space piece inside a word) must produce transcript-shaped words.
+        _toks = [" N", "eg", "an", " de", " ", "1", "0", " minut", "os", ",", " né", "?"]
+        _ts = [0.32, 0.48, 0.56, 0.8, 1.04, 1.12, 1.12, 1.2, 1.28, 1.36, 2.08, 2.24]
+        _ws = _parakeet_words(_toks, _ts)
+        assert [w["word"] for w in _ws] == ["Negan", "de 10", "minutos,", "né?"], _ws
+        assert _ws[0] == {"word": "Negan", "start": 0.32, "end": 0.56}, _ws[0]
+    finally:
+        _parakeet_ok = _saved_pok
+        _parakeet_cuda_ok = _saved_pcuda
+        _vram_free_bytes, _vram_free_at = _saved_pvram
+        _multi_tls.pin = _saved_pin
+        if _saved_pcache is None:
+            os.environ.pop(PARAKEET_CACHE_ENV, None)
+        else:
+            os.environ[PARAKEET_CACHE_ENV] = _saved_pcache
+        if _saved_penv is None:
+            os.environ.pop(PARAKEET_ENV, None)
+        else:
+            os.environ[PARAKEET_ENV] = _saved_penv
+        shutil.rmtree(_scratch_sherpa, ignore_errors=True)
 
-# real-GPU detection: a fake adapter (no nvidia-smi, no CUDA runtime
-# device) must read as NO GPU; a real compute probe (>= 1 GiB total) is
-# present — pure probes patched, no subprocess.
-_saved_smi, _saved_rt = _nvidia_smi_vram, _cuda_runtime_vram
-try:
-    _nvidia_smi_vram = lambda: None
-    _cuda_runtime_vram = lambda: None
-    assert _real_gpu_info() == (False, 0, 0), (
-        "a fake adapter (no compute probe) must not look like a GPU"
-    )
-    _nvidia_smi_vram = lambda: (int(8 * 1024 ** 3), int(4 * 1024 ** 3))
-    assert _real_gpu_info() == (True, int(8 * 1024 ** 3), int(4 * 1024 ** 3)), (
-        "a real SMI probe must report the GPU present"
-    )
-    _nvidia_smi_vram = lambda: (int(512 * 1024 ** 2), int(400 * 1024 ** 2))
-    assert _real_gpu_info() == (False, 0, 0), (
-        "sub-1 GiB total VRAM is not a compute GPU"
-    )
-finally:
-    _nvidia_smi_vram = _saved_smi
-    _cuda_runtime_vram = _saved_rt
+    # real-GPU detection: a fake adapter (no nvidia-smi, no CUDA runtime
+    # device) must read as NO GPU; a real compute probe (>= 1 GiB total) is
+    # present — pure probes patched, no subprocess.
+    _saved_smi, _saved_rt = _nvidia_smi_vram, _cuda_runtime_vram
+    try:
+        _nvidia_smi_vram = lambda: None
+        _cuda_runtime_vram = lambda: None
+        assert _real_gpu_info() == (False, 0, 0), (
+            "a fake adapter (no compute probe) must not look like a GPU"
+        )
+        _nvidia_smi_vram = lambda: (int(8 * 1024 ** 3), int(4 * 1024 ** 3))
+        assert _real_gpu_info() == (True, int(8 * 1024 ** 3), int(4 * 1024 ** 3)), (
+            "a real SMI probe must report the GPU present"
+        )
+        _nvidia_smi_vram = lambda: (int(512 * 1024 ** 2), int(400 * 1024 ** 2))
+        assert _real_gpu_info() == (False, 0, 0), (
+            "sub-1 GiB total VRAM is not a compute GPU"
+        )
+    finally:
+        _nvidia_smi_vram = _saved_smi
+        _cuda_runtime_vram = _saved_rt
 
-# parakeet GPU batch size: VRAM-derived minus the caption reservation,
-# clamped [1, 32]; the CPU provider and unknown free VRAM stay sequential.
-_saved_bs_prov, _saved_bs_env = _parakeet_provider, os.environ.get(PARAKEET_BATCH_ENV)
-_saved_bs_vram = (_vram_free_bytes, _vram_free_at)
-try:
-    _parakeet_provider = lambda: "cuda"
-    _vram_free_bytes = int(8 * 1024 ** 3)
-    _vram_free_at = time.monotonic()
-    os.environ.pop(PARAKEET_BATCH_ENV, None)
-    _bs_exp = (
-        _vram_free_bytes
-        - _caption_reserved_vram_bytes()
-        - _PARAKEET_GPU_VRAM_EST
-        - _PARAAKEET_BATCH_VRAM_SAFETY
-    ) // _PARAAKEET_WINDOW_VRAM_EST
-    assert _parakeet_batch_size() == max(1, min(_bs_exp, _PARAAKEET_BATCH_MAX)), (
-        "GPU batch must be derived from free VRAM"
-    )
-    _parakeet_provider = lambda: "cpu"
-    assert _parakeet_batch_size() == 1, (
-        "the CPU provider must keep sequential decode"
-    )
-    _parakeet_provider = lambda: "cuda"
-    _vram_free_bytes = 0
-    assert _parakeet_batch_size() == 1, (
-        "unknown free VRAM must not gamble a batch"
-    )
-    os.environ[PARAKEET_BATCH_ENV] = "4"
-    _vram_free_bytes = int(16 * 1024 ** 3)
-    assert _parakeet_batch_size() == 4, "the env cap must win over the estimate"
-finally:
-    _parakeet_provider = _saved_bs_prov
-    _vram_free_bytes, _vram_free_at = _saved_bs_vram
-    if _saved_bs_env is None:
+    # parakeet GPU batch size: VRAM-derived minus the caption reservation,
+    # clamped [1, 32]; the CPU provider and unknown free VRAM stay sequential.
+    _saved_bs_prov, _saved_bs_env = _parakeet_provider, os.environ.get(PARAKEET_BATCH_ENV)
+    _saved_bs_vram = (_vram_free_bytes, _vram_free_at)
+    try:
+        _parakeet_provider = lambda: "cuda"
+        _vram_free_bytes = int(8 * 1024 ** 3)
+        _vram_free_at = time.monotonic()
         os.environ.pop(PARAKEET_BATCH_ENV, None)
-    else:
-        os.environ[PARAKEET_BATCH_ENV] = _saved_bs_env
+        _bs_exp = (
+            _vram_free_bytes
+            - _caption_reserved_vram_bytes()
+            - _PARAKEET_GPU_VRAM_EST
+            - _PARAAKEET_BATCH_VRAM_SAFETY
+        ) // _PARAAKEET_WINDOW_VRAM_EST
+        assert _parakeet_batch_size() == max(1, min(_bs_exp, _PARAAKEET_BATCH_MAX)), (
+            "GPU batch must be derived from free VRAM"
+        )
+        _parakeet_provider = lambda: "cpu"
+        assert _parakeet_batch_size() == 1, (
+            "the CPU provider must keep sequential decode"
+        )
+        _parakeet_provider = lambda: "cuda"
+        _vram_free_bytes = 0
+        assert _parakeet_batch_size() == 1, (
+            "unknown free VRAM must not gamble a batch"
+        )
+        os.environ[PARAKEET_BATCH_ENV] = "4"
+        _vram_free_bytes = int(16 * 1024 ** 3)
+        assert _parakeet_batch_size() == 4, "the env cap must win over the estimate"
+    finally:
+        _parakeet_provider = _saved_bs_prov
+        _vram_free_bytes, _vram_free_at = _saved_bs_vram
+        if _saved_bs_env is None:
+            os.environ.pop(PARAKEET_BATCH_ENV, None)
+        else:
+            os.environ[PARAKEET_BATCH_ENV] = _saved_bs_env
 
-# GPU sequential gate: one video at a time; release frees the gate.
-assert _gpu_gate_try_acquire("twitch", "v1") is True, "the first video takes the gate"
-assert _gpu_gate_try_acquire("twitch", "v2") is False, (
-    "a second video must not stack on the GPU"
-)
-assert _gpu_gate_try_acquire("kick", "v3") is False, (
-    "a different platform is blocked too"
-)
-assert _gpu_gate_try_acquire("twitch", "v1") is True, (
-    "the holder re-acquires its own video"
-)
-_gpu_gate_release("twitch", "v1")
-assert _gpu_gate_try_acquire("kick", "v2") is True, (
-    "release must free the gate for the next video"
-)
-_gpu_gate_release("kick", "v2")
+    # GPU sequential gate: one video at a time; release frees the gate.
+    assert _gpu_gate_try_acquire("twitch", "v1") is True, "the first video takes the gate"
+    assert _gpu_gate_try_acquire("twitch", "v2") is False, (
+        "a second video must not stack on the GPU"
+    )
+    assert _gpu_gate_try_acquire("kick", "v3") is False, (
+        "a different platform is blocked too"
+    )
+    assert _gpu_gate_try_acquire("twitch", "v1") is True, (
+        "the holder re-acquires its own video"
+    )
+    _gpu_gate_release("twitch", "v1")
+    assert _gpu_gate_try_acquire("kick", "v2") is True, (
+        "release must free the gate for the next video"
+    )
+    _gpu_gate_release("kick", "v2")
+
+if os.environ.get("VODRIP_TRANSCRIBE_SELFCHECK", "").strip().lower() in ("1", "true", "yes", "on"):
+    _run_module_selfcheck()
