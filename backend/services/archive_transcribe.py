@@ -1160,6 +1160,8 @@ def _offpool_cuda_available() -> bool:
     if _offpool_cuda_ok is None:
         ok = False
         try:
+            from services.gpu_detect import detect_gpu_vendor  # local import: the GPU-batch merge renames archive_transcribe's own alias
+
             ok = bool(
                 _parakeet_cuda_available()
                 and _real_cuda_works()

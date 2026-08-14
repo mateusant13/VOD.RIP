@@ -97,25 +97,25 @@ def test_offpool_cuda_probe_requires_real_gpu(monkeypatch):
     monkeypatch.setattr(at, "_offpool_cuda_ok", None)
     monkeypatch.setattr(at, "_parakeet_cuda_available", lambda: True)
     monkeypatch.setattr(at, "_real_cuda_works", lambda: False)  # VDD: no torch CUDA
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "none")
+    monkeypatch.setattr("services.gpu_detect.detect_gpu_vendor", lambda: "none")
     assert at._offpool_cuda_available() is False
 
     monkeypatch.setattr(at, "_offpool_cuda_ok", None)
     monkeypatch.setattr(at, "_real_cuda_works", lambda: True)  # real card
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr("services.gpu_detect.detect_gpu_vendor", lambda: "nvidia")
     assert at._offpool_cuda_available() is True
 
     monkeypatch.setattr(at, "_offpool_cuda_ok", None)
     monkeypatch.setenv("VODRIP_CAPTION_CUDA", "0")
     monkeypatch.setattr(at, "_real_cuda_works", lambda: True)
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr("services.gpu_detect.detect_gpu_vendor", lambda: "nvidia")
     assert at._offpool_cuda_available() is False  # explicit kill switch
 
     monkeypatch.setattr(at, "_offpool_cuda_ok", None)
     monkeypatch.setenv("VODRIP_CAPTION_CUDA", "1")
     monkeypatch.setattr(at, "_parakeet_cuda_available", lambda: False)
     monkeypatch.setattr(at, "_real_cuda_works", lambda: True)
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr("services.gpu_detect.detect_gpu_vendor", lambda: "nvidia")
     assert at._offpool_cuda_available() is False  # CPU wheel -> CPU
 
 
