@@ -597,7 +597,15 @@ export function PreviewChatPanel({
     apiGet<PreviewSubtitlesPayload>(`/api/subtitles?url=${encodeURIComponent(watchUrl)}&langs=en,pt,es`)
       .then((p) => {
         if (cancelled) return;
-        subsCacheRef.current.set(videoId, p);
+        const cache = subsCacheRef.current;
+        cache.set(videoId, p);
+        if (cache.size > 8) {
+          // ponytail: bounded subtitles cache — same LRU-ish prune as the
+          // payload cache; upgrade path: shared cache helper if a third
+          // bounded map ever appears.
+          const oldest = cache.keys().next().value;
+          if (oldest !== undefined) cache.delete(oldest);
+        }
         setYtSubtitles(p);
         setSubsFetchState('done');
       })

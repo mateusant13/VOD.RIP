@@ -148,6 +148,27 @@ describe('PreviewChatPanel', () => {
     expect(urls().filter((u) => u.includes('/api/subtitles')).length).toBe(1);
   });
 
+  it('bounds the subtitles cache: >8 distinct videos prune the oldest (a pruned video re-fetches)', async () => {
+    const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
+    const { rerender } = render(
+      <PreviewChatPanel platform="youtube" videoId="yt1" currentTime={0} />,
+    );
+    const subsCalls = () =>
+      fetchMock.mock.calls.filter((c) => String(c[0]).includes('/api/subtitles')).length;
+    await waitFor(() => expect(subsCalls()).toBe(1));
+
+    // 8 more distinct videos fill the cache past 8 → the OLDEST (yt1) is pruned.
+    for (let i = 2; i <= 9; i++) {
+      rerender(<PreviewChatPanel platform="youtube" videoId={`yt${i}`} currentTime={0} />);
+      await waitFor(() => expect(subsCalls()).toBe(i));
+    }
+
+    // Revisit yt1: pruned → fetched again instead of served from the cache
+    // (an unbounded cache would have kept it and skipped the network).
+    rerender(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={0} />);
+    await waitFor(() => expect(subsCalls()).toBe(10));
+  });
+
   it('renders subtitles that arrive late, after the panel opened', async () => {
     mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, SUBTITLES_PAYLOAD, 60);
     render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} />);

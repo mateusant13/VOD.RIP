@@ -14,7 +14,7 @@
  *  cut off.
  *  ponytail: no tooltip lib — a positioned span; if anchored popovers are
  *  ever needed elsewhere, extract a shared useAnchoredPopover hook. */
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Info } from 'lucide-react';
 
 const TIP_W = 224; // preferred width (w-56)
@@ -33,6 +33,9 @@ export default function InfoHint({ text }: { text: string }) {
   const [pos, setPos] = useState<Pos>({ above: false, left: 0, maxWidth: TIP_W, maxHeight: 0 });
   const rootRef = useRef<HTMLSpanElement>(null);
   const tipRef = useRef<HTMLSpanElement>(null);
+  // Stable id wiring the button's aria-describedby to the tooltip box.
+  const tipId = useId();
+  const visible = hovered || open;
 
   /** Height estimate used before the box is mounted (first pass, jsdom). */
   const estimateH = () =>
@@ -86,21 +89,31 @@ export default function InfoHint({ text }: { text: string }) {
     const onPointerDown = (e: PointerEvent) => {
       if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
     const scroller: EventTarget = rootRef.current?.closest('.custom-scrollbar') ?? window;
     scroller.addEventListener('scroll', measure, { passive: true });
     window.addEventListener('resize', measure);
     document.addEventListener('pointerdown', onPointerDown);
-    document.addEventListener('keydown', onKey);
     return () => {
       scroller.removeEventListener('scroll', measure);
       window.removeEventListener('resize', measure);
       document.removeEventListener('pointerdown', onPointerDown);
-      document.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
+  // Escape dismisses BOTH states — the hover tooltip included: a keyboard
+  // user cannot mouse-leave to close it (the pinned popover already closed
+  // on Esc via the same handler).
+  useEffect(() => {
+    if (!visible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpen(false);
+        setHovered(false);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [visible]);
 
   // Re-measure with the real box size once it is mounted — runs before paint,
   // so the position is final by the time the user sees it.
@@ -108,14 +121,13 @@ export default function InfoHint({ text }: { text: string }) {
     if (tipRef.current) measure();
   });
 
-  const visible = hovered || open;
-
   return (
     <span ref={rootRef} className="relative inline-flex shrink-0">
       <button
         type="button"
         aria-label={text}
         aria-expanded={open}
+        aria-describedby={visible ? tipId : undefined}
         onMouseEnter={() => {
           measure();
           setHovered(true);
@@ -132,6 +144,7 @@ export default function InfoHint({ text }: { text: string }) {
       {visible ? (
         <span
           ref={tipRef}
+          id={tipId}
           role="tooltip"
           className={`absolute z-50 overflow-y-auto border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-[11px] leading-snug text-zinc-300 shadow-lg ${
             pos.above ? 'bottom-full mb-1.5' : 'top-full mt-1.5'

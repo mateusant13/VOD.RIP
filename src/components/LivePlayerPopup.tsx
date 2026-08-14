@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Captions, ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { archiveVideoIdFromUrl } from '../archiveScope';
+import { buildVodUrl } from '../channelUtils';
 import { useI18n } from '../i18n';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -168,6 +169,11 @@ const CAPTION_FONT_MIN_PX = 14;
 const CAPTION_FONT_MAX_PX = 48;
 const CAPTION_FONT_STEP_PX = 2;
 const CAPTION_FONT_STORAGE_KEY = 'vodrip.live.captionFontSize';
+/** Tolerance matching the cached VOD's created_at to the current session
+ *  start (fast-clip guard): the CURRENT broadcast's VOD row is created at
+ *  stream start; a PREVIOUS broadcast is hours older. ±5 min absorbs clock
+ *  skew / cache-probe latency without ever matching an older broadcast. */
+const LIVE_VOD_SESSION_MATCH_SEC = 5 * 60;
 
 /** Wall epoch seconds of a frag's PROGRAM-DATE-TIME, with the backend's
  *  _parse_iso_epoch semantics: an explicit zone offset is honored, a NAIVE
@@ -490,6 +496,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const pdtAnchorsRef = useRef<{ pos: number; pdt: number }[]>([]);
   const captionOriginRef = useRef<number | null>(null);
   const pendingCaptionsRef = useRef<CaptionBlock[]>([]);
+  // Cold-start fallback: the newest block dropped by the stale-head shift
+  // when EVERY queued block is stale (first anchor landed after the pending
+  // windows passed) — re-shown while nothing fresh is due so the overlay
+  // never goes blank (see captionClockSync).
+  const staleFallbackRef = useRef<CaptionBlock | null>(null);
   const captionEdgeRef = useRef(0);
   const archiveDurationRef = useRef(0);
 
@@ -524,6 +535,19 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     );
   }, []);
 
+  /** Wall-clock epoch (UTC seconds) when the CURRENT broadcast started —
+   *  frag PDT anchors map any buffered position to wall time (pdt − pos is
+   *  constant across a session); the caption fallback origin is the epoch at
+   *  broadcast position 0. NaN while neither clock exists yet. */
+  const liveSessionStartEpoch = useCallback((): number => {
+    const anchors = pdtAnchorsRef.current;
+    if (anchors.length > 0) {
+      const newest = anchors[anchors.length - 1]; // newest frag — least drift
+      return newest.pdt - newest.pos;
+    }
+    return captionOriginRef.current ?? Number.NaN;
+  }, []);
+
   /** Promote pending captions whose window the video clock has reached, drop
    *  stale ones, and hide a shown caption the clock ran far past (live-sync
    *  seek / resume after a stall). Runs on every timeupdate + caption
@@ -541,18 +565,29 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       return;
     }
     // Stale head: blocks the video already played past (stall recovery/seek).
+    // Cold start: the FIRST anchor can land after the pending windows already
+    // passed (the stream was live before the map existed) — dropping every
+    // queued block would leave the overlay blank until the next caption.
+    // Remember the last dropped block; when ALL pending is stale it becomes
+    // the fallback (re-shown below while nothing fresh is due).
+    let lastStale: CaptionBlock | null = null;
     while (pending.length > 0 && pending[0].end < epoch - CAPTION_STALE_SKIP_SEC) {
-      pending.shift();
+      lastStale = pending.shift()!;
     }
+    if (lastStale && pending.length === 0) staleFallbackRef.current = lastStale;
     let promoted = false;
     while (pending.length > 0 && pending[0].end - CAPTION_LEAD_SEC <= epoch) {
+      staleFallbackRef.current = null; // fresh block lands — clear the fallback
       setCaption(pending.shift()!); // newest due block wins (React batches)
       promoted = true;
     }
     if (!promoted) {
       // Nothing due — hide a shown caption the clock ran past without a
-      // fresh block queued behind it.
-      setCaption((cur) => (cur && cur.end < epoch - CAPTION_STALE_SKIP_SEC ? null : cur));
+      // fresh block queued behind it, UNLESS the cold-start fallback holds
+      // the newest stale block (never go blank while queued text exists).
+      setCaption((cur) => (
+        cur && cur.end >= epoch - CAPTION_STALE_SKIP_SEC ? cur : staleFallbackRef.current
+      ));
     }
   }, [captionEpochOf]);
 
@@ -621,6 +656,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       es.close();
       // A new stream / toggle must not inherit the previous timeline's queue.
       pendingCaptionsRef.current = [];
+      staleFallbackRef.current = null;
     };
   }, [captionSource, captionsAvailable, captionsEnabled, captionEpochOf, captionClockSync]);
 
@@ -1601,6 +1637,22 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
    * Requires a DVR VOD URL (vodUrl, resolved by App.liveArchiveContext); the
    * channel page alone has no VOD timeline to select from.
    */
+  /** P1-1: vodUrl is the channel's newest PUBLIC cached VOD — it only carries
+   *  the CURRENT broadcast's timeline when that broadcast is the cached one
+   *  (live + cached, or DVR replay). When the current broadcast is not cached
+   *  yet (stream live minutes ago) or is members-only, vodUrl points at a
+   *  PREVIOUS broadcast: applying the live playhead to its timeline would
+   *  clip the wrong content. Verify the cached VOD row's created_at matches
+   *  the current session start. Fail closed while the clock is unmapped. */
+  const isVodForCurrentSession = useCallback((url: string): boolean => {
+    const sessionStart = liveSessionStartEpoch();
+    if (!Number.isFinite(sessionStart)) return false;
+    const vod = (channel?.vodVideos ?? []).find((v) => buildVodUrl(v) === url);
+    const created = vod?.created_at ? Date.parse(vod.created_at) / 1000 : Number.NaN;
+    return Number.isFinite(created)
+      && Math.abs(created - sessionStart) <= LIVE_VOD_SESSION_MATCH_SEC;
+  }, [channel?.vodVideos, liveSessionStartEpoch]);
+
   const handleFastClip = useCallback(() => {
     const platform = (activeEntry.platform || '').toLowerCase();
     const slug = liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '';
@@ -1611,6 +1663,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     const url = vodUrl ?? activeEntry.url;
     const vodId = archiveVideoIdFromUrl(url);
     if (!vodId) {
+      showClipNotice(t('Not a Twitch VOD URL'));
+      return;
+    }
+    // A cached VOD URL must belong to the CURRENT broadcast — a previous
+    // broadcast's timeline would mis-map the live playhead (P1-1).
+    if (vodUrl && !isVodForCurrentSession(url)) {
       showClipNotice(t('Not a Twitch VOD URL'));
       return;
     }
@@ -1626,7 +1684,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         ? { sessionId: sessionIdRef.current, trimTimeline: false }
         : null,
     });
-  }, [activeEntry.url, activeEntry.platform, channelSlug, vodUrl, currentSec, archiveDuration, showClipNotice, t]);
+  }, [activeEntry.url, activeEntry.platform, channelSlug, vodUrl, currentSec, archiveDuration, showClipNotice, t, isVodForCurrentSession]);
 
   // Zoomed rail window — zoom=1 → the full 0..railMax (pixel-identical to
   // the unzoomed rail); otherwise the window anchored at railAnchorFrac.
@@ -2054,6 +2112,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                     type="button"
                     onClick={() => setCaptionsEnabled((on) => !on)}
                     aria-pressed={captionsEnabled}
+                    aria-label={captionsEnabled ? t('Hide captions') : t('Live captions')}
                     title={captionsEnabled ? t('Hide captions') : t('Live captions')}
                     className={captionsEnabled ? ccBtnLit : `${transportBtn} opacity-40`}
                   >
@@ -2141,7 +2200,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             className="pointer-events-none absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
           >
             <p
-              className="line-clamp-2 max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]"
+              className={`${captionFontSize >= 34 ? 'line-clamp-4' : captionFontSize >= 24 ? 'line-clamp-3' : 'line-clamp-2'} max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]`}
               style={{ fontSize: captionFontSize }}
             >
               {caption.text}

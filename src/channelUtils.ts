@@ -277,6 +277,15 @@ export function nextChannelPage(hasMore: boolean, current: number | undefined): 
   return (current ?? 1) + 1;
 }
 
+/** Whether a Show-more page response must be ignored: a NEWER page already
+ *  landed (the stored cursor is past this response's page), so merging it
+ *  would regress the cursor and interleave rows out of order. A page fetch
+ *  never carries a page < 2; an undefined cursor (no page landed yet) is
+ *  never stale. */
+export function stalePageResponse(pageNum: number, landedPage: number | undefined): boolean {
+  return pageNum < (landedPage ?? 1);
+}
+
 /** True when revealing the next expand step pierces past the cached rows AND
  * the backend still has deeper pages — i.e. show-more must fetch page N+1. */
 export function channelShowMoreNeedsFetch(
