@@ -18,6 +18,24 @@ function normalizeYtUrl(value) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.__koDiag) {
+    // Diagnostics relay: the content script's [ko] state mirrored to the
+    // local diag listener (http://127.0.0.1:9234). An extension-origin
+    // no-cors fetch is neither CORS- nor CSP-blocked, so no host_permission
+    // is needed. The server answers with an opaque 204; failures are
+    // swallowed on purpose.
+    // ponytail: debug-only channel; remove once the kick black-screen is
+    // root-caused (2026-08-13).
+    try {
+      const e = encodeURIComponent(String(msg.__koDiag.ev || 'ev'));
+      const d = encodeURIComponent(JSON.stringify(msg.__koDiag.data || {}));
+      fetch(`http://127.0.0.1:9234/d?e=${e}&d=${d}`, { mode: 'no-cors' }).catch(() => {});
+    } catch {
+      /* relay must never break the extension */
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
   if (!msg || msg.type !== 'ko-resolve-yt') return;
   const url = normalizeYtUrl(msg.value);
   if (!url) {

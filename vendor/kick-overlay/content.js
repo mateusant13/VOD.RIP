@@ -26,6 +26,20 @@ const SPA_MS = 900;      // Twitch SPA pathname poll (no reload on channel nav)
 const HIDE_TICKS = 3;    // consecutive ticks without a Twitch player before hiding
 const MAX_RECONNECT = 3; // hls fatal retries (fresh playback_url each time)
 
+// Diagnostics: the [ko] console lines are ALSO mirrored to a local listener
+// (127.0.0.1:9234) so the extension's real-browser state can be read without
+// F12. The content script forwards through the SW, which beacons with a
+// no-cors fetch (neither CORS- nor CSP-blocked, no host_permission needed).
+// ponytail: debug-only channel; remove once the kick black-screen is
+// root-caused (2026-08-13).
+function diag(ev, data) {
+  try {
+    chrome.runtime.sendMessage({ __koDiag: { ev, data: data || {} } }, () => void chrome.runtime.lastError);
+  } catch {
+    /* beacon must never break the overlay */
+  }
+}
+
 // Twitch routes that look like /<slug> but are not channels.
 const NOT_CHANNEL = new Set([
   'directory', 'downloads', 'friends', 'gift', 'jobs', 'login', 'notifications',
@@ -563,16 +577,24 @@ function ensurePlayer(url) {
     // Diagnostics: the kick black-screen (2026-08-13) is an hls fatal in
     // the real browser; these lines show in the page console (F12) under
     // the content-script context.
-    console.error(
-      '[ko] hls error',
-      JSON.stringify({
-        type: data.type,
-        details: data.details,
-        fatal: data.fatal,
-        reason: data.reason || (data.networkDetails && data.networkDetails.status) || '',
-        frag: data.frag ? data.frag.url.slice(0, 80) : '',
-      }),
-    );
+    const errInfo = {
+      type: data.type,
+      details: data.details,
+      fatal: data.fatal,
+      reason: data.reason || (data.networkDetails && data.networkDetails.status) || '',
+      frag: data.frag ? data.frag.url.slice(0, 80) : '',
+    };
+    console.error('[ko] hls error', JSON.stringify(errInfo));
+    diag('hls_error', errInfo);
+    // Master-manifest load failure: probe the SAME url from the content
+    // world (host-permission fetch) to split "CORS/permission blocked"
+    // from "network/server error" — response.url exposes any redirect host
+    // (an un-permissioned redirect target reads exactly like this error).
+    if (data.details === 'manifestLoadError' && KO.activeUrl) {
+      fetch(KO.activeUrl)
+        .then((r) => diag('master_probe', { status: r.status, finalUrl: r.url.slice(0, 140) }))
+        .catch((e) => diag('master_probe', { err: String(e).slice(0, 80), url: KO.activeUrl.slice(0, 120) }));
+    }
     if (!data.fatal || !KO.enabled || KO.player !== 'kick') return;
     reconnect();
   });
@@ -587,6 +609,10 @@ function ensurePlayer(url) {
       '[ko] kick manifest parsed',
       (mdata.levels || []).length + ' levels' + (top && top.height ? `, top ${top.height}p` : ''),
     );
+    diag('manifest', {
+      levels: (mdata.levels || []).length,
+      top: top && top.height ? `${top.width}x${top.height}` : '',
+    });
     const badgeEl = KO.wrap && KO.wrap.querySelector('#ko-badge');
     if (badgeEl) {
       const lv = mdata && mdata.levels && mdata.levels[0];
@@ -630,6 +656,7 @@ async function reconnect() {
     if (rc) rc.style.display = 'flex';
   }
   console.log(`[ko] kick reconnect attempt ${KO.reconnectCount}/${MAX_RECONNECT}`);
+  diag('reconnect', { n: KO.reconnectCount, max: MAX_RECONNECT });
   const k = await kickPlaybackUrl(KO.kickSlug);
   if (!k.live || !k.url) {
     teardown();
@@ -692,6 +719,11 @@ async function probe() {
   updateTwLiveSticky(tv);
   if (!KO.twLive) {
     setBadge('TW', '#6b7280');
+    diag('tw_not_live', {
+      tw: tv ? { rs: tv.readyState, paused: tv.paused, ct: Math.floor(tv.currentTime || 0), muted: tv.muted } : null,
+      hidden: document.hidden,
+      focused: document.hasFocus(),
+    });
     teardown(); // nothing to mirror; 'playing' listener re-probes on start
     return;
   }
@@ -707,7 +739,18 @@ async function probe() {
   }
 
   if (KO.player === 'kick') {
+    // Already playing on a live url? Keep it — IVS playback_urls rotate on
+    // every API call and a re-attach would reset the stream to the live edge
+    // (observed: ct snapping back every poll). The stall watchdog reconnects
+    // with a FRESH url when the current one goes stale (8s frozen).
+    if (KO.activeUrl && KO.video && !KO.video.paused && KO.video.readyState >= 2) {
+      showKickLayer();
+      setBadge('KICK', '#059669');
+      updateSwitchButtons();
+      return;
+    }
     const k = await kickPlaybackUrl(KO.kickSlug);
+    diag('kick_probe', { slug: KO.kickSlug, live: k.live, url: k.url ? 'yes' : 'no' });
     if (k.live && k.url) {
       ensurePlayer(k.url);
       showKickLayer();
@@ -716,6 +759,7 @@ async function probe() {
       return;
     }
     console.log('[ko] kick offline or unreachable', KO.kickSlug, JSON.stringify(k));
+    diag('kick_offline', { slug: KO.kickSlug, live: k.live, url: k.url ? 'yes' : 'no' });
     setBadge('KICK OFF', '#6b7280');
     if (KO.wrap) hideWrap();
     updateSwitchButtons();
@@ -842,6 +886,7 @@ function startRectLoop() {
           KO.stallTicks = 0;
           if (KO.reconnectCount < MAX_RECONNECT) {
             console.log('[ko] kick stalled (8s frozen) — reconnecting');
+            diag('stall', { ct: Math.floor(KO.video.currentTime || 0) });
             reconnect();
           }
         }
@@ -1027,5 +1072,31 @@ window.addEventListener('kick-overlay:status', () => {
   buildSwitchButtons();
   startWatchers();
   setInterval(updateSwitchButtons, RECT_MS);
+  diag('boot', { url: location.href.slice(0, 70), slug: currentSlug(), enabled: KO.enabled, player: KO.player, kickSlug: KO.kickSlug, hidden: document.hidden });
+  // Heartbeat: full overlay state every 8s while the page is open.
+  setInterval(() => {
+    const tv = twitchVideo();
+    diag('hb', {
+      slug: KO.slug,
+      player: KO.player,
+      wrapShown: !!(KO.wrap && KO.wrap.style.display !== 'none'),
+      hidden: document.hidden,
+      focused: document.hasFocus(),
+      tw: tv
+        ? { rs: tv.readyState, paused: tv.paused, ct: Math.floor(tv.currentTime || 0), muted: tv.muted, err: tv.error ? tv.error.code : 0 }
+        : null,
+      kick: KO.video
+        ? {
+            rs: KO.video.readyState,
+            paused: KO.video.paused,
+            ct: Math.floor(KO.video.currentTime || 0),
+            muted: KO.video.muted,
+            err: KO.video.error ? KO.video.error.code : 0,
+          }
+        : null,
+      yt: { ...KO.ytState },
+      twLive: KO.twLive,
+    });
+  }, 8000);
   apply();
 })();
