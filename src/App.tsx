@@ -79,7 +79,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
@@ -1164,11 +1164,13 @@ export default function App() {
   const clipsMode = channelContentFilter === 'clips';
   const streamsMode = channelContentFilter === 'streams';
   // Per-platform "backend has deeper pages" signal for the current mode.
-  const platformHasMore = (p: 'Kick' | 'Twitch' | 'YouTube'): boolean => {
+  // useCallback keeps a stable identity so handleExpandChannelList (which
+  // reads it) is not recreated on every render (P2-7).
+  const platformHasMore = useCallback((p: 'Kick' | 'Twitch' | 'YouTube'): boolean => {
     if (clipsMode) return selectedChannel?.clipHasMore ?? false;
     if (streamsMode) return p === 'YouTube' ? (selectedChannel?.streamHasMore ?? false) : false;
     return selectedChannel?.vodHasMore ?? false;
-  };
+  }, [clipsMode, streamsMode, selectedChannel]);
   const canExpandKick = effectiveKickEnabled && channelHasKick && channelPlatformCanExpand(
     kickChannelVideos, kickVisibleLimit, channelBeyondRecent.Kick ?? false, clipsMode,
     platformHasMore('Kick'),
@@ -4711,9 +4713,17 @@ export default function App() {
   const clearChannelRefreshFlight = useCallback((channelId: string, mode?: 'vods' | 'clips' | 'streams') => {
     const modes = mode ? [mode] : (['vods', 'clips', 'streams'] as const);
     for (const m of modes) {
-      const key = `${channelId}:${m}`;
-      channelRefreshInFlightRef.current.delete(key);
-      channelRefreshPromisesRef.current.delete(key);
+      const prefix = `${channelId}:${m}`;
+      channelRefreshInFlightRef.current.delete(prefix);
+      channelRefreshPromisesRef.current.delete(prefix);
+      // Show-more flights share the (channel, mode) scope — a forced refresh
+      // must supersede any in-flight page fetch too.
+      for (const k of channelRefreshInFlightRef.current) {
+        if (k.startsWith(`${prefix}:page:`)) channelRefreshInFlightRef.current.delete(k);
+      }
+      for (const k of channelRefreshPromisesRef.current.keys()) {
+        if (k.startsWith(`${prefix}:page:`)) channelRefreshPromisesRef.current.delete(k);
+      }
     }
   }, []);
 
@@ -4736,19 +4746,22 @@ export default function App() {
     // Only bust the cache on explicit forced refresh — non-forced refreshes
     // must hit the backend's 90s in-memory channel cache.
     const cacheBust = opts?.force ? `&_t=${Date.now()}` : '';
-    const flightKey = `${channelId}:${mode}`;
+    // Page fetches dedupe per (channel, mode, page): rapid Show-more clicks
+    // must not fire N concurrent copies of the same page, and a slow older
+    // page must not interleave with a newer one (see stalePageResponse).
+    const flightKey = pageFetch ? `${channelId}:${mode}:page:${pageNum}` : `${channelId}:${mode}`;
 
     if (opts?.force) {
       clearChannelRefreshFlight(channelId, mode);
     }
 
-    if (!incremental && !pageFetch) {
+    if (!incremental) {
       const pending = channelRefreshPromisesRef.current.get(flightKey);
       if (pending) return pending;
     }
 
     const task = (async () => {
-    if (!incremental && !pageFetch) channelRefreshInFlightRef.current.add(flightKey);
+    if (!incremental) channelRefreshInFlightRef.current.add(flightKey);
 
     if (!incremental && !pageFetch && !silent) {
       updateChannel(channelId, { loading: true });
@@ -4829,11 +4842,20 @@ export default function App() {
             updatedAt: new Date().toISOString(),
           });
         } else if (pageFetch) {
+          // A newer page already landed — a slow out-of-order response must
+          // not regress the cursor (see stalePageResponse).
+          if (stalePageResponse(pageNum, latest.clipPage)) return;
+          // Every platform errored → keep the previous hasMore so Show-more
+          // stays available (a failed page must not look like the backend
+          // ran dry until a full refresh).
+          const clipHasMore = incoming.length === 0 && Object.keys(errs).length > 0
+            ? (latest.clipHasMore ?? false)
+            : clipsMore;
           updateChannel(channelId, {
             clipVideos,
             clipErrors: { ...(latest.clipErrors ?? {}), ...errs },
             clipPage: clipsPage,
-            clipHasMore: clipsMore,
+            clipHasMore,
             updatedAt: new Date().toISOString(),
           });
         } else {
@@ -4897,11 +4919,18 @@ export default function App() {
             updatedAt: new Date().toISOString(),
           });
         } else if (pageFetch) {
+          // A newer page already landed — ignore the stale response (see
+          // stalePageResponse).
+          if (stalePageResponse(pageNum, latest.streamPage)) return;
+          // Fetch errored entirely → keep the previous hasMore (P2-2).
+          const streamHasMore = incoming.length === 0 && Object.keys(errs).length > 0
+            ? (latest.streamHasMore ?? false)
+            : anyMore;
           updateChannel(channelId, {
             vodVideos,
             vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
             streamPage: pageNum,
-            streamHasMore: anyMore,
+            streamHasMore,
             updatedAt: new Date().toISOString(),
           });
         } else {
@@ -4972,12 +5001,20 @@ export default function App() {
             updatedAt: new Date().toISOString(),
           });
         } else if (pageFetch) {
-          // Show-more page: append-only (no prune), advance the cursor.
+          // Show-more page: append-only (no prune), advance the cursor. A
+          // stale response (a newer page already landed) is ignored — see
+          // stalePageResponse.
+          if (stalePageResponse(pageNum, latest.vodPages)) return;
+          // Every platform errored → keep the previous hasMore so Show-more
+          // stays available (P2-2).
+          const vodHasMore = incoming.length === 0 && Object.keys(errs).length > 0
+            ? (latest.vodHasMore ?? false)
+            : anyMore;
           updateChannel(channelId, {
             vodVideos,
             vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
             vodPages: pageNum,
-            vodHasMore: anyMore,
+            vodHasMore,
             updatedAt: new Date().toISOString(),
           });
         } else {
@@ -5021,7 +5058,7 @@ export default function App() {
       }
 
     } finally {
-      if (!incremental && !pageFetch) {
+      if (!incremental) {
         channelRefreshInFlightRef.current.delete(flightKey);
         channelRefreshPromisesRef.current.delete(flightKey);
         if (!silent) {
@@ -5031,7 +5068,7 @@ export default function App() {
     }
     })();
 
-    if (!incremental && !pageFetch) {
+    if (!incremental) {
       channelRefreshPromisesRef.current.set(flightKey, task);
     }
     return task;

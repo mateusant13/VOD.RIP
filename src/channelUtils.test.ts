@@ -18,6 +18,7 @@ import {
   channelPlatformCanExpand,
   channelShowMoreNeedsFetch,
   nextChannelPage,
+  stalePageResponse,
   channelLinkDraftFromParsed,
   channelLinkWillAddSummary,
   parseChannelInput,
@@ -335,6 +336,25 @@ describe('nextChannelPage', () => {
     expect(nextChannelPage(true, 1)).toBe(2);
     expect(nextChannelPage(true, 7)).toBe(8);
     expect(nextChannelPage(true, undefined)).toBe(2);
+  });
+});
+
+describe('stalePageResponse', () => {
+  it('never treats the first page fetch as stale (no page landed yet)', () => {
+    expect(stalePageResponse(2, undefined)).toBe(false);
+  });
+
+  it('ignores a response whose page a NEWER page already landed past', () => {
+    expect(stalePageResponse(2, 3)).toBe(true);
+    expect(stalePageResponse(2, 5)).toBe(true);
+  });
+
+  it('accepts the same page landing twice (rows merge idempotently)', () => {
+    expect(stalePageResponse(2, 2)).toBe(false);
+  });
+
+  it('accepts a response landing after the previous page (normal order)', () => {
+    expect(stalePageResponse(3, 2)).toBe(false);
   });
 });
 

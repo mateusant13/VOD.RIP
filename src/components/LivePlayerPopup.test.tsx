@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
+import type { ComponentProps } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { LivePlayerPopup, __resetLivePlayerRegistryForTests, liveQualityCountNow, registerLivePlayer } from './LivePlayerPopup';
 import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
@@ -294,14 +295,44 @@ describe('LivePlayerPopup fullscreen', () => {
 describe('LivePlayerPopup fast clip', () => {
   const twitchEntry = { url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' };
   const twitchVodUrl = 'https://www.twitch.tv/videos/2117068816';
+  // Anchored live timeline: frag anchor pos 0 ↔ PDT 1_000_000 ms → the
+  // current session started at wall epoch 1000s.
+  const SESSION_START_EPOCH_S = 1000;
+  const currentVodCreatedAt = new Date(SESSION_START_EPOCH_S * 1000).toISOString();
+  // A PREVIOUS broadcast's cache row — 3h before the current session start.
+  const staleVodCreatedAt = new Date((SESSION_START_EPOCH_S - 3 * 3600) * 1000).toISOString();
 
-  function renderTwitchPopup(vodUrl?: string) {
+  function twitchChannel(createdAt: string) {
+    return {
+      id: 'c1',
+      displayName: 'titiltei',
+      kickSlug: '',
+      twitchSlug: 'titiltei',
+      youtubeSlug: '',
+      vodVideos: [{
+        id: '2117068816',
+        platform: 'Twitch',
+        title: 'Late night',
+        duration: null,
+        created_at: createdAt,
+        views: null,
+        thumbnail_url: null,
+        url: twitchVodUrl,
+        channel: 'titiltei',
+      }],
+      clipVideos: [],
+      updatedAt: '2026-08-01T00:00:00Z',
+    };
+  }
+
+  function renderTwitchPopup(vodUrl?: string, channel?: ComponentProps<typeof LivePlayerPopup>['channel']) {
     return render(
       <LivePlayerPopup
         entry={twitchEntry}
         entries={[twitchEntry]}
         channelName="titiltei"
         channelSlug="titiltei"
+        channel={channel}
         vodUrl={vodUrl}
         onClose={vi.fn()}
         onOpenHit={vi.fn()}
@@ -310,10 +341,55 @@ describe('LivePlayerPopup fast clip', () => {
     );
   }
 
-  it('TWITCH: clicking clip opens the in-app mini-preview (TwitchClipPopup) — no /api/live/clip call', async () => {
-    const fetchMock = mockFetch();
-    renderTwitchPopup(twitchVodUrl);
+  /** Live session (real master URL → FakeHls) + a resolvable clip-popup
+   *  session, so both the transport and the mini-preview render. */
+  function mockFetchLiveForClip() {
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/preview/live')) {
+        return new Response(JSON.stringify({
+          session_id: 's1',
+          kind: 'hls',
+          master_url: 'https://edge/live/master.m3u8',
+          playback_url: 'https://edge/live/master.m3u8',
+          archive_duration: 0,
+        }), { status: 200 });
+      }
+      if (url.includes('/api/preview/hls/s1/resource')) {
+        return new Response('', { status: 404 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        return new Response(JSON.stringify({ available: true }), { status: 200 });
+      }
+      if (url.includes('/api/preview/session')) {
+        return new Response(JSON.stringify({
+          session_id: 'cs1',
+          kind: 'hls',
+          master_url: '/api/preview/hls/cs1/master.m3u8',
+          playback_url: '/api/preview/hls/cs1/master.m3u8',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+    return fn;
+  }
+
+  /** Render the Twitch popup on a live session and anchor the caption clock
+   *  at SESSION_START_EPOCH_S (frag PDT anchor pos 0 ↔ epoch 1000). */
+  async function renderAnchoredTwitch(vodUrl: string | undefined, channel: ComponentProps<typeof LivePlayerPopup>['channel']) {
+    const fetchMock = mockFetchLiveForClip();
+    renderTwitchPopup(vodUrl, channel);
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
     await screen.findByTitle('Fullscreen');
+    act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
+    return fetchMock;
+  }
+
+  it('TWITCH: clicking clip opens the in-app mini-preview (TwitchClipPopup) — no /api/live/clip call', async () => {
+    const fetchMock = await renderAnchoredTwitch(twitchVodUrl, twitchChannel(currentVodCreatedAt));
 
     fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
 
@@ -329,9 +405,7 @@ describe('LivePlayerPopup fast clip', () => {
 
   it('TWITCH: mini-preview Create opens clips.twitch.tv/create with the VOD id + offsetSeconds', async () => {
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
-    mockFetch();
-    renderTwitchPopup(twitchVodUrl);
-    await screen.findByTitle('Fullscreen');
+    await renderAnchoredTwitch(twitchVodUrl, twitchChannel(currentVodCreatedAt));
 
     fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
     await screen.findByText('Twitch clip');
@@ -345,6 +419,41 @@ describe('LivePlayerPopup fast clip', () => {
     expect(u.searchParams.get('broadcasterLogin')).toBe('titiltei');
     // offsetSeconds = the trimmed selection END (VOD time of the clip).
     expect(Number(u.searchParams.get('offsetSeconds'))).toBeGreaterThanOrEqual(0);
+    openSpy.mockRestore();
+  });
+
+  it('TWITCH: a STALE cached VOD (previous broadcast) never opens the clip window', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    await renderAnchoredTwitch(twitchVodUrl, twitchChannel(staleVodCreatedAt));
+
+    fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
+
+    // The cached VOD's created_at is 3h before the current session start —
+    // applying the live playhead to its timeline would clip the WRONG
+    // broadcast. The notice path is shown instead.
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Not a Twitch VOD URL');
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeNull();
+    expect(openSpy).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+
+  it('TWITCH: the cached VOD cannot be verified (no clock map yet) → clip is blocked, not risked', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    mockFetchLiveForClip();
+    renderTwitchPopup(twitchVodUrl, twitchChannel(currentVodCreatedAt));
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Fullscreen');
+    // NOTE: no frag anchor fired — the session start is unmapped.
+
+    fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
+
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Not a Twitch VOD URL');
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeNull();
+    expect(openSpy).not.toHaveBeenCalled();
     openSpy.mockRestore();
   });
 
@@ -920,6 +1029,83 @@ describe('LivePlayerPopup live captions', () => {
     // …and clamps: another A− stays at the floor.
     fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('14px');
+  });
+
+  it('caption clamp scales with the font size (line-clamp-2 → -3 → -4)', async () => {
+    localStorage.removeItem('vodrip.live.captionFontSize');
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
+
+    const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
+    // 14px (default) → 2 lines; ≥24px → 3; ≥34px → 4 — a fixed 2-line clamp
+    // at 48px would truncate captions to a few words.
+    expect(overlayText().className).toContain('line-clamp-2');
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions')); // 24px
+    expect(overlayText().className).toContain('line-clamp-3');
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions')); // 34px
+    expect(overlayText().className).toContain('line-clamp-4');
+    // Shrinking back restores the smaller clamps.
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions')); // 24px
+    expect(overlayText().className).toContain('line-clamp-3');
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions')); // 14px
+    expect(overlayText().className).toContain('line-clamp-2');
+  });
+
+  it('captions toggle exposes an aria-label that tracks its state', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    // ON → "Hide captions" as the accessible name (matches the title).
+    expect(screen.getByRole('button', { name: 'Hide captions' })).toBeTruthy();
+    fireEvent.click(screen.getByTitle('Hide captions'));
+    // OFF → "Live captions".
+    expect(screen.getByRole('button', { name: 'Live captions' })).toBeTruthy();
+  });
+
+  it('cold start: first anchor lands after the pending windows passed → the newest caption stays, never blank', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
+
+    // The stream is already 8s in when captions arrive. The first block
+    // calibrates the fallback origin (arrival-due) and stays on screen;
+    // the later windows queue behind it.
+    at(8);
+    act(() => { es.fire('caption', JSON.stringify({ text: 'bloco-1', start: 0, end: 2 })); });
+    act(() => { es.fire('caption', JSON.stringify({ text: 'bloco-2', start: 2, end: 4 })); });
+    act(() => { es.fire('caption', JSON.stringify({ text: 'bloco-3', start: 4, end: 6 })); });
+    expect(screen.getByText('bloco-1')).toBeTruthy();
+    expect(screen.queryByText('bloco-3')).toBeNull();
+
+    // The FIRST anchor lands LATE — the mapped clock (epoch 1008) is far
+    // past every pending window (ends 2/4/6): bloco-1 goes stale AND every
+    // queued block would be dropped. The overlay must NOT blank: the newest
+    // pending block stays on screen.
+    act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
+    at(8);
+    expect(screen.getByText('bloco-3')).toBeTruthy();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeTruthy();
+    // Idempotent across ticks — the fallback persists until fresh text lands.
+    at(8.5);
+    expect(screen.getByText('bloco-3')).toBeTruthy();
+
+    // A fresh caption whose window the video reaches replaces the fallback.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'fresca', start: 1006, end: 1008, latency_ms: 300 })); });
+    expect(screen.getByText('fresca')).toBeTruthy();
+    expect(screen.queryByText('bloco-3')).toBeNull();
   });
 
   it('A+ clamps at the 48px ceiling and persists the choice', async () => {

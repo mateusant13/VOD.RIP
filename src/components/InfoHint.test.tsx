@@ -85,6 +85,27 @@ describe("InfoHint", () => {
     expect(screen.queryByText("Esc hint")).not.toBeInTheDocument();
   });
 
+  it("wires aria-describedby from the button to the tooltip box while visible", () => {
+    render(<InfoHint text="Described hint" />);
+    const btn = screen.getByRole("button", { name: "Described hint" });
+    // Idle: no dangling description reference to a missing node.
+    expect(btn).not.toHaveAttribute("aria-describedby");
+    fireEvent.mouseEnter(btn);
+    const tip = screen.getByRole("tooltip");
+    expect(btn.getAttribute("aria-describedby")).toBe(tip.id);
+    fireEvent.mouseLeave(btn);
+    expect(btn).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("Escape dismisses the hover tooltip too (keyboard users cannot mouse-leave)", () => {
+    render(<InfoHint text="Hover esc hint" />);
+    const btn = screen.getByRole("button", { name: "Hover esc hint" });
+    fireEvent.mouseEnter(btn);
+    expect(screen.getByText("Hover esc hint")).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByText("Hover esc hint")).not.toBeInTheDocument();
+  });
+
   it("has no native tooltip: only the in-DOM box shows on hover", () => {
     render(<InfoHint text="No native tooltip" />);
     const btn = screen.getByRole("button", { name: "No native tooltip" });
