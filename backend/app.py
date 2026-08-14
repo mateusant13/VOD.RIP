@@ -482,6 +482,7 @@ async def _app_lifespan(_app: FastAPI):
             done = threading.Event()
 
             def _run() -> None:
+                from deps import WARM_WORK_SEMAPHORE
                 try:
                     t0 = _tm.time()
                     # warm_youtube_resolve_only does InnerTube fast pass + prog head
@@ -489,7 +490,8 @@ async def _app_lifespan(_app: FastAPI):
                     # click path skip the ~5s extract + variant-build + master work;
                     # the prog head warm serves the first 2 MiB from local disk so
                     # the browser's canplay path doesn't hit googlevideo cold.
-                    warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
+                    with WARM_WORK_SEMAPHORE:
+                        warm_youtube_resolve_only(u, prefer_height=360, channel_key=ch_key)
                     with _WARMED_URLS_LOCK:
                         _WARMED_URLS.add(u)
                     logger.info(

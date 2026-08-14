@@ -56,6 +56,17 @@ GESTURE_WARM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wa
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")
 
+# ── Warm-work global cap ────────────────────────────────────────────────
+# Boot warm storm spans WARM(3)+GESTURE(2)+FULL(1)+ANON(2)+sync-wave(2) and
+# every warm job runs a yt-dlp extract and/or an ffmpeg mux — a 50+ URL
+# startup wave could otherwise run ~60 concurrent yt-dlp/ffmpeg processes on
+# one user PC. Every warm _run body (warm.py, session.py prog-head warm,
+# app.py sync wave) holds this semaphore around its heavy section, capping
+# total warm extract/mux work at 8 regardless of which executor it lands on.
+# User-click paths (create_session / PREVIEW_EXECUTOR / live paths) never
+# acquire it — clicks stay responsive while the warm queue drains.
+WARM_WORK_SEMAPHORE = threading.BoundedSemaphore(8)
+
 # ── Per-thread COM (Windows shell) ─────────────────────────────────────
 _shell_com_local = threading.local() if os.name == "nt" else None
 

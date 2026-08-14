@@ -216,8 +216,10 @@ def kickoff_youtube_preflight_mux(
 
     def _run() -> None:
         from services.preview.session import MuxJob
+        from deps import WARM_WORK_SEMAPHORE
         try:
-            _youtube_preflight_mux(url, prefer_height=prefer_height)
+            with WARM_WORK_SEMAPHORE:
+                _youtube_preflight_mux(url, prefer_height=prefer_height)
         finally:
             with _PREFLIGHT_MUX_LOCK:
                 _PREFLIGHT_MUX_INFLIGHT.pop(key, None)
@@ -258,6 +260,7 @@ def kickoff_youtube_batch_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        from deps import WARM_WORK_SEMAPHORE
         try:
             if _warm_vid_dead(key):
                 return
@@ -268,10 +271,11 @@ def kickoff_youtube_batch_warm(
                 return
             # ponytail: warm_youtube_resolve_only itself builds + stashes the
             # session snapshot. Calling it twice would re-extract + re-build.
-            warm_youtube_resolve_only(
-                url, prefer_height=prefer_height,
-                channel_key=channel_key,
-            )
+            with WARM_WORK_SEMAPHORE:
+                warm_youtube_resolve_only(
+                    url, prefer_height=prefer_height,
+                    channel_key=channel_key,
+                )
             with _YOUTUBE_WARM_RATE_LIMIT_LOCK:
                 _YOUTUBE_WARM_CONSECUTIVE_FAILURES = 0
                 _PRINTED_COOLDOWN = False
@@ -674,6 +678,7 @@ def kickoff_youtube_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        from deps import WARM_WORK_SEMAPHORE
         try:
             if _warm_vid_dead(key):
                 return
@@ -692,9 +697,10 @@ def kickoff_youtube_warm(
             # now builds + stashes the session snapshot itself.
             from services.ytdlp_hls import warm_youtube_extract
 
-            warm_youtube_extract(
-                url, cookies_file=cookies_file, prefer_height=prefer_height
-            )
+            with WARM_WORK_SEMAPHORE:
+                warm_youtube_extract(
+                    url, cookies_file=cookies_file, prefer_height=prefer_height
+                )
         finally:
             # ponytail: failed warm on slow VOD must not nuke session before create_session runs
             with _YOUTUBE_WARM_LOCK:
@@ -733,6 +739,7 @@ def kickoff_youtube_full_mux_warm(
 
     def _run() -> None:
         from services.preview.session import _resolve_youtube_preview_audio
+        from deps import WARM_WORK_SEMAPHORE
         global _warm_bot_gate_pause_until
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
@@ -747,60 +754,61 @@ def kickoff_youtube_full_mux_warm(
             logger.info("full-mux warm bailing — user already previewing %s", key[:24])
             return
         try:
-            from services.ytdlp_hls import warm_youtube_extract
+            with WARM_WORK_SEMAPHORE:
+                from services.ytdlp_hls import warm_youtube_extract
 
-            if not warm_youtube_extract(url, cookies_file=cookies_file):
-                return
-            try:
-                _entry, headers, _platform, variant_formats, _kind, yt_info = (
-                    resolve_stream_info(url, prefer_height=prefer_height)
-                )
-            except Exception as exc:
-                from services.ytdlp_hls import _youtube_soft_neg_error
-                from services.youtube_innertube import extract_video_id as _fevid
+                if not warm_youtube_extract(url, cookies_file=cookies_file):
+                    return
+                try:
+                    _entry, headers, _platform, variant_formats, _kind, yt_info = (
+                        resolve_stream_info(url, prefer_height=prefer_height)
+                    )
+                except Exception as exc:
+                    from services.ytdlp_hls import _youtube_soft_neg_error
+                    from services.youtube_innertube import extract_video_id as _fevid
 
-                if _youtube_soft_neg_error(exc):
-                    if _warm_gate_signal(exc):
-                        if (
-                            _warm_note_soft_neg()
-                            and time.monotonic() >= _warm_bot_gate_pause_until
-                        ):
-                            _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
-                            logger.warning(f"YouTube bot-gate detected ({_SOFT_NEG_PAUSE_THRESHOLD} consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
+                    if _youtube_soft_neg_error(exc):
+                        if _warm_gate_signal(exc):
+                            if (
+                                _warm_note_soft_neg()
+                                and time.monotonic() >= _warm_bot_gate_pause_until
+                            ):
+                                _warm_bot_gate_pause_until = time.monotonic() + _FULL_WARM_BACKOFF_SEC
+                                logger.warning(f"YouTube bot-gate detected ({_SOFT_NEG_PAUSE_THRESHOLD} consecutive soft-negatives); warm paused {int(_FULL_WARM_BACKOFF_SEC // 3600)}h")
                     else:
                         _mark_vid_warm_dead(_fevid(url) or "")
-                logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
-                return
-            _warm_note_success()
-            audio_url = _resolve_youtube_preview_audio(yt_info) if yt_info else None
-            vod_dur = 0.0
-            if yt_info:
-                try:
-                    vod_dur = float(yt_info.get("duration") or 0)
-                except (TypeError, ValueError):
-                    vod_dur = 0.0
-            logger.info("full-mux warm resolved %s h=%d dur=%.1fs audio=%s", vid, prefer_height, vod_dur, bool(audio_url))
-            variant_url = None
-            for f in variant_formats or []:
-                if int(f.get("height") or 0) == prefer_height and f.get("url"):
-                    variant_url = f["url"]
-                    break
-            if not variant_url:
-                logger.info("full-mux warm no variant for h=%d (have %s)", prefer_height, [int(f.get("height") or 0) for f in (variant_formats or [])])
-                return
-            logger.info("full-mux warm starting MuxJob %s -> %s", variant_url[:80], cache_path)
-            MuxJob(
-                video_url=variant_url,
-                audio_url=audio_url,
-                output_path=cache_path,
-                start_sec=0.0,
-                end_sec=max(0.5, vod_dur),
-                headers=headers or {},
-                prefer_height=prefer_height,
-                vod_url=url,
-                job_kind="full",
-                vod_duration=vod_dur,
-            ).run()
+                    logger.warning("full-mux warm resolve failed for %s: %s", url[:80], exc, exc_info=True)
+                    return
+                _warm_note_success()
+                audio_url = _resolve_youtube_preview_audio(yt_info) if yt_info else None
+                vod_dur = 0.0
+                if yt_info:
+                    try:
+                        vod_dur = float(yt_info.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        vod_dur = 0.0
+                logger.info("full-mux warm resolved %s h=%d dur=%.1fs audio=%s", vid, prefer_height, vod_dur, bool(audio_url))
+                variant_url = None
+                for f in variant_formats or []:
+                    if int(f.get("height") or 0) == prefer_height and f.get("url"):
+                        variant_url = f["url"]
+                        break
+                if not variant_url:
+                    logger.info("full-mux warm no variant for h=%d (have %s)", prefer_height, [int(f.get("height") or 0) for f in (variant_formats or [])])
+                    return
+                logger.info("full-mux warm starting MuxJob %s -> %s", variant_url[:80], cache_path)
+                MuxJob(
+                    video_url=variant_url,
+                    audio_url=audio_url,
+                    output_path=cache_path,
+                    start_sec=0.0,
+                    end_sec=max(0.5, vod_dur),
+                    headers=headers or {},
+                    prefer_height=prefer_height,
+                    vod_url=url,
+                    job_kind="full",
+                    vod_duration=vod_dur,
+                ).run()
         except Exception as exc:
             logger.warning("full-mux warm failed for %s: %s", url[:80], exc, exc_info=True)
 
@@ -1014,21 +1022,23 @@ def _enqueue_full_warm(
 
     def _run() -> None:
         from services.youtube_innertube import extract_video_id
+        from deps import WARM_WORK_SEMAPHORE
 
         if _warm_vid_dead(extract_video_id(url)):
             return
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
         try:
-            # warm_youtube_preview_resolve owns the failure classification:
-            # genuine gate signals arm the global pause there; per-video
-            # exhaustion marks the vid dead there. This wrapper must NOT
-            # re-count the streak (it used to — one failure double-incremented,
-            # arming the 2h pause after just 2 attempts instead of 3).
-            warm_youtube_preview_resolve(
-                url, cookies_file=cookies_file, prefer_height=prefer_height,
-                reraise=True,
-            )
+            with WARM_WORK_SEMAPHORE:
+                # warm_youtube_preview_resolve owns the failure classification:
+                # genuine gate signals arm the global pause there; per-video
+                # exhaustion marks the vid dead there. This wrapper must NOT
+                # re-count the streak (it used to — one failure double-incremented,
+                # arming the 2h pause after just 2 attempts instead of 3).
+                warm_youtube_preview_resolve(
+                    url, cookies_file=cookies_file, prefer_height=prefer_height,
+                    reraise=True,
+                )
         except Exception:
             pass
         finally:

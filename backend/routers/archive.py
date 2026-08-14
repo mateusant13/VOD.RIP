@@ -789,11 +789,12 @@ async def archive_search_remote(
     if not handle:
         return {"hits": [], "error": f"'{channel}' has no YouTube handle — add one in Settings"}
     from services.youtube_service import search_channel_videos_sync
+    from deps import INFO_EXECUTOR
 
     try:
         items = await asyncio.wait_for(
             asyncio.get_running_loop().run_in_executor(
-                None, search_channel_videos_sync, handle, q, max(1, min(int(limit), 50))
+                INFO_EXECUTOR, search_channel_videos_sync, handle, q, max(1, min(int(limit), 50))
             ),
             timeout=25,
         )

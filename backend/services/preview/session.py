@@ -199,10 +199,12 @@ def kickoff_youtube_prog_head_warm(
         _YOUTUBE_WARM_INFLIGHT[key] = done
 
     def _run() -> None:
+        from deps import WARM_WORK_SEMAPHORE
         if time.monotonic() < _warm_bot_gate_pause_until:
             return
         try:
-            _youtube_prog_head_warm(url, vid, prefer_height=prefer_height)
+            with WARM_WORK_SEMAPHORE:
+                _youtube_prog_head_warm(url, vid, prefer_height=prefer_height)
         finally:
             with _YOUTUBE_WARM_LOCK:
                 ev = _YOUTUBE_WARM_INFLIGHT.pop(key, None)

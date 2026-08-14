@@ -192,7 +192,12 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             raise
 
     loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, _extract)
+    # CPU-01: route yt-dlp extracts off the unbounded asyncio default pool
+    # onto the bounded INFO_EXECUTOR so a warm storm cannot spawn ~60
+    # concurrent extract threads.
+    from deps import INFO_EXECUTOR
+
+    info = await loop.run_in_executor(INFO_EXECUTOR, _extract)
     if info is None:
         raise ValueError("Could not extract video info")
 
