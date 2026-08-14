@@ -431,7 +431,9 @@ def test_process_job_wires_events_hook() -> None:
     def fake_detect(platform: str, video_id: str, **kw):
         return {"events": 3, "audio": kw.get("audio"), "speech": kw.get("speech")}
 
-    with patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
+    with patch.object(at, "_job_engine", return_value="parakeet"), \
+         patch.object(at, "events_enabled", return_value=True), \
+         patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
          patch.object(at, "detect_events_video", side_effect=fake_detect), \
          patch.dict(os.environ, {"VODRIP_EVENTS_ENABLED": "1"}):
         stats = at._process_job({"id": "hook-job", "kind": "transcribe",
@@ -445,7 +447,9 @@ def test_process_job_wires_events_hook() -> None:
     def boom(platform: str, video_id: str, **kw):
         raise RuntimeError("events crashed")
 
-    with patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
+    with patch.object(at, "_job_engine", return_value="parakeet"), \
+         patch.object(at, "events_enabled", return_value=True), \
+         patch.object(at, "transcribe_video", side_effect=fake_transcribe), \
          patch.object(at, "detect_events_video", side_effect=boom), \
          patch.dict(os.environ, {"VODRIP_EVENTS_ENABLED": "1"}):
         stats = at._process_job({"id": "hook-job-2", "kind": "transcribe",

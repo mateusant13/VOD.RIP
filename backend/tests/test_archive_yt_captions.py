@@ -1,10 +1,12 @@
 """YT captions-first slice — /api/settings roundtrip for yt_subtitles_first,
-the whisper skip guard (captions present + toggle on -> no model load), and
+the ASR skip guard (captions present + toggle on -> no model load), and
 the caption fetch format fallback (vtt 429 -> json3) with json3/srv3 parsing.
 
 Scratch env only: the shared settings manager is redirected to a temp file,
-the archive DB is rebound to a temp DB per module, and whisper never runs
-(transcribe_video / _get_model are patched).
+the archive DB is rebound to a temp DB per module, and ASR never runs
+(transcribe_video / _transcribe_youtube_captionless / _job_engine are
+patched — dispatch tests are hermetic, never depending on the real engine
+probe).
 
 Run from backend/: python -m pytest tests/test_archive_yt_captions.py
 """
@@ -131,6 +133,7 @@ def test_captions_first_toggle_off_runs_whisper(monkeypatch):
     archive_db.mark_captions_unavailable("youtube", "vid2")
     job_id = _seed_job("youtube", "vid2")
     with patch("deps.settings_mgr") as mgr, \
+         patch.object(archive_transcribe, "_job_engine", return_value="parakeet"), \
          patch.object(archive_transcribe, "_transcribe_youtube_captionless",
                       return_value={"segments": 1}) as tv:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)
@@ -150,6 +153,8 @@ def test_missing_archive_file_skips_gracefully(monkeypatch):
     test_yt_transcribe_policy."""
     job_id = _seed_job("twitch", "vid-missing")
     with patch.object(
+        archive_transcribe, "_job_engine", return_value="parakeet",
+    ), patch.object(
         archive_transcribe, "_transcribe_remote_twitch_kick",
         side_effect=FileNotFoundError(
             f"archive file missing for twitch/vid-missing: {job_id}"),
@@ -181,6 +186,7 @@ def test_captions_first_defaults_on_when_setting_absent(monkeypatch):
 def test_captions_first_non_youtube_still_transcribes(monkeypatch):
     job_id = _seed_job("twitch", "vid4")
     with patch("deps.settings_mgr") as mgr, \
+         patch.object(archive_transcribe, "_job_engine", return_value="parakeet"), \
          patch.object(archive_db, "transcript_for", return_value=[{"seg_idx": 0}]) as tf, \
          patch.object(archive_transcribe, "_transcribe_remote_twitch_kick",
                       return_value={"segments": 1}) as remote:

@@ -66,7 +66,7 @@ async def test_usage_reports_every_category(scratch_env, client):
     a = scratch_env.appdata
     _write(a / "archive" / "kick" / "a.mp4", 1000)
     _write(a / "archive" / "kick" / "b.mp4", 2000)
-    _write(a / "whisper-models" / "models--Systran--faster-whisper-small" / "model.bin", 4096)
+    _write(a / "whisper-models" / "parakeet" / "model.onnx", 4096)
     _write(a / "archive.db", 512)
     _write(a / "archive.db-wal", 256)
     _write(a / "archive.db-shm", 32)
