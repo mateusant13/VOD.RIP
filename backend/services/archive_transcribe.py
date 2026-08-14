@@ -4427,7 +4427,15 @@ def _set_worker_low_priority() -> None:
         import ctypes
 
         kernel32 = ctypes.windll.kernel32
-        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), _BELOW_NORMAL_PRIORITY_CLASS)
+        # 64-bit safety: HANDLE is pointer-sized. Without restype/argtypes,
+        # ctypes truncates the -1 pseudo-handle to 32 bits and the call
+        # fails silently (verified live — priority stayed Normal).
+        get_cur = kernel32.GetCurrentProcess
+        get_cur.restype = ctypes.c_void_p
+        set_prio = kernel32.SetPriorityClass
+        set_prio.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        set_prio.restype = ctypes.c_int
+        set_prio(get_cur(), _BELOW_NORMAL_PRIORITY_CLASS)
     except Exception:
         pass  # best-effort — never fail a worker start over priority
 
