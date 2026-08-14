@@ -131,7 +131,10 @@ def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
         )
     if any(
         x in low
-        for x in ("cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in")
+        for x in (
+            "cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in",
+            "preview unavailable",  # ytdlp_hls soft-gate collapse (bot-gated box)
+        )
     ):
         return (
             "YouTube preview is temporarily restricted. Try again in a few minutes."
