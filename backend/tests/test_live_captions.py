@@ -175,6 +175,10 @@ class _FakePipeline:
 def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     from services import live_captions
 
+    # Loop tests exercise the polling/transcribe path, not the engine warm-up
+    # (a real _parakeet_model() load must never run in unit tests) — the
+    # warm-up has its own dedicated test below.
+    monkeypatch.setattr(live_captions, "_warm_asr", lambda: None)
     monkeypatch.setattr(live_captions, "_resolve_live_master", pipeline.resolve_master)
     monkeypatch.setattr(live_captions, "_fetch", pipeline.fetch)
     monkeypatch.setattr(live_captions, "_decode_audio_bytes", pipeline.decode)
@@ -206,6 +210,8 @@ async def test_captioner_loop_blocks_in_order_and_seen_set_skips_redownloads(mon
         # window start/end are stream-relative (no PDT in the fixture playlists)
         assert block1["start"] == 0.0
         assert block1["end"] == 2.0
+        # no PDT anchor -> no wall-clock latency measurement (key omitted)
+        assert "latency_ms" not in block1
 
         ev2, block2 = await _wait_event(captioner.events)
         assert ev2 == "caption"
@@ -425,6 +431,62 @@ def test_transcribe_window_uses_parakeet_path(monkeypatch):
     assert live_captions._transcribe_window(audio, 3.0) == ""
 
 
+def test_warm_asr_preloads_engine_and_vad_once(monkeypatch):
+    """The worker pre-warms the parakeet model + Silero VAD at start so the
+    first flush is not a 2-6s cold load — both engine pieces load exactly
+    once (a second call hits the engine's own cache)."""
+    from services import archive_transcribe as at
+    from services import live_captions
+
+    calls: list[str] = []
+    monkeypatch.setattr(at, "_parakeet_model", lambda: calls.append("model"))
+    monkeypatch.setattr(at, "_get_vad", lambda: calls.append("vad"))
+    live_captions._warm_asr()
+    assert calls == ["model", "vad"]
+
+
+@pytest.mark.anyio
+async def test_captioner_pdt_flush_carries_latency_ms(monkeypatch):
+    """With a wall-clock origin (playlist PDT), each caption payload carries
+    latency_ms — wall ms since the window's audio completed (the frontend
+    anchors blocks to the video clock, so this trail is the visible lag)."""
+    import time as _time
+    from datetime import datetime, timezone
+
+    pdt = datetime.fromtimestamp(
+        _time.time() - 30, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    playlist = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{pdt}\n"
+        "#EXTINF:1.0,\nseg1.ts\n"
+        "#EXTINF:1.0,\nseg2.ts\n"
+    )
+    pipeline = _FakePipeline([playlist], ["window-1"])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire()
+    try:
+        ev, block = await _wait_event(captioner.events)
+        assert ev == "caption"
+        assert block["text"] == "window-1"
+        # window start anchors to the playlist PDT (wall epoch)
+        assert block["start"] == pytest.approx(_time.time() - 30, abs=5.0)
+        # the flush happened AFTER the window's audio completed — a small,
+        # positive wall latency
+        assert 0 <= block["latency_ms"] < 60_000
+    finally:
+        captioner.release()
+        th = captioner._thread
+        assert th is not None
+        th.join(timeout=3.0)
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
 # ---------------------------------------------------------------------------
 # Endpoints (gate 503 + SSE shape)
 # ---------------------------------------------------------------------------
@@ -493,15 +555,17 @@ async def test_captions_sse_gen_forwards_blocks_and_releases():
     from routers import live as live_router
 
     fake = _FakeCaptioner()
-    fake.events.put_nowait(("caption", {"text": "olá pessoal", "start": 10.0, "end": 13.0}))
+    fake.events.put_nowait(("caption", {"text": "olá pessoal", "start": 10.0, "end": 13.0, "latency_ms": 812}))
     fake.events.put_nowait(("offline", {}))
 
     frames: list[str] = []
     async for frame in live_router._captions_sse_gen(_FakeRequest(), fake):
         frames.append(frame)
 
+    # the full block — text/start/end AND latency_ms — is forwarded verbatim
     assert frames[0] == "event: caption\ndata: " + json.dumps(
-        {"text": "olá pessoal", "start": 10.0, "end": 13.0}, ensure_ascii=False
+        {"text": "olá pessoal", "start": 10.0, "end": 13.0, "latency_ms": 812},
+        ensure_ascii=False,
     ) + "\n\n"
     assert frames[1] == "event: offline\ndata: {}\n\n"
     assert fake.released == 1

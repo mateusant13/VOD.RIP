@@ -105,6 +105,8 @@ async def _run() -> None:
 
     try:
         live_captions._fetch = recording_fetch
+        # e2e drives the LOOP, not the engine — never load the real model.
+        live_captions._warm_asr = lambda: None
         live_captions._resolve_live_master = lambda platform, channel: {
             "url": f"{base}/master.m3u8",
             "headers": {},

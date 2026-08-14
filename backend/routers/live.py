@@ -50,7 +50,7 @@ class LiveDownloadRequest(BaseModel):
 # ---------------------------------------------------------------------------
 #
 # The popup's CC overlay subscribes here. One refcounted LiveCaptioner per
-# (platform, channel) polls the live audio-only HLS rendition, buffers ~3s
+# (platform, channel) polls the live audio-only HLS rendition, buffers ~2s
 # windows and transcribes them with the parakeet engine OFF the asyncio loop
 # (the captioner runs in its own worker thread; caption blocks arrive through
 # the same per-connection queue pattern as the chat SSE). The parakeet gate
