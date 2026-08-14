@@ -31,18 +31,24 @@ Design decisions:
     not 0), slots transcribe jobs whose language is in Parakeet TDT v3's 25
     European languages with sherpa-onnx (2.5-5.2 RTFx on CPU int8 vs
     whisper-large-v3-turbo cpu/int8 at 0.26-0.6, ~0.7 GB less RSS, no
-    silence hallucination — A/B 2026-08-07). Known-other (ja, ...) and
+    silence hallucination — A/B 2026-08-07; the whisper default is now the
+    much smaller 'small', so the gap is even wider). Known-other (ja, ...) and
     unknown languages stay whisper. CUDA-enabled sherpa-onnx wheels
     (>=1.13.x, see requirements.txt) let GPU slots run parakeet with
     provider='cuda', gated on the measured free-VRAM allowance; without a
     CUDA wheel GPU slots are whisper exactly as before. Model auto-downloads
     on first use into the sherpa cache (VODRIP_SHERRPA_CACHE or a
     whisper-cache sibling).
-  * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
-    cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
-    so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
-  * Default model 'large-v3-turbo'; override with env VODRIP_WHISPER_MODEL
-    (e.g. 'freds0/distil-whisper-large-v3-ptbr' or 'small').
+  * Device: _real_gpu_info() — a COMPUTE-level probe (nvidia-smi memory
+    query and/or the CUDA runtime's device count + context init), never
+    adapter names — a Virtual Display Driver / name-spoofed adapter has no
+    CUDA device and resolves to cpu/int8. This machine has an NVIDIA RTX
+    5080 (CUDA works via torch), so real runs are cuda/float16; the CPU
+    path exists for GPU-less hosts.
+  * Whisper fallback model 'small' (parakeet is the primary engine for its
+    26 languages; whisper covers everything else + the parakeet-failure
+    retry). Override with env VODRIP_WHISPER_MODEL
+    (e.g. 'freds0/distil-whisper-large-v3-ptbr').
 
 Opt-in by design: app.py does NOT import this module. Start the worker with
 ``python -m services.archive_transcribe`` or ``start_worker()`` from a launcher.
@@ -72,14 +78,13 @@ from services import archive_db, transcript_fix
 from services.archive_events import detect_events_video, events_enabled
 from services.autostart import background_mode
 from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
-from services.gpu_detect import detect_gpu_vendor
 from services.os_services import _NO_WINDOW
 from services.yt_gate import gate_remaining_sec, youtube_gate_active
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_MODEL = "small"
 SAMPLE_RATE = 16000
 
 # Env knobs (all optional).
@@ -105,11 +110,97 @@ CAPTION_WAIT_RETRY_S = 3600.0
 
 # --- device / compute -----------------------------------------------------
 
+# Real-GPU detection: NEVER trust adapter names. A "Virtual Display Driver"
+# (or any name-spoofed virtual adapter) has no CUDA compute — the probes
+# below ask the driver/runtime for actual devices, and their absence means
+# no real GPU, so every caller keeps the degrade-to-CPU path.
+_REAL_GPU_MIN_VRAM = int(1 * 1024 ** 3)  # below this it is not a compute GPU
+_REAL_GPU_PROBE_TIMEOUT_S = 5.0
+
+
+def _nvidia_smi_vram() -> Optional[tuple[int, int]]:
+    """(total, free) VRAM bytes via nvidia-smi; None when absent/fails.
+
+    nvidia-smi exists only when the NVIDIA driver stack is real — a virtual
+    adapter has no SMI. Same probe style as _gpu_util (subprocess, short
+    timeout, _NO_WINDOW)."""
+    try:
+        out = sp.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=_REAL_GPU_PROBE_TIMEOUT_S,
+            creationflags=_NO_WINDOW,
+        )
+        if out.returncode != 0:
+            return None
+        lines = (out.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        parts = [p.strip() for p in lines[0].split(",")]
+        if len(parts) != 2:
+            return None
+        total_mib, free_mib = int(parts[0]), int(parts[1])
+        return total_mib * 1024 ** 2, free_mib * 1024 ** 2
+    except (OSError, ValueError, sp.TimeoutExpired):
+        return None
+
+
+def _cuda_runtime_vram() -> Optional[tuple[int, int]]:
+    """(total, free) VRAM bytes from the CUDA runtime via nvcuda.dll.
+
+    cudaMemGetInfo forces the PRIMARY CONTEXT on device 0 — the true
+    compute-init test. A fake adapter (no CUDA device) fails
+    cudaGetDeviceCount==0 or the context init, so this returns None and
+    callers see no GPU. Windows-only; POSIX returns None (nvidia-smi
+    covers it there)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        nv = ctypes.WinDLL("nvcuda.dll")
+        count = ctypes.c_int(0)
+        if nv.cudaGetDeviceCount(ctypes.byref(count)) != 0 or count.value <= 0:
+            return None
+        if nv.cudaSetDevice(0) != 0:
+            return None
+        free_b, total_b = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        if nv.cudaMemGetInfo(ctypes.byref(free_b), ctypes.byref(total_b)) != 0:
+            return None
+        return int(total_b.value), int(free_b.value)
+    except (OSError, AttributeError):
+        return None
+
+
+def _real_gpu_info() -> tuple[bool, int, int]:
+    """(present, total_vram_bytes, free_vram_bytes) for a REAL CUDA GPU.
+
+    Both probes are compute-level: the nvidia-smi memory query (the driver's
+    own view) or the CUDA runtime's device count + context init. Either
+    succeeding with total VRAM >= _REAL_GPU_MIN_VRAM -> present. A Virtual
+    Display Driver / name-spoofed adapter fails both -> (False, 0, 0), and
+    every caller keeps the graceful CPU fallback."""
+    smi = _nvidia_smi_vram()
+    if smi is not None:
+        total, free = smi
+    else:
+        rt = _cuda_runtime_vram()
+        if rt is None:
+            return False, 0, 0
+        total, free = rt
+    if total < _REAL_GPU_MIN_VRAM:
+        return False, 0, 0
+    return True, total, free
+
+
 @lru_cache(maxsize=1)
 def _detect_device() -> tuple[str, str]:
-    """(device, compute_type) — nvidia GPU or honest CPU fallback.
+    """(device, compute_type) — real nvidia GPU or honest CPU fallback.
 
     VODRIP_WHISPER_DEVICE=cpu|cuda forces the choice (used by tests/benchmarks).
+    The presence gate is COMPUTE-based (_real_gpu_info), never adapter names:
+    a Virtual Display Driver / name-spoofed adapter has no CUDA device and
+    resolves to CPU here.
     """
     forced = os.environ.get("VODRIP_WHISPER_DEVICE", "").strip().lower()
     if forced:
@@ -118,8 +209,7 @@ def _detect_device() -> tuple[str, str]:
         if forced == "cpu":
             return "cpu", "int8"
         logger.warning("Unknown VODRIP_WHISPER_DEVICE=%r — ignoring", forced)
-    vendor = detect_gpu_vendor()
-    if vendor == "nvidia":
+    if _real_gpu_info()[0]:
         return "cuda", "float16"
     return "cpu", "int8"
 
@@ -162,11 +252,11 @@ _GPU_VRAM_MEDIAN_GAP_S = 10.0
 def _gpu_model_vram_est() -> int:
     """fp16 VRAM estimate (bytes) for the ACTIVE whisper model (name-prefixed).
 
-    large-v3-turbo is the default (~6 GiB); large/distil-large ~10; medium/
-    distil-medium ~5; small ~2; base ~1; tiny ~0.6. Unknown names fall back
-    to 6 GiB (the default model) — conservative for the common case."""
+    small is the default (~2 GiB); large-v3-turbo/large ~6-10; medium/
+    distil-medium ~5; base ~1; tiny ~0.6. Unknown names fall back to the
+    default (2 GiB) — conservative for the common case."""
     name = (model_name() or "").lower()
-    gb = 6.0  # default: large-v3-turbo
+    gb = 2.0  # default: small
     if name.startswith("large-v3-turbo") or name.startswith("distil-large-v3"):
         gb = 6.0
     elif name.startswith("large"):
@@ -328,6 +418,49 @@ def _gpu_util() -> Optional[float]:
         _gpu_util_cache = util if util is not None else 0.0
         _gpu_util_at = now
     return util
+
+
+# GPU sequential-dispatch gate (user requirement): GPU slots process ONE
+# video at a time — batched decode serves one video's windows, videos
+# finish in order, and DIFFERENT videos never interleave on the GPU. The
+# gate is a pool-level claim on (platform, video_id) taken by the first
+# GPU-pinned transcribe thread; any other GPU thread finding it held
+# releases its claim (requeues with a short backoff — the claim SQL then
+# skips the row until next_retry_at) instead of stacking a second video.
+# CPU lanes never touch the gate — they keep claiming their own jobs in
+# parallel. A live-caption session (their reservation) also blocks new GPU
+# dispatch. ponytail: per-process only — cross-process serialization is
+# already covered by the _gpu_held_by_other tasklist gate.
+_gpu_gate_lock = threading.Lock()
+_gpu_gate_video: Optional[tuple[str, str]] = None  # (platform, video_id) on the GPU now
+_GPU_GATE_RECHECK_S = 15.0  # gated claim backoff — a few poll intervals
+
+
+def _gpu_gate_try_acquire(platform: str, video_id: str) -> bool:
+    """Take the GPU gate for (platform, video_id); False when another video
+    is active on the GPU or a live-caption session holds it."""
+    global _gpu_gate_video
+    with _gpu_gate_lock:
+        if _caption_session_active():
+            return False
+        if _gpu_gate_video is not None and _gpu_gate_video != (platform, video_id):
+            return False
+        _gpu_gate_video = (platform, video_id)
+        return True
+
+
+def _gpu_gate_release(platform: str, video_id: str) -> None:
+    """Release the gate if this thread still holds it (only the holder)."""
+    global _gpu_gate_video
+    with _gpu_gate_lock:
+        if _gpu_gate_video == (platform, video_id):
+            _gpu_gate_video = None
+
+
+def _gpu_gate_held() -> bool:
+    """True while some video owns the GPU (a gate attempt would block)."""
+    with _gpu_gate_lock:
+        return _gpu_gate_video is not None
 
 
 # Per-worker peak host-RAM estimates (system RAM, not VRAM). The real peak
@@ -995,8 +1128,8 @@ def _current_model() -> Any:
 
 
 # --- Parakeet lane (sherpa-onnx) ------------------------------------------
-# A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
-# int8 on CPU runs 2.5-5.2 RTFx vs whisper large-v3-turbo cpu/int8 at
+    # A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
+# int8 on CPU runs 2.5-5.2 RTFx vs whisper-large-v3-turbo cpu/int8 at
 # 0.26-0.6 (7-15x), ~0.7 GB less peak RSS, and outputs nothing on silence
 # (no hallucination). GPU: CUDA-enabled sherpa-onnx wheels exist since
 # 1.13.x (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is
@@ -1047,7 +1180,8 @@ _parakeet_cuda_ok: Optional[bool] = None  # CUDA-provider probe (None = unprobed
 
 
 def _parakeet_cuda_available() -> bool:
-    """True when the installed sherpa-onnx is a CUDA build.
+    """True when the installed sherpa-onnx is a CUDA build AND a real GPU
+    with compute is present.
 
     The +cuda wheels (see requirements.txt) bundle onnxruntime's CUDA EP and
     version as ``X.Y.Z+cuda<cuda-ver>.cudnn9``; the plain CPU wheels carry no
@@ -1056,9 +1190,12 @@ def _parakeet_cuda_available() -> bool:
     provider='cuda')`` is the AUTHORITATIVE runtime probe — it raises unless
     the CUDA EP actually initializes, then degrades to CPU and flips this
     flag (ponytail: if k2-fsa ever changes the tag scheme, the construction
-    fallback still keeps behavior correct). Probed once per process and
-    cached; a probe failure means GPU slots stay whisper. Tests/self-check
-    pin ``_parakeet_cuda_ok`` directly so they never import sherpa-onnx."""
+    fallback still keeps behavior correct). The tag alone is NOT enough: a
+    fake adapter (Virtual Display Driver — no CUDA device, no nvidia-smi)
+    must never route GPU work, so the wheel tag is ANDed with the real-GPU
+    compute probe. Probed once per process and cached; a probe failure means
+    GPU slots stay whisper. Tests/self-check pin ``_parakeet_cuda_ok``
+    directly so they never import sherpa-onnx."""
     if not _parakeet_available():
         return False
     global _parakeet_cuda_ok
@@ -1068,7 +1205,7 @@ def _parakeet_cuda_available() -> bool:
 
             _parakeet_cuda_ok = bool(
                 "+cuda" in (getattr(sherpa_onnx, "__version__", "") or "")
-            )
+            ) and _real_gpu_info()[0]
         except Exception:
             _parakeet_cuda_ok = False
     return _parakeet_cuda_ok
@@ -1102,6 +1239,83 @@ def _parakeet_gpu_allowed() -> bool:
     if allowance <= 0:
         return True  # unknown/cold allowance -> trust the provider probe
     return allowance >= _PARAKEET_GPU_VRAM_EST
+
+
+# GPU batched decode (user requirement): decode_streams(streams) decodes a
+# BATCH of the SAME video's speech windows in one call — the 16 GiB card is
+# the point, videos finish sequentially. The batch is sized from the MEASURED
+# free VRAM (fresh cache read) minus the caption-session reservation and a
+# fixed safety margin, clamped [1, _PARAAKEET_BATCH_MAX]; unknown free VRAM
+# degrades to sequential decode (never gamble a batch we cannot size).
+PARAKEET_BATCH_ENV = "VODRIP_PARAAKEET_BATCH"  # optional cap (0/absent = VRAM-derived)
+_PARAAKEET_BATCH_MAX = 32  # clamp ceiling — never more windows per call
+_PARAAKEET_WINDOW_VRAM_EST = int(64 * 1024 ** 2)  # per 30 s window: features + activations (generous)
+_PARAAKEET_BATCH_VRAM_SAFETY = int(512 * 1024 ** 2)  # free VRAM never committed to the batch
+
+
+def _caption_session_active() -> bool:
+    """True when a live-caption session is active.
+
+    Seam to the caption-priority work (WorkerCaptionPriority2): their
+    ``caption_session_active()`` lands in this module; while it returns True
+    the GPU sequential gate refuses new GPU dispatch. Absent (their changes
+    not merged) -> False."""
+    try:
+        return bool(globals().get("caption_session_active", lambda: False)())
+    except Exception:
+        return False
+
+
+def _caption_reserved_vram_bytes() -> int:
+    """GPU bytes the live-caption session reserves (0 when idle).
+
+    Seam to the caption-priority work (WorkerCaptionPriority2): their
+    ``caption_reserved_vram_bytes()`` lands in this module; while active it
+    returns the caption recognizer's footprint, which every VRAM read here
+    subtracts so the archive batch never crowds the caption session.
+    Absent -> 0 — the batch sizes purely on measured free VRAM."""
+    try:
+        return int(globals().get("caption_reserved_vram_bytes", lambda: 0)() or 0)
+    except Exception:
+        return 0
+
+
+def _parakeet_batch_size() -> int:
+    """Windows per decode_streams call on GPU slots, sized from free VRAM.
+
+    budget = fresh-cache free VRAM - caption reservation - parakeet model/
+    arena estimate - safety margin; batch = clamp(budget // per-window est,
+    1, _PARAAKEET_BATCH_MAX). CPU provider -> 1 (the A/B-measured sequential
+    sweet spot — byte-identical to the pre-batch path). Unknown free VRAM
+    (0) -> 1. VODRIP_PARAAKEET_BATCH caps the result (0/absent = VRAM-
+    derived)."""
+    if _parakeet_provider() != "cuda":
+        return 1
+    now = time.monotonic()
+    with _vram_lock:
+        fresh = (
+            _vram_free_at
+            and now - _vram_free_at < _GPU_VRAM_MEDIAN_GAP_S * _GPU_VRAM_MEDIAN_SAMPLES
+        )
+        free = _vram_free_bytes if fresh else 0
+    if free <= 0:
+        return 1
+    budget = (
+        free
+        - _caption_reserved_vram_bytes()
+        - _PARAKEET_GPU_VRAM_EST
+        - _PARAAKEET_BATCH_VRAM_SAFETY
+    )
+    if budget <= 0:
+        return 1
+    try:
+        cap = int(os.environ.get(PARAKEET_BATCH_ENV, "0") or "0")
+    except ValueError:
+        cap = 0
+    batch = budget // _PARAAKEET_WINDOW_VRAM_EST
+    if cap > 0:
+        batch = min(batch, cap)
+    return max(1, min(batch, _PARAAKEET_BATCH_MAX))
 
 
 def _parakeet_cache_dir() -> Path:
@@ -1234,7 +1448,7 @@ def _job_engine(language: Optional[str]) -> str:
     """Engine for THIS job on the calling lane.
 
     TASK9: parakeet is the DEFAULT engine — every language the lane can run
-    through sherpa, including UNKNOWN (None) — and whisper large-v3-turbo is
+    through sherpa, including UNKNOWN (None) — and whisper small is
     the fallback, used ONLY when (a) the current thread's job override says
     whisper (user forced asr_engine='whisper', or a parakeet run failed and
     _process_job is retrying it), (b) the language is one parakeet cannot do
@@ -1421,31 +1635,31 @@ def _transcribe_batch_parakeet(
     language: Optional[str],
     *,
     clip_offsets: Optional[list[float]] = None,
+    batch_size: int = 1,
 ) -> list[tuple[list[dict], Optional[str]]]:
     """Decode [start,end] clips with the sherpa-onnx parakeet recognizer.
 
-    One OfflineStream per clip (recognizers are stateless per stream; the
-    A/B measured 2-stream concurrency at only +18% — CPU-bound — so clips
-    decode sequentially). Segments carry absolute video timestamps and the
-    same JSON shape _transcribe_batch produces: one segment per clip with
-    word-level timestamps. An empty transcript (silence -> no words — the
-    parakeet no-hallucination behavior) yields no segment for that clip.
+    One OfflineStream per clip. batch_size > 1 (GPU slots) decodes the clips
+    in batches via ``decode_streams(streams)`` — a single call over the
+    batch, sized from free VRAM (see _parakeet_batch_size) — so the 16 GiB
+    card is kept busy on ONE video's windows instead of one stream per call.
+    The recognizer's per-stream results map 1:1 to the input stream order,
+    so the returned list is in the same order as ``chunks`` and the
+    per-clip insert/manifest/resume contract is unchanged. batch_size 1 (the
+    CPU default) keeps the legacy sequential decode_stream loop byte-identical.
+
+    Segments carry absolute video timestamps and the same JSON shape
+    _transcribe_batch produces: one segment per clip with word-level
+    timestamps. An empty transcript (silence -> no words — the parakeet
+    no-hallucination behavior) yields no segment for that clip.
     ponytail: whisper splits segments on its own sentence boundaries; here
     one VAD chunk is one segment. Upgrade path: split a segment at word
     gaps > 1 s if the UI ever needs finer granularity."""
-    out: list[tuple[list[dict], Optional[str]]] = []
-    for i, (cs, ce) in enumerate(chunks):
-        base = 0.0 if clip_offsets is None else clip_offsets[i]
-        s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
-        clip = audio[s0:s1]
-        stream = rec.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, clip)
-        rec.decode_stream(stream)
+    def _clip_items(stream: Any, cs: float, ce: float, base: float) -> list[dict]:
         res = stream.result
         text = (res.text or "").strip()
         if not text:
-            out.append(([], language))
-            continue
+            return []
         words = _parakeet_words(
             getattr(res, "tokens", []) or [],
             getattr(res, "timestamps", []) or [],
@@ -1459,7 +1673,7 @@ def _transcribe_batch_parakeet(
         # clip's speech end and clip-relative word times.
         clip_start = cs + base
         last_word_end = (words[-1]["end"] if words else float(ce - cs)) + clip_start
-        items = [{
+        return [{
             "start_sec": round(clip_start, 3),
             "end_sec": round(min(ce + base, last_word_end + 0.3), 3),
             "text": text,
@@ -1469,7 +1683,32 @@ def _transcribe_batch_parakeet(
                 for w in words
             ],
         }]
-        out.append((items, language))
+
+    out: list[tuple[list[dict], Optional[str]]] = []
+    if batch_size > 1:
+        # Batched GPU path: decode_streams over sub-batches; results are
+        # read per stream IN INPUT ORDER, so timestamps stay monotonic.
+        for i in range(0, len(chunks), batch_size):
+            sub = chunks[i:i + batch_size]
+            streams = []
+            for j, (cs, ce) in enumerate(sub):
+                s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
+                stream = rec.create_stream()
+                stream.accept_waveform(SAMPLE_RATE, audio[s0:s1])
+                streams.append(stream)
+            rec.decode_streams(streams)
+            for j, (cs, ce) in enumerate(sub):
+                base = 0.0 if clip_offsets is None else clip_offsets[i + j]
+                out.append((_clip_items(streams[j], cs, ce, base), language))
+        return out
+    for i, (cs, ce) in enumerate(chunks):
+        base = 0.0 if clip_offsets is None else clip_offsets[i]
+        s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
+        clip = audio[s0:s1]
+        stream = rec.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, clip)
+        rec.decode_stream(stream)
+        out.append((_clip_items(stream, cs, ce, base), language))
     return out
 
 
@@ -2919,6 +3158,14 @@ def _transcribe_audio_source(
     ci = 0
     n_chunks = len(chunks)
     twin_won = False  # higher-priority twin transcribed mid-run — abort
+    # Per-call decode batch: parakeet on GPU slots sizes decode_streams
+    # from free VRAM (one run == one batched call); every other lane keeps
+    # the legacy _batch_size() run grouping — byte-identical to pre-batch
+    # runs. batch_size 1 (CPU / unknown VRAM) selects the legacy sequential
+    # decode_stream loop inside _transcribe_batch_parakeet.
+    parakeet_batch = _parakeet_batch_size() if engine == "parakeet" else 0
+    engine_batch = parakeet_batch if parakeet_batch > 1 else _batch_size()
+    engine_kwargs = {"batch_size": parakeet_batch} if engine == "parakeet" else {}
     while ci < n_chunks:
         cs, ce = chunks[ci]
         if ci not in missing_set:
@@ -2928,7 +3175,7 @@ def _transcribe_audio_source(
         # Batch consecutive missing clips into one GPU call; resume gaps only
         # shrink the run, never break the per-clip insert/manifest contract.
         run: list[tuple[int, tuple[float, float]]] = []
-        while ci < n_chunks and ci in missing_set and len(run) < _batch_size():
+        while ci < n_chunks and ci in missing_set and len(run) < engine_batch:
             run.append((ci, chunks[ci]))
             ci += 1
         batch_fn = _transcribe_batch_parakeet if engine == "parakeet" else _transcribe_batch
@@ -2936,9 +3183,12 @@ def _transcribe_audio_source(
             batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
             batch_out = batch_fn(
                 model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
+                **engine_kwargs,
             )
         else:
-            batch_out = batch_fn(model, audio, [c for _, c in run], language)
+            batch_out = batch_fn(
+                model, audio, [c for _, c in run], language, **engine_kwargs,
+            )
         for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
             if detected_lang is None and detected:
                 detected_lang = detected  # first batch's detection wins
@@ -3419,6 +3669,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
     # P2-4 retry cache (see _run_transcribe): the audio download functions
     # stash the wav path + owner dir here; the job-level finally releases it.
     audio_stash: dict = {}
+    gpu_gate_held = False  # this thread holds the GPU sequential gate
     if multi:
         _multi_tls.active = True
     try:
@@ -3528,6 +3779,42 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "skipped": "dedupe-transcribed",
             }
 
+        # GPU sequential gate: one video at a time on the GPU. A GPU-pinned
+        # thread finding another video active (or a live-caption session
+        # holding the GPU) releases its claim — requeue with a short backoff
+        # so the claim SQL skips the row until next_retry_at instead of
+        # hot-looping. The next video drains once the active one completes;
+        # queue priority (user kicks at 100-200) still wins because claims
+        # stay ordered priority DESC. CPU-pinned threads and non-transcribe
+        # kinds never touch the gate — CPU lanes keep draining in parallel.
+        _pin = _thread_pin()
+        if job.get("kind") == "transcribe" and _pin is not None and _pin[0] == "cuda":
+            if not _gpu_gate_try_acquire(platform, video_id):
+                archive_db.execute(
+                    "UPDATE archive_jobs SET status='queued', error=?, progress=0, "
+                    "updated_at=?, heartbeat=?, next_retry_at=? "
+                    "WHERE id=? AND status='running'",
+                    (
+                        "GPU sequential gate — another video is transcribing "
+                        "on the GPU",
+                        _now_iso(), _now_iso(),
+                        (datetime.now(timezone.utc) + timedelta(seconds=_GPU_GATE_RECHECK_S))
+                        .isoformat(timespec="seconds"),
+                        job_id,
+                    ),
+                )
+                logger.info(
+                    "transcribe job %s (%s/%s) requeued: GPU sequential gate",
+                    job_id, platform, video_id,
+                )
+                return {
+                    "job_id": job_id,
+                    "platform": platform,
+                    "video_id": video_id,
+                    "requeued": "gpu-gate",
+                }
+            gpu_gate_held = True
+
         _last_progress = [0.0]
 
         def _progress(done: float, total: float, _ci: int, _n: int) -> None:
@@ -3614,7 +3901,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     "requeued": "youtube-gate",
                 }
             except Exception as exc:
-                # TASK9: whisper large-v3-turbo is the fallback when parakeet
+                # TASK9: whisper (small default) is the fallback when parakeet
                 # itself fails (decode error, recognizer crash) — retry the SAME
                 # job once with whisper before giving up. Terminal failures
                 # (missing archive file, yt-dlp download error) are NOT retried:
@@ -3700,6 +3987,8 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         # possible retry — release it here if no retry consumed it.
         if audio_stash.get("dir"):
             shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
+        if gpu_gate_held:
+            _gpu_gate_release(platform, video_id)
         if multi:
             _multi_tls.active = False
 
@@ -3938,7 +4227,7 @@ def _gpu_autoinstall_needed() -> bool:
         return False
     if os.environ.get(PARAKEET_ENV, "1").strip() == "0":
         return False
-    if detect_gpu_vendor() != "nvidia":
+    if not _real_gpu_info()[0]:  # compute probe — never trust adapter names
         return False
     try:
         import sherpa_onnx
@@ -4318,3 +4607,80 @@ finally:
     else:
         os.environ[PARAKEET_ENV] = _saved_penv
     shutil.rmtree(_scratch_sherpa, ignore_errors=True)
+
+# real-GPU detection: a fake adapter (no nvidia-smi, no CUDA runtime
+# device) must read as NO GPU; a real compute probe (>= 1 GiB total) is
+# present — pure probes patched, no subprocess.
+_saved_smi, _saved_rt = _nvidia_smi_vram, _cuda_runtime_vram
+try:
+    _nvidia_smi_vram = lambda: None
+    _cuda_runtime_vram = lambda: None
+    assert _real_gpu_info() == (False, 0, 0), (
+        "a fake adapter (no compute probe) must not look like a GPU"
+    )
+    _nvidia_smi_vram = lambda: (int(8 * 1024 ** 3), int(4 * 1024 ** 3))
+    assert _real_gpu_info() == (True, int(8 * 1024 ** 3), int(4 * 1024 ** 3)), (
+        "a real SMI probe must report the GPU present"
+    )
+    _nvidia_smi_vram = lambda: (int(512 * 1024 ** 2), int(400 * 1024 ** 2))
+    assert _real_gpu_info() == (False, 0, 0), (
+        "sub-1 GiB total VRAM is not a compute GPU"
+    )
+finally:
+    _nvidia_smi_vram = _saved_smi
+    _cuda_runtime_vram = _saved_rt
+
+# parakeet GPU batch size: VRAM-derived minus the caption reservation,
+# clamped [1, 32]; the CPU provider and unknown free VRAM stay sequential.
+_saved_bs_prov, _saved_bs_env = _parakeet_provider, os.environ.get(PARAKEET_BATCH_ENV)
+_saved_bs_vram = (_vram_free_bytes, _vram_free_at)
+try:
+    _parakeet_provider = lambda: "cuda"
+    _vram_free_bytes = int(8 * 1024 ** 3)
+    _vram_free_at = time.monotonic()
+    os.environ.pop(PARAKEET_BATCH_ENV, None)
+    _bs_exp = (
+        _vram_free_bytes
+        - _caption_reserved_vram_bytes()
+        - _PARAKEET_GPU_VRAM_EST
+        - _PARAAKEET_BATCH_VRAM_SAFETY
+    ) // _PARAAKEET_WINDOW_VRAM_EST
+    assert _parakeet_batch_size() == max(1, min(_bs_exp, _PARAAKEET_BATCH_MAX)), (
+        "GPU batch must be derived from free VRAM"
+    )
+    _parakeet_provider = lambda: "cpu"
+    assert _parakeet_batch_size() == 1, (
+        "the CPU provider must keep sequential decode"
+    )
+    _parakeet_provider = lambda: "cuda"
+    _vram_free_bytes = 0
+    assert _parakeet_batch_size() == 1, (
+        "unknown free VRAM must not gamble a batch"
+    )
+    os.environ[PARAKEET_BATCH_ENV] = "4"
+    _vram_free_bytes = int(16 * 1024 ** 3)
+    assert _parakeet_batch_size() == 4, "the env cap must win over the estimate"
+finally:
+    _parakeet_provider = _saved_bs_prov
+    _vram_free_bytes, _vram_free_at = _saved_bs_vram
+    if _saved_bs_env is None:
+        os.environ.pop(PARAKEET_BATCH_ENV, None)
+    else:
+        os.environ[PARAKEET_BATCH_ENV] = _saved_bs_env
+
+# GPU sequential gate: one video at a time; release frees the gate.
+assert _gpu_gate_try_acquire("twitch", "v1") is True, "the first video takes the gate"
+assert _gpu_gate_try_acquire("twitch", "v2") is False, (
+    "a second video must not stack on the GPU"
+)
+assert _gpu_gate_try_acquire("kick", "v3") is False, (
+    "a different platform is blocked too"
+)
+assert _gpu_gate_try_acquire("twitch", "v1") is True, (
+    "the holder re-acquires its own video"
+)
+_gpu_gate_release("twitch", "v1")
+assert _gpu_gate_try_acquire("kick", "v2") is True, (
+    "release must free the gate for the next video"
+)
+_gpu_gate_release("kick", "v2")
