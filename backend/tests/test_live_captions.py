@@ -182,7 +182,7 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     # would create the live archive file in unit tests); the translation
     # path itself has its own tests in test_caption_translate.py.
     monkeypatch.setattr(live_captions, "_warm_asr", lambda: None)
-    monkeypatch.setattr(live_captions, "_warm_translate", lambda evidence: None)
+    monkeypatch.setattr(live_captions, "_warm_translate", lambda evidence, target_family=None: None)
     monkeypatch.setattr(live_captions, "_resolve_evidence", lambda platform, channel: None)
     # _maybe_translate must never touch the real SLID/NLLB models in unit
     # tests (they are present on dev hosts — the detect_language call would
@@ -696,6 +696,106 @@ async def test_available_endpoint_shape(monkeypatch):
         res = await client.get("/api/live/captions/available", params={"platform": "kick", "channel": "srdoglol"})
         assert res.status_code == 200
         assert res.json() == {"available": False, "reason": "model missing"}
+
+
+@pytest.mark.anyio
+async def test_captions_stream_lang_param_reaches_captioner(monkeypatch):
+    """?lang=es on the SSE request flows into captioner.acquire — the
+    per-session translate-target override. Absent lang -> acquire(None)
+    (app-language default); a bad lang is rejected 400 before any stream."""
+    from routers import live as live_router
+    from services import live_captions
+
+    monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
+    acquired: list = []
+
+    class _StubCaptioner:
+        events = None
+
+        def acquire(self, lang=None):
+            acquired.append(lang)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(live_captions, "get_captioner", lambda p, c, loop: _StubCaptioner())
+
+    async def _fake_gen(request, captioner):
+        return
+        yield  # pragma: no cover — keeps this an async generator
+
+    monkeypatch.setattr(live_router, "_captions_sse_gen", _fake_gen)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg", "lang": "es"})
+        assert res.status_code == 200
+        assert acquired == ["es"]
+        res = await client.get("/api/live/captions", params={"platform": "kick", "channel": "srdoglol"})
+        assert res.status_code == 200
+        assert acquired == ["es", None]
+        res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg", "lang": "de"})
+        assert res.status_code == 400
+        assert "lang" in res.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_captioner_acquire_lang_sets_target_family(monkeypatch):
+    """acquire('es') stores the session target on the captioner; a fresh
+    pipeline cycle (refcount 0->1) without lang resets to the app default
+    (None), so the worker never inherits a stale override."""
+    pipeline = _FakePipeline([], [])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire("es")
+    assert captioner._target_family == "es"
+    captioner.release()
+    captioner._thread.join(timeout=3.0)
+
+    # A later subscriber without lang starts a fresh worker with the default.
+    captioner.acquire()
+    assert captioner._target_family is None
+    captioner.release()
+    captioner._thread.join(timeout=3.0)
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
+@pytest.mark.anyio
+async def test_maybe_translate_uses_session_target_family(monkeypatch):
+    """_maybe_translate translates into the captioner's ?lang= override
+    (per-session selector) instead of the app language when one is set."""
+    from services import caption_translate as ct
+    from services import live_captions
+
+    monkeypatch.setattr(ct, "enabled", lambda: True)
+    monkeypatch.setattr(ct, "nllb_dir", lambda: object())  # truthy — models "present"
+    monkeypatch.setattr(ct, "slid_dir", lambda: None)
+    monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
+    monkeypatch.setattr(ct, "translate", lambda text, family: f"[{family}] {text}")
+    gates: list = []
+    monkeypatch.setattr(
+        ct, "needs_translation",
+        lambda evidence, app, votes: (gates.append(app), True)[1],
+    )
+
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", asyncio.get_running_loop(),
+    )
+    captioner._evidence_family = "en"  # stream evidence — different from both targets
+    captioner._target_family = "es"  # the user's in-player selection
+    out, translated = live_captions._maybe_translate(captioner, "hello", None)
+    assert translated is True
+    assert out == "[es] hello"
+    assert gates == ["es"]
+
+    # Without an override the app language drives the target.
+    captioner._target_family = None
+    out, translated = live_captions._maybe_translate(captioner, "hello", None)
+    assert out == "[pt] hello"
+    assert gates == ["es", "pt"]
 
 
 class _FakeRequest:

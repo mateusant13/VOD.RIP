@@ -811,7 +811,7 @@ describe('LivePlayerPopup live captions', () => {
     expect(FakeEventSource.instances[0].closed).toBe(true);
   });
 
-  it('hides the overlay and stops after an offline event (no reconnect)', async () => {
+  it('reconnects after an offline event (bounded backoff) and recovers captions without user action', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
@@ -820,12 +820,120 @@ describe('LivePlayerPopup live captions', () => {
     act(() => { es.fire('caption', JSON.stringify({ text: 'última fala', start: 0, end: 3 })); });
     expect(screen.getByText('última fala')).toBeTruthy();
 
+    // Pipeline failure → the connection closes; the CC cluster STAYS and a
+    // bounded backoff reconnects — captions never die silently.
     act(() => { es.fire('offline', '{}'); });
     expect(es.closed).toBe(true);
-    await waitFor(() => expect(screen.queryByText('última fala')).toBeNull());
-    // Availability cleared → no CC button (and no further EventSources).
+    expect(screen.getByText('última fala')).toBeTruthy();
+    expect(screen.queryByTitle('Hide captions')).toBeTruthy();
+
+    // ~1.5s later the retry re-probes /available (mockFetch: true) and opens
+    // a fresh EventSource — a fresh connection restarts the backend captioner.
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2), { timeout: 4000 });
+    const es2 = FakeEventSource.instances[1];
+    expect(es2.closed).toBe(false);
+    act(() => { es2.fire('caption', JSON.stringify({ text: 'recuperada', start: 4, end: 7 })); });
+    // Anchored to the video clock: window [4,7] is due at t=4 (origin 2.75).
+    expect(screen.queryByText('recuperada')).toBeNull();
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => { video.currentTime = 4; fireEvent(video, new Event('timeupdate')); });
+    expect(screen.getByText('recuperada')).toBeTruthy();
+    expect(screen.queryByText('última fala')).toBeNull();
+  });
+
+  it('gives up after the bounded retry budget — no endless reconnect storm, CC hides', async () => {
+    vi.useFakeTimers();
+    try {
+      mockFetch();
+      renderPopup();
+      // Flush the session + availability microtask chain (fetch mock →
+      // session resolve → probe → captionsAvailable → SSE).
+      for (let i = 0; i < 30 && FakeEventSource.instances.length === 0; i++) {
+        await act(async () => {});
+      }
+      expect(FakeEventSource.instances).toHaveLength(1);
+      expect(screen.queryByTitle('Hide captions')).toBeTruthy();
+
+      const fail = (i: number) => act(() => { FakeEventSource.instances[i].fire('offline', '{}'); });
+      const advance = (ms: number) => act(async () => { vi.advanceTimersByTime(ms); await Promise.resolve(); });
+
+      // Attempt 1 → 1.5s → probe true → reconnect.
+      fail(0);
+      await advance(1500);
+      await act(async () => {});
+      expect(FakeEventSource.instances).toHaveLength(2);
+      // Attempt 2 → 3s → reconnect.
+      fail(1);
+      await advance(3000);
+      await act(async () => {});
+      expect(FakeEventSource.instances).toHaveLength(3);
+      // Attempt 3 → 6s → reconnect.
+      fail(2);
+      await advance(6000);
+      await act(async () => {});
+      expect(FakeEventSource.instances).toHaveLength(4);
+      // Attempt 4 exceeds the budget → give up: the CC cluster hides and no
+      // further EventSource is created (no endless reconnect storm).
+      fail(3);
+      await act(async () => {});
+      expect(screen.queryByTitle('Hide captions')).toBeNull();
+      expect(FakeEventSource.instances).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries the availability probe (bounded) so a transient failure at open never kills the CC cluster', async () => {
+    let fail = 1; // first probe fails, the 1.5s re-probe succeeds
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/preview/live')) {
+        return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        if (fail > 0) {
+          fail -= 1;
+          throw new Error('network down');
+        }
+        return new Response(JSON.stringify({ available: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    // No CC button while the probe keeps failing…
     expect(screen.queryByTitle('Hide captions')).toBeNull();
-    expect(FakeEventSource.instances).toHaveLength(1);
+    // …but the bounded re-probe succeeds → the cluster appears WITHOUT any
+    // user interaction (captions "not activating until manual interaction").
+    await waitFor(() => expect(screen.queryByTitle('Hide captions')).toBeTruthy(), { timeout: 4000 });
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+  });
+
+  it('sends ?lang= on the caption SSE from the in-player selector and persists the choice', async () => {
+    localStorage.removeItem('vodrip.live.captionLang');
+    mockFetch();
+    const view = renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    // Default: no lang param — the backend follows the app language.
+    expect(FakeEventSource.instances[0].url).not.toContain('lang=');
+
+    // The selector lives in the player, next to the CC toggle (same cluster).
+    fireEvent.click(screen.getByTitle('Caption language'));
+    fireEvent.click(screen.getByText('Español'));
+    // The choice reconnects the caption stream with ?lang=es.
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    expect(FakeEventSource.instances[1].url).toContain('lang=es');
+    expect(localStorage.getItem('vodrip.live.captionLang')).toBe('es');
+
+    // Persists across popup reopen.
+    view.unmount();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(3));
+    expect(FakeEventSource.instances[2].url).toContain('lang=es');
+    expect(screen.getByTitle('Caption language').textContent).toBe('ES');
   });
 
   it('shows no CC button or overlay when the parakeet gate reports unavailable', async () => {
@@ -996,7 +1104,7 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.getByText('utc')).toBeTruthy();
   });
 
-  it('A+ / A− resize the caption overlay text, clamped at the 14px floor', async () => {
+  it('drag grip resizes the caption overlay text, clamped at the 14px floor (no A−/A+ buttons)', async () => {
     localStorage.removeItem('vodrip.live.captionFontSize');
     mockFetch();
     renderPopup();
@@ -1006,29 +1114,33 @@ describe('LivePlayerPopup live captions', () => {
     act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
+    // The A−/A+ buttons are GONE — resize is mouse-drag only (the grip).
+    expect(screen.queryByTitle('Smaller captions')).toBeNull();
+    expect(screen.queryByTitle('Larger captions')).toBeNull();
+    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
     // Default matches the previous fixed `text-sm` (14px).
     expect(overlayText().style.fontSize).toBe('14px');
 
-    // A− at the floor is disabled and a no-op.
-    expect((screen.getByTitle('Smaller captions') as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByTitle('Smaller captions'));
+    // Dragging UP past the floor clamps at 14px (2px of drag per 1px of font).
+    fireEvent.pointerDown(grip, { clientY: 100 });
+    fireEvent.pointerMove(grip, { clientY: 80 });
     expect(overlayText().style.fontSize).toBe('14px');
 
-    // A+ grows in 2px steps…
-    fireEvent.click(screen.getByTitle('Larger captions'));
+    // Dragging DOWN grows in the old 2px-step feel: 4px drag → 16px…
+    fireEvent.pointerMove(grip, { clientY: 104 });
     expect(overlayText().style.fontSize).toBe('16px');
-    fireEvent.click(screen.getByTitle('Larger captions'));
+    // …8px drag → 18px…
+    fireEvent.pointerMove(grip, { clientY: 108 });
     expect(overlayText().style.fontSize).toBe('18px');
-
-    // …A− shrinks back…
-    fireEvent.click(screen.getByTitle('Smaller captions'));
+    // …dragging back up shrinks…
+    fireEvent.pointerMove(grip, { clientY: 104 });
     expect(overlayText().style.fontSize).toBe('16px');
-    fireEvent.click(screen.getByTitle('Smaller captions'));
+    fireEvent.pointerMove(grip, { clientY: 100 });
     expect(overlayText().style.fontSize).toBe('14px');
-
-    // …and clamps: another A− stays at the floor.
-    fireEvent.click(screen.getByTitle('Smaller captions'));
+    // …and clamps: further drag stays at the floor.
+    fireEvent.pointerMove(grip, { clientY: 90 });
     expect(overlayText().style.fontSize).toBe('14px');
+    fireEvent.pointerUp(grip, { clientY: 90 });
   });
 
   it('caption clamp scales with the font size (line-clamp-2 → -3 → -4)', async () => {
@@ -1041,17 +1153,28 @@ describe('LivePlayerPopup live captions', () => {
     act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
+    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
+    // Each drag starts FROM the current size; 2px of drag per 1px of font.
+    const dragTo = (from: number, to: number) => {
+      fireEvent.pointerDown(grip, { clientY: from });
+      fireEvent.pointerMove(grip, { clientY: to });
+      fireEvent.pointerUp(grip, { clientY: to });
+    };
     // 14px (default) → 2 lines; ≥24px → 3; ≥34px → 4 — a fixed 2-line clamp
     // at 48px would truncate captions to a few words.
     expect(overlayText().className).toContain('line-clamp-2');
-    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions')); // 24px
+    dragTo(0, 20); // 14 + 10 = 24px
+    expect(overlayText().style.fontSize).toBe('24px');
     expect(overlayText().className).toContain('line-clamp-3');
-    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions')); // 34px
+    dragTo(20, 60); // 24 + 20 = 44px
+    expect(overlayText().style.fontSize).toBe('44px');
     expect(overlayText().className).toContain('line-clamp-4');
     // Shrinking back restores the smaller clamps.
-    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions')); // 24px
+    dragTo(60, 20); // 44 − 10 = 24px
+    expect(overlayText().style.fontSize).toBe('24px');
     expect(overlayText().className).toContain('line-clamp-3');
-    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions')); // 14px
+    dragTo(20, 0); // 24 − 10 = 14px
+    expect(overlayText().style.fontSize).toBe('14px');
     expect(overlayText().className).toContain('line-clamp-2');
   });
 
@@ -1108,7 +1231,7 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.queryByText('bloco-3')).toBeNull();
   });
 
-  it('A+ clamps at the 48px ceiling and persists the choice', async () => {
+  it('drag clamps at the 48px ceiling and persists the choice', async () => {
     localStorage.removeItem('vodrip.live.captionFontSize');
     mockFetch();
     renderPopup();
@@ -1118,16 +1241,17 @@ describe('LivePlayerPopup live captions', () => {
     act(() => { es.fire('caption', JSON.stringify({ text: 'gigante', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
-    // 17 × A+ from 14 reaches exactly 48px (14 + 17·2).
-    for (let i = 0; i < 17; i++) fireEvent.click(screen.getByTitle('Larger captions'));
+    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
+    // 14 + 68/2 = 48px — a huge drag clamps at the ceiling (the old 17 × A+).
+    fireEvent.pointerDown(grip, { clientY: 0 });
+    fireEvent.pointerMove(grip, { clientY: 200 });
     expect(overlayText().style.fontSize).toBe('48px');
-
-    // At the ceiling the button is disabled and a further click is a no-op.
-    expect((screen.getByTitle('Larger captions') as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByTitle('Larger captions'));
+    // Further drag is a no-op at the ceiling.
+    fireEvent.pointerMove(grip, { clientY: 400 });
     expect(overlayText().style.fontSize).toBe('48px');
+    fireEvent.pointerUp(grip, { clientY: 400 });
 
-    // Persisted to localStorage.
+    // Persisted to localStorage (the save effect writes every change).
     expect(localStorage.getItem('vodrip.live.captionFontSize')).toBe('48');
   });
 
@@ -1693,9 +1817,16 @@ describe('LivePlayerPopup live quality policy', () => {
     return hls;
   }
 
-  it('pins SOURCE on MANIFEST_PARSED with one player; a second player caps it to ≤480p; closing restores SOURCE', async () => {
+  it('pins SOURCE once the buffer is deep; a second player caps it to ≤480p; closing restores SOURCE', async () => {
     const hls = await mountLiveWithLevels();
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    // The pin is DEFERRED at MANIFEST_PARSED: applying the policy level
+    // while the live-edge buffer is ~1-2s deep would stall playback on the
+    // level switch (the ~3s buffering report). ABR stays on the fast low
+    // level until the forward buffer crosses the safety cushion.
+    expect(hls.currentLevel).toBe(-1);
+    expect(hls.autoLevelEnabled).toBe(true);
+    await act(async () => { hls.trigger('fragBuffered', { frag: { start: 10, duration: 2, programDateTime: 1_000_000 } }); });
     // Single player → SOURCE (highest bitrate = 1080p), auto ABR off (fixed level).
     expect(hls.currentLevel).toBe(2);
     expect(hls.autoLevelEnabled).toBe(false);
@@ -1712,13 +1843,13 @@ describe('LivePlayerPopup live quality policy', () => {
     expect(hls.autoLevelEnabled).toBe(false);
   });
 
-  it('re-applies at MANIFEST_PARSED when the second player opened before the manifest parsed', async () => {
+  it('re-applies at the buffer-arm when the second player opened before the manifest parsed', async () => {
     mockFetchWithLiveSrc();
     renderPopup();
     await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     // Second player opens while levels are still empty — the count-change
-    // apply no-ops; the parse-time apply must read the CURRENT count.
+    // apply no-ops; the buffer-arm apply must read the CURRENT count.
     let unsub2: (() => void) | undefined;
     await act(async () => { unsub2 = registerLivePlayer(() => {}); });
     expect(hls.currentLevel).toBe(-1); // nothing parsed yet, nothing applied
@@ -1728,10 +1859,36 @@ describe('LivePlayerPopup live quality policy', () => {
       { height: 1080, bitrate: 6_000_000 },
     ];
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls.currentLevel).toBe(-1); // still warming up — no level switch
+    await act(async () => { hls.trigger('fragBuffered', { frag: { start: 10, duration: 2, programDateTime: 1_000_000 } }); });
     expect(hls.currentLevel).toBe(1); // multi → 480
     expect(hls.autoLevelEnabled).toBe(false);
     await act(async () => { unsub2!(); });
     expect(hls.currentLevel).toBe(2); // back to single → source
+  });
+
+  it('does not pin while the forward buffer stays shallow (no mid-start level switch)', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    hls.levels = [
+      { height: 360, bitrate: 1_000_000 },
+      { height: 720, bitrate: 3_000_000 },
+      { height: 1080, bitrate: 6_000_000 },
+    ];
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    expect(hls.currentLevel).toBe(-1);
+
+    // A shallow first fragment (2s buffered at t=0) does not arm the pin.
+    await act(async () => { hls.trigger('fragBuffered', { frag: { start: 0, duration: 2, programDateTime: 1_000_000 } }); });
+    expect(hls.currentLevel).toBe(-1);
+    expect(hls.autoLevelEnabled).toBe(true);
+
+    // Once the forward buffer crosses 8s the pin lands (SOURCE, one player).
+    await act(async () => { hls.trigger('fragBuffered', { frag: { start: 10, duration: 2, programDateTime: 1_000_000 } }); });
+    expect(hls.currentLevel).toBe(2);
+    expect(hls.autoLevelEnabled).toBe(false);
   });
 
   it('count changes before the manifest parses are safe no-ops', async () => {

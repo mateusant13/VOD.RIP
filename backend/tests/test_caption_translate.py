@@ -307,6 +307,7 @@ def _captioner():
     c.platform = "twitch"
     c.channel = "srdogg"
     c._evidence_family = None
+    c._target_family = None  # no per-session ?lang= override → app language
     c._lang_votes = collections.deque(maxlen=ct.SLID_VOTE_SPAN)
     return c
 
