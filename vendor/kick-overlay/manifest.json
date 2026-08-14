@@ -1,16 +1,16 @@
 {
-  "name": "Kick Overlay",
-  "description": "Ad-free Twitch: when a streamer is live on Kick or YouTube too, plays their real full-HD stream over the Twitch player — Twitch ads become invisible and inaudible. Toggle from the toolbar.",
-  "version": "0.7.6",
-  "manifest_version": 3,
-  "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-  },
-  "permissions": [
-    "storage",
-    "activeTab",
-    "declarativeNetRequest"
-  ],
+ "name": "Kick Overlay",
+ "description": "Ad-free Twitch: when a streamer is live on Kick or YouTube too, plays their real full-HD stream over the Twitch player — Twitch ads become invisible and inaudible. Toggle from the toolbar.",
+ "version": "0.7.7",
+ "manifest_version": 3,
+ "content_security_policy": {
+  "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+ },
+ "permissions": [
+  "storage",
+  "activeTab",
+  "declarativeNetRequest"
+ ],
  "host_permissions": [
   "https://www.twitch.tv/*",
   "https://live-video.net/*",
@@ -18,53 +18,53 @@
   "https://www.youtube.com/*",
   "https://*.googlevideo.com/*"
  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "player.html"
-      ],
-      "matches": [
-        "https://www.twitch.tv/*"
-      ]
-    }
-  ],
-  "declarative_net_request": {
-    "rule_resources": [
-      {
-        "id": "ko-aca",
-        "enabled": true,
-        "path": "rules.json"
-      }
-    ]
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://www.twitch.tv/*"
-      ],
-      "js": [
-        "content.js"
-      ],
-      "run_at": "document_idle"
-    }
-  ],
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "Kick Overlay",
-    "default_icon": {
-      "16": "images/icon16.png",
-      "32": "images/icon32.png",
-      "48": "images/icon48.png",
-      "128": "images/icon128.png"
-    }
-  },
-  "icons": {
-    "16": "images/icon16.png",
-    "32": "images/icon32.png",
-    "48": "images/icon48.png",
-    "128": "images/icon128.png"
+ "background": {
+  "service_worker": "background.js"
+ },
+ "web_accessible_resources": [
+  {
+   "resources": [
+    "player.html"
+   ],
+   "matches": [
+    "https://www.twitch.tv/*"
+   ]
   }
+ ],
+ "declarative_net_request": {
+  "rule_resources": [
+   {
+    "id": "ko-aca",
+    "enabled": true,
+    "path": "rules.json"
+   }
+  ]
+ },
+ "content_scripts": [
+  {
+   "matches": [
+    "https://www.twitch.tv/*"
+   ],
+   "js": [
+    "content.js"
+   ],
+   "run_at": "document_idle"
+  }
+ ],
+ "action": {
+  "default_popup": "popup.html",
+  "default_title": "Kick Overlay",
+  "default_icon": {
+   "16": "images/icon16.png",
+   "32": "images/icon32.png",
+   "48": "images/icon48.png",
+   "128": "images/icon128.png"
+  }
+ },
+ "icons": {
+  "16": "images/icon16.png",
+  "32": "images/icon32.png",
+  "48": "images/icon48.png",
+  "128": "images/icon128.png"
+ }
 }
