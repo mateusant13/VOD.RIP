@@ -508,7 +508,6 @@ def _gpu_copies() -> int:
     # forced off, so measuring the 60 s-median free VRAM would be pure waste.
     if _gpu_held_by_other() or caption_session_active():
         return 0  # a foreign process OR the live captioner holds the GPU — don't stack
-        return 0  # another process holds a GPU model — don't stack
     if _gpu_lane_plan() is None:
         return 0  # measured median free VRAM < 2 GiB — CPU lane only
     allowance = _gpu_vram_allowance()
