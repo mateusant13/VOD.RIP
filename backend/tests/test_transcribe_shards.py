@@ -6,16 +6,16 @@ SAME audio through BOTH decode paths of transcribe_video:
 
   * sharded (VODRIP_TRANSCRIBE_SHARD_SEC=5, VODRIP_TRANSCRIBE_SHARD_MIN_SEC=5):
     PCM spilled to 5 s disk shards, VAD per shard with overlap + cross-shard
-    merge, whisper fed from concatenated clip shards, events hook handed the
-    shards instead of a full array;
+    merge, the ASR engine fed from concatenated clip shards, events hook
+    handed the shards instead of a full array;
   * non-sharded (VODRIP_TRANSCRIBE_SHARD_MIN_SEC=3600): the legacy full-array
     path.
 
 Asserts:
-  (a) bounded RAM — shard files are fixed-duration (each <= 5 s * 16k * 4 B,
+  (a) bounded RAM — shard files are fixed-duration (each <= 5 s * 16k * 2 B,
       only the tail may be short) and the decode iterator yields one array
       per shard;
-  (b) joined transcript TEXT is identical on both paths (whisper output must
+  (b) joined transcript TEXT is identical on both paths (ASR output must
       not depend on the decode strategy);
   (c) cleanup — no vodrip-shards-* temp dir survives the job, on the success
       AND the failure path; the events stage scores shard-fed regions with
@@ -49,7 +49,6 @@ os.environ["TMP"] = os.environ["TEMP"] = str(
 tempfile.tempdir = os.environ["TMP"]
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardtest-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
-os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
 os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
 # Events are default-on now; this test exercises sharding, not the PANNs
 # stage (the fake-SED comparisons at the bottom pin the shard-fed path).
@@ -142,19 +141,24 @@ def _transcribe(video_id: str) -> dict:
 
 
 def _run() -> None:
+    # Suite-order robustness: a stale probe cache (a transient nvidia-smi
+    # failure earlier in this process, or a hermetic test that patched the
+    # gates) must not fail the REAL routing below — re-probe fresh.
+    archive_transcribe._parakeet_ok = None
+    archive_transcribe._parakeet_cuda_ok = None
     fixture = _build_fixture()
-    full_shard_bytes = int(SHARD_SEC * SAMPLE_RATE) * 4
+    full_shard_bytes = int(SHARD_SEC * SAMPLE_RATE) * 2  # int16 on disk
 
     # --- (a) decode iterator + shard file contract -------------------------
     check_dir = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardcheck-"))
     try:
         shards = list(_decode_to_shards(str(fixture), shard_sec=SHARD_SEC, out_dir=str(check_dir)))
-        files = sorted(check_dir.glob("shard_*.f32"))
+        files = sorted(check_dir.glob("shard_*.i16"))
         assert len(shards) >= 2, f"fixture must span >= 2 shards: {len(shards)}"
         assert len(files) == len(shards), "one file per yielded shard"
         for i, ((start, arr), fpath) in enumerate(zip(shards, files)):
             assert start == i * SHARD_SEC, (i, start)
-            assert arr.size * 4 == fpath.stat().st_size, "file and array must agree"
+            assert arr.size * 2 == fpath.stat().st_size, "file and array must agree"
             assert arr.size <= int(SHARD_SEC * SAMPLE_RATE), (
                 "per-shard array must be bounded by the fixed shard duration"
             )
@@ -218,7 +222,7 @@ def _run() -> None:
     ev_dir = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardcheck-"))
     try:
         list(_decode_to_shards(str(fixture), shard_sec=SHARD_SEC, out_dir=str(ev_dir)))
-        shards_obj = _ShardedAudio(sorted(ev_dir.glob("shard_*.f32")), SHARD_SEC)
+        shards_obj = _ShardedAudio(sorted(ev_dir.glob("shard_*.i16")), SHARD_SEC)
         with patch.object(ev, "_sed_model", return_value=_FakeSed()):
             audio16 = archive_transcribe.decode_audio(str(fixture))
             speech = archive_transcribe.vad_speech_seconds(audio16)

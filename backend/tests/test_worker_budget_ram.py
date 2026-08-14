@@ -19,11 +19,11 @@ def _set_free_ram(monkeypatch, free_bytes: int) -> None:
 
 
 def _force_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(at, "_device_override", ("cpu", "int8"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"))
 
 
 def _force_cuda(monkeypatch) -> None:
-    monkeypatch.setattr(at, "_device_override", ("cuda", "float16"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"))
 
 
 # --- _ram_worker_clamp (pure clamp math) ------------------------------------
@@ -127,13 +127,12 @@ def test_gpu_copies_host_ram_clamp_only(monkeypatch):
 
 
 def test_gpu_copies_vram_then_ram_clamp(monkeypatch):
-    monkeypatch.setattr(at, "model_name", lambda: "large-v3-turbo")  # est 6 GiB
-    per = at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM  # 8 GiB for turbo
-    # VRAM binds first: min(8, 40 GiB // 8 GiB) = 5, host RAM ample -> 5.
+    per = at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM  # 4 GiB for parakeet
+    # VRAM binds first: min(8, 40 GiB // 4 GiB) = 8, host RAM ample -> 8.
     _allow_cuda(monkeypatch, 40 * GIB)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
     _set_free_ram(monkeypatch, 64 * GIB)
-    assert at._gpu_copies() == 5
+    assert at._gpu_copies() == 8
     # Host RAM is the binding constraint when VRAM is ample: usable
     # 4 GiB * 0.8 = 3.2 GiB // 1.0 GiB = 3.
     _allow_cuda(monkeypatch, 40 * GIB)

@@ -1,6 +1,6 @@
 """Disk router tests — usage, status, and one-click cleanups against scratch
 dirs only (APPDATA/LOCALAPPDATA/TEMP/VODRIP_* all point at tmp_path). The
-real user profile and the real whisper-models dir are never touched.
+real user profile and the real AI-models dir are never touched.
 """
 
 import os
@@ -40,11 +40,10 @@ def scratch_env(tmp_path, monkeypatch):
     monkeypatch.setenv("VODRIP_WHISPER_CACHE", str(appdata / "whisper-models"))
     monkeypatch.setenv("VODRIP_ARCHIVE_DB", str(appdata / "archive.db"))
     # Route the WS-8 cache root at the scratch tmp so the yt-dlp cache and
-    # whisper cache land where the fixture writes them; the preview_cache
+    # AI-models cache land where the fixture writes them; the preview_cache
     # category follows the DATA root (fastest-disk pick), pinned here too.
     monkeypatch.setenv("VODRIP_CACHE_DIR", str(scratch_tmp))
     monkeypatch.setenv("VODRIP_DATA_DIR", str(scratch_tmp))
-    monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
     return SimpleNamespace(appdata=appdata, tmp=scratch_tmp)
 
 
@@ -67,7 +66,7 @@ async def test_usage_reports_every_category(scratch_env, client):
     a = scratch_env.appdata
     _write(a / "archive" / "kick" / "a.mp4", 1000)
     _write(a / "archive" / "kick" / "b.mp4", 2000)
-    _write(a / "whisper-models" / "models--Systran--faster-whisper-small" / "model.bin", 4096)
+    _write(a / "whisper-models" / "parakeet" / "model.onnx", 4096)
     _write(a / "archive.db", 512)
     _write(a / "archive.db-wal", 256)
     _write(a / "archive.db-shm", 32)
@@ -80,7 +79,7 @@ async def test_usage_reports_every_category(scratch_env, client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["archive_vods"] == 3000
-    assert data["whisper_models"] == 4096
+    assert data["ai_models"] == 4096
     assert data["db"] == 512 + 256 + 32
     assert data["logs"] == 64 + 32
     assert data["preview_cache"] == 128
@@ -93,7 +92,7 @@ async def test_usage_missing_dirs_are_zero(scratch_env, client):
     resp = await client.get("/api/disk/usage")
     assert resp.status_code == 200
     data = resp.json()
-    for cat in ("archive_vods", "whisper_models", "db", "logs", "preview_cache", "update_temps"):
+    for cat in ("archive_vods", "ai_models", "db", "logs", "preview_cache", "update_temps"):
         assert data[cat] == 0
     assert data["total"] == 0
 
@@ -156,35 +155,40 @@ async def test_cleanup_unknown_category_400(scratch_env, client):
     assert resp.status_code == 400
 
 
-# --- whisper_models ---------------------------------------------------------
+# --- ai_models -------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cleanup_whisper_models_prunes_unused_keeps_active(scratch_env, client):
+async def test_cleanup_ai_models_wipes_folder_contents(scratch_env, client):
+    """The AI-models folder is a deliberate wipe now (parakeet is the one
+    model family; the old prune-inactive-whisper guard is gone)."""
     cache = scratch_env.appdata / "whisper-models"
-    _write(cache / "models--Systran--faster-whisper-small" / "model.bin", 2048)
-    _write(cache / "models--Systran--faster-whisper-medium" / "model.bin", 8192)
-    _write(cache / "not-a-model-dir" / "user-file.txt", 10)  # unknown dir — untouched
+    _write(cache / "parakeet" / "model.onnx", 2048)
+    _write(cache / "parakeet" / "tokens.txt", 512)
+    _write(cache / "embed" / "onnx" / "model.onnx", 8192)
 
-    resp = await client.post("/api/disk/cleanup", json={"category": "whisper_models"})
+    resp = await client.post("/api/disk/cleanup", json={"category": "ai_models"})
     assert resp.status_code == 200
-    assert resp.json() == {"freed_bytes": 8192}
-    assert (cache / "models--Systran--faster-whisper-small").exists() is True
-    assert (cache / "models--Systran--faster-whisper-medium").exists() is False
-    assert (cache / "not-a-model-dir").exists() is True
+    assert resp.json() == {"freed_bytes": 2048 + 512 + 8192}
+    assert cache.is_dir(), "the AI-models root itself is kept"
+    assert list(cache.iterdir()) == [], "every weight under it is deleted"
 
 
 @pytest.mark.asyncio
-async def test_cleanup_whisper_models_env_active_wins(scratch_env, client, monkeypatch):
-    monkeypatch.setenv("VODRIP_WHISPER_MODEL", "small")
+async def test_cleanup_ai_models_wipes_even_nested_unknown_files(scratch_env, client):
+    """No active-model protection: anything under the folder is wiped, and a
+    missing folder frees 0 bytes."""
     cache = scratch_env.appdata / "whisper-models"
-    _write(cache / "models--Systran--faster-whisper-small" / "model.bin", 2048)
-    _write(cache / "models--Systran--faster-whisper-large-v3-turbo" / "model.bin", 8192)
-
-    resp = await client.post("/api/disk/cleanup", json={"category": "whisper_models"})
+    _write(cache / "nested" / "deep" / "file.bin", 10)
+    resp = await client.post("/api/disk/cleanup", json={"category": "ai_models"})
     assert resp.status_code == 200
-    assert resp.json() == {"freed_bytes": 8192}
-    assert (cache / "models--Systran--faster-whisper-small").exists() is True
-    assert (cache / "models--Systran--faster-whisper-large-v3-turbo").exists() is False
+    assert resp.json() == {"freed_bytes": 10}
+    assert list(cache.iterdir()) == []
+
+    empty = scratch_env.appdata / "whisper-models"
+    empty.rmdir()
+    resp = await client.post("/api/disk/cleanup", json={"category": "ai_models"})
+    assert resp.status_code == 200
+    assert resp.json() == {"freed_bytes": 0}
 
 
 # --- archive_vods -----------------------------------------------------------

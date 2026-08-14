@@ -1,7 +1,7 @@
 # ── GPU transcription upgrade (NVIDIA, any GPU >= 6 GiB VRAM) ────────────
 # Plain `pip install -r requirements.txt` keeps CPU sherpa-onnx; run THIS
 # file instead on an NVIDIA host to swap in the CUDA-enabled wheel (the lane
-# probes the installed wheel at runtime and stays whisper on GPU slots when
+# probes the installed wheel at runtime and fails GPU slots cleanly when
 # CUDA is absent, so installing it on a CPU-only machine is harmless).
 #
 #   pip install -r requirements-gpu.txt
@@ -9,9 +9,10 @@
 # The +cuda wheel bundles its own CUDA-enabled onnxruntime (no separate
 # onnxruntime-gpu install). It loads cublasLt64_12/cufft64_11/curand64_10/
 # cudnn64_9 from PATH (Windows) / LD_LIBRARY_PATH (POSIX) at session create
-# — nvidia-cublas-cu12 + nvidia-cuda-runtime-cu12 are already pulled by
-# faster-whisper/ctranslate2 in requirements.txt; the wheels below add the
-# rest, and archive_transcribe._ensure_cuda_libs exposes their bin/lib dirs.
+# — nvidia-cublas-cu12 + nvidia-cuda-runtime-cu12 are already pinned in
+# requirements.txt (they replaced the faster-whisper/ctranslate2 wheels that
+# used to pull them); the wheels below add the rest, and
+# archive_transcribe._ensure_cuda_libs exposes their bin/lib dirs.
 --find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html
 -r requirements.txt
 sherpa-onnx==1.13.4+cuda12.cudnn9

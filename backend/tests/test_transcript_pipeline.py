@@ -312,9 +312,10 @@ def test_midrun_twin_win_aborts_before_insert(tmp_path):
         patch.object(at, "decode_audio", return_value=_FakeAudio()),
         patch.object(at, "vad_speech_seconds", return_value=[(0.0, 10.0)]),
         patch.object(at, "_plan_chunks", return_value=[(0.0, 10.0)]),
-        patch.object(at, "_job_engine", return_value="whisper"),
-        patch.object(at, "_current_model", return_value=object()),
-        patch.object(at, "_transcribe_batch", return_value=[
+        patch.object(at, "_job_engine", return_value="parakeet"),
+        patch.object(at, "_parakeet_model", return_value=object()),
+        patch.object(at, "_parakeet_batch_size", return_value=1),
+        patch.object(at, "_transcribe_batch_parakeet", return_value=[
             ([{"start_sec": 0.0, "end_sec": 5.0, "text": "hi", "words": []}], "en")
         ]),
         patch.object(at, "_read_manifest", return_value=([], [])),
@@ -323,7 +324,7 @@ def test_midrun_twin_win_aborts_before_insert(tmp_path):
         patch.object(at, "_append_manifest_entry", return_value=None),
         patch.object(at, "_manifest_path", return_value=manifest),
         patch.object(at, "_effective_device", return_value=("cpu", "int8")),
-        patch.object(at, "_asr_model_name", return_value="small"),
+        patch.object(at, "_asr_model_name", return_value=at.PARAKEET_MODEL),
         patch.object(archive_db, "transcribed_on_higher_priority_platform", return_value=True),
         patch.object(archive_db, "insert_transcript", side_effect=lambda *a, **k: inserted.append(a) or 0),
         patch.object(archive_db, "delete_transcripts", side_effect=lambda p, v: deleted.append((p, v)) or 1),

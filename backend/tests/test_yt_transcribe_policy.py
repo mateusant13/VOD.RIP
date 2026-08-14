@@ -152,9 +152,9 @@ def test_captionless_marker_runs_asr_full_pipeline(monkeypatch):
                           archive_transcribe.SAMPLE_RATE * 10, dtype=np.float32)), \
          patch.object(archive_transcribe, "vad_speech_seconds",
                       return_value=[(0.0, 10.0)]), \
-         patch.object(archive_transcribe, "_job_engine", return_value="whisper"), \
-         patch.object(archive_transcribe, "_current_model", return_value=object()), \
-         patch.object(archive_transcribe, "_transcribe_batch",
+         patch.object(archive_transcribe, "_job_engine", return_value="parakeet"), \
+         patch.object(archive_transcribe, "_parakeet_model", return_value=object()), \
+         patch.object(archive_transcribe, "_transcribe_batch_parakeet",
                       return_value=batch_out) as batch, \
          patch.object(archive_transcribe, "_effective_device",
                       return_value=("cpu", "int8")):
@@ -214,8 +214,8 @@ def test_music_fraction_marks_music_and_never_reenqueues():
                           archive_transcribe.SAMPLE_RATE * 600, dtype=np.float32)), \
          patch.object(archive_transcribe, "vad_speech_seconds",
                       return_value=[(0.0, 1.0)]), \
-         patch.object(archive_transcribe, "_job_engine", return_value="whisper"), \
-         patch.object(archive_transcribe, "_transcribe_batch",
+         patch.object(archive_transcribe, "_job_engine", return_value="parakeet"), \
+         patch.object(archive_transcribe, "_transcribe_batch_parakeet",
                       side_effect=AssertionError("ASR must not run")) as batch:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=True)
         stats = archive_transcribe._process_job(
@@ -239,6 +239,7 @@ def test_toggle_off_asr_even_with_captions():
     ])
     job_id = _seed_job("vp-off")
     with patch("deps.settings_mgr") as mgr, \
+         patch.object(archive_transcribe, "_job_engine", return_value="parakeet"), \
          patch.object(archive_transcribe, "_transcribe_youtube_captionless",
                       return_value={"segments": 1}) as asr:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=False)

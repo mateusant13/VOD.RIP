@@ -24,9 +24,7 @@ from services.disk_detect import (
     free_space,
 )
 from services.disk_hygiene import (
-    active_whisper_model_id,
     best_model_cache_drive,
-    prune_inactive_whisper_models,
     whisper_cache_dir,
 )
 from services.settings import _get_appdata_dir
@@ -36,7 +34,7 @@ router = APIRouter(tags=["disk"])
 FREE_THRESHOLD_BYTES = 5 * 1024**3  # low-disk warning below 5 GB free
 DEFAULT_KEEP_COUNT = 5
 
-CLEANABLE = ("archive_vods", "whisper_models", "preview_cache", "update_temps")
+CLEANABLE = ("archive_vods", "ai_models", "preview_cache", "update_temps")
 
 
 class CleanupRequest(BaseModel):
@@ -56,7 +54,8 @@ def _whisper_cache_dir() -> Path:
     # Shared resolver (services.disk_hygiene): VODRIP_WHISPER_CACHE env ->
     # settings.whisper_model_cache (the AI-models folder) -> best-ROI drive +
     # VOD.RIP-models -> appdata. Legacy cache-dir models are redirected with
-    # a log until the models folder is populated.
+    # a log until the models folder is populated. Name is legacy — this IS
+    # the AI-models root (parakeet/embed/PANNs/translate live under it).
     return whisper_cache_dir()
 
 
@@ -84,7 +83,7 @@ def _category_paths() -> dict[str, list[Path]]:
     db = _db_path()
     return {
         "archive_vods": [_archive_dir()],
-        "whisper_models": [_whisper_cache_dir()],
+        "ai_models": [_whisper_cache_dir()],
         "db": [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")],
         "logs": [_get_appdata_dir() / "logs", _bgutil_dir() / "pot-server.log"],
         "preview_cache": [_preview_root()],
@@ -206,7 +205,7 @@ def disks() -> dict:
     """Per-drive inventory for the Settings > Storage pickers, plus the
     auto-pick winners: the fastest usable drive (transcripts/chat data), the
     biggest-free-space drive (heavy caches) and the best-ROI drive for the
-    whisper model cache (free space AND speed). PowerShell classification is
+    AI-models folder (free space AND speed). PowerShell classification is
     cached 60s; probe failures degrade to Unknown ranks."""
     return {
         "drives": disk_inventory(),
@@ -249,10 +248,12 @@ def disk_cleanup(req: CleanupRequest) -> dict[str, int]:
     cat = req.category
     if cat == "archive_vods":
         freed = _cleanup_archive_vods()
-    elif cat == "whisper_models":
-        freed = prune_inactive_whisper_models(
-            _whisper_cache_dir(), active_whisper_model_id()
-        )
+    elif cat == "ai_models":
+        # Explicit user override: empty the AI-models folder (parakeet, embed
+        # ONNX, PANNs, SLID weights). The next job/live caption re-downloads
+        # what it needs. Deliberate wipe — the old "prune inactive whisper
+        # models" guard is gone with the whisper engine (one model family now).
+        freed = _delete_contents(_whisper_cache_dir())
     elif cat == "preview_cache":
         freed = _delete_contents(_preview_root())
     elif cat == "update_temps":

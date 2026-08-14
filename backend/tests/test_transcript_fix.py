@@ -2,11 +2,11 @@
 
 Pure-logic tests against a synthetic (but realistic) ddragon-shaped gazetteer
 (no network), plus the wired choke point in archive_transcribe
-(_transcribe_audio_source row-build loop, whisper/parakeet confidence
-threading) and the captions strong-only path. Per the approved gate spec:
+(*_transcribe_audio_source row-build loop, parakeet confidence threading)
+and the captions strong-only path. Per the approved gate spec:
 blocklist regressions, window tests, punctuation reattachment, join==text,
 idempotency, numeral variants, empty-words no-op, parakeet log-prob
-aggregation, whisper probability threading, offline no-op, stats counter.
+aggregation, offline no-op, stats counter.
 """
 from __future__ import annotations
 
@@ -538,61 +538,29 @@ def test_parakeet_batch_threads_ys_log_probs():
     assert abs(words[1]["conf"] - math.exp(-0.3)) < 1e-9
 
 
-# --- whisper probability threading -----------------------------------------
-
-def test_whisper_word_probability_threaded(monkeypatch):
-    class _Word:
-        def __init__(self, word, start, end, probability):
-            self.word, self.start, self.end, self.probability = word, start, end, probability
-
-    class _Seg:
-        def __init__(self, start, end, text, words):
-            self.start, self.end, self.text, self.words = start, end, text, words
-
-    class _Info:
-        language = "pt"
-        language_probability = 0.95
-
-    class _FakeBatched:
-        def __init__(self, model):
-            pass
-
-        def transcribe(self, audio, clip_timestamps=None, **kwargs):
-            return iter([_Seg(0.0, 1.5, "diana sena", [
-                _Word("diana", 0.0, 0.7, 0.42), _Word("sena", 0.8, 1.3, 0.11)])]), _Info()
-
-    monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", _FakeBatched)
-    import numpy as np
-    out = at._transcribe_batch(None, np.zeros(16000), [(0.0, 2.0)], "pt")
-    items, lang = out[0]
-    assert lang == "pt"
-    assert items[0]["words"][0]["conf"] == 0.42
-    assert items[0]["words"][1]["conf"] == 0.11
-
-
 # --- choke point: _transcribe_audio_source row-build loop ------------------
 
-def _fake_audio_source(tmp_path, monkeypatch, *, engine: str, batch_out) -> dict:
-    """Drive _transcribe_audio_source with a patched engine batch; returns stats."""
+def _fake_audio_source(tmp_path, monkeypatch, *, batch_out) -> dict:
+    """Drive _transcribe_audio_source with a patched parakeet batch; returns stats."""
     import numpy as np
     monkeypatch.setattr(at, "decode_audio", lambda path: np.zeros(16000 * 4, dtype=np.float32))
     monkeypatch.setattr(at, "vad_speech_seconds", lambda audio: [(0.0, 4.0)])
-    monkeypatch.setattr(at, "_job_engine", lambda lang: engine)
-    monkeypatch.setattr(at, "_current_model", lambda: object())
+    monkeypatch.setattr(at, "_job_engine", lambda lang: "parakeet")
     monkeypatch.setattr(at, "_parakeet_model", lambda: object())
+    monkeypatch.setattr(at, "_parakeet_batch_size", lambda: 1)
     monkeypatch.setattr(at, "_read_manifest", lambda path: (None, {}))
     monkeypatch.setattr(at, "_write_manifest_header", lambda path, chunks: None)
     monkeypatch.setattr(at, "_append_manifest_entry", lambda path, ci, first, count: None)
-    monkeypatch.setattr(at, "_parakeet_ok", False)
-    batch_fn = "_transcribe_batch" if engine == "whisper" else "_transcribe_batch_parakeet"
-    monkeypatch.setattr(at, batch_fn, batch_out)
+    monkeypatch.setattr(at, "_transcribe_batch_parakeet", batch_out)
     return at._transcribe_audio_source(
         "twitch", "vid-fix", str(tmp_path / "x.wav"), None, None, None,
         time.monotonic(), sharded=False, shard_dir=None,
     )
 
 
-def test_choke_point_whisper_corrects_and_merges_stats(tmp_path, monkeypatch, fixer):
+def test_choke_point_parakeet_corrects_and_merges_stats(tmp_path, monkeypatch, fixer):
+    """The ONE engine's confidence threading: parakeet log-prob confs reach
+    fix_segment at the choke point (weak path fires at conf < 0.5)."""
     def batch_out(model, audio, chunks, language, **kw):
         return [([{
             "start_sec": 0.0, "end_sec": 2.0,
@@ -603,7 +571,7 @@ def test_choke_point_whisper_corrects_and_merges_stats(tmp_path, monkeypatch, fi
             ],
         }], "pt")]
 
-    stats = _fake_audio_source(tmp_path, monkeypatch, engine="whisper", batch_out=batch_out)
+    stats = _fake_audio_source(tmp_path, monkeypatch, batch_out=batch_out)
     rows = archive_db.transcript_for("twitch", "vid-fix", raw=True)
     assert len(rows) == 1
     assert rows[0]["text"] == "Diana Senna", "weak path fires with the threaded low conf"
@@ -611,24 +579,6 @@ def test_choke_point_whisper_corrects_and_merges_stats(tmp_path, monkeypatch, fi
     assert stored_words[0] == {"word": "Diana", "start": 0.0, "end": 0.7, "conf": 0.9}
     assert stats["transcript_fix"] == {"segments_touched": 1, "strong_replaced": 1,
                                        "weak_replaced": 1, "blocked_hits": 1}
-
-
-def test_choke_point_parakeet_engine(tmp_path, monkeypatch, fixer):
-    def batch_out(model, audio, chunks, language, **kw):
-        return [([{
-            "start_sec": 0.0, "end_sec": 2.0,
-            "text": "diana sena",
-            "words": [
-                {"word": "diana", "start": 0.0, "end": 0.7, "conf": 0.9},
-                {"word": "sena", "start": 0.8, "end": 1.3, "conf": 0.2},
-            ],
-        }], "pt")]
-
-    stats = _fake_audio_source(tmp_path, monkeypatch, engine="parakeet", batch_out=batch_out)
-    rows = archive_db.transcript_for("twitch", "vid-fix", raw=True)
-    # parakeet default threshold is 0.5 — conf 0.2 < 0.5 -> weak fires too
-    assert rows[0]["text"] == "Diana Senna"
-    assert stats["transcript_fix"]["weak_replaced"] == 1
 
 
 def test_choke_point_fix_disabled(tmp_path, monkeypatch, fixer):
@@ -644,7 +594,7 @@ def test_choke_point_fix_disabled(tmp_path, monkeypatch, fixer):
             ],
         }], "pt")]
 
-    stats = _fake_audio_source(tmp_path, monkeypatch, engine="whisper", batch_out=batch_out)
+    stats = _fake_audio_source(tmp_path, monkeypatch, batch_out=batch_out)
     rows = archive_db.transcript_for("twitch", "vid-fix", raw=True)
     assert rows[0]["text"] == "diana sena", "toggle off -> rows byte-identical"
     assert "transcript_fix" not in stats

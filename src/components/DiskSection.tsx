@@ -12,11 +12,11 @@ type Props = {
   setSettings: React.Dispatch<React.SetStateAction<AppSettings>>;
 };
 
-const CLEANABLE = ['archive_vods', 'whisper_models', 'preview_cache', 'update_temps'] as const;
+const CLEANABLE = ['archive_vods', 'ai_models', 'preview_cache', 'update_temps'] as const;
 
 const ROW_LABELS: Record<string, string> = {
   archive_vods: 'Archive VODs',
-  whisper_models: 'Whisper Models',
+  ai_models: 'AI Models',
   db: 'App data',
   logs: 'Logs',
   preview_cache: 'Preview Cache',
@@ -200,7 +200,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
 
         <FieldCaption
           noWrap
-          info={t('AI model weights download here — Whisper, Parakeet, embedding & audio-event models (+ tokenizers). Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space (models are large but downloaded once and rarely change). A custom path (shared HF hub) still works.')}
+          info={t('AI model weights download here — Parakeet, embedding & audio-event models (+ tokenizers). Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space (models are large but downloaded once and rarely change). A custom path (shared HF hub) still works.')}
         >
           {t('AI Models Folder')}
         </FieldCaption>

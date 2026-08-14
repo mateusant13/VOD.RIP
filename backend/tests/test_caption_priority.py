@@ -19,11 +19,11 @@ GIB = 1024 ** 3
 
 
 def _force_cuda(monkeypatch) -> None:
-    monkeypatch.setattr(at, "_device_override", ("cuda", "float16"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"))
 
 
 def _force_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(at, "_device_override", ("cpu", "int8"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"))
 
 
 def _idle_planner(monkeypatch, vram_gib: float) -> None:
@@ -33,7 +33,6 @@ def _idle_planner(monkeypatch, vram_gib: float) -> None:
     monkeypatch.setattr(at, "_gpu_util", lambda: 0.1)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
-    monkeypatch.setattr(at, "model_name", lambda: "large-v3-turbo")  # est 6 GiB
 
 
 # --- archive GPU/CPU yield while a caption session is live -------------------
@@ -129,7 +128,7 @@ def test_parakeet_provider_offpool_cuda_on_real_gpu(monkeypatch):
     monkeypatch.setattr(at, "_offpool_cuda_available", lambda: False)
     assert at._parakeet_provider() == "cpu"
     # pool pins are untouched by the off-pool probe
-    monkeypatch.setattr(at, "_thread_pin", lambda: ("cuda", "float16"))
+    monkeypatch.setattr(at, "_thread_pin", lambda: ("cuda", "int8"))
     monkeypatch.setattr(at, "_parakeet_cuda_available", lambda: True)
     assert at._parakeet_provider() == "cuda"
     monkeypatch.setattr(at, "_thread_pin", lambda: ("cpu", "int8"))

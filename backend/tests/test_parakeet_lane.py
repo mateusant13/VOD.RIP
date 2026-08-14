@@ -1,8 +1,12 @@
-"""Parakeet CPU lane unit tests — routing, fallbacks, word assembly.
+"""Parakeet-only routing unit tests — clean failures, word assembly.
 
 No sherpa-onnx import and no model load: the availability probe is pinned
-via the module's cached ``_parakeet_ok`` flag (same technique the module's
-own self-check uses), so these run on machines without sherpa-onnx too.
+via the module's cached ``_parakeet_ok`` / ``_parakeet_cuda_ok`` flags
+(same technique the module's own self-check uses), so these run on machines
+without sherpa-onnx too. The engine is ALWAYS 'parakeet' — the faster-whisper
+fallback is gone; every unsupported/unavailable case is a clean
+_AsrUnsupportedLanguage / _AsrLaneUnavailable raise, and _process_job lands
+those as terminal failed jobs ('ASR unsupported' / 'ASR unavailable').
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -31,9 +36,14 @@ def _clean_env(monkeypatch):
 
 
 def _routed(language, *, device="cpu", parakeet_ok=True, cuda_ok=None, vram_free=None):
+    """Call _job_engine on a pinned lane; raise the routing exception out.
+
+    The old whisper fallback returned an engine name — now every
+    non-parakeet outcome RAISES, so callers assert with pytest.raises.
+    """
     at._parakeet_ok = parakeet_ok
     at._parakeet_cuda_ok = cuda_ok
-    at._device_override = (device, "int8" if device == "cpu" else "float16")
+    at._multi_tls.pin = (device, "int8")
     saved_vram_free, saved_vram_at = at._vram_free_bytes, at._vram_free_at
     if vram_free is not None:
         at._vram_free_bytes = vram_free
@@ -41,7 +51,7 @@ def _routed(language, *, device="cpu", parakeet_ok=True, cuda_ok=None, vram_free
     try:
         return at._job_engine(language)
     finally:
-        at._device_override = None
+        delattr(at._multi_tls, "pin")
         at._vram_free_bytes, at._vram_free_at = saved_vram_free, saved_vram_at
 
 
@@ -50,13 +60,13 @@ def test_cpu_lane_routes_supported_languages_to_parakeet():
         assert _routed(lang) == "parakeet", lang
 
 
-def test_known_other_languages_stay_whisper_but_unknown_defaults_parakeet():
-    """TASK9: parakeet is the DEFAULT engine; whisper only for languages
-    parakeet cannot do (ja/ko/zh/ar + anything outside the token set) or
-    when parakeet itself is unavailable."""
+def test_known_other_languages_fail_cleanly_unknown_defaults_parakeet():
+    """Parakeet covers the 26 European candidates; a KNOWN language outside
+    them (ja/ko/zh/ar/hi) fails the job cleanly — there is NO whisper
+    fallback anymore. Unknown/auto-detect (None/'') stays parakeet."""
     for lang in ("ja", "ko", "zh", "ar", "hi"):
-        assert _routed(lang) == "whisper", lang
-    # Unknown language -> parakeet (the default), NOT whisper.
+        with pytest.raises(at._AsrUnsupportedLanguage, match="ASR unsupported"):
+            _routed(lang), lang
     assert _routed(None) == "parakeet"
     assert _routed("") == "parakeet"
 
@@ -71,23 +81,23 @@ def test_gpu_lane_routes_parakeet_with_cuda_sherpa():
     assert _routed("es", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
 
 
-def test_gpu_lane_whisper_without_cuda_sherpa():
-    """GPU slot + CPU-only sherpa -> whisper (graceful degradation, pre-parakeet path).
-
-    The unprobed cache (cuda_ok=None) probes the INSTALLED wheel at runtime,
-    so its outcome is env-dependent — pinned flags keep this hermetic; the
-    None path is covered by the module self-check and the real GPU smoke."""
-    assert _routed("pt", device="cuda", cuda_ok=False) == "whisper"
+def test_gpu_lane_unavailable_without_cuda_sherpa():
+    """GPU slot + CPU-only sherpa -> clean _AsrLaneUnavailable (the old
+    whisper graceful-degradation path is gone)."""
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        _routed("pt", device="cuda", cuda_ok=False)
 
 
-def test_gpu_lane_vram_tight_falls_back():
-    """GPU slot + CUDA sherpa but tight measured free VRAM -> whisper."""
-    assert _routed("pt", device="cuda", cuda_ok=True, vram_free=1 * GIB) == "whisper"
+def test_gpu_lane_vram_tight_fails_cleanly():
+    """GPU slot + CUDA sherpa but tight measured free VRAM -> clean failure."""
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        _routed("pt", device="cuda", cuda_ok=True, vram_free=1 * GIB)
 
 
-def test_gpu_lane_keeps_whisper_for_other_languages():
-    """Known-other (ja) stays whisper on GPU slots; unknown defaults parakeet."""
-    assert _routed("ja", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "whisper"
+def test_gpu_lane_other_languages_fail_cleanly():
+    """Known-other (ja) fails cleanly on GPU slots; unknown defaults parakeet."""
+    with pytest.raises(at._AsrUnsupportedLanguage, match="ASR unsupported"):
+        _routed("ja", device="cuda", cuda_ok=True, vram_free=16 * GIB)
     assert _routed(None, device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
     assert _routed("", device="cuda", cuda_ok=True, vram_free=16 * GIB) == "parakeet"
 
@@ -98,10 +108,14 @@ def test_cpu_lane_parakeet_unaffected_by_cuda_probe():
     assert _routed("pt", device="cpu", cuda_ok=True) == "parakeet"
 
 
-def test_import_fail_falls_back_to_whisper():
-    assert _routed("pt", parakeet_ok=False) == "whisper"
-    assert at._slot_engine("cpu") == "whisper"
-    assert at._slot_engine("cuda") == "whisper"  # import fail gates the CUDA probe too
+def test_import_fail_raises_lane_unavailable():
+    """No sherpa-onnx import -> the lane cannot run parakeet -> clean raise."""
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        _routed("pt", parakeet_ok=False)
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        at._slot_engine("cpu")
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        at._slot_engine("cuda")  # import fail gates the CUDA probe too
 
 
 def test_availability_probe_caches_failed_import(monkeypatch):
@@ -123,8 +137,10 @@ def test_kill_switch_disables_lane(monkeypatch):
     monkeypatch.setenv("VODRIP_PARAAKEET", "0")
     at._parakeet_ok = True  # even with the import healthy, the switch wins
     assert at._parakeet_available() is False
-    assert _routed("pt") == "whisper"
-    assert at._slot_engine("cpu") == "whisper"
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        _routed("pt")
+    with pytest.raises(at._AsrLaneUnavailable, match="ASR unavailable"):
+        at._slot_engine("cpu")
 
 
 def test_slot_engine():
@@ -133,9 +149,11 @@ def test_slot_engine():
     assert at._slot_engine("cpu") == "parakeet"
     assert at._slot_engine("cuda") == "parakeet"
     at._parakeet_cuda_ok = False
-    assert at._slot_engine("cuda") == "whisper"
+    with pytest.raises(at._AsrLaneUnavailable):
+        at._slot_engine("cuda")
     at._parakeet_ok = False
-    assert at._slot_engine("cpu") == "whisper"
+    with pytest.raises(at._AsrLaneUnavailable):
+        at._slot_engine("cpu")
 
 
 def test_langs_intersect_with_model_tokens(tmp_path, monkeypatch):
@@ -251,17 +269,16 @@ def test_ensure_cuda_libs_skip_flag(tmp_path, monkeypatch):
 
 
 def test_manifest_engine_change_invalidates_resume():
-    header = {"chunks": [(0.0, 5.0)], "model": at.model_name()}
+    header = {"chunks": [(0.0, 5.0)], "model": at._asr_model_name()}
     entries = {0: {"ci": 0, "first": 0, "count": 1}}
-    # pre-parakeet manifests carry no 'engine' key -> read as whisper
-    missing, _ = at._resume_plan(header["chunks"], header, entries, {0}, engine="whisper")
-    assert missing == [], "old-format manifest must resume a whisper run"
-    # a parakeet run must NOT trust a whisper manifest (model + engine differ)
+    # pre-parakeet manifests carry no 'engine' key -> read as parakeet
     missing, _ = at._resume_plan(header["chunks"], header, entries, {0}, engine="parakeet")
+    assert missing == [], "old-format manifest must resume a parakeet run"
+    # a different engine label must NOT trust the manifest (model differs)
+    missing, _ = at._resume_plan(header["chunks"], header, entries, {0}, engine="captions")
     assert missing == [0], "engine switch must invalidate manifest entries"
-    # and a whisper run must not trust a parakeet manifest
     pheader = {"chunks": [(0.0, 5.0)], "model": at.PARAKEET_MODEL, "engine": "parakeet"}
-    missing, _ = at._resume_plan(pheader["chunks"], pheader, entries, {0}, engine="whisper")
+    missing, _ = at._resume_plan(pheader["chunks"], pheader, entries, {0}, engine="captions")
     assert missing == [0]
 
 
@@ -353,3 +370,71 @@ def test_gpu_autoinstall_respects_stamp_and_installs(tmp_path, monkeypatch):
     monkeypatch.setattr(at, "_gpu_autoinstall_due", lambda: False)
     at.maybe_ensure_gpu_sherpa()
     assert len(runs) == 1
+
+
+# --- job-level clean-failure contract --------------------------------------
+# _job_engine raising inside _process_job must never crash the worker: the
+# job lands 'failed' with the terminal 'ASR unsupported' / 'ASR unavailable'
+# marker (archive_db.update_job -> no backoff requeue) and _process_job
+# returns {"job_id", "error"}.
+
+def test_job_level_routing_failures_are_terminal_and_clean(tmp_path, monkeypatch):
+    """Unsupported language + unavailable lane -> terminal failed jobs."""
+    from services import archive_db
+
+    prev_db = os.environ.get("VODRIP_ARCHIVE_DB")
+    prev_app = os.environ.get("VODRIP_APP_DATA")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(tmp_path / "archive.db")
+    os.environ["VODRIP_APP_DATA"] = str(tmp_path / "appdata")
+    with archive_db._lock:
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    monkeypatch.setenv("VODRIP_SHERRPA_CACHE", str(tmp_path / "sherpa"))
+    try:
+        archive_db.get_conn()
+
+        # --- (1) unsupported language: REAL _job_engine, pinned CPU lane ---
+        archive_db.upsert_video({
+            "platform": "twitch", "video_id": "vid-ja", "channel": "chan-ja",
+            "title": "ja", "canonical_key": "ck-ja", "kind": "vod",
+            "started_at": "2026-08-03T17:24:00Z",
+        })
+        archive_db.set_channel_language("twitch", "chan-ja", "ja")
+        archive_db.enqueue_job("job-ja", "transcribe", "twitch", "vid-ja")
+        monkeypatch.setattr(at, "_parakeet_ok", True)
+        at._multi_tls.pin = ("cpu", "int8")
+        try:
+            stats = at._process_job(
+                {"id": "job-ja", "platform": "twitch", "video_id": "vid-ja"})
+        finally:
+            delattr(at._multi_tls, "pin")
+        assert stats["error"].startswith("ASR unsupported"), stats
+        row = archive_db.query(
+            "SELECT status, error FROM archive_jobs WHERE id='job-ja'")[0]
+        assert row["status"] == "failed"
+        assert row["error"].startswith("ASR unsupported")
+
+        # --- (2) lane unavailable: same terminal shape, clean message ---
+        archive_db.enqueue_job("job-lane", "transcribe", "twitch", "vid-lane")
+
+        def _boom(lang):
+            raise at._AsrLaneUnavailable(
+                "ASR unavailable on the CPU slot: no sherpa-onnx")
+
+        with patch.object(at, "_job_engine", side_effect=_boom):
+            stats = at._process_job(
+                {"id": "job-lane", "platform": "twitch", "video_id": "vid-lane"})
+        assert stats["error"].startswith("ASR unavailable"), stats
+        row = archive_db.query(
+            "SELECT status, error FROM archive_jobs WHERE id='job-lane'")[0]
+        assert row["status"] == "failed"
+        assert row["error"].startswith("ASR unavailable")
+    finally:
+        for var, prev in (("VODRIP_ARCHIVE_DB", prev_db), ("VODRIP_APP_DATA", prev_app)):
+            if prev is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = prev
+        with archive_db._lock:
+            archive_db._conn = None
+            archive_db._schema_ready = False

@@ -10,8 +10,8 @@ Model seeding:
     model files (encoder/decoder/joiner .onnx + tokens.txt — e.g. the A/B
     scratch models/ dir); otherwise VODRIP_SHERRPA_CACHE points at a fresh
     dir and the model auto-downloads from HF on first use (670 MB).
-  * Whisper: VODRIP_WHISPER_MODEL / VODRIP_WHISPER_CACHE override the
-    defaults ('small', fresh dir) so a pre-cached model can be reused.
+    (The whisper engine is gone — only VODRIP_WHISPER_DEVICE remains,
+    steering the worker lane deterministically to CPU.)
 
 Audio: VODRIP_PARAAKEET_AUDIO may point at a real speech file (16 kHz mono
 wav or any ffmpeg-decodable media); otherwise an English TTS fixture is
@@ -377,7 +377,6 @@ def _real_env():
     os.environ["VODRIP_EVENTS_ENABLED"] = "0"  # ASR-only measurement (PANNs is default-ON in production)
     os.environ.setdefault("VODRIP_TRANSCRIBE_WORKERS", "2")
     os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
-    os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
     os.environ.setdefault("VODRIP_WHISPER_CACHE", str(_TMP / "whisper-models"))
     # Parakeet model: seed dir when given (files at its root), else fresh
     # cache -> auto-download on first use.

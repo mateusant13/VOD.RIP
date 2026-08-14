@@ -126,34 +126,27 @@ class AppSettings(BaseModel):
     # Archived VOD retention: keep only the newest N video FILES per platform;
     # older files are deleted but DB rows/transcripts/chat stay forever.
     archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
-    # Local transcription model: faster-whisper id + HF cache dir (mirrors
-    # the VODRIP_WHISPER_MODEL / VODRIP_WHISPER_CACHE env knobs). A cache
-    # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
-    # NOTE: whisper_model is the faster-whisper model id (NOT an engine) —
-    # 'parakeet' here would break WhisperModel() loads. Engine selection is
-    # asr_engine ('parakeet' default; whisper small only when
-    # parakeet itself fails or the language is ja/ko/zh/ar).
-    whisper_model: str = "small"
-    # ASR engine: 'parakeet' (default) or 'whisper'. The job router keeps
-    # whisper as the fallback for ja/ko/zh/ar and parakeet-engine failures
-    # regardless; this setting forces the engine for every job.
-    asr_engine: str = "parakeet"
-    # AI-models folder: home of every model weight — faster-whisper
-    # checkpoints, sherpa-onnx parakeet, ONNX embedders, PANNs + tokenizers
-    # (parakeet/embed/PANNs resolve as siblings under it). None/'' = auto ->
-    # best-value drive (free space AND speed, see best_model_cache_drive);
-    # a custom path pointing at a shared HF hub dir reuses existing weights.
+    # AI-models folder: home of every model weight — sherpa-onnx parakeet,
+    # ONNX embedders, PANNs + tokenizers, the SLID NLLB translator
+    # (parakeet/embed/PANNs/translate resolve as siblings under it).
+    # None/'' = auto -> best-value drive (free space AND speed, see
+    # best_model_cache_drive); a custom path pointing at a shared HF hub dir
+    # reuses existing weights. (Name is legacy: whisper_model_cache now IS
+    # the AI-models root — the faster-whisper engine is gone.)
     whisper_model_cache: Optional[str] = None
     # Captions-first: when a YouTube video already has auto-caption rows at
-    # ingest, whisper transcription skips it (default on; toggle in Disk UI).
+    # ingest, ASR transcription skips it (default on; toggle in Disk UI).
     yt_subtitles_first: bool = True
     # Targeted search enrichment: lazily backfill chat / enqueue transcribe
     # jobs for videos matching the search scope (default on). Off disables
     # the whole enrichment pass — hits-only responses.
     archive_smart_enrich: bool = True
-    # Default ASR language for whisper jobs: 'auto' (whisper auto-detects) or
-    # a family code ('pt', 'en', 'es'). Per-channel overrides win over this
-    # (channel_asr_languages: slug -> code or 'auto').
+    # Default ASR language for parakeet jobs: 'auto' (parakeet has no
+    # detection — the job language stays None and the channel-language
+    # aggregation stamps the family) or a family code ('pt', 'en', 'es').
+    # Per-channel overrides win over this (channel_asr_languages: slug ->
+    # code or 'auto'). A known language outside parakeet's 26 European
+    # coverage fails the job cleanly — there is no whisper fallback.
     asr_language: str = "auto"
     channel_asr_languages: Optional[Dict[str, str]] = None
     # App UI language: 'en' | 'pt-BR' | 'es'. '' = not set yet — the
@@ -211,8 +204,6 @@ class SettingsUpdate(BaseModel):
     auto_install_extension: Optional[bool] = None
     entity_watch_enabled: Optional[bool] = None
     archive_vod_keep_count: Optional[int] = None
-    whisper_model: Optional[str] = None
-    asr_engine: Optional[str] = None
     whisper_model_cache: Optional[str] = None
     yt_subtitles_first: Optional[bool] = None
     archive_smart_enrich: Optional[bool] = None

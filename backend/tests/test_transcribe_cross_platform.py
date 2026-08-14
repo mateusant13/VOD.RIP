@@ -1,6 +1,6 @@
 """Cross-platform transcription skip: a Kick/Twitch VOD whose mirrored live
 exists on a higher-priority platform (youtube > twitch > kick) with transcript
-rows already gets its whisper job skipped — the same canonical_key rule the
+rows already gets its ASR job skipped — the same canonical_key rule the
 kick download dedupe uses (archive_kick.dedupe_decision).
 
 Also covers the language-aware dedupe half of the same canonical-key family:
@@ -158,6 +158,8 @@ def test_process_job_runs_whisper_when_no_higher_priority_mirror(monkeypatch):
     # transcribe time (_transcribe_remote_twitch_kick) instead of failing
     # on the missing file.
     with patch.object(
+        archive_transcribe, "_job_engine", return_value="parakeet",
+    ), patch.object(
         archive_transcribe, "_transcribe_remote_twitch_kick",
         return_value={"segments": 1},
     ) as remote:
@@ -182,6 +184,8 @@ def test_process_job_uses_local_file_when_present(monkeypatch):
     })
     job_id = _seed_job("kick", "k9")
     with patch.object(
+        archive_transcribe, "_job_engine", return_value="parakeet",
+    ), patch.object(
         archive_transcribe, "transcribe_video",
         return_value={"segments": 1},
     ) as tv, patch.object(
@@ -209,6 +213,8 @@ def test_process_job_youtube_not_skipped_by_kick_mirror(monkeypatch):
     # covered by test_higher_priority_never_skipped_by_lower).
     with patch("deps.settings_mgr") as mgr, \
          patch.object(
+        archive_transcribe, "_job_engine", return_value="parakeet",
+    ), patch.object(
         archive_transcribe, "_transcribe_youtube_captionless",
         return_value={"segments": 1},
     ) as tv:
