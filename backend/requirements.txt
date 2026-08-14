@@ -26,7 +26,11 @@ Pillow>=10.0.0
 # in archive_transcribe (parakeet). NVIDIA drivers are backward compatible,
 # so a CUDA-13-era driver (e.g. 610.x, CUDA 13.3) runs the CUDA-12 runtime
 # DLLs both paths need; no standalone onnxruntime-gpu wheel is required.
-onnxruntime>=1.20
+# Pinned to 1.24.x: a NEWER pip onnxruntime (1.28+) loads its DLL first at
+# boot, then the sherpa +cuda wheel's onnxruntime_providers_cuda.dll (built
+# against ORT 1.24) fails DllMain (WinError 1114) — the basename collision
+# makes the CUDA EP die before the provider list is consulted.
+onnxruntime==1.24.4
 tokenizers>=0.19
 
 # ── Archive transcription worker (opt-in: services/archive_transcribe.py) ───

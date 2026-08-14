@@ -293,19 +293,37 @@ class _CaptionTranslator:
         if d is None:
             return None
         try:
+            try:
+                import torch  # noqa: F401  # load torch/lib's cudnn (9.25) FIRST — sherpa CUDA (9.24 wheels) otherwise loads first and torch's later import fails WinError 127
+            except Exception:
+                pass  # torch unavailable — SLID still works on CPU
             import sherpa_onnx
+            from services.archive_transcribe import _ensure_cuda_libs
 
-            self._slid = sherpa_onnx.SpokenLanguageIdentification(
-                sherpa_onnx.SpokenLanguageIdentificationConfig(
-                    whisper=sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
-                        encoder=str(d / "tiny-encoder.int8.onnx"),
-                        decoder=str(d / "tiny-decoder.int8.onnx"),
-                    ),
-                    num_threads=2,
-                    provider="cpu",
-                )
+            # sherpa's CUDA EP + whisper-tiny SLID need the nvidia cu12 DLLs
+            # (cublasLt/cublas/cudnn) resolvable — frozen bundles collect them
+            # under _internal/nvidia/*/bin, which PATH prepend exposes.
+            _ensure_cuda_libs()
+            whisper_cfg = sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
+                encoder=str(d / "tiny-encoder.int8.onnx"),
+                decoder=str(d / "tiny-decoder.int8.onnx"),
             )
-            return self._slid
+            for provider in ("cuda", "cpu"):
+                try:
+                    self._slid = sherpa_onnx.SpokenLanguageIdentification(
+                        sherpa_onnx.SpokenLanguageIdentificationConfig(
+                            whisper=whisper_cfg,
+                            num_threads=2,
+                            provider=provider,
+                        )
+                    )
+                    return self._slid
+                except Exception as exc:
+                    if provider == "cuda":
+                        # ponytail: CUDA EP failure (missing DLLs, driver)
+                        # degrades to CPU — SLID is 0.08s/window either way
+                        logger.warning("SLID CUDA load failed (%s) — CPU provider", exc)
+            return None
         except Exception as exc:
             logger.warning("SLID model load failed (%s) — raw captions", exc)
             self._slid_broken_at = time.monotonic()
@@ -322,6 +340,9 @@ class _CaptionTranslator:
         try:
             import ctranslate2
             import tokenizers
+            from services.archive_transcribe import _ensure_cuda_libs
+
+            _ensure_cuda_libs()  # ctranslate2 loads cublas/cudnn lazily at first CUDA inference
 
             # P2-5: CUDA is the fast path, but the whisper/parakeet lanes
             # hold most of the VRAM — a CUDA load can fail (OOM, driver
