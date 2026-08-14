@@ -210,9 +210,9 @@ def _spawn_detached_background() -> Optional[int]:
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    # Boot maintenance — disk hygiene (incl. the whisper-model prune, which
-    # recursively scans multi-GB model dirs), archive retention, chat
-    # dedupe, FTS optimize, and the embed-model warm all run on a daemon
+    # Boot maintenance — disk hygiene (orphaned temp/preview/selfcheck
+    # sweeps), archive retention, chat dedupe, FTS optimize, and the
+    # embed-model warm all run on a daemon
     # thread so the server binds in ~1-2s instead of paying 12-25s of
     # housekeeping before first byte (measured 2026-08-07). Every step is
     # best-effort and/or age-guarded, so racing the first requests is safe;

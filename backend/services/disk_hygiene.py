@@ -17,11 +17,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Whisper model settings — same knobs as services.archive_transcribe. The
-# env vars stay per-process overrides (tests/benchmarks pin env-first); the
-# persisted settings fields are the user's choice whenever env is unset.
-DEFAULT_MODEL = "small"
-MODEL_ENV = "VODRIP_WHISPER_MODEL"
+# AI-models folder knobs — same cache knob as services.archive_transcribe.
+# The env var stays a per-process override (tests/benchmarks pin env-first);
+# the persisted whisper_model_cache field is the user's choice when unset.
+# (The whisper MODEL setting was removed with the faster-whisper engine.)
 CACHE_ENV = "VODRIP_WHISPER_CACHE"
 # Transcripts/chat data root — env override for the settings.data_dir knob.
 DATA_ENV = "VODRIP_DATA_DIR"
@@ -120,14 +119,6 @@ def run_startup_hygiene() -> dict:
         stats = sweep_orphaned_temps(
             Path(tempfile.gettempdir()), _get_appdata_dir()
         )
-        # Whisper model cache — drop HF-style dirs that aren't the active
-        # model (skipped unless the active model's dir exists, so a
-        # not-yet-downloaded model never causes a wipe).
-        pruned = prune_inactive_whisper_models(
-            whisper_cache_dir(), active_whisper_model_id()
-        )
-        if pruned:
-            stats["whisper_models"] = pruned
         total = sum(stats.values())
         if total:
             logger.info("Disk hygiene: removed %d stale items %s", total, stats)
@@ -184,23 +175,7 @@ def data_dir() -> Path:
     return _auto_data_dir
 
 
-# --- whisper model cache ---------------------------------------------------
-
-def active_whisper_model_id() -> str:
-    """Resolve the active faster-whisper model id.
-
-    Precedence: VODRIP_WHISPER_MODEL env (per-process override, legacy knob
-    pinned by test_disk_router) -> settings.whisper_model -> default.
-    """
-    env = os.environ.get(MODEL_ENV, "").strip()
-    if env:
-        return env
-    from deps import settings_mgr
-
-    return (
-        getattr(settings_mgr.get(), "whisper_model", "") or ""
-    ).strip() or DEFAULT_MODEL
-
+# --- AI-models folder (model weight home) ----------------------------------
 
 # Once per process per model kind: a legacy (heavy-cache-dir) location is
 # being used until the AI-models folder is populated — log it once, not on
@@ -233,18 +208,17 @@ def _migrated_model_dir(primary: Path, legacy: Optional[Path], what: str) -> Pat
 
 
 def whisper_cache_dir() -> Path:
-    """Resolve the whisper model cache dir — the root of the AI-models folder
-    (all model weights resolve under it; see archive_embed/_parakeet_cache_dir/
-    archive_events for the siblings).
+    """Resolve the AI-models folder — the root of every model weight
+    (parakeet, ONNX embedders, PANNs, SLID NLLB resolve as siblings under
+    it; see archive_transcribe/_parakeet_cache_dir/archive_embed/
+    archive_events/caption_translate). The whisper name is legacy.
 
     Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
     best drive + VOD.RIP-models (auto: speed-first, see
     best_model_cache_drive) -> %APPDATA%/VOD.RIP/whisper-models. The auto
     branches fall back to the legacy heavy-cache location
     <cache root>/whisper-models while it still holds models (migration, see
-    _migrated_model_dir). Pointing it at a shared HF hub dir (e.g. BrandOps'
-    models--Systran--faster-whisper-* checkpoints) lets faster-whisper reuse
-    already-downloaded models without any download.
+    _migrated_model_dir).
     """
     env = os.environ.get(CACHE_ENV, "").strip()
     if env:
@@ -273,7 +247,7 @@ def whisper_cache_dir() -> Path:
 # --- AI-models auto pick (Settings > Disk "AI Models Folder" Auto) ----------
 # The models folder follows its own disk-choice rule, distinct from the heavy
 # cache disk (biggest free space) and the data disk (fastest): the FASTEST
-# tier with room wins. AI models (whisper/parakeet/embed/PANNs weights +
+# tier with room wins. AI models (parakeet/embed/PANNs/translate weights +
 # tokenizers) are small (~0.1-0.7 GB each) but loaded at every worker start
 # and warmed at live-caption open, so a slow HDD is the worst home — speed
 # beats headroom; ties within a tier break by most free space.
@@ -305,79 +279,6 @@ def best_model_cache_drive() -> Optional[str]:
         if rank < best_rank or (rank == best_rank and free > best_free):
             best, best_rank, best_free = item["drive"], rank, free
     return best
-
-
-def _dir_size(root: Path) -> int:
-    """Recursive file-size sum; errors treated as 0 (mirrors routers.disk)."""
-    total = 0
-    try:
-        with os.scandir(root) as it:
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        total += _dir_size(Path(entry.path))
-                    elif entry.is_file(follow_symlinks=False):
-                        total += entry.stat().st_size
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return total
-
-
-def _delete_tree(path: Path) -> int:
-    """Delete a dir tree; returns pre-delete byte size (0 if gone/failed)."""
-    try:
-        if path.is_dir() and not path.is_symlink():
-            size = _dir_size(path)
-            shutil.rmtree(path, ignore_errors=True)
-            return size if not path.exists() else 0
-        if path.is_file():
-            size = path.stat().st_size
-            path.unlink()
-            return size
-    except OSError:
-        pass
-    return 0
-
-
-def prune_inactive_whisper_models(cache_dir: Path, active_id: str) -> int:
-    """Delete HF-style model dirs that aren't the active model.
-
-    faster-whisper cache dirs are named models--<org>--<model> (e.g.
-    models--Systran--faster-whisper-small). A dir is kept when the
-    active model id (slashes -> '--') is contained in its name; non-HF-style
-    dirs are left alone. Returns bytes freed.
-
-    GUARD: if the active model's own dir is missing from the cache, delete
-    NOTHING — pruning everything else would brick the next transcription.
-    ponytail: an env/settings mismatch (active model not yet downloaded) is
-    the realistic trigger; the manual "Whisper Models" cleanup is the
-    explicit override for a deliberately empty cache.
-    """
-    active = (active_id or "").strip() or DEFAULT_MODEL
-    needles = [active.replace("/", "--")]
-    last_seg = active.rsplit("/", 1)[-1]
-    if last_seg != active:
-        needles.append(last_seg)
-    if not cache_dir.is_dir():
-        return 0
-    active_dir = next(
-        (e for e in cache_dir.iterdir() if e.is_dir() and any(n in e.name for n in needles)),
-        None,
-    )
-    if active_dir is None:
-        return 0  # guard: active model dir missing -> never prune
-    freed = 0
-    for entry in cache_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        if any(n in entry.name for n in needles):
-            continue  # active model — never delete
-        if "--" not in entry.name:
-            continue  # not an HF-style model dir — leave unknown dirs alone
-        freed += _delete_tree(entry)
-    return freed
 
 
 # --- module self-check (env-guarded: creates scratch temp dirs at import) --

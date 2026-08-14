@@ -1,4 +1,4 @@
-"""Transcription worker — faster-whisper (CTranslate2) + Silero VAD for the local archive.
+"""Transcription worker — parakeet (sherpa-onnx nemo_transducer) + Silero VAD.
 
 Consumes ``archive_jobs`` rows with kind='transcribe' (and kind='events' —
 the PANNs acoustic-event stage, see services.archive_events) and writes
@@ -15,11 +15,11 @@ Design decisions:
     ONE insert_transcript() batch call, so a crash loses at most the
     in-flight chunk. A FULL re-run (no manifest, rows already present)
     replaces the old rows instead of appending a duplicate copy.
-  * Model cache: one process-global WhisperModel by default (budget 1),
-    lazy-loaded on first job, unloaded after VODRIP_WHISPER_IDLE_CLOSE
-    seconds (default 600) without use. Multi-copy mode (budget > 1 — CPU
-    workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES) gives each pool thread
-    its own model so inference runs in parallel.
+  * Model cache: one process-global parakeet OfflineRecognizer by default
+    (budget 1), lazy-loaded on first job, unloaded after
+    VODRIP_WHISPER_IDLE_CLOSE seconds (default 600) without use. Multi-copy
+    mode (budget > 1 — CPU workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES)
+    gives each pool thread its own recognizer so inference runs in parallel.
   * Hybrid pool (CUDA hosts): the worker runs the GPU copy AND CPU threads
     at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 1)
     plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2 on <16-thread boxes,
@@ -27,28 +27,23 @@ Design decisions:
     exclusive-GPU worker). Each pool thread is pinned to its slot's device
     at thread start, so CPU threads never compete for VRAM. CPU-only hosts
     are unchanged (WORKERS, same dynamic default).
-  * Parakeet lane: when sherpa-onnx is importable (and VODRIP_PARAAKEET is
-    not 0), slots transcribe jobs whose language is in Parakeet TDT v3's 25
-    European languages with sherpa-onnx (2.5-5.2 RTFx on CPU int8 vs
-    whisper-large-v3-turbo cpu/int8 at 0.26-0.6, ~0.7 GB less RSS, no
-    silence hallucination — A/B 2026-08-07; the whisper default is now the
-    much smaller 'small', so the gap is even wider). Known-other (ja, ...) and
-    unknown languages stay whisper. CUDA-enabled sherpa-onnx wheels
-    (>=1.13.x, see requirements.txt) let GPU slots run parakeet with
-    provider='cuda', gated on the measured free-VRAM allowance; without a
-    CUDA wheel GPU slots are whisper exactly as before. Model auto-downloads
-    on first use into the sherpa cache (VODRIP_SHERRPA_CACHE or a
-    whisper-cache sibling).
+  * Engine: parakeet (sherpa-onnx, nemo_transducer TDT v3 int8) is the ONLY
+    ASR engine — faster-whisper was removed. It covers 26 European language
+    families (PARAKEET_LANG_CANDIDATES) plus unknown/auto-detect. A known
+    language outside that set fails the job cleanly (explicit error naming
+    the language + the 26-language coverage); a lane without usable parakeet
+    (sherpa-onnx missing / VODRIP_PARAAKEET=0 / no CUDA wheel on a GPU slot /
+    VRAM too tight) fails the job cleanly too. There is NO whisper fallback.
+    CUDA-enabled sherpa-onnx wheels (>=1.13.x, see requirements.txt) let GPU
+    slots run parakeet with provider='cuda', gated on the measured free-VRAM
+    allowance. Model auto-downloads on first use into the sherpa cache
+    (VODRIP_SHERRPA_CACHE or an AI-models-folder sibling).
   * Device: _real_gpu_info() — a COMPUTE-level probe (nvidia-smi memory
     query and/or the CUDA runtime's device count + context init), never
     adapter names — a Virtual Display Driver / name-spoofed adapter has no
-    CUDA device and resolves to cpu/int8. This machine has an NVIDIA RTX
-    5080 (CUDA works via torch), so real runs are cuda/float16; the CPU
-    path exists for GPU-less hosts.
-  * Whisper fallback model 'small' (parakeet is the primary engine for its
-    26 languages; whisper covers everything else + the parakeet-failure
-    retry). Override with env VODRIP_WHISPER_MODEL
-    (e.g. 'freds0/distil-whisper-large-v3-ptbr').
+    CUDA device and resolves to cpu. This machine has an NVIDIA RTX 5080
+    (CUDA works via torch), so real runs are cuda; the CPU path exists for
+    GPU-less hosts.
 
 Opt-in by design: app.py does NOT import this module. Start the worker with
 ``python -m services.archive_transcribe`` or ``start_worker()`` from a launcher.
@@ -77,14 +72,13 @@ from typing import Any, Callable, Iterator, Optional
 from services import archive_db, transcript_fix
 from services.archive_events import detect_events_video, events_enabled
 from services.autostart import background_mode
-from services.disk_hygiene import active_whisper_model_id, whisper_cache_dir
+from services.disk_hygiene import whisper_cache_dir
 from services.os_services import _NO_WINDOW
 from services.yt_gate import gate_remaining_sec, youtube_gate_active
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "small"
 SAMPLE_RATE = 16000
 
 # Env knobs (all optional).
@@ -92,9 +86,7 @@ LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
 WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"  # CPU threads; 0 = GPU-only on CUDA hosts
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
-BEAM_ENV = "VODRIP_WHISPER_BEAM"
-BATCH_ENV = "VODRIP_WHISPER_BATCH"
-PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet CPU lane (whisper int8)
+PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet lane (clean job failure)
 PARAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"  # sherpa-onnx model cache override
 # Music/no-speech verdict for captionless YouTube ASR: below this fraction
 # of speech (speech_sec / total_sec) the audio is treated as instrumental
@@ -197,38 +189,33 @@ def _real_gpu_info() -> tuple[bool, int, int]:
 def _detect_device() -> tuple[str, str]:
     """(device, compute_type) — real nvidia GPU or honest CPU fallback.
 
-    VODRIP_WHISPER_DEVICE=cpu|cuda forces the choice (used by tests/benchmarks).
+    VODRIP_WHISPER_DEVICE=cpu|cuda forces the choice (used by tests/benchmarks;
+    the env name is legacy but kept — it pins the DEVICE, not an engine).
     The presence gate is COMPUTE-based (_real_gpu_info), never adapter names:
     a Virtual Display Driver / name-spoofed adapter has no CUDA device and
-    resolves to CPU here.
+    resolves to CPU here. compute_type is always 'int8' — parakeet's weights
+    are int8 ONNX regardless of device; only the provider differs.
     """
     forced = os.environ.get("VODRIP_WHISPER_DEVICE", "").strip().lower()
     if forced:
         if forced == "cuda":
-            return "cuda", "float16"
+            return "cuda", "int8"
         if forced == "cpu":
             return "cpu", "int8"
         logger.warning("Unknown VODRIP_WHISPER_DEVICE=%r — ignoring", forced)
     if _real_gpu_info()[0]:
-        return "cuda", "float16"
+        return "cuda", "int8"
     return "cpu", "int8"
 
 
-_device_override: Optional[tuple[str, str]] = None  # set after a CUDA failure
-_model_device: Optional[str] = None  # device of the loaded _model (drives override reloads)
-
-
 def _effective_device() -> tuple[str, str]:
-    return _device_override or _detect_device()
+    """(device, compute_type) for the current lane — pool pin when set,
+    else the detected default."""
+    return _thread_pin() or _detect_device()
 
 
 def device_settings() -> tuple[str, str]:
     return _detect_device()
-
-
-def model_name() -> str:
-    # Shared resolver: VODRIP_WHISPER_MODEL env override -> settings.whisper_model -> default.
-    return active_whisper_model_id()
 
 
 def _cache_dir() -> Path:
@@ -250,26 +237,10 @@ _GPU_VRAM_MEDIAN_GAP_S = 10.0
 
 
 def _gpu_model_vram_est() -> int:
-    """fp16 VRAM estimate (bytes) for the ACTIVE whisper model (name-prefixed).
-
-    small is the default (~2 GiB); large-v3-turbo/large ~6-10; medium/
-    distil-medium ~5; base ~1; tiny ~0.6. Unknown names fall back to the
-    default (2 GiB) — conservative for the common case."""
-    name = (model_name() or "").lower()
-    gb = 2.0  # default: small
-    if name.startswith("large-v3-turbo") or name.startswith("distil-large-v3"):
-        gb = 6.0
-    elif name.startswith("large"):
-        gb = 10.0
-    elif name.startswith("medium") or name.startswith("distil-medium"):
-        gb = 5.0
-    elif name.startswith("small") or name.startswith("distil-small"):
-        gb = 2.0
-    elif name.startswith("base"):
-        gb = 1.0
-    elif name.startswith("tiny"):
-        gb = 0.6
-    return int(gb * 1024 ** 3)
+    """VRAM estimate (bytes) for one GPU copy of the ONLY engine — parakeet
+    (sherpa-onnx nemo_transducer TDT v3 int8: ~0.7 GiB weights + the CUDA EP
+    arena). The whisper model ladder is gone with the whisper engine."""
+    return _PARAKEET_GPU_VRAM_EST
 
 
 def _clamp_cuda_copies(copies: int, free_vram_bytes: int) -> int:
@@ -466,9 +437,9 @@ def _gpu_gate_held() -> bool:
 # Per-worker peak host-RAM estimates (system RAM, not VRAM). The real peak
 # depends on model size, chunk length and ffmpeg decode buffers; the 20%
 # headroom below is the safety net for estimate error.
-# ponytail: estimates, not measurements — tuned for faster-whisper base/small
-# int8 on CPU and for host-side buffers when the model lives on VRAM. If a
-# machine OOMs at budget 2, lower the env knob or bump these constants.
+# ponytail: estimates, not measurements — tuned for parakeet int8 on CPU and
+# for host-side buffers when the model lives on VRAM. If a machine OOMs at
+# budget 2, lower the env knob or bump these constants.
 # Upgrade path: track per-job RSS (psutil.Process().memory_info().rss around
 # transcribe_video) and replace the constants with a rolling EMA.
 _CPU_WORKER_RSS_EST = int(1.5 * 1024 ** 3)  # model + VAD + audio buffers
@@ -543,38 +514,34 @@ def _ram_worker_clamp(configured: int, per_worker_est: int) -> int:
     return max(1, min(configured, usable // per_worker_est))
 
 
-# GPU capability ladder (user requirement: cards range 6 -> 32 GiB; EVERY
-# tier keeps a GPU path). Rungs keyed on the MEASURED 60 s-median free-VRAM
-# allowance, read AFTER the compute-apps check. int8 is the default
-# precision (project rule: 8 -> 16 bit only, no weird precisions); fp16 only
-# when VRAM clearly allows. (model, compute_type); None model = the user's
-# active model.
-_GPU_LADDER_RUNGS = (
-    (int(6.5 * 1024 ** 3), None, "float16"),   # active model fp16 — 8 GiB+ cards
-    (int(3.5 * 1024 ** 3), None, "int8"),      # active model int8 — 6-8 GiB sweet spot
-    (int(2.0 * 1024 ** 3), "medium", "int8"),  # entry cards (6 GiB class)
-)
+# GPU lane VRAM floor (parakeet-only): the GPU lane exists whenever the
+# measured 60 s-median free-VRAM allowance is >= the parakeet CUDA
+# recognizer's needs. Below the floor the pool is CPU-only. (The old
+# whisper model/precision ladder — medium int8 on entry cards, fp16 on
+# 8 GiB+ — is gone with the whisper engine: parakeet is one int8 model on
+# every tier.)
+_GPU_MIN_FREE_VRAM = int(2.0 * 1024 ** 3)
 
 
 def _gpu_lane_plan() -> Optional[tuple[Optional[str], str]]:
     """(model, compute_type) for the GPU lane, or None -> CPU lane only.
 
-    Rungs keyed on the measured 60 s-median free-VRAM allowance. Unknown
-    allowance (0 = probe failed) -> (None, 'int8') — int8 default, the
-    legacy trust-the-env path keeps working."""
+    Parakeet-only: the lane is a single fixed plan ('int8' weights, CUDA
+    provider); the tuple shape is kept for the pool plan slots and stats.
+    Unknown allowance (0 = probe failed) -> (None, 'int8') — the legacy
+    trust-the-env path keeps working."""
     allowance = _gpu_vram_allowance()
     if allowance <= 0:
         return None, "int8"
-    for threshold, model, compute_type in _GPU_LADDER_RUNGS:
-        if allowance >= threshold:
-            return model, compute_type
-    return None  # < 2 GiB — CPU lane only
+    if allowance < _GPU_MIN_FREE_VRAM:
+        return None  # < 2 GiB — CPU lane only
+    return None, "int8"
 
 
 # --- live-caption session reservation ---------------------------------------
 # The real-time captioner (services.live_captions) is the MAX-priority tenant
 # while a livestream is watched: its parakeet ASR must never wait behind
-# archive whisper/parakeet GPU copies (VRAM) or CPU lanes (decode threads).
+# archive parakeet GPU copies (VRAM) or CPU lanes (decode threads).
 # The captioner toggles this on first subscriber acquire / last release; the
 # planner reads it at every re-plan (run_worker start + the 30 s plan-watch),
 # so a caption session pauses the pool's GPU lane within ~_PLAN_RECHECK_S and
@@ -651,13 +618,13 @@ def _gpu_copies() -> int:
 
 
 def _gpu_compute_type() -> str:
-    """The ladder rung's precision for the GPU plan slots ('float16'|'int8')."""
+    """Precision label for the GPU plan slots — always 'int8' (parakeet)."""
     lane = _gpu_lane_plan()
     return lane[1] if lane else "int8"
 
 
 # System CPU load clamp: when the box is already contended (user's app
-# transcoding, other agents), CPU whisper threads would only slow it down —
+# transcoding, other agents), CPU ASR threads would only slow it down —
 # the jobs wait in SQLite and drain later. Measured via GetSystemTimes
 # (kernel32, stdlib ctypes — psutil is not a declared dependency); POSIX
 # uses os.getloadavg(). Probe failure/unknown -> False (no clamp).
@@ -772,9 +739,9 @@ def _worker_plan() -> list[tuple[str, str]]:
     RAM (ponytail: per-slot RSS is an estimate — if a box OOMs, lower
     VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES).
 
-    A plan of exactly [("cuda","float16")] (gpu_slots==1 and cpu_slots==0) is
-    the legacy single-global-model path: budget 1, _infer_lock serializing
-    inference. Any other plan -> multi-copy mode (per-thread model copies)."""
+    A plan of exactly [("cuda","int8")] (gpu_slots==1 and cpu_slots==0) is
+    the single-global-model path: budget 1, one recognizer. Any other plan
+    -> multi-copy mode (per-thread model copies)."""
     device, _ = _effective_device()
     if device == "cpu":
         workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
@@ -788,9 +755,9 @@ def _worker_plan() -> list[tuple[str, str]]:
         cpu_slots = min(cpu_slots, 1)
     plan: list[tuple[str, str]] = [("cpu", "int8")] * cpu_slots
     if gpu_slots:
-        # Only reach the lane ladder when the GPU lane is actually usable —
+        # Only reach the lane gate when the GPU lane is actually usable —
         # a held GPU (gpu_slots 0) must never trigger the ~60 s VRAM median.
-        gpu_ct = _gpu_compute_type()  # float16 when VRAM fits, else int8
+        gpu_ct = _gpu_compute_type()  # always 'int8' for parakeet
         plan = [("cuda", gpu_ct)] * gpu_slots + plan
     # Both sides clamped away (tight VRAM + busy box): a single CPU slot is
     # the floor — jobs must drain eventually, one quiet thread is safer
@@ -828,29 +795,18 @@ def _pool_plan(max_workers: Optional[int]) -> list[tuple[str, str]]:
 _PLAN_RECHECK_S = 30.0
 
 
-def _make_pool(plan: list[tuple[str, str]], lane_model: Optional[str], budget: int) -> ThreadPoolExecutor:
+def _make_pool(plan: list[tuple[str, str]], budget: int) -> ThreadPoolExecutor:
     """New transcribe executor pinned to ``plan`` (threads pin per-slot)."""
     return ThreadPoolExecutor(
         max_workers=budget, thread_name_prefix="transcribe",
         initializer=_worker_thread_init,
-        initargs=(plan, lane_model),
+        initargs=(plan,),
     )
 
 
 # --- model cache ----------------------------------------------------------
 
 _model_lock = threading.Lock()
-_model: Any = None
-_model_name: Optional[str] = None
-_model_last_used = 0.0
-_word_ts_ok = True  # distil models have no alignment heads; flipped per process
-# GPU capability ladder pinning: run_worker resolves _gpu_lane_plan() once at
-# plan time and pins (model, compute_type) here so the GPU slots load the
-# ladder's model+precision (e.g. 'medium' int8 on entry cards) while CPU
-# slots keep the user's active model. Reset in run_worker's finally; direct
-# callers (tests/scripts) never see a stale pin.
-_worker_lane_model: Optional[str] = None
-_worker_lane_ct: Optional[str] = None
 
 
 def _idle_close_seconds() -> float:
@@ -899,96 +855,20 @@ def _ensure_cuda_libs() -> None:
             pass
 
 
-def _get_model() -> Any:
-    """Return the process-global WhisperModel, lazy-loading on first use.
-
-    Re-loads if VODRIP_WHISPER_MODEL changed since last load. Not thread-safe
-    for *concurrent* transcribe() calls — callers serialize via _infer_lock.
-    """
-    global _model, _model_name, _model_last_used, _device_override, _model_device
-    name = _worker_lane_model or model_name()
-    with _model_lock:
-        if (
-            _model is not None
-            and _model_name == name
-            and _model_device == _effective_device()[0]
-        ):
-            _model_last_used = time.monotonic()
-            return _model
-        _close_model_unlocked()  # different model env -> drop the old one first
-        _ensure_cuda_libs()  # must precede the ctranslate2 import/DLL load
-        from faster_whisper import WhisperModel
-
-        device, compute_type = _effective_device()
-        if device == "cuda" and _worker_lane_ct:
-            compute_type = _worker_lane_ct  # ladder precision (int8 default)
-        t0 = time.monotonic()
-        logger.info(
-            "Loading whisper model %r (device=%s compute_type=%s, cache=%s)...",
-            name, device, compute_type, _cache_dir(),
-        )
-        try:
-            _model = WhisperModel(
-                name,
-                device=device,
-                compute_type=compute_type,
-                download_root=str(_cache_dir()),
-                **({"cpu_threads": _whisper_threads()} if device == "cpu" else {}),
-            )
-        except Exception as exc:
-            if device == "cuda":
-                # Driver/GPU hiccup — fall back to CPU for the process lifetime
-                # instead of failing every queued job.
-                logger.warning("CUDA model load failed (%s) — falling back to CPU", exc)
-                _device_override = ("cpu", "int8")
-                device, compute_type = _device_override
-                _model = WhisperModel(
-                    name,
-                    device=device,
-                    compute_type=compute_type,
-                    download_root=str(_cache_dir()),
-                    cpu_threads=_whisper_threads(),
-                )
-            else:
-                raise
-        _model_name = name
-        _model_device = device
-        _model_last_used = time.monotonic()
-        logger.info("Whisper model %r loaded in %.1fs", name, time.monotonic() - t0)
-        return _model
-
-
-def _close_model_unlocked() -> None:
-    """Drop the cached model — caller MUST hold _model_lock."""
-    global _model, _model_name, _model_device
-    model, _model = _model, None
-    _model_name = None
-    _model_device = None
-    if model is not None:
-        logger.info("Unloading whisper model")
-        del model
-        gc.collect()
-
-
 def close_model() -> None:
     """Unload the cached models, freeing RAM. Safe mid-transcription: workers
     hold a local reference, so the object lives until their last use.
 
     Also drops the cached VAD model (lazy-reloaded by the next job) and, in
-    multi-copy mode, every pool thread's whisper model AND parakeet
-    recognizer too (threads lazily reload on their next job — the registry
-    is cleared, so a fresh slot is created). The process-global parakeet
-    recognizer (single-model mode) is dropped as well."""
+    multi-copy mode, every pool thread's parakeet recognizer too (threads
+    lazily reload on their next job — the registry is cleared, so a fresh
+    slot is created). The process-global parakeet recognizer (single-model
+    mode) is dropped as well. (The whisper model cache was removed with the
+    faster-whisper engine.)"""
     global _vad, _parakeet_global
     closed_any = False
     with _model_lock:
-        _close_model_unlocked()
         for slot in _thread_slots.values():
-            model, slot.model = slot.model, None
-            if model is not None:
-                logger.info("Unloading whisper thread model")
-                del model
-                closed_any = True
             parakeet, slot.parakeet = slot.parakeet, None
             if parakeet is not None:
                 logger.info("Unloading parakeet thread recognizer")
@@ -1016,41 +896,33 @@ def close_model() -> None:
 
 
 def _maybe_close_idle_model() -> None:
-    """Close the process-global whisper model or parakeet recognizer after
+    """Close the process-global parakeet recognizer after
     VODRIP_WHISPER_IDLE_CLOSE seconds without use. Thread models die with
     the pool (close_model on worker shutdown)."""
     idle_sec = _idle_close_seconds()
-    if _model is not None and time.monotonic() - _model_last_used > idle_sec:
-        logger.info("Model idle for %.0fs — unloading", idle_sec)
-        close_model()
-        return
     if _parakeet_global is not None and time.monotonic() - _parakeet_last_used > idle_sec:
         logger.info("Parakeet recognizer idle for %.0fs — unloading", idle_sec)
         close_model()
 
 
 # --- per-thread model copies (multi-copy mode, budget > 1) ------------------
-# Each pool thread owns one WhisperModel instance so inference runs truly in
-# parallel (no global _infer_lock). The registry is keyed by thread ident —
-# the same per-thread keying CPython's threading.local uses internally.
-# Model CREATION is serialized by _model_lock (shared hub download);
-# inference never takes it. A thread whose CUDA inference OOM'd marks itself
-# cpu_fallback and reloads on CPU — only that thread degrades. In hybrid
-# mode _worker_thread_init pins each pool thread to its plan slot (GPU or
-# CPU) at thread start, so a pinned CPU thread loads on CPU even though the
-# box has a GPU.
+# Each pool thread owns one parakeet recognizer so inference runs truly in
+# parallel. The registry is keyed by thread ident — the same per-thread
+# keying CPython's threading.local uses internally. Model CREATION is
+# serialized by _model_lock (shared model dir + download); inference never
+# takes it. In hybrid mode _worker_thread_init pins each pool thread to its
+# plan slot (GPU or CPU) at thread start, so a pinned CPU thread loads on
+# CPU even though the box has a GPU.
 
 _multi_tls = threading.local()  # per-thread: .active, .cpu_fallback, .pin
 
 
 class _ThreadModelSlot:
-    """One pool thread's lazy model state (whisper copy + parakeet
-    recognizer + per-thread Silero VAD)."""
-    __slots__ = ("model", "model_name", "parakeet", "vad")
+    """One pool thread's lazy model state (parakeet recognizer + per-thread
+    Silero VAD). The whisper model copy slot was removed with the engine."""
+    __slots__ = ("parakeet", "vad")
 
     def __init__(self) -> None:
-        self.model: Any = None
-        self.model_name: Optional[str] = None
         self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (provider per slot pin)
         self.vad: Any = None       # per-thread Silero VAD (multi-copy mode only)
 
@@ -1109,72 +981,6 @@ def _thread_slot() -> _ThreadModelSlot:
     return slot
 
 
-def _thread_model() -> Any:
-    """Lazy per-thread WhisperModel copy (multi-copy mode only).
-
-    Mirrors _get_model's lazy load, keyed to the calling thread; creation is
-    serialized by _model_lock, inference is not. The thread loads on its
-    pinned device slot when one was set by the pool initializer (hybrid
-    mode), else on _effective_device(). A thread marked cpu_fallback loads
-    on CPU even when CUDA is healthy (its copy OOM'd earlier)."""
-    slot = _thread_slot()
-    name = getattr(_multi_tls, "lane_model", None) or model_name()
-    if slot.model is not None and slot.model_name == name:
-        return slot.model
-    with _model_lock:
-        if slot.model is not None and slot.model_name == name:
-            return slot.model
-        if slot.model is not None:
-            del slot.model  # stale model env / degraded copy — drop first
-            slot.model = None
-        _ensure_cuda_libs()
-        from faster_whisper import WhisperModel
-
-        device, compute_type = _thread_pin() or _effective_device()
-        if _thread_cpu_fallback() and device == "cuda":
-            device, compute_type = "cpu", "int8"
-        t0 = time.monotonic()
-        logger.info(
-            "Loading whisper thread model %r (device=%s compute_type=%s)...",
-            name, device, compute_type,
-        )
-        try:
-            slot.model = WhisperModel(
-                name,
-                device=device,
-                compute_type=compute_type,
-                download_root=str(_cache_dir()),
-            )
-        except Exception as exc:
-            if device == "cuda":
-                # This thread's copy cannot load on CUDA (driver hiccup) —
-                # degrade only this thread to CPU, not the whole process.
-                logger.warning(
-                    "thread CUDA model load failed (%s) — thread falls back to CPU", exc
-                )
-                _thread_mark_cpu_fallback()
-                slot.model = WhisperModel(
-                    name,
-                    device="cpu",
-                    compute_type="int8",
-                    download_root=str(_cache_dir()),
-                )
-            else:
-                raise
-        slot.model_name = name
-        logger.info("Thread whisper model %r loaded in %.1fs", name, time.monotonic() - t0)
-        return slot.model
-
-
-def _current_model() -> Any:
-    """The model for the current context: the calling thread's own copy in
-    multi-copy mode, else the process-global one. Direct callers of
-    transcribe_video()/_get_model() (tests, API) always get the global path."""
-    if _in_multi_mode():
-        return _thread_model()
-    return _get_model()
-
-
 # --- Parakeet lane (sherpa-onnx) ------------------------------------------
     # A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
 # int8 on CPU runs 2.5-5.2 RTFx vs whisper-large-v3-turbo cpu/int8 at
@@ -1182,15 +988,14 @@ def _current_model() -> Any:
 # (no hallucination). GPU: CUDA-enabled sherpa-onnx wheels exist since
 # 1.13.x (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is
 # importable, GPU slots run parakeet with provider='cuda', gated on the
-# measured free-VRAM allowance; without it they stay whisper (graceful
-# degradation — byte-identical to the pre-parakeet worker). The lane is
-# opt-in end to end: sherpa-onnx missing OR VODRIP_PARAAKEET=0 -> whisper.
+# measured free-VRAM allowance.
 PARAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 _PARAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 _PARAAKEET_FEATURE_DIM = 128  # nemo_transducer default (80) fails — must match the model
-# Model card: 25 European languages. Intersected at runtime with the lang
+# Model card: 26 European languages. Intersected at runtime with the lang
 # tokens the model's tokens.txt actually carries (see _parakeet_langs), so a
-# model/cache swap missing a language falls back to whisper for that job.
+# model/cache swap missing a language is a clean unsupported-language
+# failure for that job (there is no whisper fallback).
 PARAKEET_LANG_CANDIDATES = frozenset({
     "pt", "en", "es", "fr", "de", "it", "ru", "uk", "pl", "nl", "sv", "da",
     "no", "fi", "el", "tr", "hu", "cs", "ro", "bg", "hr", "sk", "sl", "et",
@@ -1211,7 +1016,7 @@ def _parakeet_available() -> bool:
 
     VODRIP_PARAAKEET=0 is a hard kill switch (no import probe). Otherwise
     the sherpa-onnx import is probed once per process and cached; an import
-    failure degrades lanes to whisper — exactly today's behavior."""
+    failure makes the lane fail jobs cleanly (no whisper fallback)."""
     if os.environ.get(PARAKEET_ENV, "1").strip() == "0":
         return False
     global _parakeet_ok
@@ -1242,8 +1047,8 @@ def _parakeet_cuda_available() -> bool:
     fake adapter (Virtual Display Driver — no CUDA device, no nvidia-smi)
     must never route GPU work, so the wheel tag is ANDed with the real-GPU
     compute probe. Probed once per process and cached; a probe failure means
-    GPU slots stay whisper. Tests/self-check pin ``_parakeet_cuda_ok``
-    directly so they never import sherpa-onnx."""
+    GPU slots fail jobs cleanly (_AsrLaneUnavailable). Tests/self-check pin
+    ``_parakeet_cuda_ok`` directly so they never import sherpa-onnx."""
     if not _parakeet_available():
         return False
     global _parakeet_cuda_ok
@@ -1322,8 +1127,7 @@ def _parakeet_gpu_allowed() -> bool:
     free-VRAM allowance must cover the parakeet footprint. Reads the CACHED
     allowance only (a cold/stale cache reads as unknown -> 0 -> allowed): a
     GPU slot only exists when _gpu_copies() measured >= 2 GiB free at claim
-    time, and parakeet is the SMALLER model — a lane that fit whisper fits
-    it. Unknown allowance trusting the provider probe mirrors the
+    time. Unknown allowance trusting the provider probe mirrors the
     probe-failure paths elsewhere (env cap trusted)."""
     if not _parakeet_cuda_available():
         return False
@@ -1420,12 +1224,10 @@ def _parakeet_batch_size() -> int:
 
 def _parakeet_cache_dir() -> Path:
     """Sherpa model cache: VODRIP_SHERRPA_CACHE override, else a subdir of
-    the AI-models folder (<whisper cache>/parakeet-models) so every model
+    the AI-models folder (<models root>/parakeet-models) so every model
     weight lives under the models folder. Falls back to the legacy drive-root
     sibling (<models parent>/parakeet-models — the pre-ownership-fix layout)
-    while it still holds the model (see _migrated_model_dir). The dir name
-    carries no '--', so the whisper prune (HF-style dirs only) leaves it
-    alone."""
+    while it still holds the model (see _migrated_model_dir)."""
     override = os.environ.get(PARAKEET_CACHE_ENV, "").strip()
     if override:
         return Path(override)
@@ -1478,9 +1280,10 @@ def _parakeet_langs() -> frozenset[str]:
     lang tokens the model actually carries (<|pt|> etc. in tokens.txt).
 
     The intersection is the runtime guard against a model/cache mismatch (a
-    swapped model missing a language falls back to whisper for it). When the
-    model isn't downloaded yet the candidate set is trusted — routing is
-    correct either way (the guard only ever narrows)."""
+    swapped model missing a language is a clean unsupported-language failure
+    for that job — there is no whisper fallback). When the model isn't
+    downloaded yet the candidate set is trusted — routing is correct either
+    way (the guard only ever narrows)."""
     if not _parakeet_available():
         return frozenset()
     d = _parakeet_resolve_dir()
@@ -1507,36 +1310,47 @@ def _parakeet_threads() -> int:
     return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes))
 
 
-_WHISPER_MAX_THREADS = 8  # same A/B sweet spot as parakeet CPU decode
+class _AsrRoutingError(Exception):
+    """Base: a transcribe job cannot run on the only ASR engine (parakeet).
+
+    Both subclasses are TERMINAL job failures: _process_job catches them,
+    logs one warning line (no traceback) and lands the job 'failed' with the
+    message (which carries the 'ASR unsupported' / 'ASR unavailable' marker
+    archive_db.update_job treats as terminal — no backoff requeue)."""
 
 
-def _whisper_threads() -> int:
-    """ctranslate2 decode threads per whisper CPU lane — same sizing as the
-    parakeet lane, so a whisper fallback never hogs the whole box (an
-    uncapped lane used every core: 18/20 threads, the system stutter)."""
-    lanes = max(1, _cpu_worker_ceiling() or _cpu_auto_workers())
-    cores = os.cpu_count() or 4
-    return max(1, min(_WHISPER_MAX_THREADS, cores // lanes))
+class _AsrUnsupportedLanguage(_AsrRoutingError):
+    """A language that is KNOWN (explicitly set) but outside parakeet's 26
+    European-language coverage (ja/ko/zh/ar and anything else). No whisper
+    fallback exists — this is the required clean failure."""
+
+
+class _AsrLaneUnavailable(_AsrRoutingError):
+    """The calling lane has no usable parakeet: sherpa-onnx not importable,
+    VODRIP_PARAAKEET=0, no CUDA wheel on a GPU slot, or VRAM too tight."""
 
 
 def _slot_engine(device: str) -> str:
-    """Engine for a plan slot: 'parakeet' when the slot can run it (CUDA
-    slots need a CUDA-enabled sherpa-onnx, CPU slots the plain import;
-    VODRIP_PARAAKEET=0 kills both), else 'whisper'."""
+    """Engine for a plan slot — always 'parakeet' (the only engine), raised
+    as _AsrLaneUnavailable when the slot cannot run it: CUDA slots need a
+    CUDA-enabled sherpa-onnx, CPU slots the plain import; VODRIP_PARAAKEET=0
+    kills both."""
     if device == "cuda":
-        return "parakeet" if _parakeet_cuda_available() else "whisper"
-    return "parakeet" if _parakeet_available() else "whisper"
+        if _parakeet_cuda_available():
+            return "parakeet"
+        raise _AsrLaneUnavailable(
+            "ASR unavailable on the GPU slot: no CUDA-enabled sherpa-onnx "
+            "(install requirements-gpu.txt or let the GPU auto-install run) — "
+            "parakeet is the only ASR engine"
+        )
+    if _parakeet_available():
+        return "parakeet"
+    raise _AsrLaneUnavailable(
+        "ASR unavailable on the CPU slot: the parakeet engine (sherpa-onnx) "
+        "is not importable"
+        + (" (VODRIP_PARAAKEET=0 kills the lane)" if os.environ.get(PARAKEET_ENV, "1").strip() == "0" else "")
+    )
 
-
-# Languages whisper MUST handle: parakeet's TDT model carries only the 26
-# European families in PARAKEET_LANG_CANDIDATES — the CJK + Arabic families
-# route to whisper even though parakeet is the default engine.
-_WHISPER_ONLY_LANGS = frozenset({"ja", "ko", "zh", "ar"})
-
-# TASK9 runtime fallback: when a parakeet run fails mid-job, _process_job
-# retries the SAME job once with whisper (thread-local so multi-copy pool
-# threads never leak each other's override). _job_engine consults it first.
-_engine_override_tls = threading.local()
 
 # The job id currently running on this thread — set by _process_job so the
 # long silent phases (ffmpeg HLS fetch, yt-dlp download) can refresh the
@@ -1551,56 +1365,62 @@ def _current_job_id() -> Optional[str]:
     return getattr(_job_id_tls, "job_id", None)
 
 
-def _engine_override() -> Optional[str]:
-    """Forced engine for the current thread (parakeet-failure fallback)."""
-    return getattr(_engine_override_tls, "engine", None)
-
-
 def _job_engine(language: Optional[str]) -> str:
-    """Engine for THIS job on the calling lane.
+    """Engine for THIS job on the calling lane — always 'parakeet' or raise.
 
-    TASK9: parakeet is the DEFAULT engine — every language the lane can run
-    through sherpa, including UNKNOWN (None) — and whisper small is
-    the fallback, used ONLY when (a) the current thread's job override says
-    whisper (user forced asr_engine='whisper', or a parakeet run failed and
-    _process_job is retrying it), (b) the language is one parakeet cannot do
-    (ja/ko/zh/ar — outside its token set), or (c) the lane has no usable
-    parakeet (no sherpa import / CUDA-wheel / VRAM). GPU slots need CUDA
-    sherpa AND enough measured free VRAM; CPU slots need the plain import.
-    Without a CUDA wheel the GPU slot is whisper exactly as before.
+    Parakeet (sherpa-onnx nemo_transducer) is the ONLY ASR engine. It covers
+    the 26 European languages in PARAKEET_LANG_CANDIDATES (intersected with
+    the model's actual tokens) plus unknown/auto-detect (None / '').
+
+    Failures are clean, never a whisper fallback:
+      * _AsrUnsupportedLanguage — a KNOWN language outside the covered set
+        (e.g. ja/ko/zh/ar). Raised AFTER the lane checks: when parakeet is
+        unavailable _parakeet_langs() is empty and the job is an
+        engine-unavailable failure, not a language-coverage one.
+      * _AsrLaneUnavailable — the lane cannot run parakeet at all (no
+        sherpa-onnx import / VODRIP_PARAAKEET=0 / no CUDA wheel on a GPU
+        slot / free VRAM below the parakeet floor).
     Pure: no settings read here (the module self-check runs at import;
-    reading settings then could touch real appdata). _process_job maps the
-    asr_engine setting onto the thread-local override instead."""
-    forced = _engine_override()
-    if forced == "whisper":
-        return "whisper"
-    if language in _WHISPER_ONLY_LANGS:
-        return "whisper"
-    # Known language outside the model's token set (ja/ko/zh/ar via the
-    # explicit set, plus anything else a swapped model lacks): whisper.
-    # Unknown (None / '') is NOT narrowed — parakeet is the default for it.
-    if language and language not in _parakeet_langs():
-        return "whisper"
+    reading settings then could touch real appdata)."""
     device, _ = _thread_pin() or _effective_device()
     if device == "cuda":
-        if _parakeet_cuda_available() and _parakeet_gpu_allowed():
-            return "parakeet"
-        return "whisper"
-    if _parakeet_available():
-        return "parakeet"
-    return "whisper"
+        if not _parakeet_cuda_available():
+            raise _AsrLaneUnavailable(
+                "ASR unavailable on the GPU slot: no CUDA-enabled sherpa-onnx "
+                "(install requirements-gpu.txt or let the GPU auto-install "
+                "run) — parakeet is the only ASR engine"
+            )
+        if not _parakeet_gpu_allowed():
+            raise _AsrLaneUnavailable(
+                "ASR unavailable on the GPU slot: free VRAM is below the "
+                "parakeet recognizer floor (~2 GiB) — close other GPU apps "
+                "or run the worker CPU-only"
+            )
+    elif not _parakeet_available():
+        raise _AsrLaneUnavailable(
+            "ASR unavailable: the parakeet engine (sherpa-onnx) is not "
+            "importable"
+            + (" (VODRIP_PARAAKEET=0 kills the lane)" if os.environ.get(PARAKEET_ENV, "1").strip() == "0" else "")
+        )
+    if language and language not in _parakeet_langs():
+        covered = ", ".join(sorted(PARAKEET_LANG_CANDIDATES))
+        raise _AsrUnsupportedLanguage(
+            f"ASR unsupported: language {language!r} is not covered by the "
+            f"parakeet engine (26 European languages: {covered})"
+        )
+    return "parakeet"
 
 
-def _asr_model_name(engine: str) -> str:
-    """The model id reported/written for a run's engine: the parakeet repo
-    id for parakeet runs, the active whisper model otherwise."""
-    return PARAKEET_MODEL if engine == "parakeet" else model_name()
+def _asr_model_name() -> str:
+    """The model id reported/written for a run — always the parakeet repo id
+    (the only ASR engine; the whisper-model resolver is gone)."""
+    return PARAKEET_MODEL
 
 
 def _parakeet_provider() -> str:
     """'cuda' on a CUDA-pinned pool slot with CUDA sherpa present, else 'cpu'.
 
-    Mirrors the whisper thread's device pin. Off-pool callers (the live
+    Mirrors the pool slot's device pin. Off-pool callers (the live
     captions worker, tests, any direct call) get the CUDA EP ONLY on a
     verified real NVIDIA GPU (_offpool_cuda_available — torch CUDA up AND
     vendor nvidia): on a box where CUDA cannot actually load (no real GPU —
@@ -1653,7 +1473,7 @@ def _load_parakeet(provider: str = "cpu") -> Any:
         kwargs.pop("provider", None)
         logger.warning(
             "parakeet CUDA recognizer failed to load (%s) — falling back to CPU "
-            "(GPU slots will stay whisper for the rest of this process)", exc,
+            "(GPU slots stay CPU for the rest of this process)", exc,
         )
         rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
         provider = "cpu"
@@ -1665,9 +1485,9 @@ def _load_parakeet(provider: str = "cpu") -> Any:
 
 
 def _parakeet_model() -> Any:
-    """The recognizer for the current context: the calling thread's own copy
-    in multi-copy mode, else the process-global one. Mirrors _current_model;
-    creation is serialized by _model_lock (shared model dir + download);
+    """The ONLY engine's recognizer for the current context: the calling
+    thread's own copy in multi-copy mode, else the process-global one.
+    Creation is serialized by _model_lock (shared model dir + download);
     inference never takes a lock (each recognizer has one owner)."""
     global _parakeet_global, _parakeet_last_used
     _parakeet_last_used = time.monotonic()
@@ -1762,11 +1582,12 @@ def _transcribe_batch_parakeet(
     per-clip insert/manifest/resume contract is unchanged. batch_size 1 (the
     CPU default) keeps the legacy sequential decode_stream loop byte-identical.
 
-    Segments carry absolute video timestamps and the same JSON shape
-    _transcribe_batch produces: one segment per clip with word-level
-    timestamps. An empty transcript (silence -> no words — the parakeet
+    Segments carry absolute video timestamps and the same JSON shape the
+    whisper batch decoder produced (one segment per clip with word-level
+    timestamps — the shape is the transcript contract, not an engine
+    detail). An empty transcript (silence -> no words — the parakeet
     no-hallucination behavior) yields no segment for that clip.
-    ponytail: whisper splits segments on its own sentence boundaries; here
+    ponytail: whisper split segments on its own sentence boundaries; here
     one VAD chunk is one segment. Upgrade path: split a segment at word
     gaps > 1 s if the UI ever needs finer granularity."""
     def _clip_items(stream: Any, cs: float, ce: float, base: float) -> list[dict]:
@@ -1854,8 +1675,8 @@ def decode_audio(path: str, ffmpeg_bin: Optional[str] = None) -> "Any":
 # --- sharded decode (bounded-RAM path) ------------------------------------
 # Long media is decoded ONCE into fixed-duration float32 shards on disk (one
 # ffmpeg pass piping 16 kHz mono PCM), then consumed one window at a time by
-# VAD / whisper / events. Peak RAM is bounded by a shard window, never by the
-# media length (a 13.5 h VOD = ~3.1 GB decoded — not resident all at once).
+# VAD / the ASR engine / events. Peak RAM is bounded by a shard window, never
+# by the media length (a 13.5 h VOD = ~3.1 GB decoded — not resident at once).
 
 SHARD_SEC_ENV = "VODRIP_TRANSCRIBE_SHARD_SEC"
 SHARD_MIN_SEC_ENV = "VODRIP_TRANSCRIBE_SHARD_MIN_SEC"
@@ -1921,8 +1742,8 @@ class _ShardedAudio:
     """Fixed-duration float32 shards on disk plus absolute range reads.
 
     Shard i covers samples [_shard_sample_bounds(i)); read() returns any
-    absolute [start, end) window as one array, so VAD / whisper / events
-    consume shards without ever holding more than one window in RAM."""
+    absolute [start, end) window as one array, so VAD / the ASR engine /
+    events consume shards without ever holding more than one window in RAM."""
 
     __slots__ = ("files", "shard_sec", "total_samples", "total_sec")
 
@@ -2095,7 +1916,7 @@ _vad: Any = None
 # torch intra-op threads per VAD-carrying lane: 3 lanes x torch's default
 # 20 threads would oversubscribe the box; 4/lane is the A/B-sane ceiling
 # (VAD is CPU-bound and mostly sequential anyway — the batched pass is
-# ~170x realtime, far below any whisper/parakeet decode).
+# ~170x realtime, far below any ASR decode).
 _VAD_TORCH_THREADS = 4
 
 # Silero v5.1 (16 kHz) — mirror the legacy get_speech_timestamps call exactly:
@@ -2434,7 +2255,7 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     return _vad_regions(probs, len(audio))
 
 
-_MAX_CHUNK_SEC = 30.0  # faster-whisper mel window — longer clips get truncated
+_MAX_CHUNK_SEC = 30.0  # chunking contract — resume granularity + batch window
 
 
 def _plan_chunks(
@@ -2444,10 +2265,10 @@ def _plan_chunks(
 ) -> list[tuple[float, float]]:
     """Merge nearby speech regions into transcribe chunks; drop sub-minimum ones.
 
-    Chunks are capped at _MAX_CHUNK_SEC: faster-whisper's batched pipeline
-    trims every clip's mel features to 30 s (pad_or_trim to 3000 frames), so
-    an uncapped continuous-speech run would silently transcribe ONLY its
-    first 30 s ("Segment N is longer than 30 seconds" warning).
+    Chunks are capped at _MAX_CHUNK_SEC (30 s): it was faster-whisper's mel
+    window (an uncapped run silently transcribed only the first 30 s), and
+    it is kept as the chunking contract — GPU batches decode 30 s windows
+    and resume granularity stays fine.
 
     Deterministic — resume relies on identical chunks across runs.
     """
@@ -2517,13 +2338,13 @@ def _read_manifest(path: Path) -> tuple[Optional[dict], dict[int, dict]]:
 
 
 def _write_manifest_header(
-    path: Path, chunks: list[tuple[float, float]], engine: str = "whisper"
+    path: Path, chunks: list[tuple[float, float]], engine: str = "parakeet"
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps({
             "chunks": chunks,
-            "model": _asr_model_name(engine),
+            "model": _asr_model_name(),
             "engine": engine,
         }) + "\n")
 
@@ -2538,18 +2359,17 @@ def _resume_plan(
     header: Optional[dict],
     entries: dict[int, dict],
     existing: set[int],
-    engine: str = "whisper",
+    engine: str = "parakeet",
 ) -> tuple[list[int], int]:
     """Return (chunk indices to transcribe, next free seg_idx).
 
     Entries are trusted only when the header matches the current plan, model
-    AND engine (an engine switch — parakeet <-> whisper — invalidates the
-    manifest like a model change does; pre-parakeet manifests carry no
-    'engine' key and read as whisper). A chunk is also re-transcribed when
-    any row in its recorded seg_idx range is missing (manual delete /
-    partial write), and the next free index is the LOWEST gap in existing —
-    so deleted rows are restored at their old index and the seg_idx sequence
-    stays contiguous."""
+    AND engine (an engine/model change invalidates the manifest; pre-engine
+    manifests carry no 'engine' key and read as 'parakeet' — the only
+    engine). A chunk is also re-transcribed when any row in its recorded
+    seg_idx range is missing (manual delete / partial write), and the next
+    free index is the LOWEST gap in existing — so deleted rows are restored
+    at their old index and the seg_idx sequence stays contiguous."""
     if not chunks:
         return [], 0
     next_idx = 0
@@ -2560,8 +2380,8 @@ def _resume_plan(
     # JSON round-trip turns the plan's tuples into lists — compare shapes.
     if (
         [tuple(c) for c in header.get("chunks", [])] != chunks
-        or header.get("engine", "whisper") != engine
-        or header.get("model") != _asr_model_name(engine)
+        or header.get("engine", "parakeet") != engine
+        or header.get("model") != _asr_model_name()
     ):
         return list(range(len(chunks))), next_idx
     missing: list[int] = []
@@ -2578,154 +2398,6 @@ def _resume_plan(
 
 # --- transcription --------------------------------------------------------
 
-_infer_lock = threading.Lock()  # CTranslate2 model instances are not thread-safe
-
-
-def _beam_size() -> int:
-    """Whisper beam width: VODRIP_WHISPER_BEAM (default 1).
-
-    Measured on PT-BR VOD slices (corpus-anchored word overlap) beam 1 ==
-    beam 5 for this workload, and greedy halves decoder work; raise via env
-    when max quality is wanted."""
-    try:
-        return max(1, int(os.environ.get(BEAM_ENV, "1") or "1"))
-    except ValueError:
-        return 1
-
-
-def _batch_size() -> int:
-    """Clips decoded per batched call: VODRIP_WHISPER_BATCH (CUDA 16, CPU 4).
-
-    CUDA default 16 keeps a 5080-class GPU saturated; CPU (int8) defaults to
-    4 so the batched features stay small. The env cap applies to both."""
-    default = 16 if _effective_device()[0] == "cuda" else 4
-    try:
-        return max(1, int(os.environ.get(BATCH_ENV, str(default)) or str(default)))
-    except ValueError:
-        return default
-
-
-def _transcribe_batch(
-    model: Any,
-    audio: "Any",
-    chunks: list[tuple[float, float]],
-    language: Optional[str],
-    *,
-    clip_offsets: Optional[list[float]] = None,
-) -> list[tuple[list[dict], Optional[str]]]:
-    """Batch-decode [start,end] clips via faster-whisper's batched pipeline.
-
-    BatchedInferencePipeline decodes many 30 s windows in one GPU call, so
-    thousands of VAD clips stop paying per-call launch overhead (measured
-    26.9x -> ~118x realtime on a 5080; 164x with beam 1). Segments carry
-    absolute video timestamps; each clip's segments are returned in input
-    order, so the per-clip insert/manifest/resume contract is unchanged.
-
-    clip_offsets: per-clip absolute offset added to the output timestamps.
-    The sharded path feeds concatenated clip audio (times relative to the
-    array) and maps segments back to video time here; None keeps the legacy
-    full-audio behavior (times already absolute) byte-identical."""
-    from faster_whisper import BatchedInferencePipeline
-
-    global _word_ts_ok, _device_override
-    clips = [{"start": s, "end": e} for s, e in chunks]
-    kwargs: dict[str, Any] = dict(
-        language=language,
-        beam_size=_beam_size(),
-        vad_filter=False,  # our own VAD pre-pass already gated the audio
-        batch_size=_batch_size(),
-        without_timestamps=False,  # keep timestamp-driven segment splitting
-    )
-    if _word_ts_ok:
-        kwargs["word_timestamps"] = True
-
-    def run(pipe: Any) -> tuple[list[Any], Any]:
-        seg_iter, info = pipe.transcribe(audio, clip_timestamps=clips, **kwargs)
-        return list(seg_iter), info
-
-    if _in_multi_mode():
-        # Multi-copy mode: the model is THIS thread's own copy — no global
-        # lock needed. A CUDA OOM degrades only this thread to CPU.
-        try:
-            raw, info = run(BatchedInferencePipeline(model))
-        except ValueError as exc:
-            if not _word_ts_ok:
-                raise
-            # distil models lack alignment heads — fall back to plain segments.
-            logger.info("Word timestamps unsupported (%s) — falling back", exc)
-            _word_ts_ok = False
-            kwargs.pop("word_timestamps", None)
-            raw, info = run(BatchedInferencePipeline(model))
-        except RuntimeError as exc:
-            if _effective_device()[0] != "cuda" or _thread_cpu_fallback():
-                raise
-            # This thread's copy hit a CUDA inference failure (OOM, driver
-            # hiccup): degrade ONLY this thread to CPU and retry once.
-            logger.warning("CUDA inference failed (%s) — degrading this thread to CPU", exc)
-            _thread_mark_cpu_fallback()
-            raw, info = run(BatchedInferencePipeline(_thread_model()))
-    else:
-        with _infer_lock:
-            try:
-                raw, info = run(BatchedInferencePipeline(model))
-            except ValueError as exc:
-                if not _word_ts_ok:
-                    raise
-                # distil models lack alignment heads — fall back to plain segments.
-                logger.info("Word timestamps unsupported (%s) — falling back", exc)
-                _word_ts_ok = False
-                kwargs.pop("word_timestamps", None)
-                raw, info = run(BatchedInferencePipeline(model))
-            except RuntimeError as exc:
-                if _effective_device()[0] != "cuda" or _device_override is not None:
-                    raise
-                # GPU present but inference broken (missing cuBLAS, driver hiccup):
-                # drop to CPU for the process lifetime and retry this batch once.
-                logger.warning("CUDA inference failed (%s) — falling back to CPU", exc)
-                _device_override = ("cpu", "int8")
-                raw, info = run(BatchedInferencePipeline(_get_model()))
-
-    detected_lang = getattr(info, "language", None) or None
-    # TASK9 autodetect improvement: only trust whisper's own detection when
-    # it is confident. A low-probability guess (short/ambiguous audio) is
-    # discarded so the job's rows carry lang=None and the done-time
-    # channel-language re-aggregation (which weighs platform clues + every
-    # channel video's transcript evidence) stamps the family instead of a
-    # coin-flip. 0.5 is the faster-whisper docs' low-confidence boundary.
-    if detected_lang is not None and (getattr(info, "language_probability", 0.0) or 0.0) < 0.5:
-        detected_lang = None
-    # Attribute each segment to its clip by start time (clips are disjoint
-    # and sorted; the pipeline offsets segments by their clip start).
-    per: list[list[Any]] = [[] for _ in chunks]
-    idx = 0
-    for seg in raw:
-        s = float(seg.start)
-        while idx < len(chunks) - 1 and s >= chunks[idx][1]:
-            idx += 1  # advance past clips that ended before this segment
-        per[idx].append(seg)
-    out: list[tuple[list[dict], Optional[str]]] = []
-    for i, segs in enumerate(per):
-        base = 0.0 if clip_offsets is None else clip_offsets[i]
-        items: list[dict] = []
-        for seg in segs:
-            words = [
-                {
-                    "word": w.word,
-                    "start": round(float(w.start) + base, 3),
-                    "end": round(float(w.end) + base, 3),
-                    **({"conf": float(w.probability)}
-                       if getattr(w, "probability", None) is not None else {}),
-                }
-                for w in (seg.words or [])
-            ]
-            items.append({
-                "start_sec": round(float(seg.start) + base, 3),
-                "end_sec": round(float(seg.end) + base, 3),
-                "text": (seg.text or "").strip(),
-                "words": words,
-            })
-        out.append((items, detected_lang))
-    return out
 
 
 def _transcribe_youtube_captionless(
@@ -2746,13 +2418,13 @@ def _transcribe_youtube_captionless(
     _transcribe_audio_source (speech fraction below VODRIP_MUSIC_SPEECH_FRAC
     -> transcript_kind='music', done, no ASR).
 
-    *audio_stash* is the P2-4 retry cache: a dict the caller passes to
+    *audio_stash* is the TASK9 retry cache: a dict the caller passes to
     EVERY engine attempt. The first call downloads the audio, stashes the
     wav path + its owning temp dir, and keeps the dir alive; the retry
-    call (parakeet -> whisper) finds the stash and REUSES the download —
-    no 350 MB re-fetch for an engine retry. The retry call (the last
-    consumer) removes the stashed dir. A direct call with no stash keeps
-    the old create-and-clean behavior.
+    call (parakeet -> parakeet, same engine) finds the stash and REUSES
+    the download — no 350 MB re-fetch for an engine retry. The retry call
+    (the last consumer) removes the stashed dir. A direct call with no
+    stash keeps the old create-and-clean behavior.
 
     Download failures:
       - bot-gate classified -> _YoutubeGateRequeue (caller requeues the
@@ -3006,8 +2678,8 @@ def _transcribe_remote_twitch_kick(
     captionless route). The temp dir is removed in finally — also on
     failure.
 
-    *audio_stash* is the P2-4 retry cache (see _transcribe_youtube_captionless):
-    the first call downloads + stashes the wav, the parakeet->whisper retry
+    *audio_stash* is the TASK9 retry cache (see _transcribe_youtube_captionless):
+    the first call downloads + stashes the wav, the parakeet->parakeet retry
     reuses it — no second 350 MB HLS fetch for an engine retry.
     """
     rows = archive_db.query(
@@ -3213,7 +2885,7 @@ def _transcribe_audio_source(
         stats = {
             "platform": platform,
             "video_id": video_id,
-            "model": model_name(),
+            "model": _asr_model_name(),
             "device": _ran[0],
             "compute_type": _ran[1],
             "total_sec": round(total_sec, 3),
@@ -3235,11 +2907,11 @@ def _transcribe_audio_source(
 
     # Model load happens only now: VAD + planning are model-free, so a
     # no-speech video never pays the (large) load cost. The engine is the
-    # slot's choice for this job's language: parakeet (slots with a usable
-    # sherpa — CUDA on GPU slots when CUDA sherpa + VRAM allow, int8 CPU
-    # otherwise — for supported languages) or whisper (everything else).
+    # slot's choice for this job's language: always 'parakeet' — the ONLY
+    # ASR engine — or a clean _AsrRoutingError (unsupported language /
+    # unavailable lane) is raised here, before any audio is consumed.
     engine = _job_engine(language)
-    model = _parakeet_model() if engine == "parakeet" else _current_model()
+    model = _parakeet_model()
     existing = {int(r["seg_idx"]) for r in archive_db.transcript_for(platform, video_id, raw=True)}
     header, entries = _read_manifest(_manifest_path(platform, video_id))
     missing, seg_idx = _resume_plan(chunks, header, entries, existing, engine=engine)
@@ -3264,7 +2936,7 @@ def _transcribe_audio_source(
     speech_done = 0.0
     detected_lang: Optional[str] = None
     # Champion-name post-fix (transcript_fix): runs at the ONE choke point
-    # shared by both engines, right before rows land. Per-job stats merge
+    # of the engine, right before rows land. Per-job stats merge
     # into the returned dict under 'transcript_fix' and are logged at info.
     fix_stats = transcript_fix.new_stats()
     fix_on = transcript_fix.enabled()
@@ -3273,13 +2945,11 @@ def _transcribe_audio_source(
     n_chunks = len(chunks)
     twin_won = False  # higher-priority twin transcribed mid-run — abort
     # Per-call decode batch: parakeet on GPU slots sizes decode_streams
-    # from free VRAM (one run == one batched call); every other lane keeps
-    # the legacy _batch_size() run grouping — byte-identical to pre-batch
-    # runs. batch_size 1 (CPU / unknown VRAM) selects the legacy sequential
-    # decode_stream loop inside _transcribe_batch_parakeet.
-    parakeet_batch = _parakeet_batch_size() if engine == "parakeet" else 0
-    engine_batch = parakeet_batch if parakeet_batch > 1 else _batch_size()
-    engine_kwargs = {"batch_size": parakeet_batch} if engine == "parakeet" else {}
+    # from free VRAM (one run == one batched call); CPU slots keep batch 1
+    # (the sequential decode_stream loop inside _transcribe_batch_parakeet,
+    # byte-identical to pre-batch runs).
+    engine_batch = _parakeet_batch_size()
+    engine_kwargs = {"batch_size": engine_batch}
     while ci < n_chunks:
         cs, ce = chunks[ci]
         if ci not in missing_set:
@@ -3292,21 +2962,22 @@ def _transcribe_audio_source(
         while ci < n_chunks and ci in missing_set and len(run) < engine_batch:
             run.append((ci, chunks[ci]))
             ci += 1
-        batch_fn = _transcribe_batch_parakeet if engine == "parakeet" else _transcribe_batch
         if sharded_audio is not None:
             batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
-            batch_out = batch_fn(
+            batch_out = _transcribe_batch_parakeet(
                 model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
                 **engine_kwargs,
             )
         else:
-            batch_out = batch_fn(
+            batch_out = _transcribe_batch_parakeet(
                 model, audio, [c for _, c in run], language, **engine_kwargs,
             )
         for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
+            # _transcribe_batch_parakeet echoes the requested language back
+            # (parakeet has no detection); first non-None wins.
             if detected_lang is None and detected:
-                detected_lang = detected  # first batch's detection wins
-            lang = language or detected_lang  # env wins; else detected; else None
+                detected_lang = detected  # first batch's language wins
+            lang = language or detected_lang  # explicit wins; else echoed; else None
             # Batch insert: one insert_transcript() call per chunk (it accepts
             # a list); a crash loses at most the in-flight chunk.
             first_idx = seg_idx
@@ -3365,7 +3036,7 @@ def _transcribe_audio_source(
         return {
             "platform": platform,
             "video_id": video_id,
-            "model": _asr_model_name(engine),
+            "model": _asr_model_name(),
             "engine": engine,
             "device": _ran[0],
             "compute_type": _ran[1],
@@ -3383,7 +3054,7 @@ def _transcribe_audio_source(
     stats = {
         "platform": platform,
         "video_id": video_id,
-        "model": _asr_model_name(engine),
+        "model": _asr_model_name(),
         "engine": engine,
         "device": _ran[0],
         "compute_type": _ran[1],
@@ -3396,9 +3067,9 @@ def _transcribe_audio_source(
         "resumed_chunks": len(chunks) - len(missing),
         "wall_sec": round(wall, 3),
         "speed_x": round(speech_sec / wall, 2) if wall > 0 else 0.0,
-        # Whisper's own detection (None when the job ran with an explicit
-        # language — then the stored rows carry the explicit tag, never the
-        # detection). The done-time channel-language correction uses it.
+        # Parakeet has no language DETECTION: the stored rows carry the
+        # explicit job language, and lang stays None for auto-detect runs
+        # (the done-time channel-language correction stamps the family).
         "lang": detected_lang if language is None else None,
     }
     if fix_on:
@@ -3752,7 +3423,7 @@ def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
         # stamped on it yet) — fall back to the channel-language aggregation,
         # which weighs every channel video's stored clue plus the WS-4
         # original_language evidence. This kills the wrong-language case:
-        # whisper auto-detect (None) misfiring on a channel whose language
+        # ASR auto-detect (None) misfiring on a channel whose language
         # is known elsewhere (e.g. a twitch twin with a youtube clue).
         try:
             from services.channel_language import aggregate_channel_language
@@ -3775,9 +3446,8 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
     """Run one claimed job; never raises — failures land in archive_jobs.error.
 
     multi=True (worker with budget > 1): the job runs on the calling pool
-    thread's own model copy — no global _infer_lock, thread-local CUDA
-    fallback. Default False keeps the single-global-model path for direct
-    callers and tests."""
+    thread's own recognizer copy — no global lock. Default False keeps the
+    single-global-model path for direct callers and tests."""
     job_id = job["id"]
     platform, video_id = job["platform"], job["video_id"]
     # P2-4 retry cache (see _run_transcribe): the audio download functions
@@ -3878,7 +3548,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         if archive_db.transcribed_on_higher_priority_platform(platform, video_id):
             # The same live/VOD exists on a higher-priority platform
             # (youtube > twitch > kick) with transcript rows already — the
-            # Kick (or Twitch) copy needs no whisper. Mirrors the download
+            # Kick (or Twitch) copy needs no ASR. Mirrors the download
             # dedupe rule (archive_kick.dedupe_decision).
             logger.info(
                 "same VOD already transcribed on a higher-priority platform — "
@@ -3950,22 +3620,15 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 )
 
         resolved_lang = _resolve_job_language(platform, video_id)
-        # Map the asr_engine setting onto the thread-local override: the
-        # engine is re-evaluated inside transcribe_video per run, and the
-        # override must cover the WHOLE job (not just this one call) so the
-        # parakeet-failure fallback below can stack on top of it.
-        try:
-            from deps import settings_mgr
-            pref = getattr(settings_mgr.get(), "asr_engine", "parakeet") or "parakeet"
-        except Exception:
-            pref = "parakeet"
-        _engine_override_tls.engine = "whisper" if pref == "whisper" else None
+        # The engine is re-evaluated inside transcribe_video per run — with
+        # parakeet as the only engine it always resolves to 'parakeet' or a
+        # clean _AsrRoutingError.
 
-        # P2-4: the parakeet->whisper fallback re-runs _run_transcribe — the
-        # downloaded audio must be fetched ONCE and reused (an engine retry
-        # must not re-download ~350 MB). The download functions stash the
-        # wav path + owner dir here; the retry call finds the stash and the
-        # job-level finally releases whatever is left.
+        # TASK9: the retry re-runs _run_transcribe — the downloaded audio
+        # must be fetched ONCE and reused (a retry must not re-download
+        # ~350 MB). The download functions stash the wav path + owner dir
+        # here; the retry call finds the stash and the job-level finally
+        # releases whatever is left.
 
         def _run_transcribe() -> dict:
             if platform == "youtube":
@@ -3994,61 +3657,57 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 progress_cb=_progress, events_cb=events_cb,
             )
 
+        engine = _job_engine(resolved_lang)
         try:
-            engine = _job_engine(resolved_lang)
-            try:
-                stats = _run_transcribe()
-            except _YoutubeGateRequeue as exc:
-                # The bot gate armed DURING the audio download (it was
-                # clear at claim time) — requeue, never fail: the freeze
-                # lifts with one probe and the job drains then.
-                archive_db.update_job(
-                    job_id, status="queued",
-                    error=f"youtube bot-gate cooldown active — requeued ({exc})"[:400],
-                )
-                logger.info(
-                    "youtube job %s requeued: bot-gate during audio download",
-                    job_id,
-                )
-                return {
-                    "job_id": job_id, "platform": platform, "video_id": video_id,
-                    "requeued": "youtube-gate",
-                }
-            except Exception as exc:
-                # TASK9: whisper (small default) is the fallback when parakeet
-                # itself fails (decode error, recognizer crash) — retry the SAME
-                # job once with whisper before giving up. Terminal failures
-                # (missing archive file, yt-dlp download error) are NOT retried:
-                # they cannot succeed on the other engine. A wall-clock download
-                # timeout (_YtDownloadTimedOut) is also not retried with whisper
-                # — the failure is in the FETCH phase, not the engine; the normal
-                # retry machinery requeues the job with backoff instead.
-                from yt_dlp.utils import DownloadError as _DLError
+            stats = _run_transcribe()
+        except _YoutubeGateRequeue as exc:
+            # The bot gate armed DURING the audio download (it was
+            # clear at claim time) — requeue, never fail: the freeze
+            # lifts with one probe and the job drains then.
+            archive_db.update_job(
+                job_id, status="queued",
+                error=f"youtube bot-gate cooldown active — requeued ({exc})"[:400],
+            )
+            logger.info(
+                "youtube job %s requeued: bot-gate during audio download",
+                job_id,
+            )
+            return {
+                "job_id": job_id, "platform": platform, "video_id": video_id,
+                "requeued": "youtube-gate",
+            }
+        except _AsrRoutingError:
+            raise  # routing failures are terminal — never engine-retried
+        except Exception as exc:
+            # TASK9: parakeet is the ONLY engine — a mid-job failure
+            # (decode error, recognizer crash) retries the SAME job once
+            # with parakeet before giving up. Terminal failures (missing
+            # archive file, yt-dlp download error) are NOT retried: they
+            # cannot succeed on a second engine run. A wall-clock
+            # download timeout (_YtDownloadTimedOut) is also not retried
+            # — the failure is in the FETCH phase, not the engine; the
+            # normal retry machinery requeues the job with backoff
+            # instead.
+            from yt_dlp.utils import DownloadError as _DLError
 
-                try:
-                    from services.archive_ytdlp import _YtDownloadTimedOut as _DLTimeout
-                except Exception:
-                    _DLTimeout = None  # pragma: no cover — archive_ytdlp is importable
-                if engine != "parakeet" or isinstance(exc, (FileNotFoundError, _DLError)):
-                    raise
-                if _DLTimeout is not None and isinstance(exc, _DLTimeout):
-                    raise
-                logger.warning(
-                    "parakeet failed for %s/%s (%s: %s) — retrying job with whisper",
-                    platform, video_id, type(exc).__name__, exc,
-                )
-                _engine_override_tls.engine = "whisper"
-                try:
-                    stats = _run_transcribe()
-                finally:
-                    _engine_override_tls.engine = "whisper" if pref == "whisper" else None
-        finally:
-            _engine_override_tls.engine = None
+            try:
+                from services.archive_ytdlp import _YtDownloadTimedOut as _DLTimeout
+            except Exception:
+                _DLTimeout = None  # pragma: no cover — archive_ytdlp is importable
+            if isinstance(exc, (FileNotFoundError, _DLError)):
+                raise
+            if _DLTimeout is not None and isinstance(exc, _DLTimeout):
+                raise
+            logger.warning(
+                "parakeet failed for %s/%s (%s: %s) — retrying job once",
+                platform, video_id, type(exc).__name__, exc,
+            )
+            stats = _run_transcribe()
         archive_db.update_job(job_id, status="done", progress=1.0)
         # New transcript evidence -> re-aggregate the channel language
         # (throttled; best-effort — a failure must never fail the job).
         # When the job ran on auto-detection and the channel's now-known
-        # family disagrees with what whisper heard, the stored rows are
+        # family disagrees with the stored rows' language, the rows are
         # re-stamped (see channel_language.on_transcribe_done). An explicit
         # job language is never overridden.
         try:
@@ -4066,6 +3725,17 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             if stats.get("segments", 0) >= 50:
                 archive_db.optimize_fts()
         return stats
+    except _AsrRoutingError as exc:
+        # Clean routing failure — unsupported language or engine/lane
+        # unavailable. ONE warning line, no traceback; the job lands
+        # 'failed' immediately (the message carries the 'ASR unsupported' /
+        # 'ASR unavailable' marker archive_db.update_job treats as
+        # terminal — no backoff requeue; the scheduler's hourly requeue
+        # still re-runs the job up to 3 attempts, so a later engine
+        # install re-drains the row).
+        logger.warning("transcribe job %s routing failure: %s", job_id, exc)
+        archive_db.update_job(job_id, status="failed", error=str(exc)[:400])
+        return {"job_id": job_id, "error": str(exc)}
     except FileNotFoundError as exc:
         # Archive file evicted/swept (or never written) — the job can never
         # succeed. Mark it failed with a warning, no traceback; the scheduler's
@@ -4115,22 +3785,21 @@ def run_worker(
 ) -> None:
     """Blocking worker loop over the transcribe queue.
 
-    Hybrid pool: the plan (_worker_plan()) is [("cuda","float16")]*gpu_slots +
+    Hybrid pool: the plan (_worker_plan()) is [("cuda","int8")]*gpu_slots +
     [("cpu","int8")]*cpu_slots on CUDA hosts (GPU copy + dynamic CPU lanes),
     [("cpu","int8")]*auto on CPU-only hosts. Each pool thread is
     pinned to its slot by the executor initializer, so a pinned CPU thread
-    loads its model on CPU even though the box has a GPU. Engines are chosen
-    PER JOB: GPU slots run parakeet with provider='cuda' for parakeet
-    languages when a CUDA sherpa-onnx is installed and VRAM allows, else
-    whisper fp16; CPU slots run parakeet int8 or whisper int8 as before. The
-    shared queue stays FIFO (_claim_next_job) with no duration routing: the
-    GPU thread claims the next job when it finishes one, CPU threads pick up
-    queued VODs in the meantime.
+    loads its recognizer on CPU even though the box has a GPU. The engine is
+    ALWAYS parakeet (the only ASR engine): GPU slots run it with
+    provider='cuda' when a CUDA sherpa-onnx is installed and VRAM allows,
+    CPU slots run it int8. The shared queue stays FIFO (_claim_next_job)
+    with no duration routing: the GPU thread claims the next job when it
+    finishes one, CPU threads pick up queued VODs in the meantime.
 
     A plan of exactly one CUDA slot (VODRIP_TRANSCRIBE_WORKERS=0) is the
-    legacy single-global-model path: budget 1, _infer_lock, the global
-    _current_model(). max_workers overrides the plan for tests/launchers
-    (all threads on the effective device, legacy raw-count semantics).
+    single-global-model path: budget 1, one recognizer. max_workers
+    overrides the plan for tests/launchers (all threads on the effective
+    device, legacy raw-count semantics).
 
     DYNAMIC PLAN (natural plan only, max_workers=None): the pool plan is
     re-evaluated every _PLAN_RECHECK_S by a daemon plan-watch thread. When
@@ -4143,24 +3812,8 @@ def run_worker(
     plan = _pool_plan(max_workers)
     budget = len(plan)
     multi = budget > 1
-    # Capability-ladder pinning: the GPU lane's model+precision (e.g. the
-    # user's model int8, or 'medium' int8 on entry cards) is resolved once
-    # at claim time and pinned for this run — CPU slots keep the active
-    # model. Only when the natural plan has CUDA slots: a CPU-only plan
-    # (held GPU / tight VRAM) and the legacy max_workers path must never
-    # pay the ~60 s VRAM median for a lane they cannot use. Reset in
-    # finally so direct callers never inherit a stale pin.
-    global _worker_lane_model, _worker_lane_ct
-    _lane = (
-        _gpu_lane_plan()
-        if max_workers is None and any(d == "cuda" for d, _ in plan)
-        else None
-    )
-    _worker_lane_model = _lane[0] if _lane else None
-    _worker_lane_ct = _lane[1] if _lane else None
-    logger.info("archive transcribe worker: plan=[%s] workers=%d lane=%s",
-                ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
-                _worker_lane_model or "active-model")
+    logger.info("archive transcribe worker: plan=[%s] workers=%d",
+                ", ".join(f"{d}/{ct}" for d, ct in plan), budget)
     # Dynamic plan re-evaluation: a GPU that frees up (or gets grabbed) is
     # noticed within ~_PLAN_RECHECK_S and the pool is swapped. In-flight
     # jobs finish on the OLD executor (shutdown(wait=False) lets them run
@@ -4183,19 +3836,14 @@ def run_worker(
                 continue
             if new_plan == plan:
                 continue
-            _new_lane = (
-                _gpu_lane_plan()
-                if any(d == "cuda" for d, _ in new_plan)
-                else None
-            )
             with _proposal_lock:
-                plan_proposal[:] = [new_plan, _new_lane]
+                plan_proposal[:] = [new_plan]
 
     watch = threading.Thread(target=_plan_watch, name="plan-watch", daemon=True)
     if max_workers is None:
         watch.start()
 
-    pool = _make_pool(plan, _worker_lane_model, budget)
+    pool = _make_pool(plan, budget)
     try:
         with pool:
             # Per-slot claim loop: each finished future frees a slot and a
@@ -4220,18 +3868,15 @@ def run_worker(
                     if proposed:
                         plan_proposal.clear()
                 if proposed:
-                    new_plan, _new_lane = proposed
+                    (new_plan,) = proposed
                     old_pool = pool
                     old_pool.shutdown(wait=False)  # in-flight run out there
                     plan, budget, multi = new_plan, len(new_plan), len(new_plan) > 1
-                    _worker_lane_model = _new_lane[0] if _new_lane else None
-                    _worker_lane_ct = _new_lane[1] if _new_lane else None
-                    pool = _make_pool(plan, _worker_lane_model, budget)
+                    pool = _make_pool(plan, budget)
                     logger.info(
                         "archive transcribe worker: plan changed -> [%s] "
-                        "workers=%d lane=%s (old pool draining)",
+                        "workers=%d (old pool draining)",
                         ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
-                        _worker_lane_model or "active-model",
                     )
                 if not pending:
                     if once:
@@ -4260,8 +3905,6 @@ def run_worker(
         if max_workers is None:
             watch_stop.set()
             watch.join(timeout=2.0)
-        _worker_lane_model = None
-        _worker_lane_ct = None
         close_model()
 
 
@@ -4463,7 +4106,7 @@ if __name__ == "__main__":
     if args.once:
         # Belt-and-suspenders on top of worker_server's own guard: a live
         # worker heartbeat means someone else is draining the queue — exit
-        # rc 0 quietly instead of double-loading the whisper model.
+        # rc 0 quietly instead of double-loading the ASR engine.
         from services import archive_db
 
         if archive_db.worker_live(age_s=45):
@@ -4486,7 +4129,7 @@ assert _plan_chunks([(0.0, 5.0), (10.0, 15.0)]) == [(0.0, 5.0), (10.0, 15.0)], (
 )
 assert _plan_chunks([(0.0, 95.0)]) == [
     (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
-], "chunks must be capped at the 30 s whisper window (uncapped clips truncate)"
+], "chunks must be capped at the 30 s chunking window (uncapped clips truncate)"
 assert _plan_chunks([(0.0, 25.0), (25.4, 70.0)]) == [
     (0.0, 30.0), (30.0, 60.0), (60.0, 70.0),
 ], "cap must apply across merged regions"
@@ -4506,11 +4149,11 @@ _b1 = _shard_sample_bounds(1, 5.0)
 assert _b1 == (80000, 160000) and _b1[0] == _shard_sample_bounds(0, 5.0)[1], (
     "shards must tile the timeline contiguously"
 )
-assert _detect_device() in (("cuda", "float16"), ("cpu", "int8")), (
-    "device settings must be a known pair (nvidia -> cuda/float16, else cpu/int8)"
+assert _detect_device() in (("cuda", "int8"), ("cpu", "int8")), (
+    "device settings must be a known pair (nvidia -> cuda/int8, else cpu/int8)"
 )
 assert _sanitize_key("abc/def:123") == "abc_def_123"
-_header = {"chunks": [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0)], "model": model_name()}
+_header = {"chunks": [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0)], "model": PARAKEET_MODEL}
 _entries = {0: {"ci": 0, "first": 0, "count": 2}, 1: {"ci": 1, "first": 2, "count": 3}}
 _missing, _next = _resume_plan(_header["chunks"], _header, _entries, {0, 1, 2, 3, 4})
 assert _missing == [2] and _next == 5, "manifest-matched chunks must be skipped"
@@ -4532,12 +4175,12 @@ assert _clamp_cuda_copies(1, 100 << 30) == 1, "no GPU copies env -> 1 (probe ski
 assert _clamp_cuda_copies(4, 4 * _per_copy + 1) == 4, "env within the VRAM budget passes through"
 assert _clamp_cuda_copies(8, 2 * _per_copy + 1) == 2, "VRAM budget clamps copies"
 assert _clamp_cuda_copies(8, _per_copy - 1) == 1, "VRAM budget never drops below 1"
-_saved_override, _saved_workers = _device_override, os.environ.get(WORKERS_ENV)
+_saved_pin_ov, _saved_workers = getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV)
 _saved_free_ram = _free_system_ram_bytes
 _saved_vram = _gpu_free_vram_bytes
 _saved_cpu = _cpu_load_high
 try:
-    _device_override = ("cpu", "int8")
+    _multi_tls.pin = ("cpu", "int8")
     _free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM clamp must not bind here
     _cpu_load_high = lambda: False
     os.environ[WORKERS_ENV] = "4"
@@ -4557,7 +4200,7 @@ try:
     _free_system_ram_bytes = lambda: 1 * 1024 ** 3
     assert _ram_worker_clamp(8, _CPU_WORKER_RSS_EST) == 1, "RAM clamp never drops below 1"
 finally:
-    _device_override = _saved_override
+    _multi_tls.pin = _saved_pin_ov
     _free_system_ram_bytes = _saved_free_ram
     _gpu_free_vram_bytes = _saved_vram
     _cpu_load_high = _saved_cpu
@@ -4566,18 +4209,19 @@ finally:
     else:
         os.environ[WORKERS_ENV] = _saved_workers
 # hybrid pool plan: CUDA host -> 1 GPU copy + 2 CPU threads by default;
-# WORKERS=0 disables the CPU side (the exact legacy single-model plan);
+# WORKERS=0 disables the CPU side (the exact single-model plan);
 # WORKERS=3 -> 1 GPU + 3 CPU slots. RAM is patched ample so the clamp never
-# binds; the VRAM probe is patched per tier so the capability ladder decides
-# the GPU lane's model+precision.
-_saved_plan_ov, _saved_plan_w, _saved_plan_g = (
-    _device_override, os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
+# binds; the VRAM probe is patched per tier so the GPU-lane VRAM floor
+# decides whether the GPU lane exists at all (parakeet is one int8 model on
+# every tier — the old whisper model/precision ladder is gone).
+_saved_plan_pin, _saved_plan_w, _saved_plan_g = (
+    getattr(_multi_tls, "pin", None), os.environ.get(WORKERS_ENV), os.environ.get(GPU_COPIES_ENV),
 )
 _saved_plan_vram, _saved_plan_cpu = _gpu_free_vram_bytes, _cpu_load_high
 _saved_plan_held = _gpu_held_by_other
 _saved_plan_util = _gpu_util
 try:
-    _device_override = ("cuda", "float16")
+    _multi_tls.pin = ("cuda", "int8")
     _free_system_ram_bytes = lambda: 64 * 1024 ** 3
     _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3  # ample VRAM — clamp must not bind
     _gpu_held_by_other = lambda: False
@@ -4585,14 +4229,14 @@ try:
     _cpu_load_high = lambda: False
     os.environ.pop(WORKERS_ENV, None)
     os.environ.pop(GPU_COPIES_ENV, None)
-    assert _worker_plan() == [("cuda", "float16")] + [("cpu", "int8")] * _cpu_auto_workers(), (
+    assert _worker_plan() == [("cuda", "int8")] + [("cpu", "int8")] * _cpu_auto_workers(), (
         "CUDA host defaults to 1 GPU copy + dynamic CPU lanes"
     )
     os.environ[WORKERS_ENV] = "0"
-    assert _worker_plan() == [("cuda", "float16")], "WORKERS=0 -> exclusive-GPU plan"
+    assert _worker_plan() == [("cuda", "int8")], "WORKERS=0 -> exclusive-GPU plan"
     os.environ[WORKERS_ENV] = "3"
     assert _worker_plan() == [
-        ("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
+        ("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
     ], "WORKERS=3 -> 1 GPU + 3 CPU slots"
     # machine-aware scale-down: tight VRAM (another app holds the GPU model)
     # -> GPU copy 0, CPU slots cover; busy box -> at most 1 CPU slot; both ->
@@ -4603,20 +4247,21 @@ try:
     assert _worker_plan() == [("cpu", "int8")] * _cpu_auto_workers(), (
         "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
     )
-    # capability ladder rungs (simulated free VRAM -> lane model+precision)
+    # GPU-lane VRAM floor (parakeet-only): 2 GiB floor -> lane off; at/above
+    # it the lane is the fixed int8 plan on every tier.
     _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == ("medium", "int8"), "2-3.5 GiB -> medium int8 entry rung"
+    assert _gpu_lane_plan() == (None, "int8"), ">= 2 GiB -> GPU lane usable (int8)"
     _gpu_free_vram_bytes = lambda: int(5.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == (None, "int8"), "3.5-6.5 GiB -> active model int8"
+    assert _gpu_lane_plan() == (None, "int8"), "5 GiB -> same int8 lane"
     _gpu_free_vram_bytes = lambda: int(8.0 * 1024 ** 3)
-    assert _gpu_lane_plan() == (None, "float16"), ">= 6.5 GiB -> active model fp16"
+    assert _gpu_lane_plan() == (None, "int8"), "8 GiB+ -> same int8 lane (no fp16 tier)"
     _cpu_slots = [("cpu", "int8")] * _cpu_auto_workers()
-    assert _worker_plan() == [("cuda", "float16")] + _cpu_slots, (
-        "8 GiB tier -> fp16 GPU lane + dynamic CPU lanes"
+    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+        "8 GiB tier -> GPU lane + dynamic CPU lanes"
     )
     _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
     assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
-        "3 GiB tier -> medium int8 GPU slot + dynamic CPU lanes"
+        "3 GiB tier -> the same GPU slot + dynamic CPU lanes"
     )
     # compute-apps guard: another process holds a GPU model -> CPU only
     _gpu_free_vram_bytes = lambda: 16 * 1024 ** 3
@@ -4629,18 +4274,18 @@ try:
     # busy GPU: a second copy is capped at 1 when util >= 70%
     os.environ[GPU_COPIES_ENV] = "3"
     _gpu_util = lambda: 0.85
-    assert _worker_plan() == [("cuda", "float16")] + _cpu_slots, (
+    assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
         "busy GPU caps copies at 1"
     )
     _gpu_util = lambda: 0.4
     assert _worker_plan() == [
-        ("cuda", "float16"), ("cuda", "float16"), ("cuda", "float16"),
+        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
     ] + _cpu_slots, "idle GPU + ample VRAM allows the configured 3 copies"
     os.environ.pop(GPU_COPIES_ENV, None)
     # contended box: at most 1 CPU slot
     _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3
     _cpu_load_high = lambda: True
-    assert _worker_plan() == [("cuda", "float16"), ("cpu", "int8")], (
+    assert _worker_plan() == [("cuda", "int8"), ("cpu", "int8")], (
         "contended box must keep at most 1 CPU slot"
     )
     _gpu_free_vram_bytes = lambda: 1 * 1024 ** 3
@@ -4648,7 +4293,7 @@ try:
         "tight VRAM + busy box -> 1 CPU slot floor"
     )
 finally:
-    _device_override = _saved_plan_ov
+    _multi_tls.pin = _saved_plan_pin
     _free_system_ram_bytes = _saved_free_ram
     _gpu_free_vram_bytes = _saved_plan_vram
     _cpu_load_high = _saved_plan_cpu
@@ -4663,12 +4308,12 @@ finally:
     else:
         os.environ[GPU_COPIES_ENV] = _saved_plan_g
 
-# parakeet lane — engine routing (pure logic: the import probe is pinned
-# via the cached _parakeet_ok flag, sherpa-onnx is never imported here and
-# nothing downloads; the sherpa cache is pointed at a scratch dir with a
-# controlled tokens.txt for the intersection check).
+# engine routing — parakeet is the ONLY ASR engine (pure logic: the import
+# probe is pinned via the cached _parakeet_ok flag, sherpa-onnx is never
+# imported here and nothing downloads; the sherpa cache is pointed at a
+# scratch dir with a controlled tokens.txt for the intersection check).
 _saved_pok, _saved_pin = _parakeet_ok, getattr(_multi_tls, "pin", None)
-_saved_peng, _saved_pcache = _device_override, os.environ.get(PARAKEET_CACHE_ENV)
+_saved_pcache = os.environ.get(PARAKEET_CACHE_ENV)
 _saved_penv = os.environ.get(PARAKEET_ENV)
 _saved_pcuda = _parakeet_cuda_ok
 _saved_pvram = (_vram_free_bytes, _vram_free_at)
@@ -4679,39 +4324,61 @@ try:
     _parakeet_cuda_ok = True
     _vram_free_bytes = 64 * 1024 ** 3
     _vram_free_at = time.monotonic()
-    _device_override = ("cpu", "int8")
+    _multi_tls.pin = ("cpu", "int8")
     assert _job_engine("pt") == "parakeet", "pt routes to parakeet on a CPU lane"
     assert _job_engine("en") == "parakeet", "en routes to parakeet on a CPU lane"
     assert _job_engine("es") == "parakeet", "es routes to parakeet on a CPU lane"
-    assert _job_engine("ja") == "whisper", "known-other languages stay on whisper"
-    assert _job_engine("ko") == "whisper", "ko stays on whisper (CJK)"
-    assert _job_engine("zh") == "whisper", "zh stays on whisper (CJK)"
-    assert _job_engine("ar") == "whisper", "ar stays on whisper (Arabic)"
     assert _job_engine(None) == "parakeet", "parakeet is the DEFAULT for unknown language"
-    _device_override = ("cuda", "float16")
-    assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots may run parakeet"
+    assert _job_engine("") == "parakeet", "empty language is auto-detect"
+
+    def _expect_unsupported(lang: str) -> None:
+        try:
+            _job_engine(lang)
+        except _AsrUnsupportedLanguage as _e:
+            assert "ASR unsupported" in str(_e) and lang in str(_e), (
+                "the clean failure must name the language and the marker"
+            )
+            assert "26 European languages" in str(_e), (
+                "the clean failure must state the coverage"
+            )
+            return
+        raise AssertionError(f"{lang!r} must fail cleanly as unsupported language")
+
+    _expect_unsupported("ja")
+    _expect_unsupported("ko")
+    _expect_unsupported("zh")
+    _expect_unsupported("ar")
+
+    def _expect_lane_unavailable(fn: Any) -> None:
+        try:
+            fn()
+        except _AsrLaneUnavailable as _e:
+            assert "ASR unavailable" in str(_e), (
+                "the clean failure must carry the terminal marker"
+            )
+            return
+        raise AssertionError("must fail cleanly as lane unavailable")
+
+    _multi_tls.pin = ("cuda", "int8")
+    assert _slot_engine("cuda") == "parakeet", "CUDA sherpa -> GPU slots run parakeet"
     assert _job_engine("pt") == "parakeet", (
         "GPU slot + CUDA sherpa + ample VRAM + supported lang -> parakeet"
     )
-    assert _job_engine("ja") == "whisper", "GPU slots keep whisper for other languages"
+    _expect_unsupported("ja")  # GPU slots fail cleanly too — no whisper
     _parakeet_cuda_ok = False
-    assert _slot_engine("cuda") == "whisper", (
-        "no CUDA sherpa -> GPU slots stay whisper (graceful degradation)"
-    )
-    assert _job_engine("pt") == "whisper", "GPU slot without CUDA sherpa -> whisper"
+    _expect_lane_unavailable(lambda: _slot_engine("cuda"))
+    _expect_lane_unavailable(lambda: _job_engine("pt"))
     _parakeet_cuda_ok = True
     _vram_free_bytes = 1 * 1024 ** 3  # tight VRAM — fresh cache read
-    assert _job_engine("pt") == "whisper", (
-        "GPU slot + CUDA sherpa but tight VRAM falls back to whisper"
-    )
+    _expect_lane_unavailable(lambda: _job_engine("pt"))
     _vram_free_bytes = 64 * 1024 ** 3
-    _parakeet_cuda_ok = True
-    _device_override = ("cpu", "int8")
+    _multi_tls.pin = ("cpu", "int8")
     os.environ[PARAKEET_ENV] = "0"
-    assert _job_engine("pt") == "whisper", "VODRIP_PARAAKEET=0 kills the parakeet lane"
+    _expect_lane_unavailable(lambda: _slot_engine("cpu"))
+    _expect_lane_unavailable(lambda: _job_engine("pt"))
     os.environ.pop(PARAKEET_ENV, None)
     _parakeet_ok = False
-    assert _job_engine("pt") == "whisper", "sherpa-onnx import failure -> whisper"
+    _expect_lane_unavailable(lambda: _job_engine("pt"))
     assert _parakeet_langs() == frozenset(), "import-fail lane routes no languages"
     _parakeet_ok = True
     assert _parakeet_langs() == PARAKEET_LANG_CANDIDATES, (
@@ -4721,7 +4388,8 @@ try:
         "thread budget must be positive and capped at the A/B sweet spot"
     )
     # tokens.txt present -> the candidate set must narrow to the model's
-    # actual lang tokens (a swapped model missing a language falls back).
+    # actual lang tokens (a swapped model missing a language is a clean
+    # unsupported-language failure for that job).
     _pd = _scratch_sherpa / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
     _pd.mkdir(parents=True, exist_ok=True)
     for _f in _PARAKEET_FILES:
@@ -4732,8 +4400,10 @@ try:
     assert _parakeet_langs() == {"pt"}, (
         "routing must intersect the candidate set with the model's lang tokens"
     )
+    assert _job_engine("pt") == "parakeet", "narrowed model still runs pt"
+    _expect_unsupported("en")  # model swap dropped en -> clean failure
     # word assembly: the real vocab convention (space-prefixed word-initial
-    # pieces, lone-space piece inside a word) must produce whisper-shaped words.
+    # pieces, lone-space piece inside a word) must produce transcript-shaped words.
     _toks = [" N", "eg", "an", " de", " ", "1", "0", " minut", "os", ",", " né", "?"]
     _ts = [0.32, 0.48, 0.56, 0.8, 1.04, 1.12, 1.12, 1.2, 1.28, 1.36, 2.08, 2.24]
     _ws = _parakeet_words(_toks, _ts)
@@ -4743,7 +4413,6 @@ finally:
     _parakeet_ok = _saved_pok
     _parakeet_cuda_ok = _saved_pcuda
     _vram_free_bytes, _vram_free_at = _saved_pvram
-    _device_override = _saved_peng
     _multi_tls.pin = _saved_pin
     if _saved_pcache is None:
         os.environ.pop(PARAKEET_CACHE_ENV, None)

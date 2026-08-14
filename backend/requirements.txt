@@ -32,9 +32,9 @@ tokenizers>=0.19
 # ── Archive transcription worker (opt-in: services/archive_transcribe.py) ───
 # torch/torchaudio pinned together — a newer torchaudio DLL fails to load
 # against torch 2.7 (WinError 127 at import).
-# nvidia-*-cu12: ctranslate2 loads cublas64_12.dll at inference; a CUDA-13-era
-# driver alone (no CUDA 12 toolkit) fails without these wheels.
-faster-whisper>=1.2.1
+# nvidia-*-cu12: the sherpa-onnx CUDA wheel's onnxruntime EP loads
+# cublas64_12.dll at session create; a CUDA-13-era driver alone (no CUDA 12
+# toolkit) fails without these wheels.
 silero-vad>=6.2.1
 torch==2.7.0
 torchaudio==2.7.0
@@ -44,10 +44,11 @@ nvidia-cuda-runtime-cu12
 # AudioSet 527 classes (laugh/clap/scream/music...). Checkpoint downloads
 # itself on first use (zenodo record 3987831).
 panns-inference>=0.1.1
-# Parakeet TDT v3 lane (services/archive_transcribe.py) — sherpa-onnx CPU
-# wheel is the baseline; CUDA wheels exist since 1.13.x and are an OPT-IN
-# upgrade on NVIDIA hosts — the lane probes the installed wheel's providers
-# at runtime and stays whisper on GPU slots when CUDA is absent, so plain
+# Parakeet TDT v3 lane (services/archive_transcribe.py) — the ONLY ASR
+# engine (faster-whisper was removed). sherpa-onnx CPU wheel is the
+# baseline; CUDA wheels exist since 1.13.x and are an OPT-IN upgrade on
+# NVIDIA hosts — the lane probes the installed wheel's providers at runtime
+# and fails GPU slots cleanly when CUDA is absent, so plain
 # `pip install -r requirements.txt` keeps working on CPU machines.
 # NVIDIA users (any GPU >= 6 GiB VRAM): `pip install -r requirements-gpu.txt`
 # swaps in the CUDA wheel + the nvidia-*-cu12 runtime libs in one command.
@@ -57,8 +58,8 @@ panns-inference>=0.1.1
 # (cp311 win_amd64 direct: https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/main/cuda/1.13.4/sherpa_onnx-1.13.4+cuda12.cudnn9-cp311-cp311-win_amd64.whl)
 # The +cuda wheel's onnxruntime CUDA EP loads cublasLt64_12/cufft64_11/
 # curand64_10/cudnn64_9 from PATH (Windows) / LD_LIBRARY_PATH (POSIX) at
-# session create — cublas + cuda-runtime are already pinned above
-# (faster-whisper/ctranslate2); archive_transcribe._ensure_cuda_libs exposes
-# their bin/lib dirs (nvjitlink is pulled in transitively but is required by
-# cublasLt at load).
+# session create — cublas + cuda-runtime are pinned above (they replaced the
+# faster-whisper/ctranslate2 wheels that used to pull them);
+# archive_transcribe._ensure_cuda_libs exposes their bin/lib dirs (nvjitlink
+# is pulled in transitively but is required by cublasLt at load).
 sherpa-onnx>=1.13.0

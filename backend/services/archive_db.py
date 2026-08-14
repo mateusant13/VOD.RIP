@@ -2278,6 +2278,13 @@ def update_job(job_id: str, *, status: Optional[str] = None,
             or ("archive-file-missing" in err)
             or ("DownloadError" in err)
             or ("no HLS source" in err)
+            # ASR routing verdicts are terminal: unsupported language
+            # (outside parakeet's 26 European languages) or an unavailable
+            # engine lane — no retry will change them (an engine install
+            # clears the lane; the scheduler's hourly drain picks the job
+            # back up via the normal requeue after attempts reset).
+            or ("ASR unsupported" in err)
+            or ("ASR unavailable" in err)
         )
         # Gate-aware retry: YouTube bot-gate failures surface as playability
         # RuntimeErrors, not HTTP 429s — the string markers alone miss them,

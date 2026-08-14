@@ -1,4 +1,4 @@
-"""Real end-to-end check for the archive transcription worker (VAD + whisper + queue).
+"""Real end-to-end check for the archive transcription worker (VAD + parakeet + queue).
 
 Builds a 20 s synthetic fixture (5 s tone + 10 s pure silence + 5 s tone) with
 ffmpeg, runs it through the REAL archive_jobs queue (run_worker) against a temp
@@ -12,8 +12,8 @@ archive DB, then verifies:
     simulated crash state keeps it until the job completes,
   * job lifecycle: queued -> running -> done, progress ends at 1.0,
   * no-speech skip: a pure-silence fixture (< 3 s planned speech) completes
-    as done with skipped='no-speech' and the whisper model is NEVER loaded
-    (_get_model/_thread_model are patched to raise).
+    as done with skipped='no-speech' and the ASR model is NEVER loaded
+    (_parakeet_model is patched to raise).
 
 Run directly (isolated process — recommended):
     python tests/test_archive_transcribe_e2e_real.py
@@ -48,7 +48,6 @@ from services.archive_transcribe import (  # noqa: E402
     _append_manifest_entry,
     _job_engine,
     _resolve_job_language,
-    model_name,
 )
 
 PLATFORM = "twitch"
@@ -109,16 +108,9 @@ def _build_fixture() -> pathlib.Path:
 
 def _worker_engine(platform: str, video_id: str) -> str:
     """The engine run_worker's _process_job picks for this video — mirror its
-    settings override mapping + _job_engine so the simulated crash manifest
-    matches the engine that resumes the job (a whisper manifest on a parakeet
-    run reads as stale and full re-runs, breaking the resume contract)."""
-    try:
-        from deps import settings_mgr
-        pref = getattr(settings_mgr.get(), "asr_engine", "parakeet") or "parakeet"
-    except Exception:
-        pref = "parakeet"
-    if pref == "whisper":
-        return "whisper"
+    _job_engine call so the simulated crash manifest matches the engine that
+    resumes the job (a wrong engine tag reads as stale and full re-runs,
+    breaking the resume contract). Parakeet is the only engine."""
     return _job_engine(_resolve_job_language(platform, video_id))
 
 
@@ -131,8 +123,8 @@ def _enqueue_and_run(job_id: str) -> dict:
 
 def _run_no_speech() -> None:
     """A pure-silence fixture (< 3 s planned speech) must complete with
-    skipped='no-speech' WITHOUT loading the whisper model: _get_model and
-    _thread_model are patched to raise, so any model load fails the job."""
+    skipped='no-speech' WITHOUT loading the ASR model: _parakeet_model is
+    patched to raise, so any model load fails the job."""
     import subprocess as sp
     from unittest.mock import patch
 
@@ -156,12 +148,10 @@ def _run_no_speech() -> None:
         "duration_sec": 8.0,
     })
     archive_db.enqueue_job("transcribe-e2e-silent", "transcribe", PLATFORM, SILENT_VIDEO)
-    # max_workers=1 -> single-global-model path, so a model load would go
-    # through _get_model; _thread_model is patched too (belt & braces for
-    # multi-copy mode). Either being called means the skip did not fire.
-    with patch.object(archive_transcribe, "_get_model",
-                      side_effect=AssertionError("no-speech skip must not load a model")), \
-         patch.object(archive_transcribe, "_thread_model",
+    # _parakeet_model is the single model-load choke point (process-global
+    # AND per-thread copies both resolve through it); it being called means
+    # the skip did not fire.
+    with patch.object(archive_transcribe, "_parakeet_model",
                       side_effect=AssertionError("no-speech skip must not load a model")):
         t0 = time.monotonic()
         run_worker(once=True, poll_interval=0.5, max_workers=1)
@@ -175,14 +165,14 @@ def _run_no_speech() -> None:
     assert wall < 30, f"no-speech skip must not load the model ({wall:.1f}s wall)"
     print("=== run 3 (no-speech skip) ===")
     print(f"  job: {job}")
-    print(f"  wall: {wall:.2f}s | model load: never (patched _get_model/_thread_model)")
+    print(f"  wall: {wall:.2f}s | model load: never (patched _parakeet_model)")
 
 
 def _run_once_requeue_exit() -> None:
     """--once must exit 0 (not spin) when a job requeues: the YouTube
     bot-gate cooldown requeues the same row until the freeze lifts, so the
     queue never drains — a --once worker that waits for a drain hangs
-    forever holding the whisper model."""
+    forever holding the ASR model."""
     import threading
     from unittest.mock import patch
 
@@ -359,15 +349,14 @@ def _run() -> None:
 
 @pytest.fixture(scope="module")
 def _real_env():
-    """Apply the scratch-DB/whisper env only when the test actually runs.
+    """Apply the scratch-DB/ASR env only when the test actually runs.
 
     pytest imports every test module to read markers; module-level writes
-    (VODRIP_ARCHIVE_DB/WHISPER_MODEL/WHISPER_IDLE_CLOSE) would leak into the
-    whole session on every run. The env is scoped here and the archive_db
-    connection is rebound to the scratch DB."""
+    (VODRIP_ARCHIVE_DB/WHISPER_IDLE_CLOSE) would leak into the whole session
+    on every run. The env is scoped here and the archive_db connection is
+    rebound to the scratch DB."""
     prev = {k: v for k, v in os.environ.items() if k.startswith("VODRIP_")}
     os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
-    os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
     os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
     with archive_db._lock:
         archive_db._conn = None
