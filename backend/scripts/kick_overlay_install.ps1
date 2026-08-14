@@ -621,6 +621,17 @@ $sweepSpawned = $true   # finally sweeps our orphan only if discovery failed
 try {
     Write-ProgressLog "auto-install: spawning a $Browser window at $($binfo.url)"
     $before = [ExtWin]::AllWindows()
+    # The user's real foreground — captured BEFORE the spawn. A new Chrome
+    # window activates on creation; capturing here (instead of after the
+    # spawn) keeps $prevFg = the USER's window, so every focus bounce below
+    # hands keystrokes back to the user instead of to our own invisible
+    # window (the picker's alpha-0 dialog kept focus and absorbed the
+    # user's typing into its 'Endereço:' path field — 'instalação
+    # inconsistente', seen live 2026-08-13).
+    $prevFg = [ExtWin]::FgWindow()
+    if ($prevFg -ne [IntPtr]::Zero) {
+        Write-ProgressLog "auto-install: user foreground captured (before spawn)"
+    }
     # Folder-picker identification: the spawn can create extra 'Nova guia'
     # windows (session-restore side effects), so accept ONLY windows that
     # look like the native picker (title/class), never generic browser tabs.
@@ -678,6 +689,15 @@ try {
     # after the title settles below.
     [ExtWin]::Invisible($newWin)
     [ExtWin]::Resize($newWin, 1280, 800)
+
+    # Hand foreground back to the user immediately: the spawn activated our
+    # window, and the whole navigation/click phase must run focusless (UIA
+    # SetValue/Invoke/PostEnter need no focus — zero-keyboard stays true).
+    # The bounce checks below keep it that way for the duration.
+    if ($prevFg -ne [IntPtr]::Zero -and [ExtWin]::FgWindow() -ne $prevFg) {
+        [ExtWin]::RestoreFg($prevFg) | Out-Null
+        Write-ProgressLog 'auto-install: foreground restored to the user (post-spawn)'
+    }
 
     # If the page did not open on the extension URL, navigate SILENTLY:
     # chrome:// URLs are dropped from the CLI, and posted WM_KEYDOWN never
@@ -741,9 +761,10 @@ try {
         # Load unpacked (dev mode must be on — the toggle is `devMode`).
         # Focus bounce: the modal picker STEALS foreground when it opens
         # (~400ms after the click) and would eat the user's keystrokes.
-        # Poll at ~10ms and hand focus back to the user's window (proven
-        # live 2026-08-13: 2 steals restored, final fg == user's window).
-        $prevFg = [ExtWin]::FgWindow()
+        # Poll at ~10ms and hand focus back to the user's window ($prevFg
+        # was captured BEFORE the spawn above — it is the USER's window,
+        # never ours). Proven live 2026-08-13: steals restored, final fg ==
+        # user's window.
         $chromePids = @(Get-Process $Browser -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         # Event-driven picker wait: hook BEFORE the click. The picker's
         # create/show/name-change events fire as soon as Chrome opens it
@@ -833,6 +854,19 @@ try {
         # bounce below runs while it is already invisible (proven live:
         # alpha-0 keeps the UIA tree intact and fully drivable).
         [ExtWin]::Invisible($dlg)
+        # Park keyboard focus on an inert control (folder list/tree) so any
+        # keystroke that lands in the residual steal window does NOTHING
+        # instead of typing into the address-bar path field. UIA SetFocus is
+        # cross-process; failure is non-fatal (the bounce loop below still
+        # hands foreground back to the user).
+        try {
+            $auDlg = [System.Windows.Automation.AutomationElement]::FromHandle($dlg)
+            $condTree = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Tree)
+            $condList = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::List)
+            $park = $auDlg.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condTree)
+            if (-not $park) { $park = $auDlg.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condList) }
+            if ($park) { $park.SetFocus() | Out-Null; Write-ProgressLog 'auto-install: picker focus parked on folder list' }
+        } catch { }
         # Focus bounce (steal-guard): the picker activates ~30-100ms after
         # creation and would eat the user's keystrokes. Restore the user's
         # foreground whenever the foreground is ANY chrome process (the
@@ -856,11 +890,20 @@ try {
 
         $dr = [ExtWin]::DrivePicker($dlg, $ExtensionDir, 25000)
         Write-ProgressLog "auto-install: picker -> $dr"
+        # The dialog close re-activates our alpha-0 window — bounce again so
+        # the post-install verify phase never holds the user's keystrokes.
+        if ($prevFg -ne [IntPtr]::Zero -and [ExtWin]::FgWindow() -ne $prevFg) {
+            [ExtWin]::RestoreFg($prevFg) | Out-Null
+            Write-ProgressLog 'auto-install: foreground restored to the user (post-picker)'
+        }
 
         # Verify via the profile: 151 hides the card from UIA, but the install
         # writes an extensions.settings entry into Secure Preferences.
         $found = $false
         for ($i = 0; $i -lt 50; $i++) {
+            if ($prevFg -ne [IntPtr]::Zero -and [ExtWin]::FgWindow() -ne $prevFg) {
+                [ExtWin]::RestoreFg($prevFg) | Out-Null
+            }
             if (Test-ExtInProfile $binfo.udd $ExtensionDir) { $found = $true; break }
             Start-Sleep -Milliseconds 200
         }
